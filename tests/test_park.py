@@ -187,6 +187,169 @@ def test_grab_cancel_registers_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
         assert not [s for s in store.list_sessions() if s.draft]
 
 
+# ---- attach mode (q+p over a LIVE Claude session tab) -----------------------------
+
+
+def _attach_setup(monkeypatch: pytest.MonkeyPatch, panel_text: str | None) -> list[str]:
+    """A live tracked session in the frontmost tab + a panel returning *panel_text*."""
+    from types import SimpleNamespace
+
+    from command_center import peek
+    from command_center.adapters import claude as claude_adapter
+
+    notified = _grab_setup(monkeypatch, panel_text)
+    with Store() as store:
+        store.ensure("live-1", cwd="/tmp")
+        store.update_fields("live-1", iterm_session_id="w0t0p0:UUID-LIVE", aim="the aim")
+    monkeypatch.setattr(peek, "frontmost_iterm_uuid", lambda: "UUID-LIVE")
+    monkeypatch.setattr(peek, "_session_for_uuid", lambda store, uuid: store.get("live-1"))
+
+    class _FakeAdapter:
+        def discover(self) -> list[SimpleNamespace]:
+            return [SimpleNamespace(session_id="live-1", alive=True, kind="interactive")]
+
+    monkeypatch.setattr(claude_adapter, "ClaudeAdapter", _FakeAdapter)
+    return notified
+
+
+def test_grab_attaches_to_live_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    notified = _attach_setup(monkeypatch, "the real prompt")
+    assert cli.main(["park", "-g"]) == 0
+    with Store() as store:
+        row = store.get("live-1")
+        assert row is not None and not row.draft
+        assert row.prompt == "the real prompt"
+        assert row.fire_at == NOW + 1200 + park.DEFAULT_BUFFER_SEC
+        assert row.fire_window == "five_hour"
+        assert not [s for s in store.list_sessions() if s.draft]  # NO detached job
+    assert notified == ["⏳ prompt parked"]
+
+
+def test_grab_new_job_flag_skips_attach(monkeypatch: pytest.MonkeyPatch) -> None:
+    _attach_setup(monkeypatch, "detached prompt")
+    assert cli.main(["park", "-g", "-j"]) == 0
+    with Store() as store:
+        row = store.get("live-1")
+        assert row is not None and row.fire_at == 0 and row.prompt is None
+        job = next(s for s in store.list_sessions() if s.draft)
+        assert job.prompt == "detached prompt"
+
+
+def test_grab_attach_now_delivers_into_the_tab(monkeypatch: pytest.MonkeyPatch) -> None:
+    from command_center import terminal
+
+    sent: list[tuple[str, str]] = []
+    _attach_setup(monkeypatch, "say hallo")
+
+    def _fake_send(uuid: str, text: str) -> bool:
+        sent.append((uuid, text))
+        return True
+
+    monkeypatch.setattr(terminal, "send_text_to_session", _fake_send)
+    assert cli.main(["park", "-g", "-N"]) == 0
+    assert sent == [("w0t0p0:UUID-LIVE", "say hallo")]
+    with Store() as store:
+        row = store.get("live-1")
+        assert row is not None and row.fire_at == 0  # delivered, nothing armed
+
+
+# ---- daemon delivery of attached prompts ---------------------------------------------
+
+
+def _attached_row(store: Store, fire_at: int) -> None:
+    store.ensure("att-1", cwd="/tmp")
+    store.update_fields(
+        "att-1",
+        prompt="attached prompt",
+        fire_at=fire_at,
+        fire_window="five_hour",
+        iterm_session_id="w0t0p0:UUID-ATT",
+    )
+
+
+def test_deliver_attached_injects_into_live_tab(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from command_center import terminal
+
+    _, notified = _daemon_setup(monkeypatch)
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        terminal,
+        "send_text_to_session",
+        lambda uuid, text: sent.append((uuid, text)) or True,  # type: ignore[func-returns-value]
+    )
+    now = int(time.time())
+    with Store() as store:
+        _attached_row(store, now - 10)
+        live = {"att-1": SimpleNamespace(alive=True)}
+        report = daemon.DaemonReport()
+        daemon._deliver_attached_prompts(  # pylint: disable=protected-access
+            store, config.load_config(), report, False, live
+        )
+        assert report.reset_fired == ["att-1"] and sent == [("w0t0p0:UUID-ATT", "attached prompt")]
+        row = store.get("att-1")
+        assert row is not None and row.fire_at == 0
+    assert notified == ["⏳ parked prompt delivered"]
+
+
+def test_deliver_attached_falls_back_to_resume_tab(monkeypatch: pytest.MonkeyPatch) -> None:
+    from command_center import terminal
+
+    _, notified = _daemon_setup(monkeypatch)
+    resumed: list[str] = []
+    monkeypatch.setattr(
+        terminal,
+        "fire_attached_in_new_tab",
+        lambda sid: resumed.append(sid) or True,  # type: ignore[func-returns-value]
+    )
+    now = int(time.time())
+    with Store() as store:
+        _attached_row(store, now - 10)
+        report = daemon.DaemonReport()
+        daemon._deliver_attached_prompts(  # pylint: disable=protected-access
+            store, config.load_config(), report, False, {}
+        )
+        assert resumed == ["att-1"]
+        row = store.get("att-1")  # lease kept: fire-attached consumes it via claim_fire
+        assert row is not None and row.fire_at >= now + park.FIRE_RETRY_SEC - 5
+    assert notified == ["⏳ parked prompt resuming in a new tab"]
+
+
+def test_fire_attached_claims_and_execs_resume(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os as os_mod
+
+    execs: list[list[str]] = []
+    monkeypatch.setattr(os_mod, "execvp", lambda prog, argv: execs.append(list(argv)))
+    now = int(time.time())
+    with Store() as store:
+        _attached_row(store, now + 900)
+    assert cli.main(["fire-attached", "att-1"]) == 0
+    assert execs == [["claude", "--resume", "att-1", "attached prompt"]]
+    with Store() as store:
+        row = store.get("att-1")
+        assert row is not None and row.fire_at == 0
+    # Second delivery attempt: the claim is gone → refuse, never resume twice.
+    assert cli.main(["fire-attached", "att-1"]) == 1
+    assert len(execs) == 1
+
+
+def test_fire_attached_rearms_on_exec_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os as os_mod
+
+    def _boom(prog: str, argv: list[str]) -> None:
+        raise OSError("no claude")
+
+    monkeypatch.setattr(os_mod, "execvp", _boom)
+    now = int(time.time())
+    with Store() as store:
+        _attached_row(store, now - 5)
+    assert cli.main(["fire-attached", "att-1"]) == 1
+    with Store() as store:
+        row = store.get("att-1")
+        assert row is not None and row.fire_at > now  # re-armed: the daemon retries
+
+
 # ---- store: columns, index, claim, summary ------------------------------------
 
 
@@ -209,7 +372,8 @@ def test_upgrade_adds_fire_columns_and_partial_index(tmp_path: Path) -> None:
             row["name"]
             for row in store.conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
         }
-        assert "idx_sessions_armed_fire" in indexes
+        assert "idx_sessions_fire_pending" in indexes
+        assert "idx_sessions_armed_fire" not in indexes  # draft-scoped first cut is dropped
 
 
 def test_create_draft_stamps_fire_fields_and_claim_is_one_shot() -> None:
@@ -244,6 +408,20 @@ def test_armed_draft_summary_counts_only_armed_live_drafts() -> None:
         store.create_draft("a4", "/tmp", "gone", fire_at=NOW + 50, fire_window="five_hour")
         store.update_fields("a4", archived=True)
         assert store.armed_draft_summary() == (NOW + 100, 2)
+        # An ATTACHED prompt (fire_at on a live non-draft row) counts too.
+        store.ensure("a5", cwd="/tmp")
+        store.update_fields("a5", prompt="attached", fire_at=NOW + 10, fire_window="five_hour")
+        assert store.armed_draft_summary() == (NOW + 10, 3)
+
+
+def test_claim_fire_is_one_shot() -> None:
+    with Store() as store:
+        store.ensure("f1", cwd="/tmp")
+        store.update_fields("f1", prompt="p", fire_at=NOW + 10)
+        assert store.claim_fire("f1") is True
+        row = store.get("f1")
+        assert row is not None and row.fire_at == 0
+        assert store.claim_fire("f1") is False
 
 
 # ---- new-job --at-reset ----------------------------------------------------------

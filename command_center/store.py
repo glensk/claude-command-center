@@ -359,12 +359,16 @@ class Store:  # pylint: disable=too-many-public-methods
         for column, decl in self._ADDED_AIM_HISTORY_COLUMNS.items():
             if column not in ah_existing:
                 self.conn.execute(f"ALTER TABLE aim_history ADD COLUMN {column} {decl}")
-        # Partial index for the armed-draft scan (statusline chip + daemon dispatch).
+        # Partial index for the armed-fire scan (statusline chip + daemon dispatch).
         # Created HERE, not in _SCHEMA: an old DB only gains fire_at via the ALTER
         # loop above, and an index referencing a missing column would fail the open.
+        # The first cut (idx_sessions_armed_fire) was draft-scoped; attached prompts
+        # (fire_at on a LIVE session row) widened the predicate, hence the new name —
+        # CREATE IF NOT EXISTS cannot redefine an existing index in place.
+        self.conn.execute("DROP INDEX IF EXISTS idx_sessions_armed_fire")
         self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_armed_fire ON sessions(fire_at) "
-            "WHERE draft = 1 AND archived = 0 AND fire_at > 0"
+            "CREATE INDEX IF NOT EXISTS idx_sessions_fire_pending ON sessions(fire_at) "
+            "WHERE archived = 0 AND fire_at > 0"
         )
         self.conn.commit()
 
@@ -566,20 +570,37 @@ class Store:  # pylint: disable=too-many-public-methods
         return cur.rowcount == 1
 
     def armed_draft_summary(self, now: int | None = None) -> tuple[int, int] | None:
-        """``(earliest fire_at, count)`` over armed drafts, or ``None`` when none.
+        """``(earliest fire_at, count)`` over ALL armed fire times, or ``None``.
 
-        One aggregate over the ``idx_sessions_armed_fire`` partial index — cheap
-        enough for the per-second statusline chip. *now* is unused for filtering on
-        purpose (an overdue job must stay visible, not vanish from the summary).
+        Covers armed future-job drafts AND parked prompts attached to live sessions
+        (``fire_at`` on a non-draft row). One aggregate over the
+        ``idx_sessions_fire_pending`` partial index — cheap enough for the
+        per-second statusline chip. *now* is unused for filtering on purpose (an
+        overdue job must stay visible, not vanish from the summary).
         """
         del now  # kept for signature stability; overdue rows must remain included
         row = self.conn.execute(
             "SELECT MIN(fire_at) AS earliest, COUNT(*) AS n FROM sessions "
-            "WHERE draft = 1 AND archived = 0 AND fire_at > 0"
+            "WHERE archived = 0 AND fire_at > 0"
         ).fetchone()
         if not row or not row["n"]:
             return None
         return int(row["earliest"]), int(row["n"])
+
+    def claim_fire(self, session_id: str) -> bool:
+        """One-shot claim of a pending fire time: ``True`` for exactly one deliverer.
+
+        The attached-prompt twin of :meth:`claim_draft`: the conditional
+        ``fire_at → 0 WHERE fire_at > 0`` update is the claim itself, so a second
+        delivery tab (or an overlapping daemon pass) finds it already consumed and
+        must not deliver the prompt twice.
+        """
+        cur = self.conn.execute(
+            "UPDATE sessions SET fire_at = 0, updated_at = ? WHERE session_id = ? AND fire_at > 0",
+            (now_ms(), session_id),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
 
     def update_fields(self, session_id: str, **fields: Any) -> None:
         """Update an explicit whitelist of columns on one session."""

@@ -624,11 +624,22 @@ it (`fire_window`):
   instead of launching; `-N/--now` skips the wait. Shell alias: `alias qp="ccc park"`.
 - **`ccc park -g/--grab`** — the **global q+p chord** (Karabiner: hold `q`, tap `p`
   while iTerm2 is frontmost, mirroring the s+p peek chord): the park panel pops over
-  whatever tab you are looking at, resolves that tab's repo + account (tracked
-  session first, tab cwd fallback — the same resolution peek uses), and on ⌘↵
-  registers the ARMED job; the **daemon** fires it in a new tab at the reset (`-N`
-  launches it in a new tab immediately). Feedback arrives via notify — there is no
-  terminal attached to a chord launch.
+  whatever tab you are looking at (resolution as in peek: tracked session first,
+  tab cwd fallback). Two targets, chosen automatically and named in the panel
+  header:
+  - **Over a live Claude session tab (default: ATTACH)** — the prompt is parked
+    ON that session (`prompt` + fire time on its row, no new job): the "open the
+    session with its AIM first, define the real prompt with q+p" workflow. At the
+    reset the daemon **types the prompt into that session's tab** (bracketed
+    paste + ⏎, same context and billing); if the tab or process is gone it opens
+    a resume tab instead (`ccc fire-attached` → `claude --resume <id> "<prompt>"`,
+    double-delivery excluded by a one-shot claim). `-N` delivers into the tab
+    immediately; `-j/--new-job` forces the detached behaviour below; the session's
+    own statusline shows `⏳ parked prompt for THIS session fires …` while armed.
+  - **Over any other tab (DETACHED)** — an armed future job for that tab's repo +
+    account; the daemon launches it as a NEW session in a new tab at the reset
+    (`-N` launches immediately). Feedback arrives via notify — there is no
+    terminal attached to a chord launch.
 - **`ccc new-job -R/--at-reset [-W WINDOW]`** — headless flow: the job is armed and the
   **daemon** fires it in a new tab within ~5 minutes after the reset (it warns at
   registration when the daemon service is not installed).

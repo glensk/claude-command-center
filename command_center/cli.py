@@ -1127,6 +1127,48 @@ def cmd_park(args: argparse.Namespace) -> int:
     return park.run_park(args)
 
 
+def cmd_fire_attached(args: argparse.Namespace) -> int:
+    """internal: resume a session WITH its parked (attached) prompt.
+
+    Runs in the fresh tab the daemon opened because the attached prompt's own
+    session tab was gone at fire time (see ``daemon._deliver_attached_prompts``).
+    Claims the delivery via the one-shot conditional ``fire_at → 0`` update — a
+    second tab refuses instead of delivering twice — then pins the session's
+    account and execs ``claude --resume <id> "<prompt>"`` in the session's cwd.
+    On an exec failure the fire time is re-armed so the daemon retries.
+    """
+    import time as _time
+
+    from . import accounts
+
+    with Store() as store:
+        session = store.get(args.session_id)
+        if session is None or not (session.prompt or "").strip():
+            print(f"error: no parked prompt on session {args.session_id}", file=sys.stderr)
+            return 1
+        if not store.claim_fire(args.session_id):
+            print(
+                f"error: parked prompt for {args.session_id} was already delivered "
+                "by another launcher",
+                file=sys.stderr,
+            )
+            return 1
+        prompt = (session.prompt or "").strip()
+        cwd = session.cwd
+        config_dir = session.config_dir
+    if cwd and os.path.isdir(cwd):
+        os.chdir(cwd)
+    accounts.apply_to_environ(config_dir)
+    try:
+        os.execvp("claude", ["claude", "--resume", args.session_id, prompt])
+    except OSError as exc:
+        with Store() as store:  # undo the claim: re-arm so the daemon retries
+            store.update_fields(args.session_id, fire_at=int(_time.time()) + 900)
+        print(f"error: could not resume {args.session_id}: {exc}", file=sys.stderr)
+        return 1
+    return 0  # unreachable on success (execvp replaced the process)
+
+
 def cmd_new_job(args: argparse.Namespace) -> int:
     """Register a FUTURE job — a saved AIM + prompt, launched later with ``ccc start-job``.
 
@@ -2595,6 +2637,13 @@ def cmd_statusline(args: argparse.Namespace) -> int:
 
     # Armed parked prompt(s): one chip in EVERY session's statusline — the soonest fire
     # time, overdue-aware (red once both dispatchers should have fired; see park.py).
+    # A prompt attached to THIS session gets its own explicit line first.
+    if session.fire_at:
+        from . import park
+
+        own = park.format_fire(session.fire_at)
+        own_color = status_color["failed"] if own.startswith("overdue") else "\033[38;5;214m"
+        print(f"{own_color}⏳ parked prompt for THIS session {own}{reset}")
     if armed:
         from . import park
 
@@ -3185,7 +3234,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--grab",
         action="store_true",
         help="global-chord mode (Karabiner q+p): park panel over the frontmost iTerm "
-        "tab; the armed job fires in a NEW tab via the daemon (no in-tab countdown)",
+        "tab — over a live Claude session the prompt attaches to THAT session "
+        "(delivered into it at the reset); otherwise an armed job fires in a NEW "
+        "tab via the daemon",
+    )
+    p_park.add_argument(
+        "-j",
+        "--new-job",
+        action="store_true",
+        help="with -g: always register a detached NEW-session job, even when the "
+        "frontmost tab is a live Claude session (skip attach)",
     )
     p_park.set_defaults(func=cmd_park)
 
@@ -3289,6 +3347,13 @@ def build_parser() -> argparse.ArgumentParser:
         "the job's auto-fire instead of asking",
     )
     p_startjob.set_defaults(func=cmd_start_job)
+
+    p_fireattached = sub.add_parser(
+        "fire-attached",
+        help="internal: resume a session with its parked (attached) prompt",
+    )
+    p_fireattached.add_argument("session_id")
+    p_fireattached.set_defaults(func=cmd_fire_attached)
 
     p_openjob = sub.add_parser(
         "open-job",

@@ -501,11 +501,20 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
     """Global-chord mode (``ccc park -g``, the Karabiner q+p): panel over any tab.
 
     There is no shell process to count down in — the prompt is captured in the park
-    panel and registered as an ARMED job for the **frontmost iTerm tab's** repo and
-    account (resolved like the peek panel: tracked session first, tab cwd fallback);
-    the daemon dispatches it in a new tab at the reset. ``-N`` launches it in a new
-    tab immediately instead. Feedback goes through notify — Karabiner gives this
-    process no terminal.
+    panel over whatever tab is frontmost (resolved like the peek panel: tracked
+    session first, tab cwd fallback).
+
+    **Attach (the default over a live Claude session tab):** the prompt is parked
+    ON that session — ``prompt`` + ``fire_at`` on its row, no new job — and at the
+    reset the daemon delivers it INTO the session (typed into its tab; a resume tab
+    with the prompt when the tab died). This is the "open the session with its AIM
+    first, define the real prompt with qp" workflow; ``-N`` delivers immediately,
+    ``-j/--new-job`` forces the detached-job behaviour instead.
+
+    **Detached (any other tab, or ``-j``):** an ARMED future job for the tab's repo
+    and account; the daemon launches it as a NEW session in a new tab at the reset
+    (``-N`` launches it immediately). Feedback goes through notify — Karabiner
+    gives this process no terminal.
     """
     from . import peek
     from .colors import short_folder
@@ -522,6 +531,21 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
     if tab_uuid:
         with Store() as store:
             session = peek._session_for_uuid(store, tab_uuid)  # pylint: disable=protected-access
+    attach = None
+    if session is not None and not session.draft and not getattr(args, "new_job", False):
+        from .adapters.claude import ClaudeAdapter
+
+        live = next(
+            (ls for ls in ClaudeAdapter().discover() if ls.session_id == session.session_id),
+            None,
+        )
+        if (
+            live is not None
+            and live.alive
+            and live.kind == "interactive"
+            and session.iterm_session_id
+        ):
+            attach = session
     cwd = session.cwd if session is not None and os.path.isdir(session.cwd or "") else ""
     if not cwd:
         cwd = peek.frontmost_iterm_cwd() or os.getcwd()
@@ -541,9 +565,14 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
     initial = ""
     if getattr(args, "clipboard", False):
         initial = _clipboard_text()[0] or ""
-    tail = "launches now in a new tab" if not fire_at else "daemon fires it in a new tab"
+    if attach is not None:
+        tail = "delivered into THIS session" if fire_at else "delivered into THIS session now"
+        target = f"→ session {short_id(attach.session_id)}"
+    else:
+        tail = "daemon fires it in a new tab" if fire_at else "launches now in a new tab"
+        target = short_folder(cwd)
     header = (
-        f"{short_folder(cwd)}  ·  {label}  ·  "
+        f"{target}  ·  {label}  ·  "
         + (format_fire(fire_at, now) if fire_at else "immediately")
         + f"  ·  {tail}"
     )
@@ -557,6 +586,26 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
         notify("⏳ park failed", size_err, cfg.notify)
         print(size_err, file=sys.stderr)
         return 1
+
+    if attach is not None:
+        if not fire_at:  # -N: deliver straight into the live session's tab
+            if terminal.send_text_to_session(attach.iterm_session_id or "", prompt):
+                message = f"delivered into session {short_id(attach.session_id)}"
+                notify("⏳ prompt delivered", message, cfg.notify)
+                print(message)
+                return 0
+            message = f"could not type into session {short_id(attach.session_id)}'s tab"
+            notify("⏳ park failed", message, cfg.notify)
+            print(f"error: {message}", file=sys.stderr)
+            return 1
+        with Store() as store:
+            store.update_fields(
+                attach.session_id, prompt=prompt, fire_at=fire_at, fire_window=window
+            )
+        done = f"for session {short_id(attach.session_id)} — {format_fire(fire_at, now)}"
+        notify("⏳ prompt parked", done, cfg.notify)
+        print(f"parked {done}")
+        return 0
 
     import uuid
 

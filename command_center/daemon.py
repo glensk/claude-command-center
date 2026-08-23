@@ -230,6 +230,10 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
         # Dispatch armed parked-prompt jobs whose fire time has passed (see park.py).
         _fire_reset_jobs(store, cfg, report, dry_run)
 
+        # Deliver parked prompts ATTACHED to existing sessions (fire_at on a
+        # non-draft row): typed into the live tab, or a resume tab as fallback.
+        _deliver_attached_prompts(store, cfg, report, dry_run, live)
+
         # Auto-resume session-limit-halted sessions: spawn the watcher when work exists.
         _spawn_resume_watcher(cfg, report, dry_run)
 
@@ -438,6 +442,63 @@ def _fire_reset_jobs(store: Store, cfg: config.Config, report: DaemonReport, dry
         store.update_fields(job.session_id, fire_at=now + park.FIRE_RETRY_SEC)
         terminal.start_job_in_new_tab(job.session_id, auto=True)
         notify("⏳ parked prompt fired", _label(job), cfg.notify)
+
+
+def _deliver_attached_prompts(
+    store: Store, cfg: config.Config, report: DaemonReport, dry_run: bool, live: dict
+) -> None:
+    """Deliver parked prompts ATTACHED to existing sessions (``fire_at`` on a non-draft row).
+
+    The "opened the session with its AIM first, defined the real prompt with qp"
+    workflow: at fire time the prompt is TYPED into the session's live iTerm tab
+    (bracketed paste + CR — same context, same billing, no new session). When the
+    tab or process is gone, a new tab resumes the session WITH the prompt
+    (``ccc fire-attached`` → ``claude --resume <id> "<prompt>"``). Same
+    re-arm-forward lease as :func:`_fire_reset_jobs`; the injection path zeroes
+    ``fire_at`` on success and ``fire-attached`` claims it with the one-shot
+    conditional update, so nothing delivers twice. No grace offset: no foreground
+    waiter ever competes for an attached prompt.
+    """
+    from . import accounts, park, terminal, usage
+
+    now = int(time.time())
+    due = [
+        s
+        for s in store.list_sessions()
+        if not s.draft and not s.archived and (s.prompt or "").strip() and 0 < s.fire_at <= now
+    ]
+    for job in due:
+        label = accounts.effective_account_label(job.config_dir or "")
+        postponed = park.postpone_until(usage.read_usage(label), job.fire_window, now)
+        if postponed is not None and postponed > job.fire_at:
+            report.reset_postponed.append(job.session_id)
+            if not dry_run:
+                store.update_fields(job.session_id, fire_at=postponed)
+                notify(
+                    "⏳ parked prompt postponed",
+                    f"{_label(job)} — {job.fire_window} still exhausted; "
+                    + park.format_fire(postponed, now),
+                    cfg.notify,
+                )
+            continue
+        report.reset_fired.append(job.session_id)
+        if dry_run:
+            continue
+        store.update_fields(job.session_id, fire_at=now + park.FIRE_RETRY_SEC)  # lease
+        live_session = live.get(job.session_id)
+        if (
+            live_session is not None
+            and getattr(live_session, "alive", False)
+            and job.iterm_session_id
+            and terminal.send_text_to_session(job.iterm_session_id, (job.prompt or "").strip())
+        ):
+            store.update_fields(job.session_id, fire_at=0)
+            notify("⏳ parked prompt delivered", _label(job), cfg.notify)
+            continue
+        # Tab/process gone (or injection failed): resume WITH the prompt in a new
+        # tab; fire-attached consumes the lease via its one-shot claim.
+        terminal.fire_attached_in_new_tab(job.session_id)
+        notify("⏳ parked prompt resuming in a new tab", _label(job), cfg.notify)
 
 
 def _spawn_resume_watcher(cfg: config.Config, report: DaemonReport, dry_run: bool) -> None:

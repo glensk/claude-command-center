@@ -720,6 +720,62 @@ def _iterm_api_tab(command: str) -> bool:
         return False
 
 
+def send_text_to_session(iterm_session_id: str, text: str) -> bool:
+    """Type *text* into an EXISTING iTerm session (by ``$ITERM_SESSION_ID``) and submit.
+
+    The delivery path for a parked prompt attached to a live Claude session: the
+    text goes in wrapped in bracketed-paste markers — a multi-line prompt must
+    arrive as ONE paste, since a bare newline would submit each line separately —
+    followed, after a beat for the composer to ingest the paste, by a lone CR that
+    submits it. Python-API socket (TCC-free, works from the launchd daemon);
+    ``False`` on any failure so the caller can fall back to a resume tab.
+    """
+    uuid = (iterm_session_id or "").split(":")[-1].strip()
+    if not uuid or not text:
+        return False
+    try:
+        import asyncio  # pylint: disable=import-outside-toplevel
+
+        import iterm2  # pylint: disable=import-outside-toplevel
+
+        async def _go() -> bool:
+            conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
+            app = await iterm2.async_get_app(conn)
+            if app is None:
+                return False
+            session = app.get_session_by_id(uuid)
+            if session is None:
+                return False
+            await session.async_send_text("\x1b[200~" + text + "\x1b[201~")
+            await asyncio.sleep(0.4)
+            await session.async_send_text("\r")
+            return True
+
+        return bool(asyncio.run(_go()))
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
+def fire_attached_in_new_tab(session_id: str) -> bool:
+    """Open a new tab that resumes a session WITH its parked prompt.
+
+    The fallback when an attached prompt's own session tab is gone at fire time:
+    the tab runs ``ccc fire-attached <id>``, which claims the delivery (one-shot
+    conditional ``fire_at`` update), pins the session's account, and execs
+    ``claude --resume <id> "<prompt>"`` in the session's cwd — the prompt itself
+    never has to survive shell/AppleScript quoting.
+    """
+    command = f"ccc fire-attached {shlex.quote(session_id)}"
+    if _launcher_mode() == "tmux":
+        return _tmux_window(command)
+    return (
+        _iterm(command)
+        or _iterm_api_tab(command)
+        or _terminal_app(command)
+        or _tmux_window(command)
+    )
+
+
 def _iterm(command: str) -> bool:
     # command is already shell-quoted; _as_quote escapes it for the AppleScript "..."
     # literal too, so a cwd/path containing a double-quote can't break out.
