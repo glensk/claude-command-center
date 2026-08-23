@@ -1169,6 +1169,33 @@ def cmd_fire_attached(args: argparse.Namespace) -> int:
     return 0  # unreachable on success (execvp replaced the process)
 
 
+def cmd_claim_fire(args: argparse.Namespace) -> int:
+    """internal: one-shot claim of a session's armed parked prompt (prints it).
+
+    Run by the session itself (the hook's armed-prompt notice tells it to) when the
+    user asks to continue with the parked prompt NOW instead of waiting for the
+    auto-fire: exit 0 = the caller owns delivery — the full prompt text is on
+    stdout and the auto-fire is disarmed; exit 1 = nothing armed / already
+    delivered. The same conditional update backs the daemon's delivery and
+    ``fire-attached``, so the prompt can never run twice.
+    """
+    with Store() as store:
+        session = store.get(args.session_id)
+        prompt = (session.prompt or "").strip() if session is not None else ""
+        if session is None or not prompt:
+            print(f"error: no parked prompt on session {args.session_id}", file=sys.stderr)
+            return 1
+        if not store.claim_fire(args.session_id):
+            print(
+                f"error: parked prompt for {args.session_id} is not armed "
+                "(already delivered or disarmed)",
+                file=sys.stderr,
+            )
+            return 1
+    print(prompt)
+    return 0
+
+
 def cmd_new_job(args: argparse.Namespace) -> int:
     """Register a FUTURE job — a saved AIM + prompt, launched later with ``ccc start-job``.
 
@@ -3354,6 +3381,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_fireattached.add_argument("session_id")
     p_fireattached.set_defaults(func=cmd_fire_attached)
+
+    p_claimfire = sub.add_parser(
+        "claim-fire",
+        help="internal: one-shot claim of a session's armed parked prompt (prints it)",
+    )
+    p_claimfire.add_argument("session_id")
+    p_claimfire.set_defaults(func=cmd_claim_fire)
 
     p_openjob = sub.add_parser(
         "open-job",

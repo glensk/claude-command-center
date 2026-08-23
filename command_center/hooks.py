@@ -103,12 +103,41 @@ _HANDOFF_NUDGE = (
     "your turn ends."
 )
 
+_PARKED_PROMPT = (
+    "⏳ A parked prompt is ARMED for this session (auto-delivery {fire}): «{first}». "
+    "If the user asks to run or continue it now (a bare 'continue' counts): run "
+    "`ccc claim-fire {sid}` FIRST — exit 0 prints the full prompt text and hands "
+    "delivery to you (execute that text as if the user had just typed it); a non-zero "
+    "exit means it was already delivered or disarmed — then do NOT run it. For any "
+    "other request, leave it armed and just answer."
+)
+
+
 _LOCK_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 
 # How long a `mark-done --close` close-after-turn request stays claimable (10 min). A
 # stamp older than this is cleared but never fired — so a stale arm can't survive into a
 # resumed session (see store.claim_close_request).
 CLOSE_REQUEST_TTL_MS = 10 * 60 * 1000
+
+
+def _parked_prompt_notice(session: Session) -> str | None:
+    """The armed-attached-prompt notice for *session*, or ``None`` when nothing is armed.
+
+    Makes a bare "continue" work: the user parks the real prompt ON the session
+    (``ccc park -g`` attach mode) and may address it before the daemon's auto-fire
+    delivers it. The `ccc claim-fire` claim is one-shot, so the session executing
+    it now and the daemon delivering at the reset can never both run it.
+    """
+    prompt = (session.prompt or "").strip()
+    if not session.fire_at or not prompt:
+        return None
+    from . import park  # lazy: keep the hook import light
+
+    first = prompt.splitlines()[0][:150] + ("…" if len(prompt) > 150 or "\n" in prompt else "")
+    return _PARKED_PROMPT.format(
+        fire=park.format_fire(session.fire_at), first=first, sid=session.session_id
+    )
 
 
 def _sharpen_context(session: Session, sid: str, threshold: int) -> str:
@@ -349,6 +378,9 @@ def handle_session_start(payload: dict[str, Any]) -> int:
             threshold = config.load_config().aim_score_threshold
             if 0 <= session.aim_score < threshold:
                 context += "\n" + _sharpen_context(session, sid, threshold)
+        # An armed parked prompt must be visible from the first turn — a resumed
+        # session otherwise guesses from the AIM while the real prompt sits armed.
+        context = "\n\n".join(filter(None, [context, _parked_prompt_notice(session)]))
         # D11: prepend the account-switch warning (the only guard the native --resume
         # picker reaches) so a session resumed under the wrong account says so up front.
         if switch_warning:
@@ -411,6 +443,11 @@ def handle_user_prompt(payload: dict[str, Any]) -> int:
                     sid=sid,
                 )
             )
+        # Armed parked prompt: additive on every turn while armed, so a bare
+        # "continue" typed into the session resolves to the parked prompt.
+        parked = _parked_prompt_notice(session)
+        if parked:
+            parts.append(parked)
         if parts:
             _emit_context("UserPromptSubmit", "\n\n".join(parts))
     return 0

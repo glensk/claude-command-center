@@ -636,6 +636,13 @@ it (`fire_window`):
     double-delivery excluded by a one-shot claim). `-N` delivers into the tab
     immediately; `-j/--new-job` forces the detached behaviour below; the session's
     own statusline shows `⏳ parked prompt for THIS session fires …` while armed.
+    **Re-edit:** a second q+p over the same session reopens the panel PREFILLED
+    with the armed prompt — ⌘↵ overwrites prompt + fire time. **"continue" works:**
+    while armed, the session's hooks (SessionStart + every user prompt) announce
+    the parked prompt, so telling the session to continue/run it makes it call
+    `ccc claim-fire <id>` — a one-shot claim that prints the full prompt, disarms
+    the auto-fire, and hands delivery to the session itself (the daemon and a
+    manual claim can never both run it).
   - **Over any other tab (DETACHED)** — an armed future job for that tab's repo +
     account; the daemon launches it as a NEW session in a new tab at the reset
     (`-N` launches immediately). Feedback arrives via notify — there is no

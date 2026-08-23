@@ -334,6 +334,64 @@ def test_fire_attached_claims_and_execs_resume(monkeypatch: pytest.MonkeyPatch) 
     assert len(execs) == 1
 
 
+def test_grab_second_park_prefills_the_armed_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    from command_center import parkpanel
+
+    _attach_setup(monkeypatch, "ignored")
+    with Store() as store:  # a prompt is already armed on the session
+        store.update_fields(
+            "live-1", prompt="old armed prompt", fire_at=NOW + 600, fire_window="five_hour"
+        )
+    seen_initial: list[str] = []
+
+    def _panel(header: str, initial: str = "") -> str:
+        del header
+        seen_initial.append(initial)
+        return "edited prompt"
+
+    monkeypatch.setattr(parkpanel, "capture_prompt", _panel)
+    assert cli.main(["park", "-g"]) == 0
+    assert seen_initial == ["old armed prompt"]  # the panel reopened for editing
+    with Store() as store:
+        row = store.get("live-1")
+        assert row is not None and row.prompt == "edited prompt"
+        assert row.fire_at == NOW + 1200 + park.DEFAULT_BUFFER_SEC  # re-armed
+
+
+def test_claim_fire_prints_prompt_once(capsys: pytest.CaptureFixture[str]) -> None:
+    now = int(time.time())
+    with Store() as store:
+        _attached_row(store, now + 600)
+    assert cli.main(["claim-fire", "att-1"]) == 0
+    assert capsys.readouterr().out.strip() == "attached prompt"
+    with Store() as store:
+        row = store.get("att-1")
+        assert row is not None and row.fire_at == 0  # disarmed: the daemon won't deliver
+    assert cli.main(["claim-fire", "att-1"]) == 1  # one-shot
+
+
+def test_hooks_announce_armed_parked_prompt(capsys: pytest.CaptureFixture[str]) -> None:
+    import json as json_mod
+
+    from command_center import hooks
+
+    now = int(time.time())
+    with Store() as store:
+        _attached_row(store, now + 600)
+    assert hooks.handle_user_prompt({"session_id": "att-1", "cwd": "/tmp"}) == 0
+    payload = json_mod.loads(capsys.readouterr().out)
+    context = payload["hookSpecificOutput"]["additionalContext"]
+    assert "parked prompt" in context.lower() and "ccc claim-fire att-1" in context
+    assert hooks.handle_session_start({"session_id": "att-1", "cwd": "/tmp"}) == 0
+    payload = json_mod.loads(capsys.readouterr().out)
+    assert "ccc claim-fire att-1" in payload["hookSpecificOutput"]["additionalContext"]
+    with Store() as store:  # disarmed → the notice disappears
+        store.update_fields("att-1", fire_at=0)
+    hooks.handle_user_prompt({"session_id": "att-1", "cwd": "/tmp"})
+    leftover = capsys.readouterr().out
+    assert "claim-fire" not in leftover
+
+
 def test_fire_attached_rearms_on_exec_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     import os as os_mod
 

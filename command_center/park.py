@@ -565,6 +565,10 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
     initial = ""
     if getattr(args, "clipboard", False):
         initial = _clipboard_text()[0] or ""
+    elif attach is not None and attach.fire_at and (attach.prompt or "").strip():
+        # Second q+p over the same session: reopen the ARMED prompt for editing —
+        # ⌘↵ then simply overwrites prompt + fire time on the row.
+        initial = (attach.prompt or "").strip()
     if attach is not None:
         tail = "delivered into THIS session" if fire_at else "delivered into THIS session now"
         target = f"→ session {short_id(attach.session_id)}"
