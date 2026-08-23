@@ -907,6 +907,13 @@ def run(args: argparse.Namespace) -> int:
     AppKit panel does not exist, so ``ccc peek`` automatically behaves as ``--print``
     (dumps the resolved prompts to stdout) instead of failing on the AppKit import.
     """
+    if not getattr(args, "print_only", False) and sys.platform == "darwin":
+        # AppKit costs ~450 ms to import — start it loading on a thread NOW so it
+        # overlaps the resolution below instead of following it (same trick as the
+        # park panel; see parkpanel.warm_appkit).
+        from .parkpanel import warm_appkit
+
+        warm_appkit()
     data = resolve_peek(session_id=getattr(args, "session", None))
     prompts_body = (
         format_prompts(data.prompts) if data.resolved else f"No prompt to show — {data.label}."

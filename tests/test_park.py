@@ -158,7 +158,9 @@ def _grab_setup(monkeypatch: pytest.MonkeyPatch, panel_text: str | None) -> list
     notified: list[str] = []
     monkeypatch.setattr(peek, "frontmost_iterm_uuid", lambda: None)
     monkeypatch.setattr(peek, "frontmost_iterm_cwd", lambda: "/tmp")
-    monkeypatch.setattr(parkpanel, "capture_prompt", lambda header, initial="": panel_text)
+    monkeypatch.setattr(
+        parkpanel, "capture_prompt", lambda header, initial="", poll=None: panel_text
+    )
     monkeypatch.setattr(
         "command_center.notify.notify", lambda title, msg, channels: notified.append(title)
     )
@@ -334,6 +336,19 @@ def test_fire_attached_claims_and_execs_resume(monkeypatch: pytest.MonkeyPatch) 
     assert len(execs) == 1
 
 
+def _poll_result(poll: object) -> tuple[str, str]:
+    """Drive the deferred-resolution poll like the panel's timer would (bounded)."""
+    import time as time_mod
+
+    assert callable(poll)
+    for _ in range(500):
+        result = poll()
+        if result is not None:
+            return result
+        time_mod.sleep(0.01)
+    raise AssertionError("grab target resolution never became ready")
+
+
 def test_grab_second_park_prefills_the_armed_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     from command_center import parkpanel
 
@@ -342,20 +357,45 @@ def test_grab_second_park_prefills_the_armed_prompt(monkeypatch: pytest.MonkeyPa
         store.update_fields(
             "live-1", prompt="old armed prompt", fire_at=NOW + 600, fire_window="five_hour"
         )
-    seen_initial: list[str] = []
+    seen_prefill: list[str] = []
 
-    def _panel(header: str, initial: str = "") -> str:
-        del header
-        seen_initial.append(initial)
+    def _panel(header: str, initial: str = "", poll: object = None) -> str:
+        del header, initial
+        seen_prefill.append(_poll_result(poll)[1])  # what the timer would prefill
         return "edited prompt"
 
     monkeypatch.setattr(parkpanel, "capture_prompt", _panel)
     assert cli.main(["park", "-g"]) == 0
-    assert seen_initial == ["old armed prompt"]  # the panel reopened for editing
+    assert seen_prefill == ["old armed prompt"]  # the panel reopened for editing
     with Store() as store:
         row = store.get("live-1")
         assert row is not None and row.prompt == "edited prompt"
         assert row.fire_at == NOW + 1200 + park.DEFAULT_BUFFER_SEC  # re-armed
+
+
+def test_grab_without_usable_reset_never_loses_the_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Detached target: saved as an UNARMED future job instead of refusing.
+    _grab_setup(monkeypatch, "precious text")
+    monkeypatch.setattr(usage, "read_usage", lambda label: None)
+    assert cli.main(["park", "-g"]) == 0
+    with Store() as store:
+        job = next(s for s in store.list_sessions() if s.draft)
+        assert job.prompt == "precious text" and job.fire_at == 0
+
+
+def test_grab_attach_without_usable_reset_arms_retry_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Attach target: armed for one retry lease so hooks/claim-fire/daemon see it.
+    _attach_setup(monkeypatch, "precious text")
+    monkeypatch.setattr(usage, "read_usage", lambda label: None)
+    assert cli.main(["park", "-g"]) == 0
+    with Store() as store:
+        row = store.get("live-1")
+        assert row is not None and row.prompt == "precious text"
+        assert row.fire_at == NOW + park.FIRE_RETRY_SEC and row.fire_window == ""
 
 
 def test_claim_fire_prints_prompt_once(capsys: pytest.CaptureFixture[str]) -> None:

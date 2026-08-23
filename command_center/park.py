@@ -392,6 +392,10 @@ def run_park(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retur
     """``ccc park`` — register a parked prompt, wait in this tab, launch at reset."""
     if getattr(args, "grab", False):
         return _run_grab(args)
+    if sys.platform == "darwin" and not getattr(args, "editor", False):
+        from . import parkpanel
+
+        parkpanel.warm_appkit()  # overlap the framework load with the work below
     from .colors import short_folder
     from .models import short_id
 
@@ -515,81 +519,150 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
     and account; the daemon launches it as a NEW session in a new tab at the reset
     (``-N`` launches it immediately). Feedback goes through notify — Karabiner
     gives this process no terminal.
+
+    **Latency:** the panel opens IMMEDIATELY (AppKit pre-warmed on a thread at
+    entry) with a placeholder header; target resolution (osascript, store, usage)
+    runs on a worker thread and fills the header — and the armed-prompt prefill —
+    via the panel's poll timer while the user is already typing. An unusable reset
+    time no longer refuses up front (the prompt is already being written): an
+    attach target is armed for one retry lease (~15 min) instead, a detached one
+    is saved as an UNARMED future job — the prompt is never lost.
     """
-    from . import peek
+    from . import parkpanel
     from .colors import short_folder
     from .models import short_id
     from .notify import notify
 
+    parkpanel.warm_appkit()  # ~450 ms framework load overlaps the resolution below
     cfg = config.load_config()
-    now = int(time.time())
     window = getattr(args, "window", "five_hour")
     buffer_sec = int(getattr(args, "buffer", DEFAULT_BUFFER_SEC))
+    want_now = bool(getattr(args, "now", False))
+    resolved: dict[str, object] = {}  # worker-thread output; read only after "ready"
 
-    session = None
-    tab_uuid = peek.frontmost_iterm_uuid()
-    if tab_uuid:
-        with Store() as store:
-            session = peek._session_for_uuid(store, tab_uuid)  # pylint: disable=protected-access
-    attach = None
-    if session is not None and not session.draft and not getattr(args, "new_job", False):
-        from .adapters.claude import ClaudeAdapter
+    def _resolve_target() -> None:  # pylint: disable=too-many-locals  # one linear resolution pass
+        from . import peek
 
-        live = next(
-            (ls for ls in ClaudeAdapter().discover() if ls.session_id == session.session_id),
-            None,
+        session = None
+        tab_uuid = peek.frontmost_iterm_uuid()
+        if tab_uuid:
+            with Store() as store:
+                session = peek._session_for_uuid(store, tab_uuid)  # pylint: disable=protected-access
+        attach = None
+        if session is not None and not session.draft and not getattr(args, "new_job", False):
+            from .adapters.claude import ClaudeAdapter
+
+            live = next(
+                (ls for ls in ClaudeAdapter().discover() if ls.session_id == session.session_id),
+                None,
+            )
+            if (
+                live is not None
+                and live.alive
+                and live.kind == "interactive"
+                and session.iterm_session_id
+            ):
+                attach = session
+        cwd = session.cwd if session is not None and os.path.isdir(session.cwd or "") else ""
+        if not cwd:
+            cwd = peek.frontmost_iterm_cwd() or os.getcwd()
+        config_dir = (
+            session.config_dir if session is not None else ""
+        ) or accounts.env_config_dir()
+        label = accounts.effective_account_label(config_dir)
+        now = int(time.time())
+        fire_at = 0
+        fire_missing = False
+        if not want_now:
+            fire_at_opt, _snapshot = _compute_fire(label, window, now, buffer_sec)
+            if fire_at_opt is None:
+                fire_missing = True
+            else:
+                fire_at = fire_at_opt
+        prefill = ""
+        if attach is not None and attach.fire_at and (attach.prompt or "").strip():
+            # Second q+p over the same session: reopen the ARMED prompt for
+            # editing — ⌘↵ then simply overwrites prompt + fire time on the row.
+            prefill = (attach.prompt or "").strip()
+        if attach is not None:
+            target = f"→ session {short_id(attach.session_id)}"
+            tail = "delivered into THIS session" + ("" if fire_at or fire_missing else " now")
+        else:
+            target = short_folder(cwd)
+            tail = "daemon fires it in a new tab" if fire_at else "launches now in a new tab"
+        if fire_missing:
+            timing = f"⚠ no usable {window} reset"
+            tail = "arms a ~15 min retry" if attach is not None else "saves UNARMED"
+        else:
+            timing = format_fire(fire_at, now) if fire_at else "immediately"
+        resolved.update(
+            attach=attach,
+            cwd=cwd,
+            config_dir=config_dir,
+            fire_at=fire_at,
+            fire_missing=fire_missing,
+            prefill=prefill,
+            header=f"{target}  ·  {label}  ·  {timing}  ·  {tail}",
         )
-        if (
-            live is not None
-            and live.alive
-            and live.kind == "interactive"
-            and session.iterm_session_id
-        ):
-            attach = session
-    cwd = session.cwd if session is not None and os.path.isdir(session.cwd or "") else ""
-    if not cwd:
-        cwd = peek.frontmost_iterm_cwd() or os.getcwd()
-    config_dir = (session.config_dir if session is not None else "") or accounts.env_config_dir()
-    label = accounts.effective_account_label(config_dir)
+        resolved["ready"] = True
 
-    fire_at = 0
-    if not getattr(args, "now", False):
-        fire_at_opt, _snapshot = _compute_fire(label, window, now, buffer_sec)
-        if fire_at_opt is None:
-            message = f"no usable {window} reset time for account '{label}' — nothing parked"
-            notify("⏳ park failed", message, cfg.notify)
-            print(f"error: {message}", file=sys.stderr)
-            return 1
-        fire_at = fire_at_opt
+    import threading
+
+    worker = threading.Thread(target=_resolve_target, daemon=True, name="park-resolve")
+    worker.start()
 
     initial = ""
     if getattr(args, "clipboard", False):
         initial = _clipboard_text()[0] or ""
-    elif attach is not None and attach.fire_at and (attach.prompt or "").strip():
-        # Second q+p over the same session: reopen the ARMED prompt for editing —
-        # ⌘↵ then simply overwrites prompt + fire time on the row.
-        initial = (attach.prompt or "").strip()
-    if attach is not None:
-        tail = "delivered into THIS session" if fire_at else "delivered into THIS session now"
-        target = f"→ session {short_id(attach.session_id)}"
-    else:
-        tail = "daemon fires it in a new tab" if fire_at else "launches now in a new tab"
-        target = short_folder(cwd)
-    header = (
-        f"{target}  ·  {label}  ·  "
-        + (format_fire(fire_at, now) if fire_at else "immediately")
-        + f"  ·  {tail}"
-    )
-    from . import parkpanel
 
-    prompt = parkpanel.capture_prompt(header, initial)
+    def _poll() -> tuple[str, str] | None:
+        if not resolved.get("ready"):
+            return None
+        # A clipboard prefill (-c) outranks the armed-prompt prefill; typed text
+        # outranks both (the panel never overwrites a non-empty editor).
+        return str(resolved["header"]), ("" if initial else str(resolved["prefill"]))
+
+    prompt = parkpanel.capture_prompt("resolving target…", initial, poll=_poll)
     if not prompt:
         return 130  # cancelled — the panel was the whole interaction, stay silent
+    worker.join(timeout=15)
     size_err = prompt_size_error(prompt)
     if size_err:
         notify("⏳ park failed", size_err, cfg.notify)
         print(size_err, file=sys.stderr)
         return 1
+    if not resolved.get("ready"):
+        # Resolution wedged (an osascript hang is the only known way): the typed
+        # prompt must survive regardless — save it UNARMED for the ambient target.
+        import uuid
+
+        session_id = str(uuid.uuid4())
+        with Store() as store:
+            store.create_draft(
+                session_id,
+                os.getcwd(),
+                _derive_aim(args, prompt),
+                prompt=prompt,
+                config_dir=accounts.env_config_dir(),
+            )
+        message = f"target resolution timed out — saved UNARMED as job {short_id(session_id)}"
+        notify("⏳ park saved unarmed", message, cfg.notify)
+        print(f"warning: {message}", file=sys.stderr)
+        return 1
+
+    from .models import Session as _Session
+
+    attach_obj = resolved["attach"]
+    attach = attach_obj if isinstance(attach_obj, _Session) else None
+    cwd = str(resolved["cwd"])
+    config_dir = str(resolved["config_dir"])
+    fire_at = int(resolved["fire_at"])  # type: ignore[call-overload]
+    fire_missing = bool(resolved["fire_missing"])
+    now = int(time.time())
+    if fire_missing and attach is not None:
+        # Arm one retry lease instead of refusing after the typing effort: the
+        # hooks/claim-fire see it, and the daemon delivers when the lease is due.
+        fire_at = now + FIRE_RETRY_SEC
 
     if attach is not None:
         if not fire_at:  # -N: deliver straight into the live session's tab
@@ -604,7 +677,12 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
             return 1
         with Store() as store:
             store.update_fields(
-                attach.session_id, prompt=prompt, fire_at=fire_at, fire_window=window
+                attach.session_id,
+                prompt=prompt,
+                fire_at=fire_at,
+                # "" on the retry lease: the fire time has no window provenance, so
+                # the daemon's postpone check must not consult one.
+                fire_window=("" if fire_missing else window),
             )
         done = f"for session {short_id(attach.session_id)} — {format_fire(fire_at, now)}"
         notify("⏳ prompt parked", done, cfg.notify)
@@ -628,6 +706,14 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
         from .spawn import spawn_ccc
 
         spawn_ccc(["sync-future"])  # mirror the row; deliberately NO score-aim spawn
+    if fire_missing:
+        message = (
+            f"{short_id(session_id)} {short_folder(cwd)} — saved UNARMED (no usable "
+            f"{window} reset); start it with ccc start-job {session_id}"
+        )
+        notify("⏳ prompt parked (not armed)", message, cfg.notify)
+        print(f"parked {message}")
+        return 0
     if not fire_at:
         launched = terminal.start_job_in_new_tab(session_id, auto=True)
         outcome = "launched in a new tab" if launched else "saved — start it with ccc start-job"
