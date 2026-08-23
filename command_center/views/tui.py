@@ -2053,17 +2053,24 @@ class CommandCenterApp(App[None]):
         # name their account (the refresh cadence is no longer in the title) and carry
         # the same 🏠/💼 glyph as the statusline (accounts.card_glyph) so the two
         # surfaces read as the same convention; the Copilot card names the model it
-        # delegates to (the `copilot_model` config).
+        # delegates to (the `copilot_model` config). Each title ends with its
+        # show/hide chord (" / t1" …) so the toggle is discoverable on the card
+        # itself; keys come from commands.by_action, never hard-coded here.
+        self.query_one("#usage", Static).border_title = (
+            f"Claude Code (private) {accounts.card_glyph('private')}"
+            f" / {commands.by_action('toggle_card_private').key}"
+        )
+        self.query_one("#usage-work", Static).border_title = (
+            f"Claude Code (work) {accounts.card_glyph('work')}"
+            f" / {commands.by_action('toggle_card_work').key}"
+        )
         self.query_one(
-            "#usage", Static
-        ).border_title = f"Claude Code (private) {accounts.card_glyph('private')}"
-        self.query_one(
-            "#usage-work", Static
-        ).border_title = f"Claude Code (work) {accounts.card_glyph('work')}"
-        self.query_one("#usage-codex", Static).border_title = "OpenAI Codex"
-        self.query_one(
-            "#usage-copilot", Static
-        ).border_title = f"{self.cfg.copilot_card_title} {self.cfg.copilot_model}"
+            "#usage-codex", Static
+        ).border_title = f"OpenAI Codex / {commands.by_action('toggle_card_codex').key}"
+        self.query_one("#usage-copilot", Static).border_title = (
+            f"{self.cfg.copilot_card_title} {self.cfg.copilot_model}"
+            f" / {commands.by_action('toggle_card_copilot').key}"
+        )
         self.query_one("#usage-nixos-supervised", Static).border_title = "nixos overseer supervised"
         self.query_one("#usage-nixos-tier-a", Static).border_title = "nixos overseer tier_a"
         self._apply_split()
