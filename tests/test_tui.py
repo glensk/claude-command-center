@@ -35,6 +35,52 @@ async def settle(pilot) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _chord_window_survives_a_slow_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop a slow TEST from firing a chord leader's timeout in the middle of a chord.
+
+    The leader window is real wall-clock (0.25s for a leader with a standalone fallback,
+    0.7s for a pure one). ``await pilot.press("a"); await pilot.press("h")`` is two trips
+    through the event loop, and on a loaded machine — the whole suite running, apps
+    mounting, workers draining — that gap can exceed 250ms. The leader's fallback then
+    fires (`a` → edit AIM, `s` → settings) and the follower lands on the wrong screen:
+    exactly why ah/sh/oo failed in whole-suite runs while passing in isolation. Stretch
+    both windows so only a test that WANTS the timeout gets one (via `chord_window`).
+    """
+    from command_center.views import tui as tui_mod
+
+    monkeypatch.setattr(tui_mod, "_CHORD_WINDOW_FALLBACK", 30.0)
+    monkeypatch.setattr(tui_mod, "_CHORD_WINDOW_PURE", 30.0)
+
+
+def chord_window(monkeypatch: pytest.MonkeyPatch, seconds: float = 0.05) -> None:
+    """Shrink the leader-chord timeout — for a test that exercises the timeout itself.
+
+    Call it BEFORE pressing the leader: the window is read when the timer is armed.
+    """
+    from command_center.views import tui as tui_mod
+
+    monkeypatch.setattr(tui_mod, "_CHORD_WINDOW_FALLBACK", seconds)
+    monkeypatch.setattr(tui_mod, "_CHORD_WINDOW_PURE", seconds)
+
+
+async def wait_for(pilot, predicate, timeout: float = 5.0) -> bool:
+    """Pump the UI until *predicate* holds (or *timeout* runs out); returns whether it did.
+
+    The load-proof replacement for "sleep past the chord window, then pause once": that
+    pattern asserts on a fixed instant, so a busy machine misses it. This one waits for
+    the STATE, and still fails (returns False) if the state never arrives.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        await pilot.pause()
+        if predicate():
+            return True
+        await asyncio.sleep(0.02)
+    await pilot.pause()
+    return predicate()
+
+
+@pytest.fixture(autouse=True)
 def _color_textual_tests(monkeypatch: pytest.MonkeyPatch) -> None:
     """Run Textual TUI tests with color enabled and category grouping pointed at ``_BASE``."""
     monkeypatch.delenv("NO_COLOR", raising=False)
@@ -820,10 +866,10 @@ def test_multiline_field_editor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
             assert app._current == sid
 
             # `a` (bare, after the chord window) opens the AIM editor in MULTILINE mode.
+            chord_window(monkeypatch)  # let the leader time out promptly → edit_aim
             await pilot.press("a")
-            await asyncio.sleep(0.5)  # > the 0.35s chord window → falls back to edit_aim
-            await pilot.pause()
-            assert isinstance(app.screen, InputScreen)
+            assert await wait_for(pilot, lambda: isinstance(app.screen, InputScreen))
+            assert isinstance(app.screen, InputScreen)  # re-assert: narrows for the next line
             assert app.screen._multiline is True
             aim_field = app.screen.query_one("#field")
             assert isinstance(aim_field, TextArea)
@@ -1190,10 +1236,9 @@ def test_ah_chord_shows_aim_history(tmp_path: Path, monkeypatch: pytest.MonkeyPa
             await pilot.pause()
 
             # A bare `a` (leader times out with no `h`) falls back to editing the AIM.
+            chord_window(monkeypatch)
             await pilot.press("a")
-            await asyncio.sleep(0.5)  # > the 0.35s chord window
-            await pilot.pause()
-            assert isinstance(app.screen, InputScreen)
+            assert await wait_for(pilot, lambda: isinstance(app.screen, InputScreen))
 
     asyncio.run(scenario())
 
@@ -1361,9 +1406,41 @@ def test_oo_chord_opens_future_file_in_obsidian(
 
     calls: list[list[str]] = []
 
-    class FakePopen:  # pylint: disable=too-few-public-methods
+    class FakePopen:
+        """Inert stand-in for EVERY Popen made while this test runs.
+
+        It replaces the shared `subprocess.Popen`, so it has to satisfy more than the
+        detached `open` under test: `subprocess.run` (gitstatus' `git status`, whose
+        20s memo expires in a long whole-suite run, so it really does shell out here)
+        uses Popen as a context manager and then communicates with it. A fake without
+        those methods failed with "does not support the context manager protocol" —
+        only in full-suite runs, where the memo had gone cold.
+        """
+
         def __init__(self, args: list[str], **_kwargs: object) -> None:
             calls.append(args)
+            self.args = args
+            self.returncode = 0
+            self.stdout = None
+            self.stderr = None
+
+        def __enter__(self) -> "FakePopen":  # noqa: UP037  # quoted for pylint E0602
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def communicate(self, *_a: object, **_kw: object) -> tuple[str, str]:
+            return ("", "")  # gitstatus reads this as a clean repo
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def wait(self, timeout: float | None = None) -> int:  # noqa: ARG002
+            return self.returncode
+
+        def kill(self) -> None:
+            pass
 
     # NB: this patches the shared `subprocess` module (tui_mod.subprocess IS
     # subprocess), so unrelated Popen calls the app makes on mount (e.g. a
@@ -1428,10 +1505,9 @@ def test_t_alone_shows_toggle_menu(tmp_path: Path, monkeypatch: pytest.MonkeyPat
             await pilot.pause()
             notes: list[str] = []
             monkeypatch.setattr(app, "notify", lambda msg, **_kw: notes.append(msg))
+            chord_window(monkeypatch)  # pure leader: the timeout is what toasts the menu
             await pilot.press("t")  # leader with no follower
-            await asyncio.sleep(0.9)  # > the 0.7s pure-leader chord window → timeout fires the menu
-            await pilot.pause()
-            assert notes, "pressing t alone should toast a menu"
+            assert await wait_for(pilot, lambda: bool(notes)), "t alone should toast a menu"
             assert "td" in notes[-1] and "tf" in notes[-1]  # both t… toggles listed
             assert "done" in notes[-1] and "future" in notes[-1]
 
@@ -2488,10 +2564,9 @@ def test_t_menu_lists_nixos_overseer_chords(
             await pilot.pause()
             notes: list[str] = []
             monkeypatch.setattr(app, "notify", lambda msg, **_kw: notes.append(msg))
+            chord_window(monkeypatch)  # pure leader: the timeout is what toasts the menu
             await pilot.press("t")  # leader with no follower
-            await asyncio.sleep(0.9)  # > 0.7s pure-leader window → timeout fires the menu
-            await pilot.pause()
-            assert notes, "pressing t alone should toast a menu"
+            assert await wait_for(pilot, lambda: bool(notes)), "t alone should toast a menu"
             assert "to" in notes[-1] and "ta" in notes[-1]
             # The menu lists each chord's gloss + its live state (expanded/collapsed).
             assert "nixos overseer supervised card  (now: expanded)" in notes[-1]
