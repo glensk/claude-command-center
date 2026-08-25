@@ -153,10 +153,12 @@ editable install), `ccc restart-tui` bounces the running TUI in its **own** term
 so the new code loads — no manual keystroke; it exits 0 once the TUI is back, 1 if none
 is running.
 
-In the TUI, the `t` leader chord shows/hides the usage cards: `t1`…`t4` for the
+In the TUI, the `t` leader chord expands/collapses the usage cards: `t1`…`t4` for the
 Claude/Codex/Copilot subscription cards, and `to`/`ta` for two optional cards fed by an
 *external* homelab "overseer" alert-triage daemon (incidents awaiting you + recent
-automatic activity) — off until you set `nixos_overseer_dir` in `config.toml`. And `u`
+automatic activity) — off until you set `nixos_overseer_dir` in `config.toml`. A
+collapsed card keeps its titled top border (`╭─ OpenAI Codex / t3 ──╮`) and drops the
+rest of the box, so the chord that brings it back stays on screen. And `u`
 undoes the last action — a close/park, mark-done, Keep, importance, sub-goal tick,
 account switch, or any toggle — walking back up to 20 steps per run. See
 [docs/reference.md](docs/reference.md).

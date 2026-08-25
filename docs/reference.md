@@ -1284,15 +1284,26 @@ other:
 ╰──────────────────────────────────────╯
 ```
 
-**Show/hide each card with the persistent `t1`…`t4` / `to` / `ta` chords** (`t1` = Claude private,
-`t2` = Claude work, `t3` = Codex, `t4` = Copilot, `to` = nixos overseer supervised,
-`ta` = nixos overseer tier_a; type `t` alone for the menu). Unlike
-the view-local `td`/`tf` toggles these **persist** to `config.toml`
+**Expand/collapse each card with the persistent `t1`…`t4` / `to` / `ta` chords** (`t1` = Claude
+private, `t2` = Claude work, `t3` = Codex, `t4` = Copilot, `to` = nixos overseer supervised,
+`ta` = nixos overseer tier_a; type `t` alone for the menu). **Collapsed is not hidden**: the card
+keeps its titled top border — the line that names its own chord — and drops the rest of the box,
+so a folded-away card stays one keystroke from coming back:
+
+```
+╭─ Claude Code (private) 🏠 / t1 ─────╮
+╭─ OpenAI Codex / t3 ─────────────────╮
+╭─ Copilot gpt-5.4 / t4 ──────────────╮
+│ ░Resets in 4d░░░░░░░░░░░░░░░░    0% │
+╰─────────────────────────────────────╯
+```
+
+Unlike the view-local `td`/`tf` toggles these **persist** to `config.toml`
 (`usage_card_private/_work/_codex/_copilot`, `card_nixos_overseer_supervised/_tier_a`
 — pure render gates); `t4` also flips the
-`copilot_usage` network-fetch gate so a hidden Copilot card costs no `gh` call, and
+`copilot_usage` network-fetch gate so a collapsed Copilot card costs no `gh` call, and
 `t2` on a machine with no `work` account explains itself instead of toggling an empty
-box.
+box (that card — the one exception — is absent entirely, title line included).
 
 **The two nixos-overseer cards** read incidents from an *external* homelab
 "overseer" alert-triage daemon (a separate project — nothing to do with ccc's own

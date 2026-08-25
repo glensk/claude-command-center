@@ -503,13 +503,14 @@ COMMANDS: list[Command] = [
     Command(
         key="t1",
         word="card-private",
-        gloss="show / hide the Claude Code (private) card",
+        gloss="expand / collapse the Claude Code (private) card",
         section=GLOBAL,
         explanation=(
-            "Show or hide the Claude Code (private) usage card — the gold-bordered "
-            "5h/weekly bars for the private account. Type t then 1. Shown by default; "
-            "the chord hides it (and again shows it), persisted to ccc's config. Only "
-            "which card is drawn changes — the underlying usage capture is untouched."
+            "Expand or collapse the Claude Code (private) usage card — the gold-bordered "
+            "5h/weekly bars for the private account. Type t then 1. Expanded by default; "
+            "the chord collapses it to its titled top border alone (and again expands "
+            "it), persisted to ccc's config. Only how much of the card is drawn changes "
+            "— the underlying usage capture is untouched."
         ),
         action="toggle_card_private",
         chord=("t", "1"),
@@ -518,13 +519,15 @@ COMMANDS: list[Command] = [
     Command(
         key="t2",
         word="card-work",
-        gloss="show / hide the Claude Code (work) card",
+        gloss="expand / collapse the Claude Code (work) card",
         section=GLOBAL,
         explanation=(
-            "Show or hide the Claude Code (work) usage card — the blue-bordered 5h/weekly "
-            "bars for the work account. Type t then 2. Shown by default; the chord hides "
-            "it (and again shows it), persisted to ccc's config. It reads '—' until a "
-            "work session runs a turn (nothing to capture before then)."
+            "Expand or collapse the Claude Code (work) usage card — the blue-bordered "
+            "5h/weekly bars for the work account. Type t then 2. Expanded by default; the "
+            "chord collapses it to its titled top border alone (and again expands it), "
+            "persisted to ccc's config. It reads '—' until a work session runs a turn "
+            "(nothing to capture before then). With no `work` account configured the card "
+            "is absent entirely, and the chord explains that instead of toggling."
         ),
         action="toggle_card_work",
         chord=("t", "2"),
@@ -533,12 +536,13 @@ COMMANDS: list[Command] = [
     Command(
         key="t3",
         word="card-codex",
-        gloss="show / hide the OpenAI Codex card",
+        gloss="expand / collapse the OpenAI Codex card",
         section=GLOBAL,
         explanation=(
-            "Show or hide the OpenAI Codex usage card — the green-bordered 5h/weekly bars "
-            "read from Codex's newest session rollout. Type t then 3. Shown by default; "
-            "the chord hides it (and again shows it), persisted to ccc's config."
+            "Expand or collapse the OpenAI Codex usage card — the green-bordered 5h/weekly "
+            "bars read from Codex's newest session rollout. Type t then 3. Expanded by "
+            "default; the chord collapses it to its titled top border alone (and again "
+            "expands it), persisted to ccc's config."
         ),
         action="toggle_card_codex",
         chord=("t", "3"),
@@ -547,14 +551,15 @@ COMMANDS: list[Command] = [
     Command(
         key="t4",
         word="card-copilot",
-        gloss="show / hide the Copilot card",
+        gloss="expand / collapse the Copilot card",
         section=GLOBAL,
         explanation=(
-            "Show or hide the Copilot usage card — the violet-bordered month-to-date "
-            "spend bar. Type t then 4. Shown by default; the chord hides it (and again "
-            "shows it). Hiding it ALSO stops the periodic `gh` billing fetch (it flips "
-            "both copilot_usage and usage_card_copilot), so a hidden card costs no network "
-            "call. Fetch-but-don't-show stays possible by hand-editing the config."
+            "Expand or collapse the Copilot usage card — the violet-bordered month-to-date "
+            "spend bar. Type t then 4. Expanded by default; the chord collapses it to its "
+            "titled top border alone (and again expands it). Collapsing it ALSO stops the "
+            "periodic `gh` billing fetch (it flips both copilot_usage and "
+            "usage_card_copilot), so a collapsed card costs no network call. "
+            "Fetch-but-don't-draw stays possible by hand-editing the config."
         ),
         action="toggle_card_copilot",
         chord=("t", "4"),
@@ -563,14 +568,15 @@ COMMANDS: list[Command] = [
     Command(
         key="to",
         word="card-nix-supervised",
-        gloss="show / hide the nixos overseer supervised card",
+        gloss="expand / collapse the nixos overseer supervised card",
         section=GLOBAL,
         explanation=(
-            "Show or hide the 'nixos overseer supervised' card — incidents from the "
+            "Expand or collapse the 'nixos overseer supervised' card — incidents from the "
             "external homelab overseer daemon that are awaiting a human decision "
-            "(orange-bordered). Type t then o. Shown by default; the chord hides it (and "
-            "again shows it), persisted to ccc's config. Reads a placeholder until "
-            "nixos_overseer_dir points at the overseer's directory."
+            "(orange-bordered). Type t then o. Expanded by default; the chord collapses it "
+            "to its titled top border alone (and again expands it), persisted to ccc's "
+            "config. Reads a placeholder until nixos_overseer_dir points at the "
+            "overseer's directory."
         ),
         action="toggle_card_nixos_overseer_supervised",
         chord=("t", "o"),
@@ -579,14 +585,15 @@ COMMANDS: list[Command] = [
     Command(
         key="ta",
         word="card-nix-tier-a",
-        gloss="show / hide the nixos overseer tier_a card",
+        gloss="expand / collapse the nixos overseer tier_a card",
         section=GLOBAL,
         explanation=(
-            "Show or hide the 'nixos overseer tier_a' card — recent AUTOMATIC (tier-A) "
-            "activity from the external homelab overseer daemon over the last 7 days "
-            "(teal-bordered). Type t then a. HIDDEN by default; the chord shows it (and "
-            "again hides it), persisted to ccc's config. Reads a placeholder until "
-            "nixos_overseer_dir points at the overseer's directory."
+            "Expand or collapse the 'nixos overseer tier_a' card — recent AUTOMATIC "
+            "(tier-A) activity from the external homelab overseer daemon over the last 7 "
+            "days (teal-bordered). Type t then a. COLLAPSED by default (its titled top "
+            "border alone); the chord expands it (and again collapses it), persisted to "
+            "ccc's config. Reads a placeholder until nixos_overseer_dir points at the "
+            "overseer's directory."
         ),
         action="toggle_card_nixos_overseer_tier_a",
         chord=("t", "a"),

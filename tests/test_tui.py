@@ -2259,6 +2259,73 @@ def test_card_toggles_flip_persist_and_t4_flips_both(
     asyncio.run(scenario())
 
 
+def test_card_toggle_collapses_to_its_title_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card whose `t…` gate is off COLLAPSES: titled top border kept, rest of box gone.
+
+    Off used to mean ``display = False`` — the whole box vanished, taking with it the
+    only place the chord that brings it back is advertised. Now the card keeps its
+    border-top row (height 1, no bottom edge) and drops everything below it.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            codex = app.query_one("#usage-codex")
+            assert codex.display is True
+            assert codex.has_class("card-collapsed") is False
+            expanded_height = codex.outer_size.height
+            expanded_width = codex.outer_size.width
+            assert expanded_height > 1  # a real box while expanded
+
+            await pilot.press("t")
+            await pilot.press("3")
+            await pilot.pause()
+            # Still on screen — just collapsed onto its own title line.
+            assert app.cfg.usage_card_codex is False
+            assert codex.display is True
+            assert codex.has_class("card-collapsed") is True
+            assert codex.outer_size.height == 1
+            # The content is clipped, not cleared, so the surviving line keeps the width
+            # it had while expanded (the column does not jump about on toggle).
+            assert codex.outer_size.width == expanded_width
+
+            await pilot.press("t")
+            await pilot.press("3")
+            await pilot.pause()
+            assert codex.has_class("card-collapsed") is False
+            assert codex.outer_size.height == expanded_height
+
+    asyncio.run(scenario())
+
+
+def test_nixos_card_titles_advertise_their_chord(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both nixos-overseer cards name their chord in the border title, like t1…t4 do.
+
+    Their titles are rebuilt every render tick (they carry a live incident count), so the
+    ` / to` / ` / ta` suffix has to survive that rebuild, not just on_mount.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._update_usage()  # the per-tick rebuild, not just the on_mount title
+            await pilot.pause()
+            assert str(app.query_one("#usage-nixos-supervised").border_title).endswith(" / to")
+            assert str(app.query_one("#usage-nixos-tier-a").border_title).endswith(" / ta")
+
+    asyncio.run(scenario())
+
+
 def test_work_card_hidden_and_t2_inert_without_a_work_account(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2277,6 +2344,8 @@ def test_work_card_hidden_and_t2_inert_without_a_work_account(
         async with app.run_test() as pilot:
             await pilot.pause()
             assert app._has_work_account() is False  # no claude_accounts configured
+            # The ONLY card that disappears outright (title line included): a work card
+            # with no work account has nothing to say, collapsed or not.
             assert app.query_one("#usage-work").display is False  # hidden, not empty
             assert app.cfg.usage_card_work is True  # the flag itself is untouched
 
@@ -2294,12 +2363,13 @@ def test_work_card_hidden_and_t2_inert_without_a_work_account(
 def test_nixos_overseer_cards_default_visibility_and_to_ta_toggle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`t5`/`t6` flip the two nixos-overseer card gates and persist; defaults differ.
+    """`to`/`ta` flip the two nixos-overseer card gates and persist; defaults differ.
 
-    The supervised card is shown by default (something to watch), the tier_a card is
-    hidden by default; each toggle is reload-modify-save (persists to config.toml).
-    With no ``nixos_overseer_dir`` configured the cards render a placeholder — but the
-    render gate (display) is independent of the data, so we drive the gates directly.
+    The supervised card is expanded by default (something to watch), the tier_a card
+    collapsed; each toggle is reload-modify-save (persists to config.toml). Both stay on
+    screen either way — off means collapsed to the titled top border, not removed. With
+    no ``nixos_overseer_dir`` configured the cards render a placeholder — but the render
+    gate is independent of the data, so we drive the gates directly.
     """
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     from command_center import config
@@ -2309,30 +2379,33 @@ def test_nixos_overseer_cards_default_visibility_and_to_ta_toggle(
         app = CommandCenterApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            # Defaults: supervised shown, tier_a hidden.
+            # Defaults: supervised expanded, tier_a collapsed (both still on screen).
             assert app.cfg.card_nixos_overseer_supervised is True
             assert app.cfg.card_nixos_overseer_tier_a is False
-            assert app.query_one("#usage-nixos-supervised").display is True
-            assert app.query_one("#usage-nixos-tier-a").display is False
+            assert app.query_one("#usage-nixos-supervised").has_class("card-collapsed") is False
+            assert app.query_one("#usage-nixos-tier-a").has_class("card-collapsed") is True
+            assert app.query_one("#usage-nixos-tier-a").display is True
             # The dir is unset, so both render the placeholder (not a crash).
             supervised_static = app.query_one("#usage-nixos-supervised")
             assert "set nixos_overseer_dir" in supervised_static.render().plain
 
-            # t5 hides the supervised card; persisted.
+            # `to` collapses the supervised card; persisted.
             await pilot.press("t")
             await pilot.press("o")
             await pilot.pause()
             assert app.cfg.card_nixos_overseer_supervised is False
             assert config.load_config().card_nixos_overseer_supervised is False
-            assert app.query_one("#usage-nixos-supervised").display is False
+            supervised = app.query_one("#usage-nixos-supervised")
+            assert supervised.has_class("card-collapsed") is True
+            assert supervised.display is True  # collapsed, not removed
 
-            # t6 shows the tier_a card; persisted.
+            # `ta` expands the tier_a card; persisted.
             await pilot.press("t")
             await pilot.press("a")
             await pilot.pause()
             assert app.cfg.card_nixos_overseer_tier_a is True
             assert config.load_config().card_nixos_overseer_tier_a is True
-            assert app.query_one("#usage-nixos-tier-a").display is True
+            assert app.query_one("#usage-nixos-tier-a").has_class("card-collapsed") is False
 
     asyncio.run(scenario())
 
@@ -2345,9 +2418,10 @@ def test_toggle_state_label_covers_nixos_overseer_cards(
     from command_center.views.tui import CommandCenterApp
 
     app = CommandCenterApp()
-    # Defaults: supervised shown, tier_a hidden.
-    assert app._toggle_state_label("toggle_card_nixos_overseer_supervised") == "shown"
-    assert app._toggle_state_label("toggle_card_nixos_overseer_tier_a") == "hidden"
+    # Defaults: supervised expanded, tier_a collapsed (off = collapsed to its title line,
+    # never removed — see test_card_toggle_collapses_to_its_title_line).
+    assert app._toggle_state_label("toggle_card_nixos_overseer_supervised") == "expanded"
+    assert app._toggle_state_label("toggle_card_nixos_overseer_tier_a") == "collapsed"
 
 
 def test_t_menu_lists_nixos_overseer_chords(
@@ -2373,9 +2447,9 @@ def test_t_menu_lists_nixos_overseer_chords(
             await pilot.pause()
             assert notes, "pressing t alone should toast a menu"
             assert "to" in notes[-1] and "ta" in notes[-1]
-            # The menu lists each chord's gloss + its live state (now: shown/hidden).
-            assert "nixos overseer supervised card  (now: shown)" in notes[-1]
-            assert "nixos overseer tier_a card  (now: hidden)" in notes[-1]
+            # The menu lists each chord's gloss + its live state (expanded/collapsed).
+            assert "nixos overseer supervised card  (now: expanded)" in notes[-1]
+            assert "nixos overseer tier_a card  (now: collapsed)" in notes[-1]
 
     asyncio.run(scenario())
 

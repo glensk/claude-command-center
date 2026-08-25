@@ -158,6 +158,30 @@ _CARD_TOGGLE_KEYS: dict[str, str] = {
     "toggle_card_nixos_overseer_tier_a": "card_nixos_overseer_tier_a",
 }
 
+# Border-title chord suffixes for the two nixos-overseer cards. The other four cards
+# build their title once in on_mount; these two are REBUILT every render tick (the title
+# carries a live incident count), so the suffix is appended there instead. Keys come from
+# the registry, never hard-coded.
+_NIXOS_SUPERVISED_CHORD = commands.by_action("toggle_card_nixos_overseer_supervised").key
+_NIXOS_TIER_A_CHORD = commands.by_action("toggle_card_nixos_overseer_tier_a").key
+
+
+def _set_card_expanded(panel: Static, expanded: bool, *, visible: bool = True) -> None:
+    """Expand or COLLAPSE one usage card — what its `t…` render gate now does.
+
+    Collapsed is not hidden: the card keeps its border-TOP row — the titled
+    ``╭─ Claude Code (private) 🏠 / t1 ───╮`` line, which is also where the toggle's own
+    chord is advertised — and drops everything below it. The ``.card-collapsed`` class
+    does that (``height: 1`` + ``border-bottom: none``); the content stays rendered, just
+    clipped away, so the surviving line keeps exactly the width it had while expanded.
+
+    *visible* is the separate, harder gate for a card that has nothing to say at all (no
+    ``work`` account): ``display = False`` removes it outright, title line included.
+    """
+    panel.display = visible
+    panel.set_class(not expanded, "card-collapsed")
+
+
 # How long a leader stays pending before its timeout. A leader with a standalone action
 # (`a` → edit_aim, `s` → settings) stays snappy — the timeout just fires that action — so
 # 250 ms. That is safe against the Karabiner vi-mode simultaneous layers because every
@@ -1375,11 +1399,13 @@ _HELP_TOPICS: dict[str, str] = {
         "  card tracks reality more closely during active work. Set it to 0 to disable\n"
         "  the speed-up. (Claude & Codex need no speed-up: their sources already update\n"
         "  every few seconds while a job runs.)\n\n"
-        "[b]Show / hide a card[/b]\n"
-        "  t1 = Claude Code (private)   t3 = OpenAI Codex\n"
-        "  t2 = Claude Code (work)      t4 = Copilot\n"
-        "  Unlike td/tf (view-local), these PERSIST to config.toml. t2 on a machine with\n"
-        "  no `work` account says so instead of toggling an empty box.\n\n"
+        "[b]Expand / collapse a card[/b]\n"
+        "  t1 = Claude Code (private)   t3 = OpenAI Codex   to = nixos supervised\n"
+        "  t2 = Claude Code (work)      t4 = Copilot        ta = nixos tier_a\n"
+        "  Collapsed keeps the card's titled top border (which names its own chord) and\n"
+        "  drops the rest of the box. Unlike td/tf (view-local), these PERSIST to\n"
+        "  config.toml. t2 on a machine with no `work` account says so instead of\n"
+        "  toggling an empty box.\n\n"
         "[b]Config keys[/b] (~/.claude/command-center/config.toml)\n"
         "  usage_refresh_sec                  card re-read / render cadence (5.0)\n"
         "  copilot_usage_refresh_sec          idle Copilot gh-fetch throttle (900)\n"
@@ -1389,6 +1415,7 @@ _HELP_TOPICS: dict[str, str] = {
         "  claude_usage_refresh_sec           idle Claude OAuth-fetch throttle (600)\n"
         "  claude_usage_refresh_active_sec    active-work Claude throttle (200; 0=off)\n"
         "  usage_card_private/_work/_codex/_copilot   the four t1..t4 toggles\n"
+        "  card_nixos_overseer_supervised/_tier_a     the to / ta toggles\n"
         "  claude_accounts                    ['private=~/.claude', 'work=~/.claude-work']\n"
         "  claude_account_emails    identity hard-link, e.g. ['work=you@company.com'] —\n"
         "                           the card shows whichever configured account is\n"
@@ -1938,6 +1965,10 @@ class CommandCenterApp(App[None]):
         width: auto; min-width: 38; height: auto; padding: 0 1;
         border: round #2bb2b2;
     }
+    /* A card whose `t…` gate is off (see _set_card_expanded): keep the titled
+       border-top row, drop the rest of the box. `!important` because the per-card
+       `#usage…` id rules out-specify a plain class selector. */
+    .card-collapsed { height: 1 !important; border-bottom: none !important; }
     #keyhints { dock: bottom; height: 1; background: $panel; }
     """
     BINDINGS = _build_bindings()
@@ -2071,8 +2102,12 @@ class CommandCenterApp(App[None]):
             f"{self.cfg.copilot_card_title} {self.cfg.copilot_model}"
             f" / {commands.by_action('toggle_card_copilot').key}"
         )
-        self.query_one("#usage-nixos-supervised", Static).border_title = "nixos overseer supervised"
-        self.query_one("#usage-nixos-tier-a", Static).border_title = "nixos overseer tier_a"
+        self.query_one(
+            "#usage-nixos-supervised", Static
+        ).border_title = f"nixos overseer supervised / {_NIXOS_SUPERVISED_CHORD}"
+        self.query_one(
+            "#usage-nixos-tier-a", Static
+        ).border_title = f"nixos overseer tier_a / {_NIXOS_TIER_A_CHORD}"
         self._apply_split()
         self.refresh_data()
         self.set_interval(self.cfg.usage_refresh_sec, self.refresh_data)
@@ -2335,25 +2370,30 @@ class CommandCenterApp(App[None]):
         # any disk touch.
         nixos_supervised = nixos_overseer.read_supervised(self.cfg)
         nixos_supervised_panel.update(nixos_overseer.render_supervised(nixos_supervised))
-        nixos_supervised_panel.border_title = nixos_overseer.card_title(
-            nixos_supervised, "nixos overseer supervised"
+        nixos_supervised_panel.border_title = (
+            f"{nixos_overseer.card_title(nixos_supervised, 'nixos overseer supervised')}"
+            f" / {_NIXOS_SUPERVISED_CHORD}"
         )
         nixos_tier_a = nixos_overseer.read_tier_a(self.cfg)
         nixos_tier_a_panel.update(nixos_overseer.render_tier_a(nixos_tier_a))
-        nixos_tier_a_panel.border_title = nixos_overseer.card_title(
-            nixos_tier_a, "nixos overseer tier_a"
+        nixos_tier_a_panel.border_title = (
+            f"{nixos_overseer.card_title(nixos_tier_a, 'nixos overseer tier_a')}"
+            f" / {_NIXOS_TIER_A_CHORD}"
         )
-        # Render gates: each card is shown/hidden by its own config flag. The Copilot
-        # RENDER gate is `usage_card_copilot` ALONE; its network FETCH stays gated on
-        # `copilot_usage` ALONE (below), so the two are independently settable by hand.
-        private_panel.display = self.cfg.usage_card_private
+        # Render gates: each card is expanded/collapsed by its own config flag — a card
+        # that is off keeps its titled border-top line and drops the rest of the box (see
+        # _set_card_expanded). The Copilot RENDER gate is `usage_card_copilot` ALONE; its
+        # network FETCH stays gated on `copilot_usage` ALONE (below), so the two are
+        # independently settable by hand.
+        _set_card_expanded(private_panel, self.cfg.usage_card_private)
         # A machine with no `work` account configured must not show a permanently empty
-        # work card. Parsed from the already-loaded Config, so this costs no file read.
-        work_panel.display = self.cfg.usage_card_work and self._has_work_account()
-        codex_panel.display = self.cfg.usage_card_codex
-        copilot_panel.display = self.cfg.usage_card_copilot
-        nixos_supervised_panel.display = self.cfg.card_nixos_overseer_supervised
-        nixos_tier_a_panel.display = self.cfg.card_nixos_overseer_tier_a
+        # work card — not even a collapsed title line — so that one is gated on `visible`
+        # and disappears entirely. Parsed from the already-loaded Config: no file read.
+        _set_card_expanded(work_panel, self.cfg.usage_card_work, visible=self._has_work_account())
+        _set_card_expanded(codex_panel, self.cfg.usage_card_codex)
+        _set_card_expanded(copilot_panel, self.cfg.usage_card_copilot)
+        _set_card_expanded(nixos_supervised_panel, self.cfg.card_nixos_overseer_supervised)
+        _set_card_expanded(nixos_tier_a_panel, self.cfg.card_nixos_overseer_tier_a)
         if self.cfg.copilot_usage:
             # Keep the (network-sourced) figure warm without blocking render: when the
             # cache is stale, fire a detached `ccc copilot-usage` to refresh it for the
@@ -3854,7 +3894,8 @@ class CommandCenterApp(App[None]):
             return "on" if idlenotify.is_enabled() else "silent"
         card_key = _CARD_TOGGLE_KEYS.get(action or "")
         if card_key is not None:
-            return "shown" if getattr(self.cfg, card_key) else "hidden"
+            # Off is "collapsed", not "hidden": the card's titled border-top line stays.
+            return "expanded" if getattr(self.cfg, card_key) else "collapsed"
         return None
 
     def _notify_chord_menu(self, leader: str) -> None:
@@ -3932,7 +3973,7 @@ class CommandCenterApp(App[None]):
     def _toggle_usage_card(
         self, key: str, label: str, *, also: str | None = None, announce: bool = True
     ) -> None:
-        """Flip a usage-card render gate, persist it, and re-render — reload-modify-save.
+        """Expand/collapse a usage card, persist it, re-render — reload-modify-save.
 
         ``self.cfg`` is cached at ``__init__`` and ``save_config`` writes EVERY key, so
         saving that stale snapshot would clobber any Settings-screen edit made since
@@ -3954,21 +3995,22 @@ class CommandCenterApp(App[None]):
 
         def undo_card(key: str = key, label: str = label, also: str | None = also) -> str | None:
             self._toggle_usage_card(key, label, also=also, announce=False)
-            return f"{label} card {'shown' if getattr(self.cfg, key) else 'hidden'} again."
+            state = "expanded" if getattr(self.cfg, key) else "collapsed"
+            return f"{label} card {state} again."
 
         self._push_undo(f"{label} card toggle", undo_card)
         if announce:
-            self.notify(f"{label} card {'shown' if new_value else 'hidden'}.")
+            self.notify(f"{label} card {'expanded' if new_value else 'collapsed'}.")
 
     def action_toggle_card_private(self) -> None:
-        """Show/hide the Claude Code (private) usage card — the `t1` chord."""
+        """Expand/collapse the Claude Code (private) usage card — the `t1` chord."""
         self._toggle_usage_card("usage_card_private", "Claude Code (private)")
 
     def action_toggle_card_work(self) -> None:
-        """Show/hide the Claude Code (work) usage card — the `t2` chord.
+        """Expand/collapse the Claude Code (work) usage card — the `t2` chord.
 
-        Flipping the flag on a machine with no ``work`` account would show nothing (the
-        card stays hidden), so say why instead of silently doing nothing.
+        Flipping the flag on a machine with no ``work`` account would show nothing (that
+        card is hidden outright, title line included), so say why instead of no-oping.
         """
         if not self._has_work_account():
             # markup=False: the example contains ``[...]`` which Textual would otherwise
@@ -3984,11 +4026,11 @@ class CommandCenterApp(App[None]):
         self._toggle_usage_card("usage_card_work", "Claude Code (work)")
 
     def action_toggle_card_codex(self) -> None:
-        """Show/hide the OpenAI Codex usage card — the `t3` chord."""
+        """Expand/collapse the OpenAI Codex usage card — the `t3` chord."""
         self._toggle_usage_card("usage_card_codex", "OpenAI Codex")
 
     def action_toggle_card_copilot(self) -> None:
-        """Show/hide the Copilot usage card — the `t4` chord.
+        """Expand/collapse the Copilot usage card — the `t4` chord.
 
         Flips BOTH the render gate (``usage_card_copilot``) AND the network-fetch gate
         (``copilot_usage``) to the same value, so hiding the card also stops paying for
@@ -3998,11 +4040,11 @@ class CommandCenterApp(App[None]):
         self._toggle_usage_card("usage_card_copilot", "Copilot", also="copilot_usage")
 
     def action_toggle_card_nixos_overseer_supervised(self) -> None:
-        """Show/hide the nixos overseer supervised card — the `t5` chord."""
+        """Expand/collapse the nixos overseer supervised card — the `to` chord."""
         self._toggle_usage_card("card_nixos_overseer_supervised", "nixos overseer supervised")
 
     def action_toggle_card_nixos_overseer_tier_a(self) -> None:
-        """Show/hide the nixos overseer tier_a card — the `t6` chord."""
+        """Expand/collapse the nixos overseer tier_a card — the `ta` chord."""
         self._toggle_usage_card("card_nixos_overseer_tier_a", "nixos overseer tier_a")
 
     def action_aim_history(self) -> None:

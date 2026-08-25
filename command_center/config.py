@@ -117,17 +117,19 @@ DEFAULTS: dict[str, object] = {
     # Which account a NEW job (no explicit -A / account select) bills to: "" = default
     # account, a label = pin, "auto" = saturate-earliest-reset routing (see routing.py).
     "job_account": "",
-    "usage_card_private": True,  # render the Claude Code (private) usage card
-    "usage_card_work": True,  # render the Claude Code (work) usage card
-    "usage_card_codex": True,  # render the OpenAI Codex usage card
-    "usage_card_copilot": True,  # RENDER the Copilot card (copilot_usage gates the FETCH)
+    # The card render gates (t1..t4 / to / ta). False does NOT remove a card: it
+    # collapses it to its titled top border, which is where its own chord is named.
+    "usage_card_private": True,  # expand the Claude Code (private) usage card
+    "usage_card_work": True,  # expand the Claude Code (work) usage card
+    "usage_card_codex": True,  # expand the OpenAI Codex usage card
+    "usage_card_copilot": True,  # EXPAND the Copilot card (copilot_usage gates the FETCH)
     # External homelab "overseer" alert-triage daemon (a SEPARATE project — unrelated to
     # ccc's own future-job plumbing). Its incidents feed two read-only TUI cards. Empty
     # (the default) = feature OFF: the cards render a placeholder and touch no disk. Point
     # it at the overseer's root dir; the DB is read at <dir>/state/overseer.sqlite (ro).
     "nixos_overseer_dir": "",
-    "card_nixos_overseer_supervised": True,  # render the "nixos overseer supervised" card
-    "card_nixos_overseer_tier_a": False,  # render the "nixos overseer tier_a" card (hidden default)
+    "card_nixos_overseer_supervised": True,  # expand the "nixos overseer supervised" card
+    "card_nixos_overseer_tier_a": False,  # expand the "nixos overseer tier_a" card (off by default)
     "llm_account": "private",  # account ccc's own headless `claude -p` calls bill to
     "prune_headless": True,  # daemon deletes contentless leftover rows (headless `claude -p` junk)
     "sync_tab_titles": True,  # daemon keeps every live tab's iTerm title in sync with its badge
