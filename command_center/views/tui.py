@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 
+from rich.cells import cell_len
 from rich.color import Color
 from rich.style import Style
 from rich.text import Text
@@ -158,6 +159,10 @@ _CARD_TOGGLE_KEYS: dict[str, str] = {
     "toggle_card_nixos_overseer_tier_a": "card_nixos_overseer_tier_a",
 }
 
+# Cells a card's top border spends on everything that is not the title itself:
+# ``╭─ `` + title + `` ─╮``. A collapsed card is sized to exactly this + its title.
+_CARD_TITLE_BORDER_CELLS = 6
+
 # Border-title chord suffixes for the two nixos-overseer cards. The other four cards
 # build their title once in on_mount; these two are REBUILT every render tick (the title
 # carries a live incident count), so the suffix is appended there instead. Keys come from
@@ -172,14 +177,28 @@ def _set_card_expanded(panel: Static, expanded: bool, *, visible: bool = True) -
     Collapsed is not hidden: the card keeps its border-TOP row — the titled
     ``╭─ Claude Code (private) 🏠 / t1 ───╮`` line, which is also where the toggle's own
     chord is advertised — and drops everything below it. The ``.card-collapsed`` class
-    does that (``height: 1`` + ``border-bottom: none``); the content stays rendered, just
-    clipped away, so the surviving line keeps exactly the width it had while expanded.
+    does that (``height: 1`` + ``border-bottom: none``).
+
+    A collapsed card also **stops paying for its content's width**. The cards sit in an
+    auto-width column that is as wide as its widest card and is pinned to the right edge,
+    so every cell a card claims is a cell taken off the job-details pane beside it — and
+    the widest card is easily one nobody is looking at (the nixos supervised card runs
+    ~79 cells with real incidents, vs 38 for the usage cards). So collapsing blanks the
+    content and pins the width to what the TITLE needs — ``╭─ <title> ─╮`` = title + 6
+    cells, floored by each card's CSS ``min-width`` — and expanding hands the width back
+    to CSS (``width: auto``, i.e. the content again). The content itself is re-rendered
+    on the next tick either way, so nothing is lost by blanking it.
 
     *visible* is the separate, harder gate for a card that has nothing to say at all (no
     ``work`` account): ``display = False`` removes it outright, title line included.
     """
     panel.display = visible
     panel.set_class(not expanded, "card-collapsed")
+    if expanded:
+        panel.styles.width = None  # drop the inline pin → back to the CSS `width: auto`
+        return
+    panel.update("")
+    panel.styles.width = cell_len(str(panel.border_title or "")) + _CARD_TITLE_BORDER_CELLS
 
 
 # How long a leader stays pending before its timeout. A leader with a standalone action
@@ -1967,7 +1986,8 @@ class CommandCenterApp(App[None]):
     }
     /* A card whose `t…` gate is off (see _set_card_expanded): keep the titled
        border-top row, drop the rest of the box. `!important` because the per-card
-       `#usage…` id rules out-specify a plain class selector. */
+       `#usage…` id rules out-specify a plain class selector. The WIDTH is pinned
+       inline there (to the title), not here — each card keeps its own min-width. */
     .card-collapsed { height: 1 !important; border-bottom: none !important; }
     #keyhints { dock: bottom; height: 1; background: $panel; }
     """

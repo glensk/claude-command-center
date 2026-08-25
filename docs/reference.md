@@ -1298,6 +1298,12 @@ so a folded-away card stays one keystroke from coming back:
 ╰─────────────────────────────────────╯
 ```
 
+A collapsed card also gives back its **width**: the cards share one auto-width column
+pinned to the right edge, so the widest card decides how far left the column starts and
+how little room is left for the job-details pane beside it. Collapsed, a card is sized to
+its title alone rather than to its (now hidden) content — folding away the nixos
+supervised card, ~79 cells wide with real incidents, hands ~38 columns back to the left.
+
 Unlike the view-local `td`/`tf` toggles these **persist** to `config.toml`
 (`usage_card_private/_work/_codex/_copilot`, `card_nixos_overseer_supervised/_tier_a`
 — pure render gates); `t4` also flips the

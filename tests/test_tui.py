@@ -2303,6 +2303,52 @@ def test_card_toggle_collapses_to_its_title_line(
     asyncio.run(scenario())
 
 
+def test_collapsed_card_width_follows_its_title_not_its_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Collapsing a FAT card gives its width back to the job-details pane beside it.
+
+    The cards share one auto-width column pinned to the right edge, so the widest card
+    sets how far left the whole column starts. The nixos supervised card is easily the
+    widest (~79 cells with real incidents, vs 38 for the usage cards) — if a collapsed
+    card kept measuring its hidden content, folding it away would free a row and no
+    columns. Collapsed, it is sized to its title alone (title + 6 cells for `╭─ … ─╮`).
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center import nixos_overseer
+    from command_center.views.tui import CommandCenterApp
+
+    title = "nixos overseer supervised (11) / to"
+    fat = "\n".join(["!! disk pressure: /var/lib/docker 92% used — awaiting decision"] * 3)
+    monkeypatch.setattr(nixos_overseer, "render_supervised", lambda _r: fat)
+    monkeypatch.setattr(nixos_overseer, "card_title", lambda _r, base: f"{base} (11)")
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            supervised = app.query_one("#usage-nixos-supervised")
+            column = app.query_one("#usage-col")
+            expanded_width = supervised.outer_size.width
+            assert expanded_width > len(title) + 6  # the content is what makes it fat
+            assert column.outer_size.width == expanded_width  # …and it sets the column
+
+            await pilot.press("t")
+            await pilot.press("o")
+            await pilot.pause()
+            assert str(supervised.border_title) == title
+            assert supervised.outer_size.width == len(title) + 6  # exactly fits the title
+            assert column.outer_size.width < expanded_width  # cells handed back to the left
+
+            # A short title collapses to the card's CSS min-width, never narrower.
+            await pilot.press("t")
+            await pilot.press("3")
+            await pilot.pause()
+            assert app.query_one("#usage-codex").outer_size.width == 38
+
+    asyncio.run(scenario())
+
+
 def test_nixos_card_titles_advertise_their_chord(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
