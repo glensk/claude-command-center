@@ -13,6 +13,7 @@ The content generators are pure (unit-testable on any platform); only the
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -64,13 +65,20 @@ def _systemctl(*args: str) -> subprocess.CompletedProcess[str]:
 
 def service_content(ccc_path: str, log_dir: Path) -> str:
     """Return the ``.service`` unit for one ``ccc daemon`` pass (``Type=oneshot``)."""
+    # Same reason as launchd._override_env_xml: the daemon must housekeep the SAME tree
+    # the status-line producer writes to, or orphaned usage temps are never reclaimed.
+    env = "".join(
+        f"Environment={name}={value}\n"
+        for name in ("CCC_HOME", "CLAUDE_HOME")
+        if (value := os.environ.get(name))
+    )
     return f"""[Unit]
 Description=ccc command center daemon (one pass)
 After=default.target
 
 [Service]
 Type=oneshot
-ExecStart={ccc_path} daemon
+{env}ExecStart={ccc_path} daemon
 StandardOutput=append:{log_dir / "daemon.log"}
 StandardError=append:{log_dir / "daemon.err"}
 """

@@ -8,6 +8,7 @@ under launchd's minimal environment.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -79,6 +80,21 @@ def is_loaded() -> bool:
     return result.returncode == 0
 
 
+def _override_env_xml() -> str:
+    """Plist ``EnvironmentVariables`` entries for any CCC_HOME / CLAUDE_HOME override.
+
+    Without these, a shell whose CCC_HOME/CLAUDE_HOME point elsewhere writes usage
+    caches into one tree while the agent housekeeps another — so the daemon would sweep
+    orphaned temps (:func:`usage.sweep_stale_temps`) in a directory the producer never
+    touches. Empty when neither is set, which is the common single-tree case.
+    """
+    return "".join(
+        f"\n        <key>{name}</key>\n        <string>{value}</string>"
+        for name in ("CCC_HOME", "CLAUDE_HOME")
+        if (value := os.environ.get(name))
+    )
+
+
 def plist_content(
     ccc_path: str, interval_sec: int, log_dir: Path, agent_label: str | None = None
 ) -> str:
@@ -100,7 +116,7 @@ def plist_content(
         <key>PATH</key>
         <string>{_path_env()}</string>
         <key>HOME</key>
-        <string>{home}</string>
+        <string>{home}</string>{_override_env_xml()}
     </dict>
     <key>StartInterval</key>
     <integer>{interval_sec}</integer>
@@ -154,7 +170,7 @@ def future_sync_plist_content(
         <key>PATH</key>
         <string>{_path_env()}</string>
         <key>HOME</key>
-        <string>{home}</string>
+        <string>{home}</string>{_override_env_xml()}
     </dict>
     <key>StandardOutPath</key>
     <string>{log_path}</string>

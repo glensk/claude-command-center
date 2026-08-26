@@ -262,18 +262,68 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     """Atomically replace *path* with *payload* via a unique ``mkstemp`` temp file.
 
     A per-write unique temp name (not a fixed ``.json.tmp``) plus ``os.replace`` means
-    concurrent writers cannot clobber one another's temp file; a failed write leaves no
-    stray temp behind.
+    concurrent writers cannot clobber one another's temp file.
+
+    The ``finally`` unlink covers every *exception* path (the old ``except OSError``
+    leaked on ``TypeError`` from ``json.dump`` and on ``KeyboardInterrupt``, which
+    contradicted :func:`write_usage`'s "never raises" contract). It cannot cover
+    asynchronous death: Claude Code cancels an in-flight status-line command when the
+    next update arrives, and this writer is the last thing the status-line script runs
+    every few seconds — so the process is killed outright with no Python unwinding.
+    Those orphans are reclaimed by :func:`sweep_stale_temps`, not here.
+
+    Deliberately no ``fsync``: this is a cache refreshed every few seconds, and the
+    extra latency would widen the very cancellation window that strands the temp file.
     """
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    replaced = False
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
         os.replace(tmp_name, path)
-    except OSError:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+        replaced = True
+    finally:
+        # Only when the replace did NOT happen — otherwise tmp_name IS *path* now.
+        if not replaced:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+
+
+# Temp files this module strands when a writer is killed mid-write. Enumerated rather
+# than a generic ``*.json.*.tmp`` glob so a future unrelated JSON writer in this
+# directory cannot silently join the deletion set. Every OTHER temp producer in the
+# repo uses a fixed name (``futuresync``/``mirrors``: ``<name>.tmp``; ``resume``:
+# ``resume_queue.tmp``; ``install``: ``.ccc-tmp-*``) or another directory.
+_TEMP_PATTERNS = ("usage.json.*.tmp", "usage-*.json.*.tmp", "copilot_usage.json.*.tmp")
+# A live temp exists for well under a millisecond, so an hour is ~7 orders of margin.
+_TEMP_MAX_AGE_SEC = 3600
+
+
+def sweep_stale_temps(now: float | None = None, *, max_age_sec: int = _TEMP_MAX_AGE_SEC) -> int:
+    """Reclaim orphaned ``mkstemp`` temps left by a killed writer. Returns the count.
+
+    Only files older than *max_age_sec* are removed, so a concurrently running writer's
+    temp is never touched. The mtime reference is conservative in the right direction:
+    ``mkstemp`` stamps it at creation and the flush at ``close()`` advances it, so age is
+    measured from the most recent write.
+    """
+    now = time.time() if now is None else now
+    home = config.app_home()
+    removed = 0
+    for pattern in _TEMP_PATTERNS:
+        try:
+            candidates = list(home.glob(pattern))
+        except OSError:
+            continue
+        for tmp in candidates:
+            try:
+                if now - tmp.stat().st_mtime < max_age_sec:
+                    continue
+                tmp.unlink()
+            except OSError:
+                continue
+            removed += 1
+    return removed
 
 
 def _window(raw: object) -> Window | None:

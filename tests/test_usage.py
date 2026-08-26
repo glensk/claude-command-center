@@ -366,6 +366,115 @@ def test_concurrent_writers_no_corruption(tmp_path: Path, monkeypatch: pytest.Mo
     assert list(config.app_home().glob("*.tmp")) == []
 
 
+def test_atomic_write_cleans_temp_on_non_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-OSError mid-write leaves no stray temp (the old `except OSError` leaked)."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    config.app_home().mkdir(parents=True, exist_ok=True)
+    target = config.app_home() / "usage.json"
+    with pytest.raises(TypeError):
+        usage._atomic_write_json(target, {"x": object()})
+    assert list(config.app_home().glob("*.tmp")) == []
+
+
+def test_atomic_write_cleans_temp_on_keyboard_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """KeyboardInterrupt at the replace leaves no temp AND does not touch the target."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    config.app_home().mkdir(parents=True, exist_ok=True)
+    target = config.app_home() / "usage.json"
+    target.write_text('{"kept": true}', encoding="utf-8")
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(usage.os, "replace", _boom)
+    with pytest.raises(KeyboardInterrupt):
+        usage._atomic_write_json(target, {"kept": False})
+    assert list(config.app_home().glob("*.tmp")) == []
+    assert target.read_text(encoding="utf-8") == '{"kept": true}'
+
+
+def test_sweep_removes_only_stale_temps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Orphans older than the threshold go; a fresh temp, the cache and the lock stay."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    home = config.app_home()
+    home.mkdir(parents=True, exist_ok=True)
+    stale = home / "usage.json.aaaaaaaa.tmp"
+    fresh = home / "usage.json.bbbbbbbb.tmp"
+    for path in (stale, fresh):
+        path.write_text("{}", encoding="utf-8")
+    old = time.time() - 7200
+    os.utime(stale, (old, old))
+    cache = home / "usage.json"
+    cache.write_text("{}", encoding="utf-8")
+    lock = home / "usage.json.lock"
+    lock.write_text("", encoding="utf-8")
+
+    assert usage.sweep_stale_temps() == 1
+    assert not stale.exists()
+    assert fresh.exists() and cache.exists() and lock.exists()
+
+
+def test_sweep_covers_every_producer_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-account `usage-<hash>.json` and `copilot_usage.json` orphans are swept too."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    home = config.app_home()
+    home.mkdir(parents=True, exist_ok=True)
+    old = time.time() - 7200
+    for name in ("usage-work-b6f4d184.json.cccccccc.tmp", "copilot_usage.json.dddddddd.tmp"):
+        path = home / name
+        path.write_text("{}", encoding="utf-8")
+        os.utime(path, (old, old))
+
+    assert usage.sweep_stale_temps() == 2
+    assert list(home.glob("*.tmp")) == []
+
+
+def test_sweep_ignores_foreign_temps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Other subsystems' temps are never in the deletion set, however old they are."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    home = config.app_home()
+    home.mkdir(parents=True, exist_ok=True)
+    old = time.time() - 7200
+    foreign = ["config.toml.eeeeeeee.tmp", "future_sync_state.json.tmp", "resume_queue.tmp"]
+    for name in foreign:
+        path = home / name
+        path.write_text("", encoding="utf-8")
+        os.utime(path, (old, old))
+
+    assert usage.sweep_stale_temps() == 0
+    assert sorted(p.name for p in home.glob("*.tmp")) == sorted(foreign)
+
+
+def test_sweep_survives_unlink_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A temp that vanishes (or cannot be removed) mid-sweep is skipped, not raised."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    home = config.app_home()
+    home.mkdir(parents=True, exist_ok=True)
+    old = time.time() - 7200
+    for name in ("usage.json.ffffffff.tmp", "usage.json.gggggggg.tmp"):
+        path = home / name
+        path.write_text("{}", encoding="utf-8")
+        os.utime(path, (old, old))
+
+    real_unlink = Path.unlink
+    calls = {"n": 0}
+
+    def _flaky(self: Path, *, missing_ok: bool = False) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("boom")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _flaky)
+    assert usage.sweep_stale_temps() == 1
+
+
 def test_render_contains_labels_pct_and_relative_reset() -> None:
     snap = usage.Usage(
         captured_at=_NOW,

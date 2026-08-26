@@ -138,6 +138,39 @@ def test_report_empty() -> None:
     assert DaemonReport().is_empty()
     assert not DaemonReport(reaped=["x"]).is_empty()
     assert not DaemonReport(pruned=["x"]).is_empty()
+    # A pure-housekeeping pass stays "empty" so it is not reported as activity.
+    assert DaemonReport(temps_swept=3).is_empty()
+
+
+def test_run_once_sweeps_temps_and_dry_run_does_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The orphan sweep runs on a real pass and is suppressed under --dry-run."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    calls: list[str] = []
+
+    from command_center import usage as usage_mod
+
+    def _fake_sweep(*_args: object, **_kwargs: object) -> int:
+        calls.append("swept")
+        return 7
+
+    monkeypatch.setattr(usage_mod, "sweep_stale_temps", _fake_sweep)
+
+    assert (
+        run_once(
+            dry_run=True, do_reap=False, do_summary=False, do_progress=False, do_alerts=False
+        ).temps_swept
+        == 0
+    )
+    assert calls == []
+    assert (
+        run_once(
+            dry_run=False, do_reap=False, do_summary=False, do_progress=False, do_alerts=False
+        ).temps_swept
+        == 7
+    )
+    assert calls == ["swept"]
 
 
 def test_daemon_prunes_headless_junk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

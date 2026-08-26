@@ -55,6 +55,7 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
     copilot_refreshed: bool = False  # routine; deliberately excluded from is_empty()
     claude_refreshed: bool = False  # routine Claude /usage OAuth fetch; excluded from is_empty()
     resume_spawned: bool = False  # spawned the resume-halted watcher; excluded from is_empty()
+    temps_swept: int = 0  # orphaned usage temp files reclaimed; excluded from is_empty()
 
     def is_empty(self) -> bool:
         return not (
@@ -146,6 +147,14 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
     cfg = config.load_config()
     adapter = ClaudeAdapter()
     report = DaemonReport()
+
+    # FIRST, before the store opens: `reconcile` below can raise, and anything placed
+    # after it would then never run again. Reclaiming orphaned usage temps is
+    # independent of the store, so it must not sit behind a fallible step.
+    if not dry_run:
+        from . import usage  # pylint: disable=import-outside-toplevel  # module convention
+
+        report.temps_swept = usage.sweep_stale_temps()
 
     with Store() as store:
         reconcile(store, adapter)

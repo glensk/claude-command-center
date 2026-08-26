@@ -2709,7 +2709,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         f"alerted={len(report.alerted)} pruned={len(report.pruned)} scored={len(report.scored)} "
         f"short_aimed={len(report.short_aimed)} copilot={int(report.copilot_refreshed)} "
         f"claude_usage={int(report.claude_refreshed)} "
-        f"resume={int(report.resume_spawned)}"
+        f"resume={int(report.resume_spawned)} temps_swept={report.temps_swept}"
     )
     if args.verbose:
         for label, ids in (
