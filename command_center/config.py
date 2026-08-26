@@ -555,11 +555,15 @@ def save_config(cfg: Config) -> None:  # pylint: disable=too-many-branches
 
     # Atomic replace: write to a unique temp in the same dir, then os.replace into place.
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    replaced = False
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
         os.replace(tmp_name, path)
-    except OSError:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+        replaced = True
+    finally:
+        # `except OSError` leaked the temp on any other exception; only unlink when the
+        # replace did NOT happen, or we would delete the file we just wrote.
+        if not replaced:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
