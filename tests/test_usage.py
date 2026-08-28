@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import threading
 import time
 from datetime import UTC, datetime
@@ -874,7 +875,7 @@ def test_copilot_usage_roundtrip_and_render(
     # "Premium requests" title and the standalone AI-credit/cost line stay gone.
     assert "Premium requests" not in plain and "covered" not in plain
     assert "3%" in plain  # 8.84 / 300 ≈ 3%
-    assert "8.8cr" in plain  # live credit count embossed in the bar
+    assert "8.8/300cr" in plain  # credits used *and* the denominator embossed in the bar
     assert "Resets in 4d" in plain  # reset embossed in the bar
     for line in plain.splitlines():
         assert len(line) == usage._CARD_INNER_WIDTH
@@ -914,6 +915,102 @@ def test_copilot_usage_stale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     fresh_now = int(Path(usage._copilot_usage_path()).stat().st_mtime) + 10
     assert usage.copilot_usage_stale(900, now=fresh_now) is False
     assert usage.copilot_usage_stale(900, now=fresh_now + 1000) is True
+
+
+# The seat's own quota endpoint — the only authoritative denominator. A trimmed copy of
+# `/copilot_internal/user` for a faculty/individual seat that has burnt its month.
+_COPILOT_SEAT = {
+    "copilot_plan": "individual",
+    "quota_reset_date_utc": "2026-09-01T00:00:00.000Z",
+    "quota_snapshots": {
+        "chat": {"unlimited": True, "entitlement": 0, "credits_used": 0},
+        "premium_interactions": {
+            "unlimited": False,
+            "entitlement": 1500,
+            "credits_used": 1505,
+            "remaining": -6,
+            "percent_remaining": 0.0,
+        },
+    },
+}
+
+
+def _fake_gh(monkeypatch: pytest.MonkeyPatch, stdout: str) -> None:
+    """Stub `subprocess.run` inside usage.py to answer one `gh api` call with *stdout*."""
+
+    def run(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=["gh"], returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(usage.subprocess, "run", run)
+
+
+def test_fetch_copilot_quota_reads_seat_entitlement(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_gh(monkeypatch, json.dumps(_COPILOT_SEAT))
+    assert usage._fetch_copilot_quota("gh") == (1500, 1505.0)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not json at all",
+        json.dumps({}),  # no quota_snapshots
+        json.dumps({"quota_snapshots": {"premium_interactions": {"unlimited": True}}}),
+        json.dumps({"quota_snapshots": {"premium_interactions": {"entitlement": 0}}}),
+    ],
+)
+def test_fetch_copilot_quota_degrades_to_none(
+    monkeypatch: pytest.MonkeyPatch, payload: str
+) -> None:
+    """Unusable answers keep the configured fallback rather than inventing a denominator."""
+    _fake_gh(monkeypatch, payload)
+    assert usage._fetch_copilot_quota("gh") is None
+
+
+def test_copilot_render_uses_live_meter_and_real_quota() -> None:
+    """A consumed seat reads 100%, not 50% against a guessed budget (the 2026-08 bug).
+
+    `quantity` (billing endpoint, up to a day stale) is 1497.7 and the guessed budget was
+    3000 — which drew a half-full bar on a seat that was actually over its 1500 credits.
+    """
+    snap = usage.CopilotUsage(
+        captured_at=_NOW,
+        year=2026,
+        month=8,
+        sku="AI Credits",
+        unit="AI credits",
+        quantity=1497.693635,
+        gross=14.98,
+        net=0.0,
+        premium_used=0.0,
+        premium_quota=300,
+        premium_reset_at=_NOW + 3 * 86400,
+        credit_quota=1500,
+        credits_used=1505.0,
+        quota_source="api",
+    )
+    plain = usage.render_copilot_usage(snap, now=_NOW).plain
+    assert "100%" in plain  # 1505 / 1500 — over quota, clamped bar, honest percentage
+    assert "1505/1500cr" in plain  # numerator and denominator both on the card
+    for line in plain.splitlines():
+        assert len(line) == usage._CARD_INNER_WIDTH
+
+
+def test_copilot_render_falls_back_to_billing_quantity() -> None:
+    """Without the live meter (`credits_used == 0`) the billing quantity still draws."""
+    snap = usage.CopilotUsage(
+        captured_at=_NOW,
+        year=2026,
+        month=8,
+        sku="AI Credits",
+        unit="AI credits",
+        quantity=750.0,
+        gross=7.5,
+        net=0.0,
+        premium_reset_at=_NOW + 3 * 86400,
+        credit_quota=1500,
+    )
+    plain = usage.render_copilot_usage(snap, now=_NOW).plain
+    assert "50%" in plain and "750/1500cr" in plain
 
 
 def test_has_active_work_matches_status_enum() -> None:

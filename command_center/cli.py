@@ -404,13 +404,21 @@ def cmd_copilot_usage(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    qty = f"{snap.quantity:.1f}" if snap.unit == "AI credits" else str(int(round(snap.quantity)))
     cost = f"${snap.gross:.2f} covered" if snap.net <= 1e-6 else f"${snap.net:.2f} billed"
     link = osc8_link("https://github.com/settings/billing", "github.com/settings/billing")
-    quota = max(1, snap.premium_quota)
-    pct = snap.premium_used / quota * 100
-    premium = f"premium requests {int(round(snap.premium_used))}/{quota} ({pct:.0f}%)"
-    print(f"GitHub Copilot — this month: {premium} · {qty} {snap.unit} · {cost}  ({link})")
+    # Headline the window the card draws: AI credits against the seat's entitlement on a
+    # credit seat, premium requests otherwise. `?` marks a quota that is still the
+    # configured guess because the per-seat endpoint did not answer.
+    used = snap.credits_used or snap.quantity
+    if snap.unit == "AI credits" and used > 0:
+        quota = max(1, snap.credit_quota)
+        mark = "" if snap.quota_source == "api" else "?"
+        head = f"AI credits {used:.1f}/{quota}{mark} ({used / quota * 100:.0f}%)"
+    else:
+        quota = max(1, snap.premium_quota)
+        pct = snap.premium_used / quota * 100
+        head = f"premium requests {int(round(snap.premium_used))}/{quota} ({pct:.0f}%)"
+    print(f"GitHub Copilot — this month: {head} · {cost}  ({link})")
     return 0
 
 

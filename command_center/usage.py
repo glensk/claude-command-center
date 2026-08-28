@@ -1116,7 +1116,10 @@ def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
 # the AI-credit quantity and cost on a line beneath it. The data is the user's own, read
 # via the official ``gh`` CLI hitting two per-user enhanced-billing endpoints
 # (``/settings/billing/usage`` for AI credits, ``/settings/billing/premium_request/usage``
-# for the bar); no proxy. The
+# for the bar) plus ``/copilot_internal/user`` for the seat's **live** credit meter and
+# its real entitlement (:func:`_fetch_copilot_quota` — the only authoritative source for
+# the denominator: entitlements differ per plan, and the billing endpoint lags by up to a
+# day, so a hard-coded budget silently halves or doubles the percentage); no proxy. The
 # network call is throttled (:func:`copilot_usage_stale`, cadence chosen by
 # :func:`adaptive_interval` — the idle ``copilot_usage_refresh_sec`` normally, the shorter
 # ``copilot_usage_refresh_active_sec`` while a job works) and run out-of-band (the daemon
@@ -1143,11 +1146,13 @@ class CopilotUsage:
     premium_quota: int = 300  # monthly included premium requests
     premium_reset_at: int = 0  # Unix epoch of the next reset (1st of next month, UTC)
     # AI-Credit window (drives the bar once the seat is on usage-based billing, where
-    # premium_used reads 0): month-to-date credits (``quantity``) vs the budget — the
-    # documented Copilot Business per-user allowance (1,900/mo; 3,000 promo to 2026-09-01).
-    credit_quota: int = (
-        3000  # AI-Credit budget the bar is drawn against (promo; 1900 after 2026-09-01)
-    )
+    # premium_used reads 0): credits used vs the seat's entitlement. Both are read from
+    # the live per-seat quota endpoint (:func:`_fetch_copilot_quota`) when it answers;
+    # ``credit_quota`` falls back to the configured ``copilot_credit_quota`` guess and
+    # ``credits_used`` to the (up-to-a-day stale) billing ``quantity``.
+    credit_quota: int = 3000  # AI-Credit budget the bar is drawn against
+    credits_used: float = 0.0  # live credits consumed this month (0.0 ⇒ use ``quantity``)
+    quota_source: str = ""  # "api" (seat entitlement) or "config" (fallback guess)
 
 
 def _copilot_usage_path() -> Path:
@@ -1223,6 +1228,8 @@ def _write_copilot_usage(snap: CopilotUsage) -> None:
         "premium_quota": snap.premium_quota,
         "premium_reset_at": snap.premium_reset_at,
         "credit_quota": snap.credit_quota,
+        "credits_used": snap.credits_used,
+        "quota_source": snap.quota_source,
     }
     path = _copilot_usage_path()
     # Same flock + mkstemp treatment as write_usage (the daemon and a TUI-spawned
@@ -1270,6 +1277,43 @@ def _fetch_premium_used(gh: str, login: str) -> float:
         for i in data.get("usageItems", [])
         if isinstance(i, dict)
     )
+
+
+def _fetch_copilot_quota(gh: str) -> tuple[int, float] | None:
+    """The seat's live AI-Credit meter as ``(entitlement, credits_used)``; None if unusable.
+
+    Reads ``/copilot_internal/user`` — the endpoint the editor plugins use — whose
+    ``quota_snapshots.premium_interactions`` carries the seat's **actual** monthly
+    entitlement and the credits burnt against it *right now*. This is the only place the
+    denominator can be learnt: it varies per plan (1,500 on an individual/faculty seat,
+    other values on Business/Enterprise), so the configured budget is only ever a guess.
+
+    Returns None when the call fails, when the seat is ``unlimited`` (no meaningful
+    denominator), or when the entitlement is absent — callers then keep the configured
+    fallback. Never raises.
+    """
+    try:
+        raw = subprocess.run(  # noqa: S603
+            [gh, "api", "/copilot_internal/user"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=True,
+        ).stdout
+        data = json.loads(raw)
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    snap = (data.get("quota_snapshots") or {}).get("premium_interactions")
+    if not isinstance(snap, dict) or snap.get("unlimited"):
+        return None
+    try:
+        entitlement = int(float(snap.get("entitlement", 0) or 0))
+        used = float(snap.get("credits_used", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return (entitlement, used) if entitlement > 0 else None
 
 
 def fetch_copilot_usage(
@@ -1332,7 +1376,15 @@ def fetch_copilot_usage(
     snap.premium_used = _fetch_premium_used(gh, login)
     snap.premium_quota = max(1, quota)
     snap.premium_reset_at = _next_month_reset(tm.tm_year, tm.tm_mon)
-    snap.credit_quota = max(1, credit_quota)
+    # The seat's own entitlement + live meter beat both the configured guess and the
+    # billing endpoint's up-to-a-day-stale quantity; fall back to them when unavailable.
+    live = _fetch_copilot_quota(gh)
+    if live is not None:
+        snap.credit_quota, snap.credits_used = max(1, live[0]), live[1]
+        snap.quota_source = "api"
+    else:
+        snap.credit_quota = max(1, credit_quota)
+        snap.quota_source = "config"
     _write_copilot_usage(snap)
     return snap
 
@@ -1363,6 +1415,8 @@ def read_copilot_usage() -> CopilotUsage | None:
             premium_quota=int(data.get("premium_quota", 300) or 300),
             premium_reset_at=int(data.get("premium_reset_at", 0) or 0),
             credit_quota=int(data.get("credit_quota", 3000) or 3000),
+            credits_used=float(data.get("credits_used", 0) or 0),
+            quota_source=str(data.get("quota_source", "")),
         )
     except (TypeError, ValueError):
         return None
@@ -1381,6 +1435,11 @@ def copilot_usage_stale(refresh_sec: float, now: int | None = None) -> bool:
     except OSError:
         return True
     return (now - int(mtime)) >= refresh_sec
+
+
+def _fmt_credits(value: float) -> str:
+    """Credits for the bar's emboss: a decimal while small, whole once it would widen the row."""
+    return f"{value:.1f}" if value < 100 else f"{value:.0f}"
 
 
 def render_copilot_usage(usage: CopilotUsage | None, now: int | None = None) -> Text:
@@ -1402,13 +1461,16 @@ def render_copilot_usage(usage: CopilotUsage | None, now: int | None = None) -> 
         reset = ""
 
     # Premium requests were retired for AI-Credit seats (that meter reads 0), so once
-    # the active SKU is AI Credits draw the bar from credits used ÷ the credit budget,
-    # embossing the live credit count. Otherwise keep the premium-request bar.
-    if usage.unit == "AI credits" and usage.quantity > 0:
+    # the active SKU is AI Credits draw the bar from credits used ÷ the seat's credit
+    # entitlement, embossing ``used/quota`` so the denominator is visible on the card
+    # (a wrong one is exactly how a 100%-consumed seat once read 50%). ``credits_used``
+    # is the live meter; ``quantity`` is the billing endpoint's laggier stand-in.
+    used = usage.credits_used or usage.quantity
+    if usage.unit == "AI credits" and used > 0:
         quota = max(1, usage.credit_quota)
-        pct = usage.quantity / quota * 100
-        credit_label = f"{usage.quantity:.1f}cr"
-        label = f"{reset} · {credit_label}" if reset else f"{usage.quantity:.1f} credits"
+        pct = used / quota * 100
+        credit_label = f"{_fmt_credits(used)}/{quota}cr"
+        label = f"{reset} · {credit_label}" if reset else f"{credit_label} used"
     else:
         quota = max(1, usage.premium_quota)
         pct = usage.premium_used / quota * 100

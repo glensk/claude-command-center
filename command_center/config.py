@@ -375,7 +375,10 @@ class Config:
     copilot_usage_refresh_active_sec: int = 300
     copilot_model: str = "gpt-5.4"
     copilot_card_title: str = "Copilot"
-    copilot_credit_quota: int = 3000  # promo value; GitHub's documented baseline is 1900
+    # Fallback only: the seat's real AI-Credit entitlement is read live from
+    # `/copilot_internal/user` (usage._fetch_copilot_quota) and wins whenever it answers.
+    # This guess is used solely when that endpoint is unreachable.
+    copilot_credit_quota: int = 3000
     claude_usage: bool = False  # fetch the Claude /usage OAuth endpoint (INERT: off)
     claude_usage_refresh_sec: int = 600
     claude_usage_refresh_active_sec: int = 200

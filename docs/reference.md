@@ -1353,12 +1353,17 @@ The Claude/Codex cards show a 5-hour (`Session:`) and a weekly (`Week:`) window 
 **relative** reset times (`Session: Resets in 1h 57m`), recomputed on every re-read
 (`usage_refresh_sec`, default 5 s — this drives the whole TUI's refresh timer). The
 Copilot card is a single bar too: once the seat is on usage-based **AI Credits**
-billing (the case since 2026-06) the bar is credits used ÷ `copilot_credit_quota`
-(default `3000`, GitHub's current promo allowance — the API exposes no allowance
-figure, and the documented Copilot Business per-user baseline is 1,900, so set it to
-whatever your seat is actually allotted), embossing the reset **and** the live credit
-count (`Resets in 24d · 84.4cr`); otherwise it falls back to premium requests used ÷
-`copilot_quota` (300), resetting on the 1st of the month.
+billing (the case since 2026-06) the bar is credits used ÷ the seat's credit
+entitlement, embossing the reset **and** both figures (`Resets in 3d · 1505/1500cr`);
+otherwise it falls back to premium requests used ÷ `copilot_quota` (300), resetting on
+the 1st of the month. Both AI-Credit numbers come from the seat's own live meter,
+`gh api /copilot_internal/user` → `quota_snapshots.premium_interactions`
+(`entitlement` + `credits_used`) — the entitlement differs per plan (1,500 on an
+individual/faculty seat) and the billing endpoint's month-to-date quantity lags by up
+to a day, so anything else is a guess that silently mis-scales the bar. When that
+endpoint does not answer, the bar degrades to the billing quantity ÷ the configured
+`copilot_credit_quota` (default `3000`) and `ccc copilot-usage` marks the denominator
+with a `?`.
 
 **Claude Code** exposes this data only in its **status-line JSON**
 (`rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}`) — the numbers
