@@ -252,6 +252,16 @@ def test_daemon_backfills_missing_short_aim(
     assert ["short-aim", "--session", "needs"] in spawned
     assert ["short-aim", "--session", "has"] not in spawned
 
+    # A labelled CURRENT aim whose revision (1) lost its label (`set-aim --first` drops the
+    # stale one) is pending again: revision (1) is what the `/aim` column renders, and the
+    # same generator run backfills it.
+    with Store() as store:
+        store.set_aim("has", "the login bug is fixed for good")  # revision (2)
+        store.set_short_aim("has", "fix login bug")  # lands on revision (2) only
+        store.set_first_short_aim("has", None)
+    report = run_once(do_reap=False, do_summary=False, do_progress=False, do_alerts=False)
+    assert "has" in report.short_aimed
+
 
 def test_refresh_copilot_usage_tightens_throttle_while_working(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

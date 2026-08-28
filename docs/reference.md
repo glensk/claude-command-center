@@ -806,8 +806,8 @@ stuck bar, so the center scores every AIM for specificity (0–100):
 - **The score is shown** as a leading chip in the `/aim` column of `ccc ls`, the
   TUI (table + detail) and the status line: `NN%`, or `-1` while a score is still pending.
 - **Short-AIM label (scannable column text + status line).** The full AIM is kept verbatim
-  (detail pane, `aim-history`), but the narrow `/aim` **column** and the in-session
-  **status line** render a ≤10-word label —
+  (detail pane, `aim-history`), but the narrow `/aim` **column** (its revision (1) label, see
+  below) and the in-session **status line** (the current AIM's) render a ≤10-word label —
   `implement X`, `maria: ws reconnect` — so running sessions are tellable apart at a glance.
   It is generated out-of-band on every AIM change by a cheap **codex** run (`codex exec`,
   via `ccc short-aim`, spawned detached) — keeping the cost off Claude tokens — and a daemon
@@ -848,6 +848,16 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   Claude Code status line (`/aim (1):`, `/aim (2):`, …) and the TUI detail pane: `1` is the first
   AIM ever defined, incrementing each time it changes. An AIM that predates history tracking shows
   as `(1)`.
+- **The `/aim` column shows revision (1)** — the TUI table (whose header then reads
+  `/aim (1)`) and `ccc ls` render the done-condition **as you first typed it**, not the latest
+  sharpened wording. The column is how you recognise a row, so it stays put while the AIM is
+  re-stated over a session's life; the *current* AIM is never more than a glance away (the
+  in-session status line, the `job details` pane, `ccc aim-history`). Each revision carries its
+  own short-AIM label, so the column stays scannable. Sessions whose AIM predates history
+  tracking have no recorded revision (1) and show their live AIM. Set `aim_column = "latest"`
+  to put the current AIM back in the column (only that exact value opts out; the header drops
+  the `(1)` marker with it). Pressing `Enter` on the column still edits the **current** AIM (a
+  new revision) — the `e` form's `/aim (1):` line is what rewrites the original.
 - **Detail-pane AIM (first + last only)** — the `job details:` pane shows just the **first** AIM
   ever defined (`/aim (1):`) and the **last/current** one (`/aim (N):`), never the middle
   revisions; when the AIM has only one revision (or predates history) just the single `/aim (1):`
@@ -856,11 +866,12 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   `ccc set-aim -f/--first "<text>"`), for when the *original* done-condition was stated badly and
   the pane/history keeps showing that wording. It is rewritten **in place**: revision 1's text is
   replaced (re-scored, its stale short-AIM label dropped), **no** revision is appended, the running
-  index never shifts, and the current AIM is untouched. The **short-AIM label is regenerated**
-  with it — the narrow `/aim` column renders that label, and the generator builds it from the
-  original AIM as a hint, so the rewrite drops the stale one (column falls back to the full AIM)
-  and spawns a fresh one; without that the column would keep showing the pre-edit wording while
-  the detail pane already shows the new. Emptying it is refused — history never
+  index never shifts, and the current AIM is untouched. The **short-AIM labels are regenerated**
+  with it — revision (1)'s (what the `/aim` column renders) and the current AIM's, whose
+  generator is hinted with the original wording, so both went stale. The rewrite drops them
+  (column and detail fall back to the full text) and spawns `ccc short-aim`, which rebuilds
+  both; without that the column would keep showing the pre-edit wording while the detail pane
+  already shows the new. Emptying it is refused — history never
   loses where the goal started. When that first revision *is* the current AIM (a single revision,
   or an AIM predating history) the live AIM is rewritten with it and any stale DONE verdict is
   dropped; the sub-goal checklist is kept, since restating a goal is not changing it.

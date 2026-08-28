@@ -34,6 +34,25 @@ def test_render_row_paints_only_low_aim_score_red() -> None:
     assert f"{_RED}improve things\x1b[0m" not in lines[0]
 
 
+def test_render_row_shows_first_aim_revision_by_default() -> None:
+    """The `/aim` column renders revision (1); `aim_first=False` (config "latest") the current."""
+    session = Session(
+        session_id="s1",
+        cwd="/repo",
+        aim="second aim: pytest -q green",
+        aim_score=85,
+        first_aim="first aim: ccc ls shows the row",
+    )
+    row = Row(session, None, Status.PARKED, 0, 0)
+    default = ls_view._render_row(row, enabled=False, warn_days=2, aim_threshold=50)[0]
+    assert "first aim: ccc ls shows the row" in default
+    assert "second aim: pytest -q green" not in default
+    latest = ls_view._render_row(
+        row, enabled=False, warn_days=2, aim_threshold=50, aim_first=False
+    )[0]
+    assert "second aim: pytest -q green" in latest
+
+
 def test_render_row_specific_aim_not_red() -> None:
     lines = ls_view._render_row(
         _row("all tests pass", 85), enabled=True, warn_days=2, aim_threshold=50

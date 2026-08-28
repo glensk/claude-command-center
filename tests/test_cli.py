@@ -353,6 +353,50 @@ def test_check_out_of_range_errors_and_mutates_nothing(
         assert all(not s.checked for s in store.list_subgoals("sess-a"))
 
 
+def test_short_aim_backfills_the_first_revision_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ccc short-aim`` labels the CURRENT AIM and, when it lost one, revision (1) too.
+
+    Revision (1) is what the `/aim` column renders (``aim_column = "first"``), and its label
+    does not come along with the current AIM's — so the generator writes both.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    cfg = _no_score_cfg()
+    for attr, value in (
+        ("short_aim", True),
+        ("short_aim_backend", "codex"),
+        ("short_aim_model", ""),
+    ):
+        setattr(cfg, attr, value)
+    monkeypatch.setattr("command_center.cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "command_center.short_aim.generate",
+        lambda aim, **kw: f"label:{aim.split(':')[0]}",
+    )
+    (tmp_path / "command-center").mkdir(parents=True)
+    db = tmp_path / "command-center" / "state.db"
+    with Store(db) as store:
+        store.ensure("s1", cwd="/repo")
+        store.set_aim("s1", "first aim: ccc ls lists it")
+        store.set_aim("s1", "second aim: pytest -q green")  # revision (1) carries no label
+
+    assert cli.cmd_short_aim(argparse.Namespace(session="s1", dry_run=None)) == 0
+
+    with Store(db) as store:
+        session = store.get("s1")
+    assert session is not None
+    assert session.short_aim == "label:second aim"
+    assert session.first_short_aim == "label:first aim"
+
+    # Idempotent: an already-labelled revision (1) is not regenerated (no second codex call).
+    monkeypatch.setattr("command_center.short_aim.generate", lambda aim, **kw: "regenerated")
+    assert cli.cmd_short_aim(argparse.Namespace(session="s1", dry_run=None)) == 0
+    with Store(db) as store:
+        session = store.get("s1")
+    assert session is not None and session.first_short_aim == "label:first aim"
+
+
 def test_set_aim_first_rewrites_revision_one_without_adding_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -185,6 +185,33 @@ def test_table_row_paints_only_low_aim_score_red(
     asyncio.run(scenario())
 
 
+def test_aim_column_shows_first_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default `aim_column = "first"`: the column (header `/aim (1)`) shows the ORIGINAL AIM."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store(tmp_path / "command-center" / "state.db")
+    sid = "revised-aim-session"
+    store.ensure(sid, cwd="/Users/x/repo")
+    store.set_aim(sid, "first aim: the ccc column shows this")
+    store.set_aim(sid, "second aim: pytest -q green")
+    store.close()
+
+    from command_center.views.tui import _AIM_COL, CommandCenterApp, SessionTable
+
+    async def scenario(first: bool) -> str:
+        app = CommandCenterApp()
+        if not first:
+            app.cfg.aim_column = "latest"
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            table = app.query_one("#sessions", SessionTable)
+            header = _plain(list(table.columns.values())[_AIM_COL].label)
+            assert header.strip() == ("/aim (1)" if first else "/aim")
+            return _plain(table.get_row_at(table.get_row_index(sid))[_AIM_COL])
+
+    assert "first aim: the ccc column shows this" in asyncio.run(scenario(True))
+    assert "second aim: pytest -q green" in asyncio.run(scenario(False))
+
+
 def test_table_row_shows_codex_badge_and_waiting_reset_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

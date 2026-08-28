@@ -509,6 +509,52 @@ def test_aim_history_seeds_preexisting_original(tmp_path: Path) -> None:
     assert [h.aim for h in store.list_aim_history("s1")] == ["legacy aim", "sharpened aim"]
 
 
+def test_sessions_carry_their_first_aim_revision(tmp_path: Path) -> None:
+    """Every Session read joins revision (1) + its short label — what the `/aim` column shows."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    store.set_aim("s1", "first aim: ccc ls shows the row")
+    store.set_short_aim("s1", "first label")  # revision (1) IS the current one here
+    store.set_aim("s1", "second aim: pytest -q green")
+    store.set_short_aim("s1", "second label")  # lands on the CURRENT revision only
+
+    session = store.get("s1")
+    assert session is not None
+    assert session.first_aim == "first aim: ccc ls shows the row"
+    assert session.first_short_aim == "first label"  # revision (1) kept its own label
+    assert session.aim == "second aim: pytest -q green"  # …and the current one is untouched
+    assert session.short_aim == "second label"
+    listed = next(s for s in store.list_sessions() if s.session_id == "s1")
+    assert (listed.first_aim, listed.first_short_aim) == (session.first_aim, "first label")
+
+    # An AIM that predates history tracking has no recorded revision (1) → both stay None.
+    store.ensure("s2")
+    store.update_fields("s2", aim="legacy aim")
+    legacy = store.get("s2")
+    assert legacy is not None
+    assert (legacy.first_aim, legacy.first_short_aim) == (None, None)
+
+
+def test_set_first_short_aim_labels_revision_one(tmp_path: Path) -> None:
+    """The revision-(1) label is writable on its own (the `/aim` column's text after a rewrite)."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    store.set_aim("s1", "first aim: ccc ls shows the row")
+    store.set_aim("s1", "second aim: pytest -q green")
+    store.set_short_aim("s1", "second label")
+
+    store.set_first_short_aim("s1", "first label")
+    history = store.list_aim_history("s1")
+    assert [h.short_aim for h in history] == ["first label", "second label"]
+    session = store.get("s1")
+    assert session is not None
+    assert session.first_short_aim == "first label"
+    assert session.short_aim == "second label"  # the current label is left alone
+
+    store.set_first_short_aim("s1", "  ")  # blank clears back to None
+    assert store.list_aim_history("s1")[0].short_aim is None
+
+
 def test_set_first_aim_rewrites_revision_one_in_place(tmp_path: Path) -> None:
     """``/aim (1)`` is editable: revision 1 is rewritten, no revision added, current AIM kept."""
     store = _store(tmp_path)

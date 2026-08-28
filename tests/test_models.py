@@ -14,6 +14,7 @@ from command_center.models import (
     Session,
     Status,
     Subgoal,
+    aim_column_first,
     aim_score_badge,
     aim_score_pct,
     deadline_badge,
@@ -152,6 +153,34 @@ def test_display_aim_prefers_short_label() -> None:
     assert display_aim(both) == "implement x"
     assert display_aim(Session("s", aim="the long full aim")) == "the long full aim"
     assert display_aim(Session("s")) is None
+
+
+def test_display_aim_first_renders_revision_one() -> None:
+    """``first=True`` (the `aim_column = "first"` default) renders revision (1), not the current."""
+    session = Session(
+        "s",
+        aim="sharpened aim",
+        short_aim="sharpened",
+        first_aim="the aim as first typed",
+        first_short_aim="as first typed",
+    )
+    assert display_aim(session, first=True) == "as first typed"  # revision (1)'s short label
+    assert display_aim(session) == "sharpened"  # unchanged default: the current AIM
+
+    # Revision (1) with no short label of its own falls back to its full text …
+    unlabelled = Session("s", aim="sharpened aim", short_aim="sharpened", first_aim="first typed")
+    assert display_aim(unlabelled, first=True) == "first typed"
+    # … and an AIM that predates history tracking (no revision recorded) to the live AIM.
+    assert display_aim(Session("s", aim="only aim"), first=True) == "only aim"
+
+
+def test_aim_column_first_only_latest_opts_out() -> None:
+    """Only an explicit "latest" turns the first-AIM column off; typos keep the default."""
+    assert aim_column_first("first") is True
+    assert aim_column_first("") is True
+    assert aim_column_first("frist") is True  # a typo must not silently flip the column
+    assert aim_column_first("latest") is False
+    assert aim_column_first("  LATEST  ") is False
 
 
 HOUR_MS = 3_600_000
