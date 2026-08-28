@@ -55,6 +55,8 @@ from .codex_in_claude import (
     _FIVE_HOUR_MINUTES,
     _SEVEN_DAY_MINUTES,
     _latest_rate_limits_event,
+    codex_refusal,
+    refusal_label,
 )
 
 # Statuses that mean a job is actively doing work — while any tracked session is in one
@@ -181,9 +183,20 @@ class Usage:
     # status-line captures and Codex snapshots). Drives the ``Fable: stale <age>`` marker in
     # the render path — see :data:`_FABLE_STALE_AFTER_SEC` and :func:`_render_card`.
     oauth_fetched_at: int = 0
+    # Codex only: non-empty when Codex is REFUSING calls for a reason that is not a
+    # window — today `workspace_owner_credits_depleted`. The windows above stay whatever
+    # the last successful call reported, so without this the card shows healthy headroom
+    # while nothing works. See :func:`codex_in_claude.codex_refusal`.
+    blocked_reason: str = ""
+    blocked_at: int = 0  # epoch seconds of the refusal that set ``blocked_reason``
 
     def is_empty(self) -> bool:
         return self.five_hour is None and self.seven_day is None
+
+    @property
+    def blocked(self) -> bool:
+        """True when the provider refuses calls regardless of what the windows say."""
+        return bool(self.blocked_reason)
 
 
 def codex_exhausted_window(
@@ -852,26 +865,45 @@ def read_codex_usage(now: int | None = None) -> Usage | None:
         return None
     if _codex_cache is not None and (_codex_cache[0], _codex_cache[1]) == key:
         return _codex_cache[2]
+    # Pick the newest EVENT, not the first file in mtime order, and date it by the
+    # event's own timestamp. File mtime is not a proxy for event age: Codex re-touches
+    # old rollout files (resumed threads, writer locks), and on 2026-08-29 a 3-day-old
+    # file sat at position 0 by mtime, so breaking on the first hit returned a 08-25
+    # reading of 19% while the real newest event said 81%. ``_codex_rate_snapshot`` in
+    # codex_in_claude.py already picks by ``max(captured_at)``; this mirrors it.
+    freshest = max(
+        (
+            rate_snapshot
+            for path in files[:_CODEX_SCAN_LIMIT]
+            if (rate_snapshot := _latest_rate_limits_event(path)) is not None
+        ),
+        key=lambda item: item.captured_at,
+        default=None,
+    )
     snapshot: Usage | None = None
-    for path in files[:_CODEX_SCAN_LIMIT]:
-        rate_snapshot = _latest_rate_limits_event(path)
-        if rate_snapshot is None:
-            continue
+    if freshest is not None:
         windows = {
             minutes: Window(used_percentage=parsed.used_percent, resets_at=parsed.resets_at)
-            for minutes, parsed in rate_snapshot.windows.items()
+            for minutes, parsed in freshest.windows.items()
         }
-
-        try:
-            captured = int(path.stat().st_mtime)
-        except OSError:
-            captured = now
         snapshot = Usage(
-            captured_at=captured,
+            captured_at=freshest.captured_at or now,
             five_hour=windows.get(_FIVE_HOUR_MINUTES),
             seven_day=windows.get(_SEVEN_DAY_MINUTES),
         )
-        break
+    # A refusal lives in the windowless blocks the loop above skips, so it is read
+    # separately and stapled on: the windows keep reporting the last healthy figures
+    # while Codex rejects every call, and only this field says so.
+    refusal = codex_refusal()
+    if refusal is not None:
+        blocked = Usage(
+            captured_at=snapshot.captured_at if snapshot is not None else refusal.captured_at,
+            five_hour=snapshot.five_hour if snapshot is not None else None,
+            seven_day=snapshot.seven_day if snapshot is not None else None,
+            blocked_reason=refusal_label(refusal.reached_type),
+            blocked_at=refusal.captured_at,
+        )
+        snapshot = blocked
     _codex_cache = (key[0], key[1], snapshot)
     return snapshot
 
@@ -1110,6 +1142,15 @@ def render_work_usage(usage: Usage | None, now: int | None = None) -> Text:
 def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
     """Render the two-bar OpenAI Codex usage card (green bars) as Rich ``Text``."""
     now = int(time.time()) if now is None else now
+    if usage is not None and usage.blocked:
+        # The bars below are the last SUCCESSFUL call's figures and would read as healthy
+        # headroom, so the refusal is stated first, in red, with the age of the numbers.
+        banner = Text(f"⛔ BLOCKED — {usage.blocked_reason}\n", style="bold red")
+        if usage.is_empty():
+            return banner + Text("(no window data)", style="grey50")
+        age = _format_age(now - usage.captured_at) if usage.captured_at else "?"
+        banner += Text(f"windows below are {age} old:\n", style="grey50")
+        return banner + _render_card(usage, now, fill_color=_CODEX_FILL, label_color=_CODEX_FILL)
     if usage is None or usage.is_empty():
         return Text("—\n(run Codex to populate)", style="grey50")
     return _render_card(usage, now, fill_color=_CODEX_FILL, label_color=_CODEX_FILL)

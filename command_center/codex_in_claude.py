@@ -1025,6 +1025,87 @@ def _latest_rate_limits_event(path: Path) -> _CodexRateSnapshot | None:
     return None
 
 
+@dataclass(frozen=True)
+class _CodexRefusal:
+    """A recorded refusal: Codex declined the call for a reason that is not a window."""
+
+    captured_at: int
+    reached_type: str  # raw ``rate_limit_reached_type``, e.g. workspace_owner_credits_depleted
+
+
+# Human labels for the refusal codes seen in the wild; anything else is de-snaked as-is.
+_REFUSAL_LABELS = {
+    "workspace_owner_credits_depleted": "workspace credits depleted",
+}
+
+
+def refusal_label(reached_type: str) -> str:
+    """Human-readable form of a ``rate_limit_reached_type`` code."""
+    return _REFUSAL_LABELS.get(reached_type, reached_type.replace("_", " "))
+
+
+def _latest_limit_block(path: Path) -> _CodexRefusal | None:
+    """Newest ``rate_limits`` block in a rollout JSONL — windowless ones INCLUDED.
+
+    Deliberately the mirror of :func:`_latest_rate_limits_event`, which SKIPS the
+    windowless ``premium`` blocks. Those are exactly where a hard refusal is recorded
+    (``rate_limit_reached_type``), so a reader that only wants windows never sees it and
+    happily reports the last healthy percentages while every call is being rejected.
+    ``reached_type`` is empty when the newest block records no refusal.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        fallback = int(path.stat().st_mtime)
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if '"rate_limits"' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        rate_limits = _dig_rate_limits(obj)
+        if rate_limits is None:
+            continue
+        raw = rate_limits.get("rate_limit_reached_type")
+        return _CodexRefusal(
+            captured_at=_event_timestamp(obj, fallback),
+            reached_type=raw.strip() if isinstance(raw, str) else "",
+        )
+    return None
+
+
+def codex_refusal() -> _CodexRefusal | None:
+    """The live refusal Codex last recorded, or ``None`` when calls are going through.
+
+    Only the NEWEST block across recent rollout files decides: an older refusal that a
+    later successful call superseded must never keep the seat marked blocked.
+
+    Deliberately NOT keyed on ``credits.has_credits``. That field is ``false`` on a
+    perfectly healthy plan-covered seat — verified 2026-08-28 against sessions that
+    completed normally minutes before the block appeared — so it says nothing about
+    whether calls are being refused. ``rate_limit_reached_type`` is ``null`` while
+    healthy and carries the reason once refusals start.
+    """
+    sessions = _codex_home() / "sessions"
+    try:
+        files = sorted(
+            sessions.glob("**/rollout-*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    blocks = [
+        block
+        for path in files[:_CODEX_SCAN_LIMIT]
+        if (block := _latest_limit_block(path)) is not None
+    ]
+    newest = max(blocks, key=lambda item: item.captured_at, default=None)
+    return newest if newest is not None and newest.reached_type else None
+
+
 def _codex_rate_snapshot() -> _CodexRateSnapshot | None:
     """Newest duration-keyed Codex quota event across recent rollout files."""
     sessions = _codex_home() / "sessions"
@@ -1297,7 +1378,14 @@ def codex_headroom(now: int | None = None) -> dict[str, Any]:
 
     state: str
     reason: str
-    if snapshot is None:
+    # A recorded refusal outranks every window reading: the windows can show ample
+    # headroom (they are a *plan allowance*, orthogonal to the workspace credit balance)
+    # while Codex rejects every call. Checked first so the gate cannot go ALLOWED the
+    # moment a window happens to roll over.
+    refusal = codex_refusal()
+    if refusal is not None:
+        state, reason = "blocked", f"Codex is refusing calls: {refusal_label(refusal.reached_type)}"
+    elif snapshot is None:
         state, reason = "unknown", "no usable rate_limits event"
     elif snapshot.malformed:
         state, reason = "unknown", "rate_limits event contains a malformed window"
@@ -1310,13 +1398,15 @@ def codex_headroom(now: int | None = None) -> dict[str, Any]:
     else:
         state, reason = "allowed", "every live window has sufficient headroom"
 
-    if state == "unknown":
+    if state in ("unknown", "blocked"):
         for row in rows:
-            row["verdict"] = "unknown"
+            row["verdict"] = state
     return {
         "state": state,
         "offload_allowed": state == "allowed",
         "reason": reason,
+        "refused_by": refusal.reached_type if refusal is not None else "",
+        "refused_at": refusal.captured_at if refusal is not None else None,
         "captured_at": snapshot.captured_at if snapshot is not None else None,
         "stale_after_seconds": _HEADROOM_STALE_AFTER_SECONDS,
         "reset_fresh_within_seconds": _HEADROOM_RESET_FRESH_SECONDS,
@@ -1506,11 +1596,15 @@ def cmd_headroom(args: argparse.Namespace) -> int:
             )
         if decision["state"] == "allowed":
             print("offload: ALLOWED")
+        elif decision["state"] == "blocked":
+            print(f"offload: DENIED (blocked — {decision['reason']})")
         elif decision["state"] == "reserve":
             print(f"offload: DENIED (reserve zone — {decision['reason']})")
         else:
             print(f"offload: DENIED (unknown — {decision['reason']})")
-    return {"allowed": 0, "reserve": 1, "unknown": 3}[decision["state"]]
+    # "blocked" shares the reserve exit code: the documented contract is 0 = offload
+    # allowed, non-zero = keep the work on Claude, and 3 already means "no usable data".
+    return {"allowed": 0, "reserve": 1, "blocked": 1, "unknown": 3}[decision["state"]]
 
 
 def cmd_delegate(args: argparse.Namespace) -> int:

@@ -41,10 +41,14 @@ def cic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
 
     ``CLAUDE_CONFIG_DIR`` matters: ``set-model``/``set-effort`` re-stamp the model marker
     into the codex skill/command descriptions, and tests must never touch the real ones.
+    ``CODEX_HOME`` matters too: ``codex_refusal`` scans the real rollout files for a
+    recorded refusal, so without this a genuinely blocked seat on the developer's machine
+    turns every headroom test's verdict into ``blocked``.
     """
     mod = _load_engine()
     monkeypatch.setenv("CODEX_IN_CLAUDE_CONFIG", str(tmp_path / "config.json"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     monkeypatch.setattr(mod, "list_models", lambda **_: list(_FAKE_CATALOG))
     return mod
 
@@ -864,3 +868,77 @@ def test_create_draft_job_type_roundtrip_and_coercion(tmp_path: Path) -> None:
     assert store.create_draft("c", "/r", "aim", job_type="garbage").job_type == "claude"  # coerced
     got = store.get("a")
     assert got is not None and got.job_type == "codex"  # persisted across read
+
+
+# --------------------------- refusal (credit) gate --------------------------- #
+def _write_rollout(root: Path, name: str, ts: int, body: str) -> Path:
+    """One rollout JSONL under a tmp CODEX_HOME, carrying a single rate_limits event."""
+    sessions = root / "sessions" / "2026" / "08" / "29"
+    sessions.mkdir(parents=True, exist_ok=True)
+    path = sessions / f"rollout-{name}.jsonl"
+    path.write_text(
+        '{"type":"event_msg","timestamp":%d,"payload":{"type":"token_count",'
+        '"rate_limits":%s}}\n' % (ts, body),
+        encoding="utf-8",
+    )
+    return path
+
+
+_HEALTHY_BLOCK = (
+    '{"limit_id":"codex","primary":{"used_percent":81.0,"window_minutes":300,'
+    '"resets_at":2000007200},"secondary":null,'
+    '"credits":{"has_credits":false,"unlimited":false,"balance":null},'
+    '"rate_limit_reached_type":null}'
+)
+_REFUSED_BLOCK = (
+    '{"limit_id":"premium","primary":null,"secondary":null,'
+    '"credits":{"has_credits":false,"unlimited":false,"balance":null},'
+    '"rate_limit_reached_type":"workspace_owner_credits_depleted"}'
+)
+
+
+def test_has_credits_false_alone_is_not_a_refusal(cic: ModuleType, tmp_path: Path) -> None:
+    """A plan-covered seat reports has_credits:false while working perfectly."""
+    _write_rollout(tmp_path / "codex", "healthy", 2000000000, _HEALTHY_BLOCK)
+    assert cic.codex_refusal() is None
+
+
+def test_refusal_detected_from_windowless_premium_block(cic: ModuleType, tmp_path: Path) -> None:
+    """The refusal lives in exactly the block the window reader skips."""
+    home = tmp_path / "codex"
+    _write_rollout(home, "healthy", 2000000000, _HEALTHY_BLOCK)
+    _write_rollout(home, "refused", 2000000100, _REFUSED_BLOCK)
+    refusal = cic.codex_refusal()
+    assert refusal is not None
+    assert refusal.reached_type == "workspace_owner_credits_depleted"
+    assert cic.refusal_label(refusal.reached_type) == "workspace credits depleted"
+
+
+def test_later_success_supersedes_an_earlier_refusal(cic: ModuleType, tmp_path: Path) -> None:
+    """Only the NEWEST block decides — a topped-up seat must not stay marked blocked."""
+    home = tmp_path / "codex"
+    _write_rollout(home, "refused", 2000000000, _REFUSED_BLOCK)
+    _write_rollout(home, "healthy", 2000000100, _HEALTHY_BLOCK)
+    assert cic.codex_refusal() is None
+
+
+def test_headroom_blocked_by_refusal_despite_window_headroom(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ample window headroom must not produce ALLOWED while Codex refuses calls."""
+    snapshot = cic._CodexRateSnapshot(
+        captured_at=_HEADROOM_NOW,
+        windows={
+            300: cic._CodexRateWindow(
+                used_percent=5.0, resets_at=_HEADROOM_NOW + 9000, window_minutes=300
+            )
+        },
+    )
+    monkeypatch.setattr(cic, "_codex_rate_snapshot", lambda: snapshot)
+    _write_rollout(tmp_path / "codex", "refused", 2000000100, _REFUSED_BLOCK)
+    decision = cic.codex_headroom(now=_HEADROOM_NOW)
+    assert decision["state"] == "blocked"
+    assert decision["offload_allowed"] is False
+    assert decision["refused_by"] == "workspace_owner_credits_depleted"
+    args = argparse.Namespace(json=False)
+    assert cic.cmd_headroom(args) == 1

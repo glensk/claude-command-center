@@ -2141,6 +2141,10 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
         )
         mark = _QUOTA_MARK.get(state, " ")
         detail = wins or prov.get("reason", "")
+        # A non-available provider that also has windows used to show ONLY the windows,
+        # hiding why it is blocked — and a refusal's windows read as healthy headroom.
+        if wins and state != quota.AVAILABLE and prov.get("reason"):
+            detail = f"{prov['reason']} ({wins})"
         print(f"  {mark} {prov['id']:<14} {state:<10} {unblocks:<16} {detail}")
     if snap["best_claude_account"]:
         print(f"best Claude account (spends what resets soonest): {snap['best_claude_account']}")

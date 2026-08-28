@@ -390,6 +390,20 @@ def _codex_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
         state = _window_state(name, win, snap.captured_at, now, stale_after)
         if state is not None:
             windows[name] = state
+    if snap.blocked:
+        # Codex is refusing calls for a reason the windows cannot express (the plan
+        # allowance and the workspace credit balance are separate gates). The windows
+        # are still attached as evidence, but they must not produce an AVAILABLE verdict.
+        return ProviderQuota(
+            id="codex",
+            kind="codex",
+            state=BLOCKED,
+            reason=snap.blocked_reason,
+            source="refusal",
+            windows=windows,
+            blocked_by="refusal",
+            captured_at=snap.blocked_at or snap.captured_at,
+        )
     verdict, reason, blocked_by, resets_at, risky = _verdict_from_windows(windows.values())
     return ProviderQuota(
         id="codex",
