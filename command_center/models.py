@@ -419,6 +419,12 @@ class Session:
     archived: bool = False
     created_at: int = 0
     updated_at: int = 0
+    # DERIVED, not columns: the session's FIRST recorded AIM — revision (1) — and that
+    # revision's cheap-model short label, joined off ``aim_history`` by every Store read
+    # (see store._SESSION_SELECT). Both are None when the AIM predates history tracking;
+    # callers fall back to the live AIM. This is what ``aim_column = "first"`` renders.
+    first_aim: str | None = None
+    first_short_aim: str | None = None
 
 
 # Future-job launch types: how `ccc start-job` turns a draft's prompt into a launch command.
@@ -858,13 +864,31 @@ def models_readout(session: Session) -> str:
     return f"{session.llm_overseer} {LLM_ARROW} {session.llm_exec}"
 
 
-def display_aim(session: Session) -> str | None:
+def aim_column_first(aim_column: str) -> bool:
+    """Whether the ``/aim`` column renders revision (1), from the ``aim_column`` config.
+
+    Only the explicit ``"latest"`` opts back into the current-AIM column; anything else
+    (including an empty or misspelled value) keeps the default first-AIM rendering.
+    """
+    return (aim_column or "").strip().lower() != "latest"
+
+
+def display_aim(session: Session, first: bool = False) -> str | None:
     """The compact AIM label: the cheap-model short label if one was generated, else the
     full AIM verbatim. The full AIM is always kept intact in the store and shown in the
     detail pane / aim-history; this is what the narrow ``/aim`` column AND the in-session
     status line render. ``store.set_aim`` clears the label on every AIM change, so this is
     always the LATEST revision's label (or the full new AIM until the generator backfills).
+
+    With *first* (config ``aim_column = "first"``, the default) it renders revision **(1)**
+    instead — the done-condition as originally typed. That keeps the ``/aim`` column, and
+    every "which job is this?" label built from it, stable while the AIM is sharpened over
+    the session's life; the current AIM stays visible in the status line, the detail pane
+    and ``ccc aim-history``. Sessions whose AIM predates history tracking have no recorded
+    revision (1) — they fall back to the live AIM.
     """
+    if first and session.first_aim:
+        return session.first_short_aim or session.first_aim
     return session.short_aim or session.aim
 
 

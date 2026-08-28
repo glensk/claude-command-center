@@ -73,6 +73,11 @@ DEFAULTS: dict[str, object] = {
     "adapt_subgoals_on_aim_change": True,  # nudge the agent to re-align an adaptive checklist
     "drift_check": False,  # run the impartial drift checker after a sub-goal change (INERT: off)
     "drift_model": "",  # model for the drift checker ("" = use llm_model); never the session agent
+    # Which AIM revision the narrow /aim column (TUI + `ccc ls`) renders: "first" = the
+    # done-condition as ORIGINALLY typed (revision (1)) so the column is a stable job
+    # identity while the AIM is sharpened; "latest" = the current AIM. Either way the
+    # current AIM stays in the status line, the detail pane and `ccc aim-history`.
+    "aim_column": "first",
     "short_aim": False,  # derive a short scannable AIM label for the /aim column (INERT: off)
     # generator: "auto" (codex if on PATH else claude) | "codex" (saves Claude tokens) | "claude"
     "short_aim_backend": "auto",
@@ -366,6 +371,7 @@ class Config:
     adapt_subgoals_on_aim_change: bool = True
     drift_check: bool = False
     drift_model: str = ""
+    aim_column: str = "first"  # /aim column revision: "first" (revision (1)) | "latest"
     short_aim: bool = False
     short_aim_backend: str = "auto"
     short_aim_model: str = ""

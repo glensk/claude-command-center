@@ -120,6 +120,7 @@ def _render_row(
     enabled: bool,
     warn_days: int,
     aim_threshold: int,
+    aim_first: bool = True,
     account_markers: dict[str, str] | None = None,
     adapter: Adapter | None = None,
     resume_armed_ids: frozenset[str] = frozenset(),
@@ -180,8 +181,9 @@ def _render_row(
         chip = aim_score_pct(session.aim, session.aim_score)
         low_score = low_aim_score(session.aim, session.aim_score, aim_threshold)
         chip_str = _paint(_SEVERITY_COLOR["red"] if low_score else _DIM, chip, enabled)
-        # Show the compact short-AIM label (cheap-model) when present, else the full AIM.
-        label = display_aim(session) or session.aim
+        # Show the compact short-AIM label (cheap-model) when present, else the full AIM —
+        # of revision (1) under `aim_column = "first"` (the default), else the current AIM.
+        label = display_aim(session, aim_first) or session.aim
         aim = f"{chip_str} {label}"
 
     if session.draft:
@@ -293,6 +295,7 @@ def render(
     warn_days: int = 2,
     folder_order: tuple[str, ...] | None = None,
     aim_threshold: int = 50,
+    aim_first: bool = True,
 ) -> str:
     """Return the full ``ccc ls`` output as a string."""
     rows = (
@@ -326,7 +329,14 @@ def render(
         counts[row.status] = counts.get(row.status, 0) + 1
         out.extend(
             _render_row(
-                row, enabled, warn_days, aim_threshold, account_markers, adapter, resume_armed_ids
+                row,
+                enabled,
+                warn_days,
+                aim_threshold,
+                aim_first,
+                account_markers,
+                adapter,
+                resume_armed_ids,
             )
         )
     summary = "  ".join(

@@ -94,6 +94,7 @@ from ..models import (
     STATUS_ICON,
     Session,
     Status,
+    aim_column_first,
     aim_score_pct,
     days_until_start,
     display_aim,
@@ -395,17 +396,24 @@ def _keyhints_text() -> Text:
     return out
 
 
-def _header_text(leading: str, word: str) -> Text:
-    """A column header; if *word* labels a command column, its shortcut shows gold."""
+def _header_text(leading: str, word: str, suffix: str = "") -> Text:
+    """A column header; if *word* labels a command column, its shortcut shows gold.
+
+    *suffix* is appended dimmed and OUTSIDE the mnemonic lookup (the `/aim (1)` marker
+    that says the column shows the ORIGINAL AIM), so it never breaks the shortcut match.
+    """
     if word == _HEAD_LABEL:
         # The header-line label (mirrors the footer's `keys:`): dimmed so it reads
         # as a line name, not a column name.
         return Text(leading + word, style="grey42")
     key = commands.column_key(word)
     if key is None:
-        return Text(leading + word, style="bold")
-    out = Text(leading, style="bold")
-    out.append_text(_gold_mnemonic(word, key, "bold"))
+        out = Text(leading + word, style="bold")
+    else:
+        out = Text(leading, style="bold")
+        out.append_text(_gold_mnemonic(word, key, "bold"))
+    if suffix:
+        out.append(suffix, style="grey42")
     return out
 
 
@@ -2083,11 +2091,26 @@ class CommandCenterApp(App[None]):
                     yield Static("", id="usage-nixos-tier-a")
         yield Static(id="keyhints")
 
+    @property
+    def _aim_first(self) -> bool:
+        """Whether the ``/aim`` column (and the job labels built from it) shows revision (1).
+
+        A property, not a cached flag: ``action_settings`` reloads ``self.cfg`` in place.
+        """
+        return aim_column_first(self.cfg.aim_column)
+
     def on_mount(self) -> None:
         self.store = Store(check_same_thread=False)
         table = self.query_one("#sessions", DataTable)
         table.cell_padding = 0  # minimise the gaps between status / ! / folder
-        table.add_columns(*[_header_text(*spec) for spec in _HEADERS])
+        # `/aim (1)` names what the column shows when it renders the ORIGINAL AIM.
+        aim_suffix = " (1)" if self._aim_first else ""
+        table.add_columns(
+            *[
+                _header_text(lead, word, aim_suffix if word == "/aim" else "")
+                for lead, word in _HEADERS
+            ]
+        )
         # Pin /aim to a fixed width up front (it is stretched to fill in fit_aim_column);
         # this stops the long, capped aim text from ballooning the column for one frame.
         aim_col = list(table.columns.values())[_AIM_COL]
@@ -2725,7 +2748,10 @@ class CommandCenterApp(App[None]):
         else:
             aim.append(" " * 5)
         # Show the compact short-AIM label (cheap-model) when present, else the full AIM.
-        aim.append((_first_line(display_aim(session)) or "—")[:_AIM_MAX_CHARS], style=aim_style)
+        aim.append(
+            (_first_line(display_aim(session, self._aim_first)) or "—")[:_AIM_MAX_CHARS],
+            style=aim_style,
+        )
         if session.draft:
             # Future job: the next-step column doubles as a tags/notes column, carrying
             # any @tags plus the free-text start_when note (moved off the id column).
@@ -3105,7 +3131,7 @@ class CommandCenterApp(App[None]):
             text.append("\n/depends-on: ", style="white")
             text.append(DEP_MARKER + " ", style=marker_style)
             repo = colors.short_folder(parent.cwd) if parent else "?"
-            aim = (_first_line(display_aim(parent)) if parent else "") or "—"
+            aim = (_first_line(display_aim(parent, self._aim_first)) if parent else "") or "—"
             text.append(f"{future_files.display_hash(dep)} {repo} — {aim} ({state})", style="white")
         marks = importance_marks(getattr(session, "importance", 0)) or "—"
         text.append(f"\n! important: {marks}\n", style="white")
@@ -4267,8 +4293,14 @@ class CommandCenterApp(App[None]):
 
                 spawn.spawn_ccc(["score-aim", "--session", sid])
 
+        original = (session.first_aim or "") if session else ""
+        prompt = "This session is done when:"
+        if self._aim_first and original and original != (session.aim if session else None):
+            # The column renders revision (1) but this editor writes the CURRENT AIM (a new
+            # revision) — say so, and point at the `e` form's `/aim (1):` line for the other.
+            prompt += "  (sets the CURRENT aim; rewrite (1) in the `e` form)"
         self._edit(
-            "This session is done when:",
+            prompt,
             (session.aim or "") if session else "",
             _save,
             multiline=True,
@@ -4666,13 +4698,13 @@ class CommandCenterApp(App[None]):
         parent = self.store.get(dep)
         if parent is None:
             return f"{future_files.display_hash(dep)} — (missing)"
-        aim = _first_line(display_aim(parent)) or "—"
+        aim = _first_line(display_aim(parent, self._aim_first)) or "—"
         return f"{future_files.display_hash(dep)} {colors.short_folder(parent.cwd)} — {aim[:36]}"
 
     def _dep_option_label(self, session: Session) -> str:
         """One candidate's row label in the dependency picker (hash · repo · status · aim)."""
         status = "FUTURE" if session.draft else session.status
-        aim = _first_line(display_aim(session)) or "—"
+        aim = _first_line(display_aim(session, self._aim_first)) or "—"
         return (
             f"{future_files.display_hash(session.session_id)}  "
             f"{colors.short_folder(session.cwd)}  {status}  — {aim[:36]}"

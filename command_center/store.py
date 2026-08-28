@@ -253,6 +253,22 @@ CREATE INDEX IF NOT EXISTS idx_file_lock_waiters_session ON file_lock_waiters(se
 """
 
 
+# Every Session read goes through this SELECT: the sessions row PLUS two derived fields —
+# the session's FIRST recorded AIM (revision (1)) and that revision's short label, read
+# straight off `aim_history`. Derived rather than denormalized into columns so there is
+# nothing for set_aim/set_first_aim/set_short_aim to keep in sync; the correlated
+# sub-selects hit idx_aim_history_session and cost nothing at TUI table sizes. Both are
+# NULL for an AIM that predates history tracking — display_aim falls back to the live AIM.
+_SESSION_SELECT = """
+SELECT s.*,
+       (SELECT h.aim FROM aim_history h WHERE h.session_id = s.session_id
+         ORDER BY h.created_at, h.id LIMIT 1) AS first_aim,
+       (SELECT h.short_aim FROM aim_history h WHERE h.session_id = s.session_id
+         ORDER BY h.created_at, h.id LIMIT 1) AS first_short_aim
+FROM sessions s
+"""
+
+
 def _row_to_session(row: sqlite3.Row) -> Session:
     data = {key: row[key] for key in row.keys()}
     for col in _BOOL_COLUMNS:
@@ -397,14 +413,14 @@ class Store:  # pylint: disable=too-many-public-methods
 
     # ---- sessions -------------------------------------------------------
     def get(self, session_id: str) -> Session | None:
-        cur = self.conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
+        cur = self.conn.execute(_SESSION_SELECT + " WHERE s.session_id = ?", (session_id,))
         row = cur.fetchone()
         return _row_to_session(row) if row else None
 
     def list_sessions(self, include_archived: bool = False) -> list[Session]:
-        sql = "SELECT * FROM sessions"
+        sql = _SESSION_SELECT
         if not include_archived:
-            sql += " WHERE archived = 0"
+            sql += " WHERE s.archived = 0"
         return [_row_to_session(r) for r in self.conn.execute(sql).fetchall()]
 
     def delete(self, session_id: str) -> None:
@@ -1009,6 +1025,23 @@ class Store:  # pylint: disable=too-many-public-methods
             "UPDATE aim_history SET short_aim = ? WHERE id = ("
             "  SELECT id FROM aim_history WHERE session_id = ? ORDER BY created_at DESC, id DESC "
             "  LIMIT 1)",
+            (label, session_id),
+        )
+        self.conn.commit()
+
+    def set_first_short_aim(self, session_id: str, short_aim: str | None) -> None:
+        """Store the cheap-model short label on the FIRST recorded AIM revision.
+
+        The counterpart of :meth:`set_short_aim` for revision (1): with
+        ``aim_column = "first"`` that revision is what the narrow ``/aim`` column renders,
+        so it needs a label of its own once the current AIM has moved on. Written by the
+        detached ``ccc short-aim`` generator; a no-op for a session with no recorded
+        history (its live AIM *is* revision 1, and carries the session's own label).
+        """
+        label = (short_aim or "").strip() or None
+        self.conn.execute(
+            "UPDATE aim_history SET short_aim = ? WHERE id = ("
+            "  SELECT id FROM aim_history WHERE session_id = ? ORDER BY created_at, id LIMIT 1)",
             (label, session_id),
         )
         self.conn.commit()
