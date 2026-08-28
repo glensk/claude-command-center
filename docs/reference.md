@@ -43,6 +43,7 @@ flags. Grouped by what they do:
 - `ccc new-prompt [-r cat/repo] [-o]` — a prefilled capture file for a future job.
 - `ccc jobs` — list registered future jobs (drafts).
 - `ccc job-account` — per-account usage urgency + which account a new job will bill to (the `job_account` policy).
+- `ccc quota` — cache-first quota oracle: which provider/account still has tokens, and when each blocked one unblocks.
 - `ccc start-job <id>` / `ccc open-job <id>|--file` — launch a saved job (in place / in a new tab, safe from Obsidian). Prefer `open-job` from scripts and agents: `start-job` execs in place and refuses without a TTY (it opens a tab instead) — see "Terminal guard" below.
 - `ccc done-job` · `ccc delete-job` · `ccc restore-job` · `ccc unlaunch` — the lifecycle: done-without-running / trash / restore / back-to-draft.
 
@@ -1589,6 +1590,69 @@ filenames); malformed entries are skipped.
 - **ccc's own state stays account-independent**: the DB/config root is `$CCC_HOME`
   (default: the `claude_home()` tree), so one store, daemon and TUI serve every
   account; only the usage snapshots are per-account.
+
+
+## `ccc quota` — the quota oracle
+
+Answers "which provider still has tokens, and until when?" from **cache only** (~0.07 s of
+reading, ~0.3 s of process start), so any script or agent can consult it before spending a
+provider attempt. This exists because the alternative is discovering a dead provider by
+ATTEMPTING it: with the GitHub Copilot seat hard-429 for three days, every `ai.py push`
+paid a doomed retry — 300 s of it, because the same-seat OpenCode fallback re-ran the
+already-refused request.
+
+```commands
+ccc quota                       # human table: provider · state · unblocks · windows
+ccc quota -j                    # versioned JSON contract (for scripts)
+ccc quota -p copilot            # one provider; exit 0=available 1=blocked 2=unknown
+ccc quota -b                    # best CLAUDE account label only
+ccc quota -M claude-opus-4-6    # scope Claude windows to the model you will call
+ccc quota -r                    # force a live re-fetch (the ONLY networked path)
+ccc quota -m copilot -u 272848 -R "429 quota exceeded"   # record an authoritative block
+ccc quota -c copilot            # clear a block
+```
+
+### Four states, and why the distinction matters
+
+| state | meaning | effect on a caller's ladder |
+| :--------- | :------------------------------------------------------ | :-------------------------- |
+| `available` | headroom proven by fresh, authoritative data | use it |
+| `blocked` | a window at 100 %, or an unexpired provider rejection | skip it |
+| `unknown` | no data, stale data, or a *guessed* denominator | **still try it** |
+| `disabled` | a capability fact with no reset (retired Gemini tier) | skip it, permanently |
+
+`unknown` is deliberately not `blocked`. Refusing to try a provider because we failed to
+*measure* it would silently delete a working rung — a worse failure than one wasted
+attempt. Callers fail open.
+
+### Windows are never collapsed
+
+A provider can be at 100 % on its 5-hour window and 49 % on its weekly one. A single
+`used_pct` would render that as healthy and send the caller straight into a rejection, so
+each provider carries a `windows` map, a `blocked_by` naming the window that blocks, and a
+`resets_at` taken from *that* window.
+
+### Hard exhaustion ≠ routing risk
+
+`routing._EXHAUSTED_PCT` (90 %) deprioritizes an account because a long job launched there
+might die mid-run. Reusing it here would throw away a tenth of a paid subscription, so
+this module reports `risky` separately; only `blocked` (≥ 100 %, or a rejection) removes a
+rung.
+
+### Model scoping
+
+Claude accounts expose a Fable-model-scoped weekly window alongside the plain one. An
+account at 100 % on `fable_week` is **not** out of tokens for an Opus request — pass
+`-M <model>` (or `model=` to `quota.snapshot`) so only the governing windows are consulted.
+
+### The cooldown store
+
+`cooldowns.json` records authoritative rejections — HTTP status, quota marker, scope,
+`observed_at`, and an absolute `blocked_until` taken from the provider's own `Retry-After`.
+It is *retry suppression*, not a billing calendar. The whole read-merge-write runs under
+one `flock` (atomic replacement alone prevents corruption but not lost updates), and
+entries apply by `observed_at` so a slow process's stale 429 cannot overwrite a later
+success.
 
 ## Layout
 

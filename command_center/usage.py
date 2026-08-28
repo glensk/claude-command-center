@@ -294,7 +294,14 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 # directory cannot silently join the deletion set. Every OTHER temp producer in the
 # repo uses a fixed name (``futuresync``/``mirrors``: ``<name>.tmp``; ``resume``:
 # ``resume_queue.tmp``; ``install``: ``.ccc-tmp-*``) or another directory.
-_TEMP_PATTERNS = ("usage.json.*.tmp", "usage-*.json.*.tmp", "copilot_usage.json.*.tmp")
+_TEMP_PATTERNS = (
+    "usage.json.*.tmp",
+    "usage-*.json.*.tmp",
+    "copilot_usage.json.*.tmp",
+    # :mod:`.quota`'s observed-rejection store writes through _atomic_write_json too, so a
+    # killed writer strands the same shape of orphan here.
+    "cooldowns.json.*.tmp",
+)
 # A live temp exists for well under a millisecond, so an hour is ~7 orders of margin.
 _TEMP_MAX_AGE_SEC = 3600
 

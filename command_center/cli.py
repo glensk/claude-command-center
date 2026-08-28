@@ -2043,6 +2043,97 @@ def cmd_job_account(args: argparse.Namespace) -> int:
     return 0
 
 
+_QUOTA_MARK = {"available": "✅", "blocked": "⛔", "unknown": "❔", "disabled": "🚫"}
+
+
+def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branches
+    """Fast, cache-first quota oracle — which provider/account still has tokens.
+
+    Reads only the snapshots ccc already maintains (~70 ms, no network) so any agent or
+    script can consult it before spending a provider attempt. ``-r/--refresh`` is the sole
+    networked path. ``-m/--mark`` records an authoritative rejection (e.g. a Copilot 429
+    with its ``Retry-After``) so the NEXT check is instant and no doomed retry is made.
+
+    Exit codes serve ``-p/--provider``: 0 available, 1 blocked, 2 unknown/disabled. The
+    full report always exits 0 — it is a status view, not a gate.
+    """
+    import time
+
+    from . import quota, usage
+
+    now = int(time.time())
+
+    if args.mark:
+        if args.retry_after is None:
+            print("quota: -m/--mark requires -u/--retry-after SEC", file=sys.stderr)
+            return 2
+        entry = quota.record_block(
+            args.mark,
+            blocked_until=now + max(0, args.retry_after),
+            reason=args.reason or "provider rejected the request",
+            source="cli",
+            observed_at=now,
+        )
+        until = usage.format_reset(int(entry["blocked_until"]), now)
+        print(f"quota: {args.mark} blocked, unblocks {until}")
+        return 0
+
+    if args.clear:
+        print(
+            f"quota: {args.clear} {'cleared' if quota.clear_block(args.clear) else 'not blocked'}"
+        )
+        return 0
+
+    if args.refresh:
+        for label in config.claude_config_dirs():
+            usage.fetch_claude_usage(label, now)
+        usage.fetch_copilot_usage(now)
+
+    snap = quota.snapshot(model=args.model, now=now)
+
+    if args.provider:
+        match = next((p for p in snap["providers"] if p["id"] == args.provider), None)
+        if match is None:
+            print(f"quota: unknown provider '{args.provider}'", file=sys.stderr)
+            return quota.EXIT_UNKNOWN
+        if not args.json:
+            reason = f" — {match['reason']}" if match.get("reason") else ""
+            print(f"{match['id']}: {match['state']}{reason}")
+        else:
+            print(json.dumps(match, indent=2))
+        return {
+            quota.AVAILABLE: quota.EXIT_AVAILABLE,
+            quota.BLOCKED: quota.EXIT_BLOCKED,
+        }.get(match["state"], quota.EXIT_UNKNOWN)
+
+    if args.best:
+        print(snap["best_claude_account"].removeprefix("claude:"))
+        return 0
+
+    if args.json:
+        print(json.dumps(snap, indent=2))
+        return 0
+
+    print(f"  {'provider':<16} {'state':<10} {'unblocks':<16} windows")
+    for prov in snap["providers"]:
+        state = prov["state"]
+        unblocks = (
+            usage.format_reset(prov["resets_at"], now)
+            if prov.get("resets_at")
+            else ("—" if state != quota.AVAILABLE else "")
+        )
+        wins = " ".join(
+            f"{name.replace('_', '')} {win['used_pct']:.0f}%{'(stale)' if win.get('stale') else ''}"
+            for name, win in (prov.get("windows") or {}).items()
+        )
+        mark = _QUOTA_MARK.get(state, " ")
+        detail = wins or prov.get("reason", "")
+        print(f"  {mark} {prov['id']:<14} {state:<10} {unblocks:<16} {detail}")
+    if snap["best_claude_account"]:
+        print(f"best Claude account (spends what resets soonest): {snap['best_claude_account']}")
+    return 0
+
+
 def cmd_resume_halted(args: argparse.Namespace) -> int:
     """Auto-resume session-limit-halted sessions once the Claude limit resets.
 
@@ -3556,6 +3647,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="print only the picked account label (for shell wrappers)",
     )
     p_jobacct.set_defaults(func=cmd_job_account)
+
+    p_quota = sub.add_parser(
+        "quota",
+        help="fast cache-first quota oracle: which provider/account still has tokens",
+    )
+    p_quota.add_argument(
+        "-j", "--json", action="store_true", help="emit the versioned JSON contract"
+    )
+    p_quota.add_argument(
+        "-p",
+        "--provider",
+        metavar="ID",
+        help="report ONE provider; exit 0=available 1=blocked 2=unknown/disabled",
+    )
+    p_quota.add_argument(
+        "-b",
+        "--best",
+        action="store_true",
+        help="print the best CLAUDE account label only (empty if none usable)",
+    )
+    p_quota.add_argument(
+        "-M",
+        "--model",
+        default="",
+        metavar="NAME",
+        help="scope the Claude windows to the model you intend to call",
+    )
+    p_quota.add_argument(
+        "-r",
+        "--refresh",
+        action="store_true",
+        help="re-fetch live usage first (the ONLY networked path)",
+    )
+    p_quota.add_argument(
+        "-m", "--mark", metavar="ID", help="record an authoritative block for a provider"
+    )
+    p_quota.add_argument(
+        "-u",
+        "--retry-after",
+        type=int,
+        metavar="SEC",
+        help="seconds until the marked provider unblocks (with -m)",
+    )
+    p_quota.add_argument("-R", "--reason", default="", help="why the provider is blocked (with -m)")
+    p_quota.add_argument("-c", "--clear", metavar="ID", help="drop a provider's block")
+    p_quota.set_defaults(func=cmd_quota)
 
     p_rm = sub.add_parser("rm", help="remove a tracked session from the command center")
     p_rm.add_argument("session_id")
