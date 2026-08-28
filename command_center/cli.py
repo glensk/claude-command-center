@@ -40,6 +40,7 @@ from .models import (
     Session,
     Status,
     Subgoal,
+    aim_column_first,
     days_until_start,
     empty_track_tint,
     now_ms,
@@ -115,6 +116,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
                 warn_days=cfg.deadline_warn_days,
                 folder_order=tuple(cfg.folder_order),
                 aim_threshold=cfg.aim_score_threshold,
+                aim_first=aim_column_first(cfg.aim_column),
             )
         )
     return 0
@@ -374,9 +376,20 @@ def cmd_short_aim(args: argparse.Namespace) -> int:
             backend=cfg.short_aim_backend,
             model=cfg.short_aim_model,
         )
+        if label:
+            store.set_short_aim(session_id, label)
+        # Revision (1) keeps a label of its own: it is what the `/aim` column renders under
+        # `aim_column = "first"`, and it does NOT come along with the current AIM's label
+        # once the two diverge (set_short_aim writes the LATEST revision; `set-aim --first`
+        # drops the original's stale one). Only generated when actually missing, so this
+        # costs a second cheap call at most once per original.
+        if original and original != session.aim and not history[0].short_aim:
+            if first_label := short_aim.generate(
+                original, backend=cfg.short_aim_backend, model=cfg.short_aim_model
+            ):
+                store.set_first_short_aim(session_id, first_label)
         if not label:
             return 0
-        store.set_short_aim(session_id, label)
     print(f"short-aim set for {session_id}: {label}")
     return 0
 

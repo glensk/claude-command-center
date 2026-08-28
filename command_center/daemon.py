@@ -344,10 +344,18 @@ def _backfill_short_aims(
     Spawns the cheap ``ccc short-aim`` generator detached (the codex run is slow). Idempotent:
     once a session has a ``short_aim`` it is skipped, so it fires at most once per AIM (and is
     re-cleared on the next AIM change by ``set_aim``). Capped per pass to bound codex usage.
+
+    A session whose *first* AIM revision lost its label (``set-aim --first`` rewrote it)
+    is pending too: revision (1) is what the ``/aim`` column renders by default, and the
+    same generator run backfills it.
     """
     if not cfg.short_aim:
         return
-    pending = [s for s in store.list_sessions() if s.aim and not s.short_aim and not s.done]
+    pending = [
+        s
+        for s in store.list_sessions()
+        if s.aim and not s.done and (not s.short_aim or (s.first_aim and not s.first_short_aim))
+    ]
     for session in pending[: cfg.max_summaries_per_run]:
         report.short_aimed.append(session.session_id)
         if dry_run:

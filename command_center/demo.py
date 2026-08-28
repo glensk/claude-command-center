@@ -35,7 +35,7 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from . import config
-from .models import Status, now_ms
+from .models import Status, aim_column_first, now_ms
 from .store import Store
 
 _DAY_MS = 86_400_000
@@ -611,6 +611,7 @@ def run(args: object) -> int:
                     warn_days=cfg.deadline_warn_days,
                     folder_order=tuple(cfg.folder_order),
                     aim_threshold=cfg.aim_score_threshold,
+                    aim_first=aim_column_first(cfg.aim_column),
                 )
             )
         print(f"\n(demo home: {home} — reset with `ccc demo --clean`)")

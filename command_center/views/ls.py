@@ -120,10 +120,10 @@ def _render_row(
     enabled: bool,
     warn_days: int,
     aim_threshold: int,
-    aim_first: bool = True,
     account_markers: dict[str, str] | None = None,
     adapter: Adapter | None = None,
     resume_armed_ids: frozenset[str] = frozenset(),
+    aim_first: bool = True,  # /aim shows revision (1) — see models.display_aim
 ) -> list[str]:
     session = row.session
     status = row.status
@@ -333,10 +333,10 @@ def render(
                 enabled,
                 warn_days,
                 aim_threshold,
-                aim_first,
                 account_markers,
                 adapter,
                 resume_armed_ids,
+                aim_first,
             )
         )
     summary = "  ".join(
