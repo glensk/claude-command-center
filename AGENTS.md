@@ -76,6 +76,23 @@ env to the `llm_account` config, and `llm_custom_command` (with `CCC_LLM_PURPOSE
 `CCC_LLM_NOTE` in the env) is the pluggable routing hatch. See the multi-account section of
 [docs/reference.md](docs/reference.md).
 
+## Launching jobs: always a tab (do not regress)
+
+**Agents: never run `ccc start-job` from a background/piped shell — use `ccc open-job <id>`.**
+`start-job` and `resume` `execvp` claude *in place*; without a TTY the exec'd process gets no
+stdin, runs its argv prompt as a headless one-shot and exits after one turn. Its transcript
+then opens with a `queue-operation` record — the exact signature `is_oneshot_headless` matches
+— so the daemon's `prune_headless` pass deletes the row and the job is gone from ccc with no
+tab and no error anywhere. That is how job `42fc3505` was lost on 2026-08-28.
+
+`cli.has_terminal()` now gates both commands *before any state mutation*: no TTY → open a real
+tab and return 0; no tab available → exit 1 without exec-ing (an `--auto` dispatch also disarms
+`fire_at`). Keep that check ahead of `claim_draft`/`archive_file` so a refusal changes nothing.
+`CCC_START_JOB_HEADLESS=1` is the only opt-out (set suite-wide by a `tests/conftest.py` autouse
+fixture). Do **not** relax `prune_headless` to "fix" a vanished job — deliberately headless
+subagent runs (`claude -p`) are *supposed* to stay invisible; the tab is what makes a real job
+visible. Tests: `tests/test_start_job_tty.py`.
+
 ## Assets / package data
 
 Installable assets (slash commands, Obsidian dashboards/templates, plugin manifests) live

@@ -135,3 +135,18 @@ def _isolate_vault_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
         return cfg
 
     monkeypatch.setattr(_config, "load_config", _tmp_vaulted)
+
+
+@pytest.fixture(autouse=True)
+def _allow_headless_start_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let the exec-path tests run without a pseudo-terminal.
+
+    ``cmd_start_job`` / ``cmd_resume`` refuse to ``execvp`` claude when this process
+    has no TTY (they open a real tab instead) — without that guard a job launched from
+    a non-interactive shell degrades into a headless one-shot whose row the daemon then
+    prunes, so it vanishes from ccc entirely. Under pytest stdin/stdout are captured, so
+    every existing test that asserts on the exec argv would take the tab branch instead.
+    Setting the documented opt-out restores the old behaviour suite-wide; the tests that
+    exercise the guard itself (``test_start_job_tty.py``) delete this var again.
+    """
+    monkeypatch.setenv("CCC_START_JOB_HEADLESS", "1")

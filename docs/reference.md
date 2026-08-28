@@ -43,7 +43,7 @@ flags. Grouped by what they do:
 - `ccc new-prompt [-r cat/repo] [-o]` — a prefilled capture file for a future job.
 - `ccc jobs` — list registered future jobs (drafts).
 - `ccc job-account` — per-account usage urgency + which account a new job will bill to (the `job_account` policy).
-- `ccc start-job <id>` / `ccc open-job <id>|--file` — launch a saved job (in place / in a new tab, safe from Obsidian).
+- `ccc start-job <id>` / `ccc open-job <id>|--file` — launch a saved job (in place / in a new tab, safe from Obsidian). Prefer `open-job` from scripts and agents: `start-job` execs in place and refuses without a TTY (it opens a tab instead) — see "Terminal guard" below.
 - `ccc done-job` · `ccc delete-job` · `ccc restore-job` · `ccc unlaunch` — the lifecycle: done-without-running / trash / restore / back-to-draft.
 
 Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique prefix), not just the full UUID — exact match wins, an ambiguous prefix errors with the matches listed, matching is case-insensitive.
@@ -421,6 +421,29 @@ tab a complete `PATH`, so a play button in an Obsidian dashboard can launch a jo
 the `execvp("claude")` ENOENT that a bare AppleScript window (no login shell) used to. `open-job`
 takes exactly one of the id or `--file` and validates the id is a real, un-archived draft (errors
 otherwise; `ccc start-job` remains the in-tab exec that actually replaces the process).
+
+**Terminal guard — a job always starts in its own tab.** `ccc start-job` (and `ccc resume`)
+`execvp` claude *in place*, and Claude Code only runs an interactive session when it owns a
+TTY. Launched from a pipe, `</dev/null`, or an agent's background shell, the exec'd process
+instead consumes its argv prompt as a headless **one-shot** and exits after a single turn —
+and its transcript then opens with a `queue-operation` record, which is exactly the signature
+`ClaudeAdapter.is_oneshot_headless` matches, so the daemon's `prune_headless` self-heal
+deletes the row. Net effect: no tab, no ccc row, and no error logged anywhere. Job
+`42fc3505` was lost that way on 2026-08-28 (an agent ran `ccc start-job -u` inside a
+`run_in_background` shell instead of `ccc open-job`).
+
+So both commands now check `cli.has_terminal()` (a TTY on **both** stdin and stdout) *before
+any state mutation*. With no terminal they hand the launch to a real tab
+(`terminal.start_job_in_new_tab` / `resume_in_new_tab`) and exit 0; if no tab can be opened
+they refuse with exit 1 rather than exec headless, leaving the draft and its file untouched
+(an `--auto` dispatch additionally disarms `fire_at` so the daemon stops retrying). Inside
+the spawned tab stdin *is* a TTY, so the guard passes and the exec proceeds — no recursion.
+
+`CCC_START_JOB_HEADLESS=1` opts out for a deliberate headless one-shot (the test suite sets
+it via an autouse fixture in `tests/conftest.py`). This is intentionally the *only* escape
+hatch: explicitly-launched headless subagents (`claude -p`, `cpriv` runs) still produce
+`queue-operation` transcripts and are still pruned, so they stay invisible in ccc — which is
+the desired split. Covered by `tests/test_start_job_tty.py`.
 
 Each synced job file carries an in-note **button row** — **▶ Start this job · ✓ Mark job as done ·
 🗑 Delete job** (three hidden Meta Bind `meta-bind-button` definitions plus one inline

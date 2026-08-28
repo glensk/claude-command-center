@@ -1087,6 +1087,21 @@ def cmd_resume(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    # Terminal guard (same trap as `start-job`): this execs claude IN PLACE, so with no
+    # TTY the resumed session would run headless for a single turn and exit instead of
+    # opening for the user. Hand it to a real tab; refuse if none can be opened.
+    if not has_terminal():
+        from . import terminal
+
+        if terminal.resume_in_new_tab(cwd, args.session_id, config_dir):
+            print(f"no terminal here — resumed {args.session_id} in a new tab instead")
+            return 0
+        print(
+            f"error: `ccc resume {args.session_id}` needs a terminal (it execs claude in "
+            "place) and no tab could be opened. Run it from a terminal tab.",
+            file=sys.stderr,
+        )
+        return 1
     if cwd and os.path.isdir(cwd):
         os.chdir(cwd)
     # Pin the session's account into os.environ, then exec (D8) — os.execvp inherits it.
@@ -1397,6 +1412,27 @@ def cmd_new_prompt(args: argparse.Namespace) -> int:
     return 0
 
 
+def has_terminal() -> bool:
+    """True when this process is attached to a real terminal on BOTH stdin and stdout.
+
+    ``start-job`` / ``resume`` replace themselves with ``claude`` via ``execvp``, and
+    Claude Code only runs an INTERACTIVE session when it owns a TTY. With stdin
+    redirected (a pipe, ``</dev/null``, an agent's background shell) the exec'd process
+    instead consumes its argv prompt as a headless ONE-SHOT and exits after a single
+    turn — see :func:`cmd_start_job`'s terminal guard for why that silently loses a job.
+
+    ``CCC_START_JOB_HEADLESS=1`` forces True, for deliberate headless use and for the
+    test suite (an autouse fixture in ``tests/conftest.py`` sets it, so the existing
+    exec-path tests keep running without a pseudo-terminal).
+    """
+    if os.environ.get("CCC_START_JOB_HEADLESS"):
+        return True
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError):  # detached / closed / replaced streams
+        return False
+
+
 def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches
     args: argparse.Namespace,
 ) -> int:
@@ -1440,6 +1476,43 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches
             return 1
         if session.archived:
             print(f"error: job {args.session_id} is archived — cannot launch", file=sys.stderr)
+            return 1
+        # (0a) Terminal guard — a job ALWAYS starts in its own tab. This command execs
+        # claude IN PLACE, so without a TTY the launched process gets no stdin, runs its
+        # argv prompt as a headless ONE-SHOT and exits after a single turn. Its transcript
+        # then opens with a ``queue-operation`` record, which is exactly the signature
+        # ``ClaudeAdapter.is_oneshot_headless`` matches, so the daemon's ``prune_headless``
+        # self-heal DELETES the row: the job ends up with no tab, no ccc row and no error
+        # anywhere. That is how job 42fc3505 was lost on 2026-08-28 (an agent ran
+        # ``ccc start-job -u`` inside a background shell instead of ``ccc open-job``).
+        # So: no terminal → open a real tab and let THAT run the launch (inside it stdin is
+        # a TTY, so this guard passes and the exec proceeds). Refuse outright if no tab can
+        # be opened — never exec headless. Checked BEFORE any state mutation, so a refusal
+        # leaves the draft and its file exactly as they were.
+        if not has_terminal():
+            from . import terminal
+
+            if terminal.start_job_in_new_tab(
+                args.session_id,
+                force=getattr(args, "force", False),
+                auto=getattr(args, "auto", False),
+            ):
+                print(
+                    f"no terminal here — opened job {args.session_id} in a new tab instead "
+                    "(a job must run in its own tab to stay visible in ccc)"
+                )
+                return 0
+            if getattr(args, "auto", False):
+                # Same contract as the other auto guards: disarm rather than let the
+                # daemon retry a dispatch that cannot work, keeping the draft intact.
+                store.update_fields(args.session_id, fire_at=0)
+            print(
+                f"error: `ccc start-job {args.session_id}` needs a terminal (it execs claude "
+                "in place) and no tab could be opened. Run it from a terminal tab, or use "
+                "`ccc open-job` which opens one for you. Set CCC_START_JOB_HEADLESS=1 only "
+                "if you really want a headless one-shot (it will not appear in ccc).",
+                file=sys.stderr,
+            )
             return 1
         if session.future_file:  # (a) pull in last-minute file edits, then re-read the row
             abs_path = futuresync.vault_root(cfg) / session.future_file
