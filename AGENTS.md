@@ -55,6 +55,7 @@ cells), and pin it with a test that asserts one identical offset across statuses
 
 Not every CLI subcommand is a TUI key. **Internal-style** commands (e.g. `score-aim`,
 `short-aim`, `check-drift`, `assess-aim`, `sync-future`, `sync-mirrors`, `copilot-usage`,
+`quota`,
 `claude-usage`, `tab-symbol`, `install-shell`, `demo`) are spawned by hooks/the daemon/other
 commands (or the shell integration) or run by hand; they have **no** `commands.py` entry and
 no footer key. Only user-facing TUI actions belong in `commands.py`. `ccc jump` is a special
