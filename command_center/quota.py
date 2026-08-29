@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Fast, cache-first quota oracle — "which provider still has tokens, and until when?"
 
 Every LLM-calling tool in this toolbox walks a *fallback ladder* of providers (GitHub
@@ -38,9 +39,35 @@ removes a rung.
 Fable-model-scoped weekly one. An account at 100 % on ``fable_week`` is NOT out of tokens
 for an Opus request. :func:`snapshot` therefore takes the model being requested and
 consults only the windows that apply to it — see :data:`_FABLE_MODEL_HINTS`.
+
+Runnable directly (``./command_center/quota.py -h``) as well as through ``ccc quota``: the
+direct path re-execs itself as a package module and forwards to the same CLI command, so
+there is exactly one implementation of the report.
 """
 
 from __future__ import annotations
+
+# Executing this file BY PATH leaves ``__package__`` empty, and the relative imports below
+# then die with "attempted relative import with no known parent package" — so a bare
+# `chmod +x` would only trade one error for another. Re-exec as a proper module first, with
+# the repo root importable. Prefer the repo's own .venv, because the system interpreter that
+# ran the shebang usually lacks this package's dependencies (rich). This MUST sit above the
+# imports it is protecting.
+if __name__ == "__main__" and not __package__:  # pragma: no cover - direct-execution shim
+    import os as _os
+    import sys as _sys
+
+    _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    _venv = _os.path.join(_root, ".venv", "bin", "python")
+    if _os.path.exists(_venv) and _os.path.realpath(_venv) != _os.path.realpath(_sys.executable):
+        _env = dict(_os.environ)
+        _env["PYTHONPATH"] = _os.pathsep.join(filter(None, (_root, _env.get("PYTHONPATH"))))
+        _os.execve(_venv, [_venv, "-m", "command_center.quota", *_sys.argv[1:]], _env)
+    _sys.path.insert(0, _root)
+    import runpy as _runpy
+
+    _runpy.run_module("command_center.quota", run_name="__main__", alter_sys=True)
+    raise SystemExit(0)
 
 import json
 import time
@@ -584,3 +611,21 @@ def _rehydrate(raw: dict[str, Any]) -> ProviderQuota:
         config_dir=raw.get("config_dir", ""),
         urgency=raw.get("urgency"),
     )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``./command_center/quota.py [args]`` — same report and exit codes as ``ccc quota``.
+
+    Forwarded to the CLI rather than reimplemented: ``ccc quota``'s flags, table and
+    ``--provider`` exit codes (0 available / 1 blocked / 2 unknown) are the contract other
+    tools depend on, and a second renderer here would drift from it.
+    """
+    import sys
+
+    from .cli import main as _cli_main
+
+    return _cli_main(["quota", *(sys.argv[1:] if argv is None else argv)])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
