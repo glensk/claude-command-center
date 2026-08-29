@@ -1148,8 +1148,16 @@ def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
         banner = Text(f"⛔ BLOCKED — {usage.blocked_reason}\n", style="bold red")
         if usage.is_empty():
             return banner + Text("(no window data)", style="grey50")
+        # The soonest window reset is when access actually returns — the refusal is a
+        # rate limit, so waiting is the remedy. Say that, because the bars below still
+        # show the last successful call's figures and read as headroom.
+        resets = [
+            w.resets_at for w in (usage.five_hour, usage.seven_day) if w and w.resets_at > now
+        ]
+        if resets:
+            banner += Text(f"access returns {format_reset(min(resets), now)}\n", style="bold red")
         age = _format_age(now - usage.captured_at) if usage.captured_at else "?"
-        banner += Text(f"windows below are {age} old:\n", style="grey50")
+        banner += Text(f"windows below are {age} old, pre-limit:\n", style="grey50")
         return banner + _render_card(usage, now, fill_color=_CODEX_FILL, label_color=_CODEX_FILL)
     if usage is None or usage.is_empty():
         return Text("—\n(run Codex to populate)", style="grey50")

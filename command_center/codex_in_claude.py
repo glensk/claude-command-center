@@ -1034,8 +1034,17 @@ class _CodexRefusal:
 
 
 # Human labels for the refusal codes seen in the wild; anything else is de-snaked as-is.
+#
+# ``workspace_owner_credits_depleted`` is OpenAI's wording and it misleads: the cause is
+# almost never "you need to buy credits". Traced end-to-end on 2026-08-28/29 — the 5h
+# window read 81% at 23:18, the next call exhausted it, and because the plan's INCLUDED
+# allowance is what ran out, Codex tried the workspace credit pool as an overflow. That
+# pool is empty (``has_credits: false``) on a normal seat that has never bought credits,
+# so the refusal is reported in credit terms. Access came back by itself at 02:57, the
+# moment the 5h window reset, with the credit balance still zero. So: this is a rate
+# limit, and the fix is to wait for the reset, not to top up.
 _REFUSAL_LABELS = {
-    "workspace_owner_credits_depleted": "workspace credits depleted",
+    "workspace_owner_credits_depleted": "included usage limit reached (no credit overflow)",
 }
 
 

@@ -911,7 +911,9 @@ def test_refusal_detected_from_windowless_premium_block(cic: ModuleType, tmp_pat
     refusal = cic.codex_refusal()
     assert refusal is not None
     assert refusal.reached_type == "workspace_owner_credits_depleted"
-    assert cic.refusal_label(refusal.reached_type) == "workspace credits depleted"
+    assert cic.refusal_label(refusal.reached_type) == (
+        "included usage limit reached (no credit overflow)"
+    )
 
 
 def test_later_success_supersedes_an_earlier_refusal(cic: ModuleType, tmp_path: Path) -> None:
