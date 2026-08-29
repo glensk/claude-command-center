@@ -836,6 +836,34 @@ def claude_usage_stale(account: str, refresh_sec: float, now: int | None = None)
     return (now - fetched) >= refresh_sec
 
 
+def _force_exhausted_window(
+    five: Window | None, seven: Window | None, now: int
+) -> tuple[Window | None, Window | None]:
+    """Pin the window that a live refusal proves is full to 100%.
+
+    A refusal means an included window reached its limit — but the call that FILLS a
+    window returns the windowless refusal instead of a fresh reading, so the last
+    numbers on record are pre-limit (81% on 2026-08-28, never 100%). Left alone they
+    read as comfortable headroom to every consumer: the card, ``ccc quota -p codex``,
+    the offload gate, another agent's router. Reporting 100% is what stops something
+    else from spending a turn discovering the block for itself.
+
+    The full window is taken to be the **most-consumed live one**: it is the one that
+    filled, and its ``resets_at`` is when access actually returns. Windows whose reset
+    has already passed are not live and are never chosen.
+    """
+    live = [
+        (name, window)
+        for name, window in (("five_hour", five), ("seven_day", seven))
+        if window is not None and window.resets_at > now
+    ]
+    if not live:
+        return five, seven
+    name, window = max(live, key=lambda item: item[1].used_percentage)
+    full = Window(used_percentage=100.0, resets_at=window.resets_at)
+    return (full if name == "five_hour" else five), (full if name == "seven_day" else seven)
+
+
 def read_codex_usage(now: int | None = None) -> Usage | None:
     """Current Codex rate-limit snapshot, from the newest session rollout file.
 
@@ -896,14 +924,18 @@ def read_codex_usage(now: int | None = None) -> Usage | None:
     # while Codex rejects every call, and only this field says so.
     refusal = codex_refusal()
     if refusal is not None:
-        blocked = Usage(
+        five, seven = _force_exhausted_window(
+            snapshot.five_hour if snapshot is not None else None,
+            snapshot.seven_day if snapshot is not None else None,
+            now,
+        )
+        snapshot = Usage(
             captured_at=snapshot.captured_at if snapshot is not None else refusal.captured_at,
-            five_hour=snapshot.five_hour if snapshot is not None else None,
-            seven_day=snapshot.seven_day if snapshot is not None else None,
+            five_hour=five,
+            seven_day=seven,
             blocked_reason=refusal_label(refusal.reached_type),
             blocked_at=refusal.captured_at,
         )
-        snapshot = blocked
     _codex_cache = (key[0], key[1], snapshot)
     return snapshot
 
@@ -1157,7 +1189,9 @@ def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
         if resets:
             banner += Text(f"access returns {format_reset(min(resets), now)}\n", style="bold red")
         age = _format_age(now - usage.captured_at) if usage.captured_at else "?"
-        banner += Text(f"windows below are {age} old, pre-limit:\n", style="grey50")
+        banner += Text(
+            f"100% = the limit that fired; other figures are {age} old\n", style="grey50"
+        )
         return banner + _render_card(usage, now, fill_color=_CODEX_FILL, label_color=_CODEX_FILL)
     if usage is None or usage.is_empty():
         return Text("—\n(run Codex to populate)", style="grey50")

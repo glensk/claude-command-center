@@ -1499,3 +1499,90 @@ def test_adaptive_interval_picks_active_only_when_shorter_and_working() -> None:
     # Floats (the render cadence) work the same way.
     assert usage.adaptive_interval(5.0, 2.0, active=True) == 2.0
     assert usage.adaptive_interval(5.0, 2.0, active=False) == 5.0
+
+
+# --------------------------- Codex refusal → 100% ---------------------------- #
+# The refusing shape actually recorded on 2026-08-28: a windowless ``premium`` block
+# whose ``rate_limit_reached_type`` names the reason. Note ``has_credits: False`` is
+# ALSO true of the healthy blocks above — it is not what marks a refusal.
+_CODEX_PREMIUM_DEPLETED = dict(
+    _CODEX_PREMIUM_NULL, rate_limit_reached_type="workspace_owner_credits_depleted"
+)
+
+
+def _blocked_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, healthy: dict
+) -> usage.Usage | None:
+    """A refusal logged after a healthy reading, as the real sequence goes."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    usage._codex_cache = None
+    _write_codex_rollout(tmp_path, healthy, name="healthy", mtime=1782300000)
+    _write_codex_rollout(tmp_path, _CODEX_PREMIUM_DEPLETED, name="refused", mtime=1782301000)
+    return usage.read_codex_usage(now=_NOW)
+
+
+def test_refusal_pins_the_filled_window_to_100(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """81% pre-limit must be reported as 100%, or consumers see phantom headroom."""
+    healthy = dict(
+        _CODEX_RATE_LIMITS,
+        primary={"used_percent": 81.0, "window_minutes": 300, "resets_at": 1782320400},
+        secondary={"used_percent": 60.0, "window_minutes": 10080, "resets_at": 1782893849},
+    )
+    snap = _blocked_snapshot(tmp_path, monkeypatch, healthy)
+    assert snap is not None and snap.blocked
+    assert snap.blocked_reason == "included usage limit reached (no credit overflow)"
+    assert snap.five_hour is not None and snap.five_hour.used_percentage == 100.0
+    assert snap.five_hour.resets_at == 1782320400  # reset preserved: when access returns
+    assert snap.seven_day is not None and snap.seven_day.used_percentage == 60.0
+
+
+def test_refusal_pins_the_most_consumed_window_not_always_the_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A weekly exhaustion must pin the WEEKLY window, not the barely-used session."""
+    healthy = dict(
+        _CODEX_RATE_LIMITS,
+        primary={"used_percent": 30.0, "window_minutes": 300, "resets_at": 1782320400},
+        secondary={"used_percent": 95.0, "window_minutes": 10080, "resets_at": 1782893849},
+    )
+    snap = _blocked_snapshot(tmp_path, monkeypatch, healthy)
+    assert snap is not None
+    assert snap.seven_day is not None and snap.seven_day.used_percentage == 100.0
+    assert snap.five_hour is not None and snap.five_hour.used_percentage == 30.0
+
+
+def test_refusal_never_pins_a_window_whose_reset_already_passed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An expired window is not live, so it cannot be the one that is full."""
+    healthy = dict(
+        _CODEX_RATE_LIMITS,
+        primary={"used_percent": 99.0, "window_minutes": 300, "resets_at": _NOW - 60},
+        secondary={"used_percent": 40.0, "window_minutes": 10080, "resets_at": 1782893849},
+    )
+    snap = _blocked_snapshot(tmp_path, monkeypatch, healthy)
+    assert snap is not None
+    assert snap.five_hour is not None and snap.five_hour.used_percentage == 99.0
+    assert snap.seven_day is not None and snap.seven_day.used_percentage == 100.0
+
+
+def test_quota_reports_codex_blocked_with_the_filled_window_and_its_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ccc quota -p codex`` must exit blocked and name when access returns."""
+    from command_center import quota
+
+    healthy = dict(
+        _CODEX_RATE_LIMITS,
+        primary={"used_percent": 81.0, "window_minutes": 300, "resets_at": 1782320400},
+        secondary={"used_percent": 60.0, "window_minutes": 10080, "resets_at": 1782893849},
+    )
+    _blocked_snapshot(tmp_path, monkeypatch, healthy)
+    usage._codex_cache = None
+    prov = quota._codex_quota(_NOW, {})
+    assert prov.state == quota.BLOCKED
+    assert prov.blocked_by == "five_hour"
+    assert prov.resets_at == 1782320400
+    assert prov.windows["five_hour"].used_pct == 100.0

@@ -391,9 +391,14 @@ def _codex_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
         if state is not None:
             windows[name] = state
     if snap.blocked:
-        # Codex is refusing calls for a reason the windows cannot express (the plan
-        # allowance and the workspace credit balance are separate gates). The windows
-        # are still attached as evidence, but they must not produce an AVAILABLE verdict.
+        # Codex is refusing calls. ``read_codex_usage`` has already pinned the window
+        # that filled to 100%, so name it as the blocker and carry its reset — that is
+        # when access returns, and it is what ``unblocks`` should show instead of "—".
+        full = max(
+            (state for state in windows.values() if state.used_pct >= _EXHAUSTED_PCT),
+            key=lambda state: state.resets_at,
+            default=None,
+        )
         return ProviderQuota(
             id="codex",
             kind="codex",
@@ -401,7 +406,8 @@ def _codex_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
             reason=snap.blocked_reason,
             source="refusal",
             windows=windows,
-            blocked_by="refusal",
+            blocked_by=full.name if full is not None else "refusal",
+            resets_at=full.resets_at if full is not None else 0,
             captured_at=snap.blocked_at or snap.captured_at,
         )
     verdict, reason, blocked_by, resets_at, risky = _verdict_from_windows(windows.values())
