@@ -51,6 +51,9 @@ the automatic Stop-time release relies on your commit step running earlier in th
 
 `ccc`'s status line adds, under Claude Code's own line:
 
+- the `/aim (1):` anchor row — the done-condition **as you first typed it**, dimmed, shown
+  whenever the current revision is no longer the first, so a sharpened AIM never hides your
+  original goal;
 - the `/aim (N):` row — the current AIM (or its short label), its running index, the
   concreteness score chip (red when vague), and a compact progress bar;
 - a `Status:` + `/next-step:` row;

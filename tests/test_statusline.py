@@ -101,8 +101,9 @@ def test_statusline_renders_short_aim_label(
 def test_statusline_no_stale_short_aim_after_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """An AIM change clears the old label — the row shows the NEW full AIM, never the
-    previous revision's short label (only the latest short aim may ever render)."""
+    """An AIM change clears the old label — the CURRENT row shows the NEW full AIM, never
+    the previous revision's short label (only the latest short aim may render there; the
+    `/aim (1)` anchor row legitimately carries revision (1)'s own label)."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     store = Store()
     store.ensure("s1", cwd="/repo")
@@ -113,8 +114,9 @@ def test_statusline_no_stale_short_aim_after_change(
     store.close()
     cli.cmd_statusline(Namespace(session="s1"))
     out = capsys.readouterr().out
-    assert "old short label" not in out
-    assert "second goal: ruff and mypy clean" in out
+    current_row = next(ln for ln in out.splitlines() if "/aim (2):" in ln)
+    assert "old short label" not in current_row
+    assert "second goal: ruff and mypy clean" in current_row
 
 
 def test_statusline_shows_aim_transition(
@@ -330,3 +332,38 @@ def test_statusline_print_glyph_reflects_the_identity_hard_link(
     monkeypatch.setattr(config, "claude_account_email_map", lambda: {"work": "work@example.com"})
     assert cli.cmd_statusline(Namespace(print_glyph=True, session=None)) == 0
     assert capsys.readouterr().out == accounts._WORK_GLYPH.strip()
+
+
+def test_statusline_always_shows_first_aim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Revision (1) stays on screen next to the current AIM, however often it is sharpened."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.set_aim("s1", "fix claude code statusline")
+    store.set_aim("s1", "second aim")
+    store.set_aim("s1", "fix AWS secret-key pattern")  # running index 3
+    store.update_fields("s1", aim_prev=None)  # steady state: no this-turn transition
+    store.close()
+    cli.cmd_statusline(Namespace(session="s1"))
+    out = capsys.readouterr().out
+    assert "/aim (1):" in out
+    assert "fix claude code statusline" in out  # the AIM the user typed themselves
+    assert "/aim (3):" in out
+    assert "fix AWS secret-key pattern" in out
+
+
+def test_statusline_first_aim_anchor_not_duplicated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A this-turn transition out of revision (1) already shows it — no second (1) row."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.set_aim("s1", "vague start")
+    store.set_aim("s1", "concrete: pytest -q green")
+    store.close()
+    cli.cmd_statusline(Namespace(session="s1"))
+    out = capsys.readouterr().out
+    assert out.count("/aim (1):") == 1

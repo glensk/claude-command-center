@@ -848,6 +848,14 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   Claude Code status line (`/aim (1):`, `/aim (2):`, …) and the TUI detail pane: `1` is the first
   AIM ever defined, incrementing each time it changes. An AIM that predates history tracking shows
   as `(1)`.
+- **The status line always shows revision (1)** — once the AIM is sharpened past its first
+  revision, the Claude Code status line prints an `/aim (1):` anchor row (dimmed, revision (1)'s
+  own short label when it has one) above the current `/aim (N):` row, so the done-condition you
+  typed yourself stays on screen for the whole session — same first-plus-last shape as the TUI
+  detail pane. The row is omitted only when it would duplicate what is already visible: a
+  single-revision session, and the turn the AIM moves off revision (1) (the transition row
+  `/aim (1): <old> ====> /aim (2): <new>` already carries it). Sessions whose AIM predates
+  history tracking have no recorded revision (1) and get no anchor row.
 - **The `/aim` column shows revision (1)** — the TUI table (whose header then reads
   `/aim (1)`) and `ccc ls` render the done-condition **as you first typed it**, not the latest
   sharpened wording. The column is how you recognise a row, so it stays put while the AIM is
