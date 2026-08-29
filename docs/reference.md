@@ -841,9 +841,9 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   one-line revert. The goal's meaning is never changed — only how concretely it is stated.
 - **Changing the AIM** drops the auto-derived checklist and resets the grading offset, so a
   fresh, AIM-aligned checklist re-derives (no stale 67%). For the turn it changed in, the status
-  line shows the transition `/aim (N-1): <old>  ====> /aim (N) <new>` (wrapping to extra lines
-  when needed so the full new AIM is visible), reverting to the plain `/aim (N):` row at the next
-  prompt.
+  line shows the transition `/aim (N-1): <old>  ====> /aim (N) <new>` — always on **one** row
+  however long (status-line rows are scarce; an over-wide row soft-wraps in the terminal rather
+  than being split up), reverting to the plain `/aim (N):` row at the next prompt.
 - **Running index** — the `/aim` prefix carries the current AIM's 1-based number, both in the
   Claude Code status line (`/aim (1):`, `/aim (2):`, …) and the TUI detail pane: `1` is the first
   AIM ever defined, incrementing each time it changes. An AIM that predates history tracking shows

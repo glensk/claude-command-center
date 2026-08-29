@@ -140,10 +140,10 @@ def test_statusline_shows_aim_transition(
     assert "tf chord toggles finished" in out  # the new AIM
 
 
-def test_statusline_wraps_long_aim_transition(
+def test_statusline_keeps_long_aim_transition_on_one_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A long new AIM wraps onto extra line(s) so the full text is always visible."""
+    """Even a long transition stays on ONE row — old, arrow, full new AIM and bar together."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     long_new = (
         "every changed file passes ruff and mypy, pytest -q is green, "
@@ -155,13 +155,12 @@ def test_statusline_wraps_long_aim_transition(
     store.close()
     cli.cmd_statusline(Namespace(session="s1"))
     out = capsys.readouterr().out
-    assert "====>" in out
-    # The whole new AIM is present even though it wrapped across lines.
-    flat = " ".join(out.split())
-    assert "every changed file passes ruff and mypy" in flat
-    assert "merged into main without conflicts" in flat
-    # More than the 2 base rows (aim + status) -> it genuinely wrapped.
-    assert len([ln for ln in out.splitlines() if ln.strip()]) >= 3
+    row = next(ln for ln in out.splitlines() if "====>" in ln)
+    # Old AIM, arrow and the WHOLE new AIM share the single row — nothing spilled over.
+    assert "improve things" in row
+    assert long_new in row
+    # Only the 2 base rows (aim + status) -> it did not wrap.
+    assert len([ln for ln in out.splitlines() if ln.strip()]) == 2
 
 
 def test_statusline_shows_running_index(

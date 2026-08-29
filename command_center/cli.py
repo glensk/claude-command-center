@@ -2657,7 +2657,7 @@ def _capture_effort_from_payload(data: dict) -> None:
         pass
 
 
-_SL_WIDTH = 100  # status-line soft width: a longer AIM transition wraps to extra lines
+_SL_WIDTH = 100  # status-line soft width: only the `/aim (1)` anchor row is clipped to it
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
 
@@ -2715,8 +2715,10 @@ def _aim_statusline_lines(
 
     ``index`` is the current AIM's running number in the session's AIM history, so the
     prefix reads ``/aim (N):``. When the AIM changed this turn (``aim_prev`` set) it renders
-    the transition ``/aim (N-1): <old>  ====> /aim (N): <new>``; if that overflows
-    :data:`_SL_WIDTH` the new AIM wraps onto extra lines so the full text is always visible.
+    the transition ``/aim (N-1): <old>  ====> /aim (N): <new>`` — always on ONE row, however
+    long: the status line is precious vertical space, so a wide row is left to the terminal's
+    own soft wrap instead of being split into an old-AIM row, wrapped new-AIM rows and a
+    trailing bar row.
 
     Whenever the current revision is not the first, :func:`_first_aim_anchor` prepends an
     ``/aim (1):`` row, so the originally typed done-condition stays visible for the whole
@@ -2768,22 +2770,9 @@ def _aim_statusline_lines(
     bold = "\033[1m"
     old_part = f"{green}{_aim_label(index - 1)}:{reset} {dim}{session.aim_prev}{reset}"
     arrow = f"{bold}====>{reset} {green}{label}:{reset} "
-    one_line = f"{old_part}   {arrow}{chip} {new_aim}{prog}{tag}"
-    if _vlen(one_line) <= _SL_WIDTH:
-        return [*anchor, one_line]
-    # Too long: old AIM on its own line, then arrow + the FULL new AIM wrapped, then bar/marker.
-    import textwrap
-
-    lines = [*anchor, old_part]
-    first_prefix = f"   {arrow}{chip} "
-    body_w = max(24, _SL_WIDTH - _vlen(first_prefix))
-    wrapped = textwrap.wrap(new_aim, width=body_w) or [new_aim]
-    for i, seg in enumerate(wrapped):
-        lines.append(f"{first_prefix}{seg}" if i == 0 else f"        {seg}")
-    trailer = f"{prog}{tag}".strip()
-    if trailer:
-        lines.append(f"        {trailer}")
-    return lines
+    # Always ONE line — old AIM, arrow, new AIM, bar and marker never split across rows;
+    # an over-wide line soft-wraps in the terminal rather than costing three status-line rows.
+    return [*anchor, f"{old_part}   {arrow}{chip} {new_aim}{prog}{tag}"]
 
 
 def cmd_statusline(args: argparse.Namespace) -> int:
