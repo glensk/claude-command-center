@@ -2676,6 +2676,33 @@ def _aim_label(index: int) -> str:
     return f"/aim ({index})" if index >= 1 else "/aim"
 
 
+def _first_aim_anchor(
+    session: Session, index: int, changed: bool, green: str, dim: str, reset: str
+) -> list[str]:
+    """The always-visible ``/aim (1):`` anchor row — the done-condition as originally typed.
+
+    The status line otherwise renders only the CURRENT revision, so once the AIM is
+    sharpened (``/aim (2)``, ``(3)``, …) the goal the user actually typed scrolls out of
+    view. This pins it: revision (1) is shown on its own row above the current one, dimmed
+    so the actionable current AIM stays prominent.
+
+    Returns no row when it would only duplicate what is already on screen: ``index <= 1``
+    (the current AIM *is* revision (1)) or a this-turn transition out of revision (1)
+    (``changed`` with ``index == 2`` already prints ``/aim (1): <old> ====>``). Sessions
+    whose AIM predates history tracking have no recorded revision (1) and get no row.
+    """
+    if index <= 1 or (changed and index == 2):
+        return []
+    first = (session.first_short_aim or session.first_aim or "").strip()
+    if not first:
+        return []
+    prefix = f"{green}{_aim_label(1)}:{reset} "
+    body_w = max(24, _SL_WIDTH - _vlen(prefix))
+    if len(first) > body_w:
+        first = first[: body_w - 1] + "…"
+    return [f"{prefix}{dim}{first}{reset}"]
+
+
 def _aim_statusline_lines(
     session: Session,
     checked: int,
@@ -2690,6 +2717,10 @@ def _aim_statusline_lines(
     prefix reads ``/aim (N):``. When the AIM changed this turn (``aim_prev`` set) it renders
     the transition ``/aim (N-1): <old>  ====> /aim (N): <new>``; if that overflows
     :data:`_SL_WIDTH` the new AIM wraps onto extra lines so the full text is always visible.
+
+    Whenever the current revision is not the first, :func:`_first_aim_anchor` prepends an
+    ``/aim (1):`` row, so the originally typed done-condition stays visible for the whole
+    session no matter how often the AIM is sharpened.
 
     The AIM text rendered is :func:`~command_center.models.display_aim` — the latest
     short label when one exists, else the full AIM. ``store.set_aim`` clears the label on
@@ -2731,18 +2762,19 @@ def _aim_statusline_lines(
         prog = ""
     tag = f"  {dim}⚠ vague — sharpen it{reset}" if low_score else ""
     changed = bool(session.aim_prev) and session.aim_prev != session.aim
+    anchor = _first_aim_anchor(session, index, changed, green, dim, reset)
     if not changed:
-        return [f"{green}{label}:{reset} {chip} {new_aim}{prog}{tag}"]
+        return [*anchor, f"{green}{label}:{reset} {chip} {new_aim}{prog}{tag}"]
     bold = "\033[1m"
     old_part = f"{green}{_aim_label(index - 1)}:{reset} {dim}{session.aim_prev}{reset}"
     arrow = f"{bold}====>{reset} {green}{label}:{reset} "
     one_line = f"{old_part}   {arrow}{chip} {new_aim}{prog}{tag}"
     if _vlen(one_line) <= _SL_WIDTH:
-        return [one_line]
+        return [*anchor, one_line]
     # Too long: old AIM on its own line, then arrow + the FULL new AIM wrapped, then bar/marker.
     import textwrap
 
-    lines = [old_part]
+    lines = [*anchor, old_part]
     first_prefix = f"   {arrow}{chip} "
     body_w = max(24, _SL_WIDTH - _vlen(first_prefix))
     wrapped = textwrap.wrap(new_aim, width=body_w) or [new_aim]
