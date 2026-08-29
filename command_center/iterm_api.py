@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Warm iTerm2 Python-API link for the TUI's resident f+j jump.
 
 One long-lived websocket connection replaces the per-jump osascript walk
@@ -9,6 +10,16 @@ degrades to None/False — callers fall back to the AppleScript helpers in
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 from typing import Any
 

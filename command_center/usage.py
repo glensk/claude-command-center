@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Account-wide subscription usage snapshots — Claude Code's ``/usage`` and Codex.
 
 Two providers, same two-window shape (a 5h session + a weekly window). Claude's
@@ -30,6 +31,16 @@ each refresh; the TUI shows both providers' cards top-right of the detail pane.
 
 # pylint: disable=too-many-lines  # cohesive multi-provider usage module (Claude/Codex/Copilot)
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 import calendar
 import contextlib

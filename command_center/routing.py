@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Route a NEW job to the Claude account that should absorb it — the ``job_account`` policy.
 
 ccc can bill sessions to more than one Claude subscription (see :mod:`.accounts`); each
@@ -37,6 +38,16 @@ surprise the user, so an empty account is only ever filled in at the moment the 
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 import time
 from dataclasses import dataclass

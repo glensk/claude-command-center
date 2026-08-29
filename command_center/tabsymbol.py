@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Per-iTerm-tab unique colored symbol, shared by the shell and the TUI.
 
 Goal: when several Claude Code sessions run in the *same folder*, their command
@@ -31,6 +32,16 @@ color channel to keep in sync.
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 import contextlib
 import fcntl

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """``ccc install-commands`` — copy ccc's slash commands into ``$CLAUDE_HOME/commands``.
 
 Ships the seven ccc slash commands (aim, next-step, done, block, deadline,
@@ -14,6 +15,16 @@ The plan is built by the pure :func:`build_plan` (easy to test); :func:`run` app
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 import os
 import time

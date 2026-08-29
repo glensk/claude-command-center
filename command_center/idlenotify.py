@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Toggle Claude Code's native idle / "waiting for input" macOS popups.
 
 The `ti` TUI chord and `ccc toggle-idle` both flip a single boolean —
@@ -17,6 +18,16 @@ an absent/oddly-shaped key falls back to a full JSON round-trip.
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 import json
 import os

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Folder → RGB colours that match the iTerm2 tab colours.
 
 Reads the precomputed ``~/.cache/repo-tab-colors.zsh`` (folder basename → "R;G;B"),
@@ -8,6 +9,16 @@ when a folder has no cached colour a deterministic per-category palette fills in
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 import hashlib
 import os

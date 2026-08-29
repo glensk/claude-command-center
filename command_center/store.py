@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """SQLite-backed store — the single source of truth for session cards.
 
 WAL mode so the hooks, the daemon, the TUI and the browser can all read/write
@@ -6,6 +7,16 @@ are never clobbered by the automatic reconcile from the live registry.
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 import json
 import re

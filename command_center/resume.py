@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Auto-resume session-limit-halted sessions once the rate limit resets.
 
 When the shared Claude account hits its session/rate limit, tracked sessions stall
@@ -28,6 +29,16 @@ sessions did ccc restart, and when?" is a grep.
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 import copy
 import dataclasses

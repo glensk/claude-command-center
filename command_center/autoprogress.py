@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Automatic per-session progress: derive sub-goals, then auto-check them off.
 
 The progress bar is ``checked / total`` of a sub-goal checklist. Manually
@@ -42,6 +43,16 @@ degrade to "no change this pass".
 # pylint: disable=import-outside-toplevel
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 import re
 from dataclasses import dataclass, field

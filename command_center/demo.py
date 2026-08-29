@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """``ccc demo`` — a self-contained fake-data command center.
 
 Seeds ~10 deterministic sessions into a **throwaway demo home** (never the real
@@ -21,6 +22,16 @@ current process's own pid, which is always alive while the demo (or a test) runs
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 # Lazy imports of the heavy view/terminal layers (import-outside-toplevel) keep the demo
 # seed cheap and avoid a cli → demo → views import cycle.

@@ -1380,3 +1380,37 @@ def test_close_now_tmux_kills_only_the_matched_pane(
     # tmux matched first → iTerm must NOT be touched even though --iterm was supplied.
     assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="w0t1p0:X")) == 0
     assert runs == [["tmux", "kill-pane", "-t", "%5"]]
+
+
+# --------------------------- direct-execution shim ---------------------------- #
+def test_every_module_is_runnable_by_path(tmp_path: Path) -> None:
+    """`./command_center/<mod>.py` must never die on the relative-import error.
+
+    Regression for the original report: `./command_center/quota.py` gave
+    `permission denied`, and a bare `chmod +x` would only have traded it for
+    `attempted relative import with no known parent package`.
+    """
+    import os
+    import subprocess
+    from pathlib import Path as _Path
+
+    pkg = _Path(__file__).resolve().parent.parent / "command_center"
+    library_exit, cli_exit = 2, 0
+    checked = 0
+    for module in sorted(pkg.glob("*.py")):
+        if module.name in {"__init__.py", "__main__.py", "_direct.py"}:
+            continue
+        assert os.access(module, os.X_OK), f"{module.name} is not executable"
+        assert module.read_text(encoding="utf-8").startswith("#!"), f"{module.name}: no shebang"
+        checked += 1
+    assert checked > 40, "expected the whole package to be covered"
+
+    # One library module and one real CLI, end to end.
+    lib = subprocess.run([str(pkg / "colors.py")], capture_output=True, text=True, check=False)
+    assert lib.returncode == library_exit
+    assert "library module, not a command" in lib.stderr
+    assert "attempted relative import" not in lib.stderr
+
+    cli = subprocess.run([str(pkg / "quota.py"), "-h"], capture_output=True, text=True, check=False)
+    assert cli.returncode == cli_exit
+    assert "usage: ccc quota" in cli.stdout

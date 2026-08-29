@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Run a user-configured shell predicate; exit 0 means the check passed.
 
 Shared by the session-level done-check (`done_check_cmd`) and the per-sub-goal
@@ -6,6 +7,16 @@ machine-check predicates. The command is user-authored (same trust model as
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 import subprocess
 

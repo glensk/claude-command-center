@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """``ccc peek`` — show this Claude session's prompts (and AIM history) for the focused tab.
 
 Bound to a Karabiner chord (hold ``s``, tap ``p`` while iTerm2 is frontmost), this
@@ -39,6 +40,16 @@ resolution logic stays importable and unit-testable on any platform.
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 # Lazy imports (colors, AppKit) keep this module — and so every `ccc` command that
 # never peeks — free of their cost; the import sits inside the function on purpose.
