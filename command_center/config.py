@@ -138,7 +138,7 @@ DEFAULTS: dict[str, object] = {
     # Identity hard-link for the usage cards: ``"label=email"`` entries, same shape as
     # ``claude_accounts``. WHICH config dir a label points at is a path; WHICH Claude
     # account is actually logged into that dir can drift (a bare `/login` in the wrong
-    # shell silently swaps it) — this pins the "Claude Code (work)"/"(private)" cards to
+    # shell silently swaps it) — this pins the "Claude (work)"/"(private)" cards to
     # an ACTUAL email address instead, so the right numbers show under the right card
     # even after such a drift. Empty (the default) ⇒ no hard link, today's pure
     # path-based behaviour (see ``accounts.resolve_card_label``).
@@ -148,10 +148,10 @@ DEFAULTS: dict[str, object] = {
     "job_account": "",
     # The card render gates (t1..t4 / to / ta). False does NOT remove a card: it
     # collapses it to its titled top border, which is where its own chord is named.
-    "usage_card_private": True,  # expand the Claude Code (private) usage card
-    "usage_card_work": True,  # expand the Claude Code (work) usage card
-    "usage_card_codex": True,  # expand the OpenAI Codex usage card
-    "usage_card_codex_private": True,  # expand the SECOND OpenAI Codex card (codex_home_private)
+    "usage_card_private": True,  # expand the Claude (private) usage card
+    "usage_card_work": True,  # expand the Claude (work) usage card
+    "usage_card_codex": True,  # expand the Codex usage card
+    "usage_card_codex_private": True,  # expand the SECOND Codex card (codex_home_private)
     "usage_card_copilot": True,  # EXPAND the Copilot card (copilot_usage gates the FETCH)
     # External homelab "overseer" alert-triage daemon (a SEPARATE project — unrelated to
     # ccc's own future-job plumbing). Its incidents feed two read-only TUI cards. Empty

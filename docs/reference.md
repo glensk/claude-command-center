@@ -316,13 +316,13 @@ long-standing **`keys:`** prefix:
 | `head:`        | the column-header line at the top of the session table (was the `!` column) |
 | `keys:`        | the bottom footer hint line (the commands with a `footer_pos`)              |
 | `job details:` | the divider above the detail pane (the bottom half of the screen)           |
-| usage cards    | `Claude Code` · `OpenAI Codex` · `GitHub Copilot <model>` (top-right of the detail pane) |
+| usage cards    | `Claude` · `Codex` · `GitHub Copilot <model>` (top-right of the detail pane) |
 
 There is **no top title bar** — the table (with its `head:` line) is the topmost widget, so
 the screen opens straight onto the sessions. The same names are listed under **Named parts**
 in the in-TUI help (`?`).
 
-![the ccc detail pane (job details:): the selected session's AIM, its concreteness score, the sub-goal checklist, the next step, and the stacked Claude Code / OpenAI Codex / GitHub Copilot subscription-usage cards](img/tui-detail.svg)
+![the ccc detail pane (job details:): the selected session's AIM, its concreteness score, the sub-goal checklist, the next step, and the stacked Claude / Codex / GitHub Copilot subscription-usage cards](img/tui-detail.svg)
 
 ### Snapshot & restore — survive a reboot with your desk intact (`ccc snapshot`)
 
@@ -1389,37 +1389,40 @@ trigger.
 > (`codex` tabs aren't tracked by `ccc` and manage their own title, so they stay
 > un-badged.)
 
-### Usage panels — Claude Code + OpenAI Codex + GitHub Copilot (in the TUI)
+### Usage panels — Claude + Codex + GitHub Copilot (in the TUI)
 
 The TUI's detail pane (bottom half) shows your subscription usage in the top-right,
 as **stacked, border-titled cards** so the providers are never confused —
-`Claude Code (private)` (gold border, per-bar green/orange/red usage bars) on top, `Claude Code (work)`
+`Claude (private)` (gold border, per-bar green/orange/red usage bars) on top, `Claude (work)`
 (blue border — shown only when a second `work` account is configured, see
-*Multi-account* below), one `OpenAI Codex <account>` card per configured ChatGPT login
+*Multi-account* below), one `Codex <account>` card per configured ChatGPT login
 (green border, green bars — the second one only when `codex_home_private` is set), and
 `<copilot_card_title> <copilot_model>` (violet border) below — the Copilot title
 shows the default delegation model from the `copilot_model` config (e.g. `gpt-5.4`).
-Each Codex card names its own account in the title (`OpenAI Codex fi…la@example.org / t3`,
+Each Codex card names its own account in the title (`Codex first…@example.org / t3`,
 read from that home's `auth.json`), so two logins are never mistaken for one another.
-The titles drop the word "usage" and the bars drop "used" to keep the cards narrow.
+The titles drop the vendor prefix and the word "usage", and the bars drop "used", to keep
+the cards narrow — a title wider than the card's 34 columns is truncated by Textual, and
+what it truncates away is the domain that tells two accounts apart.
 Each window is a **single bar** — no standalone title line; the window name and the
 reset time are **embossed inside the bar itself** (`Session:` / `Week:`, dark over the
 used portion, the card's accent colour over the track) so the bar's fill still shows
-usage behind it. The percentage is **right-aligned** to the card's inner edge, so it
-sits flush against the border with no dead space. The cards sit flush against each
-other:
+usage behind it. The percentage sits **immediately after the bar**, flush against the
+card's inner edge: the bar takes the whole row minus the percentage's own width, so
+there is no gap between bar and number (a `100%` bar is therefore one cell shorter than
+a `27%` one). The cards sit flush against each other:
 
 ```text
-╭──── Claude Code (private) ──────────╮
-│ ██Session: Resets in 1h 57m░░░   33% │
-│ ██Week: Resets in 3d 11h 36m░░   20% │
+╭──── Claude (private) ───────────────╮
+│ ██Session: Resets in 1h 57m░░░░░░33% │
+│ ██Week: Resets in 3d 11h 36m░░░░░20% │
 ╰──────────────────────────────────────╯
-╭──── OpenAI Codex fi…la@example.org ─╮
-│ ██Session: Resets in 2h 11m░░░   14% │
-│ ██Week: Resets in 6d 0h 5m░░░░   10% │
+╭──── Codex first…@example.org ───────╮
+│ ██Session: Resets in 2h 11m░░░░░░14% │
+│ ██Week: Resets in 6d 0h 5m░░░░░░░10% │
 ╰──────────────────────────────────────╯
 ╭──── Copilot gpt-5.4 ────────────────╮
-│ ░Resets in 4d░░░░░░░░░░░░░░░░░░    0% │
+│ ░Resets in 4d░░░░░░░░░░░░░░░░░░░░░0% │
 ╰──────────────────────────────────────╯
 ```
 
@@ -1431,11 +1434,11 @@ keeps its titled top border — the line that names its own chord — and drops 
 so a folded-away card stays one keystroke from coming back:
 
 ```
-╭─ Claude Code (private) 🏠 / t1 ───────╮
-╭─ OpenAI Codex fi…la@example.org / t3 ─╮
-╭─ OpenAI Codex se…nd@example.com / t5 ─╮
+╭─ Claude (private) 🏠 / t1 ─────────────╮
+╭─ Codex first…@example.org / t3 ───────╮
+╭─ Codex second…@example.com / t5 ──────╮
 ╭─ Copilot gpt-5.4 / t4 ────────────────╮
-│ ░Resets in 4d░░░░░░░░░░░░░░░░░░░   0% │
+│ ░Resets in 4d░░░░░░░░░░░░░░░░░░░░░░0% │
 ╰───────────────────────────────────────╯
 ```
 
@@ -1591,7 +1594,7 @@ with `CODEX_HOME=~/.codex-private codex login`) and a second green card appears,
 own `t5` chord, its own throttled fetch and its own cache. Empty — the default — means no
 second card at all (absent, not merely collapsed). Each card titles itself with the
 account e-mail read from that home's `auth.json` `id_token` (abbreviated:
-`OpenAI Codex fi…la@example.org / t3`), so the two are never confused. The rollout files
+`Codex first…@example.org / t3`), so the two are never confused. The rollout files
 belong to the default login, so the second card is live-endpoint-only, and a refusal
 recorded by one login never bleeds into the other's card.
 

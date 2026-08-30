@@ -103,10 +103,11 @@ def adaptive_interval(idle_sec: float, active_sec: float, *, active: bool) -> fl
 # Bar look — a "used" portion on a dark slate track, the relative reset embossed inside
 # the bar, percentage flush-right. The two Claude cards colour each bar from *its own*
 # usage (green/orange/red thresholds, see _fill_for_pct); Codex and Copilot keep a single
-# flat brand fill. The bar is wide enough to hold the longest embossed label ("Week:
-# Resets in 6d 23h 59m" = 26 chars); the percentage is then right-aligned to
-# _CARD_INNER_WIDTH so it sits flush at the card's inner edge (no dead space before the
-# border).
+# flat brand fill. A card row (see _bar_row) is exactly _CARD_INNER_WIDTH wide and the
+# percentage butts directly against the bar's end — no gap between the two — so the bar
+# takes _CARD_INNER_WIDTH minus the percentage's own width. _BAR_WIDTH is only the
+# fallback for a bare _bar() with no percentage after it; it still comfortably holds the
+# longest embossed label ("Week: Resets in 6d 23h 59m" = 26 chars).
 _BAR_WIDTH = 27
 # Content width inside a usage card: the CSS min-width is 38, minus the round border
 # (1 each side) and the 0 1 padding (1 each side) = 34. Keep in sync with the #usage*
@@ -1016,10 +1017,12 @@ def codex_account_email(home: Path) -> str | None:
 
 
 def abbrev_email(email: str) -> str:
-    """Shorten an address for a card title: ``first.last@example.org`` → ``fi…la@example.org``.
+    """Shorten an address for a card title: ``first.last@example.org`` → ``first…@example.org``.
 
-    A dotted local part collapses to the first two letters of its first and last
-    segments; an undotted one longer than five characters keeps its first two and last
+    A dotted local part keeps its first segment whole and drops the rest behind an
+    ellipsis — the readable half of an address is its first word, and initials of the
+    later segments (the old ``fi…la``) bought two columns at the cost of legibility.
+    An undotted local part longer than five characters keeps its first two and last
     two; anything shorter is left alone. The domain is never touched (it is what
     distinguishes two accounts at a glance), and a string with no ``@`` is returned
     unchanged.
@@ -1028,8 +1031,7 @@ def abbrev_email(email: str) -> str:
     if not sep:
         return email
     if "." in local:
-        segments = local.split(".")
-        short = f"{segments[0][:2]}…{segments[-1][:2]}"
+        short = f"{local.split('.')[0]}…"
     elif len(local) > 5:
         short = f"{local[:2]}…{local[-2:]}"
     else:
@@ -1038,16 +1040,19 @@ def abbrev_email(email: str) -> str:
 
 
 def codex_card_title(home: Path | None, chord: str) -> str:
-    """Border title for a Codex card: ``OpenAI Codex fi…la@example.org / t3``.
+    """Border title for a Codex card: ``Codex first…@example.org / t3``.
 
-    Naming the account is what keeps two Codex cards apart. When no e-mail can be
-    resolved (no ``auth.json``, an API-key login, or ``home`` is ``None`` because the
-    second home is not configured) the title degrades to plain ``OpenAI Codex / <chord>``.
+    Naming the account is what keeps two Codex cards apart, so the vendor prefix gives
+    way to the address: ``OpenAI Codex <account>`` overflowed the card's 34-column title
+    on a long domain and Textual truncated the domain away — the one part that tells the
+    accounts apart. When no e-mail can be resolved (no ``auth.json``, an API-key login,
+    or ``home`` is ``None`` because the second home is not configured) the title degrades
+    to plain ``Codex / <chord>``.
     """
     email = codex_account_email(home) if home is not None else None
     if email:
-        return f"OpenAI Codex {abbrev_email(email)} / {chord}"
-    return f"OpenAI Codex / {chord}"
+        return f"Codex {abbrev_email(email)} / {chord}"
+    return f"Codex / {chord}"
 
 
 def _codex_usage_path(home: Path) -> Path:
@@ -1549,8 +1554,9 @@ def _bar(
     *,
     label: str = "",
     label_color: str = _RESET_STYLE,
+    width: int = _BAR_WIDTH,
 ) -> Text:
-    """A ``_BAR_WIDTH``-cell usage bar with *label* embossed over it.
+    """A *width*-cell usage bar with *label* embossed over it.
 
     The fill/track colours stay as each cell's background (usage stays visible);
     only the glyphs covered by *label* change — dark over the bright fill, the
@@ -1559,10 +1565,10 @@ def _bar(
     back to a solid block so the bar reads as continuous.
     """
     pct = max(0.0, min(100.0, pct))
-    filled = round(pct / 100 * _BAR_WIDTH)
-    label = label[:_BAR_WIDTH]
+    filled = round(pct / 100 * width)
+    label = label[:width]
     bar = Text()
-    for i in range(_BAR_WIDTH):
+    for i in range(width):
         on_fill = i < filled
         cell_bg = fill_color if on_fill else _TRACK_COLOR
         glyph = label[i] if i < len(label) else " "
@@ -1577,16 +1583,30 @@ def _bar(
     return bar
 
 
-def _append_pct(text: Text, pct: float) -> None:
-    """Append the percentage flush-right to the card's inner edge (no dead space).
+def _bar_row(
+    pct: float,
+    fill_color: str = _FILL_COLOR,
+    *,
+    label: str = "",
+    label_color: str = _RESET_STYLE,
+) -> Text:
+    """One full-width card row: the bar, then its percentage right after it.
 
-    The bar is ``_BAR_WIDTH`` wide; the percentage is right-aligned to
-    ``_CARD_INNER_WIDTH`` so it lands against the box's right padding instead of
-    leaving empty cells between it and the border.
+    The row always spans ``_CARD_INNER_WIDTH``, so the percentage sits flush at the
+    box's inner edge; the bar absorbs whatever the percentage does not need. The bar
+    is therefore one cell narrower for a three-digit ``100%`` than for ``27%`` —
+    that is what keeps the gap between bar and number at zero on every row.
     """
     pct_str = f"{int(round(pct))}%"
-    pad = max(1, _CARD_INNER_WIDTH - _BAR_WIDTH - len(pct_str))
-    text.append(" " * pad + pct_str + "\n", style=_PCT_STYLE)
+    row = _bar(
+        pct,
+        fill_color,
+        label=label,
+        label_color=label_color,
+        width=max(1, _CARD_INNER_WIDTH - len(pct_str)),
+    )
+    row.append(pct_str + "\n", style=_PCT_STYLE)
+    return row
 
 
 def _section(  # pylint: disable=too-many-arguments
@@ -1619,8 +1639,9 @@ def _section(  # pylint: disable=too-many-arguments
     # Reset time is embossed onto the bar (not appended after it) so the row stays
     # short — one line per window, and the card no longer grows wider than the bar.
     embossed = label if label is not None else f"{prefix}Resets {format_reset(win.resets_at, now)}"
-    text.append_text(_bar(win.used_percentage, fill_color, label=embossed, label_color=label_color))
-    _append_pct(text, win.used_percentage)
+    text.append_text(
+        _bar_row(win.used_percentage, fill_color, label=embossed, label_color=label_color)
+    )
     return text
 
 
@@ -2123,7 +2144,6 @@ def render_copilot_usage(usage: CopilotUsage | None, now: int | None = None) -> 
         pct = usage.premium_used / quota * 100
         label = reset
 
-    text.append_text(_bar(pct, _COPILOT_FILL, label=label, label_color=_COPILOT_FILL))
-    _append_pct(text, pct)
+    text.append_text(_bar_row(pct, _COPILOT_FILL, label=label, label_color=_COPILOT_FILL))
     text.rstrip()
     return text

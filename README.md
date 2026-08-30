@@ -159,12 +159,12 @@ so the new code loads — no manual keystroke; it exits 0 once the TUI is back, 
 is running.
 
 In the TUI, the `t` leader chord expands/collapses the usage cards: `t1`…`t5` for the
-Claude/Codex/Copilot subscription cards (`t5` is a second OpenAI Codex card for a second
+Claude/Codex/Copilot subscription cards (`t5` is a second Codex card for a second
 ChatGPT login, shown once `codex_home_private` points at another `CODEX_HOME`), and
 `to`/`ta` for two optional cards fed by an
 *external* homelab "overseer" alert-triage daemon (incidents awaiting you + recent
 automatic activity) — off until you set `nixos_overseer_dir` in `config.toml`. A
-collapsed card keeps its titled top border (`╭─ OpenAI Codex fi…la@example.org / t3 ─╮`,
+collapsed card keeps its titled top border (`╭─ Codex first…@example.org / t3 ─╮`,
 each Codex card naming its own account) and drops the rest of the box, so the chord that
 brings it back stays on screen. And `u`
 undoes the last action — a close/park, mark-done, Keep, importance, sub-goal tick,

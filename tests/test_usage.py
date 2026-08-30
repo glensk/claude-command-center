@@ -1712,8 +1712,8 @@ def _fake_wham(monkeypatch: pytest.MonkeyPatch, payload: dict) -> dict:
 
 def test_abbrev_email_shortens_only_the_local_part() -> None:
     """The domain is what tells two accounts apart, so only the local part is squeezed."""
-    assert usage.abbrev_email("alice.example@example.com") == "al…ex@example.com"
-    assert usage.abbrev_email("openai.account@example.org") == "op…ac@example.org"
+    assert usage.abbrev_email("alice.example@example.com") == "alice…@example.com"
+    assert usage.abbrev_email("openai.account@example.org") == "openai…@example.org"
     assert usage.abbrev_email("developer@example.org") == "de…er@example.org"  # >5, undotted
     assert usage.abbrev_email("bob@x.org") == "bob@x.org"  # ≤5 chars: left alone
     assert usage.abbrev_email("not-an-address") == "not-an-address"  # no @: unchanged
@@ -1724,11 +1724,11 @@ def test_codex_account_email_reads_the_id_token_jwt(tmp_path: Path) -> None:
     home = tmp_path / "codex"
     _write_codex_auth(home)
     assert usage.codex_account_email(home) == "alice.example@example.com"
-    assert usage.codex_card_title(home, "t3") == "OpenAI Codex al…ex@example.com / t3"
+    assert usage.codex_card_title(home, "t3") == "Codex alice…@example.com / t3"
     # No auth.json (and no home at all) degrade to the plain title instead of raising.
     assert usage.codex_account_email(tmp_path / "absent") is None
-    assert usage.codex_card_title(tmp_path / "absent", "t5") == "OpenAI Codex / t5"
-    assert usage.codex_card_title(None, "t5") == "OpenAI Codex / t5"
+    assert usage.codex_card_title(tmp_path / "absent", "t5") == "Codex / t5"
+    assert usage.codex_card_title(None, "t5") == "Codex / t5"
 
 
 def test_codex_account_email_falls_back_to_the_live_snapshot(tmp_path: Path) -> None:

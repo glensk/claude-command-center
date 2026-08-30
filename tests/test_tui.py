@@ -2589,9 +2589,9 @@ def test_second_codex_card_shows_its_own_account_and_t5_toggles_it(
             assert card.display is True
             # Each card names ITS OWN account, so two green boxes are never confused.
             assert str(app.query_one("#usage-codex").border_title) == (
-                "OpenAI Codex wo…se@example.org / t3"
+                "Codex work…@example.org / t3"
             )
-            assert str(card.border_title) == "OpenAI Codex se…lo@example.com / t5"
+            assert str(card.border_title) == "Codex second…@example.com / t5"
 
             await pilot.press("t")
             await pilot.press("5")

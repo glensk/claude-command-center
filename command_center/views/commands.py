@@ -503,10 +503,10 @@ COMMANDS: list[Command] = [
     Command(
         key="t1",
         word="card-private",
-        gloss="expand / collapse the Claude Code (private) card",
+        gloss="expand / collapse the Claude (private) card",
         section=GLOBAL,
         explanation=(
-            "Expand or collapse the Claude Code (private) usage card — the gold-bordered "
+            "Expand or collapse the Claude (private) usage card — the gold-bordered "
             "5h/weekly bars for the private account. Type t then 1. Expanded by default; "
             "the chord collapses it to its titled top border alone (and again expands "
             "it), persisted to ccc's config. Only how much of the card is drawn changes "
@@ -519,10 +519,10 @@ COMMANDS: list[Command] = [
     Command(
         key="t2",
         word="card-work",
-        gloss="expand / collapse the Claude Code (work) card",
+        gloss="expand / collapse the Claude (work) card",
         section=GLOBAL,
         explanation=(
-            "Expand or collapse the Claude Code (work) usage card — the blue-bordered "
+            "Expand or collapse the Claude (work) usage card — the blue-bordered "
             "5h/weekly bars for the work account. Type t then 2. Expanded by default; the "
             "chord collapses it to its titled top border alone (and again expands it), "
             "persisted to ccc's config. It reads '—' until a work session runs a turn "
@@ -536,10 +536,10 @@ COMMANDS: list[Command] = [
     Command(
         key="t3",
         word="card-codex",
-        gloss="expand / collapse the OpenAI Codex card",
+        gloss="expand / collapse the Codex card",
         section=GLOBAL,
         explanation=(
-            "Expand or collapse the OpenAI Codex usage card — the green-bordered 5h/weekly "
+            "Expand or collapse the Codex usage card — the green-bordered 5h/weekly "
             "bars read from Codex's newest session rollout. Type t then 3. Expanded by "
             "default; the chord collapses it to its titled top border alone (and again "
             "expands it), persisted to ccc's config."
@@ -568,10 +568,10 @@ COMMANDS: list[Command] = [
     Command(
         key="t5",
         word="card-codex-private",
-        gloss="expand / collapse the second OpenAI Codex card",
+        gloss="expand / collapse the second Codex card",
         section=GLOBAL,
         explanation=(
-            "Expand or collapse the second OpenAI Codex usage card — the green-bordered "
+            "Expand or collapse the second Codex usage card — the green-bordered "
             "5h/weekly bars for the ChatGPT login held in codex_home_private. Type t then "
             "5. Expanded by default; the chord collapses it to its titled top border alone "
             "(and again expands it), persisted to ccc's config. Each Codex card names its "

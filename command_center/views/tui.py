@@ -177,7 +177,7 @@ def _set_card_expanded(panel: Static, expanded: bool, *, visible: bool = True) -
     """Expand or COLLAPSE one usage card — what its `t…` render gate now does.
 
     Collapsed is not hidden: the card keeps its border-TOP row — the titled
-    ``╭─ Claude Code (private) 🏠 / t1 ───╮`` line, which is also where the toggle's own
+    ``╭─ Claude (private) 🏠 / t1 ───╮`` line, which is also where the toggle's own
     chord is advertised — and drops everything below it. The ``.card-collapsed`` class
     does that (``height: 1`` + ``border-bottom: none``).
 
@@ -1230,7 +1230,7 @@ _HELP_PROSE = """[b]Named parts[/b] (so each can be referred to by name)
   head:        the column-header line at the top of the table
   keys:        the bottom footer hint line
   job details: the divider above the detail pane (bottom half)
-  usage cards: Claude Code / OpenAI Codex / Copilot (top-right of detail)
+  usage cards: Claude / Codex / Copilot (top-right of detail)
 
 [b]Columns[/b] (named by the [b]head:[/b] line)
   ▶ (1st)  the session is running — working, or awaiting another agent/subagent
@@ -1389,7 +1389,7 @@ _HELP_TOPICS: dict[str, str] = {
     "Update boxes (usage cards) — data & cadence": (
         "The stacked cards top-right of the detail pane, each an account-wide\n"
         "subscription-usage readout (NOT the selected session):\n\n"
-        "[b]Claude Code (private)[/b] and [b]Claude Code (work)[/b]\n"
+        "[b]Claude (private)[/b] and [b]Claude (work)[/b]\n"
         "  Session (5h) + Week (7d) + Fable (weekly-scoped) bars — each account's own\n"
         "  Claude /usage windows. Two sources, complementary:\n"
         "   • Fast path: captured passively from each live session's status line\n"
@@ -1408,7 +1408,7 @@ _HELP_TOPICS: dict[str, str] = {
         "  than the window's own lifetime (5h / 7d) — see claude_account_emails below\n"
         "  for the identity hard-link that keeps this from ever reading the wrong\n"
         "  account's numbers.\n"
-        "[b]OpenAI Codex[/b]  Session (5h) + Week (7d) bars, one card per ChatGPT login\n"
+        "[b]Codex[/b]  Session (5h) + Week (7d) bars, one card per ChatGPT login\n"
         "  (the second card needs codex_home_private set to another CODEX_HOME).\n"
         "  Source: with codex_usage on, the LIVE chatgpt.com usage endpoint — the same\n"
         "  numbers the web Settings → Usage page shows — fetched out-of-band per home\n"
@@ -1434,9 +1434,9 @@ _HELP_TOPICS: dict[str, str] = {
         "  the speed-up. (Claude & Codex need no speed-up: their sources already update\n"
         "  every few seconds while a job runs.)\n\n"
         "[b]Expand / collapse a card[/b]\n"
-        "  t1 = Claude Code (private)   t3 = OpenAI Codex   to = nixos supervised\n"
-        "  t2 = Claude Code (work)      t4 = Copilot        ta = nixos tier_a\n"
-        "  t5 = OpenAI Codex (second login)\n"
+        "  t1 = Claude (private)   t3 = Codex   to = nixos supervised\n"
+        "  t2 = Claude (work)      t4 = Copilot   ta = nixos tier_a\n"
+        "  t5 = Codex (second login)\n"
         "  Collapsed keeps the card's titled top border (which names its own chord) and\n"
         "  drops the rest of the box. Unlike td/tf (view-local), these PERSIST to\n"
         "  config.toml. t2 on a machine with no `work` account says so instead of\n"
@@ -2093,8 +2093,8 @@ class CommandCenterApp(App[None]):
                     # Todos / summary / flags and the sub-goal checklist sit at the
                     # very bottom, below the editable field lines.
                     yield Static("", id="detail-bottom")
-                # Stacked, border-titled usage cards: Claude Code (private) on top,
-                # Claude Code (work), OpenAI Codex (one card per configured ChatGPT
+                # Stacked, border-titled usage cards: Claude (private) on top,
+                # Claude (work), Codex (one card per configured ChatGPT
                 # login), then GitHub Copilot (each a distinct border + figure colour).
                 # The two Claude cards share the periwinkle fill (same product);
                 # private = gold, work = blue.
@@ -2152,11 +2152,11 @@ class CommandCenterApp(App[None]):
         # show/hide chord (" / t1" …) so the toggle is discoverable on the card
         # itself; keys come from commands.by_action, never hard-coded here.
         self.query_one("#usage", Static).border_title = (
-            f"Claude Code (private) {accounts.card_glyph('private')}"
+            f"Claude (private) {accounts.card_glyph('private')}"
             f" / {commands.by_action('toggle_card_private').key}"
         )
         self.query_one("#usage-work", Static).border_title = (
-            f"Claude Code (work) {accounts.card_glyph('work')}"
+            f"Claude (work) {accounts.card_glyph('work')}"
             f" / {commands.by_action('toggle_card_work').key}"
         )
         self._set_codex_card_titles()
@@ -2414,7 +2414,7 @@ class CommandCenterApp(App[None]):
         # accounts.resolve_card_label swaps in whichever configured account's cache
         # actually matches this card's hard-linked email (claude_account_emails), so a
         # drifted CLAUDE_CONFIG_DIR login never mislabels which account's numbers show
-        # under "Claude Code (private)" vs "(work)". A label with no hard link
+        # under "Claude (private)" vs "(work)". A label with no hard link
         # configured passes through unchanged (today's pure path-based behaviour); one
         # WITH a hard link but no current match resolves to None → the card renders
         # empty rather than a stale/wrong-account guess.
@@ -4108,7 +4108,7 @@ class CommandCenterApp(App[None]):
         """(Re)build both Codex cards' border titles — each names its own ChatGPT account.
 
         Two cards for the same product would be indistinguishable without the account, so
-        the title carries an abbreviated e-mail (``OpenAI Codex fi…la@example.org / t3``)
+        the title carries an abbreviated e-mail (``Codex first…@example.org / t3``)
         read from that home's ``auth.json``. The lookup is mtime-cached, so this is cheap
         enough to re-run on every render tick — which it must be, since a `codex login`
         can change the account under a running TUI.
@@ -4156,11 +4156,11 @@ class CommandCenterApp(App[None]):
             self.notify(f"{label} card {'expanded' if new_value else 'collapsed'}.")
 
     def action_toggle_card_private(self) -> None:
-        """Expand/collapse the Claude Code (private) usage card — the `t1` chord."""
-        self._toggle_usage_card("usage_card_private", "Claude Code (private)")
+        """Expand/collapse the Claude (private) usage card — the `t1` chord."""
+        self._toggle_usage_card("usage_card_private", "Claude (private)")
 
     def action_toggle_card_work(self) -> None:
-        """Expand/collapse the Claude Code (work) usage card — the `t2` chord.
+        """Expand/collapse the Claude (work) usage card — the `t2` chord.
 
         Flipping the flag on a machine with no ``work`` account would show nothing (that
         card is hidden outright, title line included), so say why instead of no-oping.
@@ -4176,14 +4176,14 @@ class CommandCenterApp(App[None]):
                 markup=False,
             )
             return
-        self._toggle_usage_card("usage_card_work", "Claude Code (work)")
+        self._toggle_usage_card("usage_card_work", "Claude (work)")
 
     def action_toggle_card_codex(self) -> None:
-        """Expand/collapse the OpenAI Codex usage card — the `t3` chord."""
-        self._toggle_usage_card("usage_card_codex", "OpenAI Codex")
+        """Expand/collapse the Codex usage card — the `t3` chord."""
+        self._toggle_usage_card("usage_card_codex", "Codex")
 
     def action_toggle_card_codex_private(self) -> None:
-        """Expand/collapse the second OpenAI Codex usage card — the `t5` chord.
+        """Expand/collapse the second Codex usage card — the `t5` chord.
 
         Flipping the flag on a machine with no ``codex_home_private`` would show nothing
         (that card is hidden outright, title line included), so say why instead of
@@ -4200,7 +4200,7 @@ class CommandCenterApp(App[None]):
                 markup=False,
             )
             return
-        self._toggle_usage_card("usage_card_codex_private", "OpenAI Codex (second login)")
+        self._toggle_usage_card("usage_card_codex_private", "Codex (second login)")
 
     def action_toggle_card_copilot(self) -> None:
         """Expand/collapse the Copilot usage card — the `t4` chord.
