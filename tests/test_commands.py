@@ -65,8 +65,8 @@ def test_toggle_leader_is_in_footer_as_toggle() -> None:
     assert toggle.action == "toggle_finished"
     assert toggle.footer_key == "t"  # only the leader `t` is the footer mnemonic
     # The leader's chord menu lists every `t…` chord: the per-session account switches
-    # tp/tw (first, in registry order), then the view toggles td/tf/ti, the four
-    # usage-card render gates t1…t4, and the two nixos-overseer cards to/ta.
+    # tp/tw (first, in registry order), then the view toggles td/tf/ti, the five
+    # usage-card render gates t1…t5, and the two nixos-overseer cards to/ta.
     menu = commands.chords_for_leader("t")
     assert [c.key for c in menu] == [
         "tp",
@@ -78,6 +78,7 @@ def test_toggle_leader_is_in_footer_as_toggle() -> None:
         "t2",
         "t3",
         "t4",
+        "t5",
         "to",
         "ta",
     ]
@@ -91,6 +92,7 @@ def test_toggle_leader_is_in_footer_as_toggle() -> None:
         "card-work",
         "card-codex",
         "card-copilot",
+        "card-codex-private",
         "card-nix-supervised",
         "card-nix-tier-a",
     }
@@ -135,13 +137,14 @@ def test_toggle_idle_chord_is_ti() -> None:
     assert cmd.footer_pos is None  # shown only via the `t` leader menu, like tf
 
 
-def test_card_toggle_chords_are_t1_to_t4() -> None:
-    """`t1`…`t4` toggle the four usage cards; each is a pure-menu chord (no footer slot)."""
+def test_card_toggle_chords_are_t1_to_t5() -> None:
+    """`t1`…`t5` toggle the five usage cards; each is a pure-menu chord (no footer slot)."""
     expected = {
         "1": "toggle_card_private",
         "2": "toggle_card_work",
         "3": "toggle_card_codex",
         "4": "toggle_card_copilot",
+        "5": "toggle_card_codex_private",
     }
     for digit, action in expected.items():
         cmd = commands.by_action(action)

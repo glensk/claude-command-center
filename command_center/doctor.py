@@ -235,6 +235,15 @@ def _score_ladder_checks(cfg: config.Config) -> list[Check]:
     return checks
 
 
+def _readable(path: Path) -> bool:
+    """True when *path* exists and this process can actually open it for reading."""
+    try:
+        with path.open("rb"):
+            return True
+    except OSError:
+        return False
+
+
 def _section_features(  # pylint: disable=too-many-branches,too-many-statements
     cfg: config.Config,
 ) -> Section:
@@ -250,6 +259,24 @@ def _section_features(  # pylint: disable=too-many-branches,too-many-statements
             )
     else:
         section.checks.append(Check(NA, "copilot_usage → gh", "disabled"))
+
+    # The live Codex fetch is authorized by the ChatGPT token `codex login` writes into
+    # each CODEX_HOME's auth.json; without a readable one the endpoint can only 401, so
+    # check every configured home by name (the label is what `ccc codex-usage -a` takes).
+    if cfg.codex_usage:
+        for label, home in config.codex_homes().items():
+            auth = home / "auth.json"
+            check_label = f"codex_usage → auth.json ({label})"
+            if _readable(auth):
+                section.checks.append(Check(OK, check_label, str(auth)))
+            else:
+                section.checks.append(
+                    Check(
+                        FAIL, check_label, f"{auth} not readable (CODEX_HOME={home} codex login?)"
+                    )
+                )
+    else:
+        section.checks.append(Check(NA, "codex_usage → auth.json", "disabled"))
 
     if cfg.short_aim and cfg.short_aim_backend in ("codex", "auto"):
         if shutil.which("codex"):

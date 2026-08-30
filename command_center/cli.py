@@ -473,6 +473,63 @@ def cmd_claude_usage(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_codex_usage(args: argparse.Namespace) -> int:
+    """Fetch each configured ``CODEX_HOME``'s live Codex usage and cache it; warm the card.
+
+    Mirrors ``claude-usage`` as a best-effort out-of-band warmer: for each configured
+    Codex login (or the one named by ``-a/--account``) it fetches
+    ``chatgpt.com/backend-api/wham/usage`` — the numbers the ChatGPT *Settings → Usage*
+    page shows — and caches them per home, so the card no longer waits for the next Codex
+    turn to write a rollout event. ``-j/--json`` dumps the cached snapshots instead (a
+    dict keyed by label, no fetch). Prints one line per login and always exits 0: a home
+    with no ChatGPT ``auth.json`` simply reports the failure on stderr and is skipped.
+    Spawned detached by the TUI/daemon when a cache is stale; runnable by hand.
+    """
+    import dataclasses
+    import time
+
+    from . import usage
+
+    homes = config.codex_homes()
+    account = getattr(args, "account", None)
+    if account:
+        if account not in homes:
+            print(f"codex-usage: {account} not a configured CODEX_HOME", file=sys.stderr)
+            return 0
+        homes = {account: homes[account]}
+
+    if getattr(args, "json", False):
+        cached = {
+            label: (dataclasses.asdict(snap) if (snap := usage.read_codex_live(home)) else {})
+            for label, home in homes.items()
+        }
+        print(json.dumps(cached, indent=2))
+        return 0
+
+    now = int(time.time())
+    for label, home in homes.items():
+        snap = usage.fetch_codex_usage(home, now)
+        if snap is None:
+            print(
+                f"OpenAI Codex {label}: fetch failed "
+                "(no ChatGPT auth.json token, or the endpoint refused)",
+                file=sys.stderr,
+            )
+            continue
+        head = f"OpenAI Codex {snap.email or label}"
+        if snap.plan_type:
+            head += f" ({snap.plan_type})"
+        parts = [
+            f"{name} {win.used_percentage:.0f}% resets {usage.format_reset(win.resets_at, now)}"
+            for name, win in (("Session", snap.five_hour), ("Week", snap.seven_day))
+            if win is not None
+        ]
+        if snap.blocked:
+            parts.append(f"BLOCKED — {snap.blocked_reason}")
+        print(f"{head}: " + (" · ".join(parts) if parts else "no window data"))
+    return 0
+
+
 def cmd_aim_history(args: argparse.Namespace) -> int:
     """Print the session's AIM progression — every (re)definition, first to current."""
     from datetime import datetime
@@ -2112,6 +2169,10 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
         for label in config.claude_config_dirs():
             usage.fetch_claude_usage(label, now)
         usage.fetch_copilot_usage(now)
+        # Opt-in (a network call per Codex login), so gated exactly like the daemon's pass.
+        if config.load_config().codex_usage:
+            for home in config.codex_homes().values():
+                usage.fetch_codex_usage(home, now)
 
     snap = quota.snapshot(model=args.model, now=now)
 
@@ -3281,6 +3342,24 @@ def build_parser() -> argparse.ArgumentParser:
         "-a", "--account", metavar="LABEL", help="fetch just this account (default: all)"
     )
     p_clu.set_defaults(func=cmd_claude_usage)
+
+    p_cdu = sub.add_parser(
+        "codex-usage",
+        help=(
+            "refresh+print the live OpenAI Codex usage (chatgpt.com wham/usage) "
+            "for each configured CODEX_HOME"
+        ),
+    )
+    p_cdu.add_argument(
+        "-j", "--json", action="store_true", help="dump the cached snapshots as JSON (no fetch)"
+    )
+    p_cdu.add_argument(
+        "-a",
+        "--account",
+        metavar="LABEL",
+        help="fetch just this CODEX_HOME (default | private; default: all)",
+    )
+    p_cdu.set_defaults(func=cmd_codex_usage)
 
     p_drift = sub.add_parser("check-drift", help="internal: impartial sub-goal drift check (LLM)")
     p_drift.add_argument("--session")

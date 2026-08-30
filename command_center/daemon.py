@@ -65,6 +65,7 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
     reset_postponed: list[str] = field(default_factory=list)  # armed jobs pushed to a later reset
     copilot_refreshed: bool = False  # routine; deliberately excluded from is_empty()
     claude_refreshed: bool = False  # routine Claude /usage OAuth fetch; excluded from is_empty()
+    codex_refreshed: bool = False  # routine live Codex usage fetch; excluded from is_empty()
     resume_spawned: bool = False  # spawned the resume-halted watcher; excluded from is_empty()
     temps_swept: int = 0  # orphaned usage temp files reclaimed; excluded from is_empty()
 
@@ -247,6 +248,10 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
         # OAuth usage endpoint (throttled per account; adds the Fable weekly window).
         _refresh_claude_usage(store, cfg, report, dry_run)
 
+        # Same for each configured CODEX_HOME's live ChatGPT usage endpoint, so the Codex
+        # cards do not go stale between Codex turns (throttled per home).
+        _refresh_codex_usage(store, cfg, report, dry_run)
+
         # Dispatch armed parked-prompt jobs whose fire time has passed (see park.py).
         _fire_reset_jobs(store, cfg, report, dry_run)
 
@@ -426,6 +431,33 @@ def _refresh_claude_usage(
         if usage.claude_usage_stale(label, throttle):
             if usage.fetch_claude_usage(label) is not None:
                 report.claude_refreshed = True
+
+
+def _refresh_codex_usage(
+    store: Store, cfg: config.Config, report: DaemonReport, dry_run: bool
+) -> None:
+    """Refresh each ``CODEX_HOME``'s cached live Codex usage when it is stale.
+
+    Mirrors :func:`_refresh_claude_usage`: gated on ``codex_usage``, throttled by
+    ``codex_usage_refresh_sec`` (or the shorter ``codex_usage_refresh_active_sec`` via
+    :func:`usage.adaptive_interval` while any job works), keyed per home on the cache
+    file's mtime (:func:`usage.codex_usage_stale`). Keeps the cards honest even when no
+    TUI is open and no Codex turn has run for hours — the rollout files, the offline
+    fallback, are only as fresh as the last turn. Best-effort: a home with no ChatGPT
+    ``auth.json`` simply yields no write and the last cache stands.
+    """
+    from . import usage
+
+    if not cfg.codex_usage or dry_run:
+        return
+    active = usage.has_active_work(s.status for s in store.list_sessions())
+    throttle = usage.adaptive_interval(
+        cfg.codex_usage_refresh_sec, cfg.codex_usage_refresh_active_sec, active=active
+    )
+    for home in config.codex_homes().values():
+        if usage.codex_usage_stale(home, throttle):
+            if usage.fetch_codex_usage(home) is not None:
+                report.codex_refreshed = True
 
 
 def _fire_reset_jobs(store: Store, cfg: config.Config, report: DaemonReport, dry_run: bool) -> None:

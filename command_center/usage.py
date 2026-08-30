@@ -3,13 +3,17 @@
 
 Two providers, same two-window shape (a 5h session + a weekly window). Claude's
 numbers arrive via the status-line JSON (captured by ``ccc statusline
---capture-usage``); Codex has no endpoint, so :func:`read_codex_usage` reads the
-``rate_limits`` block Codex writes onto each ``token_count`` event in its session
-rollout files (the windows are identified by their duration, not primary/secondary
-position). Codex emits more than one block shape — ``limit_id: "codex"`` carries the
-windows, while short ``codex exec`` runs log a windowless ``limit_id: "premium"`` block
-— so the reader skips windowless blocks and scans back through enough files to find the
-freshest one with real data.
+--capture-usage``). Codex has two sources: the LIVE ChatGPT usage endpoint
+(:func:`fetch_codex_usage` — the very numbers the *Settings → Usage* page shows,
+authorized by the token in ``$CODEX_HOME/auth.json``, opt-in via ``codex_usage``) and,
+as the offline fallback, the ``rate_limits`` block Codex writes onto each
+``token_count`` event in its session rollout files (the windows are identified by their
+duration, not primary/secondary position). Codex emits more than one block shape —
+``limit_id: "codex"`` carries the windows, while short ``codex exec`` runs log a
+windowless ``limit_id: "premium"`` block — so the reader skips windowless blocks and
+scans back through enough files to find the freshest one with real data.
+:func:`read_codex_usage` then serves whichever of the two is NEWER, so a live figure
+never loses to a stale rollout event (and vice versa when the endpoint is unreachable).
 
 Claude's data rides on every API response's ``anthropic-ratelimit-unified-{5h,7d}-*``
 headers (``rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}`` in the
@@ -42,6 +46,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+import base64
 import calendar
 import contextlib
 import fcntl
@@ -135,7 +140,30 @@ _OVERLAY_ON_FILL = "#11131f"  # dark glyphs over the bright "used" portion
 # session that actually carries the 5h/weekly windows — observed >25 deep. Each file
 # is small JSONL and the result is cached, so a deep scan stays cheap (~tens of ms).
 _CODEX_SCAN_LIMIT = 200
-_codex_cache: tuple[str, int, Usage | None] | None = None
+# CODEX_HOME (as a string) -> (cache key, parsed snapshot). Keyed per home because the
+# TUI renders two Codex cards from two homes on the same tick, and a single slot would
+# then miss on every one of them. Each key pairs the newest rollout file's (path, mtime)
+# with the live cache file's, so ANY new data invalidates it and nothing else does.
+_codex_cache: dict[str, tuple[tuple[str, int, str, int], Usage | None]] = {}
+
+# The live ChatGPT usage endpoint — exactly what the web *Settings → Usage* page reads.
+# Authorized by the ChatGPT OAuth access token Codex stores in ``$CODEX_HOME/auth.json``
+# (``tokens.access_token`` + ``tokens.account_id``; the token is a JWT valid ~10 days and
+# `codex` itself refreshes it whenever it runs). Never logged or printed.
+_WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+# Windows are identified by their DURATION, never by primary/secondary position — the
+# same rule the rollout reader follows (Codex has been seen putting the weekly window in
+# ``primary``). Anything of another length is ignored rather than guessed at.
+_WHAM_FIVE_HOUR_SEC = 5 * 3600
+_WHAM_SEVEN_DAY_SEC = 7 * 86400
+# JSON-RPC ids for the ``codex app-server`` fallback (see _fetch_codex_usage_appserver).
+_APPSERVER_INIT_ID = 1
+_APPSERVER_LIMITS_ID = 2
+_APPSERVER_TIMEOUT_SEC = 20
+# (auth.json path, mtime_ns) -> the account e-mail parsed out of its id_token JWT. The
+# TUI asks for both cards' titles on every 5 s tick, so the decode is memoized on the
+# file's own mtime and re-runs only when `codex login` rewrites it.
+_codex_email_cache: dict[tuple[str, int], str | None] = {}
 
 # Claude's OAuth usage endpoint — the same numbers `claude` shows in `/usage`, including
 # the Fable-model-scoped weekly window the status-line ``rate_limits`` payload does NOT
@@ -180,7 +208,7 @@ class Window:
 
 
 @dataclass
-class Usage:
+class Usage:  # pylint: disable=too-many-instance-attributes  # flat snapshot record
     """A captured snapshot of the account's rate-limit windows."""
 
     captured_at: int  # Unix epoch seconds when ccc recorded it
@@ -200,6 +228,12 @@ class Usage:
     # while nothing works. See :func:`codex_in_claude.codex_refusal`.
     blocked_reason: str = ""
     blocked_at: int = 0  # epoch seconds of the refusal that set ``blocked_reason``
+    # Codex only: True when the windows came from the LIVE usage endpoint
+    # (:func:`fetch_codex_usage`) rather than a rollout file. The blocked banner says
+    # so — live figures need no "these numbers are N old" caveat.
+    live: bool = False
+    email: str = ""  # account the figures belong to (live payload / auth.json JWT)
+    plan_type: str = ""  # e.g. "team" / "plus" — as reported by the live payload
 
     def is_empty(self) -> bool:
         return self.five_hour is None and self.seven_day is None
@@ -322,6 +356,7 @@ _TEMP_PATTERNS = (
     "usage.json.*.tmp",
     "usage-*.json.*.tmp",
     "copilot_usage.json.*.tmp",
+    "codex_usage-*.json.*.tmp",  # the per-CODEX_HOME live-usage caches
     # :mod:`.quota`'s observed-rejection store writes through _atomic_write_json too, so a
     # killed writer strands the same shape of orphan here.
     "cooldowns.json.*.tmp",
@@ -504,6 +539,19 @@ def write_usage(rate_limits: object, *, account: str = "private", now: int | Non
     return True
 
 
+def _load_json_dict(path: Path) -> dict | None:
+    """*path* parsed as a JSON object; ``None`` when absent, unreadable or not an object."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _int_field(data: dict | None, key: str) -> int:
     """Read an int field from a cache dict, tolerating missing/malformed values (→ 0)."""
     if not data:
@@ -524,15 +572,8 @@ def _read_validated(account: str) -> dict | None:
     Shared by :func:`read_usage`, :func:`oauth_fetched_at`, and :func:`write_usage`'s
     merge so all three honour the same fail-closed rule.
     """
-    try:
-        raw = _usage_path(account).read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(data, dict):
+    data = _load_json_dict(_usage_path(account))
+    if data is None:
         return None
     stored_hash = data.get("config_dir_hash")
     if stored_hash is not None:
@@ -875,41 +916,482 @@ def _force_exhausted_window(
     return (full if name == "five_hour" else five), (full if name == "seven_day" else seven)
 
 
-def read_codex_usage(now: int | None = None) -> Usage | None:
-    """Current Codex rate-limit snapshot, from the newest session rollout file.
+# --- Live OpenAI Codex usage (the ChatGPT "Settings → Usage" numbers) ----------
+#
+# Codex DOES have a usage endpoint after all: the web app's own
+# ``chatgpt.com/backend-api/wham/usage``, authorized by the ChatGPT OAuth token that
+# ``codex login`` parks in ``$CODEX_HOME/auth.json``. That matters because the rollout
+# files are only as fresh as the last Codex turn: on 2026-08-30 the newest windowed
+# rollout event was ~14 h old and its 5h reset had already passed, so the only "live"
+# window left to pin a refusal on was the WEEKLY one — the card read "Week: 100%,
+# access returns in 6d 8h" while the web page said the 5h window was full (19 m to go)
+# and the week still had 77% headroom. Live data attributes the block correctly.
+#
+# The fetch is opt-in (``codex_usage``), throttled (:func:`codex_usage_stale`) and run
+# out-of-band — the daemon and a detached ``ccc codex-usage`` — never on the render path;
+# :func:`read_codex_live` only reads the cached JSON. More than one CODEX_HOME can be
+# configured (``codex_home_private``), so every path here is per-home and every cache
+# file is named after a hash of its home.
 
-    Codex has no usage endpoint; it writes duration-identified ``rate_limits`` windows
-    onto each ``token_count`` event in
-    ``$CODEX_HOME/sessions/**/rollout-*.jsonl``. The data is account-global, so the
-    freshest entry from any session is the live allocation. Parsing the newest file
-    is cached by its ``(path, mtime)`` so the 5 s TUI refresh stays cheap when idle.
+
+def _codex_auth_data(home: Path) -> dict | None:
+    """Parsed ``<home>/auth.json``, or ``None`` when absent/unreadable/not JSON."""
+    return _load_json_dict(home.expanduser() / "auth.json")
+
+
+def _codex_auth_tokens(home: Path) -> tuple[str, str] | None:
+    """``(access_token, account_id)`` for *home*'s ChatGPT login, else ``None``.
+
+    Requires ``auth_mode`` to be absent or ``"chatgpt"`` (an API-key login has no
+    subscription windows to report) and both token fields to be non-empty strings. The
+    token is never logged or printed.
     """
-    global _codex_cache  # noqa: PLW0603  # tiny module-level parse cache keyed by file mtime
-    now = int(time.time()) if now is None else now
-    sessions_dir = config.codex_home() / "sessions"
+    data = _codex_auth_data(home)
+    if data is None:
+        return None
+    mode = data.get("auth_mode")
+    if mode is not None and mode != "chatgpt":
+        return None
+    tokens = data.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    access = tokens.get("access_token")
+    account = tokens.get("account_id")
+    if not isinstance(access, str) or not access:
+        return None
+    if not isinstance(account, str) or not account:
+        return None
+    return access, account
+
+
+def _jwt_email(token: object) -> str | None:
+    """The ``email`` claim of a JWT's payload segment — NO signature verification.
+
+    We are reading our own already-trusted local credential purely to label a card, so
+    verifying it would buy nothing (and would need OpenAI's JWKS). Any malformed input
+    yields ``None``.
+    """
+    if not isinstance(token, str):
+        return None
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    payload = parts[1]
     try:
-        files = sorted(
-            sessions_dir.glob("**/rollout-*.jsonl"),
+        raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        claims = json.loads(raw)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(claims, dict):
+        return None
+    email = claims.get("email")
+    return email if isinstance(email, str) and email else None
+
+
+def codex_account_email(home: Path) -> str | None:
+    """Which ChatGPT account *home* is logged in as, or ``None``. Never raises.
+
+    Read from ``<home>/auth.json``'s ``tokens.id_token`` JWT payload; when that carries
+    no ``email`` claim, the last live snapshot's ``email`` (the endpoint returns it) is
+    used instead. The JWT decode is memoized on the file's ``(path, mtime_ns)`` so the
+    TUI can ask for it on every render tick.
+    """
+    path = home.expanduser() / "auth.json"
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        return None
+    if key not in _codex_email_cache:
+        data = _codex_auth_data(home) or {}
+        tokens = data.get("tokens")
+        _codex_email_cache[key] = _jwt_email(
+            tokens.get("id_token") if isinstance(tokens, dict) else None
+        ) or _jwt_email(data.get("id_token"))
+    if _codex_email_cache[key]:
+        return _codex_email_cache[key]
+    # The fallback stays OUTSIDE the memo: a later fetch can supply the e-mail a
+    # claim-less JWT never had, and auth.json's mtime would not change to invalidate it.
+    cached = (_read_codex_live_data(home) or {}).get("email")
+    return cached if isinstance(cached, str) and cached else None
+
+
+def abbrev_email(email: str) -> str:
+    """Shorten an address for a card title: ``first.last@example.org`` → ``fi…la@example.org``.
+
+    A dotted local part collapses to the first two letters of its first and last
+    segments; an undotted one longer than five characters keeps its first two and last
+    two; anything shorter is left alone. The domain is never touched (it is what
+    distinguishes two accounts at a glance), and a string with no ``@`` is returned
+    unchanged.
+    """
+    local, sep, domain = email.partition("@")
+    if not sep:
+        return email
+    if "." in local:
+        segments = local.split(".")
+        short = f"{segments[0][:2]}…{segments[-1][:2]}"
+    elif len(local) > 5:
+        short = f"{local[:2]}…{local[-2:]}"
+    else:
+        short = local
+    return f"{short}@{domain}"
+
+
+def codex_card_title(home: Path | None, chord: str) -> str:
+    """Border title for a Codex card: ``OpenAI Codex fi…la@example.org / t3``.
+
+    Naming the account is what keeps two Codex cards apart. When no e-mail can be
+    resolved (no ``auth.json``, an API-key login, or ``home`` is ``None`` because the
+    second home is not configured) the title degrades to plain ``OpenAI Codex / <chord>``.
+    """
+    email = codex_account_email(home) if home is not None else None
+    if email:
+        return f"OpenAI Codex {abbrev_email(email)} / {chord}"
+    return f"OpenAI Codex / {chord}"
+
+
+def _codex_usage_path(home: Path) -> Path:
+    """Per-``CODEX_HOME`` live-usage cache path (the home's path hashed into the name)."""
+    digest = hashlib.sha1(  # noqa: S324  # cache-file naming, not security
+        str(home.expanduser().resolve()).encode(), usedforsecurity=False
+    ).hexdigest()[:8]
+    return config.app_home() / f"codex_usage-{digest}.json"
+
+
+def _wham_window(raw: object) -> tuple[int, Window] | None:
+    """One endpoint window as ``(limit_window_seconds, Window)``; ``None`` if unusable."""
+    if not isinstance(raw, dict):
+        return None
+    seconds = raw.get("limit_window_seconds")
+    pct = raw.get("used_percent")
+    resets = raw.get("reset_at")
+    if seconds is None or pct is None or resets is None:
+        return None
+    try:
+        return int(seconds), Window(used_percentage=float(pct), resets_at=int(resets))
+    except (TypeError, ValueError):
+        return None
+
+
+def _wham_blocked_reason(data: dict) -> str:
+    """Why Codex is refusing calls right now, or ``""`` when it is not.
+
+    ``rate_limit_reached_type.type`` names the reason when there is one (mapped through
+    :func:`codex_in_claude.refusal_label`, so the wording matches the rollout-sourced
+    refusal exactly). Failing that, an ``allowed: false`` / ``limit_reached: true`` rate
+    limit is a plain window exhaustion.
+    """
+    reached = data.get("rate_limit_reached_type")
+    kind = reached.get("type") if isinstance(reached, dict) else None
+    if isinstance(kind, str) and kind.strip():
+        return refusal_label(kind.strip())
+    rate = data.get("rate_limit")
+    if isinstance(rate, dict) and (
+        rate.get("allowed") is False or rate.get("limit_reached") is True
+    ):
+        return "usage limit reached"
+    return ""
+
+
+def _parse_wham_usage(data: object, now: int) -> Usage | None:
+    """Build a :class:`Usage` from a ``wham/usage`` response; ``None`` if unusable.
+
+    Windows are picked by ``limit_window_seconds`` (18000 → the 5h session, 604800 → the
+    week), NEVER by primary/secondary position. Returns ``None`` when neither window
+    parses, so a garbage body can never overwrite a good cache. Pure — no network — so
+    tests exercise it directly.
+    """
+    if not isinstance(data, dict):
+        return None
+    rate = data.get("rate_limit")
+    windows: dict[int, Window] = {}
+    if isinstance(rate, dict):
+        for field_name in ("primary_window", "secondary_window"):
+            parsed = _wham_window(rate.get(field_name))
+            if parsed is not None:
+                windows[parsed[0]] = parsed[1]
+    five = windows.get(_WHAM_FIVE_HOUR_SEC)
+    seven = windows.get(_WHAM_SEVEN_DAY_SEC)
+    if five is None and seven is None:
+        return None
+    reason = _wham_blocked_reason(data)
+    email = data.get("email")
+    plan = data.get("plan_type")
+    return Usage(
+        captured_at=now,
+        five_hour=five,
+        seven_day=seven,
+        blocked_reason=reason,
+        blocked_at=now if reason else 0,
+        live=True,
+        email=email if isinstance(email, str) else "",
+        plan_type=plan if isinstance(plan, str) else "",
+    )
+
+
+def _get_wham_usage_body(token: str, account_id: str) -> tuple[str | None, int]:
+    """GET the live usage endpoint as ``(body, http_status)``; never raises.
+
+    ``status`` is the HTTP code on an HTTP error (401/403 = the token needs refreshing,
+    which is what triggers the ``codex app-server`` fallback), ``200`` on success and
+    ``0`` for a transport-level failure.
+    """
+    req = urllib.request.Request(  # noqa: S310  # fixed https:// endpoint
+        _WHAM_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "ChatGPT-Account-Id": account_id,
+            "Accept": "application/json",
+            "User-Agent": "ccc",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310  # fixed https://
+            return resp.read().decode("utf-8"), 200
+    except urllib.error.HTTPError as err:
+        return None, int(err.code)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None, 0
+
+
+def _appserver_usage(limits: object, now: int) -> Usage | None:
+    """Map an ``account/rateLimits/read`` result to a :class:`Usage`; ``None`` if unusable.
+
+    Same duration-keyed rule as everywhere else, in the app-server's own spelling
+    (``windowDurationMins`` 300 / 10080, ``usedPercent``, ``resetsAt``).
+    """
+    if not isinstance(limits, dict):
+        return None
+    windows: dict[int, Window] = {}
+    for field_name in ("primary", "secondary"):
+        raw = limits.get(field_name)
+        if not isinstance(raw, dict):
+            continue
+        minutes = raw.get("windowDurationMins")
+        pct = raw.get("usedPercent")
+        resets = raw.get("resetsAt")
+        if minutes is None or pct is None or resets is None:
+            continue
+        try:
+            windows[int(minutes)] = Window(used_percentage=float(pct), resets_at=int(resets))
+        except (TypeError, ValueError):
+            continue
+    five = windows.get(_FIVE_HOUR_MINUTES)
+    seven = windows.get(_SEVEN_DAY_MINUTES)
+    if five is None and seven is None:
+        return None
+    reached = limits.get("rateLimitReachedType")
+    reason = refusal_label(reached.strip()) if isinstance(reached, str) and reached.strip() else ""
+    plan = limits.get("planType")
+    return Usage(
+        captured_at=now,
+        five_hour=five,
+        seven_day=seven,
+        blocked_reason=reason,
+        blocked_at=now if reason else 0,
+        live=True,
+        plan_type=plan if isinstance(plan, str) else "",
+    )
+
+
+def _fetch_codex_usage_appserver(home: Path, now: int | None = None) -> Usage | None:
+    """Ask the official ``codex app-server`` for the rate limits; ``None`` on any failure.
+
+    The fallback for a 401/403 from the HTTP endpoint: the access token in ``auth.json``
+    has expired and only ``codex`` itself may refresh it (it writes the new one back).
+    Three JSON-RPC frames go in on stdin (``initialize`` → ``initialized`` →
+    ``account/rateLimits/read``); the answer arrives in ~2.5 s among unrelated
+    notifications, so every stdout line without OUR request id is skipped. Hard timeout
+    (:data:`_APPSERVER_TIMEOUT_SEC`), after which the child is killed and whatever it had
+    already printed is still parsed.
+    """
+    exe = shutil.which("codex")
+    if not exe:
+        return None
+    now = int(time.time()) if now is None else now
+    frames = [
+        {
+            "jsonrpc": "2.0",
+            "id": _APPSERVER_INIT_ID,
+            "method": "initialize",
+            "params": {"clientInfo": {"name": "ccc", "title": "ccc", "version": "0"}},
+        },
+        {"jsonrpc": "2.0", "method": "initialized"},
+        {"jsonrpc": "2.0", "id": _APPSERVER_LIMITS_ID, "method": "account/rateLimits/read"},
+    ]
+    stdin = "".join(json.dumps(frame) + "\n" for frame in frames)
+    env = dict(os.environ, CODEX_HOME=str(home.expanduser()))
+    try:
+        proc = subprocess.run(  # noqa: S603
+            [exe, "app-server"],
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=_APPSERVER_TIMEOUT_SEC,
+            env=env,
+            check=False,
+        )
+        out = proc.stdout
+    except subprocess.TimeoutExpired as expired:
+        out = expired.stdout if isinstance(expired.stdout, str) else ""
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+    for line in (out or "").splitlines():
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict) or obj.get("id") != _APPSERVER_LIMITS_ID:
+            continue
+        result = obj.get("result")
+        return _appserver_usage(result.get("rateLimits") if isinstance(result, dict) else None, now)
+    return None
+
+
+def _write_codex_usage(home: Path, snap: Usage, now: int) -> None:
+    """Persist *snap* as *home*'s live cache (atomic, under the same ``flock`` as the rest).
+
+    ``captured_at`` dates the FIGURES, ``fetched_at`` the call — they coincide today but
+    :func:`read_codex_usage` compares ``captured_at`` against the newest rollout event,
+    so the two stay separate fields. Never raises.
+    """
+    payload = {
+        "captured_at": snap.captured_at,
+        "fetched_at": now,
+        "home": str(home.expanduser().resolve()),
+        "email": snap.email,
+        "plan_type": snap.plan_type,
+        "five_hour": _window_dict(snap.five_hour),
+        "seven_day": _window_dict(snap.seven_day),
+        "blocked_reason": snap.blocked_reason,
+        "blocked_at": snap.blocked_at,
+    }
+    path = _codex_usage_path(home)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _flock(path.with_name(path.name + ".lock")):
+            _atomic_write_json(path, payload)
+    except OSError:
+        pass
+
+
+def fetch_codex_usage(home: Path | None = None, now: int | None = None) -> Usage | None:
+    """Fetch *home*'s live Codex usage and cache it; ``None`` on any failure.
+
+    Token from ``<home>/auth.json`` → HTTPS GET :data:`_WHAM_USAGE_URL` →
+    :func:`_parse_wham_usage`. A 401/403 means the stored access token has expired, and
+    only ``codex`` may refresh it, so that case falls back ONCE to
+    :func:`_fetch_codex_usage_appserver` (which refreshes and writes the token back).
+    Best-effort throughout: a missing/API-key ``auth.json``, an HTTP or timeout error, or
+    a malformed body all return ``None`` with NO write, so callers keep the last cache.
+    """
+    home = config.codex_home() if home is None else home
+    now = int(time.time()) if now is None else now
+    tokens = _codex_auth_tokens(home)
+    if tokens is None:
+        return None
+    body, status = _get_wham_usage_body(*tokens)
+    snap: Usage | None = None
+    if body is not None:
+        try:
+            snap = _parse_wham_usage(json.loads(body), now)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    elif status in (401, 403):
+        snap = _fetch_codex_usage_appserver(home, now)
+    if snap is None:
+        return None
+    _write_codex_usage(home, snap, now)
+    return snap
+
+
+def _read_codex_live_data(home: Path) -> dict | None:
+    """*home*'s cached live snapshot as a dict, or ``None`` (absent / corrupt / foreign).
+
+    The cache file is named after a hash of the home, and the payload ALSO records the
+    home it was written for: a hash collision or a hand-copied file is refused rather
+    than served under the wrong account.
+    """
+    data = _load_json_dict(_codex_usage_path(home))
+    if data is None:
+        return None
+    stored_home = data.get("home")
+    if isinstance(stored_home, str) and stored_home != str(home.expanduser().resolve()):
+        return None
+    return data
+
+
+def read_codex_live(home: Path) -> Usage | None:
+    """Load *home*'s last live snapshot, or ``None`` when absent/unreadable/windowless."""
+    data = _read_codex_live_data(home)
+    if data is None:
+        return None
+    try:
+        five = _window(data.get("five_hour"))
+        seven = _window(data.get("seven_day"))
+        if five is None and seven is None:
+            return None
+        return Usage(
+            captured_at=_int_field(data, "captured_at"),
+            five_hour=five,
+            seven_day=seven,
+            blocked_reason=str(data.get("blocked_reason") or ""),
+            blocked_at=_int_field(data, "blocked_at"),
+            live=True,
+            email=str(data.get("email") or ""),
+            plan_type=str(data.get("plan_type") or ""),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def codex_usage_stale(home: Path, refresh_sec: float, now: int | None = None) -> bool:
+    """True if *home*'s live cache is missing or older than *refresh_sec* (drives refresh).
+
+    Mtime-based, like :func:`copilot_usage_stale`; the call sites pick *refresh_sec* with
+    :func:`adaptive_interval` (``codex_usage_refresh_sec`` idle, the shorter
+    ``codex_usage_refresh_active_sec`` while a job works).
+    """
+    now = int(time.time()) if now is None else now
+    try:
+        mtime = _codex_usage_path(home).stat().st_mtime
+    except OSError:
+        return True
+    return (now - int(mtime)) >= refresh_sec
+
+
+def _codex_rollout_files(home: Path) -> list[Path]:
+    """*home*'s session rollout files, newest mtime first ( ``[]`` when there are none)."""
+    try:
+        return sorted(
+            (home / "sessions").glob("**/rollout-*.jsonl"),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
     except OSError:
-        return None
-    if not files:
-        return None
-    newest = files[0]
+        return []
+
+
+def _path_key(path: Path | None) -> tuple[str, int]:
+    """``(path, mtime_ns)`` cache key for *path*; ``("", 0)`` when it does not exist."""
+    if path is None:
+        return ("", 0)
     try:
-        key = (str(newest), int(newest.stat().st_mtime_ns))
+        return (str(path), int(path.stat().st_mtime_ns))
     except OSError:
-        return None
-    if _codex_cache is not None and (_codex_cache[0], _codex_cache[1]) == key:
-        return _codex_cache[2]
-    # Pick the newest EVENT, not the first file in mtime order, and date it by the
-    # event's own timestamp. File mtime is not a proxy for event age: Codex re-touches
-    # old rollout files (resumed threads, writer locks), and on 2026-08-29 a 3-day-old
-    # file sat at position 0 by mtime, so breaking on the first hit returned a 08-25
-    # reading of 19% while the real newest event said 81%. ``_codex_rate_snapshot`` in
-    # codex_in_claude.py already picks by ``max(captured_at)``; this mirrors it.
+        return ("", 0)
+
+
+def _codex_rollout_snapshot(files: list[Path], now: int) -> Usage | None:
+    """The freshest windowed ``rate_limits`` event across *files*, as a :class:`Usage`.
+
+    Picks the newest EVENT, not the first file in mtime order, and dates it by the
+    event's own timestamp. File mtime is not a proxy for event age: Codex re-touches
+    old rollout files (resumed threads, writer locks), and on 2026-08-29 a 3-day-old
+    file sat at position 0 by mtime, so breaking on the first hit returned a 08-25
+    reading of 19% while the real newest event said 81%. ``_codex_rate_snapshot`` in
+    codex_in_claude.py already picks by ``max(captured_at)``; this mirrors it.
+    """
     freshest = max(
         (
             rate_snapshot
@@ -919,35 +1401,99 @@ def read_codex_usage(now: int | None = None) -> Usage | None:
         key=lambda item: item.captured_at,
         default=None,
     )
-    snapshot: Usage | None = None
-    if freshest is not None:
-        windows = {
-            minutes: Window(used_percentage=parsed.used_percent, resets_at=parsed.resets_at)
-            for minutes, parsed in freshest.windows.items()
-        }
-        snapshot = Usage(
-            captured_at=freshest.captured_at or now,
-            five_hour=windows.get(_FIVE_HOUR_MINUTES),
-            seven_day=windows.get(_SEVEN_DAY_MINUTES),
-        )
-    # A refusal lives in the windowless blocks the loop above skips, so it is read
-    # separately and stapled on: the windows keep reporting the last healthy figures
-    # while Codex rejects every call, and only this field says so.
-    refusal = codex_refusal()
-    if refusal is not None:
-        five, seven = _force_exhausted_window(
-            snapshot.five_hour if snapshot is not None else None,
-            snapshot.seven_day if snapshot is not None else None,
-            now,
-        )
-        snapshot = Usage(
-            captured_at=snapshot.captured_at if snapshot is not None else refusal.captured_at,
-            five_hour=five,
-            seven_day=seven,
-            blocked_reason=refusal_label(refusal.reached_type),
-            blocked_at=refusal.captured_at,
-        )
-    _codex_cache = (key[0], key[1], snapshot)
+    if freshest is None:
+        return None
+    windows = {
+        minutes: Window(used_percentage=parsed.used_percent, resets_at=parsed.resets_at)
+        for minutes, parsed in freshest.windows.items()
+    }
+    return Usage(
+        captured_at=freshest.captured_at or now,
+        five_hour=windows.get(_FIVE_HOUR_MINUTES),
+        seven_day=windows.get(_SEVEN_DAY_MINUTES),
+    )
+
+
+def _staple_refusal(snapshot: Usage | None, refusal: object, now: int) -> Usage:
+    """Re-issue *snapshot* with the live refusal stapled on and the full window at 100%.
+
+    The windows keep reporting the last successful call's figures while Codex rejects
+    everything, so without this the card shows comfortable headroom — see
+    :func:`_force_exhausted_window`. Every other attribute (``live``/``email``/
+    ``plan_type``) is carried over, so a stapled LIVE snapshot still renders as live.
+    """
+    reached_type = getattr(refusal, "reached_type", "")
+    captured = getattr(refusal, "captured_at", now)
+    five, seven = _force_exhausted_window(
+        snapshot.five_hour if snapshot is not None else None,
+        snapshot.seven_day if snapshot is not None else None,
+        now,
+    )
+    return Usage(
+        captured_at=snapshot.captured_at if snapshot is not None else captured,
+        five_hour=five,
+        seven_day=seven,
+        blocked_reason=refusal_label(reached_type),
+        blocked_at=captured,
+        live=snapshot.live if snapshot is not None else False,
+        email=snapshot.email if snapshot is not None else "",
+        plan_type=snapshot.plan_type if snapshot is not None else "",
+    )
+
+
+def _is_default_codex_home(home: Path) -> bool:
+    """True when *home* is the default ``CODEX_HOME`` (the one that writes rollout files)."""
+    try:
+        return home.expanduser().resolve() == config.codex_home().expanduser().resolve()
+    except OSError:  # pragma: no cover - resolve() only fails on exotic filesystems
+        return str(home) == str(config.codex_home())
+
+
+def read_codex_usage(now: int | None = None, home: Path | None = None) -> Usage | None:
+    """Current Codex rate-limit snapshot for *home* — the LIVE figures when they are newer.
+
+    Two sources, and the newer one wins:
+
+    * the live ``wham/usage`` cache (:func:`read_codex_live`), refreshed out-of-band when
+      ``codex_usage`` is on, and
+    * the newest windowed ``rate_limits`` block Codex wrote onto a ``token_count`` event
+      in ``<home>/sessions/**/rollout-*.jsonl`` — as old as the last Codex turn.
+
+    A live refusal (:func:`codex_in_claude.codex_refusal`) is read separately from the
+    windowless blocks the window scan skips and stapled on, EXCEPT when the chosen live
+    snapshot is already newer than it (the endpoint reports the block itself, and its
+    windows are the ones that actually filled). The refusal/rollout path applies only to
+    the DEFAULT home — those files are written by the default login.
+
+    Parsing is cached per home on the newest rollout file's and the live cache's
+    ``(path, mtime)`` so the 5 s TUI refresh stays cheap when idle.
+    """
+    now = int(time.time()) if now is None else now
+    home = config.codex_home() if home is None else home
+    default_home = _is_default_codex_home(home)
+    files = _codex_rollout_files(home)
+    key = _path_key(files[0] if files else None) + _path_key(_codex_usage_path(home))
+    cached = _codex_cache.get(str(home))
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    rollout = _codex_rollout_snapshot(files, now) if files else None
+    # A refusal lives in the windowless blocks the window scan skips, so it is read
+    # separately: the windows keep reporting the last healthy figures while Codex rejects
+    # every call, and only this field says so.
+    refusal = codex_refusal() if default_home else None
+    live = read_codex_live(home)
+    snapshot: Usage | None
+    if live is not None and (rollout is None or live.captured_at >= rollout.captured_at):
+        snapshot = live
+        # The live payload carries the refusal itself; only a refusal NEWER than the
+        # fetch can add anything the endpoint had not seen yet.
+        if refusal is not None and not snapshot.blocked and refusal.captured_at > live.captured_at:
+            snapshot = _staple_refusal(snapshot, refusal, now)
+    else:
+        snapshot = rollout
+        if refusal is not None:
+            snapshot = _staple_refusal(snapshot, refusal, now)
+    _codex_cache[str(home)] = (key, snapshot)
     return snapshot
 
 
@@ -1200,9 +1746,16 @@ def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
         if resets:
             banner += Text(f"access returns {format_reset(min(resets), now)}\n", style="bold red")
         age = _format_age(now - usage.captured_at) if usage.captured_at else "?"
-        banner += Text(
-            f"100% = the limit that fired; other figures are {age} old\n", style="grey50"
+        # Live figures need no caveat: the endpoint reported the block AND the windows in
+        # one answer, so the bars below ARE the state that fired. A rollout-sourced
+        # snapshot instead carries the last SUCCESSFUL call's numbers, with only the
+        # window ccc pinned reading 100% — say which is which.
+        note = (
+            f"live figures, {age} old"
+            if usage.live
+            else f"100% = the limit that fired; other figures are {age} old"
         )
+        banner += Text(note + "\n", style="grey50")
         return banner + _render_card(usage, now, fill_color=_CODEX_FILL, label_color=_CODEX_FILL)
     if usage is None or usage.is_empty():
         return Text("—\n(run Codex to populate)", style="grey50")
@@ -1492,15 +2045,8 @@ def fetch_copilot_usage(
 
 def read_copilot_usage() -> CopilotUsage | None:
     """Load the last cached Copilot snapshot, or ``None`` if absent/unreadable."""
-    try:
-        raw = _copilot_usage_path().read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(data, dict):
+    data = _load_json_dict(_copilot_usage_path())
+    if data is None:
         return None
     try:
         return CopilotUsage(

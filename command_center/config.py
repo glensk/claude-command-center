@@ -117,6 +117,19 @@ DEFAULTS: dict[str, object] = {
     # While any job is WORKING/SNOOZED the fetch throttle drops to this shorter "active"
     # interval so the cards track reality more closely; 0 or ≥ idle disables the speed-up.
     "claude_usage_refresh_active_sec": 200,  # active-work OAuth usage throttle (~1/3 of idle)
+    # Live OpenAI Codex usage: fetch ChatGPT's own usage endpoint (the numbers its
+    # Settings -> Usage page shows) with the token in `$CODEX_HOME/auth.json`, instead of
+    # only replaying the rate_limits blocks Codex leaves in its rollout files (which are
+    # as old as the last Codex turn). RENDER stays gated by usage_card_codex/_codex_private.
+    "codex_usage": False,  # fetch the live chatgpt.com Codex usage endpoint (INERT: off)
+    "codex_usage_refresh_sec": 600,  # min sec between idle live Codex usage fetches per home
+    # While any job is WORKING/SNOOZED the fetch throttle drops to this shorter "active"
+    # interval so the cards track reality more closely; 0 or >= idle disables the speed-up.
+    "codex_usage_refresh_active_sec": 200,  # active-work Codex usage throttle (~1/3 of idle)
+    # A SECOND CODEX_HOME holding another ChatGPT login, e.g. "~/.codex-private" (create
+    # it with `CODEX_HOME=~/.codex-private codex login`). Empty (the default) => no second
+    # Codex card at all: it is absent, not merely collapsed.
+    "codex_home_private": "",
     # Multi-account Claude Code. ``claude_accounts`` maps labels to config dirs, one
     # ``"label=path"`` entry per line (list[str] so save_config round-trips it). Empty
     # (the default) ⇒ a single ``{"private": claude_home()}`` account, i.e. today's
@@ -138,6 +151,7 @@ DEFAULTS: dict[str, object] = {
     "usage_card_private": True,  # expand the Claude Code (private) usage card
     "usage_card_work": True,  # expand the Claude Code (work) usage card
     "usage_card_codex": True,  # expand the OpenAI Codex usage card
+    "usage_card_codex_private": True,  # expand the SECOND OpenAI Codex card (codex_home_private)
     "usage_card_copilot": True,  # EXPAND the Copilot card (copilot_usage gates the FETCH)
     # External homelab "overseer" alert-triage daemon (a SEPARATE project — unrelated to
     # ccc's own future-job plumbing). Its incidents feed two read-only TUI cards. Empty
@@ -212,6 +226,7 @@ INERT_DEFAULT_KEYS: tuple[str, ...] = (
     "mirror_sessions",  # no vault writes (full-conversation mirror)
     "copilot_usage",  # no `gh` billing calls
     "claude_usage",  # no keychain read / Claude OAuth /usage fetch
+    "codex_usage",  # no Codex auth.json read / chatgpt.com usage fetch
     "resume_halted",  # no resume watcher / continue-script spawns
     "reap",  # never auto-close a stranger's sessions un-asked
     "short_aim",  # no codex/claude short-label generation
@@ -248,6 +263,32 @@ def codex_home() -> Path:
     """Root of OpenAI Codex CLI's state (``~/.codex`` unless ``CODEX_HOME`` is set)."""
     env = os.environ.get("CODEX_HOME")
     return Path(env) if env else Path.home() / ".codex"
+
+
+def codex_home_private() -> Path | None:
+    """The optional SECOND ``CODEX_HOME`` (a different ChatGPT login), or ``None``.
+
+    Configured as ``codex_home_private`` (e.g. ``"~/.codex-private"``, created by
+    ``CODEX_HOME=~/.codex-private codex login``). Empty — the default — means the
+    feature is off: no second card is drawn at all, exactly like the Claude work card
+    on a machine with no ``work`` account.
+    """
+    raw = load_config().codex_home_private.strip()
+    return Path(raw).expanduser() if raw else None
+
+
+def codex_homes() -> dict[str, Path]:
+    """Label -> ``CODEX_HOME`` for every configured Codex (ChatGPT) login.
+
+    Always ``{"default": codex_home()}``, plus ``{"private": …}`` when
+    ``codex_home_private`` is set. The labels are FIXED strings: they name the account
+    in ``ccc codex-usage -a LABEL`` output and key the per-home live usage caches.
+    """
+    homes = {"default": codex_home()}
+    private = codex_home_private()
+    if private is not None:
+        homes["private"] = private
+    return homes
 
 
 def claude_config_dirs() -> dict[str, Path]:
@@ -399,12 +440,17 @@ class Config:
     claude_usage: bool = False  # fetch the Claude /usage OAuth endpoint (INERT: off)
     claude_usage_refresh_sec: int = 600
     claude_usage_refresh_active_sec: int = 200
+    codex_usage: bool = False  # fetch the live chatgpt.com Codex usage endpoint (INERT: off)
+    codex_usage_refresh_sec: int = 600
+    codex_usage_refresh_active_sec: int = 200
+    codex_home_private: str = ""  # second CODEX_HOME ("" = no second Codex card)
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
     job_account: str = ""  # "" = default account, a label = pin, "auto" = burn-rate routing
     usage_card_private: bool = True
     usage_card_work: bool = True
     usage_card_codex: bool = True
+    usage_card_codex_private: bool = True  # render gate for the second Codex card
     usage_card_copilot: bool = True  # render gate (copilot_usage stays the fetch gate)
     nixos_overseer_dir: str = ""  # external overseer root ("" = feature off)
     card_nixos_overseer_supervised: bool = True

@@ -62,7 +62,7 @@ GROUP_B_VAULT: tuple[str, ...] = (
 #: Group C — offered individually, each behind its own dependency / caveat.
 GROUP_C: tuple[str, ...] = ("copilot_usage", "resume_halted", "reap")
 #: Inert keys intentionally NOT surfaced as a wizard question (secondary cost knobs).
-UNMAPPED_INERT: tuple[str, ...] = ("verify_subgoals_llm", "claude_usage")
+UNMAPPED_INERT: tuple[str, ...] = ("verify_subgoals_llm", "claude_usage", "codex_usage")
 
 #: Anchor keys always written when the user supplies a vault (even if == default).
 ANCHOR_KEYS: tuple[str, ...] = ("vault_root",)

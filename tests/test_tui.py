@@ -2509,6 +2509,101 @@ def test_work_card_hidden_and_t2_inert_without_a_work_account(
     asyncio.run(scenario())
 
 
+def test_second_codex_card_hidden_and_t5_inert_without_codex_home_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No `codex_home_private` ⇒ the second Codex card is absent and `t5` explains itself.
+
+    Same rule as the work card: a second ChatGPT login that does not exist has nothing to
+    show, so the box is removed outright rather than left permanently empty.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center import config
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app._has_codex_private() is False
+            assert app.query_one("#usage-codex-private").display is False
+            assert app.cfg.usage_card_codex_private is True  # the flag itself is untouched
+
+            await pilot.press("t")
+            await pilot.press("5")
+            await pilot.pause()
+            # Inert: nothing flipped, nothing persisted.
+            assert app.cfg.usage_card_codex_private is True
+            assert config.load_config().usage_card_codex_private is True
+            assert app.query_one("#usage-codex-private").display is False
+
+    asyncio.run(scenario())
+
+
+def test_second_codex_card_shows_its_own_account_and_t5_toggles_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a second CODEX_HOME the card appears, titles itself by account, and t5 folds it."""
+    import base64
+    import json
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    default_home = tmp_path / "codex"
+    private_home = tmp_path / "codex-private"
+    monkeypatch.setenv("CODEX_HOME", str(default_home))
+    (tmp_path / "command-center").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "command-center" / "config.toml").write_text(
+        f'codex_home_private = "{private_home}"\n', encoding="utf-8"
+    )
+
+    def _auth(home: Path, email: str) -> None:
+        claims = (
+            base64.urlsafe_b64encode(json.dumps({"email": email}).encode()).decode().rstrip("=")
+        )
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "auth.json").write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "id_token": f"header.{claims}.signature",
+                        "access_token": "tok",
+                        "account_id": "acct",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    _auth(default_home, "work.seat@example.org")
+    _auth(private_home, "second.login@example.com")
+
+    from command_center import config
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            card = app.query_one("#usage-codex-private")
+            assert card.display is True
+            # Each card names ITS OWN account, so two green boxes are never confused.
+            assert str(app.query_one("#usage-codex").border_title) == (
+                "OpenAI Codex wo…se@example.org / t3"
+            )
+            assert str(card.border_title) == "OpenAI Codex se…lo@example.com / t5"
+
+            await pilot.press("t")
+            await pilot.press("5")
+            await pilot.pause()
+            assert app.cfg.usage_card_codex_private is False
+            assert config.load_config().usage_card_codex_private is False
+            assert card.display is True  # collapsed onto its title line, not removed
+            assert card.has_class("card-collapsed") is True
+
+    asyncio.run(scenario())
+
+
 def test_nixos_overseer_cards_default_visibility_and_to_ta_toggle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

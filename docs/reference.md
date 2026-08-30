@@ -56,6 +56,7 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 - `ccc focus-job <id>` — bring a live session's tab forward (verifies it is live first).
 - `ccc rm` · `ccc prune` — drop a tracked row / delete leftovers (contentless, headless `claude -p`, and dead-launched jobs that never had a turn).
 - `ccc peek` (`--print`) · `ccc jump` — the macOS peek panel / the ccc↔session toggle.
+- `ccc snapshot` (`-l/--list`, `-n/--dry-run`) · `ccc restore-snapshot [name]` (`-n/--dry-run`, `-y/--yes`) — save the whole iTerm layout before a reboot, rebuild it afterwards.
 
 **Obsidian & mirrors**
 
@@ -72,7 +73,7 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 - `ccc install-hooks` · `ccc install-statusline` · `ccc install-commands` · `ccc install-shell` — the individual installers `ccc init` runs.
 - `ccc daemon [--install|--uninstall|--status|--dry-run]` — the background housekeeper (launchd on macOS, systemd `--user` on Linux).
 - `ccc resume-halted [--watch|--dry-run]` — auto-resume rate-limit-halted sessions once the limit resets.
-- `ccc toggle-idle` · `ccc tab-symbol` · `ccc tag` · `ccc copilot-usage` — mute idle popups / per-repo badge / typed @tags / refresh Copilot usage.
+- `ccc toggle-idle` · `ccc tab-symbol` · `ccc tag` · `ccc copilot-usage` · `ccc codex-usage` — mute idle popups / per-repo badge / typed @tags / refresh Copilot usage / refresh the live OpenAI Codex usage.
 - `ccc restart-tui` — restart the running ccc TUI in its own tab (for automations that changed ccc's code/config).
 
 Inside a Claude Code session the slash commands `/aim` `/next-step` `/done` `/block`
@@ -322,6 +323,98 @@ the screen opens straight onto the sessions. The same names are listed under **N
 in the in-TUI help (`?`).
 
 ![the ccc detail pane (job details:): the selected session's AIM, its concreteness score, the sub-goal checklist, the next step, and the stacked Claude Code / OpenAI Codex / GitHub Copilot subscription-usage cards](img/tui-detail.svg)
+
+### Snapshot & restore — survive a reboot with your desk intact (`ccc snapshot`)
+
+A macOS update is about to take the machine down and you have eleven Claude sessions,
+three `vim`s and an `htop` spread across four iTerm windows. `ccc snapshot` writes the
+*shape* of that desk to a JSON file; after the reboot `ccc restore-snapshot` rebuilds it.
+
+**What is captured.** Every iTerm2 window (its frame and which tab was selected), every
+tab, and each tab's **split topology** — read from `tab.root`'s splitter tree, so pane
+*order* is preserved (`tab.sessions` is unordered and is never used for layout). Per pane
+one of three things:
+
+- **a Claude session** — matched to ccc's own records by the pane UUID first (the
+  `iterm_session_id` ccc already stores), by the live process's tty as a fallback. Stored
+  as its session id **plus the account** (`config_dir`) it was running under.
+- **a command** — the foreground program's **exact `argv`**, read straight out of the
+  kernel (`sysctl KERN_PROCARGS2`), never re-parsed from a display string. An **ancestor
+  rule** walks up from the foreground process toward the login shell and keeps the
+  *highest* allowlisted ancestor, so `man git` wins over the `less` child that actually
+  owns the terminal. The pane's cwd comes from one batched `lsof`.
+- **a shell** — nothing in the foreground (or a program whose `argv` could not be read):
+  just the cwd, plus a note naming what was there.
+
+Snapshots live in `$CLAUDE_HOME/command-center/snapshots/` (dir `0700`, files `0600`,
+written `mkstemp` + `os.replace` so a file is never half-written) as
+`<YYYYmmdd-HHMMSS>.json`, with `-2`, `-3` … on a same-second collision. There is no
+`latest.json`: "latest" is resolved as the newest file at restore time. `ccc snapshot -l`
+lists what you have (name, age, window/tab/pane counts, how many are Claude sessions);
+`ccc snapshot -n` prints the capture and its per-pane classification without writing.
+
+**What restore does.** `ccc restore-snapshot` (no argument = the newest snapshot; a bare
+name resolves in the snapshots dir with or without `.json`; anything containing `/` is
+used as a path) prints the snapshot's age, then plans every pane:
+
+| Pane | Action |
+| :--- | :----- |
+| Claude session, already live | left alone — `already running — skipped` |
+| Claude session, resume blocked | **error** pane: only `cd <cwd>`, with the reason |
+| Claude session, clean | `cd <cwd> && claude --resume <id>`, prefixed with the account pin |
+| command on the allowlist | `cd <cwd> && <argv re-quoted element by element>` |
+| command not on the allowlist | `cd <cwd>` + a printed `[ccc-restore] was running: …` note |
+| shell / unreadable argv | `cd <cwd>` (+ the note when we know what ran) |
+| cwd gone from disk | nothing is run; the pane is reported as degraded (not an error) |
+
+"Resume blocked" is the **same** `core.resume_blockers` pre-flight `ccc resume` uses:
+an unknown account while several are configured, an id live under two accounts at once,
+or no transcript on disk. So a restore can never bill the wrong seat or exec a doomed
+`claude --resume`, and the wording is identical on both surfaces.
+
+Execution is **two-phase**: first the *whole* empty layout is built (windows in order,
+frames best-effort, tabs, then each tab's splits rebuilt recursively — child 0 keeps the
+pane it was handed, each later child is split off the previous one), then every pane
+receives its command and non-Claude panes get their recorded title back. A failure
+half-way therefore leaves a usable, if bare, desk rather than a half-typed one; per-pane
+failures are collected and reported. **Exit 0** = everything restored or cleanly skipped;
+**1** = any pane errored (or a guard refused).
+
+**Guards.**
+
+- `-n/--dry-run` prints the full window/tab/pane plan and touches iTerm not at all.
+- macOS restores app windows *itself* after a reboot, and restoring on top of that
+  silently **duplicates** the layout. So restore counts the panes iTerm already has
+  besides the one you are typing in (identified via `$ITERM_SESSION_ID`) and **refuses**
+  while any exist — `-y/--yes` overrides.
+- `launcher = "tmux"` refuses with a pointer at `tmux attach` (tmux persists its own
+  layout); a missing iTerm2 Python API refuses naming
+  *Settings → General → Magic → Enable Python API*.
+
+**Config.** `snapshot_restore_commands` (list) is the allowlist of programs a pane may
+**re-run** from its captured argv — default
+`["vi", "vim", "nvim", "less", "man", "tail", "htop", "btop", "top", "ccc", "ssh"]`.
+Anything else only ever gets *printed*. Matching **sees through interpreter wrappers**: a
+`#!`-script is exec'd as `<interpreter> <script> …`, so a `python`/`python3*`/`perl`/
+`ruby`/`node`/`bun` argv0 is matched by the **script's** basename instead — which is what
+makes the `ccc` entry relaunch the TUI (really `python3 …/bin/ccc`). An interpreter with
+no script (`python3 -m http.server`) stays matched as `python3`, and what gets re-run is
+always the full exact argv, interpreter included.
+
+**Safety model in one line:** a restored command is rebuilt exclusively from exact
+kernel-read `argv` of your own processes, re-quoted per element with `shlex.quote`;
+free-text fields are never executed, only `printf`-ed.
+
+**v1 limitations** (deliberate):
+
+- No automatic/periodic snapshot — you run it before the reboot.
+- macOS + iTerm2 Python API only; no AppleScript, Terminal.app or tmux backend.
+- Split *topology* is restored, pane **sizes** are not; profiles are not; a frame that
+  will not apply (multi-monitor) is skipped silently.
+- Natively-restored panes are not adopted or reused — hence the guard above; a
+  deliberate double restore duplicates non-Claude tabs.
+- Codex CLI panes come back as a shell + note (there is no reliable `codex resume` map).
+- A tmux session running *inside* an iTerm pane is not descended into.
 
 ### Future jobs — park a thought, start it later (`f`+`n`)
 
@@ -1302,9 +1395,12 @@ The TUI's detail pane (bottom half) shows your subscription usage in the top-rig
 as **stacked, border-titled cards** so the providers are never confused —
 `Claude Code (private)` (gold border, per-bar green/orange/red usage bars) on top, `Claude Code (work)`
 (blue border — shown only when a second `work` account is configured, see
-*Multi-account* below), `OpenAI Codex` (green border, green bars), and
+*Multi-account* below), one `OpenAI Codex <account>` card per configured ChatGPT login
+(green border, green bars — the second one only when `codex_home_private` is set), and
 `<copilot_card_title> <copilot_model>` (violet border) below — the Copilot title
 shows the default delegation model from the `copilot_model` config (e.g. `gpt-5.4`).
+Each Codex card names its own account in the title (`OpenAI Codex fi…la@example.org / t3`,
+read from that home's `auth.json`), so two logins are never mistaken for one another.
 The titles drop the word "usage" and the bars drop "used" to keep the cards narrow.
 Each window is a **single bar** — no standalone title line; the window name and the
 reset time are **embossed inside the bar itself** (`Session:` / `Week:`, dark over the
@@ -1318,7 +1414,7 @@ other:
 │ ██Session: Resets in 1h 57m░░░   33% │
 │ ██Week: Resets in 3d 11h 36m░░   20% │
 ╰──────────────────────────────────────╯
-╭──── OpenAI Codex ───────────────────╮
+╭──── OpenAI Codex fi…la@example.org ─╮
 │ ██Session: Resets in 2h 11m░░░   14% │
 │ ██Week: Resets in 6d 0h 5m░░░░   10% │
 ╰──────────────────────────────────────╯
@@ -1327,18 +1423,20 @@ other:
 ╰──────────────────────────────────────╯
 ```
 
-**Expand/collapse each card with the persistent `t1`…`t4` / `to` / `ta` chords** (`t1` = Claude
-private, `t2` = Claude work, `t3` = Codex, `t4` = Copilot, `to` = nixos overseer supervised,
+**Expand/collapse each card with the persistent `t1`…`t5` / `to` / `ta` chords** (`t1` = Claude
+private, `t2` = Claude work, `t3` = Codex, `t4` = Copilot, `t5` = the second Codex login,
+`to` = nixos overseer supervised,
 `ta` = nixos overseer tier_a; type `t` alone for the menu). **Collapsed is not hidden**: the card
 keeps its titled top border — the line that names its own chord — and drops the rest of the box,
 so a folded-away card stays one keystroke from coming back:
 
 ```
-╭─ Claude Code (private) 🏠 / t1 ─────╮
-╭─ OpenAI Codex / t3 ─────────────────╮
-╭─ Copilot gpt-5.4 / t4 ──────────────╮
-│ ░Resets in 4d░░░░░░░░░░░░░░░░    0% │
-╰─────────────────────────────────────╯
+╭─ Claude Code (private) 🏠 / t1 ───────╮
+╭─ OpenAI Codex fi…la@example.org / t3 ─╮
+╭─ OpenAI Codex se…nd@example.com / t5 ─╮
+╭─ Copilot gpt-5.4 / t4 ────────────────╮
+│ ░Resets in 4d░░░░░░░░░░░░░░░░░░░   0% │
+╰───────────────────────────────────────╯
 ```
 
 A collapsed card also gives back its **width**: the cards share one auto-width column
@@ -1348,11 +1446,12 @@ its title alone rather than to its (now hidden) content — folding away the nix
 supervised card, ~79 cells wide with real incidents, hands ~38 columns back to the left.
 
 Unlike the view-local `td`/`tf` toggles these **persist** to `config.toml`
-(`usage_card_private/_work/_codex/_copilot`, `card_nixos_overseer_supervised/_tier_a`
-— pure render gates); `t4` also flips the
+(`usage_card_private/_work/_codex/_codex_private/_copilot`,
+`card_nixos_overseer_supervised/_tier_a` — pure render gates); `t4` also flips the
 `copilot_usage` network-fetch gate so a collapsed Copilot card costs no `gh` call, and
 `t2` on a machine with no `work` account explains itself instead of toggling an empty
-box (that card — the one exception — is absent entirely, title line included).
+box (that card is absent entirely, title line included — as is the `t5` card without a
+`codex_home_private`; those two are the only cards that ever disappear outright).
 
 **The two nixos-overseer cards** read incidents from an *external* homelab
 "overseer" alert-triage daemon (a separate project — nothing to do with ccc's own
@@ -1442,19 +1541,59 @@ when every session is parked, and over `ccc serve` in the browser:
 echo "$input" | ccc statusline --session "$sid" --capture-usage
 ```
 
-**OpenAI Codex** has no usage endpoint or status-line hook either, but it writes a
+**OpenAI Codex** has two sources, and `read_codex_usage` serves whichever is **newer**.
+
+*The live endpoint (opt-in, `codex_usage = true`).* ChatGPT's own
+`https://chatgpt.com/backend-api/wham/usage` returns exactly what its *Settings → Usage*
+page shows. `ccc codex-usage` GETs it with the credentials `codex login` parked in
+`$CODEX_HOME/auth.json` (`Authorization: Bearer <tokens.access_token>` +
+`ChatGPT-Account-Id: <tokens.account_id>`; the token is never logged or printed, and an
+API-key login — `auth_mode` other than `chatgpt` — is skipped, since it has no
+subscription windows). The two windows are identified by their `limit_window_seconds`
+(18000 → `Session:`, 604800 → `Week:`), never by their primary/secondary position, and a
+`rate_limit_reached_type` marks the card **BLOCKED** with the same wording the rollout
+path uses. The access token is a JWT valid ~10 days that `codex` refreshes as it runs;
+if it has expired anyway the endpoint answers **401**, and the fetch falls back once to
+the official `codex app-server` (JSON-RPC `account/rateLimits/read` over stdio), which
+refreshes the token itself and writes it back. The fetch is throttled exactly like the
+Claude one (`codex_usage_refresh_sec` 600 s idle / `codex_usage_refresh_active_sec`
+200 s while any job works) and runs out-of-band — the daemon per configured home, plus a
+detached TUI spawn when a cache is stale; the render path only reads the cached JSON.
+Off by default (fresh-install inert: an `auth.json` read + a network call).
+
+```commands
+ccc codex-usage              # refresh + print one line per configured CODEX_HOME
+ccc codex-usage --json       # dump the cached snapshots (a dict keyed by home label)
+ccc codex-usage -a private   # just the second login
+```
+
+*The rollout files (always available, no wiring, no network).* Codex writes a
 `rate_limits` block (`primary` = 5-hour, `secondary` = weekly) onto each
 `token_count` event in its session rollout files
-(`$CODEX_HOME/sessions/**/rollout-*.jsonl`, default `~/.codex`). `read_codex_usage`
-reads the newest such block directly — it is account-global, like Claude's. Codex
-emits more than one block shape, though: the `limit_id: "codex"` block carries the
-windows, while short `codex exec` runs (the ones ccc spawns for short-aim/delegate)
-log a **windowless** `limit_id: "premium"` block whose `primary`/`secondary` are both
-`null`. The reader skips windowless blocks and scans back through enough files to find
-the freshest one that actually has data — otherwise the pile-up of tiny exec runs
-would bury the real numbers and the card would read "(run Codex to populate)". No
-wiring is needed; the card is as fresh as your most recent Codex turn (if a window
-has already elapsed since then, it shows `Resets now` until Codex runs again).
+(`$CODEX_HOME/sessions/**/rollout-*.jsonl`, default `~/.codex`) — account-global, like
+Claude's. Codex emits more than one block shape, though: the `limit_id: "codex"` block
+carries the windows, while short `codex exec` runs (the ones ccc spawns for
+short-aim/delegate) log a **windowless** `limit_id: "premium"` block whose
+`primary`/`secondary` are both `null`. The reader skips windowless blocks and scans back
+through enough files to find the freshest one that actually has data — otherwise the
+pile-up of tiny exec runs would bury the real numbers and the card would read "(run Codex
+to populate)". This source is only as fresh as your most recent Codex turn, which is the
+gap the endpoint closes: on 2026-08-30 the newest windowed event was ~14 h old and its
+5-hour reset had long passed, so the only *live* window left for a refusal to pin was the
+weekly one — the card claimed `Week: 100%, access returns in 6d 8h` while the web page
+said the 5-hour window had just filled (19 min to go) and the week still had 77% headroom.
+With live data the block is attributed to the window that actually filled, and the blocked
+banner then reads `live figures, <age> old` instead of the
+`100% = the limit that fired; other figures are <age> old` caveat the rollout path needs.
+
+*A second ChatGPT login.* Point `codex_home_private` at another `CODEX_HOME` (create it
+with `CODEX_HOME=~/.codex-private codex login`) and a second green card appears, with its
+own `t5` chord, its own throttled fetch and its own cache. Empty — the default — means no
+second card at all (absent, not merely collapsed). Each card titles itself with the
+account e-mail read from that home's `auth.json` `id_token` (abbreviated:
+`OpenAI Codex fi…la@example.org / t3`), so the two are never confused. The rollout files
+belong to the default login, so the second card is live-endpoint-only, and a refusal
+recorded by one login never bleeds into the other's card.
 
 **GitHub Copilot** is read from the official `gh` CLI hitting your own per-user
 enhanced-billing usage endpoint (`/users/{login}/settings/billing/usage`) — no

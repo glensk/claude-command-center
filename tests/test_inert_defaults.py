@@ -34,6 +34,7 @@ _EXPECTED_INERT_KEYS = {
     "mirror_sessions",
     "copilot_usage",
     "claude_usage",
+    "codex_usage",
     "resume_halted",
     "reap",
     "short_aim",

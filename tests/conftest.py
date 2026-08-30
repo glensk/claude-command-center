@@ -53,6 +53,21 @@ def _pin_claude_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _pin_codex_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin ``CODEX_HOME`` under ``tmp_path`` so NO test can read the real ``~/.codex``.
+
+    ``config.codex_home()`` anchors the Codex usage sources: the session rollout files
+    AND — since the live usage endpoint landed — ``auth.json``, which holds a real
+    ChatGPT OAuth token. A test that reaches the Codex card (the TUI renders it on every
+    tick, and its border title decodes the account e-mail out of that file) would
+    otherwise read the developer's actual credential store. Pinning it to a throwaway
+    dir keeps the suite hermetic; tests that need Codex data set ``CODEX_HOME``
+    themselves and simply re-override this default (monkeypatch is last-wins).
+    """
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_tab_symbol_side_effects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep every test off the real badge cache and the real iTerm session."""
     monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))

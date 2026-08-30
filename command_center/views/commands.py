@@ -439,7 +439,7 @@ COMMANDS: list[Command] = [
             "(up to 20 steps, remembered for this ccc run only). Covered: close/park "
             "(c/x — including the close offered after marking a live session done), "
             "mark-done/un-done (d), Keep (K), importance (!), a sub-goal tick (space), "
-            "an account switch (tp/tw), and every toggle (td / tf / ti, t1–t4, to/ta). "
+            "an account switch (tp/tw), and every toggle (td / tf / ti, t1–t5, to/ta). "
             "Undoing the close of a LIVE session cannot revive the killed process — it "
             "restores the row and reopens the conversation in a new tab (same as r). "
             "Text edits (a / n / b / D / e) are not undoable here — re-edit the field; "
@@ -563,6 +563,24 @@ COMMANDS: list[Command] = [
         ),
         action="toggle_card_copilot",
         chord=("t", "4"),
+        # No footer_pos: surfaced via the `t` leader menu, like tf/ti.
+    ),
+    Command(
+        key="t5",
+        word="card-codex-private",
+        gloss="expand / collapse the second OpenAI Codex card",
+        section=GLOBAL,
+        explanation=(
+            "Expand or collapse the second OpenAI Codex usage card — the green-bordered "
+            "5h/weekly bars for the ChatGPT login held in codex_home_private. Type t then "
+            "5. Expanded by default; the chord collapses it to its titled top border alone "
+            "(and again expands it), persisted to ccc's config. Each Codex card names its "
+            "own account in the title, so two logins are never confused. With no "
+            "codex_home_private configured the card is absent entirely, and the chord "
+            "explains that instead of toggling."
+        ),
+        action="toggle_card_codex_private",
+        chord=("t", "5"),
         # No footer_pos: surfaced via the `t` leader menu, like tf/ti.
     ),
     Command(

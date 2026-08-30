@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -422,17 +423,21 @@ def test_sweep_removes_only_stale_temps(tmp_path: Path, monkeypatch: pytest.Monk
 def test_sweep_covers_every_producer_prefix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Per-account `usage-<hash>.json` and `copilot_usage.json` orphans are swept too."""
+    """Per-account `usage-<hash>.json`, `copilot_usage.json` and per-home Codex orphans too."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     home = config.app_home()
     home.mkdir(parents=True, exist_ok=True)
     old = time.time() - 7200
-    for name in ("usage-work-b6f4d184.json.cccccccc.tmp", "copilot_usage.json.dddddddd.tmp"):
+    for name in (
+        "usage-work-b6f4d184.json.cccccccc.tmp",
+        "copilot_usage.json.dddddddd.tmp",
+        "codex_usage-a1b2c3d4.json.eeeeeeee.tmp",
+    ):
         path = home / name
         path.write_text("{}", encoding="utf-8")
         os.utime(path, (old, old))
 
-    assert usage.sweep_stale_temps() == 2
+    assert usage.sweep_stale_temps() == 3
     assert list(home.glob("*.tmp")) == []
 
 
@@ -640,7 +645,7 @@ def test_read_codex_usage_maps_windows_by_duration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    usage._codex_cache = None  # reset the module-level parse cache
+    usage._codex_cache.clear()  # reset the module-level parse cache
     _write_codex_rollout(tmp_path, _CODEX_RATE_LIMITS, name="a")
     snap = usage.read_codex_usage(now=_NOW)
     assert snap is not None
@@ -655,7 +660,7 @@ def test_read_codex_usage_primary_weekly_window_does_not_fill_five_hour(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    usage._codex_cache = None
+    usage._codex_cache.clear()
     weekly_only = {
         "limit_id": "codex",
         "primary": {
@@ -678,10 +683,10 @@ def test_read_codex_usage_primary_weekly_window_does_not_fill_five_hour(
 
 def test_read_codex_usage_none_when_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    usage._codex_cache = None
+    usage._codex_cache.clear()
     # No sessions dir at all, then a rollout with no rate_limits → still None.
     assert usage.read_codex_usage(now=_NOW) is None
-    usage._codex_cache = None
+    usage._codex_cache.clear()
     _write_codex_rollout(tmp_path, None, name="empty")
     assert usage.read_codex_usage(now=_NOW) is None
 
@@ -690,7 +695,7 @@ def test_read_codex_usage_prefers_newest_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    usage._codex_cache = None
+    usage._codex_cache.clear()
     old = dict(
         _CODEX_RATE_LIMITS,
         primary={"used_percent": 3.0, "window_minutes": 300, "resets_at": 1782320400},
@@ -713,7 +718,7 @@ def test_read_codex_usage_skips_windowless_newest_file(
     # file carries the real windows. The reader must skip the former and find the latter,
     # else the card stays stuck on "(run Codex to populate)".
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    usage._codex_cache = None
+    usage._codex_cache.clear()
     _write_codex_rollout(tmp_path, _CODEX_RATE_LIMITS, name="real", mtime=1782300000)
     _write_codex_rollout(tmp_path, _CODEX_PREMIUM_NULL, name="premium", mtime=1782301000)
     snap = usage.read_codex_usage(now=_NOW)
@@ -729,7 +734,7 @@ def test_read_codex_usage_skips_trailing_windowless_block_in_file(
     # ``codex`` block — the exact real-world shape. The shared duration-keyed event parser
     # scans from the end, so it must skip the trailing null block and return the populated one.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    usage._codex_cache = None
+    usage._codex_cache.clear()
     day = tmp_path / "sessions" / "2026" / "06" / "24"
     day.mkdir(parents=True, exist_ok=True)
     path = day / "rollout-2026-06-24T10-00-00-mixed.jsonl"
@@ -1515,7 +1520,7 @@ def _blocked_snapshot(
 ) -> usage.Usage | None:
     """A refusal logged after a healthy reading, as the real sequence goes."""
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    usage._codex_cache = None
+    usage._codex_cache.clear()
     _write_codex_rollout(tmp_path, healthy, name="healthy", mtime=1782300000)
     _write_codex_rollout(tmp_path, _CODEX_PREMIUM_DEPLETED, name="refused", mtime=1782301000)
     return usage.read_codex_usage(now=_NOW)
@@ -1580,9 +1585,508 @@ def test_quota_reports_codex_blocked_with_the_filled_window_and_its_reset(
         secondary={"used_percent": 60.0, "window_minutes": 10080, "resets_at": 1782893849},
     )
     _blocked_snapshot(tmp_path, monkeypatch, healthy)
-    usage._codex_cache = None
+    usage._codex_cache.clear()
     prov = quota._codex_quota(_NOW, {})
     assert prov.state == quota.BLOCKED
     assert prov.blocked_by == "five_hour"
     assert prov.resets_at == 1782320400
     assert prov.windows["five_hour"].used_pct == 100.0
+
+
+# ------------------- live Codex usage (chatgpt.com wham/usage) --------------------- #
+# The verified HTTP-200 payload from a blocked account, trimmed to the fields the reader
+# touches. Windows are identified by ``limit_window_seconds`` (18000 = the 5h session,
+# 604800 = the week), NEVER by primary/secondary position; the refusal reason lives in the
+# top-level ``rate_limit_reached_type``.
+_WHAM_BLOCKED = {
+    "user_id": "user-0123",
+    "account_id": "acct-test",
+    "email": "alice.example@example.com",
+    "plan_type": "team",
+    "rate_limit": {
+        "allowed": False,
+        "limit_reached": True,
+        "primary_window": {
+            "used_percent": 100,
+            "limit_window_seconds": 18000,
+            "reset_after_seconds": 705,
+            "reset_at": 1788095849,
+        },
+        "secondary_window": {
+            "used_percent": 23,
+            "limit_window_seconds": 604800,
+            "reset_after_seconds": 548497,
+            "reset_at": 1788643641,
+        },
+    },
+    "code_review_rate_limit": None,
+    "additional_rate_limits": None,
+    "credits": {
+        "has_credits": False,
+        "unlimited": False,
+        "overage_limit_reached": False,
+        "balance": None,
+    },
+    "spend_control": {"reached": False, "individual_limit": None},
+    "rate_limit_reached_type": {"type": "workspace_owner_credits_depleted", "details": None},
+    "rate_limit_upsell": None,
+    "promo": None,
+}
+_LIVE_NOW = 1788095000  # ~14 min before the 5h window's reset in the payload above
+
+
+def _write_codex_auth(
+    home: Path,
+    *,
+    email: str | None = "alice.example@example.com",
+    auth_mode: str | None = "chatgpt",
+) -> None:
+    """Write a fabricated ``$CODEX_HOME/auth.json`` (never the developer's real one)."""
+    claims: dict[str, object] = {"sub": "user-0123"}
+    if email is not None:
+        claims["email"] = email
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    data: dict[str, object] = {
+        "OPENAI_API_KEY": None,
+        "tokens": {
+            "id_token": f"eyJhbGciOiJub25lIn0.{payload}.signature",
+            "access_token": "access-token-xyz",
+            "refresh_token": "refresh-token-xyz",
+            "account_id": "acct-1",
+        },
+        "last_refresh": "2026-08-30T09:00:00.000Z",
+    }
+    if auth_mode is not None:
+        data["auth_mode"] = auth_mode
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "auth.json").write_text(json.dumps(data), encoding="utf-8")
+    usage._codex_email_cache.clear()
+
+
+def _seed_codex_live(
+    home: Path,
+    *,
+    captured_at: int,
+    five: tuple[float, int] | None = (100.0, 1788095849),
+    seven: tuple[float, int] | None = (23.0, 1788643641),
+    blocked_reason: str = "",
+    email: str = "alice.example@example.com",
+) -> Path:
+    """Write a live-usage cache file for *home* directly (no network)."""
+    path = usage._codex_usage_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "captured_at": captured_at,
+                "fetched_at": captured_at,
+                "home": str(home.expanduser().resolve()),
+                "email": email,
+                "plan_type": "team",
+                "five_hour": ({"used_percentage": five[0], "resets_at": five[1]} if five else None),
+                "seven_day": (
+                    {"used_percentage": seven[0], "resets_at": seven[1]} if seven else None
+                ),
+                "blocked_reason": blocked_reason,
+                "blocked_at": captured_at if blocked_reason else 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _fake_wham(monkeypatch: pytest.MonkeyPatch, payload: dict) -> dict:
+    """Point ``urlopen`` at *payload*; returns a dict recording the request that was made."""
+    seen: dict[str, object] = {}
+
+    def _urlopen(req: object, timeout: float | None = None) -> _FakeOAuthResp:
+        seen["url"] = req.full_url  # type: ignore[attr-defined]
+        seen["headers"] = {k.lower(): v for k, v in req.header_items()}  # type: ignore[attr-defined]
+        seen["timeout"] = timeout
+        return _FakeOAuthResp(json.dumps(payload).encode())
+
+    monkeypatch.setattr(usage.urllib.request, "urlopen", _urlopen)
+    return seen
+
+
+def test_abbrev_email_shortens_only_the_local_part() -> None:
+    """The domain is what tells two accounts apart, so only the local part is squeezed."""
+    assert usage.abbrev_email("alice.example@example.com") == "al…ex@example.com"
+    assert usage.abbrev_email("openai.account@example.org") == "op…ac@example.org"
+    assert usage.abbrev_email("developer@example.org") == "de…er@example.org"  # >5, undotted
+    assert usage.abbrev_email("bob@x.org") == "bob@x.org"  # ≤5 chars: left alone
+    assert usage.abbrev_email("not-an-address") == "not-an-address"  # no @: unchanged
+
+
+def test_codex_account_email_reads_the_id_token_jwt(tmp_path: Path) -> None:
+    """The card title's account comes from auth.json's id_token payload (no verification)."""
+    home = tmp_path / "codex"
+    _write_codex_auth(home)
+    assert usage.codex_account_email(home) == "alice.example@example.com"
+    assert usage.codex_card_title(home, "t3") == "OpenAI Codex al…ex@example.com / t3"
+    # No auth.json (and no home at all) degrade to the plain title instead of raising.
+    assert usage.codex_account_email(tmp_path / "absent") is None
+    assert usage.codex_card_title(tmp_path / "absent", "t5") == "OpenAI Codex / t5"
+    assert usage.codex_card_title(None, "t5") == "OpenAI Codex / t5"
+
+
+def test_codex_account_email_falls_back_to_the_live_snapshot(tmp_path: Path) -> None:
+    """A JWT with no ``email`` claim is healed by the e-mail the endpoint reported."""
+    home = tmp_path / "codex"
+    _write_codex_auth(home, email=None)
+    assert usage.codex_account_email(home) is None
+    _seed_codex_live(home, captured_at=_LIVE_NOW, email="alice.example@example.com")
+    assert usage.codex_account_email(home) == "alice.example@example.com"
+
+
+def test_fetch_codex_usage_parses_the_live_payload_and_caches_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verified payload → both windows, the refusal, live=True, and a cache file."""
+    home = tmp_path / "codex"
+    _write_codex_auth(home)
+    seen = _fake_wham(monkeypatch, _WHAM_BLOCKED)
+
+    snap = usage.fetch_codex_usage(home, now=_LIVE_NOW)
+
+    assert snap is not None
+    assert snap.live is True
+    assert snap.five_hour == usage.Window(used_percentage=100.0, resets_at=1788095849)
+    assert snap.seven_day == usage.Window(used_percentage=23.0, resets_at=1788643641)
+    assert snap.blocked_reason == "included usage limit reached (no credit overflow)"
+    assert snap.blocked_at == _LIVE_NOW
+    assert snap.email == "alice.example@example.com"
+    assert snap.plan_type == "team"
+    # The request: the fixed endpoint, the auth.json token, and the account header.
+    assert seen["url"] == usage._WHAM_USAGE_URL
+    headers = seen["headers"]
+    assert headers["authorization"] == "Bearer access-token-xyz"
+    assert headers["chatgpt-account-id"] == "acct-1"
+    # …and the snapshot is cached for the render path, keyed to this home.
+    cached = usage.read_codex_live(home)
+    assert cached is not None and cached.live is True
+    assert cached.five_hour == snap.five_hour and cached.seven_day == snap.seven_day
+    assert cached.blocked_reason == snap.blocked_reason
+    assert json.loads(usage._codex_usage_path(home).read_text(encoding="utf-8"))["fetched_at"] == (
+        _LIVE_NOW
+    )
+
+
+def test_fetch_codex_usage_maps_windows_by_duration_not_position(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Swap the two windows in the payload: they must still land in the right bars."""
+    home = tmp_path / "codex"
+    _write_codex_auth(home)
+    swapped = json.loads(json.dumps(_WHAM_BLOCKED))
+    rate = swapped["rate_limit"]
+    rate["primary_window"], rate["secondary_window"] = (
+        rate["secondary_window"],
+        (rate["primary_window"]),
+    )
+    _fake_wham(monkeypatch, swapped)
+
+    snap = usage.fetch_codex_usage(home, now=_LIVE_NOW)
+
+    assert snap is not None
+    assert snap.five_hour == usage.Window(used_percentage=100.0, resets_at=1788095849)
+    assert snap.seven_day == usage.Window(used_percentage=23.0, resets_at=1788643641)
+
+
+def test_fetch_codex_usage_healthy_payload_is_not_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``allowed: true`` with no reached-type is the healthy shape — no phantom block."""
+    home = tmp_path / "codex"
+    _write_codex_auth(home)
+    healthy = json.loads(json.dumps(_WHAM_BLOCKED))
+    healthy["rate_limit"]["allowed"] = True
+    healthy["rate_limit"]["limit_reached"] = False
+    healthy["rate_limit"]["primary_window"]["used_percent"] = 12
+    healthy["rate_limit_reached_type"] = None
+    _fake_wham(monkeypatch, healthy)
+
+    snap = usage.fetch_codex_usage(home, now=_LIVE_NOW)
+
+    assert snap is not None
+    assert snap.blocked is False and snap.blocked_reason == "" and snap.blocked_at == 0
+    assert snap.five_hour is not None and snap.five_hour.used_percentage == 12.0
+
+
+def test_fetch_codex_usage_skips_an_api_key_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``auth_mode`` that is not ``chatgpt`` has no subscription windows — never call."""
+    home = tmp_path / "codex"
+    _write_codex_auth(home, auth_mode="apikey")
+
+    def _boom(*_a: object, **_k: object) -> object:
+        raise AssertionError("must not reach the network for an API-key login")
+
+    monkeypatch.setattr(usage.urllib.request, "urlopen", _boom)
+    assert usage.fetch_codex_usage(home, now=_LIVE_NOW) is None
+    assert not usage._codex_usage_path(home).exists()
+
+
+def test_fetch_codex_usage_falls_back_to_the_app_server_on_401(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 401 means the stored token expired; only `codex` can refresh it, so ask it to."""
+    home = tmp_path / "codex"
+    _write_codex_auth(home)
+
+    def _unauthorized(*_a: object, **_k: object) -> object:
+        raise usage.urllib.error.HTTPError(
+            usage._WHAM_USAGE_URL, 401, "Unauthorized", Message(), None
+        )
+
+    monkeypatch.setattr(usage.urllib.request, "urlopen", _unauthorized)
+    calls: list[Path] = []
+    fallback = usage.Usage(
+        captured_at=_LIVE_NOW,
+        five_hour=usage.Window(100.0, 1788095849),
+        seven_day=usage.Window(23.0, 1788643641),
+        live=True,
+        plan_type="team",
+    )
+
+    def _appserver(home_arg: Path, now: int | None = None) -> usage.Usage:
+        calls.append(home_arg)
+        assert now == _LIVE_NOW
+        return fallback
+
+    monkeypatch.setattr(usage, "_fetch_codex_usage_appserver", _appserver)
+    snap = usage.fetch_codex_usage(home, now=_LIVE_NOW)
+    assert calls == [home]
+    assert snap is fallback
+    assert usage.read_codex_live(home) is not None  # the fallback result is cached too
+
+    # A 500 is NOT a token problem: no app-server spawn, no cache write.
+    usage._codex_usage_path(home).unlink()
+    calls.clear()
+
+    def _server_error(*_a: object, **_k: object) -> object:
+        raise usage.urllib.error.HTTPError(usage._WHAM_USAGE_URL, 500, "boom", Message(), None)
+
+    monkeypatch.setattr(usage.urllib.request, "urlopen", _server_error)
+    assert usage.fetch_codex_usage(home, now=_LIVE_NOW) is None
+    assert calls == []
+    assert not usage._codex_usage_path(home).exists()
+
+
+def test_app_server_fallback_skips_unrelated_notifications(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``codex app-server`` interleaves notifications; only OUR request id is the answer."""
+    monkeypatch.setattr(
+        usage.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None
+    )
+    stdout = (
+        "\n".join(
+            [
+                json.dumps({"id": 1, "result": {"userAgent": "codex"}}),
+                json.dumps(
+                    {"method": "remoteControl/status/changed", "params": {"connected": True}}
+                ),
+                json.dumps(
+                    {
+                        "id": 2,
+                        "result": {
+                            "rateLimits": {
+                                "limitId": "codex",
+                                "primary": {
+                                    "usedPercent": 100,
+                                    "windowDurationMins": 300,
+                                    "resetsAt": 1788095849,
+                                },
+                                "secondary": {
+                                    "usedPercent": 23,
+                                    "windowDurationMins": 10080,
+                                    "resetsAt": 1788643641,
+                                },
+                                "planType": "team",
+                                "rateLimitReachedType": "workspace_owner_credits_depleted",
+                            }
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    captured: dict[str, object] = {}
+
+    def _run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        captured["input"] = kwargs.get("input")
+        captured["timeout"] = kwargs.get("timeout")
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(usage.subprocess, "run", _run)
+    home = tmp_path / "codex"
+    snap = usage._fetch_codex_usage_appserver(home, now=_LIVE_NOW)
+
+    assert snap is not None
+    assert snap.live is True and snap.plan_type == "team"
+    assert snap.five_hour == usage.Window(used_percentage=100.0, resets_at=1788095849)
+    assert snap.seven_day == usage.Window(used_percentage=23.0, resets_at=1788643641)
+    assert snap.blocked_reason == "included usage limit reached (no credit overflow)"
+    assert captured["cmd"] == ["/usr/bin/codex", "app-server"]
+    assert captured["env"]["CODEX_HOME"] == str(home)  # type: ignore[index]
+    assert "account/rateLimits/read" in str(captured["input"])
+    assert captured["timeout"] == usage._APPSERVER_TIMEOUT_SEC
+
+    # No `codex` on PATH → no fallback at all.
+    monkeypatch.setattr(usage.shutil, "which", lambda _name: None)
+    assert usage._fetch_codex_usage_appserver(home, now=_LIVE_NOW) is None
+
+
+def test_codex_usage_stale_tracks_the_cache_mtime(tmp_path: Path) -> None:
+    """Missing or older than the throttle ⇒ stale; freshly written ⇒ not."""
+    home = tmp_path / "codex"
+    assert usage.codex_usage_stale(home, 600, now=_LIVE_NOW) is True  # no cache yet
+    path = _seed_codex_live(home, captured_at=_LIVE_NOW)
+    os.utime(path, (_LIVE_NOW - 100, _LIVE_NOW - 100))
+    assert usage.codex_usage_stale(home, 600, now=_LIVE_NOW) is False
+    os.utime(path, (_LIVE_NOW - 900, _LIVE_NOW - 900))
+    assert usage.codex_usage_stale(home, 600, now=_LIVE_NOW) is True
+
+
+def test_read_codex_usage_serves_whichever_source_is_newer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live fetch beats an older rollout event — and an older live cache loses to one."""
+    home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    _write_codex_rollout(home, _CODEX_RATE_LIMITS, name="stale", mtime=_LIVE_NOW - 50000)
+    _seed_codex_live(home, captured_at=_LIVE_NOW - 60)
+    usage._codex_cache.clear()
+
+    snap = usage.read_codex_usage(now=_LIVE_NOW, home=home)
+    assert snap is not None and snap.live is True
+    assert snap.five_hour == usage.Window(used_percentage=100.0, resets_at=1788095849)
+
+    # A Codex turn AFTER that fetch writes fresher windows: the rollout wins again.
+    _write_codex_rollout(home, _CODEX_RATE_LIMITS, name="fresh", mtime=_LIVE_NOW - 10)
+    usage._codex_cache.clear()
+    snap = usage.read_codex_usage(now=_LIVE_NOW, home=home)
+    assert snap is not None and snap.live is False
+    assert snap.five_hour is not None and snap.five_hour.used_percentage == 12.0
+
+
+def test_read_codex_usage_staples_a_refusal_newer_than_the_live_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A block recorded after the fetch still pins the full window — and stays 'live'."""
+    home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    _write_codex_rollout(home, _CODEX_PREMIUM_DEPLETED, name="refused", mtime=_LIVE_NOW - 10)
+    _seed_codex_live(
+        home,
+        captured_at=_LIVE_NOW - 600,
+        five=(81.0, 1788095849),
+        seven=(23.0, 1788643641),
+    )
+    usage._codex_cache.clear()
+
+    snap = usage.read_codex_usage(now=_LIVE_NOW, home=home)
+
+    assert snap is not None and snap.live is True
+    assert snap.blocked is True
+    assert snap.blocked_reason == "included usage limit reached (no credit overflow)"
+    # The 5h window is the most-consumed LIVE one, so it is what filled.
+    assert snap.five_hour == usage.Window(used_percentage=100.0, resets_at=1788095849)
+    assert snap.seven_day == usage.Window(used_percentage=23.0, resets_at=1788643641)
+    assert "live figures" in usage.render_codex_usage(snap, now=_LIVE_NOW).plain
+
+
+def test_read_codex_usage_live_block_is_not_re_stapled_by_an_older_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The endpoint reports the block itself; an OLDER rollout refusal adds nothing."""
+    home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    _write_codex_rollout(home, _CODEX_PREMIUM_DEPLETED, name="refused", mtime=_LIVE_NOW - 3600)
+    _seed_codex_live(
+        home,
+        captured_at=_LIVE_NOW - 60,
+        five=(12.0, 1788095849),
+        seven=(23.0, 1788643641),
+    )
+    usage._codex_cache.clear()
+
+    snap = usage.read_codex_usage(now=_LIVE_NOW, home=home)
+
+    assert snap is not None and snap.live is True and snap.blocked is False
+    assert snap.five_hour is not None and snap.five_hour.used_percentage == 12.0
+
+
+def test_read_codex_usage_second_home_is_live_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second CODEX_HOME has no rollout files — and never inherits the default's refusal."""
+    default_home = tmp_path / "codex"
+    private_home = tmp_path / "codex-private"
+    monkeypatch.setenv("CODEX_HOME", str(default_home))
+    # The DEFAULT login is blocked and has windows; the private one only has a live cache.
+    _write_codex_rollout(default_home, _CODEX_RATE_LIMITS, name="healthy", mtime=_LIVE_NOW - 200)
+    _write_codex_rollout(
+        default_home, _CODEX_PREMIUM_DEPLETED, name="refused", mtime=_LIVE_NOW - 10
+    )
+    _seed_codex_live(private_home, captured_at=_LIVE_NOW - 60, five=(7.0, 1788095849))
+    usage._codex_cache.clear()
+
+    private = usage.read_codex_usage(now=_LIVE_NOW, home=private_home)
+    assert private is not None and private.live is True
+    assert private.blocked is False  # the other account's refusal must not bleed across
+    assert private.five_hour is not None and private.five_hour.used_percentage == 7.0
+
+    # …while the default home still reports its own block, from its own rollout files.
+    default = usage.read_codex_usage(now=_LIVE_NOW, home=default_home)
+    assert default is not None and default.blocked is True
+
+    # Both snapshots are cached under their own home (one slot per home, no thrashing).
+    assert set(usage._codex_cache) == {str(default_home), str(private_home)}
+
+
+def test_read_codex_live_refuses_a_snapshot_from_another_home(tmp_path: Path) -> None:
+    """The payload records its home, so a copied/colliding cache is refused, not served."""
+    home = tmp_path / "codex"
+    path = _seed_codex_live(home, captured_at=_LIVE_NOW)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["home"] = str(tmp_path / "somewhere-else")
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert usage.read_codex_live(home) is None
+
+
+def test_render_codex_usage_blocked_banner_marks_live_figures() -> None:
+    """Live figures ARE the state that fired, so they get no 'other figures are N old'."""
+    windows = {
+        "five_hour": usage.Window(used_percentage=100.0, resets_at=_LIVE_NOW + 600),
+        "seven_day": usage.Window(used_percentage=23.0, resets_at=_LIVE_NOW + 5 * 86400),
+    }
+    reason = "included usage limit reached (no credit overflow)"
+    live = usage.Usage(
+        captured_at=_LIVE_NOW - 120,
+        five_hour=windows["five_hour"],
+        seven_day=windows["seven_day"],
+        blocked_reason=reason,
+        blocked_at=_LIVE_NOW,
+        live=True,
+    )
+    plain = usage.render_codex_usage(live, now=_LIVE_NOW).plain
+    assert "live figures, 2m old" in plain
+    assert "100% = the limit that fired" not in plain
+
+    rollout = usage.Usage(
+        captured_at=_LIVE_NOW - 120,
+        five_hour=windows["five_hour"],
+        seven_day=windows["seven_day"],
+        blocked_reason=reason,
+        blocked_at=_LIVE_NOW,
+    )
+    plain = usage.render_codex_usage(rollout, now=_LIVE_NOW).plain
+    assert "100% = the limit that fired; other figures are 2m old" in plain
+    assert "live figures" not in plain

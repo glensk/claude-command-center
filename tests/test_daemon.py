@@ -17,6 +17,7 @@ from command_center.daemon import (
     _backfill_versions,
     _label,
     _refresh_claude_usage,
+    _refresh_codex_usage,
     _refresh_copilot_usage,
     run_once,
 )
@@ -344,4 +345,47 @@ def test_refresh_claude_usage_fetches_each_stale_account(
     cfg.claude_usage = False
     with Store() as store:
         _refresh_claude_usage(store, cfg, DaemonReport(), dry_run=False)
+    assert fetched == []
+
+
+def test_refresh_codex_usage_fetches_each_stale_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per configured CODEX_HOME, a stale cache triggers exactly one live fetch."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center import usage
+
+    homes = {"default": tmp_path / "codex", "private": tmp_path / "codex-private"}
+    monkeypatch.setattr(config, "codex_homes", lambda: dict(homes))
+    cfg = config.load_config()
+    cfg.codex_usage = True
+    cfg.codex_usage_refresh_sec = 600
+    cfg.codex_usage_refresh_active_sec = 200
+
+    fetched: list[Path] = []
+
+    def _fake_fetch(home: Path, now: int | None = None) -> usage.Usage:
+        fetched.append(home)
+        return usage.Usage(captured_at=0, five_hour=usage.Window(3.0, 1), seven_day=None, live=True)
+
+    monkeypatch.setattr(usage, "fetch_codex_usage", _fake_fetch)
+    # Neither home has a cache yet → both stale.
+    monkeypatch.setattr(usage, "codex_usage_stale", lambda *_a, **_k: True)
+
+    with Store() as store:
+        store.ensure("s1", cwd="/repo")
+        report = DaemonReport()
+        _refresh_codex_usage(store, cfg, report, dry_run=False)
+        assert sorted(fetched) == sorted(homes.values())
+        assert report.codex_refreshed is True
+        # A routine refresh is not "something happened" — it must not wake the reporter.
+        assert DaemonReport(codex_refreshed=True).is_empty() is True
+
+    # Kill-switch off → no fetch. Same for a dry run.
+    fetched.clear()
+    cfg.codex_usage = False
+    with Store() as store:
+        _refresh_codex_usage(store, cfg, DaemonReport(), dry_run=False)
+        cfg.codex_usage = True
+        _refresh_codex_usage(store, cfg, DaemonReport(), dry_run=True)
     assert fetched == []

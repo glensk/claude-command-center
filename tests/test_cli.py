@@ -1382,6 +1382,100 @@ def test_close_now_tmux_kills_only_the_matched_pane(
     assert runs == [["tmux", "kill-pane", "-t", "%5"]]
 
 
+# ------------------------------ codex-usage ----------------------------------- #
+def test_codex_usage_json_dumps_the_cached_snapshots_per_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--json` reads the caches (no network) and keys them by the fixed home labels."""
+    import json
+
+    from command_center import config, usage
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    default_home = tmp_path / "codex"
+    private_home = tmp_path / "codex-private"
+    monkeypatch.setattr(
+        config, "codex_homes", lambda: {"default": default_home, "private": private_home}
+    )
+
+    def _boom(*_a: object, **_k: object) -> object:
+        raise AssertionError("--json must never fetch")
+
+    monkeypatch.setattr(usage, "fetch_codex_usage", _boom)
+    path = usage._codex_usage_path(default_home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "captured_at": 1788095000,
+                "fetched_at": 1788095000,
+                "home": str(default_home.resolve()),
+                "email": "alice.example@example.com",
+                "plan_type": "team",
+                "five_hour": {"used_percentage": 100.0, "resets_at": 1788095849},
+                "seven_day": {"used_percentage": 23.0, "resets_at": 1788643641},
+                "blocked_reason": "included usage limit reached (no credit overflow)",
+                "blocked_at": 1788095000,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert cli.main(["codex-usage", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert set(data) == {"default", "private"}
+    assert data["default"]["live"] is True
+    assert data["default"]["five_hour"] == {"used_percentage": 100.0, "resets_at": 1788095849}
+    assert data["default"]["seven_day"]["used_percentage"] == 23.0
+    assert data["default"]["email"] == "alice.example@example.com"
+    assert data["private"] == {}  # never fetched → nothing cached
+
+    # -a scopes it to one login; an unknown label is reported and still exits 0.
+    assert cli.main(["codex-usage", "-a", "default", "-j"]) == 0
+    assert set(json.loads(capsys.readouterr().out)) == {"default"}
+    assert cli.main(["codex-usage", "-a", "nope", "-j"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "not a configured CODEX_HOME" in captured.err
+
+
+def test_codex_usage_prints_one_line_per_home_and_never_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One summary line per login; a home whose fetch fails goes to stderr, exit stays 0."""
+    from command_center import config, usage
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    default_home = tmp_path / "codex"
+    private_home = tmp_path / "codex-private"
+    monkeypatch.setattr(
+        config, "codex_homes", lambda: {"default": default_home, "private": private_home}
+    )
+
+    def _fake_fetch(home: Path, now: int | None = None) -> usage.Usage | None:
+        if home == private_home:
+            return None  # no ChatGPT auth.json for that login
+        return usage.Usage(
+            captured_at=now or 0,
+            five_hour=usage.Window(100.0, (now or 0) + 660),
+            seven_day=usage.Window(23.0, (now or 0) + 6 * 86400),
+            blocked_reason="included usage limit reached (no credit overflow)",
+            blocked_at=now or 0,
+            live=True,
+            email="alice.example@example.com",
+            plan_type="team",
+        )
+
+    monkeypatch.setattr(usage, "fetch_codex_usage", _fake_fetch)
+    assert cli.main(["codex-usage"]) == 0
+    captured = capsys.readouterr()
+    assert "OpenAI Codex alice.example@example.com (team):" in captured.out
+    assert "Session 100% resets in 11m" in captured.out
+    assert "Week 23% resets in 6d 0h 0m" in captured.out
+    assert "BLOCKED — included usage limit reached (no credit overflow)" in captured.out
+    assert "OpenAI Codex private: fetch failed" in captured.err
+
+
 # --------------------------- direct-execution shim ---------------------------- #
 def test_every_module_is_runnable_by_path(tmp_path: Path) -> None:
     """`./command_center/<mod>.py` must never die on the relative-import error.

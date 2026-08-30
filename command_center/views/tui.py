@@ -149,12 +149,13 @@ def _chord_map() -> tuple[dict[str, dict[str, str]], dict[str, str | None]]:
 # leader → standalone-fallback action (e.g. `a` → edit_aim). See on_key.
 _CHORDS, _CHORD_FALLBACK = _chord_map()
 
-# The four usage-card render-gate toggles (`t1`…`t4`): action → the config bool it
+# The usage-card render-gate toggles (`t1`…`t5`): action → the config bool it
 # flips. Drives both the toggle handlers and the `t` menu's live state annotation.
 _CARD_TOGGLE_KEYS: dict[str, str] = {
     "toggle_card_private": "usage_card_private",
     "toggle_card_work": "usage_card_work",
     "toggle_card_codex": "usage_card_codex",
+    "toggle_card_codex_private": "usage_card_codex_private",
     "toggle_card_copilot": "usage_card_copilot",
     "toggle_card_nixos_overseer_supervised": "card_nixos_overseer_supervised",
     "toggle_card_nixos_overseer_tier_a": "card_nixos_overseer_tier_a",
@@ -1407,9 +1408,15 @@ _HELP_TOPICS: dict[str, str] = {
         "  than the window's own lifetime (5h / 7d) — see claude_account_emails below\n"
         "  for the identity hard-link that keeps this from ever reading the wrong\n"
         "  account's numbers.\n"
-        "[b]OpenAI Codex[/b]  Session (5h) + Week (7d) bars.\n"
-        "  Source: a cheap, mtime-cached read of the newest ~/.codex rollout file's\n"
-        "  rate_limits block — as fresh as the last Codex token_count event.\n"
+        "[b]OpenAI Codex[/b]  Session (5h) + Week (7d) bars, one card per ChatGPT login\n"
+        "  (the second card needs codex_home_private set to another CODEX_HOME).\n"
+        "  Source: with codex_usage on, the LIVE chatgpt.com usage endpoint — the same\n"
+        "  numbers the web Settings → Usage page shows — fetched out-of-band per home\n"
+        "  (codex_usage_refresh_sec / _active_sec) with the token in $CODEX_HOME/auth.json.\n"
+        "  Off (the default), or whenever that fetch is older than the last Codex turn,\n"
+        "  the card falls back to a cheap, mtime-cached read of the newest rollout file's\n"
+        "  rate_limits block — as fresh as the last Codex token_count event. Each card\n"
+        "  titles itself with its account e-mail so two logins are never confused.\n"
         "[b]{copilot_title}[/b]  one monthly premium-request bar (resets on the 1st).\n"
         "  Source: the `gh` billing API, cached in copilot_usage.json. The only card\n"
         "  whose data costs a network call, so the only one that is throttled.\n\n"
@@ -1429,6 +1436,7 @@ _HELP_TOPICS: dict[str, str] = {
         "[b]Expand / collapse a card[/b]\n"
         "  t1 = Claude Code (private)   t3 = OpenAI Codex   to = nixos supervised\n"
         "  t2 = Claude Code (work)      t4 = Copilot        ta = nixos tier_a\n"
+        "  t5 = OpenAI Codex (second login)\n"
         "  Collapsed keeps the card's titled top border (which names its own chord) and\n"
         "  drops the rest of the box. Unlike td/tf (view-local), these PERSIST to\n"
         "  config.toml. t2 on a machine with no `work` account says so instead of\n"
@@ -1441,7 +1449,11 @@ _HELP_TOPICS: dict[str, str] = {
         "  claude_usage                       fetch the Claude /usage OAuth endpoint (on)\n"
         "  claude_usage_refresh_sec           idle Claude OAuth-fetch throttle (600)\n"
         "  claude_usage_refresh_active_sec    active-work Claude throttle (200; 0=off)\n"
-        "  usage_card_private/_work/_codex/_copilot   the four t1..t4 toggles\n"
+        "  codex_usage                        fetch the live chatgpt.com Codex endpoint\n"
+        "  codex_usage_refresh_sec            idle live-Codex fetch throttle (600)\n"
+        "  codex_usage_refresh_active_sec     active-work Codex throttle (200; 0=off)\n"
+        "  codex_home_private                 second CODEX_HOME ('' = no second card)\n"
+        "  usage_card_private/_work/_codex/_codex_private/_copilot   the t1..t5 toggles\n"
         "  card_nixos_overseer_supervised/_tier_a     the to / ta toggles\n"
         "  claude_accounts                    ['private=~/.claude', 'work=~/.claude-work']\n"
         "  claude_account_emails    identity hard-link, e.g. ['work=you@company.com'] —\n"
@@ -1980,6 +1992,12 @@ class CommandCenterApp(App[None]):
         width: auto; min-width: 38; height: auto; padding: 0 1;
         border: round #19c37d;
     }
+    /* The second ChatGPT login's card — same product, so the same green box; the two
+       are told apart by the account e-mail in their border titles. */
+    #usage-codex-private {
+        width: auto; min-width: 38; height: auto; padding: 0 1;
+        border: round #19c37d;
+    }
     #usage-copilot {
         width: auto; min-width: 38; height: auto; padding: 0 1;
         border: round #a371f7;
@@ -2021,6 +2039,7 @@ class CommandCenterApp(App[None]):
         # Last time we spawned a detached `ccc claude-usage` warmer (monotonic seconds); an
         # in-process throttle so a failing OAuth fetch can't respawn on every render tick.
         self._last_claude_usage_spawn = 0.0
+        self._last_codex_usage_spawn = 0.0
         # The raw highlighted row key (incl. separators) and a map of category-splitter
         # keys → category name, so `fn` (new_job) knows which category header it is on.
         self._highlight_key: str | None = None
@@ -2074,19 +2093,21 @@ class CommandCenterApp(App[None]):
                     # Todos / summary / flags and the sub-goal checklist sit at the
                     # very bottom, below the editable field lines.
                     yield Static("", id="detail-bottom")
-                # Four stacked, border-titled usage cards: Claude Code (private) on
-                # top, Claude Code (work), OpenAI Codex, then GitHub Copilot (each a
-                # distinct border + figure colour). The two Claude cards share the
-                # periwinkle fill (same product); private = gold, work = blue.
+                # Stacked, border-titled usage cards: Claude Code (private) on top,
+                # Claude Code (work), OpenAI Codex (one card per configured ChatGPT
+                # login), then GitHub Copilot (each a distinct border + figure colour).
+                # The two Claude cards share the periwinkle fill (same product);
+                # private = gold, work = blue.
                 with Vertical(id="usage-col"):
                     yield Static("", id="usage")
                     yield Static("", id="usage-work")
                     yield Static("", id="usage-codex")
+                    yield Static("", id="usage-codex-private")
                     yield Static("", id="usage-copilot")
                     # Two read-only cards fed by the EXTERNAL homelab overseer daemon
                     # (a separate project): supervised = incidents awaiting the human
                     # (orange border), tier_a = recent automatic activity (teal border,
-                    # hidden by default). Both toggle via the `t5`/`t6` chords.
+                    # hidden by default). Both toggle via the `to`/`ta` chords.
                     yield Static("", id="usage-nixos-supervised")
                     yield Static("", id="usage-nixos-tier-a")
         yield Static(id="keyhints")
@@ -2138,9 +2159,7 @@ class CommandCenterApp(App[None]):
             f"Claude Code (work) {accounts.card_glyph('work')}"
             f" / {commands.by_action('toggle_card_work').key}"
         )
-        self.query_one(
-            "#usage-codex", Static
-        ).border_title = f"OpenAI Codex / {commands.by_action('toggle_card_codex').key}"
+        self._set_codex_card_titles()
         self.query_one("#usage-copilot", Static).border_title = (
             f"{self.cfg.copilot_card_title} {self.cfg.copilot_model}"
             f" / {commands.by_action('toggle_card_copilot').key}"
@@ -2364,25 +2383,27 @@ class CommandCenterApp(App[None]):
         except OSError:
             pass
 
-    def _update_usage(self) -> None:  # pylint: disable=too-many-locals
-        """Refresh all four account-usage cards (top-right of the detail pane).
+    def _update_usage(self) -> None:  # pylint: disable=too-many-locals,too-many-statements
+        """Refresh every account-usage card (top-right of the detail pane).
 
         Account-global and independent of the selected row; reset times are relative,
         so re-rendering each ``usage_refresh_sec`` tick makes them count down. The two
         Claude cards read their per-account snapshot (``read_usage`` / ``read_usage
         ("work")``, private gold vs work blue accent) — WHICH account label backs each
         card is first resolved by :func:`accounts.resolve_card_label` (a no-op unless
-        ``claude_account_emails`` hard-links that card to an email); Codex's is a cheap
-        cached read of its newest session rollout file (``read_codex_usage``);
-        Copilot's is the cached ``gh`` figure (``read_copilot_usage``) — all reads are
-        cheap. Each card's visibility follows its own ``usage_card_*`` render gate.
-        Only Copilot's *fetch* hits the network, gated separately on ``copilot_usage``
-        and throttled (adaptively: tighter while a job works).
+        ``claude_account_emails`` hard-links that card to an email); each Codex card is
+        a cheap cached read (the live ``wham/usage`` snapshot or that home's newest
+        session rollout, whichever is newer — ``read_codex_usage``); Copilot's is the
+        cached ``gh`` figure (``read_copilot_usage``) — all reads are cheap. Each card's
+        visibility follows its own ``usage_card_*`` render gate. Only the Copilot and
+        Codex *fetches* hit the network, gated separately on ``copilot_usage`` /
+        ``codex_usage`` and throttled (adaptively: tighter while a job works).
         """
         try:
             private_panel = self.query_one("#usage", Static)
             work_panel = self.query_one("#usage-work", Static)
             codex_panel = self.query_one("#usage-codex", Static)
+            codex_private_panel = self.query_one("#usage-codex-private", Static)
             copilot_panel = self.query_one("#usage-copilot", Static)
             nixos_supervised_panel = self.query_one("#usage-nixos-supervised", Static)
             nixos_tier_a_panel = self.query_one("#usage-nixos-tier-a", Static)
@@ -2406,6 +2427,16 @@ class CommandCenterApp(App[None]):
             usage.render_work_usage(usage.read_usage(work_label) if work_label else None)
         )
         codex_panel.update(usage.render_codex_usage(usage.read_codex_usage()))
+        # The second ChatGPT login (codex_home_private) is read the same way, just from
+        # its own CODEX_HOME; unconfigured, the card is not drawn at all (see below).
+        codex_private_home = self._codex_private_home()
+        if codex_private_home is not None:
+            codex_private_panel.update(
+                usage.render_codex_usage(usage.read_codex_usage(home=codex_private_home))
+            )
+        # Both Codex titles carry their account's e-mail, and a `codex login` can swap
+        # it, so they are rebuilt every tick — the lookup is mtime-cached, hence cheap.
+        self._set_codex_card_titles()
         copilot_panel.update(usage.render_copilot_usage(usage.read_copilot_usage()))
         # The two nixos-overseer cards read an EXTERNAL sqlite DB read-only; each read is
         # one cheap query and NEVER raises (a sentinel → placeholder on any failure), so
@@ -2434,6 +2465,13 @@ class CommandCenterApp(App[None]):
         # and disappears entirely. Parsed from the already-loaded Config: no file read.
         _set_card_expanded(work_panel, self.cfg.usage_card_work, visible=self._has_work_account())
         _set_card_expanded(codex_panel, self.cfg.usage_card_codex)
+        # …and, like the work card, the second Codex card disappears outright (title line
+        # included) on a machine with no codex_home_private — there is nothing to show.
+        _set_card_expanded(
+            codex_private_panel,
+            self.cfg.usage_card_codex_private,
+            visible=self._has_codex_private(),
+        )
         _set_card_expanded(copilot_panel, self.cfg.usage_card_copilot)
         _set_card_expanded(nixos_supervised_panel, self.cfg.card_nixos_overseer_supervised)
         _set_card_expanded(nixos_tier_a_panel, self.cfg.card_nixos_overseer_tier_a)
@@ -2478,6 +2516,29 @@ class CommandCenterApp(App[None]):
 
                 spawn.spawn_ccc(["claude-usage"])
                 self._last_claude_usage_spawn = monotonic()
+        if self.cfg.codex_usage:
+            # Same shape for the live Codex endpoint: when ANY configured CODEX_HOME's
+            # cache is stale per the adaptive throttle, fire ONE detached `ccc codex-usage`
+            # (it fetches every home). The same in-process guard applies — a fetch that
+            # keeps failing (an expired token no `codex` run has refreshed) writes nothing,
+            # so its file mtime never advances and the staleness stays true forever.
+            active = usage.has_active_work(r.status.value for r in self._rows.values())
+            throttle = usage.adaptive_interval(
+                self.cfg.codex_usage_refresh_sec,
+                self.cfg.codex_usage_refresh_active_sec,
+                active=active,
+            )
+            stale = any(
+                usage.codex_usage_stale(home, throttle) for home in self._codex_homes().values()
+            )
+            if (
+                stale
+                and (monotonic() - self._last_codex_usage_spawn) >= _CLAUDE_USAGE_SPAWN_MIN_SEC
+            ):
+                from .. import spawn  # pylint: disable=import-outside-toplevel
+
+                spawn.spawn_ccc(["codex-usage"])
+                self._last_codex_usage_spawn = monotonic()
 
     def _next_sep_key(self) -> str:
         """Unique key for a non-selectable separator/header row (``__sep__`` prefix)."""
@@ -4016,6 +4077,52 @@ class CommandCenterApp(App[None]):
         """
         return "work" in config.parse_claude_accounts(self.cfg.claude_accounts)
 
+    def _codex_private_home(self) -> Path | None:
+        """The second configured ``CODEX_HOME`` (``codex_home_private``), or ``None``.
+
+        Read off the already-loaded ``self.cfg`` (which ``action_settings`` and
+        ``_toggle_usage_card`` refresh in place) rather than via
+        :func:`config.codex_home_private`, so the 5 s render tick costs no config read.
+        """
+        raw = self.cfg.codex_home_private.strip()
+        return Path(raw).expanduser() if raw else None
+
+    def _codex_homes(self) -> dict[str, Path]:
+        """Label → ``CODEX_HOME`` for every configured Codex login (see config.codex_homes)."""
+        homes = {"default": config.codex_home()}
+        private = self._codex_private_home()
+        if private is not None:
+            homes["private"] = private
+        return homes
+
+    def _has_codex_private(self) -> bool:
+        """True when a second ``CODEX_HOME`` is configured — otherwise that card is hidden.
+
+        Without one there is nothing to populate it (no auth.json, no rollout files), so
+        the card is removed outright rather than shown permanently empty — the same rule
+        the Claude work card follows.
+        """
+        return self._codex_private_home() is not None
+
+    def _set_codex_card_titles(self) -> None:
+        """(Re)build both Codex cards' border titles — each names its own ChatGPT account.
+
+        Two cards for the same product would be indistinguishable without the account, so
+        the title carries an abbreviated e-mail (``OpenAI Codex fi…la@example.org / t3``)
+        read from that home's ``auth.json``. The lookup is mtime-cached, so this is cheap
+        enough to re-run on every render tick — which it must be, since a `codex login`
+        can change the account under a running TUI.
+        """
+        for card_id, home, action in (
+            ("#usage-codex", config.codex_home(), "toggle_card_codex"),
+            ("#usage-codex-private", self._codex_private_home(), "toggle_card_codex_private"),
+        ):
+            try:
+                panel = self.query_one(card_id, Static)
+            except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                continue
+            panel.border_title = usage.codex_card_title(home, commands.by_action(action).key)
+
     def _toggle_usage_card(
         self, key: str, label: str, *, also: str | None = None, announce: bool = True
     ) -> None:
@@ -4074,6 +4181,26 @@ class CommandCenterApp(App[None]):
     def action_toggle_card_codex(self) -> None:
         """Expand/collapse the OpenAI Codex usage card — the `t3` chord."""
         self._toggle_usage_card("usage_card_codex", "OpenAI Codex")
+
+    def action_toggle_card_codex_private(self) -> None:
+        """Expand/collapse the second OpenAI Codex usage card — the `t5` chord.
+
+        Flipping the flag on a machine with no ``codex_home_private`` would show nothing
+        (that card is hidden outright, title line included), so say why instead of
+        no-oping — exactly like `t2` without a `work` Claude account.
+        """
+        if not self._has_codex_private():
+            # markup=False: the example path contains no markup today, but the same
+            # ``[...]``-in-a-toast crash guard as action_toggle_card_work applies.
+            self.notify(
+                "No codex_home_private configured. Point it at a second CODEX_HOME, e.g. "
+                'codex_home_private = "~/.codex-private" (create that login with '
+                "CODEX_HOME=~/.codex-private codex login).",
+                severity="warning",
+                markup=False,
+            )
+            return
+        self._toggle_usage_card("usage_card_codex_private", "OpenAI Codex (second login)")
 
     def action_toggle_card_copilot(self) -> None:
         """Expand/collapse the Copilot usage card — the `t4` chord.

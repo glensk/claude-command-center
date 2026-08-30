@@ -85,6 +85,25 @@ def test_copilot_usage_flag_drives_gh_check(monkeypatch: pytest.MonkeyPatch) -> 
     assert off["copilot_usage → gh"] == doctor.NA
 
 
+def test_codex_usage_flag_drives_the_auth_json_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One check per configured CODEX_HOME: the live fetch needs a readable auth.json."""
+    codex_home = tmp_path / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    # Disabled → not-applicable, never a failure (and no per-home rows at all).
+    off = _statuses(doctor._section_features(config.Config(codex_usage=False)))
+    assert off["codex_usage → auth.json"] == doctor.NA
+
+    on = _statuses(doctor._section_features(config.Config(codex_usage=True)))
+    assert on["codex_usage → auth.json (default)"] == doctor.FAIL  # no auth.json yet
+
+    codex_home.mkdir(parents=True)
+    (codex_home / "auth.json").write_text("{}", encoding="utf-8")
+    ok = _statuses(doctor._section_features(config.Config(codex_usage=True)))
+    assert ok["codex_usage → auth.json (default)"] == doctor.OK
+
+
 def test_short_aim_codex_backend_check(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(doctor.shutil, "which", _which_factory({"osascript"}))  # no codex
     cfg = config.Config(short_aim=True, short_aim_backend="codex")

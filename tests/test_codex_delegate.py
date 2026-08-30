@@ -877,8 +877,8 @@ def _write_rollout(root: Path, name: str, ts: int, body: str) -> Path:
     sessions.mkdir(parents=True, exist_ok=True)
     path = sessions / f"rollout-{name}.jsonl"
     path.write_text(
-        '{"type":"event_msg","timestamp":%d,"payload":{"type":"token_count",'
-        '"rate_limits":%s}}\n' % (ts, body),
+        f'{{"type":"event_msg","timestamp":{ts},"payload":{{"type":"token_count",'
+        f'"rate_limits":{body}}}}}\n',
         encoding="utf-8",
     )
     return path

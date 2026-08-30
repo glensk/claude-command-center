@@ -137,6 +137,11 @@ A few features that don't fit in a one-liner but are the reason people keep it r
 - **The peek panel.** Hold a key, and a floating panel shows every prompt you've typed
   in the focused tab (plus its AIM history) — so *"what have I been asking here?"* is
   one keystroke, not a scroll through the transcript.
+- **Snapshot the whole desk before a reboot.** `ccc snapshot` saves every iTerm window,
+  tab and split — which Claude session ran where (and on which account), and the exact
+  `argv` of the other panes. After the update, `ccc restore-snapshot` rebuilds the layout:
+  each session resumed on its own seat, each allowlisted program re-run at its cwd, the
+  rest a shell with a note of what used to be there. macOS + iTerm2.
 
 ## Commands
 
@@ -153,12 +158,15 @@ editable install), `ccc restart-tui` bounces the running TUI in its **own** term
 so the new code loads — no manual keystroke; it exits 0 once the TUI is back, 1 if none
 is running.
 
-In the TUI, the `t` leader chord expands/collapses the usage cards: `t1`…`t4` for the
-Claude/Codex/Copilot subscription cards, and `to`/`ta` for two optional cards fed by an
+In the TUI, the `t` leader chord expands/collapses the usage cards: `t1`…`t5` for the
+Claude/Codex/Copilot subscription cards (`t5` is a second OpenAI Codex card for a second
+ChatGPT login, shown once `codex_home_private` points at another `CODEX_HOME`), and
+`to`/`ta` for two optional cards fed by an
 *external* homelab "overseer" alert-triage daemon (incidents awaiting you + recent
 automatic activity) — off until you set `nixos_overseer_dir` in `config.toml`. A
-collapsed card keeps its titled top border (`╭─ OpenAI Codex / t3 ──╮`) and drops the
-rest of the box, so the chord that brings it back stays on screen. And `u`
+collapsed card keeps its titled top border (`╭─ OpenAI Codex fi…la@example.org / t3 ─╮`,
+each Codex card naming its own account) and drops the rest of the box, so the chord that
+brings it back stays on screen. And `u`
 undoes the last action — a close/park, mark-done, Keep, importance, sub-goal tick,
 account switch, or any toggle — walking back up to 20 steps per run. See
 [docs/reference.md](docs/reference.md).
