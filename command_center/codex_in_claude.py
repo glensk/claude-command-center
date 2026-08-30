@@ -1056,11 +1056,29 @@ class _CodexRefusal:
 _REFUSAL_LABELS = {
     "workspace_owner_credits_depleted": "included usage limit reached (no credit overflow)",
 }
+# Card-sized wording for the same codes. The TUI's Codex card is 34 columns wide, so the
+# explanatory label above wraps to three lines there and pushes the bars down; the CLI and
+# `headroom`, which have a whole terminal width, keep the long form.
+_REFUSAL_LABELS_SHORT = {
+    "workspace_owner_credits_depleted": "usage limit reached",
+}
+# Snapshots persist the ALREADY-EXPANDED long label (there is no reached_type on the cached
+# record), so the card shortens by looking the long form back up.
+_SHORT_BY_LABEL = {
+    _REFUSAL_LABELS[code]: short
+    for code, short in _REFUSAL_LABELS_SHORT.items()
+    if code in _REFUSAL_LABELS
+}
 
 
 def refusal_label(reached_type: str) -> str:
     """Human-readable form of a ``rate_limit_reached_type`` code."""
     return _REFUSAL_LABELS.get(reached_type, reached_type.replace("_", " "))
+
+
+def short_refusal_label(label: str) -> str:
+    """Card-sized form of an already-expanded refusal *label*; unknown ones pass through."""
+    return _SHORT_BY_LABEL.get(label, label)
 
 
 def _latest_limit_block(path: Path) -> _CodexRefusal | None:

@@ -1554,8 +1554,13 @@ page shows. `ccc codex-usage` GETs it with the credentials `codex login` parked 
 API-key login — `auth_mode` other than `chatgpt` — is skipped, since it has no
 subscription windows). The two windows are identified by their `limit_window_seconds`
 (18000 → `Session:`, 604800 → `Week:`), never by their primary/secondary position, and a
-`rate_limit_reached_type` marks the card **BLOCKED** with the same wording the rollout
-path uses. The access token is a JWT valid ~10 days that `codex` refreshes as it runs;
+`rate_limit_reached_type` marks the card blocked from the same code the rollout path
+reads. The card states the refusal in **card-sized wording** (`⛔ usage limit reached`) —
+`ccc codex-usage` and `codex-in-claude headroom` keep the long explanatory form
+(`BLOCKED — included usage limit reached (no credit overflow)`), which at 61 characters
+would stretch the 38-column card past 60 and steal that width from the job-details pane
+beside it. A refusal code with no short form mapped falls through to its long label, so
+the card never drops the reason. The access token is a JWT valid ~10 days that `codex` refreshes as it runs;
 if it has expired anyway the endpoint answers **401**, and the fetch falls back once to
 the official `codex app-server` (JSON-RPC `account/rateLimits/read` over stdio), which
 refreshes the token itself and writes it back. The fetch is throttled exactly like the

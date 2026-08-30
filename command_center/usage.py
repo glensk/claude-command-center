@@ -73,6 +73,7 @@ from .codex_in_claude import (
     _latest_rate_limits_event,
     codex_refusal,
     refusal_label,
+    short_refusal_label,
 )
 
 # Statuses that mean a job is actively doing work — while any tracked session is in one
@@ -1755,7 +1756,9 @@ def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
     if usage is not None and usage.blocked:
         # The bars below are the last SUCCESSFUL call's figures and would read as healthy
         # headroom, so the refusal is stated first, in red, with the age of the numbers.
-        banner = Text(f"⛔ BLOCKED — {usage.blocked_reason}\n", style="bold red")
+        # Card-sized wording (short_refusal_label), and no "BLOCKED —" prefix: the red ⛔
+        # already says that, and the long CLI form wraps to three lines in 34 columns.
+        banner = Text(f"⛔ {short_refusal_label(usage.blocked_reason)}\n", style="bold red")
         if usage.is_empty():
             return banner + Text("(no window data)", style="grey50")
         # The soonest window reset is when access actually returns — the refusal is a

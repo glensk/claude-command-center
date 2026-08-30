@@ -2090,3 +2090,28 @@ def test_render_codex_usage_blocked_banner_marks_live_figures() -> None:
     plain = usage.render_codex_usage(rollout, now=_LIVE_NOW).plain
     assert "100% = the limit that fired; other figures are 2m old" in plain
     assert "live figures" not in plain
+
+
+def test_render_codex_usage_blocked_banner_uses_the_short_wording() -> None:
+    """The card is 34 columns; the CLI's long refusal label would widen the whole column.
+
+    ``width: auto`` on every ``#usage*`` card means the longest line decides the card's
+    width, and the cards share one right-pinned column — so the CLI wording
+    (``BLOCKED — included usage limit reached (no credit overflow)``, 61 chars) stretched
+    the Codex box past 60 columns and stole that width from the job-details pane.
+    """
+    snap = usage.Usage(
+        captured_at=_LIVE_NOW - 120,
+        five_hour=usage.Window(used_percentage=100.0, resets_at=_LIVE_NOW + 600),
+        seven_day=usage.Window(used_percentage=23.0, resets_at=_LIVE_NOW + 5 * 86400),
+        blocked_reason="included usage limit reached (no credit overflow)",
+        blocked_at=_LIVE_NOW,
+        live=True,
+    )
+    banner = usage.render_codex_usage(snap, now=_LIVE_NOW).plain.split("\n")[0]
+    assert banner == "⛔ usage limit reached"
+    assert len(banner) <= usage._CARD_INNER_WIDTH
+    # An unmapped refusal code has no short form to fall back on and passes through, so
+    # the card still says WHY rather than silently dropping the reason.
+    snap.blocked_reason = "some new refusal"
+    assert usage.render_codex_usage(snap, now=_LIVE_NOW).plain.startswith("⛔ some new refusal")
