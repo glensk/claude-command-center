@@ -21,6 +21,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from . import config, deps, repos, usage
 from .adapters.base import Adapter
@@ -143,6 +144,51 @@ def orphan_launched_ids(store: Store, adapter: Adapter, live_ids: set[str]) -> s
         and session.prompt_count == 0
         and resolve(session.cwd, session.session_id, session.config_dir) is None
     }
+
+
+def resume_blockers(session_id: str, cwd: str, config_dir: str, adapter: Any = None) -> list[str]:
+    """Why ``claude --resume <session_id>`` must NOT be launched (empty ⇒ clean).
+
+    The ONE shared pre-flight for every resume-shaped surface (``ccc resume`` and the
+    snapshot restore planner), so both refuse for exactly the same reasons and with the
+    same wording. Three fail-closed checks, in order:
+
+    1. **Unknown account** — ``config_dir`` is blank while several Claude accounts are
+       configured: resuming could bill the wrong seat (see :mod:`.accounts`).
+    2. **D9 conflict** — the id is live under two account registries at once.
+    3. **No transcript** — nothing to resume; ``claude --resume`` would die with "No
+       conversation found", so say so instead of launching a doomed process.
+
+    Each entry is a full sentence WITHOUT an ``error: `` prefix, so a caller can print
+    it as an error line or fold it into a plan note. *adapter* is injectable (tests, and
+    ``cli`` passing its own ``_adapter()``), defaulting to a fresh :class:`ClaudeAdapter`;
+    ``transcript_path`` is a concrete-adapter capability, not part of the protocol.
+    """
+    # Lazy, like the callers: keep core importable without pulling the account layer.
+    from . import accounts  # pylint: disable=import-outside-toplevel
+
+    if adapter is None:
+        from .adapters import ClaudeAdapter  # pylint: disable=import-outside-toplevel
+
+        adapter = ClaudeAdapter()
+    blockers: list[str] = []
+    if not config_dir and accounts.is_multi_account():
+        blockers.append(
+            f"{session_id} has no recorded Claude account (config_dir) and several are "
+            "configured — refusing to resume rather than risk billing the wrong account. "
+            "Start a turn from the intended account, then retry."
+        )
+    if accounts.live_conflict(session_id):
+        blockers.append(
+            f"{session_id} is live under two Claude accounts at once — close one of them, "
+            "then resume."
+        )
+    if adapter.transcript_path(cwd, session_id, config_dir) is None:
+        blockers.append(
+            f"no recorded conversation for {session_id} — it never had a turn (or its "
+            "transcript was deleted), so it cannot be resumed."
+        )
+    return blockers
 
 
 def _has_background_task(adapter: Adapter, pid: int) -> bool:

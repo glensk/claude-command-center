@@ -209,6 +209,25 @@ DEFAULTS: dict[str, object] = {
     # The session list groups strictly by this category order (see repo_root); within a
     # category, AIM-defined sessions sort first, then by progress.
     "folder_order": ["home", "infra", "llms", "sdsc"],
+    # `ccc restore-snapshot`: which programs a non-Claude pane may RE-RUN from its
+    # captured argv. A pane whose argv[0] basename is listed here is relaunched with the
+    # exact argv `ccc snapshot` read out of the kernel (re-quoted per element); anything
+    # else restores as a plain shell at the pane's cwd that merely PRINTS what used to
+    # run there. Nothing here runs without an explicit `ccc restore-snapshot`, so this is
+    # not an inert-defaults key — it only narrows what that command may relaunch.
+    "snapshot_restore_commands": [
+        "vi",
+        "vim",
+        "nvim",
+        "less",
+        "man",
+        "tail",
+        "htop",
+        "btop",
+        "top",
+        "ccc",
+        "ssh",
+    ],
 }
 
 
@@ -493,6 +512,22 @@ class Config:
     launchd_label: str = "com.claude-command-center"
     tmux_session: str = "ccc"
     folder_order: list[str] = field(default_factory=lambda: ["home", "infra", "llms", "sdsc"])
+    # Programs `ccc restore-snapshot` may re-run from a captured pane's exact argv.
+    snapshot_restore_commands: list[str] = field(
+        default_factory=lambda: [
+            "vi",
+            "vim",
+            "nvim",
+            "less",
+            "man",
+            "tail",
+            "htop",
+            "btop",
+            "top",
+            "ccc",
+            "ssh",
+        ]
+    )
     # Fail-closed sentinel — DELIBERATELY absent from ``DEFAULTS`` so it is never
     # serialized (``save_config`` iterates ``DEFAULTS`` keys). ``load_config`` sets it
     # False when an EXISTING config.toml failed to read/parse and we fell back to pure

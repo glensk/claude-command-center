@@ -1144,37 +1144,17 @@ def cmd_resume(args: argparse.Namespace) -> int:
     Claude account into the exec env, and refuses when the account is unknown, when the
     id is live under two accounts (D9), or when no transcript resolves under it.
     """
-    from . import accounts
+    from . import accounts, core
 
     with Store() as store:
         session = store.get(args.session_id)
     config_dir = session.config_dir if session else ""
-    # Fail closed: an unknown account in multi-account mode could bill the wrong seat.
-    if not config_dir and accounts.is_multi_account():
-        print(
-            f"error: {args.session_id} has no recorded Claude account (config_dir) and "
-            "several are configured — refusing to resume rather than risk billing the "
-            "wrong account. Start a turn from the intended account, then retry.",
-            file=sys.stderr,
-        )
-        return 1
-    if accounts.live_conflict(args.session_id):
-        print(
-            f"error: {args.session_id} is live under two Claude accounts at once — "
-            "close one of them, then resume.",
-            file=sys.stderr,
-        )
-        return 1
-    # A resume needs a transcript on disk. A session that never had a turn (or whose
-    # transcript was deleted) has none, so `claude --resume` would fail with "No
-    # conversation found"; report that here instead of exec-ing a doomed process.
     cwd = session.cwd if session else ""
-    if _adapter().transcript_path(cwd, args.session_id, config_dir) is None:
-        print(
-            f"error: no recorded conversation for {args.session_id} — it never had a turn "
-            "(or its transcript was deleted), so it cannot be resumed.",
-            file=sys.stderr,
-        )
+    # The three fail-closed checks (unknown account in multi-account mode, D9 conflict,
+    # missing transcript) live in core so `ccc restore-snapshot` refuses identically.
+    blockers = core.resume_blockers(args.session_id, cwd, config_dir, _adapter())
+    if blockers:
+        print(f"error: {blockers[0]}", file=sys.stderr)
         return 1
     # Terminal guard (same trap as `start-job`): this execs claude IN PLACE, so with no
     # TTY the resumed session would run headless for a single turn and exit instead of
@@ -3148,6 +3128,20 @@ def cmd_jump(args: argparse.Namespace) -> int:
     return jump.run(args)
 
 
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    """Save the whole iTerm layout (windows/tabs/splits + what each pane runs)."""
+    from . import snapshot
+
+    return snapshot.run_snapshot(args)
+
+
+def cmd_restore_snapshot(args: argparse.Namespace) -> int:
+    """Rebuild a saved iTerm layout: resume the Claude sessions, re-run the rest."""
+    from . import snapshot
+
+    return snapshot.run_restore(args)
+
+
 _RESTART_POLL_SEC = 0.1
 _RESTART_TIMEOUT_SEC = 5.0
 
@@ -4250,6 +4244,62 @@ def build_parser() -> argparse.ArgumentParser:
         help="if no ccc TUI tab exists, fail instead of opening a new one",
     )
     p_jump.set_defaults(func=cmd_jump)
+
+    p_snap = sub.add_parser(
+        "snapshot",
+        help="save the whole iTerm layout (windows/tabs/splits + what each pane runs)",
+        description=(
+            "Capture every iTerm2 window, its tabs and each tab's split topology, plus "
+            "what each pane is doing: a tracked Claude session (id + account), a "
+            "foreground program with its exact argv, or just a shell at its cwd. The "
+            "snapshot is a 0600 JSON file under CLAUDE_HOME; `ccc restore-snapshot` "
+            "rebuilds it after a reboot. Requires macOS + iTerm2 with 'Enable Python "
+            "API' on (there is no tmux/AppleScript fallback in v1)."
+        ),
+    )
+    p_snap.add_argument(
+        "-l",
+        "--list",
+        action="store_true",
+        help="list saved snapshots (name, age, window/tab/pane counts) instead of capturing",
+    )
+    p_snap.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="print the capture and its per-pane classification without writing a file",
+    )
+    p_snap.set_defaults(func=cmd_snapshot)
+
+    p_restore = sub.add_parser(
+        "restore-snapshot",
+        help="rebuild a saved iTerm layout (resume the Claude sessions, re-run the rest)",
+        description=(
+            "Rebuild the windows/tabs/splits of a snapshot: every Claude session is "
+            "resumed on ITS OWN account (skipped when already live, refused when its "
+            "resume is blocked), every other pane re-runs its captured argv when the "
+            "program is on the `snapshot_restore_commands` allowlist, else lands as a "
+            "shell at the recorded cwd printing what used to run there. Defaults to the "
+            "newest snapshot; a bare name resolves in the snapshots dir (with or without "
+            "the .json), anything containing '/' is used as a path."
+        ),
+    )
+    p_restore.add_argument(
+        "name", nargs="?", default=None, help="snapshot name or path (default: the newest)"
+    )
+    p_restore.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="print the full window/tab/pane plan without touching iTerm2",
+    )
+    p_restore.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="restore even though iTerm2 already has other panes open (duplicates the layout)",
+    )
+    p_restore.set_defaults(func=cmd_restore_snapshot)
 
     p_demo = sub.add_parser(
         "demo",
