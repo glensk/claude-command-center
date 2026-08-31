@@ -238,6 +238,15 @@ def test_every_action_names_a_config_key_to_change_it() -> None:
     assert all(r.switch.strip() for r in llmrouting.rows(_cfg()))
 
 
+def test_purposes_constant_matches_the_rows_it_is_meant_to_resolve() -> None:
+    """`PURPOSES` is what we ask `ai routing` about; a drift here silently loses a route.
+
+    The rows carry their own purpose strings, so a renamed row that forgets the constant
+    would still render — just permanently without a live route or ladder.
+    """
+    assert tuple(r.purpose for r in llmrouting.rows(_cfg())) == llmrouting.PURPOSES
+
+
 # --------------------------------------------------------------------------- #
 # the hot-path guard
 # --------------------------------------------------------------------------- #
