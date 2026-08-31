@@ -77,7 +77,13 @@ env to the `llm_account` config, and `llm_custom_command` (with `CCC_LLM_PURPOSE
 `CCC_LLM_NOTE` in the env) is the pluggable routing hatch. **`ccc llm-routing` (also embedded
 in `ccc -h`) resolves every one of those calls against the live config and names the quota it
 bills** — `command_center/llmrouting.py`, the counterpart to `ai.py routing`; check it before
-claiming which provider a ccc action costs, and add a row there whenever you add an LLM call.
+claiming which provider a ccc action costs, and add a row there (plus its label in
+`llmrouting.PURPOSES`) whenever you add an LLM call. A row whose `llm_custom_command` is
+`ai.py` is resolved for real through `ai routing -p <purposes>` — one subprocess for all of
+them, ANSI-safe column widths, ai.py's own colours — so never hard-code what a router does.
+That subprocess is gated behind `llmrouting.help_requested()`: `build_parser` runs on EVERY
+invocation including `ccc statusline`, and an epilog is only printed for `--help`, so keep
+the block out of the hot path.
 It flags any action still billing the OpenAI Codex seat, which is reserved for
 `/codex-debate` (`short_aim_backend = "codex"` used to spend ~17.6k Codex tokens per ten-word
 label). See the multi-account section of [docs/reference.md](docs/reference.md).

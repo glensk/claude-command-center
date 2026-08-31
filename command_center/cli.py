@@ -3258,8 +3258,12 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "background daemon: a launchd agent runs `ccc daemon` every few minutes to\n"
             "auto-close idle sessions, refresh summaries and fire alerts — see\n"
-            "`ccc daemon --help` for what it does and how to install / uninstall it.\n\n"
-            + llmrouting.render()
+            "`ccc daemon --help` for what it does and how to install / uninstall it."
+            # argparse only ever PRINTS an epilog for --help, but build_parser runs on
+            # every invocation (`ccc statusline` fires on each prompt render). Resolving
+            # the routing block costs a config read plus an `ai routing` subprocess, so it
+            # is built only when this run is actually asking for help.
+            + ("\n\n" + llmrouting.render() if llmrouting.help_requested() else "")
         ),
     )
     parser.add_argument("--version", action="version", version=f"ccc {__version__}")
