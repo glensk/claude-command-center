@@ -74,8 +74,13 @@ means **unknown and fails closed** on every launch-shaped surface (`cmd_resume`,
 configured — the shared `accounts.live_conflict` also refuses an id live under two accounts
 at once. ccc's own headless LLM calls must never bill ambiently: `llm._run_claude` pins its
 env to the `llm_account` config, and `llm_custom_command` (with `CCC_LLM_PURPOSE` /
-`CCC_LLM_NOTE` in the env) is the pluggable routing hatch. See the multi-account section of
-[docs/reference.md](docs/reference.md).
+`CCC_LLM_NOTE` in the env) is the pluggable routing hatch. **`ccc llm-routing` (also embedded
+in `ccc -h`) resolves every one of those calls against the live config and names the quota it
+bills** — `command_center/llmrouting.py`, the counterpart to `ai.py routing`; check it before
+claiming which provider a ccc action costs, and add a row there whenever you add an LLM call.
+It flags any action still billing the OpenAI Codex seat, which is reserved for
+`/codex-debate` (`short_aim_backend = "codex"` used to spend ~17.6k Codex tokens per ten-word
+label). See the multi-account section of [docs/reference.md](docs/reference.md).
 
 ## Launching jobs: always a tab (do not regress)
 

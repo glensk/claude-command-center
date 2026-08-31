@@ -39,7 +39,7 @@ import os
 import re
 import sys
 
-from . import __version__, config
+from . import __version__, config, llmrouting
 from .adapters import ClaudeAdapter
 from .models import (
     DEFAULT_LLM,
@@ -115,6 +115,12 @@ def _spawn_sync_mirrors(cfg: config.Config) -> None:
 # --------------------------------------------------------------------------- #
 # command handlers
 # --------------------------------------------------------------------------- #
+def cmd_llm_routing(_args: argparse.Namespace) -> int:
+    """`ccc llm-routing` — the same table `ccc --help` embeds, on demand."""
+    print(llmrouting.render(), end="")
+    return 0
+
+
 def cmd_ls(args: argparse.Namespace) -> int:
     from .views import ls as ls_view
 
@@ -3247,11 +3253,13 @@ def cmd_tab_symbol(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ccc",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Command center for parked Claude Code sessions (AIM, progress, next-step).",
         epilog=(
-            "background daemon: a launchd agent runs `ccc daemon` every few minutes to "
-            "auto-close idle sessions, refresh summaries and fire alerts — see "
-            "`ccc daemon --help` for what it does and how to install / uninstall it."
+            "background daemon: a launchd agent runs `ccc daemon` every few minutes to\n"
+            "auto-close idle sessions, refresh summaries and fire alerts — see\n"
+            "`ccc daemon --help` for what it does and how to install / uninstall it.\n\n"
+            + llmrouting.render()
         ),
     )
     parser.add_argument("--version", action="version", version=f"ccc {__version__}")
@@ -3260,6 +3268,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("ls", help="flat clickable list of all tracked sessions").set_defaults(
         func=cmd_ls
     )
+
+    sub.add_parser(
+        "llm-routing", help="which model each ccc LLM action uses now (and what it bills)"
+    ).set_defaults(func=cmd_llm_routing)
 
     p_aim = sub.add_parser("aim", help="status-line lookup of a session's done-condition")
     p_aim.add_argument("--session")

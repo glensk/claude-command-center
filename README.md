@@ -158,6 +158,15 @@ editable install), `ccc restart-tui` bounces the running TUI in its **own** term
 so the new code loads — no manual keystroke; it exits 0 once the TUI is back, 1 if none
 is running.
 
+ccc makes a handful of small LLM calls of its own (AIM scoring, the done-check, sub-goal
+derive/grade, drift, parked-session summaries, the short-AIM label). **`ccc llm-routing`
+— also printed at the bottom of `ccc -h` — resolves each one against your live config and
+names the quota it bills**, plus the config key that turns it off or moves it. It calls out
+any action still spending the OpenAI Codex seat, which is usually the one you want reserved
+for adversarial plan review rather than for generating dashboard labels. Every row obeys
+`llm_custom_command`, the single escape hatch that routes ccc's calls through your own
+multi-provider router (the purpose rides along in `$CCC_LLM_PURPOSE`).
+
 In the TUI, the `t` leader chord expands/collapses the usage cards: `t1`…`t5` for the
 Claude/Codex/Copilot subscription cards (`t5` is a second Codex card for a second
 ChatGPT login, shown once `codex_home_private` points at another `CODEX_HOME`), and
