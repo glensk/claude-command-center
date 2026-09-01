@@ -61,9 +61,10 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
+from rich.cells import cell_len
 from rich.text import Text
 
 from . import config
@@ -890,6 +891,214 @@ def claude_usage_stale(account: str, refresh_sec: float, now: int | None = None)
     return (now - fetched) >= refresh_sec
 
 
+# --- Subscription end dates (the " -> 30.9" a card's border title can carry) --------
+#
+# Neither vendor publishes a renewal date to the surfaces we can reach:
+#
+# * Anthropic's OAuth ``/profile`` carries ``subscription_created_at`` /
+#   ``subscription_status`` / ``billing_type`` but NO ``current_period_end`` — so the
+#   next charge is *derived* from the billing anniversary (:func:`next_anniversary`).
+# * ChatGPT's ``backend-api/subscriptions`` answers 403 behind Cloudflare (only
+#   ``wham/usage`` is reachable with the Codex token), leaving the id_token's
+#   ``chatgpt_subscription_active_until`` claim — refreshed only by a ``codex login``,
+#   so it goes stale within weeks and is offered as ``auto`` but never as the default.
+#
+# Hence ``subscription_ends`` takes a PINNED date per card as its normal mode, with
+# ``auto`` as the opt-in derivation. Empty (the default) touches neither endpoint.
+_OAUTH_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+# A billing anniversary moves once a month at most, so a day-old answer is as good as a
+# fresh one — and this fetch rides along with the usage fetch, whose own throttle is
+# minutes. Refetching it every 10 minutes would be pure waste on a rate-limited host.
+_PROFILE_REFRESH_SEC = 86_400
+# (path, mtime_ns) → the cached ``subscription_created_at``, so the 5 s render tick can
+# ask for a card's date without re-reading (and re-parsing) the file every time. Same
+# shape as _codex_email_cache.
+_profile_cache: dict[tuple[str, int], str] = {}
+
+
+def _profile_path(account: str) -> Path:
+    """Per-account subscription-profile cache path.
+
+    A file of its own rather than a field inside ``usage.json``: that cache has an
+    authoritative-replace merge (see :func:`write_usage`) which a slow, unrelated,
+    once-a-day fetch has no business participating in.
+    """
+    return config.app_home() / f"profile-{account}-{_account_hash(account)}.json"
+
+
+def read_subscription_created_at(account: str = "private") -> str:
+    """*account*'s cached ``subscription_created_at`` (ISO-8601), or ``""``. Never raises.
+
+    Memoized on the cache file's ``(path, mtime_ns)`` — the TUI asks on every render
+    tick, and the file changes at most once a day.
+    """
+    path = _profile_path(account)
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        return ""
+    if key not in _profile_cache:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ""
+        created = data.get("subscription_created_at") if isinstance(data, dict) else None
+        _profile_cache[key] = created if isinstance(created, str) else ""
+    return _profile_cache[key]
+
+
+def profile_fetched_at(account: str = "private") -> int:
+    """When *account*'s profile cache was last written (epoch seconds); ``0`` if never."""
+    try:
+        data = json.loads(_profile_path(account).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    return _int_field(data, "fetched_at") if isinstance(data, dict) else 0
+
+
+def claude_profile_stale(
+    account: str, refresh_sec: float = _PROFILE_REFRESH_SEC, now: int | None = None
+) -> bool:
+    """True if *account*'s subscription profile has never been fetched, or is a day old."""
+    now = int(time.time()) if now is None else now
+    fetched = profile_fetched_at(account)
+    if fetched <= 0:
+        return True
+    return (now - fetched) >= refresh_sec
+
+
+def fetch_claude_profile(account: str = "private", now: int | None = None) -> str:
+    """Fetch and cache *account*'s ``subscription_created_at``; return it (``""`` on failure).
+
+    Best-effort and silent, exactly like :func:`fetch_claude_usage`: no Keychain token,
+    a non-200, or unparseable JSON simply leaves the cache untouched and returns ``""``,
+    so a card configured ``auto`` shows no date rather than a wrong one. Only ever called
+    out-of-band (``ccc claude-usage``), never on a render path.
+    """
+    now = int(time.time()) if now is None else now
+    token = _keychain_oauth_token(account)
+    if not token:
+        return ""
+    req = urllib.request.Request(  # noqa: S310  # fixed https:// endpoint
+        _OAUTH_PROFILE_URL,
+        headers={"Authorization": f"Bearer {token}", "anthropic-beta": _OAUTH_BETA_HEADER},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310  # fixed https://
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return ""
+    org = data.get("organization") if isinstance(data, dict) else None
+    created = org.get("subscription_created_at") if isinstance(org, dict) else None
+    if not isinstance(created, str) or not created:
+        return ""
+    path = _profile_path(account)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(path, {"subscription_created_at": created, "fetched_at": now})
+    except OSError:
+        return ""
+    return created
+
+
+def next_anniversary(created: str, today: date | None = None) -> date | None:
+    """The next monthly billing anniversary of an ISO-8601 *created* timestamp.
+
+    ``subscription_created_at`` is the only date Anthropic's profile exposes, so the
+    renewal day is inferred from it: the same day-of-month, at or after *today*. A day
+    that a short month does not have is clamped to that month's last day (Stripe's own
+    rule for a 31st subscription in February). Returns ``None`` for anything unparseable.
+
+    Deliberately the MONTHLY anniversary even though the plan could be annual: it is the
+    earlier of the two answers, and this date exists to be cancelled before.
+    """
+    text = created.strip().replace("Z", "+00:00")
+    try:
+        start = datetime.fromisoformat(text).date()
+    except ValueError:
+        return None
+    today = datetime.now().date() if today is None else today
+    year, month = today.year, today.month
+    for _ in range(2):  # this month, else the next one — never more
+        day = min(start.day, calendar.monthrange(year, month)[1])
+        candidate = datetime(year, month, day).date()
+        if candidate >= today:
+            return candidate
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return None
+
+
+def codex_subscription_until(home: Path | None) -> date | None:
+    """*home*'s ChatGPT subscription end from its id_token, or ``None``. Never raises.
+
+    The ``chatgpt_subscription_active_until`` claim inside ``auth.json``'s id_token —
+    the ONLY subscription date reachable for a Codex login, and only as fresh as the
+    last ``codex login`` (its sibling ``chatgpt_subscription_last_checked`` claim shows
+    how stale). That is why ``auto`` is offered for a Codex card but a pinned date is
+    the documented default.
+    """
+    if home is None:
+        return None
+    data = _codex_auth_data(home) or {}
+    tokens = data.get("tokens")
+    token = tokens.get("id_token") if isinstance(tokens, dict) else data.get("id_token")
+    claims = _jwt_claims(token)
+    auth = claims.get("https://api.openai.com/auth") if claims else None
+    until = auth.get("chatgpt_subscription_active_until") if isinstance(auth, dict) else None
+    if not isinstance(until, str) or not until:
+        return None
+    try:
+        return datetime.fromisoformat(until.strip().replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def format_end_date(day: date, today: date) -> str:
+    """A renewal date as a card-title suffix: ``30.9`` — or ``30.9!`` once it is past.
+
+    Swiss ``D.M``, no zero padding and no year: four columns for the two facts that
+    matter on a 32-cell title. The ``!`` is what stops a PINNED date from quietly
+    rotting after its renewal — an ``auto`` date rolls forward on its own and never
+    earns one.
+    """
+    text = f"{day.day}.{day.month}"
+    return f"{text}!" if day < today else text
+
+
+def subscription_suffix(
+    card: str,
+    ends: dict[str, str],
+    home: Path | None = None,
+    today: date | None = None,
+) -> str:
+    """The `` -> 30.9`` a card's border title carries, or ``""`` when it carries none.
+
+    *ends* is :func:`config.parse_subscription_ends`'s map. A card missing from it (the
+    default for all four) gets ``""`` and costs nothing. ``auto`` derives the date —
+    :func:`next_anniversary` off the cached Claude profile for the two Claude cards,
+    :func:`codex_subscription_until` off the id_token for the two Codex ones — and also
+    yields ``""`` when that source has nothing to say, so an unreachable endpoint shows
+    no date rather than a wrong one. *home* is the card's ``CODEX_HOME`` and is only
+    read for a Codex card.
+    """
+    spec = ends.get(card, "")
+    if not spec:
+        return ""
+    today = datetime.now().date() if today is None else today
+    if spec != "auto":
+        try:
+            day: date | None = datetime.fromisoformat(spec).date()
+        except ValueError:
+            return ""
+    elif card in config.SUBSCRIPTION_CARD_ACCOUNTS:
+        day = next_anniversary(
+            read_subscription_created_at(config.SUBSCRIPTION_CARD_ACCOUNTS[card]), today
+        )
+    else:
+        day = codex_subscription_until(home)
+    return f" -> {format_end_date(day, today)}" if day is not None else ""
+
+
 def _force_exhausted_window(
     five: Window | None, seven: Window | None, now: int
 ) -> tuple[Window | None, Window | None]:
@@ -966,8 +1175,8 @@ def _codex_auth_tokens(home: Path) -> tuple[str, str] | None:
     return access, account
 
 
-def _jwt_email(token: object) -> str | None:
-    """The ``email`` claim of a JWT's payload segment — NO signature verification.
+def _jwt_claims(token: object) -> dict | None:
+    """A JWT's decoded payload segment — NO signature verification.
 
     We are reading our own already-trusted local credential purely to label a card, so
     verifying it would buy nothing (and would need OpenAI's JWKS). Any malformed input
@@ -984,9 +1193,13 @@ def _jwt_email(token: object) -> str | None:
         claims = json.loads(raw)
     except (ValueError, TypeError, json.JSONDecodeError):
         return None
-    if not isinstance(claims, dict):
-        return None
-    email = claims.get("email")
+    return claims if isinstance(claims, dict) else None
+
+
+def _jwt_email(token: object) -> str | None:
+    """The ``email`` claim of a JWT's payload segment, or ``None``."""
+    claims = _jwt_claims(token)
+    email = claims.get("email") if claims else None
     return email if isinstance(email, str) and email else None
 
 
@@ -1017,16 +1230,33 @@ def codex_account_email(home: Path) -> str | None:
     return cached if isinstance(cached, str) and cached else None
 
 
-def abbrev_email(email: str) -> str:
+def abbrev_domain(domain: str, budget: int) -> str:
+    """Squeeze a mail domain into *budget* cells, giving up as little as possible.
+
+    The LAST resort before a title overflows its card — the domain is what tells two
+    accounts apart, so it is squeezed only when keeping it whole would push the title
+    past :data:`_CARD_TITLE_BUDGET`, and then only by as much as that costs:
+    ``datascience.ch`` gives up one cell as ``datascienc…ch``, not the four of a fixed
+    chop. The tail is always the last two characters (the TLD is half of what makes a
+    domain recognizable) and the head never falls below two, so the floor is ``da…ch``
+    — a budget tighter than that lets the card grow instead (see ``_set_card_expanded``).
+    """
+    if len(domain) <= budget:
+        return domain
+    return f"{domain[: max(2, budget - 3)]}…{domain[-2:]}"
+
+
+def abbrev_email(email: str, *, domain_budget: int | None = None) -> str:
     """Shorten an address for a card title: ``first.last@example.org`` → ``first…@example.org``.
 
     A dotted local part keeps its first segment whole and drops the rest behind an
     ellipsis — the readable half of an address is its first word, and initials of the
     later segments (the old ``fi…la``) bought two columns at the cost of legibility.
     An undotted local part longer than five characters keeps its first two and last
-    two; anything shorter is left alone. The domain is never touched (it is what
-    distinguishes two accounts at a glance), and a string with no ``@`` is returned
-    unchanged.
+    two; anything shorter is left alone. The domain is left whole unless a
+    *domain_budget* is given (it is what distinguishes two accounts at a glance, so
+    callers only cap it when the title would otherwise overflow — see
+    :func:`codex_card_title`), and a string with no ``@`` is returned unchanged.
     """
     local, sep, domain = email.partition("@")
     if not sep:
@@ -1037,10 +1267,21 @@ def abbrev_email(email: str) -> str:
         short = f"{local[:2]}…{local[-2:]}"
     else:
         short = local
+    if domain_budget is not None:
+        domain = abbrev_domain(domain, domain_budget)
     return f"{short}@{domain}"
 
 
-def codex_card_title(home: Path | None, chord: str) -> str:
+# How many cells a card's border title may claim before the card grows past its CSS
+# min-width. ``_set_card_expanded`` pins a collapsed card to ``len(title) + 6`` (the
+# ``╭─ … ─╮`` furniture), and the #usage* min-width is 38 — so 32 cells of title keep
+# every card exactly as wide as the narrowest one. Beyond that the whole right-hand
+# column widens and the job-details pane pays for it, which is why a title that would
+# overflow squeezes its domain instead. Keep in sync with _CARD_INNER_WIDTH / the CSS.
+_CARD_TITLE_BUDGET = 32
+
+
+def codex_card_title(home: Path | None, chord: str, suffix: str = "") -> str:
     """Border title for a Codex card: ``Codex first…@example.org / t3``.
 
     Naming the account is what keeps two Codex cards apart, so the vendor prefix gives
@@ -1049,11 +1290,23 @@ def codex_card_title(home: Path | None, chord: str) -> str:
     accounts apart. When no e-mail can be resolved (no ``auth.json``, an API-key login,
     or ``home`` is ``None`` because the second home is not configured) the title degrades
     to plain ``Codex / <chord>``.
+
+    *suffix* is the optional subscription-end marker (`` -> 30.9``, see
+    :func:`subscription_suffix`). It costs eight cells, which is enough to push a long
+    domain over :data:`_CARD_TITLE_BUDGET` — so an overflowing title hands the domain a
+    budget short by exactly the overflow and :func:`abbrev_domain` gives up only that
+    much. The chord and the date are never truncated: they are the two things the title
+    exists to say.
     """
     email = codex_account_email(home) if home is not None else None
-    if email:
-        return f"Codex {abbrev_email(email)} / {chord}"
-    return f"Codex / {chord}"
+    if not email:
+        return f"Codex / {chord}{suffix}"
+    title = f"Codex {abbrev_email(email)} / {chord}{suffix}"
+    overflow = cell_len(title) - _CARD_TITLE_BUDGET
+    if overflow <= 0:
+        return title
+    budget = len(email.partition("@")[2]) - overflow
+    return f"Codex {abbrev_email(email, domain_budget=budget)} / {chord}{suffix}"
 
 
 def _codex_usage_path(home: Path) -> Path:

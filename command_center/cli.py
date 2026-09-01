@@ -461,6 +461,11 @@ def cmd_claude_usage(args: argparse.Namespace) -> int:
     boundary and adding the Fable weekly window the status line never carries). Prints one
     short line per account. Always exits 0 — a missing/expired token simply skips that
     account. Spawned detached by the TUI/daemon when the snapshot is stale; runnable by hand.
+
+    Rides along with a second, far rarer fetch: an account whose card is configured
+    ``subscription_ends = ["claude_…=auto"]`` also refreshes its OAuth *profile* (once a
+    day, :func:`usage.claude_profile_stale`) for the billing anniversary that card's
+    ``-> D.M`` suffix is derived from. No ``auto`` entry ⇒ that endpoint is never called.
     """
     from . import usage
 
@@ -471,11 +476,20 @@ def cmd_claude_usage(args: argparse.Namespace) -> int:
         if not labels:
             print(f"claude-usage: {account} not a configured account", file=sys.stderr)
             return 0
+    ends = config.parse_subscription_ends(config.load_config().subscription_ends)
+    derived = {
+        label
+        for card, label in config.SUBSCRIPTION_CARD_ACCOUNTS.items()
+        if ends.get(card) == "auto"
+    }
     for label in labels:
         snap = usage.fetch_claude_usage(label)
         print(
             f"claude-usage: {label} {'fetched' if snap else 'skipped (no token or fetch failed)'}"
         )
+        if label in derived and usage.claude_profile_stale(label):
+            created = usage.fetch_claude_profile(label)
+            print(f"claude-usage: {label} subscription start {created or '(unavailable)'}")
     return 0
 
 

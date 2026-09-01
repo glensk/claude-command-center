@@ -405,3 +405,33 @@ def test_parse_claude_account_emails_is_pure_and_tolerant() -> None:
     )
     # Unlike claude_accounts, empty stays empty — no default-private fallback.
     assert config.parse_claude_account_emails([]) == {}
+
+
+def test_parse_subscription_ends_is_pure_and_tolerant() -> None:
+    """`parse_subscription_ends` — the per-card renewal date behind the ``-> D.M`` title.
+
+    Same tolerance rule as its neighbours: one bad entry is skipped, never fatal, so a
+    typo in config.toml cannot blank the dates on the other cards. A well-SHAPED but
+    impossible day is rejected too — a card must show a real date or none at all.
+    """
+    entries = ["claude_private=auto", "codex_private=2026-09-30"]
+    assert config.parse_subscription_ends(entries) == {
+        "claude_private": "auto",
+        "codex_private": "2026-09-30",
+    }
+    assert (
+        config.parse_subscription_ends(
+            [
+                "nosep",  # no "="
+                "claude_privat=2026-09-30",  # card outside SUBSCRIPTION_CARDS
+                "codex=30.9.2026",  # not ISO-8601
+                "codex=2026-02-30",  # well-shaped, but February has no 30th
+                "codex_private=",  # blank value
+                "claude_work=AUTO",  # `auto` is spelled lowercase
+            ]
+        )
+        == {}
+    )
+    assert config.parse_subscription_ends([]) == {}
+    # Every card the parser accepts is a card the TUI actually draws.
+    assert set(config.SUBSCRIPTION_CARD_ACCOUNTS) <= set(config.SUBSCRIPTION_CARDS)

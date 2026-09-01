@@ -1605,7 +1605,8 @@ with `CODEX_HOME=~/.codex-private codex login`) and a second green card appears,
 own `t5` chord, its own throttled fetch and its own cache. Empty — the default — means no
 second card at all (absent, not merely collapsed). Each card titles itself with the
 account e-mail read from that home's `auth.json` `id_token` (abbreviated:
-`Codex first…@example.org / t3`), so the two are never confused. The rollout files
+`Codex first…@example.org / t3`, and squeezed further — `first…@exa…rg` — when the title
+would otherwise outgrow its card), so the two are never confused. The rollout files
 belong to the default login, so the second card is live-endpoint-only, and a refusal
 recorded by one login never bleeds into the other's card.
 
@@ -1701,6 +1702,39 @@ filenames); malformed entries are skipped.
   **empty** rather than falling back to a path-based guess that could be wrong again.
   Empty (the default) ⇒ no hard link for any label — single-account installs and
   anyone who hasn't hit this drift are completely unaffected.
+- **Subscription end dates (`subscription_ends`) — the `-> D.M` a card can carry.** A
+  paid plan you mean to cancel is only cancellable if you remember it renews. Pin the
+  date to the card that bills it and its border title says so:
+  ```toml
+  subscription_ends = ["claude_private=auto", "codex_private=2026-09-30"]
+  ```
+  ```
+  ╭─ Claude (private) 🏠 / t1 -> 18.9 ────╮
+  ╭─ Codex second…@exa…om / t5 -> 30.9 ───╮
+  ```
+  Cards: `claude_private`, `claude_work`, `codex`, `codex_private`. The date renders
+  Swiss `D.M` — four columns, no padding, no year — and gains a `!` (`30.8!`) once it is
+  past, so a **pinned** date cannot quietly rot after its renewal. Empty (the default) ⇒
+  no card carries a date and no extra endpoint is ever called.
+
+  `auto` derives the date instead of pinning it, and is only as good as its source:
+  - **Claude cards** — Anthropic's OAuth `/profile` exposes `subscription_created_at`,
+    `subscription_status` and `billing_type` but **no** `current_period_end`, so the date
+    is the next **monthly billing anniversary** of that creation timestamp (clamped in
+    short months, Stripe's own rule). It is the *earlier* of the monthly/annual readings
+    on purpose: this date exists to be cancelled before. The profile is fetched at most
+    once a day, riding along with `ccc claude-usage`, and only when an `auto` entry asks
+    for it.
+  - **Codex cards** — ChatGPT's `backend-api/subscriptions` answers 403 behind Cloudflare
+    (only `wham/usage` is reachable with the Codex token), leaving the `auth.json`
+    id_token's `chatgpt_subscription_active_until` claim. That claim is refreshed only by
+    a `codex login`, so it goes stale within weeks — prefer a pinned date here.
+
+  Either way an unresolvable `auto` renders **nothing** rather than a guess. Note the
+  title budget: Textual clips a border title at the card width minus four (32 cells at
+  the default 38-column card), and the date sits at the very end — so a title carrying
+  one squeezes its domain (`second…@exa…om`) and, if still short, the card widens by the
+  cell or two needed. Nothing is ever cut.
 - **Per-job account.** A future job carries the account it will launch (bill) under:
   `ccc new-job -A <label>`, the TUI's new-job/`e`-form account selects, and the job
   file's `account` frontmatter + control — all shown **only when more than one

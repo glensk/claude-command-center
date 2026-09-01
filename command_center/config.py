@@ -19,6 +19,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 
 import contextlib
+import datetime
 import os
 import re
 import tempfile
@@ -143,6 +144,14 @@ DEFAULTS: dict[str, object] = {
     # even after such a drift. Empty (the default) ⇒ no hard link, today's pure
     # path-based behaviour (see ``accounts.resolve_card_label``).
     "claude_account_emails": [],
+    # When each paid subscription renews, so a card can advertise its own cancel-by date:
+    # ``"card=YYYY-MM-DD"`` entries over the four cards in ``SUBSCRIPTION_CARDS``, e.g.
+    # ``["claude_private=auto", "codex_private=2026-09-30"]``. The date is appended to
+    # that card's border title as `` -> 30.9`` (Swiss D.M; a ``!`` marks one already
+    # past). ``auto`` derives it instead of pinning it — from the billing anniversary in
+    # Claude's OAuth profile, or from the ChatGPT id_token's subscription claim. Empty
+    # (the default) ⇒ no card carries a date and no profile endpoint is ever called.
+    "subscription_ends": [],
     # Which account a NEW job (no explicit -A / account select) bills to: "" = default
     # account, a label = pin, "auto" = saturate-earliest-reset routing (see routing.py).
     "job_account": "",
@@ -373,6 +382,56 @@ def parse_claude_account_emails(entries: list[str]) -> dict[str, str]:
     return emails
 
 
+# The four usage cards a subscription-end date can be pinned to. These are CARD keys,
+# not account labels: the two Claude cards are keyed by the account label they render
+# (see SUBSCRIPTION_CARD_ACCOUNTS), the two Codex ones by which CODEX_HOME they read.
+SUBSCRIPTION_CARDS = ("claude_private", "claude_work", "codex", "codex_private")
+# The Claude subscription cards → the account label whose OAuth profile carries their
+# billing anniversary. The two Codex cards have no entry: their date comes from a
+# CODEX_HOME's id_token, not from an account label.
+SUBSCRIPTION_CARD_ACCOUNTS = {"claude_private": "private", "claude_work": "work"}
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def subscription_end_map() -> dict[str, str]:
+    """Map each usage card → its configured subscription end (``"YYYY-MM-DD"``/``"auto"``).
+
+    Parses the ``subscription_ends`` config key. Empty ⇒ ``{}``: no card advertises a
+    renewal date, which is also the fresh-install default (an ``auto`` entry is what
+    authorizes the extra profile fetch, so an unconfigured install makes no such call).
+    """
+    return parse_subscription_ends(load_config().subscription_ends)
+
+
+def parse_subscription_ends(entries: list[str]) -> dict[str, str]:
+    """Pure ``"card=YYYY-MM-DD"`` / ``"card=auto"`` parser behind :func:`subscription_end_map`.
+
+    Mirrors :func:`parse_claude_account_emails`'s tolerance — an entry with no ``=``, a
+    card outside :data:`SUBSCRIPTION_CARDS`, or a value that is neither ``auto`` nor a
+    REAL ISO-8601 date (``2026-02-30`` is rejected, not just mis-shaped strings) is
+    SKIPPED without crashing, so one typo in the config never blanks the other cards.
+    """
+    ends: dict[str, str] = {}
+    for entry in entries:
+        card, sep, raw = entry.partition("=")
+        if not sep:
+            continue  # no "=" → not a "card=value" entry
+        card, raw = card.strip(), raw.strip()
+        if card not in SUBSCRIPTION_CARDS:
+            continue
+        if raw == "auto":
+            ends[card] = raw
+            continue
+        if not _ISO_DATE_RE.match(raw):
+            continue
+        try:
+            datetime.date.fromisoformat(raw)
+        except ValueError:
+            continue  # well-shaped but not a real day (2026-02-30)
+        ends[card] = raw
+    return ends
+
+
 def guard_vault_path(path: Path) -> Path:
     """Fail loudly when a TEST resolves a vault path under the real ``$HOME``.
 
@@ -465,6 +524,7 @@ class Config:
     codex_home_private: str = ""  # second CODEX_HOME ("" = no second Codex card)
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
+    subscription_ends: list[str] = field(default_factory=list)  # "card=YYYY-MM-DD|auto"
     job_account: str = ""  # "" = default account, a label = pin, "auto" = burn-rate routing
     usage_card_private: bool = True
     usage_card_work: bool = True

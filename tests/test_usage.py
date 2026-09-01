@@ -9,7 +9,7 @@ import os
 import subprocess
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
@@ -1640,11 +1640,14 @@ def _write_codex_auth(
     *,
     email: str | None = "alice.example@example.com",
     auth_mode: str | None = "chatgpt",
+    active_until: str | None = None,
 ) -> None:
     """Write a fabricated ``$CODEX_HOME/auth.json`` (never the developer's real one)."""
     claims: dict[str, object] = {"sub": "user-0123"}
     if email is not None:
         claims["email"] = email
+    if active_until is not None:
+        claims["https://api.openai.com/auth"] = {"chatgpt_subscription_active_until": active_until}
     payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     data: dict[str, object] = {
         "OPENAI_API_KEY": None,
@@ -1729,6 +1732,135 @@ def test_codex_account_email_reads_the_id_token_jwt(tmp_path: Path) -> None:
     assert usage.codex_account_email(tmp_path / "absent") is None
     assert usage.codex_card_title(tmp_path / "absent", "t5") == "Codex / t5"
     assert usage.codex_card_title(None, "t5") == "Codex / t5"
+
+
+def test_abbrev_domain_gives_up_only_what_the_budget_demands() -> None:
+    """The domain shrinks to its budget and no further; the TLD tail always survives."""
+    assert usage.abbrev_domain("datascience.example", 19) == "datascience.example"  # already fits
+    assert usage.abbrev_domain("datascience.example", 18) == "datascience.exa…le"  # 1 over
+    assert usage.abbrev_domain("datascience.example", 13) == "datascienc…le"
+    assert usage.abbrev_domain("example.com", 5) == "ex…om"  # the floor: two head characters
+    assert usage.abbrev_domain("example.com", 1) == "ex…om"  # never tighter, card grows instead
+    assert usage.abbrev_email("openai.account@example.org", domain_budget=6) == "openai…@exa…rg"
+    assert usage.abbrev_email("openai.account@example.org") == "openai…@example.org"
+
+
+def test_codex_card_title_squeezes_the_domain_only_on_overflow(tmp_path: Path) -> None:
+    """The domain survives whole until the ``-> D.M`` suffix pushes the title over budget.
+
+    The domain is what tells two Codex cards apart, so it is the LAST thing given up —
+    and only to keep the card at its 38-column CSS min-width (32 cells of title).
+    """
+    short = tmp_path / "codex-short"
+    _write_codex_auth(short, email="alice.example@ex.com")
+    # 25 cells with no date and 33 with one, so the domain survives only in the first.
+    assert usage.codex_card_title(short, "t5") == "Codex alice…@ex.com / t5"
+    assert usage.codex_card_title(short, "t5", " -> 18.9") == "Codex alice…@ex.com / t5 -> 18.9"
+    assert usage.cell_len("Codex alice…@ex.com / t5") <= usage._CARD_TITLE_BUDGET
+    # A long domain overflows on its own — and gives up exactly the overflow, no more,
+    # so a date costing eight more cells eats further into the SAME domain.
+    home = tmp_path / "codex"
+    _write_codex_auth(home, email="openai.account@datascience.example")
+    assert usage.codex_card_title(home, "t3") == "Codex openai…@datascienc…le / t3"
+    assert usage.codex_card_title(home, "t3", " -> 30.9") == ("Codex openai…@da…le / t3 -> 30.9")
+    for title in (
+        usage.codex_card_title(home, "t3"),
+        usage.codex_card_title(home, "t3", " -> 30.9"),
+    ):
+        assert usage.cell_len(title) <= usage._CARD_TITLE_BUDGET
+    # No account at all: the suffix still lands on the degraded title.
+    assert usage.codex_card_title(None, "t5", " -> 18.9") == "Codex / t5 -> 18.9"
+
+
+def test_next_anniversary_derives_the_monthly_billing_day() -> None:
+    """The renewal day is the created day-of-month, at or after today, clamped short months."""
+    created = "2025-09-18T09:53:15.392387Z"
+    # Before this month's 18th → this month's 18th; on it → today; after → next month's.
+    assert usage.next_anniversary(created, date(2026, 9, 1)) == date(2026, 9, 18)
+    assert usage.next_anniversary(created, date(2026, 9, 18)) == date(2026, 9, 18)
+    assert usage.next_anniversary(created, date(2026, 9, 19)) == date(2026, 10, 18)
+    # December rolls the YEAR over, not just the month.
+    assert usage.next_anniversary(created, date(2026, 12, 19)) == date(2027, 1, 18)
+    # A 31st subscription clamps to the last day a short month actually has.
+    assert usage.next_anniversary("2025-01-31T00:00:00Z", date(2026, 2, 1)) == date(2026, 2, 28)
+    assert usage.next_anniversary("not-a-date", date(2026, 9, 1)) is None
+    assert usage.next_anniversary("", date(2026, 9, 1)) is None
+
+
+def test_format_end_date_is_swiss_and_flags_a_lapsed_date() -> None:
+    """``D.M`` with no padding; a date already past earns a ``!`` so a pinned one can't rot."""
+    assert usage.format_end_date(date(2026, 9, 30), date(2026, 9, 1)) == "30.9"
+    assert usage.format_end_date(date(2026, 9, 1), date(2026, 9, 1)) == "1.9"  # today: not past
+    assert usage.format_end_date(date(2026, 8, 30), date(2026, 9, 1)) == "30.8!"
+
+
+def test_subscription_suffix_pins_derives_and_stays_silent(tmp_path: Path) -> None:
+    """A pinned date wins, ``auto`` derives, and anything unresolvable renders nothing."""
+    today = date(2026, 9, 1)
+    home = tmp_path / "codex"
+    _write_codex_auth(home, active_until="2026-11-21T09:10:48+00:00")
+
+    pinned = {"codex_private": "2026-09-30"}
+    assert usage.subscription_suffix("codex_private", pinned, home, today) == " -> 30.9"
+    # A card with no entry costs nothing — the default for all four.
+    assert usage.subscription_suffix("codex", pinned, home, today) == ""
+    assert usage.subscription_suffix("codex", {}, home, today) == ""
+    # `auto` on a Codex card reads the id_token's own subscription claim.
+    assert usage.subscription_suffix("codex", {"codex": "auto"}, home, today) == " -> 21.11"
+    # …and yields nothing when the claim (or the whole login) is absent, never a guess.
+    bare = tmp_path / "codex-bare"
+    _write_codex_auth(bare)
+    assert usage.subscription_suffix("codex", {"codex": "auto"}, bare, today) == ""
+    assert usage.subscription_suffix("codex", {"codex": "auto"}, None, today) == ""
+
+
+def test_subscription_suffix_auto_derives_the_claude_card_from_the_cached_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``claude_private=auto`` reads the cached profile; an empty cache shows no date."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    usage._profile_cache.clear()
+    today = date(2026, 9, 1)
+    auto = {"claude_private": "auto"}
+    # Nothing cached yet (no fetch has run) ⇒ silence, not a fabricated date.
+    assert usage.subscription_suffix("claude_private", auto, None, today) == ""
+    path = usage._profile_path("private")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"subscription_created_at": "2025-09-18T09:53:15Z", "fetched_at": 1}),
+        encoding="utf-8",
+    )
+    assert usage.subscription_suffix("claude_private", auto, None, today) == " -> 18.9"
+
+
+def test_claude_profile_fetch_caches_the_subscription_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The profile endpoint's ``subscription_created_at`` is cached, and gates on staleness."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    usage._profile_cache.clear()
+    monkeypatch.setattr(usage, "_keychain_oauth_token", lambda account: "token-xyz")
+    body = json.dumps(
+        {
+            "account": {"email": "someone@example.org"},
+            "organization": {
+                "subscription_status": "active",
+                "subscription_created_at": "2025-09-18T09:53:15.392387Z",
+            },
+        }
+    ).encode()
+    monkeypatch.setattr(usage.urllib.request, "urlopen", lambda *a, **k: _FakeOAuthResp(body))
+
+    assert usage.claude_profile_stale("private", now=1_000_000) is True
+    assert usage.fetch_claude_profile("private", now=1_000_000) == "2025-09-18T09:53:15.392387Z"
+    assert usage.read_subscription_created_at("private") == "2025-09-18T09:53:15.392387Z"
+    # Cached: fresh within a day, stale again after one.
+    assert usage.claude_profile_stale("private", now=1_000_000 + 3600) is False
+    assert usage.claude_profile_stale("private", now=1_000_000 + 90_000) is True
+    # No token ⇒ no call, no write, no crash — the cache simply keeps its last answer.
+    monkeypatch.setattr(usage, "_keychain_oauth_token", lambda account: None)
+    assert usage.fetch_claude_profile("private", now=2_000_000) == ""
+    assert usage.read_subscription_created_at("private") == "2025-09-18T09:53:15.392387Z"
 
 
 def test_codex_account_email_falls_back_to_the_live_snapshot(tmp_path: Path) -> None:

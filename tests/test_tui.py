@@ -13,7 +13,7 @@ import pytest
 from rich.text import Text
 from textual.widgets import Label, ListView
 
-from command_center import accounts
+from command_center import accounts, usage
 from command_center.store import Store
 
 # Generic repo-tree root for the category-grouping fixtures (no personal anchors).
@@ -2600,6 +2600,83 @@ def test_second_codex_card_shows_its_own_account_and_t5_toggles_it(
             assert config.load_config().usage_card_codex_private is False
             assert card.display is True  # collapsed onto its title line, not removed
             assert card.has_class("card-collapsed") is True
+
+    asyncio.run(scenario())
+
+
+def test_subscription_end_dates_reach_every_card_title_uncut(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``subscription_ends`` puts a ``-> D.M`` on the configured cards, and none is clipped.
+
+    The date lives at the very END of the title, which is exactly what Textual drops when
+    a title outgrows its card (``render_border_label`` clips at ``width - 4``). So this
+    asserts the widths too: every card must be wide enough for its own whole title.
+    """
+    import base64
+    import json
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    default_home = tmp_path / "codex"
+    private_home = tmp_path / "codex-private"
+    monkeypatch.setenv("CODEX_HOME", str(default_home))
+    (tmp_path / "command-center").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "command-center" / "config.toml").write_text(
+        f'codex_home_private = "{private_home}"\n'
+        'subscription_ends = ["claude_private=auto", "codex_private=2099-09-30"]\n',
+        encoding="utf-8",
+    )
+    # The Claude card's `auto` date is derived from this cached profile, never fetched.
+    (
+        tmp_path / "command-center" / f"profile-private-{usage._account_hash('private')}.json"
+    ).write_text(
+        json.dumps({"subscription_created_at": "2025-09-18T09:53:15Z", "fetched_at": 1}),
+        encoding="utf-8",
+    )
+    usage._profile_cache.clear()
+    claims = (
+        base64.urlsafe_b64encode(json.dumps({"email": "second.login@example.com"}).encode())
+        .decode()
+        .rstrip("=")
+    )
+    private_home.mkdir(parents=True, exist_ok=True)
+    (private_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": f"header.{claims}.signature",
+                    "access_token": "tok",
+                    "account_id": "acct",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            expected = usage.next_anniversary("2025-09-18T09:53:15Z")
+            assert expected is not None
+            private = app.query_one("#usage")
+            assert str(private.border_title).endswith(
+                f" -> {usage.format_end_date(expected, datetime.now().date())}"
+            )
+            # 38 cells with the domain whole, so it squeezes; the date is never cut.
+            assert str(app.query_one("#usage-codex-private").border_title) == (
+                "Codex second…@ex…om / t5 -> 30.9"
+            )
+            # Cards with no entry stay exactly as they were — no stray arrow.
+            assert " -> " not in str(app.query_one("#usage-codex").border_title)
+            # Nothing is clipped: each card is at least its own title plus the border.
+            for card_id in ("#usage", "#usage-codex", "#usage-codex-private"):
+                card = app.query_one(card_id)
+                title_cells = len(str(card.border_title)) + 6
+                assert card.outer_size.width >= title_cells, card_id
 
     asyncio.run(scenario())
 

@@ -164,6 +164,9 @@ _CARD_TOGGLE_KEYS: dict[str, str] = {
 # Cells a card's top border spends on everything that is not the title itself:
 # ``╭─ `` + title + `` ─╮``. A collapsed card is sized to exactly this + its title.
 _CARD_TITLE_BORDER_CELLS = 6
+# The #usage* cards' CSS min-width, mirrored here because _set_card_expanded has to
+# floor its own computed widths by it. Keep in sync with the CSS rules below.
+_CARD_MIN_WIDTH = 38
 
 # Border-title chord suffixes for the two nixos-overseer cards. The other four cards
 # build their title once in on_mount; these two are REBUILT every render tick (the title
@@ -191,16 +194,26 @@ def _set_card_expanded(panel: Static, expanded: bool, *, visible: bool = True) -
     to CSS (``width: auto``, i.e. the content again). The content itself is re-rendered
     on the next tick either way, so nothing is lost by blanking it.
 
+    An EXPANDED card gets the opposite treatment for the same reason: Textual computes
+    ``width: auto`` from the CONTENT alone and then truncates the border title to what
+    is left (``render_border_label`` clips at ``width - 4``, so 32 cells on a 38-wide
+    card, verified). A title that outgrows its card therefore loses its TAIL — the chord
+    and the subscription date, the two things the title exists to say. So the floor is
+    raised to whatever the title needs; :func:`usage.codex_card_title` has already
+    squeezed the address as far as it will go, making this at most a cell or two.
+
     *visible* is the separate, harder gate for a card that has nothing to say at all (no
     ``work`` account): ``display = False`` removes it outright, title line included.
     """
     panel.display = visible
     panel.set_class(not expanded, "card-collapsed")
+    title_cells = cell_len(str(panel.border_title or "")) + _CARD_TITLE_BORDER_CELLS
     if expanded:
         panel.styles.width = None  # drop the inline pin → back to the CSS `width: auto`
+        panel.styles.min_width = max(_CARD_MIN_WIDTH, title_cells)
         return
     panel.update("")
-    panel.styles.width = cell_len(str(panel.border_title or "")) + _CARD_TITLE_BORDER_CELLS
+    panel.styles.width = title_cells
 
 
 # How long a leader stays pending before its timeout. A leader with a standalone action
@@ -1460,7 +1473,15 @@ _HELP_TOPICS: dict[str, str] = {
         "                           the card shows whichever configured account is\n"
         "                           CURRENTLY logged in as that email, even if a bare\n"
         "                           /login swapped which physical dir holds it. Empty\n"
-        "                           (default) = no hard link, path-based as before.\n\n"
+        "                           (default) = no hard link, path-based as before.\n"
+        "  subscription_ends        when each paid plan renews, so a card can advertise\n"
+        "                           its own cancel-by date, e.g. ['claude_private=auto',\n"
+        "                           'codex_private=2026-09-30'] -> the title gains\n"
+        "                           ' -> 30.9' ('!' = already past). Cards:\n"
+        "                           claude_private/claude_work/codex/codex_private.\n"
+        "                           'auto' derives it (Claude's billing anniversary /\n"
+        "                           the ChatGPT id_token claim, only as fresh as the\n"
+        "                           last `codex login`). Empty (default) = no dates.\n\n"
         "[b]Freshness vs `claude` /usage[/b]\n"
         "  The Claude cards now track `claude`'s own /usage: `ccc claude-usage` fetches\n"
         "  each account's OAuth /usage endpoint (the daemon + a detached TUI spawn, both\n"
@@ -2150,15 +2171,10 @@ class CommandCenterApp(App[None]):
         # surfaces read as the same convention; the Copilot card names the model it
         # delegates to (the `copilot_model` config). Each title ends with its
         # show/hide chord (" / t1" …) so the toggle is discoverable on the card
-        # itself; keys come from commands.by_action, never hard-coded here.
-        self.query_one("#usage", Static).border_title = (
-            f"Claude (private) {accounts.card_glyph('private')}"
-            f" / {commands.by_action('toggle_card_private').key}"
-        )
-        self.query_one("#usage-work", Static).border_title = (
-            f"Claude (work) {accounts.card_glyph('work')}"
-            f" / {commands.by_action('toggle_card_work').key}"
-        )
+        # itself; keys come from commands.by_action, never hard-coded here. The Claude
+        # and Codex titles are then REBUILT on every render tick (an account or a
+        # subscription date can move under a running TUI); the Copilot one cannot move.
+        self._set_claude_card_titles()
         self._set_codex_card_titles()
         self.query_one("#usage-copilot", Static).border_title = (
             f"{self.cfg.copilot_card_title} {self.cfg.copilot_model}"
@@ -2436,6 +2452,10 @@ class CommandCenterApp(App[None]):
             )
         # Both Codex titles carry their account's e-mail, and a `codex login` can swap
         # it, so they are rebuilt every tick — the lookup is mtime-cached, hence cheap.
+        # All four titles can also carry a subscription-end date that rolls at midnight
+        # (or lands when an out-of-band profile fetch returns), so the Claude pair is
+        # rebuilt here too.
+        self._set_claude_card_titles()
         self._set_codex_card_titles()
         copilot_panel.update(usage.render_copilot_usage(usage.read_copilot_usage()))
         # The two nixos-overseer cards read an EXTERNAL sqlite DB read-only; each read is
@@ -4104,6 +4124,36 @@ class CommandCenterApp(App[None]):
         """
         return self._codex_private_home() is not None
 
+    def _subscription_ends(self) -> dict[str, str]:
+        """Card → its configured subscription end (``subscription_ends``); ``{}`` by default.
+
+        Parsed off the already-loaded ``self.cfg`` on each render tick — four entries of
+        pure string work, no file read — so a config edit lands without a restart.
+        """
+        return config.parse_subscription_ends(self.cfg.subscription_ends)
+
+    def _set_claude_card_titles(self) -> None:
+        """(Re)build both Claude cards' border titles.
+
+        Rebuilt every tick rather than pinned once in ``on_mount`` because the optional
+        subscription-end suffix moves under a running TUI: an ``auto`` date rolls to the
+        next anniversary at midnight, and its underlying profile fetch lands out-of-band
+        minutes after launch.
+        """
+        ends = self._subscription_ends()
+        for card_id, label, action, card in (
+            ("#usage", "private", "toggle_card_private", "claude_private"),
+            ("#usage-work", "work", "toggle_card_work", "claude_work"),
+        ):
+            try:
+                panel = self.query_one(card_id, Static)
+            except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                continue
+            panel.border_title = (
+                f"Claude ({label}) {accounts.card_glyph(label)}"
+                f" / {commands.by_action(action).key}{usage.subscription_suffix(card, ends)}"
+            )
+
     def _set_codex_card_titles(self) -> None:
         """(Re)build both Codex cards' border titles — each names its own ChatGPT account.
 
@@ -4113,15 +4163,25 @@ class CommandCenterApp(App[None]):
         enough to re-run on every render tick — which it must be, since a `codex login`
         can change the account under a running TUI.
         """
-        for card_id, home, action in (
-            ("#usage-codex", config.codex_home(), "toggle_card_codex"),
-            ("#usage-codex-private", self._codex_private_home(), "toggle_card_codex_private"),
+        ends = self._subscription_ends()
+        for card_id, home, action, card in (
+            ("#usage-codex", config.codex_home(), "toggle_card_codex", "codex"),
+            (
+                "#usage-codex-private",
+                self._codex_private_home(),
+                "toggle_card_codex_private",
+                "codex_private",
+            ),
         ):
             try:
                 panel = self.query_one(card_id, Static)
             except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
                 continue
-            panel.border_title = usage.codex_card_title(home, commands.by_action(action).key)
+            panel.border_title = usage.codex_card_title(
+                home,
+                commands.by_action(action).key,
+                usage.subscription_suffix(card, ends, home),
+            )
 
     def _toggle_usage_card(
         self, key: str, label: str, *, also: str | None = None, announce: bool = True
