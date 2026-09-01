@@ -407,6 +407,12 @@ class Session:
     # (/codex-implement-task-and-claude-review, Codex implements via patch, Claude verifies),
     # 'codex-write' (Codex edits files directly).
     job_type: str = "claude"
+    # Hard opt-out from every Codex integration for THIS session: when set, ccc exports
+    # CCC_NO_CODEX=1 into the launch/resume env, so the session's own hooks never fire a
+    # codex-debate / plan-gate round and no work is offloaded to the Codex seat. Mutually
+    # exclusive with a 'codex'/'codex-write' job_type (a job that IS codex work cannot ban
+    # codex) — refused at the domain boundary and again at launch.
+    no_codex: bool = False
     # Which models a future job runs on. The session runs ON the overseer's model
     # (`claude --model LLM_MODEL_IDS[llm_overseer]`); when llm_exec differs, the launch
     # prompt tells the overseer to delegate implementation to Agent-tool subagents on the
@@ -420,6 +426,10 @@ class Session:
     # flag-or-settings-default) and cli.cmd_statusline. "" until observed.
     model: str = ""
     effort: str = ""
+    # Caller-supplied create-or-retrieve key (``ccc new-job -K``); None = none. UNIQUE
+    # across rows via a partial index, so one key names exactly one job — how a retrying
+    # automation re-finds the job it already registered instead of making a second one.
+    idempotency_key: str | None = None
     # Future-job file mirror (see future_files.py / futuresync.py): the vault-relative
     # path of the draft's markdown file, the sha256 at last sync (echo suppression), when
     # it last synced, and when its file first went missing (0 = present; starts the grace).
@@ -453,6 +463,22 @@ CODEX_WORKFLOW_BADGE = "OAI"
 # source: the TUI paints it across cols 0-2 (``|`` + ``--`` + ``>``); ``ccc ls`` prefixes a
 # hoisted row's line with it; the detail pane shows it before the /depends-on value.
 DEP_MARKER = "|-->"
+
+
+def no_codex_conflict(job_type: str, no_codex: bool) -> str:
+    """The reason ``no_codex`` may not be combined with *job_type*, or ``""``.
+
+    The ONE domain rule behind the ``ccc new-job`` refusal, the job-file import
+    validation and the launch guard: a ``codex``/``codex-write`` job IS Codex work, so
+    banning Codex for it would produce a job that can never do what it says. Refused at
+    every write boundary rather than silently dropping one of the two settings.
+    """
+    if no_codex and job_type in CODEX_WORKFLOW_JOB_TYPES:
+        return (
+            f"no_codex cannot be combined with job type {job_type!r} — that job type runs "
+            "the Codex workflow, so banning Codex would make it unrunnable"
+        )
+    return ""
 
 
 def job_launch_prefix(job_type: str) -> str:

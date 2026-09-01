@@ -412,18 +412,22 @@ def focus_tmux_window(session_id: str) -> bool:
         return False
 
 
-def resume_in_new_tab(cwd: str, session_id: str, config_dir: str = "") -> bool:
+def resume_in_new_tab(
+    cwd: str, session_id: str, config_dir: str = "", *, no_codex: bool = False
+) -> bool:
     """Open a new terminal tab (or tmux window) in *cwd* running ``claude --resume <id>``.
 
-    *config_dir* pins the Claude account: the returned command string is prefixed with
-    :func:`command_center.accounts.launch_env_prefix`, so the resume bills the session's
-    OWN account (the default account unsets ``CLAUDE_CONFIG_DIR``; any other sets it) —
-    a fresh tab's ambient env can never silently bill the wrong account.
+    *config_dir* pins the Claude account and *no_codex* carries the session's Codex
+    opt-out: the returned command string is prefixed with
+    :func:`command_center.accounts.session_launch_env_prefix`, so the resume bills the
+    session's OWN account (the default account unsets ``CLAUDE_CONFIG_DIR``; any other
+    sets it) and inherits ``CCC_NO_CODEX=1`` when the row demands it — a fresh tab's
+    ambient env can never silently bill the wrong account or re-enable Codex.
     """
-    from .accounts import ensure_trusted, launch_env_prefix
+    from .accounts import LaunchTarget, ensure_trusted, session_launch_env_prefix
 
     ensure_trusted(config_dir, cwd)  # the tab's claude must not park on the trust dialog
-    prefix = launch_env_prefix(config_dir)
+    prefix = session_launch_env_prefix(LaunchTarget(config_dir, no_codex))
     if _launcher_mode() == "tmux":
         return _tmux_window(f"{prefix}claude --resume {shlex.quote(session_id)}", cwd=cwd)
     command = f"{prefix}cd {shlex.quote(cwd)} && claude --resume {shlex.quote(session_id)}"
@@ -431,7 +435,7 @@ def resume_in_new_tab(cwd: str, session_id: str, config_dir: str = "") -> bool:
 
 
 def resume_halted_in_new_tab(
-    cwd: str, session_id: str, script_path: str, config_dir: str = ""
+    cwd: str, session_id: str, script_path: str, config_dir: str = "", *, no_codex: bool = False
 ) -> bool:
     """Open a new terminal tab that resumes a rate-limit-halted session.
 
@@ -449,12 +453,12 @@ def resume_halted_in_new_tab(
     """
     import os
 
-    from .accounts import ensure_trusted, launch_env_prefix
+    from .accounts import LaunchTarget, ensure_trusted, session_launch_env_prefix
 
     if not cwd or not os.path.isdir(cwd) or not script_path:
         return False
     ensure_trusted(config_dir, cwd)
-    prefix = launch_env_prefix(config_dir)
+    prefix = session_launch_env_prefix(LaunchTarget(config_dir, no_codex))
     if _launcher_mode() == "tmux":
         return _tmux_window(
             f"{prefix}{shlex.quote(script_path)} {shlex.quote(session_id)} now", cwd=cwd

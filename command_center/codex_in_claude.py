@@ -36,6 +36,13 @@ Claude Code's slash-command help never drifts from the config.
   0 ok | 2 usage | 3 invalid-model | 4 codex-missing-or-auth | 5 timeout-or-stall |
   6 codex-nonzero | 7 bad-patch (reserved) | 8 quota-exhausted (skipped, see below).
 
+Launch policy: every ``codex exec`` line is assembled by
+:mod:`command_center.codex_launch` — the named ``hardened-ro``/``hardened-rw`` permission
+profile (NEVER ``-s/--sandbox``, which forces the legacy sandbox and drops the profile's deny
+rules), a validated absolute ``-C`` root (``$HOME`` and its ancestors refused; an implicit cwd
+only inside a git work tree), and a 0600 session journal that ``--resume`` re-validates against.
+A refused launch exits ``EX_USAGE`` (2) with the reason.
+
 Supervision: ``codex exec`` runs in its own process group and the WHOLE tree is killed on
 wall timeout, idle stall, or parent SIGTERM/SIGINT — a killed delegate can never leave
 codex editing the workspace behind the caller's back. The wall timeout defaults by effort
@@ -95,6 +102,8 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, TextIO
+
+from . import codex_launch
 
 DEFAULT_MODEL = "gpt-5.6-sol"  # newest/best per the Codex catalog
 COMMANDS = ("delegate-review", "debate")  # codex-related commands this manager governs
@@ -1839,7 +1848,26 @@ def cmd_delegate(args: argparse.Namespace) -> int:
             return EX_QUOTA
 
     write = args.write and not args.scout  # scouting is always read-only (plan, no edits)
-    sandbox = "workspace-write" if write else "read-only"
+    resume = getattr(args, "resume", None)
+    # ONE launch policy for every `codex exec` (see command_center.codex_launch): the
+    # binary, the validated `-C` root, and the NAMED permission profile. Never `-s`/
+    # `--sandbox` — that forces Codex's legacy sandbox and silently drops the profile's
+    # deny rules (credential stores, workspace .env/*.pem, the network block).
+    try:
+        codex_bin = codex_launch.resolve_codex()
+        resume_record = codex_launch.resolve_resume(str(resume), write=write) if resume else None
+        workdir = codex_launch.resolve_workdir(
+            resume_record.resolved_cwd if resume_record is not None else args.cwd,
+            write=write,
+        )
+        perm_args = codex_launch.permission_args(write)
+    except codex_launch.CodexMissing as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EX_NO_CODEX
+    except codex_launch.CodexLaunchError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EX_USAGE
+    run_cwd = str(workdir)
     wall_timeout = _effective_timeout(args.timeout, shown_effort)
     idle_flag = getattr(args, "idle_timeout", None)
     if idle_flag is not None:
@@ -1848,11 +1876,10 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         idle_timeout = min(DEFAULT_IDLE_TIMEOUT, wall_timeout)
     else:
         idle_timeout = DEFAULT_IDLE_TIMEOUT  # unlimited wall still guards stalls
-    resume = getattr(args, "resume", None)
     repo_map = (
         None
         if (resume or getattr(args, "no_repo_map", False))
-        else _repo_map(args.cwd, explicit=getattr(args, "repo_map", None))
+        else _repo_map(run_cwd, explicit=getattr(args, "repo_map", None))
     )
     # Advisory only: pointered tasks rarely need xhigh's exploration depth.
     if (
@@ -1882,18 +1909,18 @@ def cmd_delegate(args: argparse.Namespace) -> int:
 
     with tempfile.NamedTemporaryFile("r", suffix=".txt", delete=False) as handle:
         out_path = handle.name
-    if resume:
-        # Resume a prior round's session: codex re-attaches with its discovered
-        # context intact. Sandbox and workdir are inherited from that session
-        # (`codex exec resume` has no -s/-C flags).
-        target = ["--last"] if resume == "last" else [resume]
-        cmd = ["codex", "exec", "resume", *target, "--skip-git-repo-check", "-o", out_path]
-        cmd += ["-m", model]
+    if resume_record is not None:
+        # Resume a prior round's session: codex re-attaches with its discovered context
+        # intact. `codex exec resume` has no -C, so the workspace root is INHERITED from
+        # the original session — which is exactly why resolve_resume re-validated the
+        # journalled root (and the read/write mode) before we got here. `last` was
+        # already resolved to a concrete id, so the resumed session is unambiguous.
+        cmd = [codex_bin, "exec", "resume", resume_record.session_id, "-o", out_path]
+        cmd += [*perm_args, "-m", model]
     else:
-        cmd = ["codex", "exec", "-s", sandbox, "--skip-git-repo-check", "-o", out_path]
-        cmd += ["-m", model]
-        if args.cwd:
-            cmd += ["-C", args.cwd]
+        cmd = [codex_bin, "exec", *perm_args, "-o", out_path, "-m", model, "-C", run_cwd]
+    if workdir.skip_git_check:
+        cmd.append("--skip-git-repo-check")  # only where the root really is not a repo
     if effort:
         cmd += ["-c", f"model_reasoning_effort={effort}"]
     cmd.append(prompt)
@@ -1913,7 +1940,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:
     heartbeat_meta = {
         "model": model,
         "effort": shown_effort,
-        "repo": args.cwd or os.getcwd(),
+        "repo": run_cwd,
         "write": write,
     }
     purpose = getattr(args, "purpose", "delegate")
@@ -1921,7 +1948,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         # Take one concurrency slot before launching codex; the rest of a fan-out waits.
         with _concurrency_slot(_max_concurrent(args.max_concurrent)):
             # When Codex may write, snapshot the worktree so the caller reviews ONLY its diff.
-            before = _git_status(args.cwd) if write else None
+            before = _git_status(run_cwd) if write else None
             cost_before = codex_cost_snapshot()
             try:
                 try:
@@ -1982,9 +2009,13 @@ def cmd_delegate(args: argparse.Namespace) -> int:
     print(reply or proc.stdout.strip())
     session = _session_id_of(proc.stderr or "")
     if session:
+        # Journal the launch (CODEX_HOME/ccc-sessions.jsonl, 0600) BEFORE reporting it:
+        # `--resume <id>` is only honoured for sessions this policy actually started, and
+        # it re-checks the recorded root + read/write mode against today's rules.
+        codex_launch.record_launch(session, workdir, write=write)
         print(f"\n### SESSION\n{session}")
     if write:
-        after = _git_status(args.cwd)
+        after = _git_status(run_cwd)
         changed = sorted(set(after) - set(before or []))
         if changed:
             print("\n### CODEX-WROTE (review this diff)\n" + "\n".join(changed))
@@ -2098,7 +2129,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_del = sub.add_parser("delegate", help="run one Codex round (prints model first)")
     p_del.add_argument("prompt", help="the task for Codex")
     p_del.add_argument(
-        "-w", "--write", action="store_true", help="let Codex edit files (workspace-write)"
+        "-w",
+        "--write",
+        action="store_true",
+        help="let Codex edit files (the hardened-rw permission profile; refused when the "
+        "active CODEX_HOME config.toml does not define one)",
     )
     p_del.add_argument(
         "-S",
@@ -2106,7 +2141,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="read-only plan only (no diff) — for a pre-implementation scout round",
     )
-    p_del.add_argument("-C", "--cwd", default=None, help="repo dir Codex works in (codex -C)")
+    p_del.add_argument(
+        "-C",
+        "--cwd",
+        default=None,
+        help="repo dir Codex works in (codex -C). Refused for $HOME or any dir above it; "
+        "omit it only inside a git work tree",
+    )
     p_del.add_argument("-r", "--round", type=int, default=1, help="loop round (1-based)")
     p_del.add_argument(
         "-f", "--feedback", default=None, help="Claude's review feedback for a revision round"
@@ -2151,7 +2192,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SESSION",
         help="resume a previous round's codex session (UUID from the ### SESSION line, "
-        "or 'last') — keeps its discovered context; sandbox/cwd inherit from that session",
+        "or 'last') — keeps its discovered context; permissions/cwd inherit from that "
+        "session, so only ccc-launched sessions with a matching read/write mode are allowed",
     )
     p_del.add_argument(
         "-M",

@@ -88,6 +88,41 @@ It flags any action still billing the OpenAI Codex seat, which is reserved for
 `/codex-debate` (`short_aim_backend = "codex"` used to spend ~17.6k Codex tokens per ten-word
 label). See the multi-account section of [docs/reference.md](docs/reference.md).
 
+## The codex launch policy (do not regress)
+
+`command_center/codex_launch.py` is the ONE place a `codex exec` command line is built —
+`codex_in_claude.cmd_delegate` and `llm.run_codex` both go through it, and nothing else may
+assemble codex argv. Three invariants:
+
+1. **Never emit `-s`/`--sandbox`.** Codex ≥ 0.150 uses NAMED permission profiles
+   (`-c default_permissions="hardened-ro"` / `…="hardened-rw"`); the legacy flag overrides the
+   profile and drops its deny rules (credential stores, workspace `.env`/`*.pem`, no network).
+   A write round is emitted ONLY when the active `$CODEX_HOME/config.toml` really declares
+   `[permissions.hardened-rw]` — else refuse (exit 2), never degrade to `workspace-write`.
+2. **`-C` is always explicit and validated** by `resolve_workdir`: `$HOME` and any ancestor of
+   `$HOME` are refused; an IMPLICIT cwd is accepted only inside a git work tree; an EXPLICIT
+   non-git dir is accepted and is the only case that adds `--skip-git-repo-check`.
+3. **`--resume` goes through the journal** `$CODEX_HOME/ccc-sessions.jsonl` (0600, one line per
+   launch). `codex exec resume` inherits the old session's permissions and root while `--write`
+   is recomputed from the new CLI, so a resume is honoured only when the session is journalled
+   on this seat, the mode matches, and the recorded root still passes `resolve_workdir`.
+
+Refusals raise `CodexLaunchError` → exit 2 at the CLI boundary (`CodexMissing` → exit 4). Tests:
+`tests/test_codex_launch.py`. The profile TOML lives in the user's `config.toml`, documented in
+[docs/reference.md](docs/reference.md) § "Codex launch policy".
+
+## The `no_codex` job flag (do not regress)
+
+`no_codex` on a session row is a promise that NOTHING in that session reaches the Codex seat.
+`accounts.session_launch_env` (+ `session_apply_to_environ` / `session_launch_env_prefix`) is the
+single place that renders it as `CCC_NO_CODEX=1`; **every** ccc-owned launch/resume surface must
+use one of the three — `start-job`, `resume`, `resume-job`, the TUI `r` + undo-close, `jump`,
+`fire-attached`, the halted-session auto-resume, and snapshot restore. A surface that calls the
+bare `accounts.launch_env*` functions silently drops the flag; `tests/test_no_codex.py`
+enumerates them. The flag is never *cleared* — an ambient `CCC_NO_CODEX` is preserved. It is
+mutually exclusive with a `codex`/`codex-write` job type (`models.no_codex_conflict`), refused at
+creation AND again at launch.
+
 ## Launching jobs: always a tab (do not regress)
 
 **Agents: never run `ccc start-job` from a background/piped shell — use `ccc open-job <id>`.**

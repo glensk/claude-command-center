@@ -18,6 +18,12 @@ Two renderings of the same rule:
 * :func:`launch_env` — a child-process env ``dict`` for ``Popen(env=)`` / ``execvpe``.
 * :func:`launch_env_prefix` — a POSIX-shell snippet for the command *strings* the
   iTerm / tmux launchers build (there is no ``env=`` to pass there).
+
+Per-SESSION launch policy (the account pin plus everything else a specific session's
+row demands, currently ``CCC_NO_CODEX``) lives in :func:`session_launch_env` and its two
+siblings :func:`session_apply_to_environ` / :func:`session_launch_env_prefix`. Every
+ccc-owned launch/resume surface must go through one of those three — a surface that
+calls the bare account functions silently drops the session's own flags.
 """
 
 from __future__ import annotations
@@ -36,8 +42,9 @@ import json
 import os
 import shlex
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from . import config
 
@@ -472,6 +479,75 @@ def launch_env_prefix(config_dir: str) -> str:
         return f"unset {_SECURE_VAR} {_CONFIG_VAR}; "
     quoted = shlex.quote(_export_value(config_dir))
     return f"unset {_SECURE_VAR}; export {_CONFIG_VAR}={quoted}; "
+
+
+# --------------------------------------------------------------------------- #
+# Per-session launch policy (account pin + the session's own env flags)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class LaunchTarget:
+    """A minimal :class:`SessionLaunch` for surfaces that only carry the two values.
+
+    ``terminal``/``snapshot`` build their command STRINGS from loose arguments rather than
+    a full session row; this keeps them on the same policy without widening their APIs.
+    """
+
+    config_dir: str = ""
+    no_codex: bool = False
+
+
+class SessionLaunch(Protocol):
+    """The two fields a launch surface needs off a session row (structural).
+
+    A :class:`command_center.models.Session` satisfies it, and so does any small stand-in
+    (``snapshot.SnapPane``, :class:`LaunchTarget`) — the helpers below never need the whole
+    row. Read-only members on purpose: a frozen dataclass must satisfy it too.
+    """
+
+    @property
+    def config_dir(self) -> str:
+        """Absolute config dir of the Claude account this launch bills to ("" = unknown)."""
+
+    @property
+    def no_codex(self) -> bool:
+        """Whether this launch must ban every Codex integration."""
+
+
+def session_env_flags(session: SessionLaunch) -> dict[str, str]:
+    """The NON-account env a session's launch must carry (the single source of that list).
+
+    Today exactly one entry: ``CCC_NO_CODEX=1`` when the row's ``no_codex`` flag is set,
+    which is the kill switch every Codex integration honours (plan-gate debates, the
+    optional-offload hook, ``codex-in-claude``). It is only ever ADDED — an ambient
+    ``CCC_NO_CODEX`` from the parent shell is left exactly as it was, so a session
+    launched from inside a no-codex shell keeps that inheritance.
+    """
+    return {"CCC_NO_CODEX": "1"} if getattr(session, "no_codex", False) else {}
+
+
+def session_launch_env(
+    session: SessionLaunch, base: dict[str, str] | None = None
+) -> dict[str, str]:
+    """Child env for launching/resuming *session*: the account pin plus its own flags."""
+    env = launch_env(session.config_dir, base)
+    env.update(session_env_flags(session))
+    return env
+
+
+def session_apply_to_environ(session: SessionLaunch) -> None:
+    """The :func:`apply_to_environ` rendering: pin IN PLACE for an ``os.execvp``."""
+    apply_to_environ(session.config_dir)
+    os.environ.update(session_env_flags(session))
+
+
+def session_launch_env_prefix(session: SessionLaunch) -> str:
+    """The :func:`launch_env_prefix` rendering: a POSIX-shell snippet for a command string."""
+    prefix = launch_env_prefix(session.config_dir)
+    exports = "".join(
+        f"export {name}={shlex.quote(value)}; "
+        for name, value in sorted(session_env_flags(session).items())
+    )
+    return prefix + exports
 
 
 def env_config_dir() -> str:

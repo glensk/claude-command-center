@@ -166,6 +166,10 @@ class ParsedJob:  # pylint: disable=too-many-instance-attributes
     # Emitted only when non-empty (byte-stable for existing files); an unknown-but-
     # well-formed UUID is allowed (registration order must not matter — dangling degrades).
     depends_on: str = ""
+    # Ban every Codex integration for the launched session (``CCC_NO_CODEX=1``).
+    # A bare-bool frontmatter key, emitted ONLY when true so every existing job file
+    # stays byte-identical; refused together with a codex/codex-write job type.
+    no_codex: bool = False
     # ISO date the job was moved to the delete/ trash ("" = not deleted).
     deleted: str = ""
     # Claude account LABEL the job launches (bills) under ("" = the default account).
@@ -259,6 +263,7 @@ def parse_job_file(text: str) -> ParsedJob:
         deadline=data.get("deadline", ""),
         created=data.get("created", ""),
         deleted=data.get("deleted", ""),
+        no_codex=_truthy(data.get("no_codex", "")),
         account=data.get("account", ""),
         aim=_extract_section(body, _AIM_HEADING),
         prompt=prompt_text or None,
@@ -270,9 +275,14 @@ def parse_job_file(text: str) -> ParsedJob:
     )
 
 
+def _truthy(value: str) -> bool:
+    """Whether a raw boolean-ish frontmatter scalar reads as true."""
+    return value.strip().lower() in {"true", "yes", "1", "on"}
+
+
 def _launch_truthy(value: str) -> bool:
     """Whether a raw ``launch`` frontmatter scalar means "start this job"."""
-    return value.strip().lower() in {"true", "yes", "1", "on"}
+    return _truthy(value)
 
 
 def launch_requested(job: ParsedJob) -> bool:
@@ -323,6 +333,10 @@ def validate(job: ParsedJob, git_base: Path) -> list[str]:
     if job.account.strip() and job.account not in account_labels:
         configured = ", ".join(account_labels)
         errors.append(f"account '{job.account}' is not a configured account label ({configured})")
+    # The no_codex ⇄ codex-job-type rule, same wording as the CLI and the launch guard.
+    conflict = models.no_codex_conflict(job.job_type, job.no_codex)
+    if conflict:
+        errors.append(conflict)
     return errors
 
 
@@ -497,6 +511,7 @@ def serialize(  # pylint: disable=too-many-arguments
     deadline: str = "",
     created: str = "",
     deleted: str = "",
+    no_codex: bool = False,
     account: str = "",
     prompt: str | None = None,
     repo_options: list[str] | None = None,
@@ -534,6 +549,10 @@ def serialize(  # pylint: disable=too-many-arguments
         keys.append(f"depends_on: {_yaml_str(depends_on)}")
     if deleted.strip():
         keys.append(f"deleted: {_yaml_str(deleted)}")
+    # Bare bool (Obsidian renders a checkbox), and emitted ONLY when set so a job file
+    # without the opt-out keeps its exact current bytes.
+    if no_codex:
+        keys.append("no_codex: true")
     # In multi-account mode the label is always emitted (the caller passes the
     # concrete default account's label there, so the Obsidian select always shows a
     # value); on single-account machines it stays "" and no key is written, keeping

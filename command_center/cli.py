@@ -54,6 +54,7 @@ from .models import (
     aim_column_first,
     days_until_start,
     empty_track_tint,
+    no_codex_conflict,
     now_ms,
     parse_iso_date,
     xterm_rgb,
@@ -1170,6 +1171,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         session = store.get(args.session_id)
     config_dir = session.config_dir if session else ""
     cwd = session.cwd if session else ""
+    no_codex = bool(session.no_codex) if session else False
     # The three fail-closed checks (unknown account in multi-account mode, D9 conflict,
     # missing transcript) live in core so `ccc restore-snapshot` refuses identically.
     blockers = core.resume_blockers(args.session_id, cwd, config_dir, _adapter())
@@ -1182,7 +1184,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if not has_terminal():
         from . import terminal
 
-        if terminal.resume_in_new_tab(cwd, args.session_id, config_dir):
+        if terminal.resume_in_new_tab(cwd, args.session_id, config_dir, no_codex=no_codex):
             print(f"no terminal here — resumed {args.session_id} in a new tab instead")
             return 0
         print(
@@ -1193,8 +1195,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
         return 1
     if cwd and os.path.isdir(cwd):
         os.chdir(cwd)
-    # Pin the session's account into os.environ, then exec (D8) — os.execvp inherits it.
-    accounts.apply_to_environ(config_dir)
+    # Pin the session's account AND its own env flags (CCC_NO_CODEX) into os.environ,
+    # then exec (D8) — os.execvp inherits the mutated environment.
+    accounts.session_apply_to_environ(accounts.LaunchTarget(config_dir, no_codex))
     os.execvp("claude", ["claude", "--resume", args.session_id])  # replaces this process
 
 
@@ -1259,10 +1262,10 @@ def cmd_fire_attached(args: argparse.Namespace) -> int:
             return 1
         prompt = (session.prompt or "").strip()
         cwd = session.cwd
-        config_dir = session.config_dir
+        launch = accounts.LaunchTarget(session.config_dir, bool(session.no_codex))
     if cwd and os.path.isdir(cwd):
         os.chdir(cwd)
-    accounts.apply_to_environ(config_dir)
+    accounts.session_apply_to_environ(launch)
     try:
         os.execvp("claude", ["claude", "--resume", args.session_id, prompt])
     except OSError as exc:
@@ -1300,19 +1303,76 @@ def cmd_claim_fire(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_new_job(args: argparse.Namespace) -> int:
+# The machine-readable contract of `ccc new-job --json` / `ccc jobs --json`. Bump only
+# on an incompatible change; additive fields keep version 1 (consumers read by key).
+JSON_SCHEMA_VERSION = 1
+
+
+def _new_job_json(session: Session, created: bool) -> str:
+    """The single-line ``ccc new-job --json`` document for *session*."""
+    from . import accounts
+
+    return json.dumps(
+        {
+            "version": JSON_SCHEMA_VERSION,
+            "session_id": session.session_id,
+            "created": created,
+            "account": accounts.effective_account_label(session.config_dir or ""),
+            "no_codex": bool(session.no_codex),
+        }
+    )
+
+
+def _idempotency_conflict(existing: Session, cwd: str, aim: str, no_codex: bool) -> str:
+    """Why *existing* is not the job the caller just described, or ``""``.
+
+    A key is a promise that the SAME request maps to the same job; a caller that reuses
+    one for different work has a bug, and silently handing back the old job would hide
+    it. ``aim`` is skipped while the winning creator has not written it yet (the row is
+    claimed, its AIM lands microseconds later — see ``Store.claim_idempotency_key``).
+    """
+    diffs: list[str] = []
+    if os.path.normpath(existing.cwd or "") != os.path.normpath(cwd):
+        diffs.append(f"cwd {existing.cwd!r} != {cwd!r}")
+    if existing.aim is not None and (existing.aim or "").strip() != aim:
+        diffs.append(f"aim {existing.aim!r} != {aim!r}")
+    if bool(existing.no_codex) != no_codex:
+        diffs.append(f"no_codex {bool(existing.no_codex)} != {no_codex}")
+    return "; ".join(diffs)
+
+
+def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
+    args: argparse.Namespace,
+) -> int:
     """Register a FUTURE job — a saved AIM + prompt, launched later with ``ccc start-job``.
 
     The job id is a fresh UUID so the eventual ``claude --session-id <id>`` reuses it and
     the AIM stored here carries over. ``--prompt`` defaults to the AIM when omitted.
     ``--account`` pins the Claude account the job will launch (bill) under.
+    ``-N/--no-codex`` bans every Codex integration in the launched session (refused on a
+    codex job type). ``-K/--idempotency-key`` makes registration create-or-retrieve, so a
+    retrying automation never double-registers; ``-J/--json`` prints one machine-readable
+    line and nothing else.
     """
     import uuid
+
+    as_json = bool(getattr(args, "json", False))
+
+    def say(message: str) -> None:
+        """Human chatter — suppressed entirely in --json mode (stdout is the document)."""
+        if not as_json:
+            print(message)
 
     aim = (args.aim or "").strip()
     if not aim:
         print("error: --aim is required", file=sys.stderr)
         return 1
+    job_type = getattr(args, "job_type", "claude") or "claude"
+    no_codex = bool(getattr(args, "no_codex", False))
+    conflict = no_codex_conflict(job_type, no_codex)
+    if conflict:
+        print(f"error: {conflict}", file=sys.stderr)
+        return 2
     start_date = (getattr(args, "start_date", None) or "").strip() or None
     if start_date and parse_iso_date(start_date) is None:
         print(
@@ -1326,6 +1386,7 @@ def cmd_new_job(args: argparse.Namespace) -> int:
         return 1
     cwd = args.cwd or os.getcwd()
     session_id = str(uuid.uuid4())
+    idempotency_key = (getattr(args, "idempotency_key", None) or "").strip()
     # --at-reset: arm the job to auto-fire when the selected rate-limit window resets.
     # Deterministic (the window's resets_at + buffer, utilization is not an input) and
     # fail-loud: no usable reset time is a registration ERROR, never "fire now".
@@ -1376,7 +1437,33 @@ def cmd_new_job(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
-        store.create_draft(
+        if idempotency_key:
+            # Create-or-retrieve, atomically (one BEGIN IMMEDIATE in the store): concurrent
+            # callers with the same key collapse onto ONE job, and a key reused for a
+            # DIFFERENT job is a caller bug — refuse instead of returning the wrong id.
+            # Claimed HERE, after every pre-flight check has passed, so a rejected
+            # registration never leaves a half-built row owning the key.
+            session_id, created = store.claim_idempotency_key(
+                idempotency_key, session_id, cwd, no_codex=no_codex
+            )
+            if not created:
+                existing = store.get(session_id)
+                assert existing is not None  # the key's owner row always exists
+                mismatch = _idempotency_conflict(existing, cwd, aim, no_codex)
+                if mismatch:
+                    print(
+                        f"error: idempotency key {idempotency_key!r} already names job "
+                        f"{session_id} with different parameters ({mismatch})",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if as_json:
+                    print(_new_job_json(existing, False))
+                else:
+                    print(f"future job already registered: {session_id}  ({existing.cwd})")
+                    print(f"start it with:  ccc start-job {session_id}")
+                return 0
+        session = store.create_draft(
             session_id,
             cwd,
             aim,
@@ -1385,20 +1472,25 @@ def cmd_new_job(args: argparse.Namespace) -> int:
             start_when=getattr(args, "when", None),
             start_date=start_date,
             depends_on=depends_on,
-            job_type=getattr(args, "job_type", "claude") or "claude",
+            job_type=job_type,
+            no_codex=no_codex,
             llm_overseer=getattr(args, "overseer", None) or DEFAULT_LLM,
             llm_exec=getattr(args, "executor", None) or DEFAULT_LLM,
             config_dir=config_dir,
             fire_at=fire_at,
             fire_window=fire_window,
+            idempotency_key=idempotency_key,
         )
-    print(f"future job created: {session_id}  ({cwd})")
-    print(f"start it with:  ccc start-job {session_id}")
+    if as_json:
+        print(_new_job_json(session, True))
+    else:
+        print(f"future job created: {session_id}  ({cwd})")
+        print(f"start it with:  ccc start-job {session_id}")
     cfg = config.load_config()
     if fire_at:
         from . import park, service
 
-        print(f"armed: {park.format_fire(fire_at)} — the daemon dispatches within ~5 min after")
+        say(f"armed: {park.format_fire(fire_at)} — the daemon dispatches within ~5 min after")
         if not service.is_installed(cfg):
             print(
                 "warning: the ccc daemon service is not installed — the job will NOT "
@@ -1702,6 +1794,17 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches
             return 1
         prompt = (session.prompt or session.aim or "").strip()
         job_type = session.job_type or "claude"
+        no_codex = bool(session.no_codex)
+        # Second half of the domain rule (models.no_codex_conflict): a row that got both
+        # settings anyway — a hand-edited DB, or a job file imported by an older ccc —
+        # must not launch a Codex workflow with Codex banned. Refuse BEFORE claim_draft,
+        # so the job survives to be fixed.
+        conflict = no_codex_conflict(job_type, no_codex)
+        if conflict:
+            if getattr(args, "auto", False):
+                store.update_fields(args.session_id, fire_at=0)  # disarm, keep the draft
+            print(f"error: job {args.session_id}: {conflict}", file=sys.stderr)
+            return 1
         overseer = session.llm_overseer if session.llm_overseer in LLM_MODEL_IDS else DEFAULT_LLM
         executor = session.llm_exec if session.llm_exec in LLM_MODEL_IDS else DEFAULT_LLM
         # (decision 14) Resume-aware: check ONLY the exact project dir derived from the
@@ -1759,8 +1862,9 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches
     _spawn_sync_mirrors(cfg)  # (BEFORE execvp: the success path replaces this process)
     # Pin the job's OWN Claude account (D8) into os.environ before exec — the default
     # account unsets CLAUDE_CONFIG_DIR, any other sets it — so an ambient value in this
-    # tab can never bill the wrong seat. os.execvp inherits the mutated environment.
-    accounts.apply_to_environ(config_dir)
+    # tab can never bill the wrong seat — plus its own flags (CCC_NO_CODEX for a
+    # -N/--no-codex job). os.execvp inherits the mutated environment.
+    accounts.session_apply_to_environ(accounts.LaunchTarget(config_dir, no_codex))
     try:
         os.execvp("claude", argv)  # replaces this process on success
     except OSError as exc:  # (d) launch failed — undo the promotion so the job survives
@@ -2120,19 +2224,49 @@ def cmd_open_job(args: argparse.Namespace) -> int:
 
 
 def cmd_jobs(args: argparse.Namespace) -> int:
-    """List registered future jobs (drafts), newest first."""
+    """List registered future jobs (drafts), newest first.
+
+    ``-j/--json`` prints ONE machine-readable document instead (schema
+    :data:`JSON_SCHEMA_VERSION`) — no prompts, no colour, nothing else on stdout — so an
+    automation can enumerate parked work without scraping the human table.
+    """
     from . import accounts, colors, park
     from .models import short_id
 
     multi = accounts.is_multi_account()
     with Store() as store:
         drafts = sorted((s for s in store.list_sessions() if s.draft), key=lambda s: -s.created_at)
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "version": JSON_SCHEMA_VERSION,
+                    "jobs": [
+                        {
+                            "session_id": s.session_id,
+                            "cwd": s.cwd,
+                            "aim": s.aim or "",
+                            "draft": bool(s.draft),
+                            "archived": bool(s.archived),
+                            "created_at": s.created_at,
+                            "account": accounts.account_label(s.config_dir or ""),
+                            "no_codex": bool(s.no_codex),
+                            "idempotency_key": s.idempotency_key or None,
+                        }
+                        for s in drafts
+                    ],
+                }
+            )
+        )
+        return 0
     if not drafts:
         print("no future jobs — create one with `ccc new-job` or the `fn` chord in the TUI")
         return 0
     for session in drafts:
         folder = colors.short_folder(session.cwd)
         tag = "" if session.job_type == "claude" else f"  [{session.job_type}]"
+        if session.no_codex:  # the per-job Codex ban (CCC_NO_CODEX=1 at launch)
+            tag += "  [no-codex]"
         # In multi-account mode, tag a non-default account (e.g. [work]) like the codex tag.
         if multi and not accounts.is_default_config_dir(session.config_dir or ""):
             tag += f"  [{accounts.account_label(session.config_dir or '')}]"
@@ -2520,7 +2654,9 @@ def cmd_resume_job(args: argparse.Namespace) -> int:  # pylint: disable=too-many
             file=sys.stderr,
         )
         return 1
-    if terminal.resume_in_new_tab(session.cwd, args.session_id, session.config_dir):
+    if terminal.resume_in_new_tab(
+        session.cwd, args.session_id, session.config_dir, no_codex=bool(session.no_codex)
+    ):
         print(f"resuming in a new tab: {args.session_id}")
         return 0
     print(
@@ -3759,6 +3895,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Claude account label to launch (bill) under (default: the default account)",
     )
     p_newjob.add_argument(
+        "-N",
+        "--no-codex",
+        action="store_true",
+        help="ban every Codex integration in the launched session (CCC_NO_CODEX=1); "
+        "refused together with -j codex / -j codex-write",
+    )
+    p_newjob.add_argument(
+        "-K",
+        "--idempotency-key",
+        default=None,
+        metavar="KEY",
+        help="create-or-retrieve key: re-running with the same KEY returns the SAME job "
+        "instead of registering a second one (a KEY reused for different cwd/aim/"
+        "--no-codex exits 2)",
+    )
+    p_newjob.add_argument(
+        # -j is --job-type here, so the JSON switch takes the capital (short forms stay unique).
+        "-J",
+        "--json",
+        action="store_true",
+        help="print one machine-readable JSON line (session_id/created/account/no_codex) "
+        "and nothing else",
+    )
+    p_newjob.add_argument(
         "-R",
         "--at-reset",
         action="store_true",
@@ -3902,7 +4062,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_unlaunch.add_argument("session_id")
     p_unlaunch.set_defaults(func=cmd_unlaunch)
 
-    sub.add_parser("jobs", help="list registered future jobs (drafts)").set_defaults(func=cmd_jobs)
+    p_jobs = sub.add_parser("jobs", help="list registered future jobs (drafts)")
+    p_jobs.add_argument(
+        "-j", "--json", action="store_true", help="print the job list as one JSON document"
+    )
+    p_jobs.set_defaults(func=cmd_jobs)
 
     p_jobacct = sub.add_parser(
         "job-account",

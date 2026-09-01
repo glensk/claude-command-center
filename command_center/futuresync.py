@@ -336,6 +336,7 @@ def _serialize_registered(
         status=status,
         repo=repo_label,
         job_type=session.job_type or "claude",  # type: ignore[attr-defined]
+        no_codex=bool(session.no_codex),  # type: ignore[attr-defined]
         llm_overseer=session.llm_overseer or DEFAULT_LLM,  # type: ignore[attr-defined]
         llm_exec=session.llm_exec or DEFAULT_LLM,  # type: ignore[attr-defined]
         start_when=session.start_when or "",  # type: ignore[attr-defined]
@@ -516,6 +517,7 @@ def archive_file(store: Store, cfg: config.Config, session: object, final_status
         job = parse_job_file(text)
         cwd: str = session.cwd  # type: ignore[attr-defined]
         session_jt: str = session.job_type or "claude"  # type: ignore[attr-defined]
+        session_nc: bool = bool(session.no_codex)  # type: ignore[attr-defined]
         session_ov: str = session.llm_overseer or DEFAULT_LLM  # type: ignore[attr-defined]
         session_ex: str = session.llm_exec or DEFAULT_LLM  # type: ignore[attr-defined]
         session_aim: str = session.aim or ""  # type: ignore[attr-defined]
@@ -527,6 +529,7 @@ def archive_file(store: Store, cfg: config.Config, session: object, final_status
                 status=final_status,
                 repo=job.repo or cwd_to_repo(cwd, git_base),
                 job_type=(job.job_type if job.job_type in JOB_TYPES else session_jt),
+                no_codex=job.no_codex or session_nc,
                 llm_overseer=(job.llm_overseer if job.llm_overseer in LLM_CHOICES else session_ov),
                 llm_exec=(job.llm_exec if job.llm_exec in LLM_CHOICES else session_ex),
                 start_when=job.start_when,
@@ -619,6 +622,7 @@ def delete_file(store: Store, cfg: config.Config, session: object) -> Path:
     name = src.name if src is not None and src.exists() else job_filename(session_id, aim)
     dest = _unique_path(directory / name)
     session_jt: str = session.job_type or "claude"  # type: ignore[attr-defined]
+    session_nc: bool = bool(session.no_codex)  # type: ignore[attr-defined]
     session_ov: str = session.llm_overseer or DEFAULT_LLM  # type: ignore[attr-defined]
     session_ex: str = session.llm_exec or DEFAULT_LLM  # type: ignore[attr-defined]
     _atomic_write(
@@ -629,6 +633,7 @@ def delete_file(store: Store, cfg: config.Config, session: object) -> Path:
             status="deleted",
             repo=repo_label,
             job_type=(job.job_type if job and job.job_type in JOB_TYPES else session_jt),
+            no_codex=(job.no_codex if job else False) or session_nc,
             llm_overseer=(
                 job.llm_overseer if job and job.llm_overseer in LLM_CHOICES else session_ov
             ),
@@ -766,6 +771,7 @@ def _register(  # pylint: disable=too-many-arguments,too-many-positional-argumen
         start_date=(job.start_date.strip() or None),
         depends_on=(job.depends_on.strip() or None),
         job_type=job.job_type,
+        no_codex=job.no_codex,
         llm_overseer=job.llm_overseer,
         llm_exec=job.llm_exec,
         # No `account:` in the file ⇒ route this NEW job per the job_account policy.
@@ -827,6 +833,7 @@ def _handle_duplicate(  # pylint: disable=too-many-arguments,too-many-positional
         status=new_status,
         repo=job.repo,
         job_type=(job.job_type if job.job_type in JOB_TYPES else "claude"),
+        no_codex=job.no_codex,
         llm_overseer=(job.llm_overseer if job.llm_overseer in LLM_CHOICES else DEFAULT_LLM),
         llm_exec=(job.llm_exec if job.llm_exec in LLM_CHOICES else DEFAULT_LLM),
         start_when=job.start_when,
@@ -971,6 +978,12 @@ def _import_file_wins(  # pylint: disable=too-many-arguments,too-many-positional
     if new_jobtype != (session.job_type or "claude"):  # type: ignore[attr-defined]
         store.update_fields(session_id, job_type=new_jobtype)
         changed.append("job_type")
+
+    # validate() already refused a no_codex + codex-job-type file, so the pair below
+    # can never land in the DB in a conflicting combination.
+    if job.no_codex != bool(session.no_codex):  # type: ignore[attr-defined]
+        store.update_fields(session_id, no_codex=job.no_codex)
+        changed.append("no_codex")
 
     new_overseer = job.llm_overseer if job.llm_overseer in LLM_CHOICES else DEFAULT_LLM
     if new_overseer != (session.llm_overseer or DEFAULT_LLM):  # type: ignore[attr-defined]

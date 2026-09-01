@@ -39,6 +39,7 @@ from .models import (
     Status,
     Subgoal,
     SubgoalRevision,
+    no_codex_conflict,
     now_ms,
     short_id,
 )
@@ -114,10 +115,12 @@ _SESSION_COLUMNS = (
     "fire_window",
     "depends_on",
     "job_type",
+    "no_codex",
     "llm_overseer",
     "llm_exec",
     "model",
     "effort",
+    "idempotency_key",
     "future_file",
     "future_sync_hash",
     "future_synced_at",
@@ -136,6 +139,7 @@ _BOOL_COLUMNS = frozenset(
         "subgoals_adaptive",
         "draft",
         "aim_met",
+        "no_codex",
     }
 )
 # Columns the automatic reconcile is allowed to touch (never user-authored fields).
@@ -199,10 +203,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     fire_window       TEXT    NOT NULL DEFAULT '',
     depends_on        TEXT,
     job_type          TEXT    NOT NULL DEFAULT 'claude',
+    no_codex          INTEGER NOT NULL DEFAULT 0,
     llm_overseer      TEXT    NOT NULL DEFAULT 'fable-5',
     llm_exec          TEXT    NOT NULL DEFAULT 'fable-5',
     model             TEXT    NOT NULL DEFAULT '',
     effort            TEXT    NOT NULL DEFAULT '',
+    idempotency_key   TEXT,
     future_file          TEXT,
     future_sync_hash     TEXT,
     future_synced_at     INTEGER NOT NULL DEFAULT 0,
@@ -328,12 +334,18 @@ class Store:  # pylint: disable=too-many-public-methods
         "fire_window": "TEXT NOT NULL DEFAULT ''",
         "depends_on": "TEXT",
         "job_type": "TEXT NOT NULL DEFAULT 'claude'",
+        # Per-session Codex opt-out: CCC_NO_CODEX=1 in every launch/resume env.
+        "no_codex": "INTEGER NOT NULL DEFAULT 0",
         "llm_overseer": "TEXT NOT NULL DEFAULT 'fable-5'",
         "llm_exec": "TEXT NOT NULL DEFAULT 'fable-5'",
         # OBSERVED runtime values (distinct from the llm_overseer/llm_exec job config):
         # the model the session actually ran on + its --effort reasoning level.
         "model": "TEXT NOT NULL DEFAULT ''",
         "effort": "TEXT NOT NULL DEFAULT ''",
+        # Caller-supplied create-or-retrieve key for `ccc new-job -K` (NULL = none).
+        # UNIQUE via a partial index built in _ensure_columns (SQLite cannot ALTER in
+        # a UNIQUE column), so many NULLs coexist and one key owns exactly one row.
+        "idempotency_key": "TEXT",
         "future_file": "TEXT",
         "future_sync_hash": "TEXT",
         "future_synced_at": "INTEGER NOT NULL DEFAULT 0",
@@ -396,6 +408,14 @@ class Store:  # pylint: disable=too-many-public-methods
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_fire_pending ON sessions(fire_at) "
             "WHERE archived = 0 AND fire_at > 0"
+        )
+        # The UNIQUE half of `idempotency_key`. A PARTIAL index (WHERE NOT NULL) because
+        # every keyless row is NULL and SQLite would otherwise treat those as distinct
+        # anyway — this states the intent and keeps the index tiny. Created HERE for the
+        # same reason as the one above: an old DB only gains the column in the ALTER loop.
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_idempotency_key "
+            "ON sessions(idempotency_key) WHERE idempotency_key IS NOT NULL"
         )
         self.conn.commit()
 
@@ -516,6 +536,43 @@ class Store:  # pylint: disable=too-many-public-methods
         assert got is not None
         return got
 
+    def claim_idempotency_key(
+        self, key: str, session_id: str, cwd: str, *, no_codex: bool = False
+    ) -> tuple[str, bool]:
+        """Atomically reserve *key* for a new draft; return ``(owning id, created)``.
+
+        The create-or-retrieve half of ``ccc new-job -K``. One ``BEGIN IMMEDIATE``
+        transaction takes the write lock before anyone reads, so N concurrent creators
+        with the same key produce exactly ONE row: the winner INSERTs the placeholder
+        (which the partial UNIQUE index on ``idempotency_key`` protects), every loser
+        trips the constraint and reads the winner's id back. ``created`` is ``True`` for
+        the single creator, ``False`` for everyone who retrieved.
+
+        The placeholder carries the *identity* fields a caller compares on (``cwd``,
+        ``no_codex``) so a loser can check them immediately; the AIM and the rest arrive
+        with the winner's :meth:`create_draft` call a moment later (a loser that races
+        in between simply sees ``aim = NULL`` and skips that comparison).
+        """
+        ts = now_ms()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "INSERT INTO sessions (session_id, cwd, agent, draft, status, no_codex, "
+                "idempotency_key, created_at, updated_at) "
+                "VALUES (?, ?, 'claude', 1, ?, ?, ?, ?, ?)",
+                (session_id, cwd, Status.PARKED.value, int(bool(no_codex)), key, ts, ts),
+            )
+        except sqlite3.IntegrityError:
+            self.conn.rollback()
+            row = self.conn.execute(
+                "SELECT session_id FROM sessions WHERE idempotency_key = ?", (key,)
+            ).fetchone()
+            if row is None:  # the constraint that fired was the primary key, not the key
+                raise
+            return str(row["session_id"]), False
+        self.conn.commit()
+        return session_id, True
+
     def create_draft(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
         self,
         session_id: str,
@@ -527,11 +584,13 @@ class Store:  # pylint: disable=too-many-public-methods
         start_date: str | None = None,
         depends_on: str | None = None,
         job_type: str = "claude",
+        no_codex: bool = False,
         llm_overseer: str = DEFAULT_LLM,
         llm_exec: str = DEFAULT_LLM,
         config_dir: str = "",
         fire_at: int = 0,
         fire_window: str = "",
+        idempotency_key: str = "",
     ) -> Session:
         """Register a *future job*: a draft row holding an AIM + prompt, launched on demand.
 
@@ -551,7 +610,15 @@ class Store:  # pylint: disable=too-many-public-methods
         :meth:`set_aim` records its history + lexical score.
         *fire_at*/*fire_window* arm the parked-prompt auto-fire: the epoch second the
         job dispatches at and the rate-limit window that produced it (see park.py).
+        *no_codex* bans every Codex integration for the launched session (``CCC_NO_CODEX=1``
+        in its env); it is REFUSED on a codex job type — see :func:`no_codex_conflict`.
+        *idempotency_key* records the caller-supplied create-or-retrieve key ("" = none);
+        the atomic claim itself is :meth:`claim_idempotency_key`.
         """
+        job_type = job_type if job_type in _JOB_TYPES else "claude"
+        conflict = no_codex_conflict(job_type, no_codex)
+        if conflict:
+            raise ValueError(conflict)
         self.ensure(session_id, cwd=cwd)
         self.update_fields(
             session_id,
@@ -562,11 +629,13 @@ class Store:  # pylint: disable=too-many-public-methods
             start_when=(start_when.strip() if start_when and start_when.strip() else None),
             start_date=(start_date.strip() if start_date and start_date.strip() else None),
             depends_on=(depends_on.strip() if depends_on and depends_on.strip() else None),
-            job_type=(job_type if job_type in _JOB_TYPES else "claude"),
+            job_type=job_type,
+            no_codex=bool(no_codex),
             llm_overseer=_llm_or_default(llm_overseer),
             llm_exec=_llm_or_default(llm_exec),
             fire_at=max(0, int(fire_at)),
             fire_window=fire_window.strip(),
+            idempotency_key=(idempotency_key.strip() or None),
             status=Status.PARKED.value,
         )
         self.set_aim(session_id, aim)

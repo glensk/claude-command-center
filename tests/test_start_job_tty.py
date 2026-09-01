@@ -196,7 +196,7 @@ def test_resume_without_tty_opens_a_tab_instead_of_exec(
 
     opened: dict[str, object] = {}
 
-    def _fake_tab(cwd: str, session_id: str, config_dir: str = "") -> bool:
+    def _fake_tab(cwd: str, session_id: str, config_dir: str = "", **_: object) -> bool:
         opened.update(cwd=cwd, session_id=session_id, config_dir=config_dir)
         return True
 

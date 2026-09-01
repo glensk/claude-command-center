@@ -697,13 +697,20 @@ def _reap_fresh(adapter: ClaudeAdapter, store: Store, session_id: str) -> None:
         terminal.close_iterm_session(session.iterm_session_id)
 
 
-def _launch_resume(session_id: str, cwd: str, cfg: config.Config, config_dir: str = "") -> bool:
+def _launch_resume(
+    session_id: str,
+    cwd: str,
+    cfg: config.Config,
+    config_dir: str = "",
+    *,
+    no_codex: bool = False,
+) -> bool:
     from . import terminal
 
     script = _resolve_continue_script(cfg)
     if not script:
         return False
-    return terminal.resume_halted_in_new_tab(cwd, session_id, script, config_dir)
+    return terminal.resume_halted_in_new_tab(cwd, session_id, script, config_dir, no_codex=no_codex)
 
 
 def _consume_reset_signal(state: QueueState, account: str) -> None:
@@ -803,7 +810,13 @@ def apply_actions(
             # session comes back on work and a private one on private.
             resumed = store.get(action.session_id)
             config_dir = resumed.config_dir if resumed else _config_dir_for_key(action.account)
-            launched = _launch_resume(action.session_id, action.cwd, cfg, config_dir)
+            launched = _launch_resume(
+                action.session_id,
+                action.cwd,
+                cfg,
+                config_dir,
+                no_codex=bool(resumed.no_codex) if resumed else False,
+            )
             _log(
                 "launch",
                 action.session_id,

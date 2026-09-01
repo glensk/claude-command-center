@@ -3362,7 +3362,7 @@ def test_undo_close_live_reopens_tab(tmp_path: Path, monkeypatch: pytest.MonkeyP
         closed.append(iterm_session_id)
         return "tab"
 
-    def fake_resume(cwd: str, session_id: str, config_dir: str = "") -> bool:
+    def fake_resume(cwd: str, session_id: str, config_dir: str = "", **_: object) -> bool:
         resumed.append((cwd, session_id))
         return True
 

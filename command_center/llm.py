@@ -33,6 +33,8 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import codex_launch
+
 if TYPE_CHECKING:
     from .config import Config
 
@@ -221,15 +223,19 @@ def run_codex(prompt: str, model: str = "") -> str | None:
     """Headless ``codex exec`` text generation. Returns the final message, or ``None``.
 
     Shells out to OpenAI's Codex CLI instead of ``claude`` so cheap derived text (the
-    short-AIM label) costs Codex/ChatGPT quota, not Claude tokens. ``--ignore-user-config``
-    skips the user's ``~/.codex/config.toml`` — which would otherwise spin up MCP servers
-    that can hang on reconnect — while auth still resolves from ``CODEX_HOME``. The final
-    assistant message is captured cleanly via ``--output-last-message`` (no event noise).
-    Never raises: any failure (no ``codex`` on PATH, non-zero exit, timeout) returns ``None``
-    so callers fall back to the full AIM. Empty *model* lets Codex pick its default model.
+    short-AIM label) costs Codex/ChatGPT quota, not Claude tokens. The launch goes through
+    the one policy in :mod:`command_center.codex_launch`: the named ``hardened-ro``
+    permission profile (never ``--sandbox``, which forces the legacy sandbox and drops the
+    profile's deny rules), a throwaway empty ``-C`` root so this text call can neither be
+    confused with — nor write into — a repo, ``--ephemeral`` so it leaves no session file,
+    and one ``-c mcp_servers.<name>.enabled=false`` per configured server so no MCP
+    handshake can hang it. It deliberately does NOT pass ``--ignore-user-config``: that
+    would also drop the permission profiles this run depends on. The final assistant
+    message is captured cleanly via ``--output-last-message`` (no event noise). Never
+    raises: any failure (no ``codex`` on PATH, a refused launch, non-zero exit, timeout)
+    returns ``None`` so callers fall back to the full AIM. Empty *model* lets Codex pick
+    its default model.
     """
-    if not shutil.which("codex"):
-        return None
     # Bill the seat the shared selector picks (pin/holds-aware) instead of whatever
     # CODEX_HOME the ambient environment happens to carry — ccc's own short calls used
     # to silently spend the default (team) seat even while it was pinned away or held.
@@ -241,18 +247,28 @@ def run_codex(prompt: str, model: str = "") -> str | None:
         env = dict(os.environ)
     env["CCC_INTERNAL"] = "1"
     env["AI_NO_AUTOCOMMIT"] = "1"
+    codex_home = Path(env["CODEX_HOME"]) if env.get("CODEX_HOME") else None
+    try:
+        codex_bin = codex_launch.resolve_codex()
+        perm_args = codex_launch.permission_args(False, codex_home=codex_home)
+        mcp_args = codex_launch.mcp_disable_args(codex_home)
+    except codex_launch.CodexLaunchError:
+        return None
     out_path = ""
+    workdir = ""
     try:
         handle, out_path = tempfile.mkstemp(prefix="ccc-codex-", suffix=".txt")
         os.close(handle)
+        workdir = tempfile.mkdtemp(prefix="ccc-codex-cwd-")
         cmd = [
-            "codex",
+            codex_bin,
             "exec",
-            prompt,
-            "--sandbox",
-            "read-only",
+            *perm_args,
+            *mcp_args,
+            "--ephemeral",
             "--skip-git-repo-check",
-            "--ignore-user-config",
+            "-C",
+            workdir,
             "--color",
             "never",
             "--output-last-message",
@@ -260,6 +276,7 @@ def run_codex(prompt: str, model: str = "") -> str | None:
         ]
         if model:
             cmd += ["-m", model]
+        cmd.append(prompt)
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=120, env=env, check=False
         )
@@ -275,6 +292,8 @@ def run_codex(prompt: str, model: str = "") -> str | None:
                 os.unlink(out_path)
             except OSError:
                 pass
+        if workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 def _guarded_env(purpose: str = "", note: str = "") -> dict[str, str]:

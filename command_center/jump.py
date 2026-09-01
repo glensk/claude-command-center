@@ -139,7 +139,10 @@ def _resume_selected() -> int:
             file=sys.stderr,
         )
         return 1
-    return 0 if terminal.resume_in_new_tab(session.cwd, sid, session.config_dir) else 1
+    resumed = terminal.resume_in_new_tab(
+        session.cwd, sid, session.config_dir, no_codex=bool(session.no_codex)
+    )
+    return 0 if resumed else 1
 
 
 def _focus_ccc(ccc_tty: str | None, no_launch: bool) -> int:

@@ -540,7 +540,7 @@ def test_resume_job_parked_with_transcript_opens_new_tab(
     monkeypatch.setattr("command_center.cli._adapter", lambda: _FakeAdapter([]))  # not live
     resumed: dict[str, str] = {}
 
-    def _resume(c: str, s: str, config_dir: str = "") -> bool:
+    def _resume(c: str, s: str, config_dir: str = "", **_: object) -> bool:
         resumed["cwd"], resumed["sid"] = c, s
         return True
 
@@ -565,7 +565,7 @@ def test_resume_job_live_focuses_tab_without_resuming(
         focused["iterm"] = iterm_id
         return True
 
-    def _resume(c: str, s: str, config_dir: str = "") -> bool:
+    def _resume(c: str, s: str, config_dir: str = "", **_: object) -> bool:
         resumed["called"] = s
         return True
 
@@ -587,7 +587,7 @@ def test_resume_job_parked_without_transcript_refuses(
     resumed: dict[str, str] = {}
     monkeypatch.setattr(
         "command_center.terminal.resume_in_new_tab",
-        lambda c, s: resumed.setdefault("called", s) or True,
+        lambda c, s, config_dir="", **_: resumed.setdefault("called", s) or True,
     )
     assert cmd_resume_job(argparse.Namespace(session_id=sid)) == 1
     assert resumed == {}  # never tried to open a tab

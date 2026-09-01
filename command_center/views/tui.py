@@ -3291,7 +3291,9 @@ class CommandCenterApp(App[None]):
         if self.adapter.transcript_path(session.cwd, sid, session.config_dir) is None:
             self._offer_archive_orphan(sid)
             return
-        if terminal.resume_in_new_tab(session.cwd, sid, session.config_dir):
+        if terminal.resume_in_new_tab(
+            session.cwd, sid, session.config_dir, no_codex=bool(session.no_codex)
+        ):
             self.notify(f"Resuming in a new tab: {colors.short_folder(session.cwd)}")
         else:
             self.notify(f"Run: c --resume {sid}", severity="warning", timeout=10)
@@ -3406,7 +3408,9 @@ class CommandCenterApp(App[None]):
             return "Can't undo — session no longer exists."
         if self.adapter.transcript_path(session.cwd, sid, session.config_dir) is None:
             return f"Undid close: {label} restored (no conversation on disk to reopen)."
-        if terminal.resume_in_new_tab(session.cwd, sid, session.config_dir):
+        if terminal.resume_in_new_tab(
+            session.cwd, sid, session.config_dir, no_codex=bool(session.no_codex)
+        ):
             return f"Undid close: resuming {label} in a new tab."
         return f"Undid close: {label} restored — reopen it with r."
 

@@ -18,6 +18,7 @@ from types import ModuleType
 
 import pytest
 
+from command_center import codex_launch
 from command_center.models import job_launch_prefix
 from command_center.store import Store
 
@@ -33,6 +34,19 @@ def _load_engine() -> ModuleType:
     import command_center.codex_in_claude as engine
 
     return engine
+
+
+def _write_codex_config(home: Path, *, hardened_rw: bool) -> Path:
+    """Write a minimal ``$CODEX_HOME/config.toml``; *hardened_rw* adds the write profile."""
+    home.mkdir(parents=True, exist_ok=True)
+    text = (
+        'default_permissions = "hardened-ro"\n\n[permissions.hardened-ro]\nextends = ":read-only"\n'
+    )
+    if hardened_rw:
+        text += '\n[permissions.hardened-rw]\nextends = ":workspace"\n'
+    path = home / "config.toml"
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 @pytest.fixture()
@@ -359,11 +373,17 @@ def test_delegate_prints_model_first_and_assembles_cmd(
     monkeypatch.setattr(cic, "_exec_codex", fake_run)
     rc = cic.cmd_delegate(_ns())
     out = capsys.readouterr().out
+    cmd = captured["cmd"]
     assert rc == cic.EX_OK
     assert out.splitlines()[0] == "model: gpt-5.6-sol (effort xhigh)"  # guaranteed 1st line
-    assert captured["cmd"][:3] == ["codex", "exec", "-s"]
-    assert "read-only" in captured["cmd"] and "-m" in captured["cmd"]
-    assert "gpt-5.6-sol" in captured["cmd"]
+    assert Path(cmd[0]).name == "codex" and cmd[1] == "exec"  # resolved binary, not bare argv0
+    # Named permission profile, never the legacy sandbox flag (which drops its deny rules).
+    assert 'default_permissions="hardened-ro"' in cmd
+    assert "-s" not in cmd and "--sandbox" not in cmd
+    # The workspace root is always explicit; this repo IS a git work tree, so no opt-out.
+    assert cmd[cmd.index("-C") + 1] == str(Path.cwd().resolve())
+    assert "--skip-git-repo-check" not in cmd
+    assert "-m" in cmd and "gpt-5.6-sol" in cmd
 
 
 def test_delegate_records_cost_snapshots_and_purpose_without_stdout_preamble(
@@ -408,10 +428,12 @@ def test_delegate_parser_purpose_defaults_and_override(cic: ModuleType) -> None:
     assert parser.parse_args(["delegate", "--purpose", "review", "x"]).purpose == "review"
 
 
-def test_delegate_write_mode_uses_workspace_write(
-    cic: ModuleType, monkeypatch: pytest.MonkeyPatch
+def test_delegate_write_mode_uses_the_hardened_rw_profile(
+    cic: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """A write round runs under [permissions.hardened-rw] — never legacy workspace-write."""
     captured: dict[str, list[str]] = {}
+    _write_codex_config(tmp_path / "codex", hardened_rw=True)
 
     def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         captured["cmd"] = cmd
@@ -421,7 +443,22 @@ def test_delegate_write_mode_uses_workspace_write(
     monkeypatch.setattr(cic, "_exec_codex", fake_run)
     monkeypatch.setattr(cic, "_git_status", lambda _cwd: [])
     assert cic.cmd_delegate(_ns(write=True)) == cic.EX_OK
-    assert "workspace-write" in captured["cmd"]
+    assert 'default_permissions="hardened-rw"' in captured["cmd"]
+    assert "workspace-write" not in captured["cmd"]
+    assert "-s" not in captured["cmd"] and "--sandbox" not in captured["cmd"]
+
+
+def test_delegate_write_refuses_without_a_hardened_rw_profile(
+    cic: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No [permissions.hardened-rw] in the active CODEX_HOME ⇒ exit 2, codex never runs."""
+    _write_codex_config(tmp_path / "codex", hardened_rw=False)
+
+    def boom(*_: object, **__: object) -> None:
+        raise AssertionError("codex must not launch without a write profile")
+
+    monkeypatch.setattr(cic, "_exec_codex", boom)
+    assert cic.cmd_delegate(_ns(write=True)) == cic.EX_USAGE
 
 
 def test_delegate_scout_is_readonly_plan(cic: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -434,9 +471,10 @@ def test_delegate_scout_is_readonly_plan(cic: ModuleType, monkeypatch: pytest.Mo
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(cic, "_exec_codex", fake_run)
-    # scout wins over write → read-only sandbox, and the prompt is the scout contract
+    # scout wins over write → the read-only profile, and the prompt is the scout contract
     assert cic.cmd_delegate(_ns(scout=True, write=True)) == cic.EX_OK
-    assert "read-only" in captured["cmd"] and "workspace-write" not in captured["cmd"]
+    assert 'default_permissions="hardened-ro"' in captured["cmd"]
+    assert 'default_permissions="hardened-rw"' not in captured["cmd"]
     prompt = captured["cmd"][-1]
     assert "SCOUTING" in prompt and "### PLAN" in prompt and "NOT write" in prompt
 
@@ -562,11 +600,30 @@ def test_delegate_resume_assembles_resume_cmd(
         return subprocess.CompletedProcess(cmd, 0, "", f"session id: {uuid}\n")
 
     monkeypatch.setattr(cic, "_exec_codex", fake_run)
+    # Only a session THIS policy journalled may be resumed (same root, same mode).
+    codex_launch.record_launch(uuid, str(Path.cwd().resolve()), write=False)
     assert cic.cmd_delegate(_ns(resume=uuid)) == cic.EX_OK
-    assert captured["cmd"][:4] == ["codex", "exec", "resume", uuid]
-    assert "-s" not in captured["cmd"]  # sandbox inherited from the resumed session
+    cmd = captured["cmd"]
+    assert Path(cmd[0]).name == "codex" and cmd[1:4] == ["exec", "resume", uuid]
+    assert "-s" not in cmd  # permissions inherited from the resumed session
     out = capsys.readouterr().out
     assert "### SESSION" in out and uuid in out  # session id reported for the next round
+
+
+def test_delegate_resume_refuses_unknown_and_mode_mismatch(
+    cic: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unjournalled id, and a read session asked to resume in write mode, both refuse."""
+
+    def boom(*_: object, **__: object) -> None:
+        raise AssertionError("codex must not launch on a refused resume")
+
+    monkeypatch.setattr(cic, "_exec_codex", boom)
+    _write_codex_config(tmp_path / "codex", hardened_rw=True)
+    unknown = "019ff5b3-7bea-7c80-ad5e-21cc5b7c64bd"
+    assert cic.cmd_delegate(_ns(resume=unknown)) == cic.EX_USAGE
+    codex_launch.record_launch(unknown, str(Path.cwd().resolve()), write=False)
+    assert cic.cmd_delegate(_ns(resume=unknown, write=True)) == cic.EX_USAGE
 
 
 def test_delegate_runs_lists_live_and_cleans_dead(
@@ -617,7 +674,7 @@ def test_delegate_show_prompt_dry_run(
     monkeypatch.setattr(cic, "_exec_codex", boom)
     assert cic.cmd_delegate(_ns(show_prompt=True, prompt="do the thing")) == cic.EX_OK
     out = capsys.readouterr().out
-    assert "### DRY RUN" in out and "do the thing" in out and "command: codex exec" in out
+    assert "### DRY RUN" in out and "do the thing" in out and " exec " in out
 
 
 def test_delegate_pointer_hint_for_xhigh(

@@ -439,8 +439,55 @@ then reads `(fn adds one)`), so `tf` always has at least this one line to toggle
 `claude --session-id <id> "<prompt>"` in the repo, with the AIM already set — the draft simply
 becomes the live session (it reuses the pre-assigned id, so the AIM carries over). Everything
 is also scriptable: `ccc new-job -a "…" [-p "…"] [-c REPO] [-w "during holidays"]
-[-s YYYY-MM-DD] [-O overseer] [-E executor]`, `ccc jobs`, `ccc start-job <id>`. Future jobs are
+[-s YYYY-MM-DD] [-O overseer] [-E executor] [-N] [-K KEY] [-J]`, `ccc jobs [-j]`,
+`ccc start-job <id>`. Future jobs are
 inert until launched — the daemon never reaps, grades, or alerts on them.
+
+#### Banning Codex for one job (`-N/--no-codex`)
+
+`ccc new-job -N` marks a job **no-codex**: every ccc-owned surface that launches or resumes it
+exports `CCC_NO_CODEX=1`, the kill switch all Codex integrations honour (the plan-gate debate,
+the optional-offload hook, `codex-in-claude`). One helper — `accounts.session_launch_env` and
+its `session_apply_to_environ` / `session_launch_env_prefix` renderings — is the single place
+that decides this, and **every** launch surface goes through it: `start-job`, `resume` (the
+in-place `execvp`), `resume-job`, the TUI's `r` and its undo-close, `ccc jump`, the
+attached-prompt `fire-attached`, the halted-session auto-resume, and snapshot restore (the typed
+tab command carries the `export`). An ambient `CCC_NO_CODEX` from the parent shell is never
+cleared — the flag is only ever added.
+
+The flag round-trips through the job file (`no_codex: true` in the frontmatter, emitted only when
+set so existing files stay byte-identical) and is shown as a `[no-codex]` tag in `ccc jobs`.
+It is **refused together with `-j codex` / `-j codex-write`** — that job type *is* Codex work, so
+banning Codex would make it unrunnable. The refusal fires at the domain boundary
+(`ccc new-job` exits 2; `Store.create_draft` raises; the job-file import writes a sync-error
+callout) **and** again at launch, where `ccc start-job` refuses a row that somehow carries both,
+before it claims the draft — so nothing is lost.
+
+#### Idempotent registration + JSON output (for automations)
+
+`ccc new-job -K/--idempotency-key KEY` makes registration **create-or-retrieve**: the first call
+registers the job, every later call with the same KEY returns that same job instead of a second
+one. The claim is a single `BEGIN IMMEDIATE` transaction against a partial UNIQUE index, so even
+concurrent creators collapse onto one row. A KEY reused with a **different** `cwd`/`aim`/
+`--no-codex` is a caller bug: exit 2 naming the differences, rather than silently handing back
+the wrong job. Keyless jobs are never deduplicated (their key is `NULL`).
+
+Two machine-readable outputs, both a single line, schema `version: 1` (additive fields keep
+version 1 — read by key):
+
+```commands
+ccc new-job -a "…" -c <repo> -K deploy-42 -J
+# {"version":1,"session_id":"…","created":true,"account":"private","no_codex":false}
+
+ccc jobs -j
+# {"version":1,"jobs":[{"session_id":"…","cwd":"…","aim":"…","draft":true,"archived":false,
+#                      "created_at":1756…,"account":"private","no_codex":false,
+#                      "idempotency_key":null}]}
+```
+
+`--json` suppresses every human line on stdout (warnings still go to stderr). Note the short
+options: on `new-job`, `-j` is already `--job-type`, so JSON takes **`-J`**; on `jobs` there is no
+clash and it is **`-j`**. Both accept the long `--json`.
 
 **SCHEDULED — future jobs with a fixed start date.** A future job can carry a machine-readable
 `start_date` (`-s/--start-date YYYY-MM-DD`, the dialog's *Fixed start date* field, the `e`
@@ -839,6 +886,90 @@ summary) so codex starts oriented, and it is told its time budget explicitly.
 The same selector powers **future jobs**: a `new-job -j codex` / `-j codex-write` draft (or the
 TUI "Run as" menu) launches straight into `/codex-implement-task-and-claude-review`, so a parked
 task gets done by Codex and verified by Claude when you start it.
+
+#### Codex launch policy — permission profiles, the `-C` root, and the session journal
+
+Every `codex exec` ccc starts — the `delegate`/scout rounds and ccc's own cheap text calls —
+is assembled by **one** module, `command_center/codex_launch.py`. Nothing else builds a codex
+command line.
+
+**Named permission profiles, never `-s/--sandbox`.** Codex ≥ 0.150 replaced the legacy
+`sandbox_mode` key with named profiles (`default_permissions = "<name>"` + a
+`[permissions.<name>]` table). The two must not be mixed: passing `-s`/`--sandbox` forces the
+LEGACY sandbox and silently **drops** the profile's deny rules — credential stores, the
+workspace's own `.env`/`*.pem`/`*.key`, the network block. ccc therefore emits
+`-c default_permissions="hardened-ro"` for a read round and `-c default_permissions="hardened-rw"`
+for a write round, and never emits `-s` at all.
+
+`hardened-rw` is **opt-in**: a write round runs only when the active `$CODEX_HOME/config.toml`
+really declares `[permissions.hardened-rw]`. Without it ccc refuses (exit 2,
+`no hardened-rw profile configured; refusing legacy workspace-write`) rather than falling back to
+a rule-free `workspace-write`. You only ADD the table — the file's own
+`default_permissions = "hardened-ro"` stays put, and ccc selects the write profile per
+invocation with `-c`, so an interactive `codex` is unaffected. The profile is the read-only one
+plus workspace write; keep its deny list identical to `hardened-ro`'s and change only `extends`,
+which must be `":workspace"` (`":workspace-write"` is **not** a built-in name and fails config
+load with `cannot extend unsupported built-in profile`):
+
+```toml
+[permissions.hardened-rw]
+description = "Workspace-write implementer; credential stores unreadable; sandbox network off"
+extends     = ":workspace"
+
+[permissions.hardened-rw.filesystem]
+glob_scan_max_depth = 3
+"~/.ssh"                   = "deny"
+"~/.aws"                   = "deny"
+"~/.gnupg"                 = "deny"
+"~/.kube"                  = "deny"
+"~/.netrc"                 = "deny"
+"~/.pgpass"                = "deny"
+"~/.docker"                = "deny"
+"~/.codex/auth.json"       = "deny"
+"~/.config/gcloud"         = "deny"
+"~/.config/sops"           = "deny"
+"~/.config/rclone"         = "deny"
+
+[permissions.hardened-rw.filesystem.":workspace_roots"]
+"**/.env"   = "deny"
+"**/.env.*" = "deny"
+"**/*.pem"  = "deny"
+"**/*.key"  = "deny"
+"**/*.sops" = "deny"
+```
+
+**The `-C` workspace root is always explicit and always validated.** `resolve_workdir`
+resolves it strictly (symlinks included) and then:
+
+| Case                                                | Result                                                           |
+| :-------------------------------------------------- | :---------------------------------------------------------------- |
+| `$HOME` itself, or any directory containing `$HOME` | **refused** (exit 2) — a write round there owns the account      |
+| a path that does not exist / is not a directory     | **refused** (exit 2)                                             |
+| **implicit** cwd (no `-C`) inside a git work tree   | accepted                                                         |
+| **implicit** cwd NOT in a git work tree             | **refused** (exit 2) — pass `-C` if that really is the workspace |
+| **explicit** `-C` on a non-git directory            | accepted, and `--skip-git-repo-check` is added                   |
+
+`--skip-git-repo-check` is now passed only in that last case instead of unconditionally, so a
+mistyped root fails loudly instead of being waved through.
+
+**The session journal.** Each successful launch appends one line to
+`$CODEX_HOME/ccc-sessions.jsonl` (mode `0600`):
+`{"ts", "session_id", "resolved_cwd", "permission_profile", "write"}`. `--resume <id|last>`
+resolves through it and is honoured **only** when the session was launched by ccc on this seat,
+its read/write mode matches the round being asked for, and its recorded root still passes
+`resolve_workdir` today — otherwise exit 2 with the reason. This matters because
+`codex exec resume` inherits the ORIGINAL session's permissions and working root while `--write`
+is recomputed from the new command line; without the journal a resume could quietly run a write
+round in a root the current policy rejects.
+
+**ccc's own text calls** (`short_aim` via `run_codex`) go through the same policy plus
+`--ephemeral` (no session file), a throwaway empty `mkdtemp()` as `-C` (so a label call can
+neither be confused with nor write into a repo), and one `-c mcp_servers.<name>.enabled=false`
+per configured MCP server. They deliberately no longer pass `--ignore-user-config`, which would
+also drop the permission profiles. There is no wholesale "no MCP" switch: codex's `-c` deep-MERGES
+tables, so `-c mcp_servers={}` parses fine and changes nothing (verified against codex-cli
+0.150.1) — servers have to be disabled by name, which is why the disable list is derived from the
+active config.
 
 ### AIM quality (low score → red chip), progress grading & weighting
 

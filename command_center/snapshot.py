@@ -120,13 +120,15 @@ _ARGMAX_FALLBACK = 262_144
 # Neutral layout model
 # --------------------------------------------------------------------------- #
 @dataclass
-class SnapPane:
+class SnapPane:  # pylint: disable=too-many-instance-attributes
     """One captured pane: what ran in it, and where.
 
     ``kind`` is ``"claude"`` (a tracked Claude Code session — ``session_id`` +
     ``config_dir`` say which id on which account), ``"command"`` (a foreground program
     whose exact ``argv`` we captured) or ``"shell"`` (nothing but the shell, or a
     program whose argv could not be read — ``display`` then names it for the note).
+    ``no_codex`` mirrors the session row's Codex opt-out so a restored pane comes back
+    with the same ``CCC_NO_CODEX`` pin it had.
     """
 
     kind: str
@@ -134,6 +136,7 @@ class SnapPane:
     title: str = ""
     session_id: str = ""
     config_dir: str = ""
+    no_codex: bool = False
     argv: list[str] = field(default_factory=list)
     display: str = ""
 
@@ -186,6 +189,8 @@ def pane_to_json(pane: SnapPane) -> dict[str, Any]:
             out[key] = value
     if pane.argv:
         out["argv"] = list(pane.argv)
+    if pane.no_codex:  # omitted when false, so existing snapshot files stay byte-identical
+        out["no_codex"] = True
     return out
 
 
@@ -221,6 +226,7 @@ def pane_from_json(data: dict[str, Any]) -> SnapPane:
         title=str(data.get("title") or ""),
         session_id=str(data.get("session_id") or ""),
         config_dir=str(data.get("config_dir") or ""),
+        no_codex=bool(data.get("no_codex")),
         argv=[str(a) for a in argv],
         display=str(data.get("display") or ""),
     )
@@ -607,6 +613,7 @@ def _classify_pane(  # pylint: disable=too-many-arguments,too-many-positional-ar
             title=title,
             session_id=session.session_id,
             config_dir=session.config_dir,
+            no_codex=bool(getattr(session, "no_codex", False)),
         )
 
     shell_pid = shell_pid_for_tty(ps_rows, tty) if tty else None
@@ -939,7 +946,7 @@ def _claude_action(pane: SnapPane, blockers: Blockers) -> PaneAction:
             "cannot resume: " + "; ".join(reasons),
             error=True,
         )
-    prefix = accounts.launch_env_prefix(pane.config_dir)
+    prefix = accounts.session_launch_env_prefix(pane)
     resume = f"cd {shlex.quote(pane.cwd)} && claude --resume {shlex.quote(pane.session_id)}"
     return _action(pane, prefix + resume)
 
