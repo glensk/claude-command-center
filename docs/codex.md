@@ -49,6 +49,7 @@ codex-in-claude.py usage [--json]                            # Codex 5h + weekly
 codex-in-claude.py headroom [--json]                         # learned optional-offload reserve
 codex-in-claude.py delegate [--write] [--scout] -C <repo> "<task>"  # one round; prints model first
 codex-in-claude.py home                                      # which CODEX_HOME (account) Codex bills now
+codex-in-claude.py home -j                                   # machine-readable: {home, source, label, email, until}
 codex-in-claude.py home ~/.codex-private -u 2026-09-07       # pin ALL Codex use to the 2nd login until that date (inclusive)
 codex-in-claude.py home -c                                   # drop the pin
 ```
@@ -58,6 +59,16 @@ moves `delegate`, `usage`/`headroom` AND `codex-review.py` (the `/codex-debate` 
 to that login at once and lapses by itself after the date; an explicit `$CODEX_HOME` in the
 environment still overrides it. Create the second login once with
 `CODEX_HOME=~/.codex-private codex login` (same value as ccc's `codex_home_private`).
+
+Since 2026-09-01 the pin is one input to a quota-aware **selector**, not the whole
+answer: `_codex_home()` resolves `$CODEX_HOME` → `ccc quota`'s verdicts (an
+administrative hold or a blocked seat is excluded FIRST, then an eligible pin wins,
+then team→private order; nothing eligible falls back pin-else-default with a stderr
+warning) — so `ccc quota -m codex -H -U <stamp> -R "team seat reserved"` really keeps
+every Codex consumer off the team seat, pin or no pin. `ccc quota`'s footer and
+`best_codex_account` in its JSON show the same selection; `codex-review.py` consumes
+it via `home -j` (falling back to its local pin read only when the CLI is missing),
+and ccc's own `llm.run_codex` (short-AIM/scoring text) bills the selected seat too.
 
 `--for all` is a real reset: it moves `default` **and** clears the per-command pins, which
 would otherwise shadow it. A bare `set-model <slug>` (no `--for`) only moves `default`.

@@ -1586,7 +1586,7 @@ def test_quota_reports_codex_blocked_with_the_filled_window_and_its_reset(
     )
     _blocked_snapshot(tmp_path, monkeypatch, healthy)
     usage._codex_cache.clear()
-    prov = quota._codex_quota(_NOW, {})
+    prov = quota._codex_seat_quota("codex", "default", tmp_path, _NOW, {})
     assert prov.state == quota.BLOCKED
     assert prov.blocked_by == "five_hour"
     assert prov.resets_at == 1782320400
@@ -2274,3 +2274,27 @@ def test_render_codex_usage_blocked_banner_uses_the_short_wording() -> None:
     # the card still says WHY rather than silently dropping the reason.
     snap.blocked_reason = "some new refusal"
     assert usage.render_codex_usage(snap, now=_LIVE_NOW).plain.startswith("⛔ some new refusal")
+
+
+def test_refusal_attribution_is_per_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each seat's row carries ITS OWN rollout refusal — never another home's.
+
+    ``codex_refusal`` used to scan the pin-effective home, so with a pin active a
+    private-seat refusal was stapled onto the team row (and a private row could ignore
+    its own). Both directions are pinned here.
+    """
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    home_a, home_b = tmp_path / "seat-a", tmp_path / "seat-b"
+    healthy = dict(
+        _CODEX_RATE_LIMITS,
+        primary={"used_percent": 30.0, "window_minutes": 300, "resets_at": 1782320400},
+        secondary={"used_percent": 60.0, "window_minutes": 10080, "resets_at": 1782893849},
+    )
+    _write_codex_rollout(home_a, healthy, name="healthy", mtime=1782300000)
+    _write_codex_rollout(home_a, _CODEX_PREMIUM_DEPLETED, name="refused", mtime=1782301000)
+    _write_codex_rollout(home_b, healthy, name="healthy", mtime=1782300000)
+    usage._codex_cache.clear()
+    snap_a = usage.read_codex_usage(now=_NOW, home=home_a)
+    snap_b = usage.read_codex_usage(now=_NOW, home=home_b)
+    assert snap_a is not None and snap_a.blocked
+    assert snap_b is not None and not snap_b.blocked

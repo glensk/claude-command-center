@@ -865,6 +865,31 @@ def cmd_home(args: argparse.Namespace) -> int:
         email = codex_account_email(effective) or ""
     except Exception:  # pylint: disable=broad-exception-caught  # display-only
         email = ""
+    if getattr(args, "json", False):
+        # The machine contract external drivers (codex-review.py) consume instead of
+        # re-implementing pin/hold resolution — ONE selector, everywhere.
+        label = "default"
+        try:
+            from . import quota  # pylint: disable=import-outside-toplevel
+
+            for name, home_path in quota._canonical_codex_homes().items():  # noqa: SLF001
+                if home_path.expanduser().resolve() == effective.expanduser().resolve():
+                    label = name
+                    break
+        except Exception:  # pylint: disable=broad-exception-caught  # metadata only
+            pass
+        print(
+            json.dumps(
+                {
+                    "home": str(effective),
+                    "source": source,
+                    "label": label,
+                    "email": email,
+                    "until": str(cfg.get("codex_home_until") or ""),
+                }
+            )
+        )
+        return EX_OK
     print(f"codex home: {effective}  [{source}]" + (f"  account: {email}" if email else ""))
     return EX_OK
 
@@ -1012,14 +1037,41 @@ def pinned_codex_home(cfg: dict | None = None, today: date | None = None) -> Pat
 
 
 def _codex_home() -> Path:
-    """Codex state dir: ``$CODEX_HOME`` → the config pin (:func:`pinned_codex_home`) →
-    ``~/.codex``. Every usage/headroom/refusal reader and ``delegate``'s exec env go
-    through here, so a pin moves ALL Codex use to that account at once."""
+    """Codex state dir: ``$CODEX_HOME`` → the quota selector → pin → ``~/.codex``.
+
+    Every usage/headroom/refusal reader and ``delegate``'s exec env go through here, so
+    the answer moves ALL Codex use to that seat at once. The selector
+    (:func:`command_center.quota.select_codex_account`) honours administrative holds
+    and blocked verdicts FIRST and the account pin only among eligible seats — the pin
+    picks a seat, it does not override "do not use this seat". When NOTHING is
+    eligible the pin-else-default order still answers (with a stderr warning): a
+    debate the user explicitly requested must run somewhere. Any selector failure
+    degrades to the pre-selector behaviour (pin-else-default) rather than raising —
+    this function sits on render paths.
+    """
     env = os.environ.get("CODEX_HOME")
     if env:
         return Path(env)
     pinned = pinned_codex_home()
-    return pinned if pinned is not None else Path.home() / ".codex"
+    fallback = pinned if pinned is not None else Path.home() / ".codex"
+    try:
+        from . import quota  # local: quota imports this module's pin reader
+
+        homes = quota._canonical_codex_homes()  # noqa: SLF001
+        rows = quota._codex_quotas(  # noqa: SLF001
+            int(time.time()), quota.read_cooldowns()
+        )
+        selected = quota.select_codex_account(rows, quota._codex_pin_label(homes))  # noqa: SLF001
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return fallback
+    if not selected:
+        print(
+            f"⚠️  no Codex seat is eligible (holds/blocks) — falling back to {fallback}",
+            file=sys.stderr,
+        )
+        return fallback
+    label = selected.partition(":")[2] or "default"
+    return homes.get(label, fallback)
 
 
 def codex_exec_env(base: dict[str, str] | None = None) -> dict[str, str]:
@@ -1222,11 +1274,16 @@ def _latest_limit_block(path: Path) -> _CodexRefusal | None:
     return None
 
 
-def codex_refusal() -> _CodexRefusal | None:
-    """The live refusal Codex last recorded, or ``None`` when calls are going through.
+def codex_refusal(home: Path | None = None) -> _CodexRefusal | None:
+    """The live refusal recorded in *home*'s rollouts (default: the effective home).
 
     Only the NEWEST block across recent rollout files decides: an older refusal that a
     later successful call superseded must never keep the seat marked blocked.
+
+    *home* matters for attribution: each seat's rollouts carry that seat's refusals,
+    and reading "the effective home" while labelling the result "the team seat" is
+    exactly the misattribution ``quota``'s per-seat rows exist to avoid — callers
+    building per-seat rows MUST pass the row's own home.
 
     Deliberately NOT keyed on ``credits.has_credits``. That field is ``false`` on a
     perfectly healthy plan-covered seat — verified 2026-08-28 against sessions that
@@ -1234,7 +1291,7 @@ def codex_refusal() -> _CodexRefusal | None:
     whether calls are being refused. ``rate_limit_reached_type`` is ``null`` while
     healthy and carries the reason once refusals start.
     """
-    sessions = _codex_home() / "sessions"
+    sessions = (home if home is not None else _codex_home()) / "sessions"
     try:
         files = sorted(
             sessions.glob("**/rollout-*.jsonl"),
@@ -2162,6 +2219,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_home.add_argument("path", nargs="?", help="CODEX_HOME to pin (needs its auth.json)")
     p_home.add_argument("-u", "--until", help="pin expires after this ISO date (inclusive)")
     p_home.add_argument("-c", "--clear", action="store_true", help="remove the pin")
+    p_home.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help="machine-readable selection: {home, source, label, email, until}",
+    )
     p_home.set_defaults(func=cmd_home)
 
     p_runs = sub.add_parser(

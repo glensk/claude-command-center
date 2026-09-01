@@ -70,7 +70,14 @@ from . import config, usage
 # (notably the ``ai.py`` commit-message ladder) MUST refuse a version they do not know
 # rather than misread a renamed field — an oracle that is silently misparsed is worse than
 # no oracle, because it removes working rungs.
-SCHEMA_VERSION = 1
+#
+# v2 (2026-09-01): the ``codex`` row now means the CANONICAL team seat (``~/.codex``,
+# env-independent) and a second ``codex:private`` row appears when a private login is
+# configured; ``best_codex_account`` / ``codex_pin`` name the seat delegation should
+# bill; windows carry ``evidence_at``; cooldown-backed rows carry ``block_scope``.
+# A v1 consumer reading a v2 payload could misattribute the ``codex`` row, so the
+# version is bumped and old consumers fail closed to "no opinion" — by design.
+SCHEMA_VERSION = 2
 
 # Provider states. Only BLOCKED may remove a rung from a ladder; UNKNOWN deliberately
 # stays runnable (fail-open), and DISABLED is a config/capability fact with no reset.
@@ -103,7 +110,21 @@ _COPILOT_STALE_AFTER_SEC = 24 * 3600
 # Fable-week-exhausted account as out of tokens for an Opus request.
 _FABLE_MODEL_HINTS = ("fable",)
 
+# The Fable weekly figure is only as fresh as the last successful OAuth fetch
+# (``oauth_fetched_at``): statusline writes refresh ``captured_at`` while PRESERVING a
+# stale Fable value, so judging ``fable_week`` by ``captured_at`` + 7d let a days-old
+# figure govern verdicts as if live. Mirrors the card's own threshold
+# (:data:`usage._FABLE_STALE_AFTER_SEC`).
+_FABLE_EVIDENCE_STALE_SEC = usage._FABLE_STALE_AFTER_SEC  # noqa: SLF001
+
 _COOLDOWNS_NAME = "cooldowns.json"
+
+# Cooldown entry kinds. ``observed`` is a provider's own rejection with a retry
+# deadline; ``hold`` is an ADMINISTRATIVE reservation ("do not use this seat until…")
+# that no observed rejection or success may overwrite or shorten — only its own expiry
+# or an explicit clear removes it.
+KIND_OBSERVED = "observed"
+KIND_HOLD = "hold"
 
 
 @dataclass
@@ -111,13 +132,16 @@ class WindowState:
     """One rate-limit window, resolved to a state.
 
     ``stale`` is tracked separately from ``used_pct`` because a stale 100 % must NOT
-    block: it is a reading from a window that may since have reset.
+    block: it is a reading from a window that may since have reset. ``evidence_at`` is
+    when the figure itself was measured — for ``fable_week`` that is the OAuth fetch,
+    which can be much older than the snapshot's ``captured_at``.
     """
 
     name: str
     used_pct: float
     resets_at: int
     stale: bool = False
+    evidence_at: int = 0
 
     @property
     def exhausted(self) -> bool:
@@ -134,7 +158,7 @@ class WindowState:
 class ProviderQuota:
     """One provider (or one Claude account) resolved to a state, with its evidence."""
 
-    id: str  # "copilot" | "codex" | "gemini" | "claude:<account>"
+    id: str  # "copilot" | "codex[:private]" | "gemini" | "claude:<account>"
     kind: str  # "copilot" | "codex" | "gemini" | "claude"
     state: str  # AVAILABLE | BLOCKED | UNKNOWN | DISABLED
     reason: str = ""  # human explanation, always set for non-available states
@@ -144,9 +168,11 @@ class ProviderQuota:
     resets_at: int = 0  # reset of the BLOCKING window (0 when not blocked)
     captured_at: int = 0  # when the underlying snapshot was taken
     risky: bool = False  # advisory 90 % flag (never removes a rung on its own)
-    account: str = ""  # Claude account label, when kind == "claude"
+    account: str = ""  # Claude account label / Codex home label ("default"|"private")
     config_dir: str = ""  # Claude account config dir, when kind == "claude"
     urgency: float | None = None  # %/hour burn needed to exhaust by reset (Claude only)
+    email: str = ""  # billable identity behind a Codex home (auth.json id_token)
+    block_scope: str = ""  # cooldown-backed blocks: the entry's scope (e.g. "auth", "hold")
 
 
 def _cooldowns_path() -> Path:
@@ -186,6 +212,15 @@ def read_cooldowns(now: int | None = None) -> dict[str, dict]:
     }
 
 
+def _is_live_hold(entry: object, now: int) -> bool:
+    """True for an unexpired administrative hold entry."""
+    return (
+        isinstance(entry, dict)
+        and entry.get("kind") == KIND_HOLD
+        and int(entry.get("blocked_until", 0) or 0) > now
+    )
+
+
 def record_block(
     provider: str,
     *,
@@ -195,16 +230,23 @@ def record_block(
     scope: str = "",
     observed_at: int | None = None,
     source: str = "",
+    kind: str = KIND_OBSERVED,
 ) -> dict:
-    """Record an authoritative rejection for *provider*; returns the stored entry.
+    """Record an authoritative rejection (or a ``kind="hold"``) for *provider*.
 
-    The whole read-merge-write runs under ONE :func:`usage._flock`: atomic replacement
-    alone prevents a corrupt file but not a lost update, and concurrent ``ai.py push``
-    runs marking different providers would otherwise silently drop one another's entries.
+    Returns the stored entry. The whole read-merge-write runs under ONE
+    :func:`usage._flock`: atomic replacement alone prevents a corrupt file but not a
+    lost update, and concurrent ``ai.py push`` runs marking different providers would
+    otherwise silently drop one another's entries.
 
     Writes are ordered by ``observed_at``, not by arrival: a 429 observed before a later
     success must never overwrite that success just because its process was slower to
     write. An older observation is therefore discarded, not applied.
+
+    An unexpired HOLD outranks every observed write regardless of timestamps: "do not
+    use this seat until <deadline>" is policy, and a provider rejection with a shorter
+    retry must not quietly shorten it. Only another explicit hold (or expiry / an
+    explicit clear) replaces a hold.
     """
     observed_at = int(time.time()) if observed_at is None else int(observed_at)
     entry = {
@@ -214,12 +256,15 @@ def record_block(
         "status": int(status),
         "scope": scope,
         "source": source,
+        "kind": kind if kind in (KIND_OBSERVED, KIND_HOLD) else KIND_OBSERVED,
     }
     path = _cooldowns_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with usage._flock(path.with_suffix(".lock")):  # noqa: SLF001
         current = _read_cooldowns_unlocked()
         existing = current.get(provider)
+        if _is_live_hold(existing, observed_at) and entry["kind"] != KIND_HOLD:
+            return existing  # type: ignore[return-value]  # an unexpired hold stands
         if isinstance(existing, dict) and int(existing.get("observed_at", 0) or 0) > observed_at:
             return existing  # a NEWER observation already stands — do not regress it
         current[provider] = entry
@@ -229,11 +274,18 @@ def record_block(
     return entry
 
 
-def clear_block(provider: str, *, observed_at: int | None = None) -> bool:
+def clear_block(
+    provider: str, *, observed_at: int | None = None, observed_only: bool = False
+) -> bool:
     """Drop *provider*'s block (a success, or an explicit ``--clear``). True if removed.
 
     Also ``observed_at``-ordered: clearing is just another observation, so a stale success
     cannot wipe a block recorded after it.
+
+    ``observed_only`` is the SUCCESS-path mode (``ai.py`` clearing a memoized auth
+    failure after a rung served): it refuses to touch an unexpired hold, because a
+    provider working again says nothing about an administrative reservation. An
+    explicit ``ccc quota -c`` (without ``-O``) removes anything.
     """
     observed_at = int(time.time()) if observed_at is None else int(observed_at)
     path = _cooldowns_path()
@@ -244,6 +296,8 @@ def clear_block(provider: str, *, observed_at: int | None = None) -> bool:
         existing = current.get(provider)
         if not isinstance(existing, dict):
             return False
+        if observed_only and _is_live_hold(existing, observed_at):
+            return False  # a success never lifts an administrative hold
         if int(existing.get("observed_at", 0) or 0) > observed_at:
             return False  # a newer block stands
         del current[provider]
@@ -254,18 +308,33 @@ def clear_block(provider: str, *, observed_at: int | None = None) -> bool:
 
 
 def _window_state(
-    name: str, win: usage.Window | None, captured_at: int, now: int, stale_after: int
+    name: str,
+    win: usage.Window | None,
+    captured_at: int,
+    now: int,
+    stale_after: int,
+    evidence_at: int | None = None,
 ) -> WindowState | None:
     """Resolve one :class:`usage.Window` to a :class:`WindowState`, or ``None`` if absent.
 
     A window whose ``resets_at`` has already passed is reported stale: the snapshot
     describes a window that no longer exists, so its percentage proves nothing.
+
+    *evidence_at* overrides which timestamp ages the figure. ``fable_week`` needs it:
+    statusline writes refresh ``captured_at`` while carrying the OLD Fable value
+    forward, so aging that window by ``captured_at`` reported a days-stale figure as
+    live — the bug that let a stale Fable reading govern a definitive verdict.
     """
     if win is None:
         return None
-    stale = (captured_at + stale_after) < now or win.resets_at <= now
+    basis = captured_at if evidence_at is None else evidence_at
+    stale = (basis + stale_after) < now or win.resets_at <= now
     return WindowState(
-        name=name, used_pct=float(win.used_percentage), resets_at=int(win.resets_at), stale=stale
+        name=name,
+        used_pct=float(win.used_percentage),
+        resets_at=int(win.resets_at),
+        stale=stale,
+        evidence_at=basis,
     )
 
 
@@ -309,17 +378,22 @@ def _verdict_from_windows(
 
 
 def _cooldown_quota(pid: str, kind: str, entry: dict) -> ProviderQuota:
-    """Build a BLOCKED provider straight from an observed-rejection entry."""
+    """Build a BLOCKED provider straight from a cooldown entry (rejection or hold)."""
+    is_hold = entry.get("kind") == KIND_HOLD
     return ProviderQuota(
         id=pid,
         kind=kind,
         state=BLOCKED,
-        reason=str(entry.get("reason") or "provider rejected the request"),
-        source="cooldown",
-        blocked_by="observed-rejection",
+        reason=str(
+            entry.get("reason")
+            or ("administrative hold" if is_hold else "provider rejected the request")
+        ),
+        source="hold" if is_hold else "cooldown",
+        blocked_by="hold" if is_hold else "observed-rejection",
         resets_at=int(entry.get("blocked_until", 0) or 0),
         captured_at=int(entry.get("observed_at", 0) or 0),
         risky=True,
+        block_scope=str(entry.get("scope") or ("hold" if is_hold else "")),
     )
 
 
@@ -343,12 +417,15 @@ def _claude_quota(account: str, model: str, now: int, cooldowns: dict[str, dict]
             config_dir=config_dir,
         )
     windows: dict[str, WindowState] = {}
-    for name, win, stale_after in (
-        ("five_hour", snap.five_hour, _SESSION_STALE_AFTER_SEC),
-        ("seven_day", snap.seven_day, _WEEK_STALE_AFTER_SEC),
-        ("fable_week", snap.fable_week, _WEEK_STALE_AFTER_SEC),
+    for name, win, stale_after, evidence_at in (
+        ("five_hour", snap.five_hour, _SESSION_STALE_AFTER_SEC, None),
+        ("seven_day", snap.seven_day, _WEEK_STALE_AFTER_SEC, None),
+        # Fable's figure only changes on a successful OAuth fetch; statusline writes
+        # refresh captured_at while carrying the old value, so the fetch time is the
+        # honest evidence age and the card's 1-hour threshold applies.
+        ("fable_week", snap.fable_week, _FABLE_EVIDENCE_STALE_SEC, snap.oauth_fetched_at),
     ):
-        state = _window_state(name, win, snap.captured_at, now, stale_after)
+        state = _window_state(name, win, snap.captured_at, now, stale_after, evidence_at)
         if state is not None:
             windows[name] = state
     governing = _windows_for_model(windows, model)
@@ -388,14 +465,50 @@ def _urgency(windows: Iterable[WindowState], now: int) -> float | None:
     return (100.0 - min(100.0, max(0.0, win.used_pct))) / hours
 
 
-def _codex_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
-    """Resolve the Codex/ChatGPT seat from its cached window snapshot."""
-    if "codex" in cooldowns:
-        return _cooldown_quota("codex", "codex", cooldowns["codex"])
-    snap = usage.read_codex_usage(now)
+def _canonical_codex_homes() -> dict[str, Path]:
+    """Label → ``CODEX_HOME`` for every Codex login, ENV-INDEPENDENT and deduped.
+
+    Deliberately NOT :func:`config.codex_homes`: that honours an ambient
+    ``$CODEX_HOME``, so a process launched with the private home in its env would
+    label the private path ``codex`` and list the same seat twice — and a hold on
+    ``codex`` would then mean different seats in different processes. Provider ids
+    must name the same billable identity everywhere.
+    """
+    homes: dict[str, Path] = {"default": Path.home() / ".codex"}
+    private = config.codex_home_private()
+    if private is not None:
+        try:
+            same = private.expanduser().resolve() == homes["default"].expanduser().resolve()
+        except OSError:  # pragma: no cover - resolve() fails only on exotic filesystems
+            same = str(private) == str(homes["default"])
+        if not same:
+            homes["private"] = private
+    return homes
+
+
+def _codex_seat_quota(
+    pid: str, label: str, home: Path, now: int, cooldowns: dict[str, dict]
+) -> ProviderQuota:
+    """Resolve ONE Codex/ChatGPT seat from its cached window snapshot."""
+    email = ""
+    try:
+        email = usage.codex_account_email(home) or ""
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        email = ""  # identity is display metadata, never a reason to fail the row
+    if pid in cooldowns:
+        quota = _cooldown_quota(pid, "codex", cooldowns[pid])
+        quota.account, quota.email = label, email
+        return quota
+    snap = usage.read_codex_usage(now, home)
     if snap is None:
         return ProviderQuota(
-            id="codex", kind="codex", state=UNKNOWN, reason="no usage snapshot", source="windows"
+            id=pid,
+            kind="codex",
+            state=UNKNOWN,
+            reason="no usage snapshot",
+            source="windows",
+            account=label,
+            email=email,
         )
     windows: dict[str, WindowState] = {}
     for name, win, stale_after in (
@@ -415,7 +528,7 @@ def _codex_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
             default=None,
         )
         return ProviderQuota(
-            id="codex",
+            id=pid,
             kind="codex",
             state=BLOCKED,
             reason=snap.blocked_reason,
@@ -424,10 +537,12 @@ def _codex_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
             blocked_by=full.name if full is not None else "refusal",
             resets_at=full.resets_at if full is not None else 0,
             captured_at=snap.blocked_at or snap.captured_at,
+            account=label,
+            email=snap.email or email,
         )
     verdict, reason, blocked_by, resets_at, risky = _verdict_from_windows(windows.values())
     return ProviderQuota(
-        id="codex",
+        id=pid,
         kind="codex",
         state=verdict,
         reason=reason,
@@ -437,7 +552,58 @@ def _codex_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
         resets_at=resets_at,
         captured_at=snap.captured_at,
         risky=risky,
+        account=label,
+        email=snap.email or email,
     )
+
+
+def _codex_quotas(now: int, cooldowns: dict[str, dict]) -> list[ProviderQuota]:
+    """One row per configured Codex seat: ``codex`` (team), then ``codex:private``."""
+    rows = []
+    for label, home in _canonical_codex_homes().items():
+        pid = "codex" if label == "default" else f"codex:{label}"
+        rows.append(_codex_seat_quota(pid, label, home, now, cooldowns))
+    return rows
+
+
+def _codex_pin_label(homes: dict[str, Path]) -> str:
+    """The label of an ACTIVE codex-in-claude account pin, or ``""``.
+
+    The pin lives in codex-in-claude's own config (``codex_home`` +
+    ``codex_home_until``); mapping its path onto the canonical homes names the seat in
+    this module's vocabulary. A pin at a path outside the known homes reports ``""`` —
+    the selector then treats it as absent rather than inventing an id.
+    """
+    from . import codex_in_claude  # local: keep quota importable without the CLI half
+
+    pinned = codex_in_claude.pinned_codex_home()
+    if pinned is None:
+        return ""
+    for label, home in homes.items():
+        try:
+            if pinned.expanduser().resolve() == home.expanduser().resolve():
+                return label
+        except OSError:  # pragma: no cover - resolve() fails only on exotic filesystems
+            if str(pinned) == str(home):
+                return label
+    return ""
+
+
+def select_codex_account(rows: list[ProviderQuota], pin_label: str) -> str:
+    """The provider id of the Codex seat delegation should bill, or ``""``.
+
+    Precedence (debate-settled): seats under a hold or any BLOCKED/DISABLED verdict
+    are excluded FIRST; an eligible pin wins; otherwise the first eligible seat in
+    team→private order. When nothing is eligible the answer is ``""`` — the executor
+    (:func:`codex_in_claude._codex_home`) then falls back pin-else-default loudly,
+    because a debate the user explicitly requested must still be able to run.
+    """
+    eligible = [row for row in rows if row.state not in (BLOCKED, DISABLED)]
+    if pin_label:
+        pinned = next((row for row in eligible if row.account == pin_label), None)
+        if pinned is not None:
+            return pinned.id
+    return eligible[0].id if eligible else ""
 
 
 def _copilot_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
@@ -544,14 +710,18 @@ def snapshot(
     # Usable accounts first, then by descending urgency (spend what resets soonest).
     claude.sort(key=lambda q: (q.state != AVAILABLE, -(q.urgency or 0.0)))
 
+    homes = _canonical_codex_homes()
+    codex_rows = _codex_quotas(now, cooldowns)
+    pin_label = _codex_pin_label(homes)
+
     providers = [
         _copilot_quota(now, cooldowns),
-        _codex_quota(now, cooldowns),
+        *codex_rows,
         *claude,
         _gemini_quota(cooldowns),
     ]
     best = next((q.id for q in claude if q.state == AVAILABLE), "")
-    return {
+    result: dict[str, Any] = {
         "version": SCHEMA_VERSION,
         "now": now,
         "model": model,
@@ -559,8 +729,19 @@ def snapshot(
         # decision owned by each caller's ladder config, not a quota fact this module can
         # know. Only Claude-account ranking is a quota-domain decision.
         "best_claude_account": best,
+        # The Codex seat delegation (codex-debate / codex-implement / ccc's own codex
+        # calls) should bill: pin > eligibility > team-first. "" = nothing eligible.
+        "best_codex_account": select_codex_account(codex_rows, pin_label),
         "providers": [_provider_dict(q) for q in providers],
     }
+    if pin_label:
+        from . import codex_in_claude  # local: display metadata only
+
+        result["codex_pin"] = {
+            "account": pin_label,
+            "until": str(codex_in_claude.load_config().get("codex_home_until") or ""),
+        }
+    return result
 
 
 def _provider_dict(quota: ProviderQuota) -> dict[str, Any]:
@@ -598,6 +779,8 @@ def _rehydrate(raw: dict[str, Any]) -> ProviderQuota:
         account=raw.get("account", ""),
         config_dir=raw.get("config_dir", ""),
         urgency=raw.get("urgency"),
+        email=raw.get("email", ""),
+        block_scope=raw.get("block_scope", ""),
     )
 
 

@@ -192,6 +192,25 @@ def _dispatch_route(
     return (f"llm_custom_command → {_elide(command, 28)}", "external router", "")
 
 
+def _codex_seat_label() -> str:
+    """Which Codex seat ccc's own codex calls would bill right now (selector-resolved).
+
+    ``llm.run_codex`` routes through :func:`codex_in_claude.codex_exec_env`, so showing
+    a hardcoded "codex default" here could lie about the billed account whenever a pin
+    or hold is active. Display-only: any failure degrades to the old wording.
+    """
+    try:
+        from . import codex_in_claude, quota
+
+        home = codex_in_claude._codex_home()  # noqa: SLF001
+        for label, path in quota._canonical_codex_homes().items():  # noqa: SLF001
+            if path.expanduser().resolve() == home.expanduser().resolve():
+                return label
+        return str(home)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return "codex default"
+
+
 def _rung(
     name: str, cfg: Config, purpose: str, routes: dict[str, tuple[str, str, str]]
 ) -> tuple[str, str, str]:
@@ -199,7 +218,7 @@ def _rung(
     if name == "claude":
         return _dispatch_route(cfg, cfg.score_model or cfg.llm_model, purpose, routes)
     if name == "codex":
-        return ("codex exec → (codex default)", CODEX_COST, "")
+        return (f"codex exec → ({_codex_seat_label()} seat)", CODEX_COST, "")
     if name == "copilot":
         return (f"opencode → {cfg.copilot_model or '(default)'}", "Copilot/EPFL seat", "")
     if name == "gemini":

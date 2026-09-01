@@ -2201,24 +2201,54 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
     now = int(time.time())
 
     if args.mark:
-        if args.retry_after is None:
-            print("quota: -m/--mark requires -u/--retry-after SEC", file=sys.stderr)
+        if (args.retry_after is None) == (not args.until):
+            print(
+                "quota: -m/--mark requires exactly one of -u/--retry-after SEC or -U/--until STAMP",
+                file=sys.stderr,
+            )
             return 2
+        if args.until:
+            # Local-time ISO stamp; the deadline is EXCLUSIVE ("blocked while now <
+            # stamp"), matching the store's `blocked_until > now` liveness test — so a
+            # seat held "until Sunday night" frees at Monday 00:00:00, not 23:59:00.
+            from datetime import datetime
+
+            try:
+                blocked_until = int(datetime.fromisoformat(args.until).timestamp())
+            except ValueError:
+                print(
+                    f"quota: -U/--until must be an ISO stamp "
+                    f"(e.g. 2026-09-07T00:00), got {args.until!r}",
+                    file=sys.stderr,
+                )
+                return 2
+        else:
+            blocked_until = now + max(0, args.retry_after)
+        kind = quota.KIND_HOLD if args.hold else quota.KIND_OBSERVED
         entry = quota.record_block(
             args.mark,
-            blocked_until=now + max(0, args.retry_after),
-            reason=args.reason or "provider rejected the request",
+            blocked_until=blocked_until,
+            reason=args.reason
+            or ("administrative hold" if args.hold else "provider rejected the request"),
             source="cli",
             observed_at=now,
+            kind=kind,
+            scope=args.scope,
         )
+        if entry.get("kind") == quota.KIND_HOLD and kind != quota.KIND_HOLD:
+            print(f"quota: {args.mark} has an unexpired HOLD — observed mark not applied")
+            return 0
         until = usage.format_reset(int(entry["blocked_until"]), now)
-        print(f"quota: {args.mark} blocked, unblocks {until}")
+        word = "held" if entry.get("kind") == quota.KIND_HOLD else "blocked"
+        print(f"quota: {args.mark} {word}, unblocks {until}")
         return 0
 
     if args.clear:
-        print(
-            f"quota: {args.clear} {'cleared' if quota.clear_block(args.clear) else 'not blocked'}"
-        )
+        cleared = quota.clear_block(args.clear, observed_only=args.observed_only)
+        outcome = "cleared" if cleared else "not blocked"
+        if not cleared and args.observed_only:
+            outcome = "not cleared (no observed block; holds need a plain -c)"
+        print(f"quota: {args.clear} {outcome}")
         return 0
 
     if args.refresh:
@@ -2255,7 +2285,7 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
         print(json.dumps(snap, indent=2))
         return 0
 
-    print(f"  {'provider':<16} {'state':<10} {'unblocks':<16} windows")
+    print(f"  {'provider':<16} {'state':<10} {'data age':<12} {'unblocks':<16} windows")
     for prov in snap["providers"]:
         state = prov["state"]
         unblocks = (
@@ -2263,6 +2293,16 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
             if prov.get("resets_at")
             else ("—" if state != quota.AVAILABLE else "")
         )
+        # How old the evidence behind this verdict is. Cooldown/hold rows are labelled
+        # as the age of the MARK, not of quota data — a hold recorded yesterday says
+        # nothing about yesterday's usage figures.
+        captured = int(prov.get("captured_at", 0) or 0)
+        if not captured:
+            age = "—"
+        elif prov.get("source") in ("cooldown", "hold"):
+            age = f"marked {usage._format_age(max(0, now - captured))}"  # noqa: SLF001
+        else:
+            age = usage._format_age(max(0, now - captured))  # noqa: SLF001
         wins = " ".join(
             f"{name.replace('_', '')} {win['used_pct']:.0f}%{'(stale)' if win.get('stale') else ''}"
             for name, win in (prov.get("windows") or {}).items()
@@ -2273,9 +2313,18 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
         # hiding why it is blocked — and a refusal's windows read as healthy headroom.
         if wins and state != quota.AVAILABLE and prov.get("reason"):
             detail = f"{prov['reason']} ({wins})"
-        print(f"  {mark} {prov['id']:<14} {state:<10} {unblocks:<16} {detail}")
+        if prov.get("email"):
+            detail = f"{detail}  [{prov['email']}]" if detail else f"[{prov['email']}]"
+        print(f"  {mark} {prov['id']:<14} {state:<10} {age:<12} {unblocks:<16} {detail}")
     if snap["best_claude_account"]:
         print(f"best Claude account (spends what resets soonest): {snap['best_claude_account']}")
+    best_codex = snap.get("best_codex_account", "")
+    pin = snap.get("codex_pin") or {}
+    pin_note = f"  [pin: {pin['account']} until {pin.get('until') or '∞'}]" if pin else ""
+    if best_codex:
+        print(f"codex seat for delegation (pin/holds-aware): {best_codex}{pin_note}")
+    else:
+        print(f"codex seat for delegation: none eligible (holds/blocks){pin_note}")
     return 0
 
 
@@ -3909,8 +3958,35 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SEC",
         help="seconds until the marked provider unblocks (with -m)",
     )
+    p_quota.add_argument(
+        "-U",
+        "--until",
+        metavar="STAMP",
+        help="local ISO deadline for -m, EXCLUSIVE (blocked while now < STAMP), "
+        "e.g. 2026-09-07T00:00",
+    )
+    p_quota.add_argument(
+        "-H",
+        "--hold",
+        action="store_true",
+        help="mark as an administrative HOLD: observed rejections/successes cannot "
+        "overwrite or clear it — only expiry or an explicit -c",
+    )
     p_quota.add_argument("-R", "--reason", default="", help="why the provider is blocked (with -m)")
+    p_quota.add_argument(
+        "-s",
+        "--scope",
+        default="",
+        help="block scope tag for -m (e.g. 'auth' = entitlement/login failure; "
+        "consumers may treat auth-scoped blocks as not worth a last-resort retry)",
+    )
     p_quota.add_argument("-c", "--clear", metavar="ID", help="drop a provider's block")
+    p_quota.add_argument(
+        "-O",
+        "--observed-only",
+        action="store_true",
+        help="with -c: clear only an observed block, never a hold (the success-path mode)",
+    )
     p_quota.set_defaults(func=cmd_quota)
 
     p_rm = sub.add_parser("rm", help="remove a tracked session from the command center")

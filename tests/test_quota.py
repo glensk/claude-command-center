@@ -98,10 +98,44 @@ def test_claude_account_blocked_for_fable_but_available_for_opus(
         five_hour=_win(4.0),
         seven_day=_win(83.0, 86400),
         fable_week=_win(100.0, 86400),
+        oauth_fetched_at=NOW,  # Fable evidence is only as fresh as the OAuth fetch
     )
     monkeypatch.setattr(usage, "read_usage", lambda _a: snap)
     assert quota._claude_quota("private", "claude-fable-5", NOW, {}).state == quota.BLOCKED
     assert quota._claude_quota("private", "claude-opus-4-6", NOW, {}).state == quota.AVAILABLE
+
+
+def test_stale_fable_evidence_governs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fresh ``captured_at`` + stale ``oauth_fetched_at`` ⇒ the Fable window is stale.
+
+    Statusline writes refresh ``captured_at`` while CARRYING the old Fable value, so a
+    days-old 100 % Fable figure used to read as live and block Fable routing. The
+    evidence for ``fable_week`` is the OAuth fetch time, with the card's 1 h threshold.
+    """
+    snap = usage.Usage(
+        captured_at=NOW,  # a statusline write seconds ago
+        five_hour=_win(4.0),
+        seven_day=_win(83.0, 86400),
+        fable_week=_win(100.0, 86400),
+        oauth_fetched_at=NOW - 7200,  # ...but no OAuth fetch for 2 h
+    )
+    monkeypatch.setattr(usage, "read_usage", lambda _a: snap)
+    got = quota._claude_quota("private", "claude-fable-5", NOW, {})
+    assert got.state == quota.AVAILABLE  # stale 100 % must not block
+    assert got.windows["fable_week"].stale
+    assert got.windows["fable_week"].evidence_at == NOW - 7200
+
+
+def test_never_fetched_fable_is_stale_not_blocking(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``oauth_fetched_at=0`` (no OAuth fetch ever) can never let Fable block."""
+    snap = usage.Usage(
+        captured_at=NOW,
+        five_hour=_win(4.0),
+        seven_day=_win(83.0, 86400),
+        fable_week=_win(100.0, 86400),
+    )
+    monkeypatch.setattr(usage, "read_usage", lambda _a: snap)
+    assert quota._claude_quota("private", "claude-fable-5", NOW, {}).state == quota.AVAILABLE
 
 
 # ── copilot precedence ───────────────────────────────────────────────────────────
@@ -230,7 +264,7 @@ def test_temp_pattern_covers_the_cooldown_store() -> None:
 
 def test_snapshot_is_versioned_and_json_serializable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(usage, "read_usage", lambda _a: None)
-    monkeypatch.setattr(usage, "read_codex_usage", lambda _n=None: None)
+    monkeypatch.setattr(usage, "read_codex_usage", lambda _n=None, _h=None: None)
     monkeypatch.setattr(usage, "read_copilot_usage", lambda: None)
     snap = quota.snapshot(model="claude-opus-4-6", now=NOW)
     assert snap["version"] == quota.SCHEMA_VERSION
@@ -287,3 +321,120 @@ def test_snapshot_is_fast() -> None:
     start = time.monotonic()
     quota.snapshot(model="claude-opus-4-6", now=NOW)
     assert time.monotonic() - start < 1.0
+
+
+# ── administrative holds (kind="hold") ──────────────────────────────────────────
+
+
+def test_observed_rejection_cannot_overwrite_an_unexpired_hold() -> None:
+    """A provider 429 with a shorter retry must not quietly shorten a policy hold."""
+    quota.record_block(
+        "codex", blocked_until=NOW + 5 * 86400, observed_at=NOW, kind=quota.KIND_HOLD
+    )
+    quota.record_block("codex", blocked_until=NOW + 60, observed_at=NOW + 10, reason="429")
+    entry = quota.read_cooldowns(NOW + 20)["codex"]
+    assert entry["kind"] == quota.KIND_HOLD
+    assert entry["blocked_until"] == NOW + 5 * 86400
+
+
+def test_success_clear_skips_holds_but_explicit_clear_removes_them() -> None:
+    quota.record_block("codex", blocked_until=NOW + 86400, observed_at=NOW, kind=quota.KIND_HOLD)
+    # The success path (ai.py after a rung served) must never lift a reservation.
+    assert not quota.clear_block("codex", observed_at=NOW + 10, observed_only=True)
+    assert "codex" in quota.read_cooldowns(NOW + 20)
+    # A human's explicit `ccc quota -c` removes anything.
+    assert quota.clear_block("codex", observed_at=NOW + 30)
+    assert "codex" not in quota.read_cooldowns(NOW + 40)
+
+
+def test_hold_deadline_is_exclusive() -> None:
+    """`-U 2026-09-07T00:00` means blocked while now < deadline — free AT the instant."""
+    deadline = NOW + 1000
+    quota.record_block("codex", blocked_until=deadline, observed_at=NOW, kind=quota.KIND_HOLD)
+    assert "codex" in quota.read_cooldowns(deadline - 1)
+    assert "codex" not in quota.read_cooldowns(deadline)
+    assert "codex" not in quota.read_cooldowns(deadline + 1)
+
+
+def test_hold_row_reports_scope_and_source() -> None:
+    quota.record_block(
+        "codex",
+        blocked_until=NOW + 86400,
+        observed_at=NOW,
+        kind=quota.KIND_HOLD,
+        reason="team seat reserved",
+    )
+    row = quota._cooldown_quota("codex", "codex", quota.read_cooldowns(NOW + 1)["codex"])
+    assert (row.state, row.source, row.block_scope) == (quota.BLOCKED, "hold", "hold")
+
+
+# ── codex seats: canonical identity + selection ──────────────────────────────────
+
+
+def test_canonical_codex_homes_ignore_ambient_codex_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A process running WITH the private home in its env must not relabel the seats."""
+    private = tmp_path / "codex-private"
+    monkeypatch.setenv("CODEX_HOME", str(private))  # ambient override must not leak in
+    monkeypatch.setattr(quota.config, "codex_home_private", lambda: private)
+    homes = quota._canonical_codex_homes()
+    assert homes["default"] == Path.home() / ".codex"
+    assert homes["private"] == private
+
+
+def test_private_home_equal_to_default_is_deduped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(quota.config, "codex_home_private", lambda: Path.home() / ".codex")
+    assert list(quota._canonical_codex_homes()) == ["default"]
+
+
+def _codex_row(pid: str, label: str, state: str) -> quota.ProviderQuota:
+    return quota.ProviderQuota(id=pid, kind="codex", state=state, account=label)
+
+
+def test_selector_prefers_eligible_pin() -> None:
+    rows = [
+        _codex_row("codex", "default", quota.AVAILABLE),
+        _codex_row("codex:private", "private", quota.AVAILABLE),
+    ]
+    assert quota.select_codex_account(rows, "private") == "codex:private"
+
+
+def test_selector_excludes_held_seats_before_the_pin() -> None:
+    """A pin on a held/blocked seat must not override 'do not use this seat'."""
+    rows = [
+        _codex_row("codex", "default", quota.BLOCKED),
+        _codex_row("codex:private", "private", quota.AVAILABLE),
+    ]
+    assert quota.select_codex_account(rows, "default") == "codex:private"
+
+
+def test_selector_unknown_is_eligible_and_team_first() -> None:
+    """UNKNOWN stays usable (fail-open), and the team seat leads without a pin."""
+    rows = [
+        _codex_row("codex", "default", quota.UNKNOWN),
+        _codex_row("codex:private", "private", quota.AVAILABLE),
+    ]
+    assert quota.select_codex_account(rows, "") == "codex"
+
+
+def test_selector_returns_empty_when_nothing_is_eligible() -> None:
+    rows = [
+        _codex_row("codex", "default", quota.BLOCKED),
+        _codex_row("codex:private", "private", quota.BLOCKED),
+    ]
+    assert quota.select_codex_account(rows, "private") == ""
+
+
+def test_snapshot_has_one_row_per_codex_seat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(quota.config, "codex_home_private", lambda: tmp_path / "codex-private")
+    monkeypatch.setattr(usage, "read_usage", lambda _a: None)
+    monkeypatch.setattr(usage, "read_codex_usage", lambda _n=None, _h=None: None)
+    monkeypatch.setattr(usage, "read_copilot_usage", lambda: None)
+    snap = quota.snapshot(model="claude-opus-4-6", now=NOW)
+    ids = [p["id"] for p in snap["providers"] if p["kind"] == "codex"]
+    assert ids == ["codex", "codex:private"]
+    assert snap["version"] == quota.SCHEMA_VERSION
+    assert "best_codex_account" in snap

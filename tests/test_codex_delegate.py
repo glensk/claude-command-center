@@ -1003,3 +1003,31 @@ def test_cmd_home_sets_and_clears_pin(
     assert cic.cmd_home(argparse.Namespace(path=None, until=None, clear=True)) == cic.EX_OK
     saved = json.loads(cfg_path.read_text(encoding="utf-8"))
     assert saved["codex_home"] is None
+
+
+def test_codex_home_fails_over_when_default_seat_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No pin + a hold on the team seat ⇒ delegation bills the private seat.
+
+    The selector (quota.select_codex_account) is the ONE decider: holds/blocks exclude
+    a seat before the pin or the default order get a say.
+    """
+    from command_center import config, quota, usage
+
+    engine = _load_engine()
+    private = tmp_path / "codex-private"
+    private.mkdir()
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude-home"))
+    monkeypatch.setenv("CODEX_IN_CLAUDE_CONFIG", str(tmp_path / "config.json"))  # no pin
+    monkeypatch.setattr(config, "codex_home_private", lambda: private)
+    monkeypatch.setattr(usage, "codex_account_email", lambda _h: "")
+    monkeypatch.setattr(usage, "read_codex_usage", lambda _n=None, _h=None: None)
+    quota.record_block(
+        "codex",
+        blocked_until=int(time.time()) + 3600,
+        kind=quota.KIND_HOLD,
+        reason="team seat reserved",
+    )
+    assert engine._codex_home() == private

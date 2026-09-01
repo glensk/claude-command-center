@@ -1689,14 +1689,6 @@ def _staple_refusal(snapshot: Usage | None, refusal: object, now: int) -> Usage:
     )
 
 
-def _is_default_codex_home(home: Path) -> bool:
-    """True when *home* is the default ``CODEX_HOME`` (the one that writes rollout files)."""
-    try:
-        return home.expanduser().resolve() == config.codex_home().expanduser().resolve()
-    except OSError:  # pragma: no cover - resolve() only fails on exotic filesystems
-        return str(home) == str(config.codex_home())
-
-
 def read_codex_usage(now: int | None = None, home: Path | None = None) -> Usage | None:
     """Current Codex rate-limit snapshot for *home* — the LIVE figures when they are newer.
 
@@ -1710,15 +1702,15 @@ def read_codex_usage(now: int | None = None, home: Path | None = None) -> Usage 
     A live refusal (:func:`codex_in_claude.codex_refusal`) is read separately from the
     windowless blocks the window scan skips and stapled on, EXCEPT when the chosen live
     snapshot is already newer than it (the endpoint reports the block itself, and its
-    windows are the ones that actually filled). The refusal/rollout path applies only to
-    the DEFAULT home — those files are written by the default login.
+    windows are the ones that actually filled). The refusal is scanned from THIS home's
+    own rollouts — reading the pin-effective home here used to staple a private seat's
+    refusal onto the team seat's row whenever a pin was active.
 
     Parsing is cached per home on the newest rollout file's and the live cache's
     ``(path, mtime)`` so the 5 s TUI refresh stays cheap when idle.
     """
     now = int(time.time()) if now is None else now
     home = config.codex_home() if home is None else home
-    default_home = _is_default_codex_home(home)
     files = _codex_rollout_files(home)
     key = _path_key(files[0] if files else None) + _path_key(_codex_usage_path(home))
     cached = _codex_cache.get(str(home))
@@ -1728,7 +1720,7 @@ def read_codex_usage(now: int | None = None, home: Path | None = None) -> Usage 
     # A refusal lives in the windowless blocks the window scan skips, so it is read
     # separately: the windows keep reporting the last healthy figures while Codex rejects
     # every call, and only this field says so.
-    refusal = codex_refusal() if default_home else None
+    refusal = codex_refusal(home)
     live = read_codex_live(home)
     snapshot: Usage | None
     if live is not None and (rollout is None or live.captured_at >= rollout.captured_at):

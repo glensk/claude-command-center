@@ -230,7 +230,15 @@ def run_codex(prompt: str, model: str = "") -> str | None:
     """
     if not shutil.which("codex"):
         return None
-    env = dict(os.environ)
+    # Bill the seat the shared selector picks (pin/holds-aware) instead of whatever
+    # CODEX_HOME the ambient environment happens to carry — ccc's own short calls used
+    # to silently spend the default (team) seat even while it was pinned away or held.
+    try:
+        from .codex_in_claude import codex_exec_env  # lazy: keep module import light
+
+        env = codex_exec_env()
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        env = dict(os.environ)
     env["CCC_INTERNAL"] = "1"
     env["AI_NO_AUTOCOMMIT"] = "1"
     out_path = ""

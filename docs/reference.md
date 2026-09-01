@@ -1810,15 +1810,27 @@ paid a doomed retry — 300 s of it, because the same-seat OpenCode fallback re-
 already-refused request.
 
 ```commands
-ccc quota                       # human table: provider · state · unblocks · windows
-ccc quota -j                    # versioned JSON contract (for scripts)
-ccc quota -p copilot            # one provider; exit 0=available 1=blocked 2=unknown
+ccc quota                       # human table: provider · state · data age · unblocks · windows
+ccc quota -j                    # versioned JSON contract (for scripts), schema v2
+ccc quota -p codex:private      # one provider; exit 0=available 1=blocked 2=unknown
 ccc quota -b                    # best CLAUDE account label only
 ccc quota -M claude-opus-4-6    # scope Claude windows to the model you will call
 ccc quota -r                    # force a live re-fetch (the ONLY networked path)
 ccc quota -m copilot -u 272848 -R "429 quota exceeded"   # record an authoritative block
-ccc quota -c copilot            # clear a block
+ccc quota -m codex -H -U 2026-09-07T00:00 -R "team seat reserved"  # administrative HOLD
+ccc quota -c copilot            # clear a block (also the only way to lift a hold)
+ccc quota -c claude:private -O  # observed-only clear: lifts a rejection, never a hold
 ```
+
+Both Codex seats appear as their own rows — `codex` (the canonical team seat,
+`~/.codex`, env-independent) and `codex:private` (`codex_home_private`) — each with the
+account e-mail from its `auth.json` as identity proof and its own rollout-refusal
+attribution. The footer names the seat delegation bills right now
+(`best_codex_account`: an ELIGIBLE pin wins, holds/blocks exclude a seat first,
+team-first otherwise); `codex-in-claude`'s `_codex_home()`, `codex-review.py` (via
+`codex-in-claude.py home -j`) and ccc's own `llm.run_codex` all follow that one
+selector. The `data age` column shows how old each row's governing evidence is
+(`marked <age>` for cooldown/hold rows — the age of the mark, not of quota data).
 
 ### Four states, and why the distinction matters
 
@@ -1861,6 +1873,18 @@ It is *retry suppression*, not a billing calendar. The whole read-merge-write ru
 one `flock` (atomic replacement alone prevents corruption but not lost updates), and
 entries apply by `observed_at` so a slow process's stale 429 cannot overwrite a later
 success.
+
+Two entry kinds share the store. `observed` (the default) is a provider's own
+rejection; `hold` (`-H`, deadline via `-U`, EXCLUSIVE — blocked while `now < STAMP`)
+is an administrative reservation ("leave the team seat alone until the weekly reset").
+An unexpired hold outranks every observed write regardless of timestamps, a success
+never lifts it (`-O` exists precisely so success-path clears cannot), and only expiry
+or an explicit `-c` removes it. `scope` tags why a block exists — `ai.py` records
+Claude auth/billing failures with `scope=auth`, and its all-blocked safety valve
+refuses to restore auth-scoped rungs (an unpaid seat rejects every attempt until a
+human acts). Expiry is filtered on READ, so concurrent invocations racing an expired
+entry can each probe once before the first failure re-records — accepted; they
+converge via `observed_at` ordering.
 
 ## Layout
 
