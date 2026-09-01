@@ -170,6 +170,66 @@ def _claude_json_path(config_dir: str | Path) -> Path:
     return _resolve(config_dir) / ".claude.json"
 
 
+TRUST_KEY = "hasTrustDialogAccepted"
+
+
+def ensure_trusted(config_dir: str, cwd: str | Path | None = None) -> bool:
+    """Trust *cwd* (default: the process cwd) for the account of *config_dir*.
+
+    Claude Code's "Do you trust the files in this folder?" answer is
+    ``projects[<abs cwd>].hasTrustDialogAccepted`` in that ACCOUNT's
+    ``.claude.json`` (:func:`_claude_json_path`) — private and work are separate
+    files, so a folder trusted on one seat still prompts on the other, and an
+    unattended launch (``ccc start-job`` from launchd, a tp drive) parks on the
+    dialog forever (2026-09-01: gitlab-ci-watch's sandbox clone). Albert's rule:
+    every folder he launches into is trusted, on every account. Only that key is
+    written, atomically; a missing config (an account that never ran) is left
+    alone. Returns True when the file was written.
+    """
+    import json
+    import os
+    import tempfile
+
+    target = str(Path(cwd).resolve()) if cwd else os.getcwd()
+    # Claude Code's layout: the DEFAULT account's file is the config dir's SIBLING
+    # (~/.claude.json next to ~/.claude/), any other account's is inside its dir.
+    # Derived from the config dir (not Path.home()) so a test that pins CLAUDE_HOME
+    # under tmp can never reach the real ~/.claude.json.
+    resolved = _resolve(config_dir)
+    path = (
+        (resolved.parent / ".claude.json")
+        if is_default_config_dir(config_dir)
+        else resolved / ".claude.json"
+    )
+    try:
+        with path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    projects = data.setdefault("projects", {})
+    if not isinstance(projects, dict):
+        return False
+    entry = projects.get(target)
+    if not isinstance(entry, dict):
+        entry = {}
+        projects[target] = entry
+    if entry.get(TRUST_KEY) is True:
+        return False
+    entry[TRUST_KEY] = True
+    fd, tmp = tempfile.mkstemp(prefix=".claude.json.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+        os.replace(tmp, path)
+    except OSError:
+        Path(tmp).unlink(missing_ok=True)
+        return False
+    return True
+
+
 def account_email(config_dir: str) -> str | None:
     """The email currently logged into *config_dir*'s Claude account, or ``None``.
 
@@ -394,6 +454,9 @@ def apply_to_environ(config_dir: str) -> None:
         os.environ.pop(_CONFIG_VAR, None)
     else:
         os.environ[_CONFIG_VAR] = _export_value(config_dir)
+    # The exec that follows starts claude in os.getcwd(): trust it for this
+    # account first, or an unattended launch parks on the trust dialog.
+    ensure_trusted(config_dir)
 
 
 def launch_env_prefix(config_dir: str) -> str:

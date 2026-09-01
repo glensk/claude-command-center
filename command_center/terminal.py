@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Open a session in a new terminal tab (macOS: iTerm2, fallback Terminal.app).
+"""Open a session in a new terminal tab (macOS: iTerm2 only — never Terminal.app).
 
 Used by the TUI's one-key "resume" action: open a fresh tab rooted in the
 session's cwd and run ``claude --resume <id>``.
@@ -407,7 +407,7 @@ def focus_tmux_window(session_id: str) -> bool:
         # No client attached: open a fresh iTerm tab that attaches to the session. No
         # _tmux_window fallback here — attaching from inside tmux is nonsense.
         command = f"tmux attach -t {shlex.quote(tmux_session)}"
-        return _iterm(command) or _iterm_api_tab(command) or _terminal_app(command)
+        return _iterm(command) or _iterm_api_tab(command)
     except (subprocess.SubprocessError, OSError):
         return False
 
@@ -420,13 +420,14 @@ def resume_in_new_tab(cwd: str, session_id: str, config_dir: str = "") -> bool:
     OWN account (the default account unsets ``CLAUDE_CONFIG_DIR``; any other sets it) —
     a fresh tab's ambient env can never silently bill the wrong account.
     """
-    from .accounts import launch_env_prefix
+    from .accounts import ensure_trusted, launch_env_prefix
 
+    ensure_trusted(config_dir, cwd)  # the tab's claude must not park on the trust dialog
     prefix = launch_env_prefix(config_dir)
     if _launcher_mode() == "tmux":
         return _tmux_window(f"{prefix}claude --resume {shlex.quote(session_id)}", cwd=cwd)
     command = f"{prefix}cd {shlex.quote(cwd)} && claude --resume {shlex.quote(session_id)}"
-    return _iterm(command) or _iterm_api_tab(command) or _terminal_app(command)
+    return _iterm(command) or _iterm_api_tab(command)
 
 
 def resume_halted_in_new_tab(
@@ -440,7 +441,7 @@ def resume_halted_in_new_tab(
     re-probing; if the limit is secretly back the resume just 429s and the session
     re-halts (detected next tick) — no orphaned waiting tab. The tab keeps the
     resumed REPL open. Returns False (no launch) when *cwd* or *script_path* is
-    missing. macOS / iTerm2, with Terminal.app fallback.
+    missing. macOS / iTerm2 only.
 
     The whole shell command is shlex-quoted (for the shell) AND the resulting
     string is ``_as_quote``-escaped before it is embedded in the AppleScript
@@ -448,10 +449,11 @@ def resume_halted_in_new_tab(
     """
     import os
 
-    from .accounts import launch_env_prefix
+    from .accounts import ensure_trusted, launch_env_prefix
 
     if not cwd or not os.path.isdir(cwd) or not script_path:
         return False
+    ensure_trusted(config_dir, cwd)
     prefix = launch_env_prefix(config_dir)
     if _launcher_mode() == "tmux":
         return _tmux_window(
@@ -460,7 +462,7 @@ def resume_halted_in_new_tab(
     command = (
         f"{prefix}cd {shlex.quote(cwd)} && {shlex.quote(script_path)} {shlex.quote(session_id)} now"
     )
-    return _iterm(command) or _iterm_api_tab(command) or _terminal_app(command)
+    return _iterm(command) or _iterm_api_tab(command)
 
 
 def start_job_in_new_tab(session_id: str, force: bool = False, auto: bool = False) -> bool:
@@ -481,12 +483,7 @@ def start_job_in_new_tab(session_id: str, force: bool = False, auto: bool = Fals
     # Under launchd (the WatchPaths agent) osascript is TCC-blocked, so the
     # Python-API tab is the working path there; tmux stays the last resort for
     # a Mac with iTerm not running / API disabled — the job still launches.
-    return (
-        _iterm(command)
-        or _iterm_api_tab(command)
-        or _terminal_app(command)
-        or _tmux_window(command)
-    )
+    return _iterm(command) or _iterm_api_tab(command) or _tmux_window(command)
 
 
 def focus_iterm_session(iterm_session_id: str) -> bool:
@@ -582,8 +579,8 @@ def focus_session_name(needle: str) -> bool:
 
 
 def launch_ccc_tab() -> bool:
-    """Open a new iTerm2 tab (or Terminal.app window) running the ``ccc`` TUI."""
-    return _iterm("ccc") or _terminal_app("ccc")
+    """Open a new iTerm2 tab running the ``ccc`` TUI (iTerm2 only)."""
+    return _iterm("ccc") or _iterm_api_tab("ccc")
 
 
 def is_iterm_frontmost() -> bool:
@@ -779,12 +776,7 @@ def fire_attached_in_new_tab(session_id: str) -> bool:
     command = f"ccc fire-attached {shlex.quote(session_id)}"
     if _launcher_mode() == "tmux":
         return _tmux_window(command)
-    return (
-        _iterm(command)
-        or _iterm_api_tab(command)
-        or _terminal_app(command)
-        or _tmux_window(command)
-    )
+    return _iterm(command) or _iterm_api_tab(command) or _tmux_window(command)
 
 
 def _iterm(command: str) -> bool:
@@ -805,12 +797,8 @@ def _iterm(command: str) -> bool:
     return _osascript(script) is not None
 
 
-def _terminal_app(command: str) -> bool:
-    escaped = _as_quote(command)
-    script = f'''
-    tell application "Terminal"
-        do script "{escaped}"
-        activate
-    end tell
-    '''
-    return _osascript(script) is not None
+# Albert's ruling (2026-09-01): a launch never falls back to Terminal.app. On
+# 2026-09-01 a `ccc start-job` dispatched by gitlab-ci-watch's acceptance test
+# reached the old `_terminal_app` fallback and opened a Terminal.app window that
+# nobody was watching (and parked on the trust dialog). iTerm2 (AppleScript,
+# then the Python API) or tmux — or a loud False — are the only outcomes.

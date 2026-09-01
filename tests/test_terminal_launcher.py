@@ -48,7 +48,8 @@ def _no_applescript(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("AppleScript path must not be used")
 
     monkeypatch.setattr(terminal, "_iterm", boom)
-    monkeypatch.setattr(terminal, "_terminal_app", boom)
+    monkeypatch.setattr(terminal, "_iterm_api_tab", boom)
+    assert not hasattr(terminal, "_terminal_app")  # Terminal.app fallback is gone for good
 
 
 def test_launcher_tmux_resume_builds_new_window(
