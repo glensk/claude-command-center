@@ -2666,9 +2666,10 @@ def test_subscription_end_dates_reach_every_card_title_uncut(
             assert str(private.border_title).endswith(
                 f" -> {usage.format_end_date(expected, datetime.now().date())}"
             )
-            # 38 cells with the domain whole, so it squeezes; the date is never cut.
+            # 38 cells as "second…@example.com", so the LOCAL part squeezes; at 36 the
+            # title still exceeds the 32-cell budget, and the card widens to carry it.
             assert str(app.query_one("#usage-codex-private").border_title) == (
-                "Codex second…@ex…om / t5 -> 30.9"
+                "Codex se.lo@example.com / t5 -> 30.9"
             )
             # Cards with no entry stay exactly as they were — no stray arrow.
             assert " -> " not in str(app.query_one("#usage-codex").border_title)

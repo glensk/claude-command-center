@@ -1734,40 +1734,45 @@ def test_codex_account_email_reads_the_id_token_jwt(tmp_path: Path) -> None:
     assert usage.codex_card_title(None, "t5") == "Codex / t5"
 
 
-def test_abbrev_domain_gives_up_only_what_the_budget_demands() -> None:
-    """The domain shrinks to its budget and no further; the TLD tail always survives."""
-    assert usage.abbrev_domain("datascience.example", 19) == "datascience.example"  # already fits
-    assert usage.abbrev_domain("datascience.example", 18) == "datascience.exa…le"  # 1 over
-    assert usage.abbrev_domain("datascience.example", 13) == "datascienc…le"
-    assert usage.abbrev_domain("example.com", 5) == "ex…om"  # the floor: two head characters
-    assert usage.abbrev_domain("example.com", 1) == "ex…om"  # never tighter, card grows instead
-    assert usage.abbrev_email("openai.account@example.org", domain_budget=6) == "openai…@exa…rg"
+def test_abbrev_email_squeezes_the_local_part_and_never_the_domain() -> None:
+    """Under pressure an address gives up its local part, two characters per segment.
+
+    The domain is half of what makes an address recognizable, so it is never touched —
+    a squeezed one (``albert…@gm…om``) stops reading as an address at all.
+    """
+    assert usage.abbrev_email("openai.account@example.org", squeeze_local=True) == (
+        "op.ac@example.org"
+    )
+    assert usage.abbrev_email("albert.glensk@gmail.example", squeeze_local=True) == (
+        "al.gl@gmail.example"
+    )
+    # Ignored when it would not actually be shorter: three segments cost more than "first…".
+    assert usage.abbrev_email("a.b.c.dee@example.org", squeeze_local=True) == "a…@example.org"
+    # An undotted local part has no segments to initialize — the default rule stands.
+    assert usage.abbrev_email("developer@example.org", squeeze_local=True) == "de…er@example.org"
+    assert usage.abbrev_email("bob@x.org", squeeze_local=True) == "bob@x.org"
     assert usage.abbrev_email("openai.account@example.org") == "openai…@example.org"
 
 
-def test_codex_card_title_squeezes_the_domain_only_on_overflow(tmp_path: Path) -> None:
-    """The domain survives whole until the ``-> D.M`` suffix pushes the title over budget.
+def test_codex_card_title_squeezes_the_local_part_only_on_overflow(tmp_path: Path) -> None:
+    """The address stays whole until the title exceeds budget, then the LOCAL part pays.
 
-    The domain is what tells two Codex cards apart, so it is the LAST thing given up —
-    and only to keep the card at its 38-column CSS min-width (32 cells of title).
+    The domain is what tells two Codex cards apart at a glance, so it is never squeezed;
+    a title that still overflows lets the card widen instead (see _set_card_expanded).
     """
     short = tmp_path / "codex-short"
     _write_codex_auth(short, email="alice.example@ex.com")
-    # 25 cells with no date and 33 with one, so the domain survives only in the first.
+    # 24 cells, and 32 with a date — both inside budget, so nothing is given up.
     assert usage.codex_card_title(short, "t5") == "Codex alice…@ex.com / t5"
     assert usage.codex_card_title(short, "t5", " -> 18.9") == "Codex alice…@ex.com / t5 -> 18.9"
-    assert usage.cell_len("Codex alice…@ex.com / t5") <= usage._CARD_TITLE_BUDGET
-    # A long domain overflows on its own — and gives up exactly the overflow, no more,
-    # so a date costing eight more cells eats further into the SAME domain.
+    assert usage.cell_len("Codex alice…@ex.com / t5 -> 18.9") == usage._CARD_TITLE_BUDGET
+    # A long domain overflows at 33 cells — the LOCAL part pays, and the domain survives.
     home = tmp_path / "codex"
     _write_codex_auth(home, email="openai.account@datascience.example")
-    assert usage.codex_card_title(home, "t3") == "Codex openai…@datascienc…le / t3"
-    assert usage.codex_card_title(home, "t3", " -> 30.9") == ("Codex openai…@da…le / t3 -> 30.9")
-    for title in (
-        usage.codex_card_title(home, "t3"),
-        usage.codex_card_title(home, "t3", " -> 30.9"),
-    ):
-        assert usage.cell_len(title) <= usage._CARD_TITLE_BUDGET
+    assert usage.codex_card_title(home, "t3") == "Codex op.ac@datascience.example / t3"
+    assert usage.codex_card_title(home, "t3", " -> 30.9") == (
+        "Codex op.ac@datascience.example / t3 -> 30.9"
+    )
     # No account at all: the suffix still lands on the degraded title.
     assert usage.codex_card_title(None, "t5", " -> 18.9") == "Codex / t5 -> 18.9"
 

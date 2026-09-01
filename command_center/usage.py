@@ -1230,45 +1230,36 @@ def codex_account_email(home: Path) -> str | None:
     return cached if isinstance(cached, str) and cached else None
 
 
-def abbrev_domain(domain: str, budget: int) -> str:
-    """Squeeze a mail domain into *budget* cells, giving up as little as possible.
-
-    The LAST resort before a title overflows its card — the domain is what tells two
-    accounts apart, so it is squeezed only when keeping it whole would push the title
-    past :data:`_CARD_TITLE_BUDGET`, and then only by as much as that costs:
-    ``datascience.ch`` gives up one cell as ``datascienc…ch``, not the four of a fixed
-    chop. The tail is always the last two characters (the TLD is half of what makes a
-    domain recognizable) and the head never falls below two, so the floor is ``da…ch``
-    — a budget tighter than that lets the card grow instead (see ``_set_card_expanded``).
-    """
-    if len(domain) <= budget:
-        return domain
-    return f"{domain[: max(2, budget - 3)]}…{domain[-2:]}"
-
-
-def abbrev_email(email: str, *, domain_budget: int | None = None) -> str:
+def abbrev_email(email: str, *, squeeze_local: bool = False) -> str:
     """Shorten an address for a card title: ``first.last@example.org`` → ``first…@example.org``.
 
     A dotted local part keeps its first segment whole and drops the rest behind an
     ellipsis — the readable half of an address is its first word, and initials of the
     later segments (the old ``fi…la``) bought two columns at the cost of legibility.
     An undotted local part longer than five characters keeps its first two and last
-    two; anything shorter is left alone. The domain is left whole unless a
-    *domain_budget* is given (it is what distinguishes two accounts at a glance, so
-    callers only cap it when the title would otherwise overflow — see
-    :func:`codex_card_title`), and a string with no ``@`` is returned unchanged.
+    two; anything shorter is left alone. A string with no ``@`` is returned unchanged.
+
+    **The domain is never touched.** It is half of what makes an address recognizable,
+    and squeezing it produced titles (``albert…@gm…om``) that no longer read as an
+    address at all. When a title has to give up cells it gives up the LOCAL part
+    instead: *squeeze_local* takes two characters per dotted segment
+    (``albert.glensk`` → ``al.gl``, ``openai.account`` → ``op.ac``), which is both
+    shorter and more legible than a mangled domain. It is ignored when it would not
+    actually be shorter — a three-segment local part squeezes to more cells than
+    ``first…``, and there the card grows instead (see ``_set_card_expanded``).
     """
     local, sep, domain = email.partition("@")
     if not sep:
         return email
     if "." in local:
         short = f"{local.split('.')[0]}…"
+        if squeeze_local:
+            initials = ".".join(segment[:2] for segment in local.split("."))
+            short = min(short, initials, key=len)
     elif len(local) > 5:
         short = f"{local[:2]}…{local[-2:]}"
     else:
         short = local
-    if domain_budget is not None:
-        domain = abbrev_domain(domain, domain_budget)
     return f"{short}@{domain}"
 
 
@@ -1292,21 +1283,19 @@ def codex_card_title(home: Path | None, chord: str, suffix: str = "") -> str:
     to plain ``Codex / <chord>``.
 
     *suffix* is the optional subscription-end marker (`` -> 30.9``, see
-    :func:`subscription_suffix`). It costs eight cells, which is enough to push a long
-    domain over :data:`_CARD_TITLE_BUDGET` — so an overflowing title hands the domain a
-    budget short by exactly the overflow and :func:`abbrev_domain` gives up only that
-    much. The chord and the date are never truncated: they are the two things the title
-    exists to say.
+    :func:`subscription_suffix`). It costs eight cells, which is enough to push most
+    addresses over :data:`_CARD_TITLE_BUDGET` — so an overflowing title squeezes its
+    LOCAL part (``al.gl@gmail.com``) and keeps the domain whole; if that still does not
+    fit, ``_set_card_expanded`` widens the card by the cells needed. The chord and the
+    date are never truncated: they are the two things the title exists to say.
     """
     email = codex_account_email(home) if home is not None else None
     if not email:
         return f"Codex / {chord}{suffix}"
     title = f"Codex {abbrev_email(email)} / {chord}{suffix}"
-    overflow = cell_len(title) - _CARD_TITLE_BUDGET
-    if overflow <= 0:
+    if cell_len(title) <= _CARD_TITLE_BUDGET:
         return title
-    budget = len(email.partition("@")[2]) - overflow
-    return f"Codex {abbrev_email(email, domain_budget=budget)} / {chord}{suffix}"
+    return f"Codex {abbrev_email(email, squeeze_local=True)} / {chord}{suffix}"
 
 
 def _codex_usage_path(home: Path) -> Path:
