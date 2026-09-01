@@ -1508,3 +1508,77 @@ def test_every_module_is_runnable_by_path(tmp_path: Path) -> None:
     cli = subprocess.run([str(pkg / "quota.py"), "-h"], capture_output=True, text=True, check=False)
     assert cli.returncode == cli_exit
     assert "usage: ccc quota" in cli.stdout
+
+
+# ---- archive (tp single-listing) ---------------------------------------------
+
+
+def test_archive_hides_parked_session_but_keeps_it_resumable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`ccc archive` soft-hides a parked non-draft session; the row (cwd, account) stays."""
+    from command_center.cli import cmd_archive
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("CCC_INTERNAL", "1")
+    monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [])
+    db = tmp_path / "command-center" / "state.db"
+    with Store(db) as store:
+        store.ensure("parked-1", cwd="/repo")
+        store.update_fields("parked-1", config_dir="/Users/x/.claude-work")
+    assert cmd_archive(argparse.Namespace(session_id="parked-1", undo=False)) == 0
+    assert "archived parked-1" in capsys.readouterr().out
+    with Store(db) as store:
+        row = store.get("parked-1")
+        assert row is not None and row.archived is True and row.draft is False
+        assert row.cwd == "/repo" and row.config_dir == "/Users/x/.claude-work"
+        assert all(s.session_id != "parked-1" for s in store.list_sessions())
+    # idempotent
+    assert cmd_archive(argparse.Namespace(session_id="parked-1", undo=False)) == 0
+    assert "already archived" in capsys.readouterr().out
+    # undo
+    assert cmd_archive(argparse.Namespace(session_id="parked-1", undo=True)) == 0
+    with Store(db) as store:
+        row = store.get("parked-1")
+        assert row is not None and row.archived is False
+
+
+def test_archive_refuses_live_and_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center.cli import cmd_archive
+    from command_center.models import LiveSession
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("CCC_INTERNAL", "1")
+    live = LiveSession(pid=7, session_id="live-1", cwd="/repo", alive=True)
+    monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [live])
+    db = tmp_path / "command-center" / "state.db"
+    with Store(db) as store:
+        store.ensure("live-1", cwd="/repo")
+        store.create_draft("draft-1", "/repo", "Future thing", prompt="do it")
+    assert cmd_archive(argparse.Namespace(session_id="live-1", undo=False)) == 1
+    assert "is live" in capsys.readouterr().err
+    assert cmd_archive(argparse.Namespace(session_id="draft-1", undo=False)) == 1
+    assert "delete-job" in capsys.readouterr().err
+    assert cmd_archive(argparse.Namespace(session_id="nope", undo=False)) == 1
+    with Store(db) as store:
+        for sid in ("live-1", "draft-1"):
+            row = store.get(sid)
+            assert row is not None and row.archived is False
+
+
+def test_upsert_from_live_unarchives_a_resumed_parked_session(tmp_path: Path) -> None:
+    """A tp-archived session that is resumed shows up in ccc again; a trashed draft does not."""
+    from command_center.models import LiveSession
+
+    with Store(tmp_path / "state.db") as store:
+        store.ensure("s-arch", cwd="/repo")
+        store.update_fields("s-arch", archived=True)
+        store.create_draft("d-arch", "/repo", "Trashed draft", prompt="x")
+        store.update_fields("d-arch", archived=True)
+        store.upsert_from_live(LiveSession(pid=1, session_id="s-arch", cwd="/repo", alive=True))
+        store.upsert_from_live(LiveSession(pid=2, session_id="d-arch", cwd="/repo", alive=True))
+        s_row, d_row = store.get("s-arch"), store.get("d-arch")
+        assert s_row is not None and s_row.archived is False
+        assert d_row is not None and d_row.archived is True

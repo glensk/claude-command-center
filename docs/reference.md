@@ -54,6 +54,7 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 - `ccc resume <id>` — resume a session in this terminal (`execvp`).
 - `ccc resume-job <id>` — resume a parked session in a new tab (focuses it if already live).
 - `ccc focus-job <id>` — bring a live session's tab forward (verifies it is live first).
+- `ccc archive <id>` (`-u/--undo`) — soft-hide a PARKED session (`archived=1`) so it is listed once, on tp's board (`tp import-ccc -a -z` calls this); the row keeps its cwd/account, so `ccc resume <id>` / `ccc resume-job <id>` still work, and the moment the session is seen live again it is un-archived (it parks back into ccc's list until tp re-archives it). Refuses live sessions and FUTURE drafts (`delete-job` is the draft trash).
 - `ccc rm` · `ccc prune` — drop a tracked row / delete leftovers (contentless, headless `claude -p`, and dead-launched jobs that never had a turn).
 - `ccc peek` (`--print`) · `ccc jump` — the macOS peek panel / the ccc↔session toggle.
 - `ccc snapshot` (`-l/--list`, `-n/--dry-run`) · `ccc restore-snapshot [name]` (`-n/--dry-run`, `-y/--yes`) — save the whole iTerm layout before a reboot, rebuild it afterwards.

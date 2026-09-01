@@ -671,14 +671,22 @@ class Store:  # pylint: disable=too-many-public-methods
         return claimed
 
     def upsert_from_live(self, live: LiveSession) -> None:
-        """Reconcile a live registry entry, preserving user-authored fields."""
-        self.ensure(live.session_id, cwd=live.cwd, agent=live.agent)
+        """Reconcile a live registry entry, preserving user-authored fields.
+
+        A NON-draft row that was soft-hidden by ``ccc archive`` (tp lists it instead) is
+        un-archived the moment it is seen live again: a running session must show up in
+        the TUI, whatever hid it while parked. Draft rows keep their flag — an archived
+        draft is a trashed FUTURE job, and only ``restore-job`` may revive that.
+        """
+        existing = self.ensure(live.session_id, cwd=live.cwd, agent=live.agent)
         patch: dict[str, Any] = {"cwd": live.cwd, "agent": live.agent, "last_seen_pid": live.pid}
         if live.name:
             patch["name"] = live.name
         self.update_fields(
             live.session_id, **{k: v for k, v in patch.items() if k in _RECONCILE_COLUMNS}
         )
+        if existing.archived and not existing.draft:
+            self.update_fields(live.session_id, archived=False)
 
     # ---- subgoals -------------------------------------------------------
     def list_subgoals(self, session_id: str) -> list[Subgoal]:

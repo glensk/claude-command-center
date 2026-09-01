@@ -944,3 +944,62 @@ def test_headroom_blocked_by_refusal_despite_window_headroom(
     assert decision["refused_by"] == "workspace_owner_credits_depleted"
     args = argparse.Namespace(json=False)
     assert cic.cmd_headroom(args) == 1
+
+
+# ---- account pin (`codex-in-claude.py home`) -----------------------------------
+
+
+def test_pinned_codex_home_honours_inclusive_expiry(tmp_path: Path) -> None:
+    from datetime import date
+
+    from command_center import codex_in_claude as cic
+
+    cfg = {"codex_home": str(tmp_path), "codex_home_until": "2026-09-07"}
+    assert cic.pinned_codex_home(cfg, today=date(2026, 9, 7)) == tmp_path  # inclusive
+    assert cic.pinned_codex_home(cfg, today=date(2026, 9, 8)) is None  # lapsed
+    assert cic.pinned_codex_home({"codex_home": str(tmp_path)}, today=date(2030, 1, 1)) == tmp_path
+    assert cic.pinned_codex_home({"codex_home": None}) is None
+    assert cic.pinned_codex_home({"codex_home": str(tmp_path), "codex_home_until": "soon"}) is None
+
+
+def test_codex_home_resolution_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from command_center import codex_in_claude as cic
+
+    cfg_path = tmp_path / "config.json"
+    monkeypatch.setenv("CODEX_IN_CLAUDE_CONFIG", str(cfg_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    assert cic._codex_home() == Path.home() / ".codex"  # pylint: disable=protected-access
+    pinned = tmp_path / "private"
+    cfg_path.write_text(json.dumps({"codex_home": str(pinned)}), encoding="utf-8")
+    assert cic._codex_home() == pinned  # pylint: disable=protected-access
+    assert cic.codex_exec_env({})["CODEX_HOME"] == str(pinned)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "explicit"))
+    assert cic._codex_home() == tmp_path / "explicit"  # pylint: disable=protected-access
+    assert cic.codex_exec_env()["CODEX_HOME"] == str(tmp_path / "explicit")
+
+
+def test_cmd_home_sets_and_clears_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import argparse
+
+    from command_center import codex_in_claude as cic
+
+    cfg_path = tmp_path / "config.json"
+    monkeypatch.setenv("CODEX_IN_CLAUDE_CONFIG", str(cfg_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    home = tmp_path / "second"
+    home.mkdir()
+    ns = argparse.Namespace(path=str(home), until="2026-09-07", clear=False)
+    assert cic.cmd_home(ns) == cic.EX_USAGE  # no auth.json yet
+    (home / "auth.json").write_text("{}", encoding="utf-8")
+    assert cic.cmd_home(ns) == cic.EX_OK
+    out = capsys.readouterr().out
+    assert str(home) in out and "until 2026-09-07" in out
+    saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert saved["codex_home"] == str(home) and saved["codex_home_until"] == "2026-09-07"
+    bad = argparse.Namespace(path=str(home), until="next monday", clear=False)
+    assert cic.cmd_home(bad) == cic.EX_USAGE
+    assert cic.cmd_home(argparse.Namespace(path=None, until=None, clear=True)) == cic.EX_OK
+    saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert saved["codex_home"] is None

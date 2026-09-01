@@ -1925,6 +1925,62 @@ def cmd_delete_job(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_archive(args: argparse.Namespace) -> int:
+    """Soft-hide a PARKED session (``archived=1``) — ``delete-job``'s counterpart for a
+    real (non-draft) session, added for tp's single-listing rule.
+
+    tp imports ccc's parked jobs onto its own board and then retires them here so a job is
+    listed once. The alternatives are wrong for that: ``rm`` hard-deletes the row and with
+    it the cwd/account ``ccc resume`` needs (a multi-account setup then refuses to resume),
+    ``mark-done`` puts a job nobody did on the Done dashboard, and ``delete-job`` accepts
+    FUTURE drafts only. Archiving keeps the row — ``Store.get`` ignores ``archived`` — so
+    ``ccc resume <id>`` / ``ccc resume-job <id>`` still work; the running mirror is dropped.
+    A resumed session is un-archived the moment it is seen live
+    (:meth:`Store.upsert_from_live`) so the TUI tracks it again; when it parks once more
+    it is listed in ccc again until tp re-archives it (``tp import-ccc -a -z``).
+
+    Refuses a LIVE session and a FUTURE draft (use ``delete-job``). ``-u/--undo`` clears
+    the flag.
+    """
+    from . import mirrors
+
+    cfg = config.load_config()
+    with Store() as store:
+        resolved = _resolve_job_or_report(store, args.session_id)
+        if resolved is None:
+            return 1
+        session = store.get(resolved)
+        assert session is not None  # resolve_job_id only ever returns a real id
+        if args.undo:
+            if not session.archived:
+                print(f"error: {resolved} is not archived", file=sys.stderr)
+                return 1
+            store.update_fields(resolved, archived=False)
+            print(f"unarchived {resolved}")
+            _spawn_sync_mirrors(cfg)
+            return 0
+        if session.draft:
+            print(
+                f"error: {resolved} is a FUTURE job — trash it with `ccc delete-job` instead",
+                file=sys.stderr,
+            )
+            return 1
+        live_ids = {ls.session_id for ls in _adapter().discover() if ls.alive}
+        if resolved in live_ids:
+            print(f"error: {resolved} is live — park or exit it first", file=sys.stderr)
+            return 1
+        if session.archived:
+            print(f"{resolved} is already archived")
+            return 0
+        store.update_fields(resolved, archived=True)
+        mirrors.remove_mirror(cfg, resolved)
+    print(
+        f"archived {resolved} (still resumable: ccc resume {resolved}; "
+        f"undo: ccc archive -u {resolved})"
+    )
+    return 0
+
+
 def cmd_restore_job(args: argparse.Namespace) -> int:
     """Stage a deleted job back into FUTURE (inverse of ``delete-job``).
 
@@ -3764,6 +3820,17 @@ def build_parser() -> argparse.ArgumentParser:
         "(used by the in-note '↩ Stage job back in' button and the delete dashboard)",
     )
     p_restjob.set_defaults(func=cmd_restore_job)
+
+    p_archive = sub.add_parser(
+        "archive",
+        help="soft-hide a parked session (tp lists it instead); stays resumable with "
+        "`ccc resume` — -u undoes",
+    )
+    p_archive.add_argument("session_id", help="session UUID or unique prefix")
+    p_archive.add_argument(
+        "-u", "--undo", action="store_true", help="clear the archived flag again"
+    )
+    p_archive.set_defaults(func=cmd_archive)
 
     p_focusjob = sub.add_parser(
         "focus-job",

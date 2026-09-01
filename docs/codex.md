@@ -48,7 +48,16 @@ codex-in-claude.py sync-skills [--check]                     # re-stamp the mode
 codex-in-claude.py usage [--json]                            # Codex 5h + weekly quota
 codex-in-claude.py headroom [--json]                         # learned optional-offload reserve
 codex-in-claude.py delegate [--write] [--scout] -C <repo> "<task>"  # one round; prints model first
+codex-in-claude.py home                                      # which CODEX_HOME (account) Codex bills now
+codex-in-claude.py home ~/.codex-private -u 2026-09-07       # pin ALL Codex use to the 2nd login until that date (inclusive)
+codex-in-claude.py home -c                                   # drop the pin
 ```
+
+`home` is the **account pin**: `codex_home` + `codex_home_until` in the shared config. It
+moves `delegate`, `usage`/`headroom` AND `codex-review.py` (the `/codex-debate` adversary)
+to that login at once and lapses by itself after the date; an explicit `$CODEX_HOME` in the
+environment still overrides it. Create the second login once with
+`CODEX_HOME=~/.codex-private codex login` (same value as ccc's `codex_home_private`).
 
 `--for all` is a real reset: it moves `default` **and** clears the per-command pins, which
 would otherwise shadow it. A bare `set-model <slug>` (no `--for`) only moves `default`.

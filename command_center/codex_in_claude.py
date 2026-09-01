@@ -92,7 +92,7 @@ import time
 import urllib.parse
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -421,9 +421,20 @@ def config_path() -> Path:
 
 
 def load_config() -> dict:
-    """Load the config, tolerating a missing/corrupt file (returns defaults)."""
+    """Load the config, tolerating a missing/corrupt file (returns defaults).
+
+    ``codex_home`` / ``codex_home_until`` are the account pin (see
+    :func:`pinned_codex_home`); ``codex-review.py`` reads the same two keys.
+    """
     path = config_path()
-    base = {"default": DEFAULT_MODEL, "delegate-review": None, "debate": None, "effort": "xhigh"}
+    base = {
+        "default": DEFAULT_MODEL,
+        "delegate-review": None,
+        "debate": None,
+        "effort": "xhigh",
+        "codex_home": None,
+        "codex_home_until": None,
+    }
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
@@ -799,6 +810,65 @@ def cmd_set_model(args: argparse.Namespace) -> int:
     return EX_OK
 
 
+def cmd_home(args: argparse.Namespace) -> int:
+    """``home [PATH] [-u DATE] [-c]`` — show, set or clear the Codex account pin.
+
+    No arguments: print the effective ``CODEX_HOME`` and where it comes from (env / pin /
+    default), the pin's expiry, and the account e-mail behind that home when readable.
+    ``PATH`` sets the pin (must hold an ``auth.json``, i.e. a completed
+    ``CODEX_HOME=<PATH> codex login``); ``-u/--until`` bounds it (ISO date, inclusive);
+    ``-c/--clear`` removes it. The pin governs ``delegate``, ``usage``/``headroom`` and
+    ``codex-review.py`` (debates) alike; an explicit ``$CODEX_HOME`` still overrides it.
+    """
+    cfg = load_config()
+    if args.clear:
+        cfg["codex_home"] = None
+        cfg["codex_home_until"] = None
+        save_config(cfg)
+        print("codex home pin cleared — back to $CODEX_HOME / ~/.codex")
+        return EX_OK
+    if args.path:
+        home = Path(args.path).expanduser()
+        if not (home / "auth.json").is_file():
+            print(
+                f"error: {home} has no auth.json — run `CODEX_HOME={home} codex login` first",
+                file=sys.stderr,
+            )
+            return EX_USAGE
+        if args.until:
+            try:
+                date.fromisoformat(args.until)
+            except ValueError:
+                print(f"error: -u/--until must be an ISO date, got {args.until!r}", file=sys.stderr)
+                return EX_USAGE
+        cfg["codex_home"] = str(home)
+        cfg["codex_home_until"] = args.until or None
+        save_config(cfg)
+    elif args.until:
+        print("error: -u/--until needs a PATH (or use -c to clear)", file=sys.stderr)
+        return EX_USAGE
+
+    effective = _codex_home()
+    if os.environ.get("CODEX_HOME"):
+        source = "env $CODEX_HOME"
+    elif pinned_codex_home(cfg) is not None:
+        until = cfg.get("codex_home_until")
+        source = f"config pin (until {until}, inclusive)" if until else "config pin (no expiry)"
+    else:
+        source = "default"
+        if cfg.get("codex_home"):
+            source += f" (pin on {cfg['codex_home']} expired {cfg.get('codex_home_until')})"
+    email = ""
+    try:
+        from .usage import codex_account_email  # pylint: disable=import-outside-toplevel
+
+        email = codex_account_email(effective) or ""
+    except Exception:  # pylint: disable=broad-exception-caught  # display-only
+        email = ""
+    print(f"codex home: {effective}  [{source}]" + (f"  account: {email}" if email else ""))
+    return EX_OK
+
+
 def cmd_get_effort(_args: argparse.Namespace) -> int:
     """Print the configured reasoning effort (or 'default' = the model's own default)."""
     print(resolve_effort() or "default")
@@ -919,9 +989,48 @@ def _build_delegate_prompt(
 # --------------------------------------------------------------------------- #
 # Codex usage / rate-limit awareness (read-only; vendored, mirrors ccc usage.py)
 # --------------------------------------------------------------------------- #
+def pinned_codex_home(cfg: dict | None = None, today: date | None = None) -> Path | None:
+    """The account pin from the shared config, or ``None`` when there is none / it expired.
+
+    ``codex_home`` names a second ``CODEX_HOME`` (another ChatGPT login, e.g.
+    ``~/.codex-private``); ``codex_home_until`` is an ISO date, INCLUSIVE, after which the
+    pin lapses on its own — "use the private seat until Monday" needs no follow-up edit.
+    An unparsable date is treated as expired (fail towards the default seat).
+    """
+    cfg = load_config() if cfg is None else cfg
+    raw = cfg.get("codex_home")
+    if not raw:
+        return None
+    until = cfg.get("codex_home_until")
+    if until:
+        try:
+            if date.fromisoformat(str(until)) < (today or date.today()):
+                return None
+        except ValueError:
+            return None
+    return Path(str(raw)).expanduser()
+
+
 def _codex_home() -> Path:
-    """Codex state dir (``$CODEX_HOME`` or ``~/.codex``)."""
-    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    """Codex state dir: ``$CODEX_HOME`` → the config pin (:func:`pinned_codex_home`) →
+    ``~/.codex``. Every usage/headroom/refusal reader and ``delegate``'s exec env go
+    through here, so a pin moves ALL Codex use to that account at once."""
+    env = os.environ.get("CODEX_HOME")
+    if env:
+        return Path(env)
+    pinned = pinned_codex_home()
+    return pinned if pinned is not None else Path.home() / ".codex"
+
+
+def codex_exec_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """``base`` (default ``os.environ``) plus ``CODEX_HOME`` pointing at :func:`_codex_home`.
+
+    An explicit ``$CODEX_HOME`` in the caller's env always wins; otherwise the pinned
+    home (or the default) is made explicit so the child ``codex`` bills the right seat.
+    """
+    env = dict(os.environ if base is None else base)
+    env.setdefault("CODEX_HOME", str(_codex_home()))
+    return env
 
 
 @dataclass(frozen=True)
@@ -1709,7 +1818,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         idle_minutes=(max(1, idle_timeout // 60) if idle_timeout else None),
         repo_map=repo_map,
     )
-    env = dict(os.environ)
+    env = codex_exec_env()  # CODEX_HOME made explicit: env → config pin → ~/.codex
     env["CCC_NO_CODEX"] = "1"  # never re-trigger the plan/k8s automation
     env["CCC_INTERNAL"] = "1"
     env["AI_NO_AUTOCOMMIT"] = "1"  # never let a nested run auto-commit
@@ -2040,6 +2149,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_headroom.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")
     p_headroom.set_defaults(func=cmd_headroom)
+
+    p_home = sub.add_parser(
+        "home",
+        help="show/set/clear the Codex account pin (which CODEX_HOME every Codex call bills)",
+        description=(
+            "Pin ALL Codex use (delegate, usage/headroom, codex-review.py debates) to a "
+            "second ChatGPT login, e.g. ~/.codex-private, optionally until an ISO date "
+            "(inclusive). An explicit $CODEX_HOME in the environment still wins."
+        ),
+    )
+    p_home.add_argument("path", nargs="?", help="CODEX_HOME to pin (needs its auth.json)")
+    p_home.add_argument("-u", "--until", help="pin expires after this ISO date (inclusive)")
+    p_home.add_argument("-c", "--clear", action="store_true", help="remove the pin")
+    p_home.set_defaults(func=cmd_home)
 
     p_runs = sub.add_parser(
         "runs", help="list in-flight delegate runs (elapsed/idle/last output, one line each)"
