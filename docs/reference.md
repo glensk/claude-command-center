@@ -1555,7 +1555,13 @@ API-key login — `auth_mode` other than `chatgpt` — is skipped, since it has 
 subscription windows). The two windows are identified by their `limit_window_seconds`
 (18000 → `Session:`, 604800 → `Week:`), never by their primary/secondary position, and a
 `rate_limit_reached_type` marks the card blocked from the same code the rollout path
-reads. The card states the refusal in **card-sized wording** (`⛔ usage limit reached`) —
+reads. The card draws **no banner** when the live snapshot already pins the exhausted
+window: that row reads `Session: Resets in 19m … 100%`, which is both the refusal and
+when it lifts, so `⛔ usage limit reached` / `access returns in 19m` / `live figures, 0m
+old` were three lines repeating the bar under them. Where the bars do *not* carry the
+block — rollout-sourced figures (the last SUCCESSFUL call's, so they read as headroom),
+or no live exhausted window to pin — the banner stays, in **card-sized wording**
+(`⛔ usage limit reached`);
 `ccc codex-usage` and `codex-in-claude headroom` keep the long explanatory form
 (`BLOCKED — included usage limit reached (no credit overflow)`), which at 61 characters
 would stretch the 38-column card past 60 and steal that width from the job-details pane
@@ -1590,9 +1596,9 @@ gap the endpoint closes: on 2026-08-30 the newest windowed event was ~14 h old a
 5-hour reset had long passed, so the only *live* window left for a refusal to pin was the
 weekly one — the card claimed `Week: 100%, access returns in 6d 8h` while the web page
 said the 5-hour window had just filled (19 min to go) and the week still had 77% headroom.
-With live data the block is attributed to the window that actually filled, and the blocked
-banner then reads `live figures, <age> old` instead of the
-`100% = the limit that fired; other figures are <age> old` caveat the rollout path needs.
+With live data the block is attributed to the window that actually filled — and the card
+then needs no banner at all, where the rollout path still prefixes its bars with
+`⛔ …` + `100% = the limit that fired; other figures are <age> old`.
 
 *A second ChatGPT login.* Point `codex_home_private` at another `CODEX_HOME` (create it
 with `CODEX_HOME=~/.codex-private codex login`) and a second green card appears, with its

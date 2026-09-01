@@ -1751,9 +1751,22 @@ def render_work_usage(usage: Usage | None, now: int | None = None) -> Text:
 
 
 def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
-    """Render the two-bar OpenAI Codex usage card (green bars) as Rich ``Text``."""
+    """Render the two-bar OpenAI Codex usage card (green bars) as Rich ``Text``.
+
+    A refusal normally prefixes the bars with a red banner — but a **live** snapshot
+    whose exhausted window is already pinned at 100% needs none: that row reads
+    ``Session: Resets in 19m … 100%``, which is both the refusal and when it lifts, so
+    the banner only repeated it (``⛔ usage limit reached`` / ``access returns in 19m`` /
+    ``live figures, 0m old``) at the cost of three of the card's lines. The banner stays
+    wherever the bars do NOT carry the block: rollout-sourced figures (those bars are the
+    last SUCCESSFUL call's and read as headroom, hence the ``100% = the limit that fired``
+    caveat) and any snapshot with no live exhausted window to pin (see
+    :func:`codex_exhausted_window`).
+    """
     now = int(time.time()) if now is None else now
     if usage is not None and usage.blocked:
+        if usage.live and not usage.is_empty() and codex_exhausted_window(usage, now) is not None:
+            return _render_card(usage, now, fill_color=_CODEX_FILL, label_color=_CODEX_FILL)
         # The bars below are the last SUCCESSFUL call's figures and would read as healthy
         # headroom, so the refusal is stated first, in red, with the age of the numbers.
         # Card-sized wording (short_refusal_label), and no "BLOCKED —" prefix: the red ⛔

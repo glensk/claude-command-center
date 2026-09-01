@@ -1999,7 +1999,10 @@ def test_read_codex_usage_staples_a_refusal_newer_than_the_live_fetch(
     # The 5h window is the most-consumed LIVE one, so it is what filled.
     assert snap.five_hour == usage.Window(used_percentage=100.0, resets_at=1788095849)
     assert snap.seven_day == usage.Window(used_percentage=23.0, resets_at=1788643641)
-    assert "live figures" in usage.render_codex_usage(snap, now=_LIVE_NOW).plain
+    # …and the card is just the two bars: the pinned 100% row IS the refusal.
+    card = usage.render_codex_usage(snap, now=_LIVE_NOW).plain
+    assert card.startswith("Session: Resets in ") and "100%" in card
+    assert "⛔" not in card
 
 
 def test_read_codex_usage_live_block_is_not_re_stapled_by_an_older_refusal(
@@ -2062,7 +2065,7 @@ def test_read_codex_live_refuses_a_snapshot_from_another_home(tmp_path: Path) ->
 
 
 def test_render_codex_usage_blocked_banner_marks_live_figures() -> None:
-    """Live figures ARE the state that fired, so they get no 'other figures are N old'."""
+    """Live+pinned needs no banner at all; the rollout path keeps its caveat."""
     windows = {
         "five_hour": usage.Window(used_percentage=100.0, resets_at=_LIVE_NOW + 600),
         "seven_day": usage.Window(used_percentage=23.0, resets_at=_LIVE_NOW + 5 * 86400),
@@ -2076,9 +2079,26 @@ def test_render_codex_usage_blocked_banner_marks_live_figures() -> None:
         blocked_at=_LIVE_NOW,
         live=True,
     )
+    # The 100% bar already embosses "Resets in 10m", so ⛔ / "access returns in 10m" /
+    # "live figures, 2m old" were three lines repeating the row beneath them.
     plain = usage.render_codex_usage(live, now=_LIVE_NOW).plain
-    assert "live figures, 2m old" in plain
-    assert "100% = the limit that fired" not in plain
+    assert plain.splitlines() == [
+        "Session: Resets in 10m        100%",
+        "Week: Resets in 5d 0h 0m       23%",
+    ]
+
+    # A LIVE snapshot with nothing pinned (no window at 100%) still needs the banner —
+    # otherwise the card would show only headroom while Codex refuses.
+    unpinned = usage.Usage(
+        captured_at=_LIVE_NOW - 120,
+        five_hour=usage.Window(used_percentage=99.0, resets_at=_LIVE_NOW + 600),
+        seven_day=windows["seven_day"],
+        blocked_reason=reason,
+        blocked_at=_LIVE_NOW,
+        live=True,
+    )
+    plain = usage.render_codex_usage(unpinned, now=_LIVE_NOW).plain
+    assert plain.startswith("⛔ usage limit reached\naccess returns in 10m\nlive figures, 2m old\n")
 
     rollout = usage.Usage(
         captured_at=_LIVE_NOW - 120,
@@ -2099,6 +2119,9 @@ def test_render_codex_usage_blocked_banner_uses_the_short_wording() -> None:
     width, and the cards share one right-pinned column — so the CLI wording
     (``BLOCKED — included usage limit reached (no credit overflow)``, 61 chars) stretched
     the Codex box past 60 columns and stole that width from the job-details pane.
+
+    Rollout-sourced (``live=False``), since a live pinned snapshot renders no banner —
+    its 100% bar already carries the refusal.
     """
     snap = usage.Usage(
         captured_at=_LIVE_NOW - 120,
@@ -2106,7 +2129,6 @@ def test_render_codex_usage_blocked_banner_uses_the_short_wording() -> None:
         seven_day=usage.Window(used_percentage=23.0, resets_at=_LIVE_NOW + 5 * 86400),
         blocked_reason="included usage limit reached (no credit overflow)",
         blocked_at=_LIVE_NOW,
-        live=True,
     )
     banner = usage.render_codex_usage(snap, now=_LIVE_NOW).plain.split("\n")[0]
     assert banner == "⛔ usage limit reached"
