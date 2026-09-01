@@ -2075,7 +2075,7 @@ class CopilotUsage:
     # the live per-seat quota endpoint (:func:`_fetch_copilot_quota`) when it answers;
     # ``credit_quota`` falls back to the configured ``copilot_credit_quota`` guess and
     # ``credits_used`` to the (up-to-a-day stale) billing ``quantity``.
-    credit_quota: int = 3000  # AI-Credit budget the bar is drawn against
+    credit_quota: int = 1900  # AI-Credit budget the bar is drawn against (Business baseline)
     credits_used: float = 0.0  # live credits consumed this month (0.0 ⇒ use ``quantity``)
     quota_source: str = ""  # "api" (seat entitlement) or "config" (fallback guess)
 
@@ -2295,8 +2295,8 @@ def fetch_copilot_usage(
         try:
             credit_quota = config.load_config().copilot_credit_quota
         # pylint: disable=broad-exception-caught
-        except Exception:  # noqa: BLE001 - fall back to the default budget
-            credit_quota = 3000
+        except Exception:  # noqa: BLE001 - fall back to the Business baseline budget
+            credit_quota = 1900
     snap = _summarize_copilot(items, tm.tm_year, tm.tm_mon, now)
     snap.premium_used = _fetch_premium_used(gh, login)
     snap.premium_quota = max(1, quota)
@@ -2332,7 +2332,7 @@ def read_copilot_usage() -> CopilotUsage | None:
             premium_used=float(data.get("premium_used", 0) or 0),
             premium_quota=int(data.get("premium_quota", 300) or 300),
             premium_reset_at=int(data.get("premium_reset_at", 0) or 0),
-            credit_quota=int(data.get("credit_quota", 3000) or 3000),
+            credit_quota=int(data.get("credit_quota", 1900) or 1900),
             credits_used=float(data.get("credits_used", 0) or 0),
             quota_source=str(data.get("quota_source", "")),
         )

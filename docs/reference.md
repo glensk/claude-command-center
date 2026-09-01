@@ -1485,8 +1485,8 @@ the 1st of the month. Both AI-Credit numbers come from the seat's own live meter
 individual/faculty seat) and the billing endpoint's month-to-date quantity lags by up
 to a day, so anything else is a guess that silently mis-scales the bar. When that
 endpoint does not answer, the bar degrades to the billing quantity ÷ the configured
-`copilot_credit_quota` (default `3000`) and `ccc copilot-usage` marks the denominator
-with a `?`.
+`copilot_credit_quota` (default `1900`, the documented Copilot Business per-user
+baseline) and `ccc copilot-usage` marks the denominator with a `?`.
 
 **Claude Code** exposes this data only in its **status-line JSON**
 (`rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}`) — the numbers

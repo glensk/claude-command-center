@@ -105,10 +105,9 @@ DEFAULTS: dict[str, object] = {
     # Monthly AI-Credit budget the card's bar is drawn against once the seat is on
     # usage-based (AI Credits) billing — premium requests were retired 2026-06, so
     # that meter reads 0. GitHub's API exposes no allowance figure, so this is a
-    # chosen budget: 3,000 matches GitHub's current promo allowance (through
-    # 2026-09-01); the documented Copilot Business per-user baseline is 1,900
-    # credits/user/mo. Set it to whatever your seat is actually allotted.
-    "copilot_credit_quota": 3000,
+    # chosen budget: 1,900 credits/user/mo, the documented Copilot Business
+    # per-user baseline. Set it to whatever your seat is actually allotted.
+    "copilot_credit_quota": 1900,
     # Claude /usage OAuth fetch: keep each account's usage card in step with `claude`'s
     # own /usage (incl. any weekly model-scoped window the status line never carries) by
     # fetching the OAuth usage endpoint out-of-band (reads the CLI's keychain token).
@@ -513,8 +512,9 @@ class Config:
     copilot_card_title: str = "Copilot"
     # Fallback only: the seat's real AI-Credit entitlement is read live from
     # `/copilot_internal/user` (usage._fetch_copilot_quota) and wins whenever it answers.
-    # This guess is used solely when that endpoint is unreachable.
-    copilot_credit_quota: int = 3000
+    # This guess is used solely when that endpoint is unreachable; 1,900 is the
+    # documented Copilot Business per-user baseline.
+    copilot_credit_quota: int = 1900
     claude_usage: bool = False  # fetch the Claude /usage OAuth endpoint (INERT: off)
     claude_usage_refresh_sec: int = 600
     claude_usage_refresh_active_sec: int = 200
