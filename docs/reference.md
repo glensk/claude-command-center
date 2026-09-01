@@ -1606,8 +1606,8 @@ with `CODEX_HOME=~/.codex-private codex login`) and a second green card appears,
 own `t5` chord, its own throttled fetch and its own cache. Empty — the default — means no
 second card at all (absent, not merely collapsed). Each card titles itself with the
 account e-mail read from that home's `auth.json` `id_token` (abbreviated:
-`Codex first…@example.org / t3`, and squeezed further — `first…@exa…rg` — when the title
-would otherwise outgrow its card), so the two are never confused. The rollout files
+`Codex first…@example.org / t3`, and squeezed further — `fi.la@example.org` — when the
+title would otherwise outgrow its card), so the two are never confused. The rollout files
 belong to the default login, so the second card is live-endpoint-only, and a refusal
 recorded by one login never bleeds into the other's card.
 
@@ -1734,8 +1734,9 @@ filenames); malformed entries are skipped.
   Either way an unresolvable `auto` renders **nothing** rather than a guess. Note the
   title budget: Textual clips a border title at the card width minus four (32 cells at
   the default 38-column card), and the date sits at the very end — so a title carrying
-  one squeezes its domain (`second…@exa…om`) and, if still short, the card widens by the
-  cell or two needed. Nothing is ever cut.
+  one squeezes its **local part** (`al.gl@gmail.com`, two characters per dotted segment)
+  and, if that still does not fit, the card widens by the cells needed. The domain is
+  never squeezed and nothing is ever cut.
 - **Per-job account.** A future job carries the account it will launch (bill) under:
   `ccc new-job -A <label>`, the TUI's new-job/`e`-form account selects, and the job
   file's `account` frontmatter + control — all shown **only when more than one
