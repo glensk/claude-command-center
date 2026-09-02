@@ -16,6 +16,7 @@ dependencies = [
     # iterm_api): sub-ms focus/lookup vs the ~620 ms AppleScript window walk. Imported
     # lazily inside methods so the package stays optional (non-mac / no API server).
     "iterm2>=2.20",
+    "extdeps",
 ]
 
 [project.optional-dependencies]
@@ -56,3 +57,6 @@ testpaths = ["tests"]
 markers = [
     "slow: end-to-end tests that build a wheel + spin a sandbox (deselect with -m 'not slow')",
 ]
+
+[tool.uv.sources]
+extdeps = { git = "https://github.com/glensk/extdeps" }

@@ -227,6 +227,7 @@ name = "claude-command-center"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "extdeps" },
     { name = "iterm2" },
     { name = "pyobjc-framework-cocoa", marker = "sys_platform == 'darwin'" },
     { name = "pyyaml" },
@@ -244,6 +245,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "extdeps", git = "https://github.com/glensk/extdeps" },
     { name = "iterm2", specifier = ">=2.20" },
     { name = "mypy", marker = "extra == 'dev'" },
     { name = "pylint", marker = "extra == 'dev'" },
@@ -273,6 +275,11 @@ sdist = { url = "https://files.pythonhosted.org/packages/81/e1/56027a71e31b02ddc
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1e/77/dc8c558f7593132cf8fefec57c4f60c83b16941c574ac5f619abb3ae7933/dill-0.4.1-py3-none-any.whl", hash = "sha256:1e1ce33e978ae97fcfcff5638477032b801c46c7c65cf717f95fbc2248f79a9d", size = 120019, upload-time = "2026-01-19T02:36:55.663Z" },
 ]
+
+[[package]]
+name = "extdeps"
+version = "0.1.0"
+source = { git = "https://github.com/glensk/extdeps#971ad47ecb69451893bd9fa21c73a0a8bc73b4db" }
 
 [[package]]
 name = "frozenlist"

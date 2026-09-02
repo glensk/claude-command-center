@@ -131,6 +131,12 @@ DEFAULTS: dict[str, object] = {
     # it with `CODEX_HOME=~/.codex-private codex login`). Empty (the default) => no second
     # Codex card at all: it is absent, not merely collapsed.
     "codex_home_private": "",
+    # THIRD and further ChatGPT logins, one ``"label=path"`` entry each (same shape as
+    # ``claude_accounts``), e.g. ``["de=~/.codex-de"]``. Each entry adds its own green
+    # usage card (chords t6..t8, in config order) and its own ``codex:<label>`` quota row,
+    # so an account pin on that home is honoured. Labels are validated
+    # ``^[a-z0-9][a-z0-9_-]*$`` and may not re-use the fixed ``default``/``private``.
+    "codex_homes_extra": [],
     # Multi-account Claude Code. ``claude_accounts`` maps labels to config dirs, one
     # ``"label=path"`` entry per line (list[str] so save_config round-trips it). Empty
     # (the default) ⇒ a single ``{"private": claude_home()}`` account, i.e. today's
@@ -144,6 +150,13 @@ DEFAULTS: dict[str, object] = {
     # even after such a drift. Empty (the default) ⇒ no hard link, today's pure
     # path-based behaviour (see ``accounts.resolve_card_label``).
     "claude_account_emails": [],
+    # The user's OWN per-account shell launcher, for `ccc switch-account` (relaunch a live
+    # session under another account in the SAME tab): ``"label=command"`` entries, e.g.
+    # ``["private=cpriv", "work=cwork"]`` — the shell function/alias that pins that account
+    # the way the user always launches it (wrapper flags, permission mode, …). The typed
+    # relaunch is then ``<command> --resume <id>``. Empty (the default) ⇒ the generic
+    # subshell form ``( <account env pin> claude --resume <id> )``.
+    "claude_account_launchers": [],
     # When each paid subscription renews, so a card can advertise its own cancel-by date:
     # ``"card=YYYY-MM-DD"`` entries over the four cards in ``SUBSCRIPTION_CARDS``, e.g.
     # ``["claude_private=auto", "codex_private=2026-09-30"]``. The date is appended to
@@ -161,6 +174,10 @@ DEFAULTS: dict[str, object] = {
     "usage_card_work": True,  # expand the Claude (work) usage card
     "usage_card_codex": True,  # expand the Codex usage card
     "usage_card_codex_private": True,  # expand the SECOND Codex card (codex_home_private)
+    # Labels of the ``codex_homes_extra`` cards that start COLLAPSED. Inverted relative to
+    # the booleans above (which are True = expanded) because the extra cards are dynamic:
+    # an unlisted label is expanded, so a newly added login needs no second key.
+    "usage_card_codex_extra_collapsed": [],
     "usage_card_copilot": True,  # EXPAND the Copilot card (copilot_usage gates the FETCH)
     # External homelab "overseer" alert-triage daemon (a SEPARATE project — unrelated to
     # ccc's own future-job plumbing). Its incidents feed two read-only TUI cards. Empty
@@ -200,6 +217,18 @@ DEFAULTS: dict[str, object] = {
     "done_dir": "~/obsidian/01-llm-tasks/done",  # root of the DONE session mirrors
     "mirror_sessions": False,  # export-only full-conversation mirror per session (INERT: off)
     "sessions_dir": "~/obsidian/01-llm-tasks/sessions",  # root of the full-session mirrors
+    # Mirror scrubber — every byte the three export-only mirror roots receive passes through
+    # it first (docs/reference.md § mirrors). First token = the scrubber executable, resolved
+    # through the external-deps registry ($SECRET_BROKER_CLIENT → $PATH; a token containing
+    # "/" is used verbatim and must exist + be executable); the rest are its arguments. The
+    # document goes in on stdin, the VOUCHED document comes back on stdout; exit 0 = vouched,
+    # anything else = that write is WITHHELD (previous file kept). "" = no scrubber = every
+    # mirror write withheld — fail closed.
+    "mirror_scrub_cmd": "secret-broker-client.py scrub --shapes",
+    # The ONLY passthrough: write mirrors without a scrubber verdict. `ccc doctor` FAILs while
+    # this is on together with any mirror switch. Not an inert-defaults key: False is the safe
+    # value, True is the deliberate opt-OUT of the protection.
+    "mirror_allow_unscrubbed": False,
     "vault_name": "",  # Obsidian vault name for obsidian:// URIs ("" = basename of vault_root)
     # Root of the category/repo tree (layout <repo_root>/<category>/<repo>). Resolution:
     # this value → $GIT_BASE env → "" (no tree: every session falls into the "others" bucket).
@@ -305,17 +334,61 @@ def codex_home_private() -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
+# The labels the two built-in Codex homes own. A ``codex_homes_extra`` entry may not
+# re-use one: it would silently shadow the seat every other module names by that label.
+RESERVED_CODEX_LABELS = ("default", "private")
+
+
+def codex_homes_extra() -> dict[str, Path]:
+    """Label → ``CODEX_HOME`` for every THIRD-and-further ChatGPT login, in config order.
+
+    Parses the ``codex_homes_extra`` config key — a ``list[str]`` of ``"label=path"``
+    entries. Empty (the default) ⇒ ``{}``: only the two built-in homes exist, which is
+    today's behaviour.
+    """
+    return parse_codex_homes_extra(load_config().codex_homes_extra)
+
+
+def parse_codex_homes_extra(entries: list[str]) -> dict[str, Path]:
+    """Pure ``"label=path"`` parser behind :func:`codex_homes_extra`.
+
+    Split out so callers holding an already-loaded ``Config`` (the TUI's render tick)
+    can resolve the extra homes without re-reading the config file. Mirrors
+    :func:`parse_claude_accounts`'s tolerance — an entry with no ``=``, a blank path, a
+    label failing ``_ACCOUNT_LABEL_RE``, or a label in :data:`RESERVED_CODEX_LABELS` is
+    SKIPPED without crashing, and a repeated label keeps its FIRST entry. The path is
+    ``expanduser()``-ed but deliberately NOT ``resolve()``-d, exactly like
+    :func:`codex_home_private` (``quota._canonical_codex_homes`` resolves where it needs
+    identity).
+    """
+    homes: dict[str, Path] = {}
+    for entry in entries:
+        label, sep, raw = entry.partition("=")
+        if not sep:
+            continue  # no "=" → not a "label=path" entry
+        label, raw = label.strip(), raw.strip()
+        if not raw or not _ACCOUNT_LABEL_RE.match(label):
+            continue  # blank path or a label that could smuggle a path separator
+        if label in RESERVED_CODEX_LABELS or label in homes:
+            continue  # never shadow a built-in seat; a duplicate keeps the first entry
+        homes[label] = Path(raw).expanduser()
+    return homes
+
+
 def codex_homes() -> dict[str, Path]:
     """Label -> ``CODEX_HOME`` for every configured Codex (ChatGPT) login.
 
     Always ``{"default": codex_home()}``, plus ``{"private": …}`` when
-    ``codex_home_private`` is set. The labels are FIXED strings: they name the account
-    in ``ccc codex-usage -a LABEL`` output and key the per-home live usage caches.
+    ``codex_home_private`` is set, then one entry per ``codex_homes_extra`` login in
+    config order. The labels name the account in ``ccc codex-usage -a LABEL`` output and
+    key the per-home live usage caches: ``default`` and ``private`` are FIXED strings,
+    while the extra labels are whatever ``codex_homes_extra`` spells them.
     """
     homes = {"default": codex_home()}
     private = codex_home_private()
     if private is not None:
         homes["private"] = private
+    homes.update(codex_homes_extra())
     return homes
 
 
@@ -382,9 +455,42 @@ def parse_claude_account_emails(entries: list[str]) -> dict[str, str]:
     return emails
 
 
-# The four usage cards a subscription-end date can be pinned to. These are CARD keys,
-# not account labels: the two Claude cards are keyed by the account label they render
-# (see SUBSCRIPTION_CARD_ACCOUNTS), the two Codex ones by which CODEX_HOME they read.
+def claude_account_launcher_map() -> dict[str, str]:
+    """Map each Claude account label → the user's own shell launcher for it (see DEFAULTS).
+
+    Parses the ``claude_account_launchers`` config key. Empty ⇒ ``{}``: every account
+    relaunches through the generic env-pinned ``claude --resume`` form.
+    """
+    return parse_claude_account_launchers(load_config().claude_account_launchers)
+
+
+def parse_claude_account_launchers(entries: list[str]) -> dict[str, str]:
+    """Pure ``"label=command"`` parser behind :func:`claude_account_launcher_map`.
+
+    Same tolerance as :func:`parse_claude_account_emails`: an entry with no ``=``, a
+    blank command, or a label failing ``_ACCOUNT_LABEL_RE`` is SKIPPED without crashing.
+    The command is kept verbatim (it is typed into the user's interactive shell, where
+    a function or alias name is exactly what is wanted) — only a newline is refused,
+    since the relauncher submits ONE line.
+    """
+    launchers: dict[str, str] = {}
+    for entry in entries:
+        label, sep, raw = entry.partition("=")
+        if not sep:
+            continue  # no "=" → not a "label=command" entry
+        label, raw = label.strip(), raw.strip()
+        if not raw or "\n" in raw or not _ACCOUNT_LABEL_RE.match(label):
+            continue
+        launchers[label] = raw
+    return launchers
+
+
+# The four FIXED usage cards a subscription-end date can be pinned to. These are CARD
+# keys, not account labels: the two Claude cards are keyed by the account label they
+# render (see SUBSCRIPTION_CARD_ACCOUNTS), the two Codex ones by which CODEX_HOME they
+# read. A ``codex_<label>`` key is accepted on top of these four — one per
+# ``codex_homes_extra`` card, whose labels are only known at runtime (see
+# :func:`is_subscription_card`).
 SUBSCRIPTION_CARDS = ("claude_private", "claude_work", "codex", "codex_private")
 # The Claude subscription cards → the account label whose OAuth profile carries their
 # billing anniversary. The two Codex cards have no entry: their date comes from a
@@ -403,11 +509,26 @@ def subscription_end_map() -> dict[str, str]:
     return parse_subscription_ends(load_config().subscription_ends)
 
 
+def is_subscription_card(card: str) -> bool:
+    """True for a card key a subscription-end date may be pinned to.
+
+    The four fixed :data:`SUBSCRIPTION_CARDS`, plus ``codex_<label>`` for any extra
+    Codex card — its label comes from ``codex_homes_extra``, so it cannot be enumerated
+    here; the same ``_ACCOUNT_LABEL_RE`` that gates the label there gates it here, which
+    keeps a typo (``codex_De``, ``codex_``) rejected exactly as before.
+    """
+    if card in SUBSCRIPTION_CARDS:
+        return True
+    if not card.startswith("codex_"):
+        return False
+    return _ACCOUNT_LABEL_RE.match(card[len("codex_") :]) is not None
+
+
 def parse_subscription_ends(entries: list[str]) -> dict[str, str]:
     """Pure ``"card=YYYY-MM-DD"`` / ``"card=auto"`` parser behind :func:`subscription_end_map`.
 
     Mirrors :func:`parse_claude_account_emails`'s tolerance — an entry with no ``=``, a
-    card outside :data:`SUBSCRIPTION_CARDS`, or a value that is neither ``auto`` nor a
+    card :func:`is_subscription_card` rejects, or a value that is neither ``auto`` nor a
     REAL ISO-8601 date (``2026-02-30`` is rejected, not just mis-shaped strings) is
     SKIPPED without crashing, so one typo in the config never blanks the other cards.
     """
@@ -417,7 +538,7 @@ def parse_subscription_ends(entries: list[str]) -> dict[str, str]:
         if not sep:
             continue  # no "=" → not a "card=value" entry
         card, raw = card.strip(), raw.strip()
-        if card not in SUBSCRIPTION_CARDS:
+        if not is_subscription_card(card):
             continue
         if raw == "auto":
             ends[card] = raw
@@ -523,14 +644,18 @@ class Config:
     codex_usage_refresh_sec: int = 600
     codex_usage_refresh_active_sec: int = 200
     codex_home_private: str = ""  # second CODEX_HOME ("" = no second Codex card)
+    codex_homes_extra: list[str] = field(default_factory=list)  # "label=path" per extra login
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
+    claude_account_launchers: list[str] = field(default_factory=list)  # "label=shell command"
     subscription_ends: list[str] = field(default_factory=list)  # "card=YYYY-MM-DD|auto"
     job_account: str = ""  # "" = default account, a label = pin, "auto" = burn-rate routing
     usage_card_private: bool = True
     usage_card_work: bool = True
     usage_card_codex: bool = True
     usage_card_codex_private: bool = True  # render gate for the second Codex card
+    # Labels of the codex_homes_extra cards that are COLLAPSED (unlisted = expanded).
+    usage_card_codex_extra_collapsed: list[str] = field(default_factory=list)
     usage_card_copilot: bool = True  # render gate (copilot_usage stays the fetch gate)
     nixos_overseer_dir: str = ""  # external overseer root ("" = feature off)
     card_nixos_overseer_supervised: bool = True
@@ -566,6 +691,8 @@ class Config:
     done_dir: str = "~/obsidian/01-llm-tasks/done"
     mirror_sessions: bool = False
     sessions_dir: str = "~/obsidian/01-llm-tasks/sessions"
+    mirror_scrub_cmd: str = "secret-broker-client.py scrub --shapes"
+    mirror_allow_unscrubbed: bool = False
     vault_name: str = ""
     repo_root: str = ""
     category_colors: dict[str, str] = field(default_factory=dict)
