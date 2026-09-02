@@ -79,6 +79,7 @@ from .. import (
     tags,
     terminal,
     usage,
+    watchdog,
 )
 from ..adapters.claude import ClaudeAdapter
 from ..core import Row, build_rows
@@ -2096,6 +2097,15 @@ class CommandCenterApp(App[None]):
         # Set by the fast poll when `ccc restart-tui` asks us to restart: run() re-execs
         # the process in place (same tab) once the app has exited and the terminal restored.
         self.restart_requested = False
+        # Liveness watchdog (a plain thread — see watchdog.py): the fast poll beats it; a
+        # dead loop/timer set, or an exit that never finishes, gets a stack dump + a
+        # self-heal (re-exec in place / finish the quit) instead of a frozen last frame.
+        self._watchdog = watchdog.Watchdog(
+            is_exiting=self._watchdog_is_exiting,
+            restart_wanted=lambda: self.restart_requested,
+            state=self._watchdog_state,
+            reexec=_reexec_in_place,
+        )
 
     # ---- layout (top: table, bottom: detail) ----------------------------
     def compose(self) -> ComposeResult:
@@ -2208,6 +2218,10 @@ class CommandCenterApp(App[None]):
         # Fast, cheap poll for `ccc jump` signals (the f+j toggle): the whole-toggle verb
         # and the cursor-move request, so a jump lands near-instantly, not after 5 s.
         self.set_interval(_JUMP_POLL_SEC, self._poll_jump_request)
+        # Only a real terminal gets the watchdog: its self-heal re-execs / exits the
+        # process, which a headless run_test() app (tests) must never trigger.
+        if sys.__stdout__ is not None and sys.__stdout__.isatty():
+            self._watchdog.start()
 
     def on_unmount(self) -> None:
         # Retract the identity so `ccc jump` stops handing this (now gone) TUI the toggle.
@@ -2215,6 +2229,31 @@ class CommandCenterApp(App[None]):
             jumpstate.clear_tui()
         except OSError:
             pass
+
+    def _watchdog_is_exiting(self) -> bool:
+        """True once the app has begun to exit (exit() called, pump closing, loop done)."""
+        return bool(
+            getattr(self, "_exit", False)
+            or getattr(self, "_closing", False)
+            or not getattr(self, "_running", False)
+        )
+
+    def _watchdog_state(self) -> dict[str, object]:
+        """The flags a wedge report needs next to the stack dump (cheap, no widgets)."""
+        try:
+            workers = [f"{w.name}={w.state.name}" for w in self.workers]
+        except Exception as error:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            workers = [repr(error)]
+        return {
+            "running": getattr(self, "_running", None),
+            "exit": getattr(self, "_exit", None),
+            "closing": getattr(self, "_closing", None),
+            "restart_requested": self.restart_requested,
+            "editing": self._editing,
+            "timers": len(getattr(self, "_timers", ())),
+            "workers": workers,
+            "screen_stack": len(getattr(self, "screen_stack", ())),
+        }
 
     def _apply_split(self) -> None:
         top = max(5, min(95, round(self.cfg.split_ratio * 100)))
@@ -2295,6 +2334,7 @@ class CommandCenterApp(App[None]):
         except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             pass
         self._rows = {r.session.session_id: r for r in rows}
+        watchdog.mark_healthy()  # a refresh applied: a watchdog re-exec'd generation is fine
         self._sep_seq = 0
         self._sep_category = {}
         self._rule_seps = {}
@@ -2948,6 +2988,7 @@ class CommandCenterApp(App[None]):
         A pending *restart* verb (``ccc restart-tui``) takes precedence: we consume it,
         flag the app and exit cleanly; run() re-execs the process in place (same tab).
         """
+        self._watchdog.beat()  # this timer firing IS the liveness proof (see watchdog.py)
         if jumpstate.peek_restart():
             jumpstate.clear_restart()
             self.restart_requested = True
@@ -5053,8 +5094,15 @@ def _reexec_in_place() -> None:
 
 def run() -> int:
     """Launch the TUI, re-exec'ing in place if it asked to restart itself."""
+    # `kill -USR1 <pid>` dumps every thread's Python stack to tui-watchdog.log — the
+    # on-demand twin of the watchdog's automatic wedge report (see watchdog.py).
+    try:
+        watchdog.register_usr1()
+    except OSError:
+        pass
     app = CommandCenterApp()
     app.run()
+    app._watchdog.stop()  # pylint: disable=protected-access  # run() returned: not wedged
     if app.restart_requested:
         _reexec_in_place()  # replaces this process — does not return on success
     return 0

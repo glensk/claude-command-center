@@ -748,6 +748,29 @@ def test_depends_on_column_migrates_onto_existing_db(tmp_path: Path) -> None:
         assert got is not None and got.depends_on == "parent-uuid"
 
 
+def test_row_to_session_drops_columns_this_build_does_not_know(tmp_path: Path) -> None:
+    # The DB is shared and the code is an editable install: a NEWER ccc (another session's
+    # hook, the daemon) can ALTER TABLE under a long-lived OLDER process (the TUI). Reading
+    # such a row must drop the unknown column, not raise inside Session(**row) — that
+    # TypeError killed the TUI's refresh worker and froze its last frame (2026-09-02).
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    with Store(db):
+        pass  # creates the schema
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO sessions (session_id, cwd) VALUES ('s1', '/repo/s1')")
+    conn.execute("ALTER TABLE sessions ADD COLUMN from_the_future TEXT NOT NULL DEFAULT 'x'")
+    conn.commit()
+    conn.close()
+    with Store(db) as store:
+        row = store.get("s1")
+        assert row is not None
+        assert row.cwd == "/repo/s1"
+        assert not hasattr(row, "from_the_future")
+        assert row.done is False  # bool coercion of the known columns still happens
+
+
 def test_close_requested_at_column_migrates_and_roundtrips(tmp_path: Path) -> None:
     # Guards the _SESSION_COLUMNS whitelist + the ALTER-in-place migration for the new
     # close_requested_at column: a pre-migration DB gains it (default 0) and it survives a

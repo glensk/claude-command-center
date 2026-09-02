@@ -18,6 +18,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+import dataclasses
 import json
 import re
 import sqlite3
@@ -286,10 +287,20 @@ FROM sessions s
 """
 
 
+_SESSION_FIELDS = frozenset(field.name for field in dataclasses.fields(Session))
+
+
 def _row_to_session(row: sqlite3.Row) -> Session:
-    data = {key: row[key] for key in row.keys()}
+    # Keep only the columns THIS process's Session knows. The DB is shared by every ccc
+    # process on the machine and the code is an editable install, so a long-lived TUI
+    # keeps reading rows that a NEWER ccc (another session's hook, the daemon) has just
+    # widened with an ALTER TABLE: `Session(**row)` then raised "unexpected keyword
+    # argument 'no_codex'" inside the refresh worker (2026-09-02) and the TUI froze on
+    # its last frame. A column this build has but the row lacks keeps the dataclass default.
+    data = {key: row[key] for key in row.keys() if key in _SESSION_FIELDS}
     for col in _BOOL_COLUMNS:
-        data[col] = bool(data[col])
+        if col in data:
+            data[col] = bool(data[col])
     return Session(**data)
 
 

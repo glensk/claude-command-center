@@ -3450,7 +3450,9 @@ def cmd_restore_snapshot(args: argparse.Namespace) -> int:
 
 
 _RESTART_POLL_SEC = 0.1
-_RESTART_TIMEOUT_SEC = 5.0
+# Long enough to cover a wedged shutdown healed by the TUI's watchdog (its 10 s exit grace,
+# the stack dump, the in-place re-exec and the new mount) — a healthy restart returns in ~1 s.
+_RESTART_TIMEOUT_SEC = 25.0
 
 
 def cmd_restart_tui(args: argparse.Namespace) -> int:
@@ -3462,12 +3464,14 @@ def cmd_restart_tui(args: argparse.Namespace) -> int:
 
     Exit 0 once the TUI has come back up (the request was consumed and a live TUI
     identity is re-registered — a same-pid ``execv`` restart after a teardown gap, or a
-    fresh pid); exit 1 when no TUI is running, or the restart did not complete in 5 s.
+    fresh pid); exit 1 when no TUI is running, or the restart did not complete in 25 s
+    (long enough for the TUI's watchdog to heal a shutdown that hung — see watchdog.py).
     """
     import time
 
-    from . import jumpstate
+    from . import jumpstate, watchdog
 
+    watchdog_log = watchdog.log_path
     tui = jumpstate.get_tui()
     if tui is None:
         print("no running ccc TUI", file=sys.stderr)
@@ -3495,8 +3499,9 @@ def cmd_restart_tui(args: argparse.Namespace) -> int:
             return 0
     jumpstate.clear_restart()  # stale-request safety: don't let it restart a TUI started later
     print(
-        "error: ccc TUI did not restart within 5s — is it wedged? "
-        "check the tab (or start it with `ccc tui`)",
+        f"error: ccc TUI did not restart within {_RESTART_TIMEOUT_SEC:.0f}s — is it wedged? "
+        "check the tab (or start it with `ccc tui`); a wedge report with every thread's "
+        f"stack is appended to {watchdog_log()}, and `kill -USR1 {old_pid}` dumps one now",
         file=sys.stderr,
     )
     return 1

@@ -213,9 +213,24 @@ Textual has restored the terminal — the process **re-execs itself in place**
 (`os.execv`/`execvp`), so the TUI comes back up in its **own terminal tab** with the new
 code, no new window or manual keystroke. It exits **0** once the TUI has restarted (the
 request was consumed and a live TUI re-registered), and **1** when no TUI is running or
-the restart did not complete within 5 s. It is an internal-style command (no TUI key, no
+the restart did not complete within 25 s. It is an internal-style command (no TUI key, no
 footer entry). A leftover restart request is always cleared on TUI startup, so a stale
 file can never loop-restart a freshly launched TUI.
+
+**Liveness watchdog.** The TUI runs a plain daemon thread (`watchdog.py`, not a Textual
+timer — those are the first casualty of a wedge) that the 0.1 s poll beats. If the
+heartbeat stops for 120 s while the app is not exiting, or an exit (quit / restart) has
+not finished within 10 s, the TUI is wedged: the watchdog appends a report — the app's
+state flags plus a `faulthandler` dump of **every thread's Python stack** — to
+`$CCC_HOME/command-center/tui-watchdog.log`, restores the terminal, and then re-execs
+the TUI in place (a stall, or a hung restart) or finishes the quit. At most three
+consecutive watchdog re-execs (`$CCC_TUI_WATCHDOG_RESTARTS`, reset by the first applied
+refresh) — past that it exits 1 and names the log. `kill -USR1 <pid>` writes the same
+all-thread stack dump on demand. Why: on 2026-09-02 a shutdown hung before `Unmount`
+and the last frame sat on screen for hours — ages, next-steps and progress bars frozen
+while the store (and the status line) moved on, and `ccc restart-tui` could not help
+because the poll that consumes its request was dead too. The 25 s `restart-tui` budget
+covers that heal.
 
 In the TUI, **`d`** marks the selected session done (its in-session `Status:` line
 shows `done` on that session's next render). If the session is still live, `d` then

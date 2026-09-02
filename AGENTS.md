@@ -25,7 +25,14 @@ uv run pylint command_center/<files>
 ```
 
 Install editable while developing (`uv tool install --editable . --reinstall`) — the TUI
-loads its code (keys, footer, help) at launch, so restart it after a change.
+loads its code (keys, footer, help) at launch, so restart it after a change
+(`ccc restart-tui`). Two consequences of that long-lived process sharing one SQLite DB
+with every other ccc process (do not regress): `store._row_to_session` must **drop
+columns the running build does not know** (a newer ccc's `ALTER TABLE` under an older
+TUI once raised inside its refresh worker and froze the table), and a wedged TUI must
+**self-heal**, never sit on a stale frame — `watchdog.py` (a plain thread the 0.1 s poll
+beats) dumps every thread's Python stack to `tui-watchdog.log` and re-execs/exits;
+`kill -USR1 <pid>` dumps the same on demand.
 
 Secrets live in `.env` (never commit); see `.env.example`.
 
@@ -234,6 +241,10 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
   overrides where present); `tabcolor.dedupe_live` recolours open tabs that would share one
   id-chip colour, writing only the per-tab colour cache + its `.manual` marker (the two files
   the status line already honours). Linux hotkey samples: `assets/hotkeys-linux/` (keyd/xremap).
++ **TUI liveness** — `watchdog.py` is the self-heal for a wedged TUI (stalled timers, or
+  an exit that hangs): heartbeat + exit-grace verdicts, the `tui-watchdog.log` wedge
+  report with every thread's Python stack, terminal restore, capped in-place re-exec;
+  `views/tui.py` beats it from the fast poll and starts it only on a real tty.
 + **Packaging** — the wheel ships three console entry points (`ccc`, `codex-in-claude`,
   `claude-session-continue`) and the `command_center/assets/` package data.
 
