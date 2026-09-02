@@ -10,7 +10,14 @@ import pytest
 
 from command_center import usage
 from command_center.core import Row, build_rows
-from command_center.models import LiveSession, Session, Status, TranscriptScan, now_ms
+from command_center.models import (
+    CODEX_WORKFLOW_NAME,
+    LiveSession,
+    Session,
+    Status,
+    TranscriptScan,
+    now_ms,
+)
 from command_center.store import Store
 
 _DAY = 86_400_000
@@ -751,6 +758,51 @@ def test_transcript_facts_persists_nothing_on_a_read_failure(
 
     assert core._transcript_facts(adapter, session, scans, dirty) == ("fable-5", False)  # pylint: disable=protected-access
     assert [row.model for row in dirty] == ["claude-fable-5"]
+
+
+def test_transcript_facts_answers_from_the_prior_row_when_a_reread_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once a row is known, a transient read failure — or a transcript that vanished —
+    answers from that row (the one build_rows renders anyway), never "" / False, and still
+    persists nothing: one pass must not disagree with its own rows."""
+    from command_center import core  # pylint: disable=import-outside-toplevel
+    from command_center.adapters import ClaudeAdapter  # pylint: disable=import-outside-toplevel
+    from command_center.adapters import (
+        claude as claude_mod,  # pylint: disable=import-outside-toplevel
+    )
+
+    proj = tmp_path / "projects" / "-repo"
+    proj.mkdir(parents=True)
+    path = proj / "sid.jsonl"
+    path.write_text(
+        '{"type": "user", "message": {"role": "user", "content": '
+        f'"<command-name>/{CODEX_WORKFLOW_NAME}</command-name>"}}}}\n'
+        '{"type": "assistant", "message": {"role": "assistant", "model": "claude-fable-5", '
+        '"content": [{"type": "text", "text": "x"}]}}\n',
+        encoding="utf-8",
+    )
+    store = Store(tmp_path / "s.db")
+    session = store.ensure("sid", cwd="/repo")
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    scans: dict[str, TranscriptScan] = {}
+    dirty: list[TranscriptScan] = []
+    assert core._transcript_facts(adapter, session, scans, dirty) == ("fable-5", True)  # pylint: disable=protected-access
+    prior = scans["sid"]
+    dirty.clear()
+
+    def _fail(path: Path, chunk_size: int = 65536) -> str | None:
+        raise OSError("simulated EIO")
+
+    monkeypatch.setattr(claude_mod, "last_model_in_file", _fail)
+    with path.open("a", encoding="utf-8") as handle:  # identity changes → a real re-read
+        handle.write('{"type": "user", "message": {"role": "user", "content": "more"}}\n')
+    assert core._transcript_facts(adapter, session, scans, dirty) == ("fable-5", True)  # pylint: disable=protected-access
+    assert dirty == [] and scans["sid"] is prior  # nothing learned → nothing written
+
+    path.unlink()  # vanished: still the prior row, still nothing persisted
+    assert core._transcript_facts(adapter, session, scans, dirty) == ("fable-5", True)  # pylint: disable=protected-access
+    assert dirty == [] and scans["sid"] is prior
     store.close()
 
 

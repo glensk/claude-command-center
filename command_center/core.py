@@ -311,8 +311,15 @@ def _transcript_facts(
         # A read failure (the OSError the transcript readers now raise) is not a fact:
         # persist NOTHING and let the next pass retry — see scan_transcript § Property P.
         new = None
-    if new is None:  # no transcript (never had a turn, or deleted)
-        return "", job_hit
+    if new is None:
+        # Nothing readable this pass (never had a turn, deleted, or the read failed). A
+        # prior row stays the answer: it is still in *scans*, so build_rows renders ITS
+        # ``codex`` flag — answering "" / False here would make one pass's status
+        # (``codex_waiting``) disagree with its own rows. Only a session that never had a
+        # scan row falls back to the job type alone.
+        if prior is None:
+            return "", job_hit
+        return model_label(prior.model), job_hit or prior.codex
     if new is not prior:  # identity: the same object means the file was untouched
         scans[sid] = new
         dirty.append(new)
