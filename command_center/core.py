@@ -31,6 +31,7 @@ from .models import (
     LiveSession,
     Session,
     Status,
+    TranscriptScan,
     derive_status,
     model_label,
     now_ms,
@@ -39,6 +40,11 @@ from .models import (
 from .store import Store
 
 _DAY_MS = 86_400_000
+
+# Sentinel for ``reconcile(codex_usage=…)``: "not supplied", so the function reads the
+# Codex usage snapshot itself. ``None`` is a legitimate VALUE (no snapshot available), so
+# it cannot double as the default.
+_UNSET: Any = object()
 
 
 @dataclass
@@ -236,6 +242,43 @@ def _observed_model(adapter: Adapter, session: Session) -> str:
         return ""
 
 
+def _transcript_facts(
+    adapter: Adapter,
+    session: Session,
+    scans: dict[str, TranscriptScan],
+    dirty: list[TranscriptScan],
+) -> tuple[str, bool]:
+    """The session's ``(observed model label, uses-Codex)`` from ONE transcript pass.
+
+    Both facts used to be read separately (``observed_model`` walked every line of every
+    transcript, ``uses_codex_workflow`` scanned every whole file for the marker) on every
+    build — 34 s of a cold ``ccc ls`` over 677 sessions. ``scan_transcript`` answers both
+    from a single ``stat()`` when the file is unchanged since the persisted *scans* row,
+    which is the case for every done/parked session.
+
+    *scans* is updated in place and every row whose transcript actually changed is appended
+    to *dirty* for one batched write at the end of the pass. ``scan_transcript`` is a
+    concrete-adapter capability, not part of the :class:`Adapter` protocol, so an adapter
+    without it (stubs in tests) falls back to the legacy per-fact reads.
+    """
+    job_hit = (session.job_type or "claude") in CODEX_WORKFLOW_JOB_TYPES
+    scan_fn = getattr(adapter, "scan_transcript", None)
+    if scan_fn is None:
+        return _observed_model(adapter, session), _uses_codex_workflow(adapter, session)
+    sid = session.session_id
+    prior = scans.get(sid)
+    try:
+        new = scan_fn(session.cwd, sid, prior)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        new = None
+    if new is None:  # no transcript (never had a turn, or deleted)
+        return "", job_hit
+    if new is not prior:  # identity: the same object means the file was untouched
+        scans[sid] = new
+        dirty.append(new)
+    return model_label(new.model), job_hit or new.codex
+
+
 def _session_effort(adapter: Adapter, pid: int) -> str | None:
     """The ``--effort`` level of the live process *pid* (optional adapter capability).
 
@@ -289,12 +332,22 @@ def _settings_effort_cached(config_dir: str, cache: dict[str, str]) -> str:
     return cache[key]
 
 
-def reconcile(  # pylint: disable=too-many-locals,too-many-branches
-    store: Store, adapter: Adapter
-) -> None:
-    """Sync the store with the live registry; park sessions that are no longer live."""
-    codex_block = usage.codex_exhausted_window(usage.read_codex_usage())
+def reconcile(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+    store: Store, adapter: Adapter, codex_usage: Any = _UNSET
+) -> dict[str, TranscriptScan]:
+    """Sync the store with the live registry; park sessions that are no longer live.
+
+    Returns the transcript scans (session id → :class:`TranscriptScan`) it worked from,
+    already updated for this pass and persisted — :func:`build_rows` reuses them instead of
+    touching the transcripts a second time. *codex_usage* lets a caller that already read
+    the Codex snapshot pass it in rather than have it read twice per build; unset means
+    read it here (every other caller is unchanged).
+    """
+    snapshot = usage.read_codex_usage() if codex_usage is _UNSET else codex_usage
+    codex_block = usage.codex_exhausted_window(snapshot)
     codex_exhausted = codex_block is not None
+    scans = store.transcript_scans()
+    dirty: list[TranscriptScan] = []
     live_by_id: dict[str, LiveSession] = {ls.session_id: ls for ls in adapter.discover()}
     # Per-account settings.json effort, realpath-deduped: on this machine every
     # account's settings.json is the same stow file, so the resolved-path key reads it
@@ -305,7 +358,10 @@ def reconcile(  # pylint: disable=too-many-locals,too-many-branches
         stored = store.get(live.session_id)
         halted = live.alive and adapter.is_halted(live.cwd, live.session_id)
         background = live.alive and _has_background_task(adapter, live.pid)
-        uses_codex = stored is not None and _uses_codex_workflow(adapter, stored)
+        # One transcript pass for BOTH facts (model + Codex marker); see _transcript_facts.
+        observed_model, uses_codex = ("", False)
+        if stored is not None:
+            observed_model, uses_codex = _transcript_facts(adapter, stored, scans, dirty)
         status = derive_status(
             live,
             stored,
@@ -334,7 +390,7 @@ def reconcile(  # pylint: disable=too-many-locals,too-many-branches
         if stored is not None:
             # OBSERVED model (from the transcript) — persist only when it changed, so an
             # unchanged model adds no key (the status/last_response write happens anyway).
-            model = _observed_model(adapter, stored)
+            model = observed_model
             if model and model != (stored.model or ""):
                 fields["model"] = model
             # Effort: an explicit --effort flag on the live process is authoritative; with
@@ -361,7 +417,7 @@ def reconcile(  # pylint: disable=too-many-locals,too-many-branches
         # to read once the process is gone, and today's settings default must never backfill
         # a historical row). Accumulate so a no-change pass writes nothing (byte-stable).
         updates: dict[str, object] = {}
-        model = _observed_model(adapter, session)
+        model, _ = _transcript_facts(adapter, session, scans, dirty)
         if model and model != (session.model or ""):
             updates["model"] = model
         if session.done:
@@ -379,6 +435,10 @@ def reconcile(  # pylint: disable=too-many-locals,too-many-branches
             updates["closed_at"] = now_ms()
         if updates:
             store.update_fields(session.session_id, **updates)
+    # One batched write for every transcript that actually changed (usually a handful of
+    # live sessions); an all-frozen pass writes nothing at all.
+    store.put_transcript_scans(dirty)
+    return scans
 
 
 DEFAULT_FOLDER_ORDER = ("home", "infra", "llms", "sdsc")
@@ -505,6 +565,7 @@ def build_rows(
     done_max_age_days: int = 0,
     folder_order: tuple[str, ...] = DEFAULT_FOLDER_ORDER,
     include_future: bool = True,
+    reconcile_first: bool = True,
 ) -> list[Row]:
     """Reconcile, then return display rows grouped strictly by repo category.
 
@@ -515,10 +576,21 @@ def build_rows(
     ``done_max_age_days`` > 0 hides done sessions finished more than that many days
     ago (by ``done_at``, falling back to last activity); 0 shows all.
     ``include_future`` toggles whether not-yet-started future jobs are listed.
+
+    ``reconcile_first=False`` builds the rows from the stored state and the PERSISTED
+    transcript scans alone — no registry reconcile, no transcript read, no usage read. That
+    is the quick first paint (a caller then reconciles in the background and rebuilds); the
+    rows are as fresh as the last pass that did reconcile.
     """
-    reconcile(store, adapter)
+    if reconcile_first:
+        # Read the Codex snapshot ONCE and hand it to reconcile (it needs the same one).
+        codex_usage = usage.read_codex_usage()
+        scans = reconcile(store, adapter, codex_usage=codex_usage)
+        codex_block = usage.codex_exhausted_window(codex_usage)
+    else:  # quick first paint: stored rows + persisted facts only, no transcript/usage work
+        scans = store.transcript_scans()
+        codex_block = None
     live_by_id: dict[str, LiveSession] = {ls.session_id: ls for ls in adapter.discover()}
-    codex_block = usage.codex_exhausted_window(usage.read_codex_usage())
     codex_label = codex_block[0] if codex_block else None
     codex_reset_at = codex_block[1].resets_at if codex_block else None
     now = now_ms()
@@ -546,7 +618,14 @@ def build_rows(
         # Weighted progress: essential sub-goals count more. Degenerates to the plain
         # count when every weight is 1, so unweighted checklists are unaffected.
         checked, total = store.progress_weighted(session.session_id)
-        uses_codex = _uses_codex_workflow(adapter, session)
+        # No file access here: the marker was settled by the scan pass (or a previous one).
+        if hasattr(adapter, "scan_transcript"):
+            sid = session.session_id
+            uses_codex = (session.job_type or "claude") in CODEX_WORKFLOW_JOB_TYPES or (
+                scans[sid].codex if sid in scans else False
+            )
+        else:  # stub adapter without the scan capability → the legacy per-session read
+            uses_codex = _uses_codex_workflow(adapter, session)
         rows.append(
             Row(
                 session,

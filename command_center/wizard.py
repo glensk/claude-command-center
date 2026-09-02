@@ -242,6 +242,7 @@ def write_config(profile: Profile, *, force: bool) -> tuple[bool, Path | None]:
             backup = None
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(minimal_config_text(profile), encoding="utf-8")
+    config.invalidate_config_cache()  # every writer of config.toml drops the load_config memo
     return True, backup
 
 

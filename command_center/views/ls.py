@@ -12,7 +12,7 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-from .. import accounts, cachettl, config, resume, tabsymbol
+from .. import accounts, cachettl, config, repos, resume, tabsymbol
 from ..adapters.base import Adapter
 from ..adapters.claude import ClaudeAdapter
 from ..core import Row, build_rows
@@ -124,6 +124,7 @@ def _render_row(
     adapter: Adapter | None = None,
     resume_armed_ids: frozenset[str] = frozenset(),
     aim_first: bool = True,  # /aim shows revision (1) — see models.display_aim
+    root: str | None = None,  # pre-resolved repos.repo_root — see render()
 ) -> list[str]:
     session = row.session
     status = row.status
@@ -137,7 +138,11 @@ def _render_row(
     folder = folder_link(session.cwd or ".", label=display, width=_FOLDER_WIDTH, color=enabled)
     # Per-repo colored badge before the folder (matches the TUI + the user's tabs): a live
     # row shows its iTerm tab's claimed emoji, every other row the deterministic per-repo one.
-    badge_cell = tabsymbol.cell_for(session.iterm_session_id, session.cwd or "", live=row.is_open)
+    # *root* comes pre-resolved from render(): without it every row re-resolves the repo
+    # tree through a fresh config read (629 of them on a big listing).
+    badge_cell = tabsymbol.cell_for(
+        session.iterm_session_id, session.cwd or "", live=row.is_open, root=root
+    )
 
     fraction = effective_progress(session.manual_progress, row.checked, row.total)
     pct = f"{int(round(fraction * 100)):3d}%" if fraction is not None else "  · "
@@ -310,12 +315,16 @@ def render(
     # login marks each row with the account it TRULY bills — one .claude.json read per configured
     # account here, never one per row (see accounts.effective_home_markers).
     account_markers = accounts.effective_home_markers()
+    # One config read for the whole listing, and the repo-tree root resolved from it once:
+    # every row's badge + folder label keys off that root, so resolving it per row cost one
+    # config read (pre-memo: one TOML parse) per row.
+    cfg = config.load_config()
+    root = repos.repo_root(cfg)
     # Which halted rows will auto-revive on their account's reset (green ▶ after the red ||).
     # Evaluated ONLY for halted rows — it stats a transcript — and the config is read once.
     armed: set[str] = set()
     halted = [r for r in rows if r.status is Status.HALTED]
     if halted and isinstance(adapter, ClaudeAdapter):
-        cfg = config.load_config()
         queue = resume.load_state()  # one snapshot per listing, not one read per row
         armed = {
             r.session.session_id
@@ -337,6 +346,7 @@ def render(
                 adapter,
                 resume_armed_ids,
                 aim_first,
+                root,
             )
         )
     summary = "  ".join(

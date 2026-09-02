@@ -40,6 +40,7 @@ from .models import (
     Status,
     Subgoal,
     SubgoalRevision,
+    TranscriptScan,
     no_codex_conflict,
     now_ms,
     short_id,
@@ -268,6 +269,20 @@ CREATE TABLE IF NOT EXISTS file_lock_waiters (
     PRIMARY KEY (file_path, session_id)
 );
 CREATE INDEX IF NOT EXISTS idx_file_lock_waiters_session ON file_lock_waiters(session_id);
+-- Per-session transcript facts (observed model, Codex-workflow marker) cached across
+-- PROCESSES, keyed by the transcript's (path, mtime_ns, size) identity. Deliberately NO
+-- foreign key on session_id: every hook/daemon/TUI process upserts sessions concurrently,
+-- and a scan row must never fail (or cascade) on who wrote the session row first.
+CREATE TABLE IF NOT EXISTS transcript_scan (
+    session_id       TEXT    PRIMARY KEY,
+    path             TEXT    NOT NULL,
+    mtime_ns         INTEGER NOT NULL,
+    size             INTEGER NOT NULL,
+    model            TEXT,
+    codex            INTEGER NOT NULL DEFAULT 0,
+    codex_scanned_to INTEGER NOT NULL DEFAULT 0,
+    scanned_at       INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -290,18 +305,38 @@ FROM sessions s
 _SESSION_FIELDS = frozenset(field.name for field in dataclasses.fields(Session))
 
 
-def _row_to_session(row: sqlite3.Row) -> Session:
+def _row_to_session(row: sqlite3.Row, keys: list[str] | None = None) -> Session:
     # Keep only the columns THIS process's Session knows. The DB is shared by every ccc
     # process on the machine and the code is an editable install, so a long-lived TUI
     # keeps reading rows that a NEWER ccc (another session's hook, the daemon) has just
     # widened with an ALTER TABLE: `Session(**row)` then raised "unexpected keyword
     # argument 'no_codex'" inside the refresh worker (2026-09-02) and the TUI froze on
     # its last frame. A column this build has but the row lacks keeps the dataclass default.
-    data = {key: row[key] for key in row.keys() if key in _SESSION_FIELDS}
+    #
+    # *keys* is that intersection precomputed by the caller: every row of one SELECT has
+    # the same columns, so list_sessions() derives it once instead of re-intersecting ~70
+    # column names per row (it does this for every session on every refresh).
+    if keys is None:
+        keys = [key for key in row.keys() if key in _SESSION_FIELDS]
+    data: dict[str, Any] = {key: row[key] for key in keys}
     for col in _BOOL_COLUMNS:
         if col in data:
             data[col] = bool(data[col])
     return Session(**data)
+
+
+def _row_to_scan(row: sqlite3.Row) -> TranscriptScan:
+    """Build a :class:`TranscriptScan` from a ``transcript_scan`` row (bools coerced)."""
+    return TranscriptScan(
+        session_id=str(row["session_id"]),
+        path=str(row["path"]),
+        mtime_ns=int(row["mtime_ns"]),
+        size=int(row["size"]),
+        model=row["model"],
+        codex=bool(row["codex"]),
+        codex_scanned_to=int(row["codex_scanned_to"]),
+        scanned_at=int(row["scanned_at"]),
+    )
 
 
 class Store:  # pylint: disable=too-many-public-methods
@@ -463,19 +498,32 @@ class Store:  # pylint: disable=too-many-public-methods
         sql = _SESSION_SELECT
         if not include_archived:
             sql += " WHERE s.archived = 0"
-        return [_row_to_session(r) for r in self.conn.execute(sql).fetchall()]
+        rows = self.conn.execute(sql).fetchall()
+        if not rows:
+            return []
+        # One intersection for the whole result set (see _row_to_session): the columns are
+        # a property of the SELECT, not of the row.
+        keys = [key for key in rows[0].keys() if key in _SESSION_FIELDS]
+        return [_row_to_session(r, keys) for r in rows]
 
     def delete(self, session_id: str) -> None:
-        """Remove a session and its sub-goals (FK cascade)."""
+        """Remove a session, its sub-goals (FK cascade) and its transcript-scan row.
+
+        ``transcript_scan`` carries no foreign key (see :data:`_SCHEMA`), so its row is
+        deleted explicitly — otherwise a re-created session id would inherit the facts of
+        the transcript the deleted row was scanned from.
+        """
         self.conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        self.conn.execute("DELETE FROM transcript_scan WHERE session_id = ?", (session_id,))
         self.conn.commit()
 
     def delete_many(self, session_ids: Iterable[str]) -> int:
-        """Remove several sessions (and their sub-goals); return the count deleted."""
+        """Remove several sessions (sub-goals + transcript scans); return the count deleted."""
         ids = [(sid,) for sid in session_ids]
         if not ids:
             return 0
         self.conn.executemany("DELETE FROM sessions WHERE session_id = ?", ids)
+        self.conn.executemany("DELETE FROM transcript_scan WHERE session_id = ?", ids)
         self.conn.commit()
         return len(ids)
 
@@ -767,6 +815,51 @@ class Store:  # pylint: disable=too-many-public-methods
         )
         if existing.archived and not existing.draft:
             self.update_fields(live.session_id, archived=False)
+
+    # ---- transcript scans -----------------------------------------------
+    def get_transcript_scan(self, session_id: str) -> TranscriptScan | None:
+        """The persisted transcript facts for *session_id*, or ``None`` if never scanned."""
+        row = self.conn.execute(
+            "SELECT * FROM transcript_scan WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        return _row_to_scan(row) if row else None
+
+    def transcript_scans(self) -> dict[str, TranscriptScan]:
+        """Every persisted transcript scan, keyed by session id — ONE select.
+
+        The whole table is a few hundred short rows and :func:`core.reconcile` needs it
+        for every session, so one read beats a per-session lookup.
+        """
+        rows = self.conn.execute("SELECT * FROM transcript_scan").fetchall()
+        return {str(row["session_id"]): _row_to_scan(row) for row in rows}
+
+    def put_transcript_scans(self, scans: Iterable[TranscriptScan]) -> None:
+        """Persist *scans* (INSERT OR REPLACE) in ONE transaction, ONE commit.
+
+        Called once per reconcile pass with only the rows whose transcript actually
+        changed, so an all-frozen pass writes (and commits) nothing at all.
+        """
+        payload = [
+            (
+                scan.session_id,
+                scan.path,
+                int(scan.mtime_ns),
+                int(scan.size),
+                scan.model,
+                int(scan.codex),
+                int(scan.codex_scanned_to),
+                int(scan.scanned_at),
+            )
+            for scan in scans
+        ]
+        if not payload:
+            return
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO transcript_scan (session_id, path, mtime_ns, size, model, "
+            "codex, codex_scanned_to, scanned_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            payload,
+        )
+        self.conn.commit()
 
     # ---- subgoals -------------------------------------------------------
     def list_subgoals(self, session_id: str) -> list[Subgoal]:

@@ -34,6 +34,29 @@ TUI once raised inside its refresh worker and froze the table), and a wedged TUI
 beats) dumps every thread's Python stack to `tui-watchdog.log` and re-execs/exits;
 `kill -USR1 <pid>` dumps the same on demand.
 
+## Startup / refresh cost (do not regress)
+
+A cold `ccc ls` once took 45 s because every process re-parsed every stored transcript.
+The invariants that keep it under a few seconds:
+
+- **Transcript facts are persisted, never re-derived per process.** `core.reconcile`
+  bulk-loads `store.transcript_scans()`, asks `ClaudeAdapter.scan_transcript(cwd, sid,
+  prior)` for each session and batches the changed rows back in one commit. The adapter
+  returns the *same* `prior` object when `(path, mtime_ns, size)` match — a frozen
+  (done/parked) transcript costs one `stat()`. New per-transcript facts go into
+  `models.TranscriptScan` + that table, not into a fresh full-file read.
+- **Read the tail, not the file.** `last_model_in_file` walks backwards in 64 KiB blocks;
+  `codex_marker_in_file` resumes from `codex_scanned_to` (transcripts are append-only).
+- **`config.load_config()` is memoized** on the file's `(path, mtime_ns, size)` and returns
+  a deep copy; every writer of `config.toml` goes through `save_config` (which invalidates).
+  Hot per-row paths pass the resolved `root` down (`tabsymbol.cell_for(..., root=)`).
+- **One build at a time in the TUI.** `refresh_data` refuses to start a second
+  `data-refresh` thread worker (Textual cannot interrupt a thread — `exclusive=True` only
+  produced cancelled-but-running duplicates); a tick that lands mid-build sets
+  `_refresh_pending` and `on_worker_state_changed` runs the single follow-up. The first
+  worker run paints `build_rows(reconcile_first=False)` (stored rows + persisted facts)
+  before the full reconcile, so rows appear within ~1 s of launch.
+
 Secrets live in `.env` (never commit); see `.env.example`.
 
 ## The `commands.py` single-source rule (do not regress)
@@ -56,7 +79,7 @@ included** — so the columns after it never shift between rows (live / waiting 
 done / future alike). Pad the raw text (ANSI + OSC 8 have zero width; `💤 😴 🏠 💼` are two
 cells), and pin it with a test that asserts one identical offset across statuses. Full rule
 
-+ worked example (`cachettl.CELL_WIDTH` / `cell_padding`): README § "Column alignment".
+- worked example (`cachettl.CELL_WIDTH` / `cell_padding`): README § "Column alignment".
 
 ## Internal-style vs TUI commands
 
@@ -216,24 +239,24 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
 
 ## Trying it / screenshots
 
-+ `ccc demo [--ls] [--clean]` seeds a throwaway fake-data home (never the real
+- `ccc demo [--ls] [--clean]` seeds a throwaway fake-data home (never the real
   `CLAUDE_HOME`) and opens the TUI/list — the fastest way to see a change in context.
-+ `tools/gen_screenshots.py` regenerates `docs/img/*.svg` from that same demo data (driven
+- `tools/gen_screenshots.py` regenerates `docs/img/*.svg` from that same demo data (driven
   headlessly via Textual's `run_test`), so the README screenshots never go stale.
 
 ## Where the plumbing lives
 
-+ **Installer layer** — `command_center/install.py` owns the hook + status-line wiring
+- **Installer layer** — `command_center/install.py` owns the hook + status-line wiring
   merged into `$CLAUDE_HOME/settings.json` (`ccc install-hooks` / `install-statusline`;
   symlink-safe atomic writes with timestamped backups, idempotent). `doctor.py` is the
   read-only `ccc doctor` health check.
-+ **Onboarding layer** — `wizard.py` (`ccc init`) is the first-run flow (env detection,
+- **Onboarding layer** — `wizard.py` (`ccc init`) is the first-run flow (env detection,
   consent checklist, minimal `config.toml`, then the installers, incl. `install-shell`).
   `install_commands.py` (`ccc install-commands`) copies the slash commands; `obsidian.py`
   (`ccc obsidian-setup`) seeds the vault folders, dashboards and shellcommands entries;
   `shell_install.py` (`ccc install-shell`) writes the opt-in shell rc block (AIM-at-startup
   wrapper + cross-terminal OSC tab badges).
-+ **Platform seam** — `service.py` is the ONE place that decides launchd (macOS,
+- **Platform seam** — `service.py` is the ONE place that decides launchd (macOS,
   `launchd.py`) vs systemd `--user` (Linux, `systemdunit.py`) for the `ccc daemon`
   service, so `cli.py`/`doctor.py` stay platform-agnostic. `notify.py`'s `"auto"` channel
   resolves to `osascript` (macOS) / `notify-send` (Linux). Deterministic per-repo tab
@@ -241,11 +264,11 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
   overrides where present); `tabcolor.dedupe_live` recolours open tabs that would share one
   id-chip colour, writing only the per-tab colour cache + its `.manual` marker (the two files
   the status line already honours). Linux hotkey samples: `assets/hotkeys-linux/` (keyd/xremap).
-+ **TUI liveness** — `watchdog.py` is the self-heal for a wedged TUI (stalled timers, or
+- **TUI liveness** — `watchdog.py` is the self-heal for a wedged TUI (stalled timers, or
   an exit that hangs): heartbeat + exit-grace verdicts, the `tui-watchdog.log` wedge
   report with every thread's Python stack, terminal restore, capped in-place re-exec;
   `views/tui.py` beats it from the fast poll and starts it only on a real tty.
-+ **Packaging** — the wheel ships three console entry points (`ccc`, `codex-in-claude`,
+- **Packaging** — the wheel ships three console entry points (`ccc`, `codex-in-claude`,
   `claude-session-continue`) and the `command_center/assets/` package data.
 
 ## Private/local notes

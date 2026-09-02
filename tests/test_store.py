@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center.models import LiveSession
+from command_center.models import LiveSession, TranscriptScan
 from command_center.store import AmbiguousJobId, Store, resolve_job_id
 
 
@@ -795,6 +795,91 @@ def test_close_requested_at_column_migrates_and_roundtrips(tmp_path: Path) -> No
         store.update_fields("old", close_requested_at=1234567890)
         got = store.get("old")
         assert got is not None and got.close_requested_at == 1234567890
+
+
+def _scan(session_id: str, **over: object) -> TranscriptScan:
+    """A TranscriptScan for *session_id* with sane defaults, overridable per field."""
+    fields: dict[str, object] = {
+        "session_id": session_id,
+        "path": f"/transcripts/{session_id}.jsonl",
+        "mtime_ns": 1_700_000_000_000_000_000,
+        "size": 4096,
+        "model": "claude-fable-5",
+        "codex": False,
+        "codex_scanned_to": 4096,
+        "scanned_at": 1_700_000_000_000,
+    }
+    fields.update(over)
+    return TranscriptScan(**fields)  # type: ignore[arg-type]
+
+
+def test_transcript_scans_roundtrip_and_replace(tmp_path: Path) -> None:
+    # The scan rows are what let a later pass skip re-parsing a frozen transcript, so they
+    # must survive the round trip exactly — including the INTEGER-stored `codex` flag,
+    # which has to come back as a real bool.
+    store = _store(tmp_path)
+    assert store.transcript_scans() == {}
+    assert store.get_transcript_scan("s1") is None
+
+    store.put_transcript_scans([_scan("s1", codex=True), _scan("s2")])
+    got = store.get_transcript_scan("s1")
+    assert got is not None
+    assert got == _scan("s1", codex=True)
+    assert got.codex is True  # coerced back from INTEGER, not left as 1
+    assert store.get_transcript_scan("s2") is not None
+    assert store.get_transcript_scan("s2").codex is False  # type: ignore[union-attr]
+    assert set(store.transcript_scans()) == {"s1", "s2"}
+
+    # A later pass replaces the row for the same session id (INSERT OR REPLACE).
+    store.put_transcript_scans([_scan("s1", size=9000, model="claude-opus-4-8", codex=True)])
+    again = store.transcript_scans()["s1"]
+    assert again.size == 9000 and again.model == "claude-opus-4-8"
+    assert len(store.transcript_scans()) == 2  # replaced, not duplicated
+
+    store.put_transcript_scans([])  # no-op on an empty batch
+    assert len(store.transcript_scans()) == 2
+    store.close()
+
+
+def test_delete_removes_transcript_scan_rows(tmp_path: Path) -> None:
+    # transcript_scan carries no foreign key (concurrent writers), so the deletes must
+    # clear it explicitly — else a re-created session id would inherit stale facts.
+    store = _store(tmp_path)
+    for sid in ("s1", "s2", "s3"):
+        store.ensure(sid, cwd="/repo")
+    store.put_transcript_scans([_scan("s1"), _scan("s2"), _scan("s3")])
+
+    store.delete("s1")
+    assert store.get_transcript_scan("s1") is None
+    assert set(store.transcript_scans()) == {"s2", "s3"}
+
+    store.delete_many(["s2", "s3"])
+    assert store.transcript_scans() == {}
+    store.close()
+
+
+def test_transcript_scan_table_is_created_on_an_older_db(tmp_path: Path) -> None:
+    # A DB written by a ccc that predates the table gains it on open (CREATE IF NOT EXISTS
+    # in _SCHEMA), exactly like the ALTER-in-place column migrations.
+    import sqlite3
+
+    from command_center import store as store_mod
+
+    db = tmp_path / "legacy.db"
+    legacy_schema = store_mod._SCHEMA[
+        : store_mod._SCHEMA.index("CREATE TABLE IF NOT EXISTS transcript_scan")
+    ]
+    assert "transcript_scan" not in legacy_schema
+    conn = sqlite3.connect(db)
+    conn.executescript(legacy_schema)
+    conn.execute("INSERT INTO sessions (session_id, cwd) VALUES ('old', '/repo/old')")
+    conn.commit()
+    conn.close()
+
+    with Store(db) as store:  # opening runs _SCHEMA → the table appears
+        assert store.transcript_scans() == {}
+        store.put_transcript_scans([_scan("old")])
+        assert store.get_transcript_scan("old") is not None
 
 
 def test_claim_close_request_fires_at_most_once(tmp_path: Path) -> None:

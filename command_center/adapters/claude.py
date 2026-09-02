@@ -20,7 +20,14 @@ import time
 from pathlib import Path
 
 from .. import config
-from ..models import CODEX_WORKFLOW_NAME, EFFORT_LEVELS, LiveSession, SessionEvent
+from ..models import (
+    CODEX_WORKFLOW_NAME,
+    EFFORT_LEVELS,
+    LiveSession,
+    SessionEvent,
+    TranscriptScan,
+    now_ms,
+)
 
 # A genuine invocation of the Codex workflow records the slash command as a
 # ``<command-name>/codex-implement-task-and-claude-review`` tag in the transcript.
@@ -132,10 +139,13 @@ _PROMPT_WRAPPER_RE = re.compile(
     r".*?</\1>",
     re.DOTALL,
 )
-_CODEX_WORKFLOW_CACHE: dict[str, tuple[float, bool]] = {}
-# Mtime cache of the observed model per transcript path (see ``observed_model``): a
-# growing live transcript is re-read when its mtime moves, a frozen one read once.
-_OBSERVED_MODEL_CACHE: dict[str, tuple[float, str | None]] = {}
+# In-process caches for the two per-transcript facts, keyed by the file's
+# ``(mtime_ns, size)`` identity — the same pin the persisted ``transcript_scan`` row uses
+# (see ``store.transcript_scans``), so a cache hit means "this exact file state".
+# session_id -> (mtime_ns, size, marker found, bytes scanned)
+_CODEX_WORKFLOW_CACHE: dict[str, tuple[int, int, bool, int]] = {}
+# transcript path -> (mtime_ns, size, observed model)
+_OBSERVED_MODEL_CACHE: dict[str, tuple[int, int, str | None]] = {}
 
 
 def _prompt_payload_text(content: object) -> str | None:
@@ -244,6 +254,100 @@ def _tool_result_text(content: object) -> str:
         if isinstance(block, dict) and block.get("type") == "text"
     ]
     return "\n".join(p for p in parts if p)
+
+
+def _model_in_line(line: bytes) -> str | None:
+    """The real ``message.model`` of one raw transcript line, or ``None``.
+
+    The prefilter (the raw bytes ``"assistant"`` AND ``"model"`` both present) is what makes
+    the tail read cheap: transcripts are written as COMPACT JSON, so a record that carries a
+    model always contains those exact byte sequences and a line that does not can be
+    rejected without a ``json.loads``. ``"<synthetic>"`` is the harness's own placeholder
+    model and never counts.
+    """
+    if b'"assistant"' not in line or b'"model"' not in line:
+        return None
+    try:
+        record = json.loads(line.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return None  # a partial line (live transcript mid-write) or plain junk
+    if not isinstance(record, dict) or record.get("type") != "assistant":
+        return None
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return None
+    value = message.get("model")
+    return value if isinstance(value, str) and value and value != "<synthetic>" else None
+
+
+def last_model_in_file(path: Path, chunk_size: int = 65536) -> str | None:
+    """The raw ``message.model`` of the LAST real assistant record in transcript *path*.
+
+    Reads the file BACKWARDS in *chunk_size* blocks and returns on the first hit, because
+    the answer is essentially always in the last 64 KiB (198 of 200 sampled transcripts):
+    the previous forward walk parsed every line of every stored transcript on each pass —
+    376k lines across 677 sessions, ~27 s of a cold ``ccc ls``. Each block carries its
+    leading partial line into the next (earlier) block, so no record is split by the
+    chunking; lines are then examined newest-first (see :func:`_model_in_line`).
+
+    A trailing partial line (a live transcript caught mid-write) simply fails to parse and
+    is skipped, as are blank lines. ``None`` when the file is empty, unreadable, or holds
+    no real assistant record.
+    """
+    try:
+        with path.open("rb") as handle:
+            pos = handle.seek(0, os.SEEK_END)
+            carry = b""  # partial first line of the block already scanned
+            while pos > 0:
+                start = max(0, pos - chunk_size)
+                handle.seek(start)
+                block = handle.read(pos - start) + carry
+                pos = start
+                lines = block.split(b"\n")
+                if pos > 0:  # lines[0] continues into the block before this one
+                    carry = lines[0]
+                    lines = lines[1:]
+                for line in reversed(lines):
+                    model = _model_in_line(line)
+                    if model is not None:
+                        return model
+    except OSError:
+        return None
+    return None
+
+
+def codex_marker_in_file(path: Path, start: int = 0, chunk_size: int = 1 << 20) -> tuple[bool, int]:
+    """Scan bytes ``[start, size)`` of *path* for the Codex-workflow marker.
+
+    Returns ``(found, size)``: the size is the offset the scan covered, so the next pass
+    over an append-only transcript can resume there instead of re-reading the whole file
+    (a full-file scan of every session cost ~7 s of a cold ``ccc ls``). Consecutive chunks
+    overlap by ``len(marker) - 1`` bytes so a marker straddling a boundary is still found.
+    A *start* past the end means the file was truncated or rewritten under us, so the scan
+    restarts from 0. ``(False, start)`` on a read error — nothing new was covered.
+    """
+    marker = _CODEX_WORKFLOW_MARKER.encode()
+    overlap = len(marker) - 1
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            pos = start if 0 <= start <= size else 0
+            handle.seek(pos)
+            carry = b""  # tail of the previous chunk, in case the marker straddles
+            while pos < size:
+                block = handle.read(chunk_size)
+                if not block:
+                    break
+                pos += len(block)
+                window = carry + block
+                if marker in window:
+                    return True, size
+                # Carry the last marker-length-1 bytes of the STREAM (not of this block):
+                # correct even when chunk_size is smaller than the marker itself.
+                carry = window[-overlap:] if overlap else b""
+    except OSError:
+        return False, start
+    return False, size
 
 
 def events_in_file(path: Path) -> list[SessionEvent]:
@@ -419,7 +523,7 @@ def _command_for_pid(pid: int) -> str | None:
     return None
 
 
-class ClaudeAdapter:
+class ClaudeAdapter:  # pylint: disable=too-many-public-methods
     """Reads Claude Code session state from one or more account config dirs.
 
     Multi-account (D0/D1/D14): ``discover()`` scans EVERY configured account's
@@ -626,32 +730,36 @@ class ClaudeAdapter:
     def uses_codex_workflow(self, cwd: str, session_id: str) -> bool:
         """True if this transcript invoked the Codex implementation workflow.
 
-        The launch ``job_type`` covers future jobs started through ccc. This catches
-        manual use of the slash command or same-named skill by scanning the whole
-        transcript for the workflow marker. Reads are mtime-cached: a growing live
-        transcript is re-read when its mtime moves, while a frozen transcript is read
-        once per process.
+        The launch ``job_type`` covers future jobs started through ccc; this catches manual
+        use of the slash command or same-named skill by scanning the transcript for the
+        workflow marker (:func:`codex_marker_in_file`). The in-process cache is keyed by the
+        file's ``(mtime_ns, size)`` identity: an unchanged file answers from the cache, a
+        GROWN one is scanned only over the bytes appended since the last pass (transcripts
+        are append-only), and any other change (a rewrite in place) forces a full rescan.
+        A marker once seen is sticky — it can never un-happen.
+
+        This is the per-process view; :meth:`scan_transcript` is the same answer persisted
+        across processes (``store.transcript_scans``).
         """
         path = self.transcript_path(cwd, session_id)
         if path is None:
             return False
         try:
-            mtime = path.stat().st_mtime
+            st = path.stat()
         except OSError:
             return False
+        start = 0
         cached = _CODEX_WORKFLOW_CACHE.get(session_id)
-        if cached is not None and cached[0] == mtime:
-            return cached[1]
-        found = False
-        try:
-            with path.open(encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    if _CODEX_WORKFLOW_MARKER in line:
-                        found = True
-                        break
-        except OSError:
-            return False
-        _CODEX_WORKFLOW_CACHE[session_id] = (mtime, found)
+        if cached is not None:
+            c_mtime, c_size, c_found, c_scanned = cached
+            if c_found:
+                return True
+            if c_mtime == st.st_mtime_ns and c_size == st.st_size:
+                return False
+            if st.st_size > c_size:  # grew → only the new bytes can hold a new marker
+                start = c_scanned
+        found, scanned_to = codex_marker_in_file(path, start)
+        _CODEX_WORKFLOW_CACHE[session_id] = (st.st_mtime_ns, st.st_size, found, scanned_to)
         return found
 
     def observed_model(self, cwd: str, session_id: str) -> str | None:
@@ -664,44 +772,74 @@ class ClaudeAdapter:
         never launched as a ccc job). ``None`` when the transcript is missing or holds
         no real model entry.
 
-        Transcripts are append-only, so we read forward and keep the last valid value.
-        Reads are mtime-cached like :meth:`uses_codex_workflow` (keyed by path); each
-        line is parsed defensively (a live transcript can end in a partial line).
+        The read is a backwards tail scan (:func:`last_model_in_file`), cached in-process
+        per transcript path by the file's ``(mtime_ns, size)`` identity — the same pin
+        :meth:`scan_transcript` persists across processes.
         """
         path = self.transcript_path(cwd, session_id)
         if path is None:
             return None
         try:
-            mtime = path.stat().st_mtime
+            st = path.stat()
         except OSError:
             return None
         key = str(path)
         cached = _OBSERVED_MODEL_CACHE.get(key)
-        if cached is not None and cached[0] == mtime:
-            return cached[1]
-        model: str | None = None
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2]
+        model = last_model_in_file(path)
+        _OBSERVED_MODEL_CACHE[key] = (st.st_mtime_ns, st.st_size, model)
+        return model
+
+    def scan_transcript(
+        self, cwd: str, session_id: str, prior: TranscriptScan | None
+    ) -> TranscriptScan | None:
+        """The session's transcript facts, reusing *prior* when the file is untouched.
+
+        The cross-process counterpart of :meth:`observed_model` + :meth:`uses_codex_workflow`
+        (the persisted rows come from ``store.transcript_scans``): one ``stat()`` decides
+        whether the file has to be opened at all. When *prior* pins the same
+        ``(path, mtime_ns, size)`` the very SAME object is returned, so a caller can test
+        ``new is prior`` to know there is nothing to re-persist — that identity is what makes
+        a pass over hundreds of frozen (done/parked) transcripts cost one stat each instead
+        of a full re-parse.
+
+        Otherwise the model is re-read from the tail and the marker scan resumes at
+        ``prior.codex_scanned_to`` — the file is append-only, so only the bytes added since
+        the last pass can hold a new marker; a file that shrank below that offset (truncated
+        or rewritten) is scanned from 0 again. A marker already found is sticky and is never
+        looked for again. ``None`` when no transcript resolves under any account, or it
+        cannot be stat'ed.
+        """
+        path = self.transcript_path(cwd, session_id)
+        if path is None:
+            return None
         try:
-            with path.open(encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(record, dict) or record.get("type") != "assistant":
-                        continue
-                    message = record.get("message")
-                    if not isinstance(message, dict):
-                        continue
-                    value = message.get("model")
-                    if isinstance(value, str) and value and value != "<synthetic>":
-                        model = value
+            st = path.stat()
         except OSError:
             return None
-        _OBSERVED_MODEL_CACHE[key] = (mtime, model)
-        return model
+        same: TranscriptScan | None = None
+        if prior is not None and prior.path == str(path):
+            if prior.mtime_ns == st.st_mtime_ns and prior.size == st.st_size:
+                return prior  # identity == "nothing changed" (see the docstring)
+            same = prior
+        if same is not None and same.codex:
+            found, scanned_to = True, st.st_size
+        else:
+            # Resume only when the file GREW (append-only): any other change — a rewrite in
+            # place, same size or smaller — rescans from 0, matching uses_codex_workflow.
+            start = same.codex_scanned_to if same is not None and st.st_size > same.size else 0
+            found, scanned_to = codex_marker_in_file(path, start)
+        return TranscriptScan(
+            session_id=session_id,
+            path=str(path),
+            mtime_ns=st.st_mtime_ns,
+            size=st.st_size,
+            model=last_model_in_file(path),
+            codex=found,
+            codex_scanned_to=scanned_to,
+            scanned_at=now_ms(),
+        )
 
     def last_user_prompt(self, cwd: str, session_id: str) -> str | None:
         """The most recent prompt the human typed in *session_id*, cleaned for display.

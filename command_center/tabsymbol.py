@@ -140,7 +140,7 @@ def cell(iterm_session_id: str | None, *, show: bool = True) -> str:
     return f"{badge} " if badge else _CELL_PAD
 
 
-def _repo_key(cwd_or_repo: str) -> str:
+def _repo_key(cwd_or_repo: str, root: str | None = None) -> str:
     """Normalize a cwd (or bare repo id) to a stable key so cwd and repo-name agree.
 
     A path-like input (absolute, ``~``-relative, or containing a slash) is reduced to
@@ -148,6 +148,11 @@ def _repo_key(cwd_or_repo: str) -> str:
     title and TUI row already show — so the shell hook (``ccc tab-symbol --print <cwd>``)
     and the TUI/ls row, both fed the same cwd under the same config, resolve to the same
     key. A bare token (e.g. a repo name) is used verbatim.
+
+    *root* is the already-resolved :func:`command_center.repos.repo_root`. Pass it when
+    rendering a whole listing: omitting it makes ``short_folder`` resolve the tree root
+    per call, i.e. one config read per ROW (629 of them on a big table). ``None`` keeps
+    the on-demand resolution, so a one-shot caller needs no change.
     """
     text = (cwd_or_repo or "").strip()
     if not text:
@@ -155,11 +160,11 @@ def _repo_key(cwd_or_repo: str) -> str:
     if text.startswith(("/", "~")) or "/" in text:
         from . import colors  # lazy: keep the shell-hook (``ccc tab-symbol``) import light
 
-        return colors.short_folder(os.path.expanduser(text))
+        return colors.short_folder(os.path.expanduser(text), root)
     return text
 
 
-def symbol_for_repo(cwd_or_repo: str) -> str:
+def symbol_for_repo(cwd_or_repo: str, root: str | None = None) -> str:
     """A deterministic badge for a repo/cwd — a stable hash into :data:`PALETTE`.
 
     The same input maps to the same emoji forever, with **no** shared cache, so a
@@ -168,16 +173,21 @@ def symbol_for_repo(cwd_or_repo: str) -> str:
     the author's real per-tab assignments still win on his machine; this is the generic
     fallback that makes every session — and every plain terminal — show a symbol.
 
+    *root* is the pre-resolved repo-tree root (see :func:`_repo_key`); the badge itself
+    is identical either way, it only saves the per-call root resolution.
+
     Returns ``""`` for an empty key (no cwd to key on).
     """
-    key = _repo_key(cwd_or_repo)
+    key = _repo_key(cwd_or_repo, root)
     if not key:
         return ""
     digest = hashlib.md5(key.encode("utf-8")).hexdigest()  # noqa: S324 (non-crypto: stable slot)
     return PALETTE[int(digest, 16) % len(PALETTE)]
 
 
-def cell_for(iterm_session_id: str | None, cwd: str, *, live: bool = True) -> str:
+def cell_for(
+    iterm_session_id: str | None, cwd: str, *, live: bool = True, root: str | None = None
+) -> str:
     """Fixed-width ``"<emoji> "`` badge cell for a row: live tab cache, else deterministic.
 
     Resolution mirrors the tab title: a *live* session's claimed iTerm-tab badge wins (so
@@ -185,8 +195,12 @@ def cell_for(iterm_session_id: str | None, cwd: str, *, live: bool = True) -> st
     row falls back to :func:`symbol_for_repo` for *cwd* — a stable per-repo symbol that
     needs no live tab. So a parked/finished row, a demo row, or a plain-terminal session
     all still show their repo's symbol (the cell only blanks when there is no cwd at all).
+
+    This is the per-ROW entry point, so *root* matters here: the TUI and ``ccc ls``
+    resolve :func:`command_center.repos.repo_root` once per listing and pass it down
+    rather than paying a config read (and, before the memo, a TOML parse) per row.
     """
-    badge = (read(iterm_session_id) if live else None) or symbol_for_repo(cwd)
+    badge = (read(iterm_session_id) if live else None) or symbol_for_repo(cwd, root)
     return f"{badge} " if badge else _CELL_PAD
 
 

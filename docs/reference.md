@@ -700,7 +700,8 @@ byte-stable (rewritten only on a real change — the only timestamps are `create
 marker — a file without it is never touched. Every mirror also carries **`model:`** and
 **`effort:`** frontmatter keys — the model that **actually answered** (the last real
 `message.model` in the transcript, mapped to a ccc short name like `fable-5`; `""` until a turn
-exists) and the observed reasoning effort (captured while the session is live: an explicit
+exists — read from the transcript's tail and persisted per session in the `transcript_scan`
+table keyed by the file's mtime/size, so a frozen transcript is never re-read) and the observed reasoning effort (captured while the session is live: an explicit
 `--effort` launch flag is authoritative, else the global `effortLevel` from
 `~/.claude/settings.json` fills it once; `""` for a session never observed live — a historical
 parked session is never backfilled with today's default). Trust them over

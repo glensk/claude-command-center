@@ -19,6 +19,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 
 import contextlib
+import copy
 import datetime
 import os
 import re
@@ -595,8 +596,38 @@ class Config:
     loaded_from_disk: bool = True
 
 
+# One-entry memo for :func:`load_config`, keyed on the config file's identity
+# ``(path, st_mtime_ns, st_size)``. See the load_config docstring for the contract.
+_CONFIG_MEMO: tuple[tuple[str, int, int], Config] | None = None
+
+
+def _config_key(path: Path) -> tuple[str, int, int]:
+    """Identity of the config file: ``(path, mtime_ns, size)``, ``-1``/``-1`` when missing.
+
+    A missing file is a real, cacheable state (a fresh install runs on pure DEFAULTS),
+    and the sentinel differs from every stat of a real file, so the memo drops itself the
+    moment the file appears.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return (str(path), -1, -1)
+    return (str(path), stat.st_mtime_ns, stat.st_size)
+
+
+def invalidate_config_cache() -> None:
+    """Drop the :func:`load_config` memo — call after writing ``config.toml``.
+
+    ``st_mtime_ns`` has real granularity, so a save landing within the same tick as the
+    previous load would otherwise re-serve the pre-save Config. :func:`save_config` calls
+    this itself; a test (or any other writer that bypasses ``save_config``) must too.
+    """
+    global _CONFIG_MEMO  # pylint: disable=global-statement
+    _CONFIG_MEMO = None
+
+
 def load_config() -> Config:
-    """Load config from TOML, layered over ``DEFAULTS``.
+    """Load config from TOML, layered over ``DEFAULTS`` (memoized on the file's identity).
 
     Fail-closed guard against the "failed load → save defaults" clobber that once
     silently wiped a real config: when an EXISTING config.toml cannot be read or parsed
@@ -604,9 +635,29 @@ def load_config() -> Config:
     as before, but flag it ``loaded_from_disk=False``. :func:`save_config` refuses to
     persist such a Config over the existing file. A MISSING file (fresh install) keeps
     ``loaded_from_disk=True`` — saving defaults there is expected and safe.
+
+    **Why the memo:** this is a hot path, not a startup-only read. Painting one TUI/``ccc
+    ls`` frame of 629 rows re-entered it 629 times (``tabsymbol.cell_for`` →
+    ``symbol_for_repo`` → ``colors.short_folder`` → ``repos.repo_root``), re-parsing the
+    same TOML every time — 5.2 s of pure parsing under load. The memo is keyed on
+    ``(path, st_mtime_ns, st_size)``, so an edit by any process (or by ``ccc`` itself) is
+    picked up on the next call without a watcher; ``st_size`` catches the rare same-tick
+    rewrite that keeps the mtime.
+
+    **Deep-copy contract:** every call returns a Config the caller OWNS. The TUI's
+    toggles mutate ``self.cfg`` in place and the test suite rewrites vault paths on the
+    loaded object, so handing out the cached instance would poison every later reader.
+
+    A failed parse is NEVER cached (``loaded_from_disk=False``): a repaired file must
+    take effect on the very next call, whatever its stat says.
     """
-    data: dict[str, object] = dict(DEFAULTS)
+    global _CONFIG_MEMO  # pylint: disable=global-statement
     path = config_path()
+    memo_key = _config_key(path)
+    memo = _CONFIG_MEMO
+    if memo is not None and memo[0] == memo_key:
+        return copy.deepcopy(memo[1])
+    data: dict[str, object] = dict(DEFAULTS)
     loaded_from_disk = True
     if path.exists():
         try:
@@ -616,6 +667,8 @@ def load_config() -> Config:
             loaded_from_disk = False
     cfg = Config(**{key: data[key] for key in DEFAULTS if key in data})  # type: ignore[arg-type]
     cfg.loaded_from_disk = loaded_from_disk
+    if loaded_from_disk:
+        _CONFIG_MEMO = (memo_key, copy.deepcopy(cfg))
     return cfg
 
 
@@ -672,6 +725,10 @@ def save_config(cfg: Config) -> None:  # pylint: disable=too-many-branches
     Every emitted string — scalar, list item, dict key AND dict value — goes through
     :func:`_toml_str`, so a value carrying a quote or backslash stays parsable TOML
     instead of poisoning the file into the fail-closed path above.
+
+    The :func:`load_config` memo is dropped right after the write: the stat key alone
+    cannot be trusted here, because a save landing in the same ``st_mtime_ns`` tick as
+    the load that preceded it would keep serving the pre-save Config.
     """
     path = config_path()
     if path.exists() and cfg.loaded_from_disk is False:
@@ -728,3 +785,4 @@ def save_config(cfg: Config) -> None:  # pylint: disable=too-many-branches
         if not replaced:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_name)
+    invalidate_config_cache()  # mtime granularity: never serve the pre-save Config again

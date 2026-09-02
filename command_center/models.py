@@ -212,6 +212,25 @@ class SubgoalRevision:
     created_at: int  # epoch ms this version became current
 
 
+@dataclass
+class TranscriptScan:
+    """Facts scanned from one session's transcript, keyed by the transcript's identity.
+
+    ``(path, mtime_ns, size)`` pin the file state the facts were read from: a later pass
+    whose ``stat()`` matches reuses the row without opening the file (frozen transcripts
+    of done/parked sessions then cost one stat per pass instead of a full re-parse).
+    """
+
+    session_id: str
+    path: str
+    mtime_ns: int
+    size: int
+    model: str | None = None  # raw message.model of the last real assistant record
+    codex: bool = False  # Codex-workflow marker seen (sticky once True — append-only file)
+    codex_scanned_to: int = 0  # byte offset the marker scan has covered
+    scanned_at: int = 0  # ms epoch of the scan
+
+
 # Future-job model choices: which Claude model a job's overseer / executor runs on.
 # The session runs ON the overseer's model; when the executor differs, the overseer is
 # told to delegate implementation to Agent-tool subagents on the executor's model.

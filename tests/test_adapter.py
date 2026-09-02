@@ -490,6 +490,182 @@ def test_observed_model_last_real_and_skips_synthetic(tmp_path: Path) -> None:
     assert adapter.observed_model("/repo", "d") is None
 
 
+def _assistant_rec(model: object) -> str:
+    """An assistant record carrying *model* (the shape ``last_model_in_file`` looks for)."""
+    return _rec(
+        type="assistant",
+        message={"role": "assistant", "model": model, "content": [{"type": "text", "text": "x"}]},
+    )
+
+
+def test_last_model_in_file_reads_the_tail_backwards(tmp_path: Path) -> None:
+    """The reverse chunked reader answers with the LAST real model, whatever the file
+    ends with — that tail read is what replaced the full forward parse of every stored
+    transcript (~27 s of a cold `ccc ls`)."""
+    from command_center.adapters.claude import last_model_in_file
+
+    # (a) the model sits in the last line.
+    a = tmp_path / "a.jsonl"
+    a.write_text(
+        _assistant_rec("claude-opus-4-8") + "\n" + _assistant_rec("claude-fable-5") + "\n",
+        encoding="utf-8",
+    )
+    assert last_model_in_file(a) == "claude-fable-5"
+
+    # (b) the last assistant record is the harness's <synthetic> placeholder → skip to the
+    # last REAL model behind it.
+    b = tmp_path / "b.jsonl"
+    b.write_text(
+        _assistant_rec("claude-fable-5") + "\n" + _assistant_rec("<synthetic>") + "\n",
+        encoding="utf-8",
+    )
+    assert last_model_in_file(b) == "claude-fable-5"
+
+    # (c) many chunks, and the target record straddles the boundaries (chunk_size=64 is far
+    # smaller than one record) — the carry-over must not split a line.
+    c = tmp_path / "c.jsonl"
+    filler = _rec(type="user", message={"role": "user", "content": "x" * 200}) + "\n"
+    c.write_text(
+        _assistant_rec("claude-opus-4-8")
+        + "\n"
+        + _assistant_rec("claude-fable-5")
+        + "\n"
+        + filler * 5,
+        encoding="utf-8",
+    )
+    assert last_model_in_file(c, chunk_size=64) == "claude-fable-5"
+
+    # (d) a live transcript caught mid-write ends in a partial line: the truncation keeps
+    # the model (so the prefilter passes and json really is attempted), the parse fails, and
+    # the last COMPLETE record wins.
+    d = tmp_path / "d.jsonl"
+    partial = _assistant_rec("claude-opus-4-8")[:100]
+    assert '"model"' in partial and not partial.endswith("}")
+    d.write_text(_assistant_rec("claude-fable-5") + "\n" + partial, encoding="utf-8")
+    assert last_model_in_file(d) == "claude-fable-5"
+
+    # (e) no assistant record at all, (f) empty + missing file, (g) blank lines tolerated.
+    e = tmp_path / "e.jsonl"
+    e.write_text(_rec(type="user", message={"role": "user", "content": "hi"}) + "\n", "utf-8")
+    assert last_model_in_file(e) is None
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    assert last_model_in_file(empty) is None
+    assert last_model_in_file(tmp_path / "nope.jsonl") is None
+    g = tmp_path / "g.jsonl"
+    g.write_text("\n\n" + _assistant_rec("claude-fable-5") + "\n\n\n", encoding="utf-8")
+    assert last_model_in_file(g) == "claude-fable-5"
+
+
+def test_codex_marker_in_file_scans_a_byte_range(tmp_path: Path) -> None:
+    """The marker scan reports how far it got so the next pass can resume there (the
+    transcripts are append-only), and overlaps its chunks so a straddling marker is seen."""
+    from command_center.adapters.claude import codex_marker_in_file
+
+    marker_line = (
+        _rec(
+            type="user",
+            message={
+                "role": "user",
+                "content": f"<command-name>/{CODEX_WORKFLOW_NAME}</command-name>",
+            },
+        )
+        + "\n"
+    )
+    plain = _rec(type="user", message={"role": "user", "content": "normal ask"}) + "\n"
+
+    absent = tmp_path / "absent.jsonl"
+    absent.write_text(plain, encoding="utf-8")
+    assert codex_marker_in_file(absent) == (False, absent.stat().st_size)
+
+    present = tmp_path / "present.jsonl"
+    present.write_text(plain + marker_line, encoding="utf-8")
+    size = present.stat().st_size
+    assert codex_marker_in_file(present) == (True, size)
+
+    # A chunk size far smaller than the marker: only the overlap makes it findable.
+    assert codex_marker_in_file(present, chunk_size=8) == (True, size)
+
+    # Resuming AFTER the marker never re-finds it; resuming before it does.
+    after = len(plain.encode()) + len(marker_line.encode())
+    assert codex_marker_in_file(present, start=after) == (False, size)
+    assert codex_marker_in_file(present, start=len(plain.encode())) == (True, size)
+
+    # A start past the end means the file was truncated/rewritten → rescan from 0.
+    assert codex_marker_in_file(present, start=size + 10_000) == (True, size)
+
+
+def test_scan_transcript_reuses_the_prior_row_when_nothing_changed(tmp_path: Path) -> None:
+    """An unchanged transcript costs one stat() and hands back the SAME object — the
+    identity callers use to know there is nothing to re-persist."""
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    proj = tmp_path / "projects" / "-repo"
+    proj.mkdir(parents=True)
+    path = proj / "sid.jsonl"
+    path.write_text(_assistant_rec("claude-opus-4-8") + "\n", encoding="utf-8")
+
+    first = adapter.scan_transcript("/repo", "sid", None)
+    assert first is not None
+    assert first.session_id == "sid" and first.path == str(path)
+    assert first.model == "claude-opus-4-8" and first.codex is False
+    assert first.size == path.stat().st_size and first.codex_scanned_to == first.size
+    assert first.scanned_at > 0
+
+    assert adapter.scan_transcript("/repo", "sid", first) is first  # identity, not equality
+
+    # An appended turn on a NEW model → a fresh row (bigger, re-read).
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(_assistant_rec("claude-fable-5") + "\n")
+    second = adapter.scan_transcript("/repo", "sid", first)
+    assert second is not None and second is not first
+    assert second.model == "claude-fable-5" and second.size > first.size
+
+    assert adapter.scan_transcript("/repo", "missing", None) is None  # no transcript
+
+
+def test_scan_transcript_codex_marker_is_incremental_and_sticky(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker scan only reads the bytes appended since the last pass, and a marker
+    already seen is never looked for again (it cannot un-happen)."""
+    from command_center.adapters import claude as claude_mod
+
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    proj = tmp_path / "projects" / "-repo"
+    proj.mkdir(parents=True)
+    path = proj / "sid.jsonl"
+    path.write_text(_rec(type="user", message={"role": "user", "content": "hi"}) + "\n", "utf-8")
+
+    first = adapter.scan_transcript("/repo", "sid", None)
+    assert first is not None and first.codex is False
+    assert first.codex_scanned_to == first.size  # covered the whole file
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            _rec(
+                type="user",
+                message={
+                    "role": "user",
+                    "content": f"<command-name>/{CODEX_WORKFLOW_NAME}</command-name>",
+                },
+            )
+            + "\n"
+        )
+    second = adapter.scan_transcript("/repo", "sid", first)
+    assert second is not None and second.codex is True
+
+    # Sticky: with the marker already recorded the scan is not run again at all.
+    def _boom(*_args: object, **_kwargs: object) -> tuple[bool, int]:
+        raise AssertionError("codex_marker_in_file must not run once the marker is known")
+
+    monkeypatch.setattr(claude_mod, "codex_marker_in_file", _boom)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(_assistant_rec("claude-fable-5") + "\n")
+    third = adapter.scan_transcript("/repo", "sid", second)
+    assert third is not None and third.codex is True
+    assert third.codex_scanned_to == third.size
+
+
 def test_todos(tmp_path: Path) -> None:
     adapter = ClaudeAdapter(claude_home=tmp_path)
     assert adapter.todos("sid") == []

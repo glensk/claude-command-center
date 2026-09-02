@@ -165,3 +165,16 @@ def _allow_headless_start_job(monkeypatch: pytest.MonkeyPatch) -> None:
     exercise the guard itself (``test_start_job_tty.py``) delete this var again.
     """
     monkeypatch.setenv("CCC_START_JOB_HEADLESS", "1")
+
+
+@pytest.fixture(autouse=True)
+def _reset_config_memo() -> None:
+    """Drop the ``load_config`` memo before every test.
+
+    The memo is keyed on ``(config path, mtime_ns, size)``, so the per-test ``CLAUDE_HOME``
+    pin already keeps tests apart; resetting it here makes that isolation structural
+    rather than a side effect of every test getting a distinct ``tmp_path``.
+    """
+    from command_center import config as _config
+
+    _config.invalidate_config_cache()

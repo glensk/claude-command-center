@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,11 +24,12 @@ _BASE = "/repo-root"
 async def settle(pilot) -> None:
     """Wait out the app's thread workers (data refresh, pane close), then let the UI apply.
 
-    Refresh is exclusive, so a newer refresh coalesces the pending one to CANCELLED — and
-    a pane-close schedules a follow-up refresh that does exactly that. wait_for_complete
-    would re-raise that benign WorkerCancelled, so poll until the worker set drains
-    instead. call_from_thread blocks the worker until its UI callback returns, so a
-    finished worker has already applied its rows; one final pause flushes the deferrals.
+    A refresh that lands mid-build is deferred (``_refresh_pending``) and re-issued when
+    the in-flight worker reports done, so the worker set can grow again one beat after it
+    drained; polling it (rather than ``wait_for_complete``, which would re-raise a benign
+    WorkerCancelled from an older run) tolerates that. call_from_thread blocks the worker
+    until its UI callback returns, so a finished worker has already applied its rows; one
+    final pause flushes the deferrals.
     """
     while any(not worker.is_finished for worker in pilot.app.workers):
         await pilot.pause()
@@ -3606,5 +3608,133 @@ def test_poll_honours_a_restart_request_and_flags_the_app(
             app._poll_jump_request()  # the fast poll would fire this every 0.1 s
             assert app.restart_requested is True
             assert jumpstate.peek_restart() is False  # consumed by the handler
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# refresh loop: instant first paint, then strictly one build at a time
+# --------------------------------------------------------------------------- #
+def test_first_refresh_paints_stored_rows_before_the_full_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stale-while-revalidate: the cold build no longer leaves the table empty.
+
+    The first worker runs build_rows TWICE — once with ``reconcile_first=False`` (stored
+    rows only: no reconcile, no transcript scan, so it lands in milliseconds) and then the
+    authoritative build that replaces them. Every later refresh is a full build.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _seed(tmp_path)
+
+    from command_center.views import tui as tui_mod
+    from command_center.views.tui import CommandCenterApp
+
+    real_build = tui_mod.build_rows
+    seen: list[bool] = []
+
+    def recording_build(*args, **kwargs):
+        seen.append(bool(kwargs.get("reconcile_first", True)))
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(tui_mod, "build_rows", recording_build)
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app.refresh_data()  # a second refresh must NOT re-serve the quick rows
+            await settle(pilot)
+
+    asyncio.run(scenario())
+
+    assert seen[:2] == [False, True]  # quick stored-rows pass, then the real build
+    assert seen.count(False) == 1  # the quick pass is a startup-only shortcut
+
+
+def test_refresh_never_runs_two_builds_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tick arriving mid-build defers instead of piling a second thread on the first.
+
+    ``exclusive=True`` could not do this: Textual cannot interrupt a THREAD worker, so the
+    "cancelled" predecessor kept running and a 30-45 s cold build accumulated up to nine
+    concurrent builds of the same data, each slowing the others down.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _seed(tmp_path)
+
+    from command_center.views import tui as tui_mod
+    from command_center.views.tui import CommandCenterApp
+
+    lock = threading.Lock()
+    running = 0
+    peak = 0
+    calls = 0
+
+    def slow_build(*_args, **_kwargs):
+        nonlocal running, peak, calls
+        with lock:
+            running += 1
+            calls += 1
+            peak = max(peak, running)
+        time.sleep(0.3)
+        with lock:
+            running -= 1
+        return []
+
+    monkeypatch.setattr(tui_mod, "build_rows", slow_build)
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        app.cfg.usage_refresh_sec = 0.05  # read by on_mount's set_interval
+        async with app.run_test() as pilot:
+            deadline = time.monotonic() + 0.7
+            while time.monotonic() < deadline:
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+            app._editing = True  # stop new builds so teardown can drain
+            await settle(pilot)
+
+    asyncio.run(scenario())
+
+    assert peak == 1  # never two builds in flight, however many ticks were skipped
+    assert calls >= 2  # …and the loop did keep rebuilding
+
+
+def test_a_refresh_deferred_mid_build_runs_exactly_once_afterwards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deferred refresh is coalesced to ONE follow-up, then the flag is clear."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _seed(tmp_path)
+
+    from command_center.views import tui as tui_mod
+    from command_center.views.tui import CommandCenterApp
+
+    calls = 0
+
+    def slow_build(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        time.sleep(0.15)
+        return []
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)  # startup builds are done; swap in the slow one now
+            monkeypatch.setattr(tui_mod, "build_rows", slow_build)
+
+            assert app.refresh_data() is True  # this one starts
+            assert app.refresh_data() is False  # in flight → deferred, not a second thread
+            assert app._refresh_pending is True
+
+            assert await wait_for(pilot, lambda: calls >= 2)
+            await settle(pilot)
+            await asyncio.sleep(0.2)
+            await pilot.pause()
+            assert calls == 2  # exactly one follow-up, not one per skipped call
+            assert app._refresh_pending is False
 
     asyncio.run(scenario())

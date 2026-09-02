@@ -56,7 +56,7 @@ from textual.widgets import (
     Static,
     TextArea,
 )
-from textual.worker import get_current_worker
+from textual.worker import Worker, WorkerState, get_current_worker
 
 from .. import (
     accounts,
@@ -467,13 +467,20 @@ def _bg_style(rgb: tuple[int, int, int]) -> str:
     return f"{fore} on #{red:02x}{green:02x}{blue:02x}"
 
 
-def _id_badge(session: Session, *, live: bool) -> str:
+def _id_badge(session: Session, *, live: bool, root: str | None = None) -> str:
     """The row's tab badge — live tab cache, else the deterministic per-repo symbol.
 
     Two spaces stand in when there is nothing to key on (no cwd), so the id lands at the
     same column on every row (an emoji is 2 cells wide).
+
+    *root* is the repo-tree root the caller already resolved (``_apply_rows`` does it once
+    per render); omitting it makes the deterministic symbol resolve the root — and with it
+    the config — once per ROW.
     """
-    return tabsymbol.cell_for(session.iterm_session_id, session.cwd, live=live).strip() or "  "
+    return (
+        tabsymbol.cell_for(session.iterm_session_id, session.cwd, live=live, root=root).strip()
+        or "  "
+    )
 
 
 def _draft_id_cell(session: Session) -> Text:
@@ -2053,6 +2060,9 @@ class CommandCenterApp(App[None]):
         self.sub_title = "Claude Command Center" if self.cfg.tab_title else ""
         self._current: str | None = None
         self._rows: dict[str, Row] = {}
+        # Repo-tree root resolved ONCE per render tick (see _apply_rows) and handed to every
+        # row: resolving it per row cost a config read (pre-memo, a TOML parse) per row.
+        self._root: str = ""
         # Account map cached per render tick (see _apply_rows) → the model column's home marker.
         self._account_dirs: dict[str, Path] = {}
         # …and the identity-corrected marker map derived from it (resolved dir → 🏠/💼/blank).
@@ -2094,6 +2104,13 @@ class CommandCenterApp(App[None]):
         # Undo stack (the `u` key): most recent last, capped at _UNDO_MAX, this run only.
         self._undo_stack: list[_UndoEntry] = []
         self._undoing = False  # True while action_undo runs an entry — suppresses re-push
+        # Refresh-loop state (see refresh_data / on_worker_state_changed): a tick that lands
+        # while a build is still running sets the pending flag instead of starting a second
+        # build; the flag is drained when that worker reports done.
+        self._refresh_pending = False
+        # False until the first (stale-while-revalidate) paint has been applied, so the
+        # worker knows whether to serve stored rows before the full build.
+        self._first_paint_done = False
         # Set by the fast poll when `ccc restart-tui` asks us to restart: run() re-execs
         # the process in place (same tab) once the app has exited and the terminal restored.
         self.restart_requested = False
@@ -2199,7 +2216,7 @@ class CommandCenterApp(App[None]):
         ).border_title = f"{_NIXOS_TIER_A_CHORD}:nixos overseer tier_a"
         self._apply_split()
         self.refresh_data()
-        self.set_interval(self.cfg.usage_refresh_sec, self.refresh_data)
+        self.set_interval(self.cfg.usage_refresh_sec, self._tick)
         # Publish this TUI's identity so `ccc jump` hands us the whole f+j toggle (the
         # fast path — see jump / iterm_api). Clear any stale toggle first: one left by a
         # dead TUI must not fire on startup.
@@ -2261,23 +2278,62 @@ class CommandCenterApp(App[None]):
         self.query_one("#detail-wrap").styles.height = f"{100 - top}%"
 
     # ---- data -----------------------------------------------------------
-    def refresh_data(self) -> None:
-        """Schedule an off-loop rebuild of the session rows (coalesced).
+    def _tick(self) -> None:
+        """The ``usage_refresh_sec`` timer: rebuild the rows, or at least re-render usage.
 
-        build_rows() (reconcile + transcript scans) can take hundreds of ms, so it
-        runs in a thread worker; the widget updates land back on the UI thread via
-        _apply_rows. exclusive=True coalesces bursts: a newer refresh cancels the
-        pending one, whose stale rows are then discarded (see _refresh_worker).
+        :meth:`refresh_data` declines to start a build while one is still running, and a
+        cold build can outlast several ticks. The usage cards render RELATIVE reset times,
+        so they must keep counting down through those skipped ticks — otherwise a long
+        build freezes "resets in 2h 14m" on screen. They are normally repainted at the end
+        of :meth:`_apply_rows`, so re-render them here whenever no build was started (and
+        the first paint has landed, i.e. the widgets hold real content).
+        """
+        started = self.refresh_data()
+        if not started and self._first_paint_done:
+            self._update_usage()
+
+    def refresh_data(self) -> bool:
+        """Schedule an off-loop rebuild of the session rows; True when one was started.
+
+        build_rows() (reconcile + transcript scans) can take tens of SECONDS on a cold
+        cache, so it runs in a thread worker; the widget updates land back on the UI
+        thread via _apply_rows.
+
+        Strictly one build at a time. This used to rely on ``exclusive=True``, which is a
+        no-op for a THREAD worker: Textual cannot interrupt a thread, so the "cancelled"
+        predecessor kept running and a 30-45 s cold build accumulated up to nine
+        concurrent workers all doing the same work — each one making the others slower.
+        Now a tick that arrives mid-build only raises ``_refresh_pending``, and
+        :meth:`on_worker_state_changed` starts the single follow-up build when the
+        in-flight one reports done. The follow-up cannot be scheduled from inside the
+        worker: the worker is still RUNNING there, so this guard would defer forever.
         """
         if self._editing:
-            return
+            return False
+        if any(w.group == "data-refresh" and not w.is_finished for w in self.workers):
+            self._refresh_pending = True
+            return False
         self.run_worker(
             self._refresh_worker,
             thread=True,
-            exclusive=True,
             group="data-refresh",
             description="rebuild session rows",
         )
+        return True
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        """Drain a deferred refresh once the in-flight build finishes (any outcome).
+
+        The coalescing counterpart to :meth:`refresh_data`: at most one build is queued
+        behind the running one, however many ticks were skipped while it ran.
+        """
+        if event.worker.group != "data-refresh":
+            return
+        if event.state not in (WorkerState.SUCCESS, WorkerState.ERROR, WorkerState.CANCELLED):
+            return
+        if self._refresh_pending:
+            self._refresh_pending = False
+            self.refresh_data()
 
     def _refresh_worker(self) -> None:
         # Worker thread, with its OWN per-run Store (~14 ms): sharing the UI thread's
@@ -2288,6 +2344,24 @@ class CommandCenterApp(App[None]):
         # superseded refresh worker that is still mid-build when the next one starts.
         if self.store is None:
             return  # not mounted yet / shutting down
+        # Stale-while-revalidate: the very first build reconciles every transcript and can
+        # take tens of seconds, during which the table used to sit EMPTY. Paint the stored
+        # rows first (no reconcile, no transcript scan — a plain read of what the daemon
+        # and the hooks already wrote), then fall through to the authoritative build that
+        # replaces them. Everything after the first tick goes straight to the full build.
+        if not self._first_paint_done:
+            self._first_paint_done = True
+            with Store() as store:
+                quick = build_rows(
+                    store,
+                    self.adapter,
+                    include_done=self._show_finished,
+                    done_max_age_days=self.cfg.done_max_age_days,
+                    folder_order=tuple(self.cfg.folder_order),
+                    include_future=self._show_future,
+                    reconcile_first=False,
+                )
+            self.call_from_thread(self._apply_rows, quick)
         with Store() as store:
             rows = build_rows(
                 store,
@@ -2310,6 +2384,9 @@ class CommandCenterApp(App[None]):
         table = self.query_one("#sessions", DataTable)
         previous = self._current
         table.clear()
+        # Resolve the repo-tree root ONCE per render and hand it to every row (the badge and
+        # the folder label both key off it). Resolved per row it was a config read per row.
+        self._root = repos.repo_root(self.cfg)
         # Resolve the account map once per render — drives the model column's home-icon
         # marker (see _add_session_row). One cheap read per tick, like the detail pane.
         self._account_dirs = config.claude_config_dirs()
@@ -2382,7 +2459,7 @@ class CommandCenterApp(App[None]):
                 continue
             # One header per repo category; rows are sorted so a category is one
             # contiguous block (AIM-first within it), so it can never recur.
-            category, _leaf = colors.folder_split(row.session.cwd, repos.repo_root(self.cfg))
+            category, _leaf = colors.folder_split(row.session.cwd, self._root)
             if category != current_category:
                 current_category = category
                 self._add_category_splitter(table, category)
@@ -2718,7 +2795,7 @@ class CommandCenterApp(App[None]):
 
     def _add_session_row(self, table: DataTable, row: Row, indent_repo: bool = True) -> None:
         session = row.session
-        root = repos.repo_root(self.cfg)
+        root = self._root  # resolved once per render in _apply_rows, our only caller
         done = row.status is Status.DONE
         base = _DONE_STYLE if done else _STATUS_STYLE.get(row.status, "white")
         live = row.live
@@ -2801,7 +2878,7 @@ class CommandCenterApp(App[None]):
         # ONLY a row with an open tab is painted: a parked/finished/draft row has no tab on
         # screen to match a colour to, so it stays receded.
         id_rgb = _id_bg_rgb(session) if (row.is_open and not done) else None
-        badge = _id_badge(session, live=row.is_open)
+        badge = _id_badge(session, live=row.is_open, root=root)
         if row.dep_depth > 0:
             # Hoisted dependent: indent the folder cell 2 spaces per nesting level so the
             # tree structure reads (the row already sits directly under its parent).

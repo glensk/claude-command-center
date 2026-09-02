@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import colors, tabsymbol, terminal
+from command_center import colors, repos, tabsymbol, terminal
 from command_center.models import Session
 
 
@@ -191,6 +191,25 @@ def test_cell_for_live_cache_overrides_deterministic() -> None:
 
 def test_cell_for_blank_when_no_cwd() -> None:
     assert tabsymbol.cell_for(None, "", live=False) == "   "  # nothing to key on → blank pad
+
+
+def test_passing_the_resolved_root_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """*root* is a pure optimisation: the SAME badge, minus one config read per row.
+
+    The TUI and ``ccc ls`` resolve the repo tree once per listing and hand it down; a
+    one-shot caller (the shell hook) still omits it. Both spellings must key identically,
+    inside the tree AND outside it, or a row and its tab would disagree.
+    """
+    monkeypatch.setenv("GIT_BASE", "/repo-root")
+    root = repos.repo_root()
+    for cwd in ("/repo-root/cat/repo-a", "/repo-root/cat/repo-a/tickets", "/elsewhere/scratch"):
+        assert tabsymbol.symbol_for_repo(cwd, root) == tabsymbol.symbol_for_repo(cwd)
+        assert tabsymbol.cell_for("w0t0p0:NOPE", cwd, live=True, root=root) == tabsymbol.cell_for(
+            "w0t0p0:NOPE", cwd, live=True
+        )
+        assert tabsymbol.cell_for("w0t0p0:NOPE", cwd, live=False, root=root) == tabsymbol.cell_for(
+            "w0t0p0:NOPE", cwd, live=False
+        )
 
 
 def test_palette_exhaustion_reclaims_oldest() -> None:

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
 
 from command_center import usage
 from command_center.core import Row, build_rows
-from command_center.models import LiveSession, Status, now_ms
+from command_center.models import LiveSession, Status, TranscriptScan, now_ms
 from command_center.store import Store
 
 _DAY = 86_400_000
@@ -394,6 +395,125 @@ def test_reconcile_persists_observed_model_for_parked_session(
     monkeypatch.setattr(store, "update_fields", _spy)
     reconcile(store, _ParkedModelAdapter())
     assert calls == []  # byte-stable: nothing changed → no store write
+    store.close()
+
+
+class _ScanAdapter(_StubAdapter):
+    """Stub with the ``scan_transcript`` capability, recording what it was handed.
+
+    Mimics the real contract: given a *prior* row (the file is unchanged) it returns that
+    SAME object, so the caller can tell "nothing to persist" by identity.
+    """
+
+    def __init__(
+        self, live: str | None = None, *, model: str = "claude-fable-5", codex: bool = False
+    ) -> None:
+        self._live = (
+            LiveSession(pid=4321, session_id=live, cwd="/repo", raw_status="idle", alive=True)
+            if live
+            else None
+        )
+        self._model = model
+        self._codex = codex
+        self.calls: list[str] = []
+        self.priors: list[TranscriptScan | None] = []
+
+    def discover(self) -> list[LiveSession]:
+        return [self._live] if self._live is not None else []
+
+    def scan_transcript(
+        self, cwd: str, session_id: str, prior: TranscriptScan | None
+    ) -> TranscriptScan | None:
+        self.calls.append(session_id)
+        self.priors.append(prior)
+        if prior is not None:
+            return prior  # unchanged transcript → the caller's own object back
+        return TranscriptScan(
+            session_id=session_id,
+            path=f"/transcripts/{session_id}.jsonl",
+            mtime_ns=1_700_000_000_000_000_000,
+            size=4096,
+            model=self._model,
+            codex=self._codex,
+            codex_scanned_to=4096,
+            scanned_at=1_700_000_000_000,
+        )
+
+
+def test_reconcile_persists_transcript_scans_and_reuses_them_next_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scan rows are the cross-PROCESS cache: pass one scans every non-draft session
+    and persists what it read; the next process hands those rows straight back to the
+    adapter, which recognises the file as untouched and returns them unchanged — so
+    nothing is re-read and nothing is re-written."""
+    from command_center.core import reconcile  # pylint: disable=import-outside-toplevel
+
+    db = tmp_path / "s.db"
+    store = Store(db)
+    store.ensure("parked", cwd="/repo")
+    store.create_draft("job", "/repo", "Ship the thing")  # a draft has no transcript
+    adapter = _ScanAdapter(live="live1", codex=True)
+
+    scans = reconcile(store, adapter)
+    assert adapter.calls == ["live1", "parked"]  # the draft is never scanned
+    assert adapter.priors == [None, None]  # nothing persisted yet
+    assert set(scans) == {"live1", "parked"}
+    stored = store.transcript_scans()
+    assert set(stored) == {"live1", "parked"}
+    assert stored["parked"] == scans["parked"]
+    for sid in ("live1", "parked"):
+        session = store.get(sid)
+        assert session is not None and session.model == "fable-5"  # model_label of the raw id
+    store.close()
+
+    # A FRESH process (new Store on the same file) starts from the persisted rows.
+    store = Store(db)
+    adapter = _ScanAdapter(live="live1")
+    before = store.transcript_scans()
+    batches: list[list[TranscriptScan]] = []
+    orig = store.put_transcript_scans
+
+    def _spy(scans_in: Iterable[TranscriptScan]) -> None:
+        rows = list(scans_in)
+        batches.append(rows)
+        orig(rows)
+
+    monkeypatch.setattr(store, "put_transcript_scans", _spy)
+    reconcile(store, adapter)
+    assert adapter.priors == [before["live1"], before["parked"]]
+    assert batches == [[]]  # nothing dirty → the batch write is a no-op
+    assert store.transcript_scans() == before  # byte-stable: same rows, same scanned_at
+    store.close()
+
+
+def test_build_rows_without_reconcile_uses_the_persisted_scans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``reconcile_first=False`` is the quick first paint: stored rows plus persisted
+    transcript facts, with no reconcile, no transcript read and no usage read."""
+
+    def _no_usage() -> usage.Usage | None:
+        raise AssertionError("the quick paint must not read the Codex usage snapshot")
+
+    monkeypatch.setattr(usage, "read_codex_usage", _no_usage)
+    store = Store(tmp_path / "s.db")
+    store.ensure("codexrow", cwd="/repo")
+    store.ensure("plain", cwd="/repo")
+    store.put_transcript_scans(
+        [
+            TranscriptScan("codexrow", "/t/codexrow.jsonl", 1, 2, "claude-fable-5", True, 2, 5),
+            TranscriptScan("plain", "/t/plain.jsonl", 1, 2, "claude-fable-5", False, 2, 5),
+        ]
+    )
+    adapter = _ScanAdapter()
+
+    rows = {r.session.session_id: r for r in build_rows(store, adapter, reconcile_first=False)}
+    assert adapter.calls == []  # no transcript touched at all
+    assert rows["codexrow"].uses_codex_workflow is True  # read off the persisted scan
+    assert rows["plain"].uses_codex_workflow is False
+    session = store.get("plain")
+    assert session is not None and session.status == Status.IDLE.value  # never reconciled
     store.close()
 
 
