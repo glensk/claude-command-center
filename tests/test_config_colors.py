@@ -407,6 +407,60 @@ def test_parse_claude_account_emails_is_pure_and_tolerant() -> None:
     assert config.parse_claude_account_emails([]) == {}
 
 
+def test_parse_codex_homes_extra_is_pure_ordered_and_tolerant(tmp_path: Path) -> None:
+    """`parse_codex_homes_extra` — the third-and-further ChatGPT logins.
+
+    Same "one bad entry never blanks the rest" tolerance as its neighbours, plus two
+    rules of its own: the fixed `default`/`private` labels may not be re-used (they name
+    the built-in seats everywhere else), and a duplicate label keeps its FIRST entry.
+    Order is the config's own — it is what maps a login onto the `t6`/`t7`/`t8` chord.
+    """
+    parsed = config.parse_codex_homes_extra([f"de={tmp_path}/de", f"fr={tmp_path}/fr"])
+    assert list(parsed) == ["de", "fr"]  # config order, not sorted
+    assert parsed["de"] == tmp_path / "de"
+
+    # ``~`` is expanded but the path is NOT resolved (mirrors codex_home_private).
+    assert config.parse_codex_homes_extra(["de=~/.codex-de"]) == {"de": Path.home() / ".codex-de"}
+
+    # No "=", blank path, a label that could smuggle a path separator or an upper-case
+    # one, and both reserved labels: all skipped, none fatal.
+    assert (
+        config.parse_codex_homes_extra(
+            ["nosep", "de=", "De=/x", "a/b=/y", "=/z", "default=/d", "private=/p"]
+        )
+        == {}
+    )
+    # A repeated label keeps the first entry (a later line never silently wins).
+    assert config.parse_codex_homes_extra(["de=/first", "de=/second"]) == {"de": Path("/first")}
+    assert config.parse_codex_homes_extra([]) == {}
+
+
+def test_codex_homes_orders_default_then_private_then_extras(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`codex_homes` = default → private (when set) → the extras, in config order."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    cfg_dir = tmp_path / "command-center"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = cfg_dir / "config.toml"
+
+    # Without codex_home_private the extras follow `default` directly.
+    cfg_path.write_text(f'codex_homes_extra = ["de={tmp_path}/de"]\n', encoding="utf-8")
+    config.invalidate_config_cache()
+    assert list(config.codex_homes()) == ["default", "de"]
+    assert config.codex_homes()["de"] == tmp_path / "de"
+
+    cfg_path.write_text(
+        f'codex_home_private = "{tmp_path}/priv"\n'
+        f'codex_homes_extra = ["de={tmp_path}/de", "fr={tmp_path}/fr"]\n',
+        encoding="utf-8",
+    )
+    config.invalidate_config_cache()
+    assert list(config.codex_homes()) == ["default", "private", "de", "fr"]
+    assert list(config.codex_homes_extra()) == ["de", "fr"]
+
+
 def test_parse_subscription_ends_is_pure_and_tolerant() -> None:
     """`parse_subscription_ends` — the per-card renewal date behind the ``-> D.M`` title.
 
@@ -428,10 +482,20 @@ def test_parse_subscription_ends_is_pure_and_tolerant() -> None:
                 "codex=2026-02-30",  # well-shaped, but February has no 30th
                 "codex_private=",  # blank value
                 "claude_work=AUTO",  # `auto` is spelled lowercase
+                "codex_De=2026-10-01",  # a codex_<label> key, but not a valid label
+                "codex_=2026-10-01",  # ...and an empty one
             ]
         )
         == {}
     )
     assert config.parse_subscription_ends([]) == {}
+    # A codex_homes_extra card is keyed `codex_<label>`; its label is only known at
+    # runtime, so the parser validates the SHAPE instead of enumerating the cards.
+    assert config.parse_subscription_ends(["codex_de=2026-10-01"]) == {"codex_de": "2026-10-01"}
+    assert config.parse_subscription_ends(["codex_de=auto"]) == {"codex_de": "auto"}
+    assert config.is_subscription_card("codex_de") is True
+    assert config.is_subscription_card("codex_De") is False
+    assert config.is_subscription_card("claude_privat") is False
     # Every card the parser accepts is a card the TUI actually draws.
     assert set(config.SUBSCRIPTION_CARD_ACCOUNTS) <= set(config.SUBSCRIPTION_CARDS)
+    assert all(config.is_subscription_card(card) for card in config.SUBSCRIPTION_CARDS)

@@ -1244,9 +1244,12 @@ def abbrev_email(email: str, *, squeeze_local: bool = False) -> str:
     address at all. When a title has to give up cells it gives up the LOCAL part
     instead: *squeeze_local* takes two characters per dotted segment
     (``first.last`` → ``fi.la``, ``openai.account`` → ``op.ac``), which is both
-    shorter and more legible than a mangled domain. It is ignored when it would not
-    actually be shorter — a three-segment local part squeezes to more cells than
-    ``first…``, and there the card grows instead (see ``_set_card_expanded``).
+    shorter and more legible than a mangled domain. It is ignored when it would cost
+    MORE than one extra cell over ``first…`` — a four-segment local part squeezes to
+    far more, and there the card grows instead (see ``_set_card_expanded``). Within one
+    cell the initials win: they keep every segment visible, which is what tells
+    ``first.last.de@…`` apart from ``first.last@…`` on the card next to it, whereas
+    ``first…`` collapses both to the same title.
     """
     local, sep, domain = email.partition("@")
     if not sep:
@@ -1255,7 +1258,8 @@ def abbrev_email(email: str, *, squeeze_local: bool = False) -> str:
         short = f"{local.split('.')[0]}…"
         if squeeze_local:
             initials = ".".join(segment[:2] for segment in local.split("."))
-            short = min(short, initials, key=len)
+            if len(initials) <= len(short) + 1:
+                short = initials
     elif len(local) > 5:
         short = f"{local[:2]}…{local[-2:]}"
     else:
@@ -1288,14 +1292,19 @@ def codex_card_title(home: Path | None, chord: str, suffix: str = "") -> str:
     LOCAL part (``al.gl@gmail.com``) and keeps the domain whole; if that still does not
     fit, ``_set_card_expanded`` widens the card by the cells needed. The chord leads and
     the date is never truncated: they are the two things the title exists to say.
+
+    An EMPTY *chord* drops the ``<chord>:`` prefix entirely rather than emitting a bare
+    leading ``:`` — a ``codex_homes_extra`` card past the third one has no chord left to
+    advertise, and a naked colon would read as a broken title.
     """
+    prefix = f"{chord}:" if chord else ""
     email = codex_account_email(home) if home is not None else None
     if not email:
-        return f"{chord}:Codex{suffix}"
-    title = f"{chord}:Codex {abbrev_email(email)}{suffix}"
+        return f"{prefix}Codex{suffix}"
+    title = f"{prefix}Codex {abbrev_email(email)}{suffix}"
     if cell_len(title) <= _CARD_TITLE_BUDGET:
         return title
-    return f"{chord}:Codex {abbrev_email(email, squeeze_local=True)}{suffix}"
+    return f"{prefix}Codex {abbrev_email(email, squeeze_local=True)}{suffix}"
 
 
 def _codex_usage_path(home: Path) -> Path:

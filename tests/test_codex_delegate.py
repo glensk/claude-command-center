@@ -1062,6 +1062,44 @@ def test_cmd_home_sets_and_clears_pin(
     assert saved["codex_home"] is None
 
 
+def test_cmd_home_json_labels_a_codex_homes_extra_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`home -j` names a pin at a `codex_homes_extra` login by ITS label, not "default".
+
+    The label is the seat's vocabulary everywhere (`codex:de` quota row, `codex-usage
+    -a de`); before `codex_homes_extra` existed such a home was unknown to
+    `_canonical_codex_homes`, so the pin reported the default seat's label.
+    """
+    import argparse
+
+    from command_center import codex_in_claude as cic
+    from command_center import config, usage
+
+    extra = tmp_path / "codex-de"
+    extra.mkdir()
+    (extra / "auth.json").write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude-home"))
+    monkeypatch.setenv("CODEX_IN_CLAUDE_CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setattr(config, "codex_home_private", lambda: None)
+    monkeypatch.setattr(config, "codex_homes_extra", lambda: {"de": extra})
+    monkeypatch.setattr(usage, "codex_account_email", lambda _h: "")
+    monkeypatch.setattr(usage, "read_codex_usage", lambda _n=None, _h=None: None)
+
+    assert cic.cmd_home(argparse.Namespace(path=str(extra), until="2099-09-07", clear=False)) == (
+        cic.EX_OK
+    )
+    capsys.readouterr()
+    assert cic.cmd_home(argparse.Namespace(path=None, until=None, clear=False, json=True)) == (
+        cic.EX_OK
+    )
+    reported = json.loads(capsys.readouterr().out)
+    assert reported["home"] == str(extra)
+    assert reported["label"] == "de"
+    assert reported["source"].startswith("config pin")
+
+
 def test_codex_home_fails_over_when_default_seat_is_held(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

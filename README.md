@@ -174,10 +174,11 @@ router is reported as opaque rather than guessed at. The lookup happens only whe
 actually ask for help: `build_parser` runs on every `ccc` call (`ccc statusline` fires on
 each prompt render), so the block is built solely for `-h`/`--help`.
 
-In the TUI, the `t` leader chord expands/collapses the usage cards: `t1`…`t5` for the
+In the TUI, the `t` leader chord expands/collapses the usage cards: `t1`…`t8` for the
 Claude/Codex/Copilot subscription cards (`t5` is a second Codex card for a second
-ChatGPT login, shown once `codex_home_private` points at another `CODEX_HOME`), and
-`to`/`ta` for two optional cards fed by an
+ChatGPT login, shown once `codex_home_private` points at another `CODEX_HOME`; and more
+via `codex_homes_extra`, one `"label=path"` entry per further login → cards `t6`…`t8`),
+and `to`/`ta` for two optional cards fed by an
 *external* homelab "overseer" alert-triage daemon (incidents awaiting you + recent
 automatic activity) — off until you set `nixos_overseer_dir` in `config.toml`. A
 collapsed card keeps its titled top border (`╭─ t3:Codex first…@example.org ─╮`,

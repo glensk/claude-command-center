@@ -1572,7 +1572,8 @@ as **stacked, border-titled cards** so the providers are never confused —
 `Claude (private)` (gold border, per-bar green/orange/red usage bars) on top, `Claude (work)`
 (blue border — shown only when a second `work` account is configured, see
 *Multi-account* below), one `Codex <account>` card per configured ChatGPT login
-(green border, green bars — the second one only when `codex_home_private` is set), and
+(green border, green bars — the second one only when `codex_home_private` is set, further
+ones per `codex_homes_extra` entry), and
 `<copilot_card_title> <copilot_model>` (violet border) below — the Copilot title
 shows the default delegation model from the `copilot_model` config (e.g. `gpt-5.4`).
 Each Codex card names its own account in the title (`t3:Codex first…@example.org`,
@@ -1602,8 +1603,9 @@ a `27%` one). The cards sit flush against each other:
 ╰──────────────────────────────────────╯
 ```
 
-**Expand/collapse each card with the persistent `t1`…`t5` / `to` / `ta` chords** (`t1` = Claude
+**Expand/collapse each card with the persistent `t1`…`t8` / `to` / `ta` chords** (`t1` = Claude
 private, `t2` = Claude work, `t3` = Codex, `t4` = Copilot, `t5` = the second Codex login,
+`t6`/`t7`/`t8` = the first three `codex_homes_extra` logins,
 `to` = nixos overseer supervised,
 `ta` = nixos overseer tier_a; type `t` alone for the menu). **Collapsed is not hidden**: the card
 keeps its titled top border — the line that names its own chord — and drops the rest of the box,
@@ -1626,11 +1628,13 @@ supervised card, ~79 cells wide with real incidents, hands ~38 columns back to t
 
 Unlike the view-local `td`/`tf` toggles these **persist** to `config.toml`
 (`usage_card_private/_work/_codex/_codex_private/_copilot`,
+`usage_card_codex_extra_collapsed` for the `t6`…`t8` cards,
 `card_nixos_overseer_supervised/_tier_a` — pure render gates); `t4` also flips the
 `copilot_usage` network-fetch gate so a collapsed Copilot card costs no `gh` call, and
 `t2` on a machine with no `work` account explains itself instead of toggling an empty
 box (that card is absent entirely, title line included — as is the `t5` card without a
-`codex_home_private`; those two are the only cards that ever disappear outright).
+`codex_home_private` and a `t6`…`t8` card with no `codex_homes_extra` entry at that
+position; those are the only cards that ever disappear outright).
 
 **The two nixos-overseer cards** read incidents from an *external* homelab
 "overseer" alert-triage daemon (a separate project — nothing to do with ccc's own
@@ -1786,6 +1790,20 @@ title would otherwise outgrow its card), so the two are never confused. The roll
 belong to the default login, so the second card is live-endpoint-only, and a refusal
 recorded by one login never bleeds into the other's card.
 
+*A third, fourth, fifth ChatGPT login.* `codex_homes_extra` takes one `"label=path"`
+entry per further login (same shape as `claude_accounts`, e.g.
+`codex_homes_extra = ["de=~/.codex-de"]`); the labels are validated
+`^[a-z0-9][a-z0-9_-]*$` and may not re-use the fixed `default`/`private`. Each entry adds,
+in config order: a green card with the widget id `usage-codex-x-<label>` and the chord
+`t6`, `t7` or `t8` (positional — a fourth extra login still gets a card, just no chord);
+a `codex:<label>` quota row, so `ccc quota` shows the seat and a
+`codex-in-claude.py home <PATH> -u <DATE>` pin on it is honoured by the selector; the
+subscription key `codex_<label>` for `subscription_ends`; and the label
+`ccc codex-usage -a <label>` takes. Collapsing is inverted for these cards:
+`usage_card_codex_extra_collapsed` lists the labels that start COLLAPSED, so a newly
+added login is expanded without touching a second key. A login added under a running TUI
+gets its widget only after `ccc restart-tui` (the cards are composed once at launch).
+
 **GitHub Copilot** is read from the official `gh` CLI hitting your own per-user
 enhanced-billing usage endpoint (`/users/{login}/settings/billing/usage`) — no
 proxy, your real GitHub credentials. `fetch_copilot_usage` sums the current month's
@@ -1888,7 +1906,8 @@ filenames); malformed entries are skipped.
   ╭─ t1:Claude (private) 🏠 -> 18.9 ──────╮
   ╭─ t5:Codex se.lo@example.com -> 30.9 ──╮
   ```
-  Cards: `claude_private`, `claude_work`, `codex`, `codex_private`. The date renders
+  Cards: `claude_private`, `claude_work`, `codex`, `codex_private`, plus `codex_<label>`
+  for each `codex_homes_extra` card (`codex_de=2026-10-01`). The date renders
   Swiss `D.M` — four columns, no padding, no year — and gains a `!` (`30.8!`) once it is
   past, so a **pinned** date cannot quietly rot after its renewal. Empty (the default) ⇒
   no card carries a date and no extra endpoint is ever called.
@@ -1997,10 +2016,11 @@ ccc quota -c copilot            # clear a block (also the only way to lift a hol
 ccc quota -c claude:private -O  # observed-only clear: lifts a rejection, never a hold
 ```
 
-Both Codex seats appear as their own rows — `codex` (the canonical team seat,
-`~/.codex`, env-independent) and `codex:private` (`codex_home_private`) — each with the
-account e-mail from its `auth.json` as identity proof and its own rollout-refusal
-attribution. The footer names the seat delegation bills right now
+Every Codex seat appears as its own row — `codex` (the canonical team seat, `~/.codex`,
+env-independent), `codex:private` (`codex_home_private`) and one `codex:<label>` per
+`codex_homes_extra` login — each with the account e-mail from its `auth.json` as identity
+proof and its own rollout-refusal attribution. A seat whose path is already listed is
+deduped away, so one billable identity is never counted twice. The footer names the seat delegation bills right now
 (`best_codex_account`: an ELIGIBLE pin wins, holds/blocks exclude a seat first,
 team-first otherwise); `codex-in-claude`'s `_codex_home()`, `codex-review.py` (via
 `codex-in-claude.py home -j`) and ccc's own `llm.run_codex` all follow that one

@@ -65,8 +65,9 @@ def test_toggle_leader_is_in_footer_as_toggle() -> None:
     assert toggle.action == "toggle_finished"
     assert toggle.footer_key == "t"  # only the leader `t` is the footer mnemonic
     # The leader's chord menu lists every `t…` chord: the per-session account switches
-    # tp/tw (first, in registry order), then the view toggles td/tf/ti, the five
-    # usage-card render gates t1…t5, and the two nixos-overseer cards to/ta.
+    # tp/tw (first, in registry order), then the view toggles td/tf/ti, the usage-card
+    # render gates t1…t8 (t6…t8 = the codex_homes_extra cards), and the two
+    # nixos-overseer cards to/ta.
     menu = commands.chords_for_leader("t")
     assert [c.key for c in menu] == [
         "tp",
@@ -79,6 +80,9 @@ def test_toggle_leader_is_in_footer_as_toggle() -> None:
         "t3",
         "t4",
         "t5",
+        "t6",
+        "t7",
+        "t8",
         "to",
         "ta",
     ]
@@ -93,6 +97,9 @@ def test_toggle_leader_is_in_footer_as_toggle() -> None:
         "card-codex",
         "card-copilot",
         "card-codex-private",
+        "card-codex-3",
+        "card-codex-4",
+        "card-codex-5",
         "card-nix-supervised",
         "card-nix-tier-a",
     }
@@ -137,15 +144,23 @@ def test_toggle_idle_chord_is_ti() -> None:
     assert cmd.footer_pos is None  # shown only via the `t` leader menu, like tf
 
 
-def test_card_toggle_chords_are_t1_to_t5() -> None:
-    """`t1`…`t5` toggle the five usage cards; each is a pure-menu chord (no footer slot)."""
+def test_card_toggle_chords_are_t1_to_t8() -> None:
+    """`t1`…`t8` toggle the usage cards; each is a pure-menu chord (no footer slot).
+
+    `t6`…`t8` are the three ``codex_homes_extra`` cards, in that list's own order — so
+    the chords are positional, not label-keyed.
+    """
     expected = {
         "1": "toggle_card_private",
         "2": "toggle_card_work",
         "3": "toggle_card_codex",
         "4": "toggle_card_copilot",
         "5": "toggle_card_codex_private",
+        "6": "toggle_card_codex_extra_1",
+        "7": "toggle_card_codex_extra_2",
+        "8": "toggle_card_codex_extra_3",
     }
+    assert len(set(expected.values())) == len(expected)  # one action each, no aliasing
     for digit, action in expected.items():
         cmd = commands.by_action(action)
         assert cmd.chord == ("t", digit)
@@ -191,8 +206,9 @@ def test_registry_invariants_hold_with_new_chords() -> None:
     # The new digit chords collide with no existing binding, alias, or chord.
     binds = {c.bind for c in commands.COMMANDS if c.bind}
     aliases = {a for c in commands.COMMANDS for a in c.aliases}
-    assert binds.isdisjoint({"1", "2", "3", "4"})
-    assert aliases.isdisjoint({"1", "2", "3", "4"})
+    digits = {"1", "2", "3", "4", "5", "6", "7", "8"}
+    assert binds.isdisjoint(digits)
+    assert aliases.isdisjoint(digits)
 
 
 def test_account_switch_chords_are_tp_and_tw() -> None:

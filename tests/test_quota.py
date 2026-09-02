@@ -388,6 +388,73 @@ def test_private_home_equal_to_default_is_deduped(monkeypatch: pytest.MonkeyPatc
     assert list(quota._canonical_codex_homes()) == ["default"]
 
 
+def test_canonical_codex_homes_include_extras_and_dedupe_them(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`codex_homes_extra` logins get their own labels — unless they duplicate a seat.
+
+    One billable identity may hold exactly one provider id: a second label for the same
+    path would double-count the seat and split its holds across two rows.
+    """
+    private = tmp_path / "codex-private"
+    extra = tmp_path / "codex-de"
+    monkeypatch.setattr(quota.config, "codex_home_private", lambda: private)
+    monkeypatch.setattr(
+        quota.config,
+        "codex_homes_extra",
+        lambda: {"de": extra, "dup": private, "team": Path.home() / ".codex"},
+    )
+    homes = quota._canonical_codex_homes()
+    assert list(homes) == ["default", "private", "de"]  # `dup`/`team` are the same seats
+    assert homes["de"] == extra
+
+
+def test_codex_quota_rows_carry_one_id_per_seat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Row ids: `codex`, `codex:private`, then one `codex:<label>` per extra login."""
+    monkeypatch.setattr(quota.config, "codex_home_private", lambda: tmp_path / "codex-private")
+    monkeypatch.setattr(quota.config, "codex_homes_extra", lambda: {"de": tmp_path / "codex-de"})
+    monkeypatch.setattr(usage, "codex_account_email", lambda _h: "")
+    monkeypatch.setattr(usage, "read_codex_usage", lambda _n=None, _h=None: None)
+    rows = quota._codex_quotas(NOW, {})
+    assert [row.id for row in rows] == ["codex", "codex:private", "codex:de"]
+    assert [row.account for row in rows] == ["default", "private", "de"]
+
+
+def test_pin_at_an_extra_home_resolves_to_its_label(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A pin whose path is a `codex_homes_extra` home names that seat, not ``""``.
+
+    Before `codex_homes_extra` existed such a pin fell outside the known homes, mapped
+    to ``""`` and was silently ignored by the selector.
+    """
+    from command_center import codex_in_claude
+
+    extra = tmp_path / "codex-de"
+    monkeypatch.setattr(quota.config, "codex_home_private", lambda: None)
+    monkeypatch.setattr(quota.config, "codex_homes_extra", lambda: {"de": extra})
+    monkeypatch.setattr(codex_in_claude, "pinned_codex_home", lambda *_a, **_k: extra)
+    homes = quota._canonical_codex_homes()
+    assert quota._codex_pin_label(homes) == "de"
+    # A pin at a path ccc knows nothing about still reports "" (absent, not invented).
+    monkeypatch.setattr(codex_in_claude, "pinned_codex_home", lambda *_a, **_k: tmp_path / "nope")
+    assert quota._codex_pin_label(homes) == ""
+
+
+def test_selector_honours_an_extra_seat_pin_and_falls_through_when_blocked() -> None:
+    """An eligible `codex:<label>` pin wins; a blocked one is excluded before the pin."""
+    rows = [
+        _codex_row("codex", "default", quota.AVAILABLE),
+        _codex_row("codex:private", "private", quota.AVAILABLE),
+        _codex_row("codex:de", "de", quota.AVAILABLE),
+    ]
+    assert quota.select_codex_account(rows, "de") == "codex:de"
+    rows[2] = _codex_row("codex:de", "de", quota.BLOCKED)
+    assert quota.select_codex_account(rows, "de") == "codex"
+
+
 def _codex_row(pid: str, label: str, state: str) -> quota.ProviderQuota:
     return quota.ProviderQuota(id=pid, kind="codex", state=state, account=label)
 

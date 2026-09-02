@@ -439,7 +439,7 @@ COMMANDS: list[Command] = [
             "(up to 20 steps, remembered for this ccc run only). Covered: close/park "
             "(c/x — including the close offered after marking a live session done), "
             "mark-done/un-done (d), Keep (K), importance (!), a sub-goal tick (space), "
-            "an account switch (tp/tw), and every toggle (td / tf / ti, t1–t5, to/ta). "
+            "an account switch (tp/tw), and every toggle (td / tf / ti, t1–t8, to/ta). "
             "Undoing the close of a LIVE session cannot revive the killed process — it "
             "restores the row and reopens the conversation in a new tab (same as r). "
             "Text edits (a / n / b / D / e) are not undoable here — re-edit the field; "
@@ -581,6 +581,60 @@ COMMANDS: list[Command] = [
         ),
         action="toggle_card_codex_private",
         chord=("t", "5"),
+        # No footer_pos: surfaced via the `t` leader menu, like tf/ti.
+    ),
+    Command(
+        key="t6",
+        word="card-codex-3",
+        gloss="expand / collapse the 3rd Codex card",
+        section=GLOBAL,
+        explanation=(
+            "Expand or collapse the THIRD Codex usage card — the green-bordered 5h/weekly "
+            "bars for the ChatGPT login listed FIRST in codex_homes_extra. Type t then 6. "
+            "Expanded by default; the chord collapses it to its titled top border alone "
+            "(and again expands it), persisted to ccc's config. Each Codex card names its "
+            "own account in the title, so the logins are never confused. With nothing "
+            "configured at that position the card is absent entirely, and the chord "
+            "explains that instead of toggling."
+        ),
+        action="toggle_card_codex_extra_1",
+        chord=("t", "6"),
+        # No footer_pos: surfaced via the `t` leader menu, like tf/ti.
+    ),
+    Command(
+        key="t7",
+        word="card-codex-4",
+        gloss="expand / collapse the 4th Codex card",
+        section=GLOBAL,
+        explanation=(
+            "Expand or collapse the FOURTH Codex usage card — the green-bordered "
+            "5h/weekly bars for the ChatGPT login listed SECOND in codex_homes_extra. "
+            "Type t then 7. Expanded by default; the chord collapses it to its titled top "
+            "border alone (and again expands it), persisted to ccc's config. Each Codex "
+            "card names its own account in the title, so the logins are never confused. "
+            "With nothing configured at that position the card is absent entirely, and "
+            "the chord explains that instead of toggling."
+        ),
+        action="toggle_card_codex_extra_2",
+        chord=("t", "7"),
+        # No footer_pos: surfaced via the `t` leader menu, like tf/ti.
+    ),
+    Command(
+        key="t8",
+        word="card-codex-5",
+        gloss="expand / collapse the 5th Codex card",
+        section=GLOBAL,
+        explanation=(
+            "Expand or collapse the FIFTH Codex usage card — the green-bordered 5h/weekly "
+            "bars for the ChatGPT login listed THIRD in codex_homes_extra. Type t then 8. "
+            "Expanded by default; the chord collapses it to its titled top border alone "
+            "(and again expands it), persisted to ccc's config. Each Codex card names its "
+            "own account in the title, so the logins are never confused. With nothing "
+            "configured at that position the card is absent entirely, and the chord "
+            "explains that instead of toggling."
+        ),
+        action="toggle_card_codex_extra_3",
+        chord=("t", "8"),
         # No footer_pos: surfaced via the `t` leader menu, like tf/ti.
     ),
     Command(

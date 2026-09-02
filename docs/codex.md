@@ -59,6 +59,10 @@ moves `delegate`, `usage`/`headroom` AND `codex-review.py` (the `/codex-debate` 
 to that login at once and lapses by itself after the date; an explicit `$CODEX_HOME` in the
 environment still overrides it. Create the second login once with
 `CODEX_HOME=~/.codex-private codex login` (same value as ccc's `codex_home_private`).
+The pin must point at a home **ccc knows** — `~/.codex`, `codex_home_private`, or an entry
+of `codex_homes_extra`. A path outside those maps to no seat label, so the selector treats
+the pin as absent and ignores it; add the login to `codex_homes_extra` first
+(`codex_homes_extra = ["de=~/.codex-de"]`) and it gains its own `codex:de` quota row.
 
 Since 2026-09-01 the pin is one input to a quota-aware **selector**, not the whole
 answer: `_codex_home()` resolves `$CODEX_HOME` → `ccc quota`'s verdicts (an

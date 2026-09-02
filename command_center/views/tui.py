@@ -176,6 +176,13 @@ _CARD_MIN_WIDTH = 38
 _NIXOS_SUPERVISED_CHORD = commands.by_action("toggle_card_nixos_overseer_supervised").key
 _NIXOS_TIER_A_CHORD = commands.by_action("toggle_card_nixos_overseer_tier_a").key
 
+# Chord keys of the extra Codex cards (`t6`/`t7`/`t8`), POSITIONAL: the i-th
+# ``codex_homes_extra`` login gets the i-th chord. Derived from the registry like every
+# other key in this module; a 4th+ extra home simply carries no chord in its title.
+_EXTRA_CODEX_CHORDS = tuple(
+    commands.by_action(f"toggle_card_codex_extra_{i}").key for i in (1, 2, 3)
+)
+
 
 def _set_card_expanded(panel: Static, expanded: bool, *, visible: bool = True) -> None:
     """Expand or COLLAPSE one usage card — what its `t…` render gate now does.
@@ -1431,7 +1438,8 @@ _HELP_TOPICS: dict[str, str] = {
         "  for the identity hard-link that keeps this from ever reading the wrong\n"
         "  account's numbers.\n"
         "[b]Codex[/b]  Session (5h) + Week (7d) bars, one card per ChatGPT login\n"
-        "  (the second card needs codex_home_private set to another CODEX_HOME).\n"
+        "  (the second card needs codex_home_private set to another CODEX_HOME; a third\n"
+        "  and beyond come from codex_homes_extra).\n"
         "  Source: with codex_usage on, the LIVE chatgpt.com usage endpoint — the same\n"
         "  numbers the web Settings → Usage page shows — fetched out-of-band per home\n"
         "  (codex_usage_refresh_sec / _active_sec) with the token in $CODEX_HOME/auth.json.\n"
@@ -1458,7 +1466,7 @@ _HELP_TOPICS: dict[str, str] = {
         "[b]Expand / collapse a card[/b]\n"
         "  t1 = Claude (private)   t3 = Codex   to = nixos supervised\n"
         "  t2 = Claude (work)      t4 = Copilot   ta = nixos tier_a\n"
-        "  t5 = Codex (second login)\n"
+        "  t5 = Codex (second login)   t6/t7/t8 = the codex_homes_extra logins\n"
         "  Collapsed keeps the card's titled top border (which names its own chord) and\n"
         "  drops the rest of the box. Unlike td/tf (view-local), these PERSIST to\n"
         "  config.toml. t2 on a machine with no `work` account says so instead of\n"
@@ -1475,6 +1483,9 @@ _HELP_TOPICS: dict[str, str] = {
         "  codex_usage_refresh_sec            idle live-Codex fetch throttle (600)\n"
         "  codex_usage_refresh_active_sec     active-work Codex throttle (200; 0=off)\n"
         "  codex_home_private                 second CODEX_HOME ('' = no second card)\n"
+        "  codex_homes_extra                  more CODEX_HOMEs, ['label=~/.codex-label',\n"
+        "                                     ...] -> cards t6..t8\n"
+        "  usage_card_codex_extra_collapsed   labels of those cards to collapse\n"
         "  usage_card_private/_work/_codex/_codex_private/_copilot   the t1..t5 toggles\n"
         "  card_nixos_overseer_supervised/_tier_a     the to / ta toggles\n"
         "  claude_accounts                    ['private=~/.claude', 'work=~/.claude-work']\n"
@@ -1487,7 +1498,8 @@ _HELP_TOPICS: dict[str, str] = {
         "                           its own cancel-by date, e.g. ['claude_private=auto',\n"
         "                           'codex_private=2026-09-30'] -> the title gains\n"
         "                           ' -> 30.9' ('!' = already past). Cards:\n"
-        "                           claude_private/claude_work/codex/codex_private.\n"
+        "                           claude_private/claude_work/codex/codex_private, plus\n"
+        "                           codex_<label> for a codex_homes_extra card.\n"
         "                           'auto' derives it (Claude's billing anniversary /\n"
         "                           the ChatGPT id_token claim, only as fresh as the\n"
         "                           last `codex login`). Empty (default) = no dates.\n\n"
@@ -2028,6 +2040,13 @@ class CommandCenterApp(App[None]):
         width: auto; min-width: 38; height: auto; padding: 0 1;
         border: round #19c37d;
     }
+    /* …and every THIRD-and-further login (codex_homes_extra). One rule for all of them:
+       their ids (#usage-codex-x-<label>) are only known at runtime, so they carry a
+       class instead — same green box, told apart by the e-mail in the border title. */
+    .usage-codex-extra {
+        width: auto; min-width: 38; height: auto; padding: 0 1;
+        border: round #19c37d;
+    }
     #usage-copilot {
         width: auto; min-width: 38; height: auto; padding: 0 1;
         border: round #a371f7;
@@ -2158,6 +2177,13 @@ class CommandCenterApp(App[None]):
                     yield Static("", id="usage-work")
                     yield Static("", id="usage-codex")
                     yield Static("", id="usage-codex-private")
+                    # One more green card per codex_homes_extra login, in config order.
+                    # Composed ONCE, so a login added to the config under a running TUI
+                    # gets its widget only after a restart (`ccc restart-tui`);
+                    # _update_usage therefore SKIPS a label whose widget is missing
+                    # instead of raising on the render tick.
+                    for label in self._codex_homes_extra():
+                        yield Static("", id=f"usage-codex-x-{label}", classes="usage-codex-extra")
                     yield Static("", id="usage-copilot")
                     # Two read-only cards fed by the EXTERNAL homelab overseer daemon
                     # (a separate project): supervised = incidents awaiting the human
@@ -2613,6 +2639,16 @@ class CommandCenterApp(App[None]):
         codex_private_home = self._codex_private_home()
         if codex_private_home is not None:
             codex_private_panel.update(usage.render_codex_usage(self._codex_usage.get("private")))
+        # …and one card per codex_homes_extra login, rendered from the same worker-read
+        # snapshot map. A label whose widget is missing (added to the config under a
+        # RUNNING TUI — compose ran before it existed) is skipped, never raised on.
+        extra_panels: dict[str, Static] = {}
+        for label in self._codex_homes_extra():
+            try:
+                extra_panels[label] = self.query_one(f"#usage-codex-x-{label}", Static)
+            except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                continue
+            extra_panels[label].update(usage.render_codex_usage(self._codex_usage.get(label)))
         # Both Codex titles carry their account's e-mail, and a `codex login` can swap
         # it, so they are rebuilt every tick — the lookup is mtime-cached, hence cheap.
         # All four titles can also carry a subscription-end date that rolls at midnight
@@ -2655,6 +2691,13 @@ class CommandCenterApp(App[None]):
             self.cfg.usage_card_codex_private,
             visible=self._has_codex_private(),
         )
+        # The extra Codex cards invert the gate: a label LISTED in
+        # usage_card_codex_extra_collapsed is collapsed, anything else expanded — so a
+        # newly configured login needs no second key to show up. They only exist when
+        # configured, so `visible` is never in question here.
+        collapsed = set(self.cfg.usage_card_codex_extra_collapsed)
+        for label, extra_panel in extra_panels.items():
+            _set_card_expanded(extra_panel, label not in collapsed, visible=True)
         _set_card_expanded(copilot_panel, self.cfg.usage_card_copilot)
         _set_card_expanded(nixos_supervised_panel, self.cfg.card_nixos_overseer_supervised)
         _set_card_expanded(nixos_tier_a_panel, self.cfg.card_nixos_overseer_tier_a)
@@ -4277,12 +4320,21 @@ class CommandCenterApp(App[None]):
         raw = self.cfg.codex_home_private.strip()
         return Path(raw).expanduser() if raw else None
 
+    def _codex_homes_extra(self) -> dict[str, Path]:
+        """Label → ``CODEX_HOME`` for every THIRD-and-further login (``codex_homes_extra``).
+
+        Parsed off the already-loaded ``self.cfg`` for the same reason as
+        :meth:`_codex_private_home`: the 5 s render tick must cost no config read.
+        """
+        return config.parse_codex_homes_extra(self.cfg.codex_homes_extra)
+
     def _codex_homes(self) -> dict[str, Path]:
         """Label → ``CODEX_HOME`` for every configured Codex login (see config.codex_homes)."""
         homes = {"default": config.codex_home()}
         private = self._codex_private_home()
         if private is not None:
             homes["private"] = private
+        homes.update(self._codex_homes_extra())
         return homes
 
     def _has_codex_private(self) -> bool:
@@ -4325,32 +4377,44 @@ class CommandCenterApp(App[None]):
             )
 
     def _set_codex_card_titles(self) -> None:
-        """(Re)build both Codex cards' border titles — each names its own ChatGPT account.
+        """(Re)build every Codex card's border title — each names its own ChatGPT account.
 
-        Two cards for the same product would be indistinguishable without the account, so
-        the title carries an abbreviated e-mail (``t3:Codex first…@example.org``)
-        read from that home's ``auth.json``. The lookup is mtime-cached, so this is cheap
-        enough to re-run on every render tick — which it must be, since a `codex login`
-        can change the account under a running TUI.
+        Several cards for the same product would be indistinguishable without the
+        account, so the title carries an abbreviated e-mail (``t3:Codex
+        first…@example.org``) read from that home's ``auth.json``. The lookup is
+        mtime-cached, so this is cheap enough to re-run on every render tick — which it
+        must be, since a `codex login` can change the account under a running TUI.
+
+        The two fixed cards resolve their chord through the registry; the
+        ``codex_homes_extra`` cards take theirs positionally from
+        :data:`_EXTRA_CODEX_CHORDS`, and a 4th+ login (no chord left) simply gets a
+        chord-less title.
         """
         ends = self._subscription_ends()
-        for card_id, home, action, card in (
-            ("#usage-codex", config.codex_home(), "toggle_card_codex", "codex"),
+        cards: list[tuple[str, Path | None, str, str]] = [
+            (
+                "#usage-codex",
+                config.codex_home(),
+                commands.by_action("toggle_card_codex").key,
+                "codex",
+            ),
             (
                 "#usage-codex-private",
                 self._codex_private_home(),
-                "toggle_card_codex_private",
+                commands.by_action("toggle_card_codex_private").key,
                 "codex_private",
             ),
-        ):
+        ]
+        for index, (label, extra_home) in enumerate(self._codex_homes_extra().items()):
+            chord = _EXTRA_CODEX_CHORDS[index] if index < len(_EXTRA_CODEX_CHORDS) else ""
+            cards.append((f"#usage-codex-x-{label}", extra_home, chord, f"codex_{label}"))
+        for card_id, home, chord, card in cards:
             try:
                 panel = self.query_one(card_id, Static)
             except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
                 continue
             panel.border_title = usage.codex_card_title(
-                home,
-                commands.by_action(action).key,
-                usage.subscription_suffix(card, ends, home),
+                home, chord, usage.subscription_suffix(card, ends, home)
             )
 
     def _toggle_usage_card(
@@ -4431,6 +4495,65 @@ class CommandCenterApp(App[None]):
             )
             return
         self._toggle_usage_card("usage_card_codex_private", "Codex (second login)")
+
+    def _toggle_codex_extra_card(self, index: int, *, announce: bool = True) -> None:
+        """Expand/collapse the *index*-th (1-based) ``codex_homes_extra`` card, and persist.
+
+        Same reload-modify-save contract as :meth:`_toggle_usage_card` — ``self.cfg`` is
+        a launch-time snapshot and ``save_config`` writes EVERY key, so a stale save
+        would clobber any Settings-screen edit made since. The persisted key is a LIST of
+        COLLAPSED labels (``usage_card_codex_extra_collapsed``): unlisted = expanded, so
+        a login added to the config later needs no second key.
+        """
+        labels = list(self._codex_homes_extra())
+        if index > len(labels):
+            # markup=False: the example carries ``[...]``, which Textual would otherwise
+            # parse as console markup and crash the toast render on (see t2).
+            self.notify(
+                f"No Codex login configured at position {index} of codex_homes_extra. "
+                "Add 'label=~/.codex-label' there (create that login with "
+                "CODEX_HOME=~/.codex-label codex login) and restart the TUI.",
+                severity="warning",
+                markup=False,
+            )
+            return
+        label = labels[index - 1]
+        cfg = config.load_config()
+        collapsed = [name for name in cfg.usage_card_codex_extra_collapsed if name != label]
+        now_collapsed = len(collapsed) == len(cfg.usage_card_codex_extra_collapsed)
+        if now_collapsed:
+            collapsed.append(label)
+        cfg.usage_card_codex_extra_collapsed = collapsed
+        try:
+            config.save_config(cfg)
+        except RuntimeError as err:
+            self.notify(str(err), severity="error")
+            return
+        self.cfg = cfg
+        self._update_usage()
+
+        def undo_codex_extra(index: int = index, label: str = label) -> str | None:
+            self._toggle_codex_extra_card(index, announce=False)
+            state = (
+                "collapsed" if label in self.cfg.usage_card_codex_extra_collapsed else "expanded"
+            )
+            return f"Codex card {label} {state} again."
+
+        self._push_undo(f"Codex card {label} toggle", undo_codex_extra)
+        if announce:
+            self.notify(f"Codex card {label} {'collapsed' if now_collapsed else 'expanded'}.")
+
+    def action_toggle_card_codex_extra_1(self) -> None:
+        """Expand/collapse the 3rd Codex card (1st codex_homes_extra) — the `t6` chord."""
+        self._toggle_codex_extra_card(1)
+
+    def action_toggle_card_codex_extra_2(self) -> None:
+        """Expand/collapse the 4th Codex card (2nd codex_homes_extra) — the `t7` chord."""
+        self._toggle_codex_extra_card(2)
+
+    def action_toggle_card_codex_extra_3(self) -> None:
+        """Expand/collapse the 5th Codex card (3rd codex_homes_extra) — the `t8` chord."""
+        self._toggle_codex_extra_card(3)
 
     def action_toggle_card_copilot(self) -> None:
         """Expand/collapse the Copilot usage card — the `t4` chord.

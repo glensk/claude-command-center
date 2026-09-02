@@ -473,16 +473,30 @@ def _canonical_codex_homes() -> dict[str, Path]:
     label the private path ``codex`` and list the same seat twice — and a hold on
     ``codex`` would then mean different seats in different processes. Provider ids
     must name the same billable identity everywhere.
+
+    ``default`` and ``private`` first, then one entry per ``codex_homes_extra`` login in
+    config order. A home whose path is already listed is DROPPED, however it is spelled:
+    two labels for one seat would double-count it and split its holds.
     """
     homes: dict[str, Path] = {"default": Path.home() / ".codex"}
+
+    def _is_new(candidate: Path) -> bool:
+        """True when *candidate* is not already one of the collected homes."""
+        for home in homes.values():
+            try:
+                same = candidate.expanduser().resolve() == home.expanduser().resolve()
+            except OSError:  # pragma: no cover - resolve() fails only on exotic filesystems
+                same = str(candidate) == str(home)
+            if same:
+                return False
+        return True
+
     private = config.codex_home_private()
-    if private is not None:
-        try:
-            same = private.expanduser().resolve() == homes["default"].expanduser().resolve()
-        except OSError:  # pragma: no cover - resolve() fails only on exotic filesystems
-            same = str(private) == str(homes["default"])
-        if not same:
-            homes["private"] = private
+    if private is not None and _is_new(private):
+        homes["private"] = private
+    for label, home in config.codex_homes_extra().items():
+        if _is_new(home):
+            homes[label] = home
     return homes
 
 
@@ -558,7 +572,11 @@ def _codex_seat_quota(
 
 
 def _codex_quotas(now: int, cooldowns: dict[str, dict]) -> list[ProviderQuota]:
-    """One row per configured Codex seat: ``codex`` (team), then ``codex:private``."""
+    """One row per configured Codex seat.
+
+    ``codex`` (team), then ``codex:private``, then one ``codex:<label>`` per
+    ``codex_homes_extra`` login — the ids an account pin and a hold are named by.
+    """
     rows = []
     for label, home in _canonical_codex_homes().items():
         pid = "codex" if label == "default" else f"codex:{label}"

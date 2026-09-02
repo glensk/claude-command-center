@@ -1734,6 +1734,15 @@ def test_codex_account_email_reads_the_id_token_jwt(tmp_path: Path) -> None:
     assert usage.codex_card_title(None, "t5") == "t5:Codex"
 
 
+def test_codex_card_title_drops_the_prefix_for_a_chordless_card(tmp_path: Path) -> None:
+    """A card with no chord (a 4th+ codex_homes_extra login) never shows a bare ``:``."""
+    home = tmp_path / "codex"
+    _write_codex_auth(home)
+    assert usage.codex_card_title(home, "") == "Codex alice…@example.com"
+    assert usage.codex_card_title(home, "", " -> 30.9") == "Codex alice…@example.com -> 30.9"
+    assert usage.codex_card_title(None, "") == "Codex"
+
+
 def test_abbrev_email_squeezes_the_local_part_and_never_the_domain() -> None:
     """Under pressure an address gives up its local part, two characters per segment.
 
@@ -1748,6 +1757,12 @@ def test_abbrev_email_squeezes_the_local_part_and_never_the_domain() -> None:
     )
     # Ignored when it would not actually be shorter: three segments cost more than "first…".
     assert usage.abbrev_email("a.b.c.dee@example.org", squeeze_local=True) == "a…@example.org"
+    # Within one cell of ``first…`` the initials win — they keep the segment that tells
+    # two logins of the same person apart (``al.gl.de`` vs ``al.gl``), which
+    # ``albert…`` would hide.
+    assert usage.abbrev_email("albert.glensk.de@example.org", squeeze_local=True) == (
+        "al.gl.de@example.org"
+    )
     # An undotted local part has no segments to initialize — the default rule stands.
     assert usage.abbrev_email("developer@example.org", squeeze_local=True) == "de…er@example.org"
     assert usage.abbrev_email("bob@x.org", squeeze_local=True) == "bob@x.org"

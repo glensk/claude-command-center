@@ -2697,6 +2697,113 @@ def test_second_codex_card_shows_its_own_account_and_t5_toggles_it(
     asyncio.run(scenario())
 
 
+def _write_codex_auth(home: Path, email: str) -> None:
+    """Seed *home* with the ``auth.json`` a ChatGPT `codex login` writes."""
+    import base64
+    import json
+
+    claims = base64.urlsafe_b64encode(json.dumps({"email": email}).encode()).decode().rstrip("=")
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": f"header.{claims}.signature",
+                    "access_token": "tok",
+                    "account_id": "acct",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_third_codex_card_from_codex_homes_extra_and_t6_toggles_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `codex_homes_extra` login gets its own card, chord `t6`, and a persisted collapse.
+
+    The extra cards invert the render gate of the fixed ones: the config lists the
+    labels that are COLLAPSED, so a newly configured login is expanded by default and
+    needs no second key.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    default_home = tmp_path / "codex"
+    extra_home = tmp_path / "codex-de"
+    monkeypatch.setenv("CODEX_HOME", str(default_home))
+    (tmp_path / "command-center").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "command-center" / "config.toml").write_text(
+        f'codex_homes_extra = ["de={extra_home}"]\nsubscription_ends = ["codex_de=2099-10-01"]\n',
+        encoding="utf-8",
+    )
+    _write_codex_auth(default_home, "work.seat@example.org")
+    _write_codex_auth(extra_home, "third.login@example.com")
+
+    from command_center import config
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            card = app.query_one("#usage-codex-x-de")
+            assert card.display is True
+            assert card.has_class("card-collapsed") is False  # unlisted ⇒ expanded
+            # Its own chord leads the title, its own account names it, and the
+            # subscription date it was pinned closes it (Swiss D.M, never truncated).
+            # The date costs eight cells, so the local part squeezes to `th.lo`.
+            assert str(card.border_title) == "t6:Codex th.lo@example.com -> 1.10"
+            assert card.outer_size.width >= len(str(card.border_title)) + 6
+
+            await pilot.press("t")
+            await pilot.press("6")
+            await pilot.pause()
+            assert config.load_config().usage_card_codex_extra_collapsed == ["de"]
+            assert app.cfg.usage_card_codex_extra_collapsed == ["de"]
+            assert card.display is True  # collapsed onto its title line, not removed
+            assert card.has_class("card-collapsed") is True
+
+            app.action_undo()
+            await pilot.pause()
+            assert config.load_config().usage_card_codex_extra_collapsed == []
+            assert card.has_class("card-collapsed") is False
+            assert app._undo_stack == []  # the re-entrant toggle did not re-push
+
+    asyncio.run(scenario())
+
+
+def test_extra_codex_cards_absent_and_t6_inert_without_codex_homes_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No `codex_homes_extra` ⇒ no third card at all, and `t6` explains instead of writing.
+
+    Same rule as `t2`/`t5`: a login that does not exist has nothing to show, so there is
+    no widget to collapse — and the chord must not persist a label for a card nobody has.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center import config
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app._codex_homes_extra() == {}
+            assert len(app.query("#usage-codex-x-de")) == 0  # never composed
+            assert len(app.query(".usage-codex-extra")) == 0
+
+            await pilot.press("t")
+            await pilot.press("6")
+            await pilot.pause()
+            # Inert: nothing flipped, nothing persisted, nothing to undo.
+            assert app.cfg.usage_card_codex_extra_collapsed == []
+            assert config.load_config().usage_card_codex_extra_collapsed == []
+            assert app._undo_stack == []
+
+    asyncio.run(scenario())
+
+
 def test_subscription_end_dates_reach_every_card_title_uncut(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
