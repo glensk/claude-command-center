@@ -48,7 +48,7 @@ from datetime import date
 from pathlib import Path
 from typing import IO
 
-from . import config, deps, repos
+from . import config, deps, repos, scrub
 from .future_files import (
     ParsedJob,
     content_hash,
@@ -66,7 +66,7 @@ from .future_files import (
     upsert_error_block,
     validate,
 )
-from .models import DEFAULT_LLM, JOB_TYPES, LLM_CHOICES, now_ms
+from .models import DEFAULT_LLM, JOB_TYPES, LLM_CHOICES, Session, now_ms
 from .store import Store
 
 # A DB change is a "conflict" only if it happened more than this long after the last
@@ -245,6 +245,65 @@ def _spawn_launch(session_id: str) -> bool:
         return False
 
 
+def _credential_tripwire(cfg: config.Config, session: Session) -> scrub.CheckVerdict | None:
+    """Check a draft's AIM + prompt for a live credential; ``None`` when not armed.
+
+    **Armed** iff a mirror switch (``mirror_running`` / ``mirror_done`` /
+    ``mirror_sessions``) is on and ``mirror_allow_unscrubbed`` is off. Rationale: without
+    the mirrors the transcript never leaves the machine, so a fresh install with no broker
+    must still be able to launch jobs; WITH them the launched prompt is echoed verbatim
+    into the vault (the running/session cards), and those roots already require a
+    scrubber — so demanding one here costs nothing extra and closes the hole at its
+    source, before the value is ever spoken to a session.
+
+    Runs the scrubber's ``check`` verb (a verdict, never a rewrite). An unresolvable
+    scrubber is reported as DEGRADED with the resolution reason — fail closed, exactly
+    like the mirror writes.
+    """
+    if not (cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions):
+        return None
+    if cfg.mirror_allow_unscrubbed:
+        return None
+    text = f"{session.aim or ''}\n{session.prompt or ''}"
+    resolution = scrub.resolve_scrubber(cfg.mirror_scrub_cmd, verb="check")
+    if resolution.scrubber is None:
+        return scrub.CheckVerdict(scrub.DEGRADED, reason=resolution.reason)
+    return scrub.check(resolution.scrubber, text)
+
+
+def _refuse_launch(
+    cfg: config.Config, session: Session, verdict: scrub.CheckVerdict, report: SyncReport
+) -> None:
+    """Record a refused launch: the managed ``ccc-sync-error`` callout + a report line.
+
+    The callout names the credential's LABEL only (the checker never returns the value,
+    and neither do we). Nothing is spawned and nothing is appended to ``report.launched``.
+    """
+    if verdict.state == scrub.LEAK:
+        labels = ", ".join(verdict.labels) or "unlabelled"
+        error = (
+            f"launch refused: live credential in prompt/AIM ({labels}) — "
+            "remove it and re-tick launch"
+        )
+        detail = f"launch refused (credential {labels}): {session.session_id}"
+    else:
+        error = (
+            f"launch refused: credential scrubber degraded ({verdict.reason}) — "
+            "fix the scrubber and re-tick launch"
+        )
+        detail = f"launch refused (scrubber degraded): {session.session_id}"
+    report.details.append(detail)
+    if not session.future_file:
+        return
+    path = _abs_path(cfg, session.future_file)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    if text:
+        _write_error(path, text, [error], report)
+
+
 def _consume_launch(store: Store, cfg: config.Config, session_id: str, report: SyncReport) -> None:
     """Act on a consumed ``launch: true`` flip: spawn iff the row is a live, unblocked draft.
 
@@ -255,6 +314,12 @@ def _consume_launch(store: Store, cfg: config.Config, session_id: str, report: S
     do NOT spawn — instead write the managed ``ccc-sync-error`` callout onto the file
     ("blocked: depends on <4-hex> — <state>"). No retrigger loop (launch was already
     reset to false); the user re-flips once the dependency completes.
+
+    Then the **credential tripwire** (:func:`_credential_tripwire`): with the vault
+    mirrors on, a prompt/AIM carrying a live credential value is never launched — the
+    session would echo it straight into the running/session mirrors. A leak or a degraded
+    checker refuses the launch the same way a blocked dependency does (callout + report
+    line, no spawn); the user scrubs the prompt (or fixes the scrubber) and re-ticks.
     """
     session = store.get(session_id)
     if session is None or not session.draft or session.archived or session.done:
@@ -278,6 +343,10 @@ def _consume_launch(store: Store, cfg: config.Config, session_id: str, report: S
                     [f"blocked: depends on {blocker.parent_hash} — {blocker.state}"],
                     report,
                 )
+        return
+    verdict = _credential_tripwire(cfg, session)
+    if verdict is not None and verdict.state != scrub.CLEAN:
+        _refuse_launch(cfg, session, verdict, report)
         return
     ok = _spawn_launch(session_id)
     report.launched.append(session_id)

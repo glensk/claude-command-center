@@ -65,7 +65,7 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 **Obsidian & mirrors**
 
 - `ccc obsidian-setup [-r VAULT] [--install-plugins]` — seed the vault folders, dashboards & job buttons.
-- `ccc sync-future` · `ccc sync-mirrors` — reconcile the future-job files / export the running+done mirrors (usually automatic).
+- `ccc sync-future` · `ccc sync-mirrors` (`-F/--full`, `-R/--rescrub`, `-v/--verbose`) — reconcile the future-job files / export the running+done+session mirrors (usually automatic). Every mirror write is vouched for by the credential scrubber first: `-F/--full` lifts the per-pass scrub budgets (the one-off migration), `-R/--rescrub` drops every stored vouch before the pass, and the command exits **3** when any document was withheld because the scrubber could not vouch for it.
 
 **Cross-session file locks**
 
@@ -723,7 +723,8 @@ session's **first** AIM, so they never rename when the AIM is sharpened mid-sess
 current-aim-named mirror is renamed on the next pass). The daemon refreshes them each pass and every
 lifecycle command (`start-job`, `mark-done`, `rm`, `unlaunch`) fires a detached `ccc sync-mirrors`.
 Both are **off by default** (fresh-install inert); enable with `mirror_running = true` /
-`mirror_done = true`.
+`mirror_done = true` — and only together with a working credential scrubber, which is what
+actually lets ccc write them (next-but-one paragraph).
 
 **Full-session mirrors (`01-llm-tasks/sessions/`).** A third export-only tree holds ONE file per
 tracked session (parked, running or done — membership is independent of the running/done
@@ -741,6 +742,54 @@ backslash-escaped (a pasted terminal snippet can open a code fence it never clos
 swallow the whole rest of the note), and a dangling fence in an assistant reply is self-closed —
 Claude's balanced code blocks keep rendering as code. In the TUI, the **`os`** chord (type `o`
 then `s` on the selected row) opens the selected session's full-session file in Obsidian directly.
+
+**Credential scrubbing (fail closed).** The three mirror roots embed prompts, replies and tool
+output **verbatim** — including any credential value a session ever printed — so every mirror
+document (running, done and full-session alike) is passed through an external credential scrubber
+before it is written. The scrubber is a subprocess named by `mirror_scrub_cmd` (default
+`secret-broker-client.py scrub --shapes`): its **first token is the executable**, resolved through
+the external-deps registry (`$SECRET_BROKER_CLIENT` → `$PATH`; a token containing `/` is used
+verbatim and must exist and be executable), the remaining tokens are its arguments. The contract
+is deliberately dumb: the document goes in on **stdin**, the vouched document comes back on
+**stdout**, `SCRUBBED: <labels>` lines go to stderr (label names only, never values), and **exit 0
+means vouched**. Anything else — a non-zero exit, a timeout (60 s per document), empty or
+oversized output, output that is not valid UTF-8, a returned document that lost its frontmatter
+identity — means that write is **WITHHELD**: the previous file is left exactly as it was, that
+pass's cleanup is skipped (a withheld card must never be reaped as stale), the daemon logs one
+stderr line per pass, `ccc sync-mirrors` exits 3, and `ccc doctor` shows ❌ under
+"mirrors → scrubber".
+
+Scrubbing every card on every pass would be far too slow, so vouches are **persisted** — a
+`mirror_vouch` table in the store keyed by session and root, holding the raw content hash, the
+written hash, the policy string (the exact `mirror_scrub_cmd`) and a timestamp. The steady state
+therefore costs **no scrubber calls at all**: a card is re-scrubbed only when its content changes,
+when its file changes, or when `mirror_scrub_cmd` changes, and is re-vouched after 24 h. One
+daemon pass spends at most 120 s on required scrubs and 20 s on re-vouching; whatever does not fit
+is reported as `deferred` and simply keeps its previous, stale-but-safe file.
+`ccc sync-mirrors -F/--full` lifts both budgets (the one-off migration pass), and
+`ccc sync-mirrors -R/--rescrub` drops every stored vouch first — what you run after changing the
+scrubber's rule set or its inventory. `mirror_scrub_cmd = ""` means *no scrubber*, and therefore
+every mirror write is withheld; `mirror_allow_unscrubbed = true` is the **only** passthrough, and
+`ccc doctor` keeps a ❌ on it for as long as it is on.
+
+**The FUTURE-draft tripwire.** A credential pasted into a draft's prompt would be echoed into the
+mirrors the moment the job runs, so with any mirror switch on (and `mirror_allow_unscrubbed` off)
+flipping `launch: true` first runs the scrubber's `check` verb over the draft's AIM + prompt. A
+leak — or a checker that cannot vouch (degraded/unavailable/missing) — **refuses the launch**:
+nothing is spawned, and the file gets the managed `status: error` callout naming the credential's
+**label** (never its value), e.g. *"launch refused: live credential in prompt/AIM (aws.key) —
+remove it and re-tick launch"*. The toggle was already consumed by the canonical rewrite, so a
+refusal never loops: remove the value (or fix the scrubber) and tick `launch` again. With every
+mirror off the tripwire is disarmed — nothing leaves the machine then, and a fresh install with no
+scrubber can still launch jobs.
+
+**Migration (existing installs).** The mirrors now require a resolvable scrubber (or the explicit
+`mirror_allow_unscrubbed = true`). If you already run them: install the scrubber client, then run
+`ccc sync-mirrors --full -v` **once** so every existing card is scrubbed and vouched — after that
+the normal budgeted passes are no-ops until content changes. `ccc init` enables
+`mirror_running` / `mirror_done` / `mirror_sessions` only when a scrubber resolves; when none does
+it says so and leaves them off (the future-job files, which hold no verbatim transcript, still go
+on).
 
 **Vault dashboards.** Three dataviewjs dashboards sit one level above the mirror trees (outside the
 queried folders, so they never mirror themselves): **`01-llm-tasks/future.md`** (editable — native

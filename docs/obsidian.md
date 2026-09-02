@@ -118,6 +118,23 @@ running/done note links to its stable full-session note (a `session` frontmatter
 a `[[…|full session]]` wikilink), so your entire Claude Code history is searchable and
 cross-linked in Obsidian — and readable on your phone.
 
+Those notes embed the transcript **verbatim**, so every one of them is passed through an
+external credential scrubber before it is written:
+
+| Key                       | Default                                  | What it does                                            |
+| :------------------------ | :--------------------------------------- | :------------------------------------------------------ |
+| `mirror_scrub_cmd`        | `secret-broker-client.py scrub --shapes` | note on stdin, vouched note on stdout, exit 0 = vouched |
+| `mirror_allow_unscrubbed` | `false`                                  | the ONLY passthrough (`ccc doctor` ❌ while on)          |
+
+It **fails closed**: no scrubber, a non-zero exit, a timeout or unusable output means the
+note is simply not written — the previous file stays, that pass's cleanup is skipped,
+`ccc sync-mirrors` exits 3 and `ccc doctor` flags it. Vouches are cached in the store, so
+the steady state costs no scrubber calls at all. Migrating an existing vault: install the
+scrubber client, then run `ccc sync-mirrors --full -v` once to scrub and vouch everything
+already there. The same check guards launches — ticking `launch` on a future job whose
+prompt carries a live credential is refused, with the label (never the value) written into
+the job file.
+
 ## Dashboards
 
 Three dataviewjs dashboards sit one level above the mirror trees (so they never mirror

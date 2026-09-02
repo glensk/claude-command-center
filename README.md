@@ -97,7 +97,7 @@ and some are macOS-first (they drive iTerm2 / Karabiner). Honest table:
 | Sub-goal auto-derive + grade  | auto-builds + ticks the checklist so the bar moves on its own                                | a cheap LLM (Haiku)                                                | `autoprogress` / `grade_on_turn`     |
 | Drift + DONE checkers         | impartial second model grades goal-drift and "is the AIM met?"                               | a cheap LLM (Haiku)                                                | `drift_check` / `assess_aim_on_turn` |
 | Future jobs                   | park a described job, launch it later from terminal or Obsidian                              | Python only                                                        | always on                            |
-| Obsidian mirrors + dashboards | every session as a searchable markdown note; job-launch buttons                              | an Obsidian vault                                                  | `ccc obsidian-setup`, mirror flags   |
+| Obsidian mirrors + dashboards | every session as a searchable markdown note; job-launch buttons                              | an Obsidian vault + a credential scrubber                          | `ccc obsidian-setup`, mirror flags   |
 | Background daemon + alerts    | reaps idle sessions, regenerates summaries, desktop-notifies                                 | launchd (macOS) / systemd --user (Linux); `notify-send` on Linux   | `ccc daemon --install`               |
 | Auto-resume halted            | resumes rate-limit-halted sessions once the limit resets (machine must stay on)              | `claude-session-continue`                                          | `resume_halted`                      |
 | Cross-session file locks      | serializes edits when several sessions share one checkout                                    | Claude Code hooks                                                  | `file_lock_enabled` (default on)     |
@@ -133,7 +133,9 @@ A few features that don't fit in a one-liner but are the reason people keep it r
 - **Full-session markdown mirrors.** Every session — running, parked, or done — is
   mirrored to a markdown note in your Obsidian vault: the whole conversation, prompts,
   AIM history, sub-goals, rendered terminal-like. Your entire Claude Code history
-  becomes searchable, linkable, and phone-readable.
+  becomes searchable, linkable, and phone-readable. Because those notes embed the
+  transcript verbatim, every mirrored byte passes through a credential scrubber first —
+  fail closed: no scrubber, no write.
 - **The peek panel.** Hold a key, and a floating panel shows every prompt you've typed
   in the focused tab (plus its AIM history) — so *"what have I been asking here?"* is
   one keystroke, not a scroll through the transcript.

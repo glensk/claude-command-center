@@ -13,6 +13,12 @@ features ON only when a vault is supplied, copilot/resume/reap OFF) and runs the
 installers; ``-m/--minimal`` writes nothing on and runs no installers. With neither ``-y``
 nor ``-m`` and no TTY the wizard exits 3 (the repo's interactive-only convention).
 
+The export-only **mirrors** are a separate consent step from the FUTURE-job files: they
+embed transcripts verbatim, so ccc never writes them without a vouch from the external
+credential scrubber. The wizard therefore offers/enables ``mirror_running`` /
+``mirror_done`` / ``mirror_sessions`` only when :func:`scrubber_status` resolves one, and
+otherwise says so instead of silently switching them on.
+
 The consent groups are the SINGLE source mapping every inert key to a wizard question;
 :data:`UNMAPPED_INERT` names inert keys deliberately not surfaced. A drift test asserts the
 union equals :data:`config.INERT_DEFAULT_KEYS`, so a new inert key cannot be added without
@@ -37,7 +43,17 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, doctor, install, install_commands, launchd, obsidian, resume, shell_install
+from . import (
+    config,
+    doctor,
+    install,
+    install_commands,
+    launchd,
+    obsidian,
+    resume,
+    scrub,
+    shell_install,
+)
 
 # --------------------------------------------------------------------------- #
 # consent groups — the single mapping of inert keys → wizard questions
@@ -52,13 +68,13 @@ GROUP_A_CHECKERS: tuple[str, ...] = (
     "autoprogress",
     "short_aim",
 )
+#: Group B1 — the editable FUTURE-job files (no verbatim transcript content leaves ccc).
+GROUP_B_FUTURE: tuple[str, ...] = ("future_files",)
+#: Group B2 — the export-only mirrors. They embed transcripts VERBATIM, so the wizard only
+#: offers them when a credential scrubber resolves (see :func:`scrubber_status`).
+GROUP_B_MIRRORS: tuple[str, ...] = ("mirror_running", "mirror_done", "mirror_sessions")
 #: Group B — vault export features, offered only when a vault path is supplied.
-GROUP_B_VAULT: tuple[str, ...] = (
-    "future_files",
-    "mirror_running",
-    "mirror_done",
-    "mirror_sessions",
-)
+GROUP_B_VAULT: tuple[str, ...] = GROUP_B_FUTURE + GROUP_B_MIRRORS
 #: Group C — offered individually, each behind its own dependency / caveat.
 GROUP_C: tuple[str, ...] = ("copilot_usage", "resume_halted", "reap")
 #: Inert keys intentionally NOT surfaced as a wizard question (secondary cost knobs).
@@ -85,6 +101,29 @@ def detect_score_backends() -> list[str]:
     CLIs are on PATH (the AIM scorer then degrades to the offline lexical estimate).
     """
     return [name for name, tool in SCORE_BACKEND_TOOLS if shutil.which(tool)]
+
+
+def scrubber_status() -> tuple[str | None, str]:
+    """Whether a credential scrubber resolves: ``(executable, "")`` or ``(None, reason)``.
+
+    The mirror roots embed transcripts verbatim, so ccc refuses to write them without a
+    vouch from the external scrubber (``mirror_scrub_cmd``). The wizard therefore only
+    offers/enables the mirror switches when the default command resolves here — one
+    ``<exe> -h`` probe through the external-deps registry, never an LLM/network call.
+    """
+    resolution = scrub.resolve_scrubber(str(config.DEFAULTS["mirror_scrub_cmd"]))
+    if resolution.scrubber is None:
+        return None, resolution.reason
+    return resolution.scrubber.executable, ""
+
+
+def _print_no_scrubber_note(reason: str) -> None:
+    """Explain why the wizard left the mirror switches off (printed on stdout)."""
+    print(
+        f"mirrors: off — no credential scrubber resolves ({reason}).\n"
+        "  Install secret-broker-client.py (or set SECRET_BROKER_CLIENT), then enable\n"
+        "  mirror_running / mirror_done / mirror_sessions in config.toml."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -146,12 +185,13 @@ def _print_env(env: Env) -> None:
 # profile → config overrides (pure, testable)
 # --------------------------------------------------------------------------- #
 @dataclass
-class Profile:
+class Profile:  # pylint: disable=too-many-instance-attributes
     """The choices a wizard run resolves to (interactive or ``-y``/``-m``)."""
 
     vault_root: str | None = None  # None → no vault features
     checkers: bool = False
-    vault_features: bool = False
+    vault_features: bool = False  # the editable FUTURE-job files
+    mirrors: bool = False  # the export-only mirrors (needs a resolvable scrubber)
     copilot: bool = False
     resume: bool = False
     reap: bool = False
@@ -185,7 +225,11 @@ def config_values(profile: Profile) -> dict[str, object]:
         values["vault_root"] = profile.vault_root
         values.update(vault_dir_overrides(profile.vault_root))
         if profile.vault_features:
-            for key in GROUP_B_VAULT:
+            for key in GROUP_B_FUTURE:
+                values[key] = True
+        if profile.mirrors:
+            # Only reachable with a scrubber (the mirrors are fail-closed on credentials).
+            for key in GROUP_B_MIRRORS:
                 values[key] = True
     if profile.copilot:
         values["copilot_usage"] = True
@@ -276,11 +320,21 @@ def _interactive_profile(env: Env) -> tuple[Profile, bool]:
         default=True,
     )
     vault_features = False
+    mirrors = False
     if vault_root:
         vault_features = _ask_yes_no(
-            "Enable the vault export features (future-job + running/done/session mirrors)?",
+            "Enable the vault export features (future-job files)?",
             default=True,
         )
+        exe, reason = scrubber_status()
+        if exe:
+            mirrors = _ask_yes_no(
+                "Enable the running/done/session mirrors? Every card passes through the "
+                f"credential scrubber at {exe}",
+                default=True,
+            )
+        else:
+            _print_no_scrubber_note(reason)
     copilot = False
     if env.gh:
         copilot = _ask_yes_no("Show the GitHub Copilot usage card (uses `gh`)?", default=False)
@@ -303,6 +357,7 @@ def _interactive_profile(env: Env) -> tuple[Profile, bool]:
             vault_root=vault_root,
             checkers=checkers,
             vault_features=vault_features,
+            mirrors=mirrors,
             copilot=copilot,
             resume=resume_opt,
             reap=reap,
@@ -364,10 +419,14 @@ def run(args) -> int:  # pylint: disable=too-many-branches
         profile = Profile(vault_root=vault_arg or None)
     elif yes:
         vault = vault_arg or env.vault_guess
+        exe, reason = scrubber_status() if vault else (None, "")
+        if vault and exe is None:
+            _print_no_scrubber_note(reason)
         profile = Profile(
             vault_root=vault,
             checkers=True,
             vault_features=bool(vault),
+            mirrors=bool(vault) and exe is not None,
             copilot=False,
             resume=False,
             reap=False,

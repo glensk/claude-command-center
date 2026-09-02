@@ -108,8 +108,14 @@ def test_yes_writes_checkers_on_no_vault(
 
 
 def test_yes_with_vault_enables_vault_features(
-    tmp_path: Path, _claude_home: Path, _stub_installers: dict[str, int]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _claude_home: Path,
+    _stub_installers: dict[str, int],
 ) -> None:
+    # A resolvable credential scrubber is what unlocks the mirror switches (never probe
+    # the developer's real PATH here — the answer would differ per machine).
+    monkeypatch.setattr(wizard, "scrubber_status", lambda: ("/opt/stub/scrubber", ""))
     vault = tmp_path / "v"
     vault.mkdir()
     assert wizard.run(_args(yes=True, vault_root=str(vault))) == 0
@@ -119,6 +125,31 @@ def test_yes_with_vault_enables_vault_features(
     assert data["vault_root"] == str(vault)
     assert data["future_dir"] == f"{vault}/01-llm-tasks/future"
     assert _stub_installers.get("obsidian")
+
+
+def test_yes_with_vault_but_no_scrubber_leaves_mirrors_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    _claude_home: Path,
+    _stub_installers: dict[str, int],
+) -> None:
+    """No scrubber → the FUTURE files go on, the verbatim mirrors stay off (and it says so)."""
+    monkeypatch.setattr(
+        wizard,
+        "scrubber_status",
+        lambda: (None, "no scrubber configured (mirror_scrub_cmd is empty)"),
+    )
+    vault = tmp_path / "v"
+    vault.mkdir()
+    assert wizard.run(_args(yes=True, vault_root=str(vault))) == 0
+    data = _load(_claude_home)
+    assert data["future_files"] is True
+    for key in wizard.GROUP_B_MIRRORS:
+        assert key not in data
+    out = capsys.readouterr().out
+    assert "mirrors: off" in out
+    assert "no scrubber configured" in out
 
 
 # ------------------------------ -m minimal ------------------------------ #
@@ -206,6 +237,22 @@ def test_minimal_config_text_only_diffs_from_defaults() -> None:
     assert "grade_on_turn = true" in text
     assert "reap" not in text  # already default false → not emitted
     assert "verify_subgoals_llm" not in text  # never turned on by init
+
+
+def test_config_values_splits_future_files_from_mirrors() -> None:
+    """``vault_features`` writes only the FUTURE keys; the mirrors need their own consent."""
+    base = wizard.Profile(vault_root="/tmp/v", vault_features=True)
+    values = wizard.config_values(base)
+    for key in wizard.GROUP_B_FUTURE:
+        assert values[key] is True
+    for key in wizard.GROUP_B_MIRRORS:
+        assert key not in values
+
+    with_mirrors = wizard.config_values(
+        wizard.Profile(vault_root="/tmp/v", vault_features=True, mirrors=True)
+    )
+    for key in wizard.GROUP_B_VAULT:
+        assert with_mirrors[key] is True
 
 
 def test_score_backends_serialized_as_toml_list() -> None:

@@ -671,6 +671,216 @@ def test_consume_launch_blocked_by_dependency(env: Env, monkeypatch: pytest.Monk
 
 
 # ---------------------------------------------------------------------------
+# FUTURE-draft credential tripwire (a launched prompt is echoed into the mirrors)
+# ---------------------------------------------------------------------------
+#: A value the fake checker treats as a live credential (never a real secret shape).
+DUMMY_VALUE = "DUMMY-LIVE-VALUE-0123456789"
+
+_CHECKER_STUB = """#!/bin/sh
+case "$1" in
+  -h|--help)
+    echo "usage: fake-broker {{ scrub | check }} < document"
+    exit 0
+    ;;
+esac
+printf '%s\\n' "$1" >> "{calls}"
+document=$(cat)
+{verdict}
+"""
+_VERDICT_CLEAN_OR_LEAK = """case "$document" in
+  *{value}*)
+    echo "LEAK-VERDICT v1: 1 hit(s)"
+    echo "LIVE CREDENTIAL IN OUTPUT: test.key" >&2
+    exit 1
+    ;;
+esac
+echo "CLEAN-VERDICT v1"
+exit 0"""
+_VERDICT_DEGRADED = """echo "secret-broker: unavailable — cannot vouch (exit 3)" >&2
+exit 3"""
+
+
+@dataclass
+class Checker:
+    """A fake secret-broker client: its path, and the log of the verbs it was asked for."""
+
+    path: Path
+    calls_file: Path
+
+    @property
+    def calls(self) -> list[str]:
+        if not self.calls_file.exists():
+            return []
+        return self.calls_file.read_text(encoding="utf-8").split()
+
+
+def _checker(tmp_path: Path, *, degraded: bool = False) -> Checker:
+    """Write an executable stub speaking the v1 verdict contract (never a real broker)."""
+    calls = tmp_path / "checker-calls.log"
+    script = tmp_path / ("checker-degraded.sh" if degraded else "checker.sh")
+    verdict = _VERDICT_DEGRADED if degraded else _VERDICT_CLEAN_OR_LEAK.format(value=DUMMY_VALUE)
+    script.write_text(_CHECKER_STUB.format(calls=calls, verdict=verdict), encoding="utf-8")
+    script.chmod(0o755)
+    return Checker(script, calls)
+
+
+def _arm_tripwire(env: Env, checker: Checker) -> None:
+    """Turn a mirror switch on (what arms the tripwire) and point it at *checker*."""
+    env.cfg.mirror_running = True
+    env.cfg.mirror_scrub_cmd = f"{checker.path} scrub"
+
+
+def _tick_launch(env: Env, session_id: str) -> Path:
+    """Flip the exported file's launch toggle on, the way a phone edit does."""
+    path = _abs(env, session_id)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("launch: false", "launch: true"),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _error_callout(text: str) -> str:
+    """The managed error block of a job file ("" when there is none)."""
+    start = text.find("<!-- ccc-sync-error -->")
+    end = text.find("<!-- /ccc-sync-error -->")
+    return "" if start < 0 or end < 0 else text[start : end + len("<!-- /ccc-sync-error -->")]
+
+
+def _no_spawn(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace the launch spawn with a recorder; returns the list of spawned ids."""
+    calls: list[str] = []
+
+    def fake_spawn(sid: str) -> bool:
+        calls.append(sid)
+        return True
+
+    monkeypatch.setattr(futuresync, "_spawn_launch", fake_spawn)
+    return calls
+
+
+def test_launch_with_credential_in_prompt_is_refused(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live credential in the prompt: no spawn, a status: error callout naming the label."""
+    spawned = _no_spawn(monkeypatch)
+    checker = _checker(tmp_path)
+    _arm_tripwire(env, checker)
+    sid = _new_draft(env, "Rotate the deploy key", prompt=f"use token {DUMMY_VALUE} to deploy")
+    futuresync.run_sync(env.store, env.cfg)  # bootstrap export
+    path = _tick_launch(env, sid)
+
+    report = futuresync.run_sync(env.store, env.cfg)
+
+    assert spawned == []
+    assert report.launched == []
+    assert checker.calls == ["check"]
+    text = path.read_text(encoding="utf-8")
+    assert 'status: "error"' in text
+    callout = _error_callout(text)
+    assert "live credential in prompt/AIM (test.key)" in callout
+    # The label travels, the VALUE never does (it stays only where the user typed it).
+    assert DUMMY_VALUE not in callout
+    assert any("launch refused (credential test.key)" in d for d in report.details)
+
+
+def test_launch_with_degraded_checker_is_refused(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checker that cannot vouch is not a clean verdict: fail closed, no spawn."""
+    spawned = _no_spawn(monkeypatch)
+    checker = _checker(tmp_path, degraded=True)
+    _arm_tripwire(env, checker)
+    sid = _new_draft(env, "Harmless job", prompt="nothing secret here")
+    futuresync.run_sync(env.store, env.cfg)
+    path = _tick_launch(env, sid)
+
+    report = futuresync.run_sync(env.store, env.cfg)
+
+    assert spawned == []
+    assert report.launched == []
+    callout = _error_callout(path.read_text(encoding="utf-8"))
+    assert "credential scrubber degraded" in callout
+    assert any("launch refused (scrubber degraded)" in d for d in report.details)
+
+
+def test_launch_with_clean_prompt_still_spawns(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clean verdict changes nothing: the toggle launches exactly as before."""
+    spawned = _no_spawn(monkeypatch)
+    checker = _checker(tmp_path)
+    _arm_tripwire(env, checker)
+    sid = _new_draft(env, "Launch me from the phone", prompt="just do the work")
+    futuresync.run_sync(env.store, env.cfg)
+    path = _tick_launch(env, sid)
+
+    report = futuresync.run_sync(env.store, env.cfg)
+
+    assert spawned == [sid]
+    assert report.launched == [sid]
+    assert checker.calls == ["check"]
+    assert "<!-- ccc-sync-error -->" not in path.read_text(encoding="utf-8")
+
+
+def test_launch_tripwire_disarmed_without_mirrors(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No mirror is on → the transcript never leaves the machine → no broker needed."""
+    spawned = _no_spawn(monkeypatch)
+    checker = _checker(tmp_path)
+    env.cfg.mirror_scrub_cmd = f"{checker.path} scrub"  # mirrors stay off
+    sid = _new_draft(env, "Rotate the deploy key", prompt=f"use token {DUMMY_VALUE} to deploy")
+    futuresync.run_sync(env.store, env.cfg)
+    _tick_launch(env, sid)
+
+    report = futuresync.run_sync(env.store, env.cfg)
+
+    assert spawned == [sid]
+    assert report.launched == [sid]
+    assert checker.calls == []  # never even resolved
+
+
+def test_launch_tripwire_disarmed_by_allow_unscrubbed(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``mirror_allow_unscrubbed`` is the one deliberate passthrough — here too."""
+    spawned = _no_spawn(monkeypatch)
+    checker = _checker(tmp_path)
+    _arm_tripwire(env, checker)
+    env.cfg.mirror_allow_unscrubbed = True
+    sid = _new_draft(env, "Rotate the deploy key", prompt=f"use token {DUMMY_VALUE} to deploy")
+    futuresync.run_sync(env.store, env.cfg)
+    _tick_launch(env, sid)
+
+    report = futuresync.run_sync(env.store, env.cfg)
+
+    assert spawned == [sid]
+    assert report.launched == [sid]
+    assert checker.calls == []
+
+
+def test_refused_launch_does_not_retrigger_next_pass(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The toggle was consumed before the refusal, so a refused launch never loops."""
+    spawned = _no_spawn(monkeypatch)
+    checker = _checker(tmp_path)
+    _arm_tripwire(env, checker)
+    sid = _new_draft(env, "Rotate the deploy key", prompt=f"use token {DUMMY_VALUE} to deploy")
+    futuresync.run_sync(env.store, env.cfg)
+    path = _tick_launch(env, sid)
+    futuresync.run_sync(env.store, env.cfg)
+    assert "launch: false" in path.read_text(encoding="utf-8")
+
+    report2 = futuresync.run_sync(env.store, env.cfg)
+
+    assert spawned == []
+    assert report2.launched == []
+    assert checker.calls == ["check"]  # one refusal, not one per pass
+
+
+# ---------------------------------------------------------------------------
 # per-job account (config_dir) round-trip in multi-account mode
 # ---------------------------------------------------------------------------
 @pytest.fixture
