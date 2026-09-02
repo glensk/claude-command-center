@@ -1727,11 +1727,11 @@ def test_codex_account_email_reads_the_id_token_jwt(tmp_path: Path) -> None:
     home = tmp_path / "codex"
     _write_codex_auth(home)
     assert usage.codex_account_email(home) == "alice.example@example.com"
-    assert usage.codex_card_title(home, "t3") == "Codex alice…@example.com / t3"
+    assert usage.codex_card_title(home, "t3") == "t3:Codex alice…@example.com"
     # No auth.json (and no home at all) degrade to the plain title instead of raising.
     assert usage.codex_account_email(tmp_path / "absent") is None
-    assert usage.codex_card_title(tmp_path / "absent", "t5") == "Codex / t5"
-    assert usage.codex_card_title(None, "t5") == "Codex / t5"
+    assert usage.codex_card_title(tmp_path / "absent", "t5") == "t5:Codex"
+    assert usage.codex_card_title(None, "t5") == "t5:Codex"
 
 
 def test_abbrev_email_squeezes_the_local_part_and_never_the_domain() -> None:
@@ -1761,20 +1761,20 @@ def test_codex_card_title_squeezes_the_local_part_only_on_overflow(tmp_path: Pat
     a title that still overflows lets the card widen instead (see _set_card_expanded).
     """
     short = tmp_path / "codex-short"
-    _write_codex_auth(short, email="alice.example@ex.com")
+    _write_codex_auth(short, email="alice.example@exam.com")
     # 24 cells, and 32 with a date — both inside budget, so nothing is given up.
-    assert usage.codex_card_title(short, "t5") == "Codex alice…@ex.com / t5"
-    assert usage.codex_card_title(short, "t5", " -> 18.9") == "Codex alice…@ex.com / t5 -> 18.9"
-    assert usage.cell_len("Codex alice…@ex.com / t5 -> 18.9") == usage._CARD_TITLE_BUDGET
-    # A long domain overflows at 33 cells — the LOCAL part pays, and the domain survives.
+    assert usage.codex_card_title(short, "t5") == "t5:Codex alice…@exam.com"
+    assert usage.codex_card_title(short, "t5", " -> 18.9") == "t5:Codex alice…@exam.com -> 18.9"
+    assert usage.cell_len("t5:Codex alice…@exam.com -> 18.9") == usage._CARD_TITLE_BUDGET
+    # A long domain overflows at 36 cells — the LOCAL part pays, and the domain survives.
     home = tmp_path / "codex"
     _write_codex_auth(home, email="openai.account@datascience.example")
-    assert usage.codex_card_title(home, "t3") == "Codex op.ac@datascience.example / t3"
+    assert usage.codex_card_title(home, "t3") == "t3:Codex op.ac@datascience.example"
     assert usage.codex_card_title(home, "t3", " -> 30.9") == (
-        "Codex op.ac@datascience.example / t3 -> 30.9"
+        "t3:Codex op.ac@datascience.example -> 30.9"
     )
     # No account at all: the suffix still lands on the degraded title.
-    assert usage.codex_card_title(None, "t5", " -> 18.9") == "Codex / t5 -> 18.9"
+    assert usage.codex_card_title(None, "t5", " -> 18.9") == "t5:Codex -> 18.9"
 
 
 def test_next_anniversary_derives_the_monthly_billing_day() -> None:

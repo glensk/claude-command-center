@@ -2421,7 +2421,7 @@ def test_collapsed_card_width_follows_its_title_not_its_content(
     from command_center import nixos_overseer
     from command_center.views.tui import CommandCenterApp
 
-    title = "nixos overseer supervised (11) / to"
+    title = "to:nixos overseer supervised (11)"
     fat = "\n".join(["!! disk pressure: /var/lib/docker 92% used — awaiting decision"] * 3)
     monkeypatch.setattr(nixos_overseer, "render_supervised", lambda _r: fat)
     monkeypatch.setattr(nixos_overseer, "card_title", lambda _r, base: f"{base} (11)")
@@ -2458,7 +2458,7 @@ def test_nixos_card_titles_advertise_their_chord(
     """Both nixos-overseer cards name their chord in the border title, like t1…t4 do.
 
     Their titles are rebuilt every render tick (they carry a live incident count), so the
-    ` / to` / ` / ta` suffix has to survive that rebuild, not just on_mount.
+    `to:` / `ta:` prefix has to survive that rebuild, not just on_mount.
     """
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     from command_center.views.tui import CommandCenterApp
@@ -2469,8 +2469,8 @@ def test_nixos_card_titles_advertise_their_chord(
             await pilot.pause()
             app._update_usage()  # the per-tick rebuild, not just the on_mount title
             await pilot.pause()
-            assert str(app.query_one("#usage-nixos-supervised").border_title).endswith(" / to")
-            assert str(app.query_one("#usage-nixos-tier-a").border_title).endswith(" / ta")
+            assert str(app.query_one("#usage-nixos-supervised").border_title).startswith("to:")
+            assert str(app.query_one("#usage-nixos-tier-a").border_title).startswith("ta:")
 
     asyncio.run(scenario())
 
@@ -2588,10 +2588,8 @@ def test_second_codex_card_shows_its_own_account_and_t5_toggles_it(
             card = app.query_one("#usage-codex-private")
             assert card.display is True
             # Each card names ITS OWN account, so two green boxes are never confused.
-            assert str(app.query_one("#usage-codex").border_title) == (
-                "Codex work…@example.org / t3"
-            )
-            assert str(card.border_title) == "Codex second…@example.com / t5"
+            assert str(app.query_one("#usage-codex").border_title) == ("t3:Codex work…@example.org")
+            assert str(card.border_title) == "t5:Codex second…@example.com"
 
             await pilot.press("t")
             await pilot.press("5")
@@ -2666,10 +2664,10 @@ def test_subscription_end_dates_reach_every_card_title_uncut(
             assert str(private.border_title).endswith(
                 f" -> {usage.format_end_date(expected, datetime.now().date())}"
             )
-            # 38 cells as "second…@example.com", so the LOCAL part squeezes; at 36 the
+            # 36 cells as "second…@example.com", so the LOCAL part squeezes; at 34 the
             # title still exceeds the 32-cell budget, and the card widens to carry it.
             assert str(app.query_one("#usage-codex-private").border_title) == (
-                "Codex se.lo@example.com / t5 -> 30.9"
+                "t5:Codex se.lo@example.com -> 30.9"
             )
             # Cards with no entry stay exactly as they were — no stray arrow.
             assert " -> " not in str(app.query_one("#usage-codex").border_title)

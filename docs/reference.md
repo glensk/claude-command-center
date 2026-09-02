@@ -1531,7 +1531,7 @@ as **stacked, border-titled cards** so the providers are never confused —
 (green border, green bars — the second one only when `codex_home_private` is set), and
 `<copilot_card_title> <copilot_model>` (violet border) below — the Copilot title
 shows the default delegation model from the `copilot_model` config (e.g. `gpt-5.4`).
-Each Codex card names its own account in the title (`Codex first…@example.org / t3`,
+Each Codex card names its own account in the title (`t3:Codex first…@example.org`,
 read from that home's `auth.json`), so two logins are never mistaken for one another.
 The titles drop the vendor prefix and the word "usage", and the bars drop "used", to keep
 the cards narrow — a title wider than the card's 34 columns is truncated by Textual, and
@@ -1566,10 +1566,10 @@ keeps its titled top border — the line that names its own chord — and drops 
 so a folded-away card stays one keystroke from coming back:
 
 ```
-╭─ Claude (private) 🏠 / t1 ─────────────╮
-╭─ Codex first…@example.org / t3 ───────╮
-╭─ Codex second…@example.com / t5 ──────╮
-╭─ Copilot gpt-5.4 / t4 ────────────────╮
+╭─ t1:Claude (private) 🏠 ───────────────╮
+╭─ t3:Codex first…@example.org ─────────╮
+╭─ t5:Codex second…@example.com ────────╮
+╭─ t4:Copilot gpt-5.4 ──────────────────╮
 │ ░Resets in 4d░░░░░░░░░░░░░░░░░░░░░░0% │
 ╰───────────────────────────────────────╯
 ```
@@ -1737,7 +1737,7 @@ with `CODEX_HOME=~/.codex-private codex login`) and a second green card appears,
 own `t5` chord, its own throttled fetch and its own cache. Empty — the default — means no
 second card at all (absent, not merely collapsed). Each card titles itself with the
 account e-mail read from that home's `auth.json` `id_token` (abbreviated:
-`Codex first…@example.org / t3`, and squeezed further — `fi.la@example.org` — when the
+`t3:Codex first…@example.org`, and squeezed further — `fi.la@example.org` — when the
 title would otherwise outgrow its card), so the two are never confused. The rollout files
 belong to the default login, so the second card is live-endpoint-only, and a refusal
 recorded by one login never bleeds into the other's card.
@@ -1841,8 +1841,8 @@ filenames); malformed entries are skipped.
   subscription_ends = ["claude_private=auto", "codex_private=2026-09-30"]
   ```
   ```
-  ╭─ Claude (private) 🏠 / t1 -> 18.9 ────╮
-  ╭─ Codex second…@exa…om / t5 -> 30.9 ───╮
+  ╭─ t1:Claude (private) 🏠 -> 18.9 ──────╮
+  ╭─ t5:Codex se.lo@example.com -> 30.9 ──╮
   ```
   Cards: `claude_private`, `claude_work`, `codex`, `codex_private`. The date renders
   Swiss `D.M` — four columns, no padding, no year — and gains a `!` (`30.8!`) once it is

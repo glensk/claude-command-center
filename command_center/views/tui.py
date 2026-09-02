@@ -180,7 +180,7 @@ def _set_card_expanded(panel: Static, expanded: bool, *, visible: bool = True) -
     """Expand or COLLAPSE one usage card — what its `t…` render gate now does.
 
     Collapsed is not hidden: the card keeps its border-TOP row — the titled
-    ``╭─ Claude (private) 🏠 / t1 ───╮`` line, which is also where the toggle's own
+    ``╭─ t1:Claude (private) 🏠 ───╮`` line, which is also where the toggle's own
     chord is advertised — and drops everything below it. The ``.card-collapsed`` class
     does that (``height: 1`` + ``border-bottom: none``).
 
@@ -197,8 +197,9 @@ def _set_card_expanded(panel: Static, expanded: bool, *, visible: bool = True) -
     An EXPANDED card gets the opposite treatment for the same reason: Textual computes
     ``width: auto`` from the CONTENT alone and then truncates the border title to what
     is left (``render_border_label`` clips at ``width - 4``, so 32 cells on a 38-wide
-    card, verified). A title that outgrows its card therefore loses its TAIL — the chord
-    and the subscription date, the two things the title exists to say. So the floor is
+    card, verified). A title that outgrows its card therefore loses its TAIL — the
+    subscription date and the end of the account's domain (the chord LEADS the title,
+    so it is the one part that always survives). So the floor is
     raised to whatever the title needs; :func:`usage.codex_card_title` has already
     squeezed the address as far as it will go, making this at most a cell or two.
 
@@ -2169,23 +2170,23 @@ class CommandCenterApp(App[None]):
         # name their account (the refresh cadence is no longer in the title) and carry
         # the same 🏠/💼 glyph as the statusline (accounts.card_glyph) so the two
         # surfaces read as the same convention; the Copilot card names the model it
-        # delegates to (the `copilot_model` config). Each title ends with its
-        # show/hide chord (" / t1" …) so the toggle is discoverable on the card
+        # delegates to (the `copilot_model` config). Each title starts with its
+        # show/hide chord ("t1:" …) so the toggle is discoverable on the card
         # itself; keys come from commands.by_action, never hard-coded here. The Claude
         # and Codex titles are then REBUILT on every render tick (an account or a
         # subscription date can move under a running TUI); the Copilot one cannot move.
         self._set_claude_card_titles()
         self._set_codex_card_titles()
         self.query_one("#usage-copilot", Static).border_title = (
+            f"{commands.by_action('toggle_card_copilot').key}:"
             f"{self.cfg.copilot_card_title} {self.cfg.copilot_model}"
-            f" / {commands.by_action('toggle_card_copilot').key}"
         )
         self.query_one(
             "#usage-nixos-supervised", Static
-        ).border_title = f"nixos overseer supervised / {_NIXOS_SUPERVISED_CHORD}"
+        ).border_title = f"{_NIXOS_SUPERVISED_CHORD}:nixos overseer supervised"
         self.query_one(
             "#usage-nixos-tier-a", Static
-        ).border_title = f"nixos overseer tier_a / {_NIXOS_TIER_A_CHORD}"
+        ).border_title = f"{_NIXOS_TIER_A_CHORD}:nixos overseer tier_a"
         self._apply_split()
         self.refresh_data()
         self.set_interval(self.cfg.usage_refresh_sec, self.refresh_data)
@@ -2465,14 +2466,14 @@ class CommandCenterApp(App[None]):
         nixos_supervised = nixos_overseer.read_supervised(self.cfg)
         nixos_supervised_panel.update(nixos_overseer.render_supervised(nixos_supervised))
         nixos_supervised_panel.border_title = (
+            f"{_NIXOS_SUPERVISED_CHORD}:"
             f"{nixos_overseer.card_title(nixos_supervised, 'nixos overseer supervised')}"
-            f" / {_NIXOS_SUPERVISED_CHORD}"
         )
         nixos_tier_a = nixos_overseer.read_tier_a(self.cfg)
         nixos_tier_a_panel.update(nixos_overseer.render_tier_a(nixos_tier_a))
         nixos_tier_a_panel.border_title = (
+            f"{_NIXOS_TIER_A_CHORD}:"
             f"{nixos_overseer.card_title(nixos_tier_a, 'nixos overseer tier_a')}"
-            f" / {_NIXOS_TIER_A_CHORD}"
         )
         # Render gates: each card is expanded/collapsed by its own config flag — a card
         # that is off keeps its titled border-top line and drops the rest of the box (see
@@ -4154,15 +4155,15 @@ class CommandCenterApp(App[None]):
             except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
                 continue
             panel.border_title = (
-                f"Claude ({label}) {accounts.card_glyph(label)}"
-                f" / {commands.by_action(action).key}{usage.subscription_suffix(card, ends)}"
+                f"{commands.by_action(action).key}:Claude ({label}) "
+                f"{accounts.card_glyph(label)}{usage.subscription_suffix(card, ends)}"
             )
 
     def _set_codex_card_titles(self) -> None:
         """(Re)build both Codex cards' border titles — each names its own ChatGPT account.
 
         Two cards for the same product would be indistinguishable without the account, so
-        the title carries an abbreviated e-mail (``Codex first…@example.org / t3``)
+        the title carries an abbreviated e-mail (``t3:Codex first…@example.org``)
         read from that home's ``auth.json``. The lookup is mtime-cached, so this is cheap
         enough to re-run on every render tick — which it must be, since a `codex login`
         can change the account under a running TUI.

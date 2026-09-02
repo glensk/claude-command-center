@@ -1273,29 +1273,29 @@ _CARD_TITLE_BUDGET = 32
 
 
 def codex_card_title(home: Path | None, chord: str, suffix: str = "") -> str:
-    """Border title for a Codex card: ``Codex first…@example.org / t3``.
+    """Border title for a Codex card: ``t3:Codex first…@example.org``.
 
     Naming the account is what keeps two Codex cards apart, so the vendor prefix gives
     way to the address: ``OpenAI Codex <account>`` overflowed the card's 34-column title
     on a long domain and Textual truncated the domain away — the one part that tells the
     accounts apart. When no e-mail can be resolved (no ``auth.json``, an API-key login,
     or ``home`` is ``None`` because the second home is not configured) the title degrades
-    to plain ``Codex / <chord>``.
+    to plain ``<chord>:Codex``.
 
     *suffix* is the optional subscription-end marker (`` -> 30.9``, see
     :func:`subscription_suffix`). It costs eight cells, which is enough to push most
     addresses over :data:`_CARD_TITLE_BUDGET` — so an overflowing title squeezes its
     LOCAL part (``al.gl@gmail.com``) and keeps the domain whole; if that still does not
-    fit, ``_set_card_expanded`` widens the card by the cells needed. The chord and the
-    date are never truncated: they are the two things the title exists to say.
+    fit, ``_set_card_expanded`` widens the card by the cells needed. The chord leads and
+    the date is never truncated: they are the two things the title exists to say.
     """
     email = codex_account_email(home) if home is not None else None
     if not email:
-        return f"Codex / {chord}{suffix}"
-    title = f"Codex {abbrev_email(email)} / {chord}{suffix}"
+        return f"{chord}:Codex{suffix}"
+    title = f"{chord}:Codex {abbrev_email(email)}{suffix}"
     if cell_len(title) <= _CARD_TITLE_BUDGET:
         return title
-    return f"Codex {abbrev_email(email, squeeze_local=True)} / {chord}{suffix}"
+    return f"{chord}:Codex {abbrev_email(email, squeeze_local=True)}{suffix}"
 
 
 def _codex_usage_path(home: Path) -> Path:
