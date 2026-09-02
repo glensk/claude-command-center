@@ -132,6 +132,18 @@ then opens with a `queue-operation` record — the exact signature `is_oneshot_h
 — so the daemon's `prune_headless` pass deletes the row and the job is gone from ccc with no
 tab and no error anywhere. That is how job `42fc3505` was lost on 2026-08-28.
 
+**A tab is never assumed, it is reported (tp#90).** `open-job` exits 0 whenever the job
+launched — in an iTerm2 tab (`iterm_applescript` / `iterm_api`) OR a tmux window (`tmux`) —
+and says which (`-j/--json` → `{"version": 1, "session_id", "launcher"}`); it exits 1 only when
+nothing launched. Under launchd the AppleScript rung depends on the macOS Automation grant for
+the launchd job's *executable path* (a new python build = a new prompt), and the Python-API
+rung is NOT an escape from that gate (the `iterm2` package fetches its cookie via AppleScript,
+with no timeout — so it runs only behind iTerm2's `disable-automation-auth` switch). To prove
+a context can reach a tab, run `ccc terminal-probe -j` from it (no job, no Claude session) and
+look for its marker in a NEW iTerm2 session; `ccc doctor` (Terminal) shows the grant for ccc's
+own interpreter. Never add a Terminal.app rung back, and never bound the API rung with a
+thread — a blocked `osascript` keeps running and can open a tab after ccc moved on.
+
 `cli.has_terminal()` now gates both commands *before any state mutation*: no TTY → open a real
 tab and return 0; no tab available → exit 1 without exec-ing (an `--auto` dispatch also disarms
 `fire_at`). Keep that check ahead of `claim_draft`/`archive_file` so a refusal changes nothing.

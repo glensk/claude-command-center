@@ -549,15 +549,22 @@ def test_uncheck_clears_the_position(tmp_path: Path, monkeypatch: pytest.MonkeyP
         assert all(not s.checked for s in store.list_subgoals("sess-a"))
 
 
-def _stub_open_tab(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Record every ``terminal.start_job_in_new_tab`` call (returns True = tab opened)."""
+def _stub_open_tab(
+    monkeypatch: pytest.MonkeyPatch, launcher: str = "iterm_applescript"
+) -> list[str]:
+    """Record every ``terminal.start_job_launch`` call; *launcher* is the rung it reports.
+
+    ``open-job`` uses the rung-returning twin of ``start_job_in_new_tab`` (tp#90) so it can
+    say WHERE the job landed; ``""`` means nothing launched.
+    """
     calls: list[str] = []
 
-    def _fake(session_id: str) -> bool:
+    def _fake(session_id: str, force: bool = False, auto: bool = False) -> str:
+        del force, auto
         calls.append(session_id)
-        return True
+        return launcher
 
-    monkeypatch.setattr("command_center.terminal.start_job_in_new_tab", _fake)
+    monkeypatch.setattr("command_center.terminal.start_job_launch", _fake)
     return calls
 
 
@@ -1582,3 +1589,90 @@ def test_upsert_from_live_unarchives_a_resumed_parked_session(tmp_path: Path) ->
         s_row, d_row = store.get("s-arch"), store.get("d-arch")
         assert s_row is not None and s_row.archived is False
         assert d_row is not None and d_row.archived is True
+
+
+# ----------------------------- open-job rung (tp#90) ----------------------------- #
+def _draft(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, session_id: str) -> None:
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft(session_id, "/Users/x/repo", "Migrate tickets")
+    store.close()
+
+
+def test_open_job_json_is_one_line_naming_the_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    from command_center.cli import cmd_open_job
+
+    _draft(tmp_path, monkeypatch, "job-json")
+    _stub_open_tab(monkeypatch, launcher="iterm_api")
+    assert cmd_open_job(argparse.Namespace(session_id="job-json", json=True)) == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == {"version": 1, "session_id": "job-json", "launcher": "iterm_api"}
+
+
+def test_open_job_tmux_landing_exits_zero_names_tmux_and_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center.cli import cmd_open_job
+
+    _draft(tmp_path, monkeypatch, "job-tmux")
+    _stub_open_tab(monkeypatch, launcher="tmux")
+    monkeypatch.setattr(
+        "command_center.terminal.degraded_launch_warning",
+        lambda launcher: "warning: no iTerm2 tab" if launcher == "tmux" else "",
+    )
+    assert cmd_open_job(argparse.Namespace(session_id="job-tmux", json=False)) == 0
+    captured = capsys.readouterr()
+    assert "NOT an iTerm2 tab" in captured.out  # the job runs, but nobody is looking at it
+    assert captured.err.startswith("warning:")
+
+
+def test_open_job_nothing_launched_is_exit_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center.cli import cmd_open_job
+
+    _draft(tmp_path, monkeypatch, "job-none")
+    _stub_open_tab(monkeypatch, launcher="")
+    assert cmd_open_job(argparse.Namespace(session_id="job-none", json=True)) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""  # no JSON line for "nothing launched"
+    assert "could not open a terminal tab" in captured.err
+
+
+def test_terminal_probe_json_contract(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    from command_center.cli import cmd_terminal_probe
+
+    monkeypatch.setattr("command_center.terminal.degraded_launch_warning", lambda _l: "")
+    monkeypatch.setattr(
+        "command_center.terminal.probe_launch",
+        lambda: ("CCC-TERMINAL-PROBE abc123def456", "iterm_applescript"),
+    )
+    assert cmd_terminal_probe(argparse.Namespace(json=True)) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "version": 1,
+        "launcher": "iterm_applescript",
+        "marker": "CCC-TERMINAL-PROBE abc123def456",
+    }
+    monkeypatch.setattr(
+        "command_center.terminal.probe_launch", lambda: ("CCC-TERMINAL-PROBE abc123def456", "")
+    )
+    assert cmd_terminal_probe(argparse.Namespace(json=True)) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["launcher"] == ""
+    assert "nothing launched" in captured.err
+
+
+def test_open_job_and_terminal_probe_parsers_take_json() -> None:
+    parser = cli.build_parser()
+    assert parser.parse_args(["open-job", "-j", "abc"]).json is True
+    assert parser.parse_args(["terminal-probe", "--json"]).json is True
+    assert parser.parse_args(["terminal-probe"]).func.__name__ == "cmd_terminal_probe"

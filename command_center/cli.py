@@ -2189,6 +2189,13 @@ def cmd_open_job(args: argparse.Namespace) -> int:
 
     Validates the id is a real, un-archived draft; a clear error + exit 1 otherwise (including
     an unreadable/unparseable ``--file`` or one whose frontmatter has no ``session_id``).
+
+    The launch ladder is iTerm2 (AppleScript) → iTerm2 (Python API, only when TCC-free) →
+    tmux, and the rung that landed it is REPORTED, never hidden (tp#90): the human line says
+    where the job runs, ``-j/--json`` prints exactly one line ``{"version": 1, "session_id",
+    "launcher"}`` with ``launcher`` ∈ ``iterm_applescript | iterm_api | tmux``, and a tmux
+    landing on an iTerm2-configured Mac adds a ``warning:`` on stderr. Exit 0 iff something
+    launched (tmux included — the job IS running); 1 iff nothing did.
     """
     from . import terminal
 
@@ -2213,14 +2220,53 @@ def cmd_open_job(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    if terminal.start_job_in_new_tab(session_id):
-        print(f"opening future job {session_id} in a new tab")
-        return 0
-    print(
-        f"error: could not open a terminal tab — run: ccc start-job {session_id}",
-        file=sys.stderr,
-    )
-    return 1
+    launcher = terminal.start_job_launch(session_id)
+    if not launcher:
+        print(
+            f"error: could not open a terminal tab — run: ccc start-job {session_id}",
+            file=sys.stderr,
+        )
+        return 1
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {"version": JSON_SCHEMA_VERSION, "session_id": session_id, "launcher": launcher}
+            )
+        )
+    else:
+        print(f"opening future job {session_id} {terminal.describe_launcher(launcher)}")
+    warning = terminal.degraded_launch_warning(launcher)
+    if warning:
+        print(warning, file=sys.stderr)
+    return 0
+
+
+def cmd_terminal_probe(args: argparse.Namespace) -> int:
+    """``ccc terminal-probe`` — where would a launch land HERE? Prove it without a job.
+
+    Runs the exact ``open-job`` ladder with one harmless command that prints
+    ``CCC-TERMINAL-PROBE <nonce>`` into the tab it opens — no job, no Claude session, no
+    state touched. Made for the launchd question of tp#90: run it from a real LaunchAgent
+    (gitlab-ci-watch's ``tests/acceptance/launchd_tab_probe.sh`` does) and look for the
+    marker in a NEW iTerm2 session. ``-j/--json`` prints one line ``{"version": 1,
+    "launcher", "marker"}``; exit 0 iff something launched. A tmux landing leaves nothing
+    behind (the window closes when ``printf`` exits); an iTerm2 tab stays open with the
+    marker in it.
+    """
+    from . import terminal
+
+    marker, launcher = terminal.probe_launch()
+    if getattr(args, "json", False):
+        print(json.dumps({"version": JSON_SCHEMA_VERSION, "launcher": launcher, "marker": marker}))
+    elif launcher:
+        print(f"probe {marker!r} launched {terminal.describe_launcher(launcher)}")
+    if not launcher:
+        print(f"error: nothing launched for probe {marker!r}", file=sys.stderr)
+        return 1
+    warning = terminal.degraded_launch_warning(launcher)
+    if warning:
+        print(warning, file=sys.stderr)
+    return 0
 
 
 def cmd_jobs(args: argparse.Namespace) -> int:
@@ -3989,7 +4035,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="read the job's session_id from this markdown file instead of a positional id "
         "(used by the in-note Obsidian '▶ Start this job' button)",
     )
+    p_openjob.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help="print one JSON line {version, session_id, launcher} instead of the human line; "
+        "launcher is iterm_applescript | iterm_api | tmux (tmux = the job runs, but not in a tab)",
+    )
     p_openjob.set_defaults(func=cmd_open_job)
+
+    p_probe = sub.add_parser(
+        "terminal-probe",
+        help="open a tab that only prints a marker, through the same ladder open-job uses — "
+        "proves where a launch lands from this context (e.g. a launchd job) without a real job",
+    )
+    p_probe.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help="print one JSON line {version, launcher, marker}; exit 0 iff something launched",
+    )
+    p_probe.set_defaults(func=cmd_terminal_probe)
 
     p_donejob = sub.add_parser(
         "done-job",

@@ -29,6 +29,9 @@ def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(launchd, "is_loaded", lambda: False)
     monkeypatch.setattr(launchd, "is_installed", lambda: False)
+    # Never read this machine's real Automation store: the Terminal section must be −
+    # ("unreadable") unless a test points it at a fake TCC.db of its own.
+    monkeypatch.setattr(doctor, "_TCC_DB", tmp_path / "no-such-TCC.db")
 
 
 def _statuses(section: doctor.Section) -> dict[str, str]:
@@ -238,3 +241,90 @@ def test_exit_code_zero_when_no_failures() -> None:
     assert healthy.exit_code == 0
     broken = doctor.Report([doctor.Section("x", [doctor.Check(doctor.FAIL, "a")])])
     assert broken.exit_code == 1
+
+
+# ------------------------- Terminal section (tp#90) ------------------------- #
+def _tcc_db(path: Path, rows: list[tuple[str, str, int, int, str]]) -> Path:
+    """A fake TCC.db with only the columns the doctor reads."""
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE access (service TEXT, client TEXT, client_type INTEGER, "
+        "auth_value INTEGER, indirect_object_identifier TEXT)"
+    )
+    conn.executemany("INSERT INTO access VALUES (?, ?, ?, ?, ?)", rows)
+    conn.commit()
+    conn.close()
+    return path
+
+
+_AE, _ITERM = "kTCCServiceAppleEvents", "com.googlecode.iterm2"
+
+
+def test_tcc_grant_verdicts(tmp_path: Path) -> None:
+    db = _tcc_db(
+        tmp_path / "TCC.db",
+        [
+            (_AE, "/py/allowed", 1, 2, _ITERM),
+            (_AE, "/py/denied", 1, 0, _ITERM),
+            (_AE, "/py/terminal-only", 1, 2, "com.apple.Terminal"),
+        ],
+    )
+    grant = doctor._tcc_apple_events_grant
+    assert grant("/py/allowed", db) == "allowed"
+    assert grant("/py/denied", db) == "denied"
+    assert (
+        grant("/py/terminal-only", db) == "unknown"
+    )  # a grant for Terminal.app is not one for iTerm2
+    assert grant("/py/never-asked", db) == "unknown"
+    assert grant("/py/allowed", tmp_path / "missing.db") == "unreadable"
+    junk = tmp_path / "junk.db"
+    junk.write_text("not a database", encoding="utf-8")
+    assert grant("/py/allowed", junk) == "unreadable"
+
+
+def test_terminal_section_fails_only_on_an_explicit_denial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    import sys
+
+    from command_center import terminal
+
+    exe = os.path.realpath(sys.executable)
+    label = "Automation grant → iTerm2 (ccc's interpreter)"
+    monkeypatch.setattr(doctor.sys, "platform", "darwin")
+    monkeypatch.setattr(doctor, "_iterm2_present", lambda: True)
+    monkeypatch.setattr(doctor, "_iterm_api_server_enabled", lambda: True)
+    monkeypatch.setattr(terminal, "is_iterm_api_auth_tcc_free", lambda: False)
+
+    monkeypatch.setattr(
+        doctor, "_TCC_DB", _tcc_db(tmp_path / "denied.db", [(_AE, exe, 1, 0, _ITERM)])
+    )
+    section = doctor._section_terminal()
+    assert _statuses(section)[label] == doctor.FAIL
+    assert _statuses(section)["Python-API rung TCC-free"] == doctor.NA
+    assert _statuses(section)["iTerm2 Python API server"] == doctor.OK
+
+    monkeypatch.setattr(
+        doctor, "_TCC_DB", _tcc_db(tmp_path / "allowed.db", [(_AE, exe, 1, 2, _ITERM)])
+    )
+    assert _statuses(doctor._section_terminal())[label] == doctor.OK
+
+    monkeypatch.setattr(doctor, "_TCC_DB", _tcc_db(tmp_path / "empty.db", []))
+    assert _statuses(doctor._section_terminal())[label] == doctor.NA  # never asked: informational
+
+    monkeypatch.setattr(doctor, "_TCC_DB", tmp_path / "absent.db")
+    assert _statuses(doctor._section_terminal())[label] == doctor.NA  # unreadable: informational
+
+    monkeypatch.setattr(terminal, "is_iterm_api_auth_tcc_free", lambda: True)
+    assert _statuses(doctor._section_terminal())["Python-API rung TCC-free"] == doctor.OK
+
+    monkeypatch.setattr(doctor.sys, "platform", "linux")
+    assert {c.status for c in doctor._section_terminal().checks} == {doctor.NA}
+
+
+def test_report_includes_the_terminal_section(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor.shutil, "which", _which_factory({"claude"}))
+    assert "Terminal (iTerm2 launch path)" in doctor.render(doctor.build_report(config.Config()))

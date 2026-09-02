@@ -203,6 +203,151 @@ def _section_daemon() -> Section:
     return section
 
 
+#: macOS's Automation (TCC) store; the Apple-events grant that gates every AppleScript to iTerm2.
+_TCC_DB = Path.home() / "Library" / "Application Support" / "com.apple.TCC" / "TCC.db"
+_ITERM_BUNDLE_ID = "com.googlecode.iterm2"
+
+
+def _tcc_apple_events_grant(client: str, db: Path | None = None) -> str:
+    """macOS's Automation verdict for executable *client* (a real path) → iTerm2.
+
+    ``"allowed"`` / ``"denied"`` / ``"unknown"`` (no row — never asked, so the first
+    launch will prompt) / ``"unreadable"`` (db absent or protected, or a schema this
+    reader does not know). Read-only (``mode=ro`` URI); never raises. The TCC schema
+    is Apple-private, so anything unexpected degrades to ``"unreadable"`` rather than
+    a wrong verdict.
+    """
+    import sqlite3  # pylint: disable=import-outside-toplevel
+
+    path = db or _TCC_DB
+    if not path.exists():
+        return "unreadable"
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
+        try:
+            rows = conn.execute(
+                "SELECT auth_value FROM access WHERE service = 'kTCCServiceAppleEvents' "
+                "AND client = ? AND indirect_object_identifier = ?",
+                (client, _ITERM_BUNDLE_ID),
+            ).fetchall()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return "unreadable"
+    if not rows:
+        return "unknown"
+    values = {row[0] for row in rows}
+    if values & {2, 3}:  # 2 = allowed, 3 = limited
+        return "allowed"
+    if 0 in values:
+        return "denied"
+    return "unknown"
+
+
+def _iterm_api_server_enabled() -> bool | None:
+    """iTerm2's "Enable Python API" preference; ``None`` when it cannot be read."""
+    argv = ["defaults", "read", _ITERM_BUNDLE_ID, "EnableAPIServer"]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() == "1" if proc.returncode == 0 else None
+
+
+def _section_terminal() -> Section:
+    """The iTerm2 launch path (tp#90): can a launchd-started ccc still reach a tab?
+
+    Reports the Automation grant for **ccc's own interpreter** — the responsible
+    executable of ccc's own LaunchAgents (``~/.local/bin/ccc`` resolves to it), and
+    therefore what decides whether ``ccc sync-future``'s launches land in an iTerm2
+    tab or fall through to tmux. A job launched by ANOTHER program (gitlab-ci-watch's
+    poller) is judged on THAT program's executable, which this section cannot know:
+    prove it dynamically (``ccc terminal-probe`` from its LaunchAgent). ❌ only for an
+    explicit denial; a never-asked path or an unreadable store is − (informational).
+    """
+    import os  # pylint: disable=import-outside-toplevel
+
+    from . import terminal  # pylint: disable=import-outside-toplevel
+
+    section = Section("Terminal (iTerm2 launch path)")
+    if sys.platform != "darwin":
+        section.checks.append(Check(NA, "iTerm2 launcher", "not macOS — tmux launcher"))
+        return section
+    if not _iterm2_present():
+        section.checks.append(
+            Check(NA, "iTerm2 launcher", "iTerm2 not detected — launches fall through to tmux")
+        )
+        return section
+
+    exe = os.path.realpath(sys.executable)
+    grant = _tcc_apple_events_grant(exe)
+    label = "Automation grant → iTerm2 (ccc's interpreter)"
+    if grant == "allowed":
+        section.checks.append(Check(OK, label, exe))
+    elif grant == "denied":
+        section.checks.append(
+            Check(
+                FAIL,
+                label,
+                f"DENIED for {exe} — every launchd launch of ccc's own agents falls through "
+                "to tmux; re-allow under System Settings › Privacy & Security › Automation",
+            )
+        )
+    elif grant == "unknown":
+        section.checks.append(
+            Check(
+                NA,
+                label,
+                f"not yet asked for {exe} — the first launchd launch prompts (10 s), then "
+                "falls through to tmux until Allow is clicked; the grant is per executable "
+                "path, so a Homebrew/uv python upgrade asks again",
+            )
+        )
+    else:
+        section.checks.append(
+            Check(
+                NA,
+                label,
+                "TCC.db unreadable — check System Settings › Privacy & Security › Automation",
+            )
+        )
+
+    api = _iterm_api_server_enabled()
+    if api:
+        section.checks.append(Check(OK, "iTerm2 Python API server", "enabled"))
+    else:
+        section.checks.append(
+            Check(
+                NA,
+                "iTerm2 Python API server",
+                "disabled or unknown — the Python-API rung is skipped (AppleScript + tmux remain)",
+            )
+        )
+    if terminal.is_iterm_api_auth_tcc_free():
+        section.checks.append(
+            Check(OK, "Python-API rung TCC-free", "iTerm2's disable-automation-auth switch is set")
+        )
+    else:
+        section.checks.append(
+            Check(
+                NA,
+                "Python-API rung TCC-free",
+                "no disable-automation-auth switch — the rung needs the same Automation grant "
+                "(it fetches its cookie via AppleScript), so it is skipped once AppleScript failed",
+            )
+        )
+    section.checks.append(
+        Check(
+            NA,
+            "other launchd launchers",
+            "a job launched by another program is judged on THAT executable — prove it with "
+            "`ccc terminal-probe -j` from its own LaunchAgent (gitlab-ci-watch: "
+            "tests/acceptance/launchd_tab_probe.sh)",
+        )
+    )
+    return section
+
+
 #: Score-ladder backend → the CLI whose presence enables it (custom has no CLI dep).
 _SCORE_BACKEND_TOOL = {
     "copilot": "opencode",
@@ -354,6 +499,7 @@ def build_report(cfg: config.Config | None = None) -> Report:
             _section_core(),
             _section_wiring(),
             _section_daemon(),
+            _section_terminal(),
             _section_features(cfg),
         ]
     )

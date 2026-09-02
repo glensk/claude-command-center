@@ -564,6 +564,31 @@ the `execvp("claude")` ENOENT that a bare AppleScript window (no login shell) us
 takes exactly one of the id or `--file` and validates the id is a real, un-archived draft (errors
 otherwise; `ccc start-job` remains the in-tab exec that actually replaces the process).
 
+**Where did it land? (tp#90, 2026-09-02).** The launch ladder is iTerm2 via AppleScript →
+iTerm2 via the Python API (only when iTerm2's root-owned `disable-automation-auth` switch makes
+that path free of Apple events — otherwise the `iterm2` package would re-run the very
+`osascript` that just failed, with no timeout) → a window in the persistent tmux session
+(`tmux_session`). `open-job` never hides the rung: the human line says where the job runs,
+`-j/--json` prints exactly one line `{"version": 1, "session_id": "<uuid>", "launcher":
+"iterm_applescript" | "iterm_api" | "tmux"}`, and a tmux landing on an iTerm2-configured Mac adds
+a `warning:` on stderr. **Exit 0 iff something launched** — tmux included, the job IS running —
+and 1 iff nothing did; consumers (gitlab-ci-watch) read `launcher` to tell a visible tab from a
+tmux window, and never retry a launch that returned 0.
+
+Under launchd the AppleScript rung is gated by macOS **Automation (TCC)** for the launchd job's
+*real executable path* (the process launchd started — for a job launched by another program,
+that program's interpreter, not ccc's). Every Homebrew/uv python patch release is a new path
+and therefore a new prompt; an unattended job hits ccc's 10 s `osascript` timeout and falls
+through to tmux until Allow is clicked once. Two tools make this visible without dispatching
+anything real: **`ccc terminal-probe [-j]`** runs the exact `open-job` ladder with one harmless
+command that prints `CCC-TERMINAL-PROBE <nonce>` into the tab it opens (JSON `{"version": 1,
+"launcher", "marker"}`; exit 0 iff something launched; a tmux landing closes itself) — run it
+from the LaunchAgent in question and look for the marker in a NEW iTerm2 session
+(gitlab-ci-watch's `tests/acceptance/launchd_tab_probe.sh` automates that); and **`ccc doctor`**'s
+*Terminal* section reads the Automation verdict for ccc's own interpreter (❌ only on an explicit
+denial; a never-asked path or an unreadable store is −), plus the Python-API server and
+auth-disable switches.
+
 **Terminal guard — a job always starts in its own tab.** `ccc start-job` (and `ccc resume`)
 `execvp` claude *in place*, and Claude Code only runs an interactive session when it owns a
 TTY. Launched from a pipe, `</dev/null`, or an agent's background shell, the exec'd process

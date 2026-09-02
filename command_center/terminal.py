@@ -34,6 +34,19 @@ _TAB_COLORS: dict[str, tuple[int, int, int]] = {
     "grey": (128, 128, 128),
 }
 
+#: Rungs of the tab-launch ladder, as reported by ``ccc open-job -j`` and
+#: ``ccc terminal-probe -j`` (``"launcher"``). ``iterm_applescript`` = an iTerm2 tab via
+#: ``osascript``; ``iterm_api`` = an iTerm2 tab via the Python-API socket; ``tmux`` = a
+#: window in the persistent tmux session — the job runs, but nobody is looking at it.
+LAUNCHER_ITERM_APPLESCRIPT = "iterm_applescript"
+LAUNCHER_ITERM_API = "iterm_api"
+LAUNCHER_TMUX = "tmux"
+LAUNCHERS = frozenset({LAUNCHER_ITERM_APPLESCRIPT, LAUNCHER_ITERM_API, LAUNCHER_TMUX})
+#: The rungs that put a visible iTerm2 tab on screen.
+TAB_LAUNCHERS = frozenset({LAUNCHER_ITERM_APPLESCRIPT, LAUNCHER_ITERM_API})
+#: The marker ``ccc terminal-probe`` prints into the tab it opens (followed by a nonce).
+PROBE_MARKER_PREFIX = "CCC-TERMINAL-PROBE"
+
 
 def color_rgb(name: str | None) -> tuple[int, int, int] | None:
     """Resolve a color name or ``#rrggbb`` to an RGB triple (or None)."""
@@ -357,9 +370,11 @@ def tmux_pane_for_session(session_id: str) -> tuple[str, str] | None:
 def focus_tmux_window(session_id: str) -> bool:
     """Select + surface the tmux window hosting *session_id* (launchd-spawned jobs).
 
-    ccc jobs fired by the launchd future-sync watcher land in tmux windows of the persistent
-    session (``tmux_session``), not iTerm tabs — so they have no ``iterm_session_id`` and the
-    plain ``focus_iterm_session`` path dead-ends. This locates the window by walking each
+    A ccc job fired from launchd (the future-sync watcher, gitlab-ci-watch) lands in a tmux
+    window of the persistent session (``tmux_session``) instead of an iTerm tab whenever its
+    executable lacks the macOS Automation grant for iTerm2 (tp#90) — so it has no
+    ``iterm_session_id`` and the plain ``focus_iterm_session`` path dead-ends. This locates the
+    window by walking each
     pane's process tree for the claude carrying ``--session-id <session_id>`` (``ccc start-job``
     execs claude in place, so it is the pane_pid itself), selects that window, and brings it on
     screen: if a client is already attached to the session, the selected window is now visible
@@ -407,7 +422,7 @@ def focus_tmux_window(session_id: str) -> bool:
         # No client attached: open a fresh iTerm tab that attaches to the session. No
         # _tmux_window fallback here — attaching from inside tmux is nonsense.
         command = f"tmux attach -t {shlex.quote(tmux_session)}"
-        return _iterm(command) or _iterm_api_tab(command)
+        return bool(_open_tab(command, tmux_fallback=False))
     except (subprocess.SubprocessError, OSError):
         return False
 
@@ -431,7 +446,7 @@ def resume_in_new_tab(
     if _launcher_mode() == "tmux":
         return _tmux_window(f"{prefix}claude --resume {shlex.quote(session_id)}", cwd=cwd)
     command = f"{prefix}cd {shlex.quote(cwd)} && claude --resume {shlex.quote(session_id)}"
-    return _iterm(command) or _iterm_api_tab(command)
+    return bool(_open_tab(command, tmux_fallback=False))
 
 
 def resume_halted_in_new_tab(
@@ -466,7 +481,7 @@ def resume_halted_in_new_tab(
     command = (
         f"{prefix}cd {shlex.quote(cwd)} && {shlex.quote(script_path)} {shlex.quote(session_id)} now"
     )
-    return _iterm(command) or _iterm_api_tab(command)
+    return bool(_open_tab(command, tmux_fallback=False))
 
 
 def start_job_in_new_tab(session_id: str, force: bool = False, auto: bool = False) -> bool:
@@ -480,14 +495,101 @@ def start_job_in_new_tab(session_id: str, force: bool = False, auto: bool = Fals
     ``--auto`` (unattended dispatch, e.g. the daemon's parked-prompt fire): guards
     are never bypassed — a tripped one disarms the job instead of asking.
     """
+    return bool(start_job_launch(session_id, force=force, auto=auto))
+
+
+def start_job_launch(session_id: str, force: bool = False, auto: bool = False) -> str:
+    """Launch ``ccc start-job <id>`` in a new tab and report the rung that landed it.
+
+    The rung-returning twin of :func:`start_job_in_new_tab` (same command, same
+    ladder), for callers that must tell a visible iTerm2 tab from a tmux window —
+    ``ccc open-job`` prints it and its ``--json`` carries it as ``"launcher"``.
+    Returns one of :data:`LAUNCHERS` or ``""`` when nothing launched.
+
+    Under launchd the AppleScript rung is gated by macOS Automation (TCC) for the
+    launchd job's *real executable path* — a grant Homebrew silently invalidates with
+    every python patch release (new Cellar path = new TCC client). The Python-API
+    rung is NOT an escape from that gate (see :func:`_iterm_api_auth_is_tcc_free`),
+    so tmux is the honest last resort: the job still launches, and the caller can
+    see that it did not land in a tab.
+    """
     flag = (" --force" if force else "") + (" --auto" if auto else "")
     command = f"ccc start-job{flag} {shlex.quote(session_id)}"
     if _launcher_mode() == "tmux":
-        return _tmux_window(command)
-    # Under launchd (the WatchPaths agent) osascript is TCC-blocked, so the
-    # Python-API tab is the working path there; tmux stays the last resort for
-    # a Mac with iTerm not running / API disabled — the job still launches.
-    return _iterm(command) or _iterm_api_tab(command) or _tmux_window(command)
+        return LAUNCHER_TMUX if _tmux_window(command) else ""
+    return _open_tab(command, tmux_fallback=True)
+
+
+def probe_launch() -> tuple[str, str]:
+    """``ccc terminal-probe``: run the open-job ladder with a harmless marker command.
+
+    Opens whatever ``ccc open-job`` would open in this context, but the tab only
+    prints ``CCC-TERMINAL-PROBE <nonce>`` — no job, no Claude session. Returns
+    ``(marker, launcher)``; *launcher* is ``""`` when nothing launched. A caller
+    proving the launchd path (gitlab-ci-watch's ``launchd_tab_probe.sh``) looks for
+    *marker* in a NEW iTerm2 session's contents. A tmux landing cleans up after
+    itself: the window closes when ``printf`` exits.
+    """
+    import uuid  # pylint: disable=import-outside-toplevel
+
+    marker = f"{PROBE_MARKER_PREFIX} {uuid.uuid4().hex[:12]}"
+    command = f"printf '%s\\n' {shlex.quote(marker)}"
+    if _launcher_mode() == "tmux":
+        return marker, (LAUNCHER_TMUX if _tmux_window(command) else "")
+    return marker, _open_tab(command, tmux_fallback=True)
+
+
+def degraded_launch_warning(launcher: str) -> str:
+    """The stderr warning for a launch that fell through to tmux on a Mac set to iTerm2.
+
+    Returns ``""`` for every other case: only an iTerm2-configured macOS launch whose
+    AppleScript rung failed is a *degradation* (typically a missing or still-pending
+    Automation grant for the launchd job's executable — ``ccc doctor``, Terminal
+    section). ``launcher = "tmux"`` in the config, and the automatic tmux mode on a
+    host without ``osascript`` (Linux), are the intended path and stay silent.
+    """
+    if launcher != LAUNCHER_TMUX or sys.platform != "darwin" or _launcher_mode() != "iterm":
+        return ""
+    session = _tmux_session()
+    return (
+        "warning: no iTerm2 tab could be opened — the command is running in a window of "
+        f"tmux session {session!r} (attach: tmux attach -t {shlex.quote(session)}). From "
+        "launchd this usually means macOS Automation has not granted (or has denied) iTerm2 "
+        "control to the launchd job's executable — the process launchd started, not "
+        "necessarily ccc's interpreter. Click Allow on the pending prompt, or run "
+        "`ccc doctor` (Terminal section)."
+    )
+
+
+def describe_launcher(launcher: str) -> str:
+    """Human phrase for a rung of :data:`LAUNCHERS`: where the launched command runs."""
+    if launcher == LAUNCHER_ITERM_APPLESCRIPT:
+        return "in a new iTerm2 tab (AppleScript)"
+    if launcher == LAUNCHER_ITERM_API:
+        return "in a new iTerm2 tab (Python API)"
+    if launcher == LAUNCHER_TMUX:
+        return f"in a new window of tmux session {_tmux_session()!r} — NOT an iTerm2 tab"
+    return "nowhere (no launcher succeeded)"
+
+
+def _open_tab(command: str, *, tmux_fallback: bool) -> str:
+    """Run *command* in a new iTerm2 tab; return the rung that landed it (or ``""``).
+
+    The ladder every launch path shares: AppleScript (``osascript``, bounded by
+    :func:`_osascript`'s timeout) → the iTerm2 Python API, but ONLY when iTerm2's
+    auth-disable switch makes that path Apple-event-free (otherwise it would re-run
+    the very Apple event that just failed, with no timeout) → tmux when
+    *tmux_fallback* (job launches, attached-prompt fires) — never for a resume or
+    a ``tmux attach``, where a tmux window would be nonsense. *command* must
+    already be shell-quoted.
+    """
+    if _iterm(command):
+        return LAUNCHER_ITERM_APPLESCRIPT
+    if _iterm_api_tab(command):
+        return LAUNCHER_ITERM_API
+    if tmux_fallback and _tmux_window(command):
+        return LAUNCHER_TMUX
+    return ""
 
 
 def focus_iterm_session(iterm_session_id: str) -> bool:
@@ -584,7 +686,7 @@ def focus_session_name(needle: str) -> bool:
 
 def launch_ccc_tab() -> bool:
     """Open a new iTerm2 tab running the ``ccc`` TUI (iTerm2 only)."""
-    return _iterm("ccc") or _iterm_api_tab("ccc")
+    return bool(_open_tab("ccc", tmux_fallback=False))
 
 
 def is_iterm_frontmost() -> bool:
@@ -679,29 +781,83 @@ def close_iterm_session(iterm_session_id: str) -> str:
     return result if result in ("tab", "session") else ""
 
 
-def _osascript(script: str) -> str | None:
-    """Run an AppleScript; return its stdout on success, or None on failure."""
+def _osascript(script: str, timeout: float = 10) -> str | None:
+    """Run an AppleScript; return its stdout on success, or None on failure.
+
+    *timeout* is the bound on a pending macOS Automation (TCC) prompt: ``osascript``
+    blocks until the dialog is answered, so a launch from an unattended launchd job
+    gives up after *timeout* seconds and the ladder moves on (the dialog stays on
+    screen; once Allow is clicked the grant persists for that executable path).
+    """
     if not shutil.which("osascript"):
         return None
     try:
         result = subprocess.run(
-            ["osascript", "-e", script], capture_output=True, text=True, timeout=10, check=False
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
         )
     except (subprocess.SubprocessError, OSError):
         return None
     return result.stdout if result.returncode == 0 else None
 
 
-def _iterm_api_tab(command: str) -> bool:
-    """Create an iTerm tab over the Python-API websocket (no TCC Apple events).
+def _iterm_api_auth_is_tcc_free() -> bool:
+    """True iff the ``iterm2`` package can connect WITHOUT sending an Apple event.
 
-    launchd contexts (the WatchPaths future-sync agent, the daemon) cannot
-    osascript iTerm — TCC Automation silently denies without ever prompting —
-    but iTerm's own API socket is outside TCC, so a phone-launched job still
-    lands in a real, locatable iTerm tab (verified 2026-07-17: cookie-less
-    connect from a non-iTerm env succeeds). Degrades False on anything missing
-    (``iterm2`` package, the API setting, iTerm itself) so callers fall through.
+    The package authenticates by asking iTerm2 for a cookie over AppleScript
+    (``iterm2.auth.authenticate`` → ``/usr/bin/osascript … request cookie and key``):
+    an Apple event gated by the SAME Automation (TCC) grant as the AppleScript rung,
+    and one it waits on with **no timeout** (``CommandLineApplescriptRunner.execute``
+    → ``communicate()``). An inherited ``ITERM2_COOKIE`` is no way out either: a
+    stale cookie 401s and the package then forces a fresh AppleScript request
+    (``connection.py``, ``authenticate(True)``). The one TCC-free configuration is
+    iTerm2's root-owned ``~/Library/Application Support/iTerm2/disable-automation-auth``
+    switch, which the package checks itself via ``applescript_auth_disabled()`` —
+    with it, ``authenticate()`` returns without AppleScript and a 401 raises at once,
+    so the whole connect is bounded by its websocket ``wait_for``. Verified
+    2026-09-02 (tp#90) by reading the installed package; the earlier "no TCC Apple
+    events" claim here was wrong — the 2026-07-17 check ran from a shell whose
+    responsible process already held the grant.
     """
+    try:
+        from iterm2 import auth  # pylint: disable=import-outside-toplevel
+
+        return bool(auth.applescript_auth_disabled())
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
+def is_iterm_api_auth_tcc_free() -> bool:
+    """Public read of :func:`_iterm_api_auth_is_tcc_free` (for ``ccc doctor``)."""
+    return _iterm_api_auth_is_tcc_free()
+
+
+def _iterm_reachable_by_apple_event(timeout: float = 5) -> bool:
+    """Bounded stand-in for the ``iterm2`` package's unbounded cookie request.
+
+    Ask iTerm2 for its version over AppleScript with a *timeout*: success proves this
+    process holds the Automation grant, so the package's own cookie request (fresh or
+    forced) will return promptly; failure — denied, prompt pending, no ``osascript`` —
+    means that request would block forever, and the caller must not connect at all.
+    """
+    return _osascript('tell application "iTerm2" to version', timeout=timeout) is not None
+
+
+def _iterm_api_tab(command: str) -> bool:
+    """Create an iTerm tab over the Python-API websocket — only when that is TCC-free.
+
+    Runs solely behind the failed AppleScript rung, and only when
+    :func:`_iterm_api_auth_is_tcc_free` says the package will not send an Apple
+    event of its own: otherwise it would repeat the exact call that just failed —
+    and, unlike :func:`_osascript`, wait on it with no timeout (tp#90). Degrades
+    False on anything missing (``iterm2`` package, the API setting, iTerm itself)
+    so callers fall through to tmux.
+    """
+    if not _iterm_api_auth_is_tcc_free():
+        return False
     try:
         import asyncio  # pylint: disable=import-outside-toplevel
 
@@ -739,11 +895,20 @@ def send_text_to_session(iterm_session_id: str, text: str) -> bool:
     text goes in wrapped in bracketed-paste markers — a multi-line prompt must
     arrive as ONE paste, since a bare newline would submit each line separately —
     followed, after a beat for the composer to ingest the paste, by a lone CR that
-    submits it. Python-API socket (TCC-free, works from the launchd daemon);
-    ``False`` on any failure so the caller can fall back to a resume tab.
+    submits it. Python-API socket; ``False`` on any failure so the caller can fall
+    back to a resume tab.
+
+    NOT TCC-free (tp#90): unless iTerm2's auth-disable switch is set, the ``iterm2``
+    package obtains its cookie over an Apple event with no timeout, so a launchd
+    daemon whose executable lacks (or is waiting on a prompt for) the Automation
+    grant would hang here. Hence the bounded pre-check: a 5 s AppleScript version
+    query must succeed first — it proves the grant, so the package's own request
+    returns promptly; if it fails we return ``False`` before connecting.
     """
     uuid = (iterm_session_id or "").split(":")[-1].strip()
     if not uuid or not text:
+        return False
+    if not _iterm_api_auth_is_tcc_free() and not _iterm_reachable_by_apple_event():
         return False
     try:
         import asyncio  # pylint: disable=import-outside-toplevel
@@ -780,7 +945,7 @@ def fire_attached_in_new_tab(session_id: str) -> bool:
     command = f"ccc fire-attached {shlex.quote(session_id)}"
     if _launcher_mode() == "tmux":
         return _tmux_window(command)
-    return _iterm(command) or _iterm_api_tab(command) or _tmux_window(command)
+    return bool(_open_tab(command, tmux_fallback=True))
 
 
 def _iterm(command: str) -> bool:

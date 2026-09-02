@@ -3274,8 +3274,10 @@ class CommandCenterApp(App[None]):
                     timeout=10,
                 )
             elif terminal.focus_tmux_window(sid):
-                # Launchd future-sync jobs land in a tmux window (no iterm_session_id) —
-                # locate + surface it rather than dead-ending on "switch to it manually".
+                # A launchd-launched job (future-sync, gitlab-ci-watch) lands in a tmux
+                # window — no iterm_session_id — when its executable lacks the Automation
+                # grant for iTerm2 (tp#90); locate + surface it rather than dead-ending on
+                # "switch to it manually".
                 self.notify("Focused tmux window (attached in iTerm).")
             else:
                 self.notify(
