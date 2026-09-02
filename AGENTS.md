@@ -172,8 +172,9 @@ you add an opt-in feature, add its key to both and to the wizard grouping.
 ## The public-tree gate (do not regress)
 
 This is a public mirror of a private repo. `tools/check_public_tree.py` scans the tree for
-personal/private anchors and **must stay clean** (only the two documented hits in
-`tools/SEED_STATE.json` are allowed):
+personal/private anchors and **must stay clean** — the only tolerated hits are the entries
+in `tools/public_tree_allowlist.txt`, and `tests/test_public_tree.py` runs the same scan
+under plain `pytest`, so a new anchor fails the suite rather than only the manual gate:
 
 ```commands
 python3 tools/check_public_tree.py     # exit 0 == clean

@@ -1738,13 +1738,13 @@ def test_abbrev_email_squeezes_the_local_part_and_never_the_domain() -> None:
     """Under pressure an address gives up its local part, two characters per segment.
 
     The domain is half of what makes an address recognizable, so it is never touched —
-    a squeezed one (``albert…@gm…om``) stops reading as an address at all.
+    a squeezed one (``first…@gm…om``) stops reading as an address at all.
     """
     assert usage.abbrev_email("openai.account@example.org", squeeze_local=True) == (
         "op.ac@example.org"
     )
-    assert usage.abbrev_email("albert.glensk@gmail.example", squeeze_local=True) == (
-        "al.gl@gmail.example"
+    assert usage.abbrev_email("first.last@gmail.example", squeeze_local=True) == (
+        "fi.la@gmail.example"
     )
     # Ignored when it would not actually be shorter: three segments cost more than "first…".
     assert usage.abbrev_email("a.b.c.dee@example.org", squeeze_local=True) == "a…@example.org"

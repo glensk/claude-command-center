@@ -47,6 +47,8 @@ FORBIDDEN_PATTERNS: tuple[str, ...] = (
     "." + "claude-code-sessions",
     "CSC" + "S",
     "albert." + "glensk",
+    "Albe" + "rt",  # the first name alone, as it appeared in comments
+    "epfl" + ".ch",  # the employer domain, as it appeared in test fixtures
 )
 
 # Fallback walk: directories never descended into when git enumeration is absent.

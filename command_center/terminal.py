@@ -801,7 +801,7 @@ def _iterm(command: str) -> bool:
     return _osascript(script) is not None
 
 
-# Albert's ruling (2026-09-01): a launch never falls back to Terminal.app. On
+# Standing rule (2026-09-01): a launch never falls back to Terminal.app. On
 # 2026-09-01 a `ccc start-job` dispatched by gitlab-ci-watch's acceptance test
 # reached the old `_terminal_app` fallback and opened a Terminal.app window that
 # nobody was watching (and parked on the trust dialog). iTerm2 (AppleScript,

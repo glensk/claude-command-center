@@ -10,7 +10,7 @@
 #
 # Forbidden patterns (case-sensitive) enforced by the checker:
 #   /Users/albert  com.albert  EPFL  pixel9a  42-Git  mydotfiles
-#   .claude-code-sessions  CSCS  albert.glensk
+#   .claude-code-sessions  CSCS  albert.glensk  Albert  epfl.ch
 #
 # Entries are added deliberately during de-personalization when a hit is a
 # legitimate, unavoidable reference (e.g. a documented example path). Until a

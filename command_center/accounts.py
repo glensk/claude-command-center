@@ -188,8 +188,8 @@ def ensure_trusted(config_dir: str, cwd: str | Path | None = None) -> bool:
     ``.claude.json`` (:func:`_claude_json_path`) — private and work are separate
     files, so a folder trusted on one seat still prompts on the other, and an
     unattended launch (``ccc start-job`` from launchd, a tp drive) parks on the
-    dialog forever (2026-09-01: gitlab-ci-watch's sandbox clone). Albert's rule:
-    every folder he launches into is trusted, on every account. Only that key is
+    dialog forever (2026-09-01: gitlab-ci-watch's sandbox clone). The rule here:
+    every folder ccc launches into is trusted, on every account. Only that key is
     written, atomically; a missing config (an account that never ran) is left
     alone. Returns True when the file was written.
     """

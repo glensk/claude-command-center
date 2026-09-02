@@ -391,10 +391,10 @@ def test_parse_claude_account_emails_is_pure_and_tolerant() -> None:
     non-empty fallback: an absent/all-malformed list means "no hard link", not "assume
     private" (an unconfigured card must resolve as a plain passthrough, never a guess).
     """
-    entries = ["work=albert@epfl.ch", "private=albert@gmail.com"]
+    entries = ["work=user@example.org", "private=user@example.com"]
     assert config.parse_claude_account_emails(entries) == {
-        "work": "albert@epfl.ch",
-        "private": "albert@gmail.com",
+        "work": "user@example.org",
+        "private": "user@example.com",
     }
     # Malformed entries (no "=", bad label, no "@" in the value) are skipped, not fatal.
     assert (

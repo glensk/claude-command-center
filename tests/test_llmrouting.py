@@ -19,7 +19,7 @@ from command_center.config import Config
 # What `ai routing -p …` answers for a purpose: (first rung, cost, full ladder).
 _COPILOT_ROUTE = (
     "copilot(claude-haiku-4.5)",
-    "Copilot/EPFL seat",
+    "GitHub Copilot seat",
     "copilot(claude-haiku-4.5) → claude-code@work(claude-opus-4-6)",
 )
 
@@ -62,7 +62,7 @@ def test_bills_codex_matches_either_spelling() -> None:
     """ccc says "Codex/ChatGPT seat", ai.py says "ChatGPT/Codex seat" — both count."""
     assert llmrouting.bills_codex(llmrouting.CODEX_COST)
     assert llmrouting.bills_codex("ChatGPT/Codex seat")
-    assert not llmrouting.bills_codex("Copilot/EPFL seat")
+    assert not llmrouting.bills_codex(llmrouting.COPILOT_COST)
 
 
 def test_a_live_route_that_lands_on_codex_is_still_flagged() -> None:
@@ -89,7 +89,7 @@ def test_live_route_replaces_the_opaque_router_description() -> None:
     cfg = _cfg(llm_custom_command="ai.py prompt -i -R judge", assess_aim_on_turn=True)
     row = _row(cfg, "aim-met", {"aim-met": _COPILOT_ROUTE})
     assert row.provider == "ai.py → copilot(claude-haiku-4.5)"
-    assert row.cost == "Copilot/EPFL seat"
+    assert row.cost == "GitHub Copilot seat"
     assert row.ladder == _COPILOT_ROUTE[2]
 
 

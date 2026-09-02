@@ -167,7 +167,7 @@ for adversarial plan review rather than for generating dashboard labels. Every r
 `llm_custom_command`, the single escape hatch that routes ccc's calls through your own
 multi-provider router (the purpose rides along in `$CCC_LLM_PURPOSE`).
 
-When that router is [`ai.py`](https://github.com/glensk/mydotfiles), the table does not stop
+When that router is `ai.py` (the maintainer's private multi-provider router), the table does not stop
 at "ask your router" — it asks, once, via `ai routing -p <purposes>`, and shows the rung that
 really runs plus the full fallback ladder per purpose, in ai.py's own colours. Any other
 router is reported as opaque rather than guessed at. The lookup happens only when you

@@ -183,7 +183,7 @@ def test_resolve_workdir_refuses_an_ancestor_of_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     parent = _git_repo(tmp_path / "users")
-    home = parent / "albert"
+    home = parent / "user"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     with pytest.raises(codex_launch.CodexLaunchError, match="CONTAINS .HOME"):
@@ -402,7 +402,7 @@ def test_argv_home_and_home_ancestor_refuse(
 ) -> None:
     monkeypatch.setenv("CODEX_HOME", str(_write_config(tmp_path / "rw", hardened_rw=True)))
     parent = _git_repo(tmp_path / "users")
-    home = _git_repo(parent / "albert")
+    home = _git_repo(parent / "user")
     monkeypatch.setenv("HOME", str(home))
     link = tmp_path / "shortcut"
     link.symlink_to(home, target_is_directory=True)

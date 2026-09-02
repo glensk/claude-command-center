@@ -53,6 +53,8 @@ if TYPE_CHECKING:
 # case-insensitively on "codex" (:func:`bills_codex`) because ai.py spells its own label
 # the other way round ("ChatGPT/Codex seat") and either may reach the cost column.
 CODEX_COST = "Codex/ChatGPT seat"
+# The label for the GitHub Copilot rung (``opencode`` delegating to the seat's model).
+COPILOT_COST = "GitHub Copilot seat"
 
 # Longest a rendered cell may get before it is elided. Keeps the table inside a normal
 # terminal even when `llm_custom_command` is a long shell one-liner.
@@ -220,7 +222,7 @@ def _rung(
     if name == "codex":
         return (f"codex exec → ({_codex_seat_label()} seat)", CODEX_COST, "")
     if name == "copilot":
-        return (f"opencode → {cfg.copilot_model or '(default)'}", "Copilot/EPFL seat", "")
+        return (f"opencode → {cfg.copilot_model or '(default)'}", COPILOT_COST, "")
     if name == "gemini":
         return (f"gemini → {cfg.gemini_model or '(default)'}", "Gemini quota", "")
     if name == "custom":

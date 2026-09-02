@@ -1240,10 +1240,10 @@ def abbrev_email(email: str, *, squeeze_local: bool = False) -> str:
     two; anything shorter is left alone. A string with no ``@`` is returned unchanged.
 
     **The domain is never touched.** It is half of what makes an address recognizable,
-    and squeezing it produced titles (``albert…@gm…om``) that no longer read as an
+    and squeezing it produced titles (``first…@gm…om``) that no longer read as an
     address at all. When a title has to give up cells it gives up the LOCAL part
     instead: *squeeze_local* takes two characters per dotted segment
-    (``albert.glensk`` → ``al.gl``, ``openai.account`` → ``op.ac``), which is both
+    (``first.last`` → ``fi.la``, ``openai.account`` → ``op.ac``), which is both
     shorter and more legible than a mangled domain. It is ignored when it would not
     actually be shorter — a three-segment local part squeezes to more cells than
     ``first…``, and there the card grows instead (see ``_set_card_expanded``).
