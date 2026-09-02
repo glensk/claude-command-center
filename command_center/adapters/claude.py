@@ -12,6 +12,7 @@ on-disk layout, so a future Claude Code change can break at most this file:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -291,28 +292,30 @@ def last_model_in_file(path: Path, chunk_size: int = 65536) -> str | None:
     chunking; lines are then examined newest-first (see :func:`_model_in_line`).
 
     A trailing partial line (a live transcript caught mid-write) simply fails to parse and
-    is skipped, as are blank lines. ``None`` when the file is empty, unreadable, or holds
-    no real assistant record.
+    is skipped, as are blank lines. ``None`` when the file is empty or holds no real
+    assistant record.
+
+    A read failure RAISES :class:`OSError` — it is not a fact about the transcript, and
+    swallowing it as ``None`` would let a transient EIO/EACCES be persisted as "this
+    session ran on no model" (see ``scan_transcript`` § Property P). Every caller contains
+    it and simply retries on the next pass.
     """
-    try:
-        with path.open("rb") as handle:
-            pos = handle.seek(0, os.SEEK_END)
-            carry = b""  # partial first line of the block already scanned
-            while pos > 0:
-                start = max(0, pos - chunk_size)
-                handle.seek(start)
-                block = handle.read(pos - start) + carry
-                pos = start
-                lines = block.split(b"\n")
-                if pos > 0:  # lines[0] continues into the block before this one
-                    carry = lines[0]
-                    lines = lines[1:]
-                for line in reversed(lines):
-                    model = _model_in_line(line)
-                    if model is not None:
-                        return model
-    except OSError:
-        return None
+    with path.open("rb") as handle:
+        pos = handle.seek(0, os.SEEK_END)
+        carry = b""  # partial first line of the block already scanned
+        while pos > 0:
+            start = max(0, pos - chunk_size)
+            handle.seek(start)
+            block = handle.read(pos - start) + carry
+            pos = start
+            lines = block.split(b"\n")
+            if pos > 0:  # lines[0] continues into the block before this one
+                carry = lines[0]
+                lines = lines[1:]
+            for line in reversed(lines):
+                model = _model_in_line(line)
+                if model is not None:
+                    return model
     return None
 
 
@@ -324,30 +327,59 @@ def codex_marker_in_file(path: Path, start: int = 0, chunk_size: int = 1 << 20) 
     (a full-file scan of every session cost ~7 s of a cold ``ccc ls``). Consecutive chunks
     overlap by ``len(marker) - 1`` bytes so a marker straddling a boundary is still found.
     A *start* past the end means the file was truncated or rewritten under us, so the scan
-    restarts from 0. ``(False, start)`` on a read error — nothing new was covered.
+    restarts from 0.
+
+    A read failure RAISES :class:`OSError` rather than reporting ``(False, start)``: "I
+    could not read it" is not the fact "no marker", and persisting it would freeze a
+    wrong answer into the scan row (see ``scan_transcript`` § Property P). Every caller
+    contains it and retries on the next pass.
     """
     marker = _CODEX_WORKFLOW_MARKER.encode()
     overlap = len(marker) - 1
-    try:
-        with path.open("rb") as handle:
-            size = handle.seek(0, os.SEEK_END)
-            pos = start if 0 <= start <= size else 0
-            handle.seek(pos)
-            carry = b""  # tail of the previous chunk, in case the marker straddles
-            while pos < size:
-                block = handle.read(chunk_size)
-                if not block:
-                    break
-                pos += len(block)
-                window = carry + block
-                if marker in window:
-                    return True, size
-                # Carry the last marker-length-1 bytes of the STREAM (not of this block):
-                # correct even when chunk_size is smaller than the marker itself.
-                carry = window[-overlap:] if overlap else b""
-    except OSError:
-        return False, start
+    with path.open("rb") as handle:
+        size = handle.seek(0, os.SEEK_END)
+        pos = start if 0 <= start <= size else 0
+        handle.seek(pos)
+        carry = b""  # tail of the previous chunk, in case the marker straddles
+        while pos < size:
+            block = handle.read(chunk_size)
+            if not block:
+                break
+            pos += len(block)
+            window = carry + block
+            if marker in window:
+                return True, size
+            # Carry the last marker-length-1 bytes of the STREAM (not of this block):
+            # correct even when chunk_size is smaller than the marker itself.
+            carry = window[-overlap:] if overlap else b""
     return False, size
+
+
+def first_record_is_queue_op(path: Path) -> bool | None:
+    """Whether *path*'s FIRST non-blank record is a ``queue-operation`` — tri-state.
+
+    That first record is the on-disk signature of a headless ``claude -p`` run (the
+    prompt is enqueued), whereas an interactive session's transcript opens with session
+    meta (``last-prompt`` / ``summary`` / a user message).
+
+    ``True``/``False`` are returned ONLY after the first non-blank line really parsed as
+    JSON. ``None`` means "nothing decided yet" — an empty file, an unreadable one, or a
+    first record that is not valid JSON (a transcript caught mid-write) — because this
+    answer gets PERSISTED (``TranscriptScan.headless``): storing a not-yet-known as
+    ``False`` would freeze a headless row into looking interactive forever, so the
+    undetermined case must stay distinguishable and be re-probed next pass.
+    """
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                record = json.loads(stripped)
+                return isinstance(record, dict) and record.get("type") == "queue-operation"
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None  # empty file (or blank lines only): nothing to decide on yet
 
 
 def events_in_file(path: Path) -> list[SessionEvent]:
@@ -810,6 +842,36 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         or rewritten) is scanned from 0 again. A marker already found is sticky and is never
         looked for again. ``None`` when no transcript resolves under any account, or it
         cannot be stat'ed.
+
+        ``headless`` (the first record being a queue-operation) is the one fact that can be
+        *missing* from an otherwise-current row: rows written before the column existed
+        carry ``None``. So an identity match with ``headless is None`` still probes the
+        first record once — and only then, when something was actually learned, returns a
+        NEW object so the caller persists it. An undetermined probe returns *prior*
+        unchanged, which is what keeps a broken/empty transcript from re-writing its row on
+        every pass. On a fresh row the fact is carried forward from *prior* ONLY on a
+        same-path GROW (an append-only file's first record cannot change); truncation, a
+        same-size rewrite or a path change all re-probe.
+
+        **Property P (why no writer needs to win a race).** Every persisted row satisfies
+        ``codex_scanned_to <= size``: ``codex_marker_in_file`` reports the size IT saw at
+        its own open, which can exceed the ``stat()`` taken a moment earlier on a live
+        transcript, so the offset is clamped to the pinned size (bytes covered beyond it
+        are simply re-read next pass — bounded). On ANY identity mismatch the next pass
+        re-derives every fact from the CURRENT file: the model from the tail, the marker
+        from the persisted offset when the file grew else from 0, ``headless`` per the grow
+        rule above. So whichever of two concurrent scanners wrote last, the next pass scans
+        a superset of the bytes that could hold an unseen marker — a stale write costs one
+        bounded re-read, never a wrong sticky fact (``codex=True`` is sticky and an
+        append-only file re-finds its marker anyway). This is precisely why
+        ``Store.put_transcript_scans`` carries no ordering guard: an
+        ``excluded.mtime_ns >= mtime_ns`` rule would refuse *forever* to persist a
+        transcript restored with an OLDER mtime, and rescan it on every pass instead.
+
+        A read failure (``OSError`` out of ``last_model_in_file`` /
+        ``codex_marker_in_file``) PROPAGATES: it is not a fact about the transcript, so
+        nothing is persisted and the caller retries next pass. Only this method's own
+        ``stat()`` failure returns ``None`` ("no transcript").
         """
         path = self.transcript_path(cwd, session_id)
         if path is None:
@@ -821,7 +883,13 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         same: TranscriptScan | None = None
         if prior is not None and prior.path == str(path):
             if prior.mtime_ns == st.st_mtime_ns and prior.size == st.st_size:
-                return prior  # identity == "nothing changed" (see the docstring)
+                if prior.headless is not None:
+                    return prior  # identity == "nothing changed" (see the docstring)
+                # Current row, but from before ``headless`` existed: fill it in once.
+                probe = first_record_is_queue_op(path)
+                if probe is None:
+                    return prior  # nothing learned → no write this pass
+                return dataclasses.replace(prior, headless=probe)
             same = prior
         if same is not None and same.codex:
             found, scanned_to = True, st.st_size
@@ -830,6 +898,17 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
             # place, same size or smaller — rescans from 0, matching uses_codex_workflow.
             start = same.codex_scanned_to if same is not None and st.st_size > same.size else 0
             found, scanned_to = codex_marker_in_file(path, start)
+        # Property P: pin the offset to the size THIS row records, never the (possibly
+        # larger) size the marker scan saw at its own open.
+        scanned_to = min(scanned_to, st.st_size)
+        # The first record of an append-only file cannot change, so a same-path GROW
+        # carries the known fact forward; anything else (truncation, a same-size rewrite,
+        # a new path) re-reads it.
+        headless = (
+            same.headless
+            if (same is not None and same.headless is not None and st.st_size > same.size)
+            else first_record_is_queue_op(path)
+        )
         return TranscriptScan(
             session_id=session_id,
             path=str(path),
@@ -839,6 +918,7 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
             codex=found,
             codex_scanned_to=scanned_to,
             scanned_at=now_ms(),
+            headless=headless,
         )
 
     def last_user_prompt(self, cwd: str, session_id: str) -> str | None:
@@ -860,21 +940,16 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         new headless rows by entrypoint; this lets ``prune`` retro-detect ones that
         leaked in before the hook learned to skip the ``sdk`` entrypoint, since their
         ``entrypoint`` is no longer on disk once parked.
+
+        The probe itself is :func:`first_record_is_queue_op` (shared with the persisted
+        ``TranscriptScan.headless`` fact); its tri-state ``None`` ("not determined yet")
+        collapses to ``False`` here — this per-call answer is never stored, and a
+        missing/unreadable transcript must not be pruned as headless junk.
         """
         path = self.transcript_path(cwd, session_id)
         if path is None:
             return False
-        try:
-            with path.open(encoding="utf-8") as handle:
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    record = json.loads(line)
-                    return isinstance(record, dict) and record.get("type") == "queue-operation"
-        except (OSError, json.JSONDecodeError):
-            return False
-        return False
+        return first_record_is_queue_op(path) is True
 
     def claude_version(self, cwd: str, session_id: str) -> str | None:
         """The Claude Code version that last wrote to the session's transcript.

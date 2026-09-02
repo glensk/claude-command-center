@@ -9,10 +9,11 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from rich.text import Text
-from textual.widgets import Label, ListView
+from textual.widgets import Label, ListView, Static
 
 from command_center import accounts, usage
 from command_center.store import Store
@@ -260,6 +261,98 @@ def test_table_row_shows_codex_badge_and_waiting_reset_status(
             assert _styled_fragments(ver, "bold black on white") == ["OAI"]
             assert isinstance(nxt, Text)
             assert "waiting for Codex 5h reset" in nxt.plain
+
+    asyncio.run(scenario())
+
+
+def _codex_stub(idents: list[int]) -> object:
+    """A ``read_codex_usage`` replacement recording the thread it ran on (5h window 42%)."""
+
+    def stub(now: int | None = None, home: Path | None = None) -> usage.Usage:
+        idents.append(threading.get_ident())
+        return usage.Usage(int(time.time()), usage.Window(42.0, int(time.time()) + 3600), None)
+
+    return stub
+
+
+def _card_text(app: Any, card_id: str) -> str:
+    """The plain text a usage card currently renders."""
+    return _plain(app.query_one(card_id, Static).render())
+
+
+def test_codex_usage_is_read_off_the_ui_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every ``read_codex_usage`` runs on the refresh worker, never on the UI thread.
+
+    One call globs+stats every rollout file of the CODEX_HOME (~1900 files, needed even to
+    KEY its in-process cache, 0.2-0.3s cold), so on the 5s render tick it stalls the frame
+    and on first paint it delays the whole table.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    idents: list[int] = []
+    monkeypatch.setattr(usage, "read_codex_usage", _codex_stub(idents))
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        ui_thread = threading.get_ident()
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert len(idents) >= 1  # the build really did read the snapshot
+            assert ui_thread not in idents
+
+    asyncio.run(scenario())
+
+
+def test_update_usage_renders_the_installed_codex_snapshot_without_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The render tick re-renders the worker's snapshot — it must not read at all.
+
+    A read from here would be the regression; the stub raises to prove the path is gone,
+    and the card keeps the figures the last build installed (so the relative reset times
+    keep counting down through ticks that skipped their build).
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    idents: list[int] = []
+    monkeypatch.setattr(usage, "read_codex_usage", _codex_stub(idents))
+
+    from command_center.views.tui import CommandCenterApp
+
+    def boom(now: int | None = None, home: Path | None = None) -> usage.Usage:
+        raise AssertionError("read_codex_usage must never run on the render tick")
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert "42%" in _card_text(app, "#usage-codex")
+            monkeypatch.setattr(usage, "read_codex_usage", boom)
+            app._update_usage()  # no read, hence no exception
+            assert "42%" in _card_text(app, "#usage-codex")
+
+    asyncio.run(scenario())
+
+
+def test_codex_card_shows_the_placeholder_before_the_first_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty snapshot map (every tick until the first full build) paints the placeholder."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    idents: list[int] = []
+    monkeypatch.setattr(usage, "read_codex_usage", _codex_stub(idents))
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app._codex_usage = {}
+            app._update_usage()
+            assert _card_text(app, "#usage-codex") == usage.render_codex_usage(None).plain
 
     asyncio.run(scenario())
 

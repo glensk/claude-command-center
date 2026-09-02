@@ -39,14 +39,32 @@ beats) dumps every thread's Python stack to `tui-watchdog.log` and re-execs/exit
 A cold `ccc ls` once took 45 s because every process re-parsed every stored transcript.
 The invariants that keep it under a few seconds:
 
-- **Transcript facts are persisted, never re-derived per process.** `core.reconcile`
+- **Transcript facts are persisted, never re-derived per process.** `core.reconcile_pass`
   bulk-loads `store.transcript_scans()`, asks `ClaudeAdapter.scan_transcript(cwd, sid,
-  prior)` for each session and batches the changed rows back in one commit. The adapter
+  prior)` for each session and batches the changed rows back in one upsert. The adapter
   returns the *same* `prior` object when `(path, mtime_ns, size)` match — a frozen
   (done/parked) transcript costs one `stat()`. New per-transcript facts go into
-  `models.TranscriptScan` + that table, not into a fresh full-file read.
+  `models.TranscriptScan` + that table (a nullable column added through
+  `Store._add_column`, which tolerates the duplicate-column race between two fresh
+  builds), not into a fresh full-file read. `core.headless_leak_ids` (prune / daemon) and
+  `mirrors._scan_for` (every `ccc sync-mirrors`) go through the same
+  `scan_transcript(prior)` call — the per-file `is_oneshot_headless` / `observed_model`
+  probes are the fallback for stub adapters only.
+- **A persisted fact is a *decided* fact.** `first_record_is_queue_op` is tri-state
+  (`None` = empty / unreadable / malformed first record — never persisted as `False`, and
+  the next scan re-probes); `last_model_in_file` / `codex_marker_in_file` RAISE `OSError`,
+  and `scan_transcript` then publishes no row (every caller contains the exception and
+  retries next pass). Property P (`scan_transcript` docstring): every persisted row has
+  `codex_scanned_to <= size` and any identity mismatch re-derives every fact from the
+  current file, so concurrent scanners need no ordering guard on the upsert.
 - **Read the tail, not the file.** `last_model_in_file` walks backwards in 64 KiB blocks;
   `codex_marker_in_file` resumes from `codex_scanned_to` (transcripts are append-only).
+- **One registry read and one session read per build.** `build_rows(reconcile_first=True)`
+  renders the `ReconcilePass` it just made: `discover()` once, `list_sessions()` once —
+  taken AFTER the live loop, with the rows the parking loop wrote refreshed. That snapshot
+  is the pass's consistency boundary (a row another process writes after it shows one
+  build later). `store._row_to_session` reads positionally (`tuple(row)` + one
+  `_session_columns` per SELECT): `row["name"]` on `sqlite3.Row` is a linear scan.
 - **`config.load_config()` is memoized** on the file's `(path, mtime_ns, size)` and returns
   a deep copy; every writer of `config.toml` goes through `save_config` (which invalidates).
   Hot per-row paths pass the resolved `root` down (`tabsymbol.cell_for(..., root=)`).
@@ -55,7 +73,21 @@ The invariants that keep it under a few seconds:
   produced cancelled-but-running duplicates); a tick that lands mid-build sets
   `_refresh_pending` and `on_worker_state_changed` runs the single follow-up. The first
   worker run paints `build_rows(reconcile_first=False)` (stored rows + persisted facts)
-  before the full reconcile, so rows appear within ~1 s of launch.
+  before the full reconcile, so rows appear within ~1 s of launch. The Codex usage
+  snapshots are read in that worker too (`read_codex_usage` globs+stats every rollout file
+  of a `CODEX_HOME`, ~0.3 s cold) and travel with the rows in ONE
+  `call_from_thread(_apply_rows, rows, snapshots)`; `_update_usage` renders
+  `self._codex_usage` and never reads.
+- **Hot spawns build one subparser.** `cli.main` passes `argv[0]` to `build_parser(only=…)`
+  when it is in `cli._HOT_SUBCOMMANDS` (`statusline`, `aim`, `hook`, `tab-symbol`: the
+  status line spawns three ccc processes per render per live session every 3 s, every hook
+  event one more, the shell badge hook one per `cd`). The same `_add_<name>(sub)` function
+  builds the subparser in both modes, so every argv form of a hot subcommand is fast by
+  construction (no form list to keep in sync); `llmrouting` is imported only where used.
+  Hook events have one source, `hookspec.HOOK_EVENTS` (`HOOK_SPEC` wires `post-tool-use`
+  twice, so `ALL_HOOK_ARGS` is a set source, not a `choices=` source). `ccc doctor` §
+  "Spawn fast path" lists the subcommands the installed wiring spawns and whether each takes
+  the short path.
 
 Secrets live in `.env` (never commit); see `.env.example`.
 
@@ -111,9 +143,10 @@ claiming which provider a ccc action costs, and add a row there (plus its label 
 `llmrouting.PURPOSES`) whenever you add an LLM call. A row whose `llm_custom_command` is
 `ai.py` is resolved for real through `ai routing -p <purposes>` — one subprocess for all of
 them, ANSI-safe column widths, ai.py's own colours — so never hard-code what a router does.
-That subprocess is gated behind `llmrouting.help_requested()`: `build_parser` runs on EVERY
-invocation including `ccc statusline`, and an epilog is only printed for `--help`, so keep
-the block out of the hot path.
+That subprocess is gated behind `llmrouting.help_requested()`: the full `build_parser()` runs
+on every non-hot invocation, an epilog is only printed for `--help`, and the hot subcommands
+(`_HOT_SUBCOMMANDS`, see "Startup / refresh cost") build a single epilog-free subparser — so
+keep the block out of the hot path.
 It flags any action still billing the OpenAI Codex seat, which is reserved for
 `/codex-debate` (`short_aim_backend = "codex"` used to spend ~17.6k Codex tokens per ten-word
 label). See the multi-account section of [docs/reference.md](docs/reference.md).

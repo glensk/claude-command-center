@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -808,6 +810,7 @@ def _scan(session_id: str, **over: object) -> TranscriptScan:
         "codex": False,
         "codex_scanned_to": 4096,
         "scanned_at": 1_700_000_000_000,
+        "headless": None,
     }
     fields.update(over)
     return TranscriptScan(**fields)  # type: ignore[arg-type]
@@ -880,6 +883,163 @@ def test_transcript_scan_table_is_created_on_an_older_db(tmp_path: Path) -> None
         assert store.transcript_scans() == {}
         store.put_transcript_scans([_scan("old")])
         assert store.get_transcript_scan("old") is not None
+
+
+def _legacy_scan_schema() -> str:
+    """``_SCHEMA`` as it was before ``transcript_scan.headless`` existed."""
+    from command_center import store as store_mod
+
+    legacy = store_mod._SCHEMA.replace(
+        "    scanned_at       INTEGER NOT NULL DEFAULT 0,\n    headless         INTEGER\n",
+        "    scanned_at       INTEGER NOT NULL DEFAULT 0\n",
+    )
+    assert "headless" not in legacy
+    return legacy
+
+
+def _legacy_scan_db(db: Path) -> None:
+    """Create *db* with the pre-``headless`` schema and one scan row already in it."""
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.executescript(_legacy_scan_schema())
+    conn.execute(
+        "INSERT INTO transcript_scan (session_id, path, mtime_ns, size, model, codex, "
+        "codex_scanned_to, scanned_at) VALUES ('old', '/t/old.jsonl', 1, 2, 'm', 0, 2, 3)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_transcript_scan_headless_roundtrips_all_three_states(tmp_path: Path) -> None:
+    # headless is TRI-STATE: True/False are facts, None is "not determined yet" (an
+    # empty/unreadable first record) and MUST come back as None so the next scan
+    # re-probes instead of inheriting a bogus False.
+    store = _store(tmp_path)
+    store.put_transcript_scans(
+        [_scan("yes", headless=True), _scan("no", headless=False), _scan("dunno")]
+    )
+    got = store.transcript_scans()
+    assert got["yes"].headless is True  # coerced back from INTEGER, not left as 1
+    assert got["no"].headless is False
+    assert got["dunno"].headless is None
+    assert got["yes"] == _scan("yes", headless=True)
+
+    # A later pass overwrites the value in both directions, None included.
+    store.put_transcript_scans([_scan("yes", headless=None), _scan("dunno", headless=False)])
+    again = store.transcript_scans()
+    assert again["yes"].headless is None
+    assert again["dunno"].headless is False
+    store.close()
+
+
+def test_transcript_scan_headless_column_migrates_onto_an_older_db(tmp_path: Path) -> None:
+    # A DB written before the column existed gains it on open (the transcript_scan arm of
+    # _ensure_columns); the pre-existing row reads back as None = undetermined, not False.
+    db = tmp_path / "legacy.db"
+    _legacy_scan_db(db)
+
+    with Store(db) as store:  # opening runs _ensure_columns → ALTER adds headless
+        old = store.get_transcript_scan("old")
+        assert old is not None and old.headless is None
+        store.put_transcript_scans([_scan("old", headless=True)])
+        assert store.get_transcript_scan("old").headless is True  # type: ignore[union-attr]
+
+
+def test_add_column_swallows_a_peer_that_won_the_migration_race(tmp_path: Path) -> None:
+    # Every ccc process runs the migration on open, and the DDL runs in autocommit
+    # (Python's legacy transaction control only opens an implicit transaction before DML),
+    # so the swallow matters exactly when both PRAGMAs preceded either ALTER: the loser
+    # must treat "duplicate column name" as "already migrated", not as an error.
+    db = tmp_path / "legacy.db"
+    _legacy_scan_db(db)
+
+    with Store(db) as first:  # its __init__ already added the column
+        assert first.get_transcript_scan("old") is not None
+        with Store(db) as second:
+            second._add_column("transcript_scan", "headless", "INTEGER")  # pylint: disable=protected-access
+            rows = second.conn.execute("SELECT headless FROM transcript_scan").fetchall()
+            assert [row["headless"] for row in rows] == [None]
+
+    # Anything OTHER than a duplicate column still raises (never a blanket swallow).
+    with Store(db) as store:
+        with pytest.raises(sqlite3.OperationalError):
+            store._add_column("no_such_table", "x", "INTEGER")  # pylint: disable=protected-access
+
+
+def test_two_concurrent_store_inits_both_migrate_and_read_headless(tmp_path: Path) -> None:
+    # The real race: two fresh ccc processes opening the same legacy DB at once. Both
+    # constructors must succeed (one ALTER wins, the other is swallowed) and both stores
+    # must be able to read the column.
+    import threading
+
+    db = tmp_path / "legacy.db"
+    _legacy_scan_db(db)
+
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+    seen: list[object] = []
+
+    def _open() -> None:
+        try:
+            barrier.wait(timeout=10)
+            with Store(db) as store:
+                row = store.get_transcript_scan("old")
+                assert row is not None
+                seen.append(row.headless)
+        except BaseException as exc:  # pylint: disable=broad-exception-caught
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_open) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+    assert not errors
+    assert seen == [None, None]
+
+
+def test_put_transcript_scans_upsert_preserves_a_newer_builds_column(tmp_path: Path) -> None:
+    # INSERT OR REPLACE deletes and re-inserts the row, resetting every column THIS build
+    # does not know about (a newer ccc's — the DB is shared and the code is an editable
+    # install). The explicit UPSERT touches only the columns this build owns.
+    import sqlite3
+
+    db = tmp_path / "state.db"
+    store = Store(db)
+    store.put_transcript_scans([_scan("s1")])
+    store.conn.execute("ALTER TABLE transcript_scan ADD COLUMN future TEXT")
+    store.conn.execute("UPDATE transcript_scan SET future = 'x' WHERE session_id = 's1'")
+    store.conn.commit()
+
+    store.put_transcript_scans([_scan("s1", size=9000, headless=True)])
+    row = store.conn.execute(
+        "SELECT size, headless, future FROM transcript_scan WHERE session_id = 's1'"
+    ).fetchone()
+    assert row["size"] == 9000 and row["headless"] == 1
+    assert row["future"] == "x"  # untouched by a build that has never heard of it
+    assert isinstance(store.conn, sqlite3.Connection)
+    store.close()
+
+
+def test_list_sessions_matches_get_field_for_field(tmp_path: Path) -> None:
+    # list_sessions reads its rows POSITIONALLY off ONE precomputed column map (29 ms of
+    # the 88 ms at 637 rows was `row["name"]` linear scans); get() derives its own map for
+    # a single row. The two must stay indistinguishable, field for field.
+    store = _store(tmp_path)
+    store.ensure("s1", cwd="/repo/one")
+    store.set_aim("s1", "ship it")
+    store.update_fields("s1", done=True, importance=2, model="claude-fable-5", effort="high")
+    store.ensure("s2", cwd="/repo/two")
+    store.create_draft("s3", "/repo/three", "Do the thing")
+
+    listed = store.list_sessions()
+    assert [s.session_id for s in listed] == ["s1", "s2", "s3"]
+    for session in listed:
+        single = store.get(session.session_id)
+        assert single is not None
+        assert dataclasses.asdict(session) == dataclasses.asdict(single)
+    store.close()
 
 
 def test_claim_close_request_fires_at_most_once(tmp_path: Path) -> None:

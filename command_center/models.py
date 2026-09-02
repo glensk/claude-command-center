@@ -229,6 +229,9 @@ class TranscriptScan:
     codex: bool = False  # Codex-workflow marker seen (sticky once True — append-only file)
     codex_scanned_to: int = 0  # byte offset the marker scan has covered
     scanned_at: int = 0  # ms epoch of the scan
+    # First record is a queue-operation (a headless ``claude -p`` run); None = not
+    # determined yet (empty/unreadable first record), so the next scan re-probes.
+    headless: bool | None = None
 
 
 # Future-job model choices: which Claude model a job's overseer / executor runs on.

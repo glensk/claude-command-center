@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -544,14 +545,13 @@ def test_last_model_in_file_reads_the_tail_backwards(tmp_path: Path) -> None:
     d.write_text(_assistant_rec("claude-fable-5") + "\n" + partial, encoding="utf-8")
     assert last_model_in_file(d) == "claude-fable-5"
 
-    # (e) no assistant record at all, (f) empty + missing file, (g) blank lines tolerated.
+    # (e) no assistant record at all, (f) empty file, (g) blank lines tolerated.
     e = tmp_path / "e.jsonl"
     e.write_text(_rec(type="user", message={"role": "user", "content": "hi"}) + "\n", "utf-8")
     assert last_model_in_file(e) is None
     empty = tmp_path / "empty.jsonl"
     empty.write_text("", encoding="utf-8")
     assert last_model_in_file(empty) is None
-    assert last_model_in_file(tmp_path / "nope.jsonl") is None
     g = tmp_path / "g.jsonl"
     g.write_text("\n\n" + _assistant_rec("claude-fable-5") + "\n\n\n", encoding="utf-8")
     assert last_model_in_file(g) == "claude-fable-5"
@@ -593,6 +593,248 @@ def test_codex_marker_in_file_scans_a_byte_range(tmp_path: Path) -> None:
 
     # A start past the end means the file was truncated/rewritten → rescan from 0.
     assert codex_marker_in_file(present, start=size + 10_000) == (True, size)
+
+
+def test_transcript_readers_raise_on_a_read_failure(tmp_path: Path) -> None:
+    """A read failure is NOT a fact about the transcript, so both readers raise.
+
+    Swallowing an OSError as ``None`` / ``(False, start)`` would let a transient
+    EIO/EACCES be PERSISTED as "no model" / "no marker" in the scan row (see
+    ``scan_transcript`` § Property P). Every caller contains it and retries next pass.
+    """
+    from command_center.adapters.claude import codex_marker_in_file, last_model_in_file
+
+    missing = tmp_path / "nope.jsonl"
+    with pytest.raises(OSError):
+        last_model_in_file(missing)
+    with pytest.raises(OSError):
+        codex_marker_in_file(missing)
+
+
+def test_core_wrappers_contain_the_reader_oserror(tmp_path: Path) -> None:
+    """``observed_model`` / ``uses_codex_workflow`` may now raise; the core wrappers that
+    feed a row must still degrade to "" / False rather than kill the build."""
+    from command_center import core
+    from command_center.models import Session
+
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    proj = tmp_path / "projects" / "-repo"
+    proj.mkdir(parents=True)
+    (proj / "sid.jsonl").mkdir()  # resolves (exists) but every open() raises IsADirectoryError
+
+    session = Session(session_id="sid", cwd="/repo")
+    with pytest.raises(OSError):
+        adapter.observed_model("/repo", "sid")
+    with pytest.raises(OSError):
+        adapter.uses_codex_workflow("/repo", "sid")
+    assert core._observed_model(adapter, session) == ""  # pylint: disable=protected-access
+    assert core._uses_codex_workflow(adapter, session) is False  # pylint: disable=protected-access
+    # scan_transcript propagates it too, so nothing half-read is ever persisted.
+    with pytest.raises(OSError):
+        adapter.scan_transcript("/repo", "sid", None)
+
+
+def test_first_record_is_queue_op_is_tri_state(tmp_path: Path) -> None:
+    """``None`` means "not decided yet" and must never collapse to ``False``: the answer
+    is persisted (``TranscriptScan.headless``), and a ``False`` frozen in from an empty or
+    mid-write transcript would make a headless one-shot look interactive forever."""
+    from command_center.adapters.claude import first_record_is_queue_op
+
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    assert first_record_is_queue_op(empty) is None
+
+    blanks = tmp_path / "blanks.jsonl"
+    blanks.write_text("\n\n", encoding="utf-8")
+    assert first_record_is_queue_op(blanks) is None
+
+    malformed = tmp_path / "malformed.jsonl"
+    malformed.write_text('{"type": "queue-oper', encoding="utf-8")  # caught mid-write
+    assert first_record_is_queue_op(malformed) is None
+
+    assert first_record_is_queue_op(tmp_path / "missing.jsonl") is None
+
+    headless = tmp_path / "headless.jsonl"
+    headless.write_text("\n" + _rec(type="queue-operation") + "\n", encoding="utf-8")
+    assert first_record_is_queue_op(headless) is True  # leading blank line skipped
+
+    interactive = tmp_path / "interactive.jsonl"
+    interactive.write_text(_rec(type="last-prompt") + "\n", encoding="utf-8")
+    assert first_record_is_queue_op(interactive) is False
+
+
+def _adapter_with(tmp_path: Path, name: str, text: str) -> tuple[ClaudeAdapter, Path]:
+    """A ClaudeAdapter over *tmp_path* plus a written ``/repo`` transcript for *name*."""
+    proj = tmp_path / "projects" / "-repo"
+    proj.mkdir(parents=True, exist_ok=True)
+    path = proj / f"{name}.jsonl"
+    path.write_text(text, encoding="utf-8")
+    return ClaudeAdapter(claude_home=tmp_path), path
+
+
+def test_scan_transcript_headless_is_probed_once_and_carried_on_a_grow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The headless fact is persisted, not re-probed: an unchanged file with the fact
+    already known costs one stat, and a same-path GROW carries it forward (an append-only
+    file's first record cannot change)."""
+    from command_center.adapters import claude as claude_mod
+
+    adapter, path = _adapter_with(tmp_path, "sid", _rec(type="queue-operation") + "\n")
+
+    first = adapter.scan_transcript("/repo", "sid", None)
+    assert first is not None and first.headless is True
+
+    # Known fact + untouched file → the SAME object (nothing to re-persist).
+    assert adapter.scan_transcript("/repo", "sid", first) is first
+
+    # A prior row from before the column existed (headless None) on an UNCHANGED file:
+    # the probe runs once and a NEW object comes back so the caller persists it.
+    legacy = dataclasses.replace(first, headless=None)
+    filled = adapter.scan_transcript("/repo", "sid", legacy)
+    assert filled is not None and filled is not legacy and filled.headless is True
+    assert (filled.path, filled.mtime_ns, filled.size) == (
+        legacy.path,
+        legacy.mtime_ns,
+        legacy.size,
+    )
+
+    # A GROW on the same path carries the fact forward without opening the first record.
+    def _boom(*_args: object, **_kwargs: object) -> bool | None:
+        raise AssertionError("a same-path grow must not re-probe the first record")
+
+    monkeypatch.setattr(claude_mod, "first_record_is_queue_op", _boom)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(_assistant_rec("claude-fable-5") + "\n")
+    grown = adapter.scan_transcript("/repo", "sid", first)
+    assert grown is not None and grown is not first and grown.headless is True
+
+
+def _padded(record: str, size: int) -> str:
+    """*record* as the first line of a transcript, space-padded to exactly *size* bytes.
+
+    Lets a test rewrite a transcript at a CHOSEN byte size (the identity `scan_transcript`
+    pins) with a different first record.
+    """
+    line = record + "\n"
+    assert len(line) <= size
+    return line + " " * (size - len(line))
+
+
+def test_scan_transcript_headless_is_reprobed_on_any_other_identity_change(
+    tmp_path: Path,
+) -> None:
+    """A same-size rewrite and a truncation are not appends, so the first record CAN have
+    changed — both re-probe rather than carry the stale fact."""
+    adapter, path = _adapter_with(tmp_path, "sid", _padded(_rec(type="queue-operation"), 200))
+    first = adapter.scan_transcript("/repo", "sid", None)
+    assert first is not None and first.headless is True and first.size == 200
+
+    # (a) same-size rewrite (different mtime): re-probed, so the fact FLIPS.
+    path.write_text(_padded(_rec(type="last-prompt"), 200), encoding="utf-8")
+    bump = first.mtime_ns + 1_000_000_000
+    os.utime(path, ns=(bump, bump))
+    rewritten = adapter.scan_transcript("/repo", "sid", first)
+    assert rewritten is not None and rewritten.size == first.size  # same identity size
+    assert rewritten.headless is False
+
+    # (b) truncation / replacement: strictly smaller → re-probed, flips back.
+    path.write_text(_padded(_rec(type="queue-operation"), 100), encoding="utf-8")
+    smaller = adapter.scan_transcript("/repo", "sid", rewritten)
+    assert smaller is not None and smaller.size < rewritten.size
+    assert smaller.headless is True
+
+
+def test_scan_transcript_undetermined_headless_writes_nothing(tmp_path: Path) -> None:
+    """An empty / mid-write transcript learns nothing, so the prior row comes back
+    UNCHANGED (identity) — otherwise every pass would rewrite that row forever."""
+    adapter, path = _adapter_with(tmp_path, "sid", "")
+
+    first = adapter.scan_transcript("/repo", "sid", None)
+    assert first is not None and first.headless is None  # empty file → undetermined
+
+    # Same object back: nothing was learned this pass, so nothing is persisted.
+    assert adapter.scan_transcript("/repo", "sid", first) is first
+
+    # Appended for real → the fact finally lands.
+    path.write_text(_rec(type="queue-operation") + "\n", encoding="utf-8")
+    second = adapter.scan_transcript("/repo", "sid", first)
+    assert second is not None and second.headless is True
+
+    # A malformed first record is the same kind of "not yet": None, then the real value
+    # once the line is complete.
+    _, broken = _adapter_with(tmp_path, "broken", '{"type": "queue-oper')
+    partial = adapter.scan_transcript("/repo", "broken", None)
+    assert partial is not None and partial.headless is None
+    broken.write_text(_rec(type="queue-operation") + "\n", encoding="utf-8")
+    repaired = adapter.scan_transcript("/repo", "broken", partial)
+    assert repaired is not None and repaired.headless is True
+
+
+def test_scan_transcript_clamps_the_scanned_offset_to_the_pinned_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Property P: ``codex_scanned_to <= size`` in every persisted row.
+
+    ``codex_marker_in_file`` reports the size IT saw at its own open, which on a live
+    transcript can exceed the ``stat()`` taken a moment earlier. An unclamped offset
+    would then let a later SAME-SIZE rewrite resume past bytes that were never scanned
+    and miss the marker in them.
+    """
+    from command_center.adapters import claude as claude_mod
+
+    body = "x" * 99 + "\n"
+    adapter, path = _adapter_with(tmp_path, "sid", body)
+    assert path.stat().st_size == 100
+
+    monkeypatch.setattr(claude_mod, "codex_marker_in_file", lambda *_a, **_k: (False, 200))
+    row = adapter.scan_transcript("/repo", "sid", None)
+    assert row is not None and row.size == 100
+    assert row.codex_scanned_to == 100  # clamped to the size THIS row pins
+
+    # Now the file really is 200 bytes with the marker at byte 120 — past the clamped
+    # offset, so the real scan resumes from 100 and still finds it. Had the row kept the
+    # unclamped 200 it would have resumed at 200 and missed the marker entirely.
+    monkeypatch.undo()
+    marker = claude_mod._CODEX_WORKFLOW_MARKER  # pylint: disable=protected-access
+    tail = 199 - 120 - len(marker)
+    assert tail >= 0
+    path.write_text("y" * 120 + marker + "z" * tail + "\n", encoding="utf-8")
+    assert path.stat().st_size == 200
+    os.utime(path, ns=(row.mtime_ns + 1_000_000_000, row.mtime_ns + 1_000_000_000))
+    second = adapter.scan_transcript("/repo", "sid", row)
+    assert second is not None and second.codex is True
+
+
+def test_scan_transcript_survives_a_stale_concurrent_writer(tmp_path: Path) -> None:
+    """Property P: whichever of two scanners persisted last, the next pass re-derives
+    every fact from the CURRENT file — a stale row costs one bounded re-read, never a
+    wrong answer (the store deliberately carries no ordering guard)."""
+    adapter, path = _adapter_with(tmp_path, "sid", _assistant_rec("claude-opus-4-8") + "\n")
+    scan_a = adapter.scan_transcript("/repo", "sid", None)  # v1: no marker
+    assert scan_a is not None and scan_a.codex is False
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            _rec(
+                type="user",
+                message={
+                    "role": "user",
+                    "content": f"<command-name>/{CODEX_WORKFLOW_NAME}</command-name>",
+                },
+            )
+            + "\n"
+        )
+        handle.write(_assistant_rec("claude-fable-5") + "\n")
+    scan_b = adapter.scan_transcript("/repo", "sid", scan_a)
+    assert scan_b is not None and scan_b.codex is True
+
+    # A peer re-persisted the STALE v1 row; this pass starts from it again and still lands
+    # on the truth (marker found, model from the tail).
+    again = adapter.scan_transcript("/repo", "sid", scan_a)
+    assert again is not None and again.codex is True
+    assert again.model == "claude-fable-5"
+    assert again.codex_scanned_to <= again.size  # the invariant holds on every row
 
 
 def test_scan_transcript_reuses_the_prior_row_when_nothing_changed(tmp_path: Path) -> None:

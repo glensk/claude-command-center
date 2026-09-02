@@ -19,7 +19,7 @@ import pytest
 
 from command_center import config, futuresync, mirrors, sessionmd
 from command_center.future_files import slugify
-from command_center.models import LiveSession, Session, Status, now_ms
+from command_center.models import LiveSession, Session, Status, TranscriptScan, model_label, now_ms
 from command_center.store import Store
 
 
@@ -255,6 +255,109 @@ def test_mirror_frontmatter_observed_model(env: Env) -> None:
     )
     assert 'model: "fable-5"' in stext
     assert 'effort: "xhigh"' in stext
+
+
+def _put_scan(env: Env, sid: str, path: Path, **over: object) -> TranscriptScan:
+    """Persist a transcript-scan row for *sid* pinned to *path*'s real identity."""
+    st = path.stat()
+    fields: dict[str, object] = {
+        "session_id": sid,
+        "path": str(path),
+        "mtime_ns": st.st_mtime_ns,
+        "size": st.st_size,
+        "model": "claude-fable-5",
+        "codex": False,
+        "codex_scanned_to": st.st_size,
+        "scanned_at": 1,
+        "headless": False,
+    }
+    fields.update(over)
+    scan = TranscriptScan(**fields)  # type: ignore[arg-type]
+    env.store.put_transcript_scans([scan])
+    return scan
+
+
+def test_mirror_model_comes_off_the_persisted_scan(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged transcript costs one ``stat()``: the ``model:`` field is read off the
+    persisted scan row, not re-derived with a tail read per mirror per pass."""
+    from command_center.adapters import claude as claude_mod
+
+    cwd = str(env.git_base / "home" / "ccc")
+    sid = _running_session(env, "Read from the scan row")
+    path = _write_model_transcript(env, cwd, sid, "claude-opus-4-8")
+    # The persisted row disagrees with the file's content but pins its exact identity —
+    # so it must be trusted (that is the whole point of the cross-process cache).
+    scan = _put_scan(env, sid, path, model="claude-fable-5")
+
+    def _boom(*_args: object, **_kwargs: object) -> str | None:
+        raise AssertionError("an unchanged transcript must not be re-read for its model")
+
+    monkeypatch.setattr(claude_mod, "last_model_in_file", _boom)
+    mirrors.run_mirrors(env.store, env.cfg)
+    text = _rpath(env, "Read from the scan row", sid).read_text(encoding="utf-8")
+    assert model_label(scan.model) == "fable-5"
+    assert f'model: "{model_label(scan.model)}"' in text  # the row's model, not the file's
+    # Nothing changed → the row is not rewritten either (byte-stable pass).
+    assert env.store.get_transcript_scan(sid) == scan
+
+
+def test_mirror_refreshes_a_stale_scan_row(env: Env) -> None:
+    """A standalone ``ccc sync-mirrors`` right after a model switch writes the NEW model.
+
+    The mirror pass refreshes each session's scan row against the file itself, so it does
+    not depend on the daemon having reconciled first — and the refreshed row is persisted
+    for every other reader.
+    """
+    cwd = str(env.git_base / "home" / "ccc")
+    sid = _running_session(env, "Switched to opus")
+    path = _write_model_transcript(env, cwd, sid, "claude-opus-4-8")
+    stale = _put_scan(env, sid, path, model="claude-fable-5", size=path.stat().st_size - 10)
+
+    mirrors.run_mirrors(env.store, env.cfg)
+    text = _rpath(env, "Switched to opus", sid).read_text(encoding="utf-8")
+    assert 'model: "opus-4.8"' in text  # the file wins over the stale row
+
+    fresh = env.store.get_transcript_scan(sid)
+    assert fresh is not None and fresh != stale
+    assert fresh.model == "claude-opus-4-8"
+    assert fresh.size == path.stat().st_size
+    assert fresh.codex_scanned_to <= fresh.size  # Property P holds on the written row
+
+
+def test_observed_model_label_probes_an_adapter_without_scan_transcript(env: Env) -> None:
+    """A stub adapter with no ``scan_transcript`` keeps the legacy per-session probe:
+    ``_scan_for`` yields no row, and the label falls back to ``observed_model``."""
+
+    class _ProbeOnly:
+        """Neither ``scan_transcript`` nor a real transcript — just the probe."""
+
+        def __init__(self) -> None:
+            self.asked: list[str] = []
+
+        def observed_model(self, cwd: str, session_id: str) -> str | None:
+            self.asked.append(session_id)
+            return "claude-opus-4-8"
+
+    sid = _running_session(env, "Probe me")
+    session = _get(env, sid)
+    adapter = _ProbeOnly()
+    scans: dict[str, TranscriptScan] = {}
+    dirty: list[TranscriptScan] = []
+
+    scan = mirrors._scan_for(adapter, session, scans, dirty)  # type: ignore[arg-type]  # pylint: disable=protected-access
+    assert scan is None and scans == {} and dirty == []
+    label = mirrors._observed_model_label(adapter, session, scan)  # type: ignore[arg-type]  # pylint: disable=protected-access
+    assert label == "opus-4.8"
+    assert adapter.asked == [sid]
+
+    # A probe that raises (the OSError the readers now propagate) still degrades to "".
+    class _Raising:
+        def observed_model(self, cwd: str, session_id: str) -> str | None:
+            raise OSError("simulated EIO")
+
+    assert mirrors._observed_model_label(_Raising(), session) == ""  # type: ignore[arg-type]  # pylint: disable=protected-access
 
 
 # ---------------------------------------------------------------------------

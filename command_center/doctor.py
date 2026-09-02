@@ -9,6 +9,11 @@ The report is built by the pure :func:`build_report` (easy to test); :func:`run`
 it and returns the exit code.
 """
 
+# `_section_fast_path` reads `cli._HOT_SUBCOMMANDS` through a LAZY import, exactly as
+# `cli.cmd_doctor` imports this module — two deliberate function-local edges, never an
+# import-time cycle (pylint only sees the pair).
+# pylint: disable=cyclic-import
+
 from __future__ import annotations
 
 if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
@@ -21,6 +26,8 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -125,22 +132,6 @@ def _section_wiring() -> Section:
     return section
 
 
-def _stop_hook_commands(settings: dict) -> list[str]:
-    """The Stop event's hook commands, flattened in wired order (empty if none)."""
-    hooks = settings.get("hooks")
-    stop = hooks.get("Stop") if isinstance(hooks, dict) else None
-    if not isinstance(stop, list):
-        return []
-    commands: list[str] = []
-    for group in stop:
-        if not isinstance(group, dict):
-            continue
-        for entry in group.get("hooks", []) or []:
-            if isinstance(entry, dict):
-                commands.append(str(entry.get("command", "")))
-    return commands
-
-
 def _stop_order_check(settings: dict) -> Check:
     """WARN when ccc's ``release-locks`` Stop hook is not the LAST Stop entry.
 
@@ -149,7 +140,7 @@ def _stop_order_check(settings: dict) -> Check:
     drop. Install enforces this; a later foreign append can break it — this guards that.
     Recognised via the same matcher install.py uses for ccc-owned entries.
     """
-    commands = _stop_hook_commands(settings)
+    commands = install.hook_commands(settings, "Stop")
     positions = [
         i
         for i, cmd in enumerate(commands)
@@ -165,6 +156,158 @@ def _stop_order_check(settings: dict) -> Check:
         "release-locks not last — close-after-done & lock-release must run after foreign "
         "Stop hooks like auto-commit (ccc install-hooks)",
     )
+
+
+# --------------------------------------------------------------------------- #
+# spawn fast path (which ccc subcommands the wiring spawns, and how they parse)
+# --------------------------------------------------------------------------- #
+#: Shell interpreters whose first non-option argument is the script they run.
+_SHELL_RUNNERS = frozenset({"bash", "sh", "zsh"})
+#: Tokens that mean "the ccc binary" in a hand-written or generated command.
+_CCC_BIN_REFS = frozenset({"ccc", "$CCC_BIN", "${CCC_BIN}"})
+#: What a ccc subcommand looks like (anything else after `ccc` is not one we can name).
+_SUBCOMMAND = re.compile(r"^[a-z][a-z-]*$")
+
+
+def _is_ccc_ref(token: str) -> bool:
+    """Whether *token* refers to the ccc binary (a name, a path to it, or $CCC_BIN)."""
+    return token in _CCC_BIN_REFS or token.endswith("/ccc")
+
+
+def _ccc_calls(text: str) -> tuple[list[str], bool]:
+    """The ``ccc <subcommand>`` calls in *text*, plus "a call site was indeterminate".
+
+    Line-based and shell-aware rather than a regex: comment lines are skipped (a
+    `# ccc install-statusline` in a header is documentation, not a spawn) and each
+    remaining line is tokenized with :mod:`shlex`, so quoting is honoured. A ccc
+    reference whose next token is not a literal subcommand (``ccc "$cmd"``, a flag, end
+    of line) is reported as indeterminate instead of guessed at.
+    """
+    names: list[str] = []
+    indeterminate = False
+    for raw in text.splitlines():
+        line = raw.lstrip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            tokens = shlex.split(line, comments=True)
+        except ValueError:  # unbalanced quotes: this line stays unknown
+            indeterminate = True
+            continue
+        for index, token in enumerate(tokens):
+            if not _is_ccc_ref(token):
+                continue
+            following = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if _SUBCOMMAND.match(following):
+                names.append(following)
+            else:
+                indeterminate = True
+    return names, indeterminate
+
+
+def _script_behind(command: str) -> tuple[Path | None, bool]:
+    """The ONE script *command* runs and may be read, plus "resolution failed".
+
+    Follows a single explicit indirection — ``bash|sh|zsh <path> …`` or a bare
+    executable path — and only inside ``$HOME``: doctor is a read-only probe, not a
+    crawler, so a script elsewhere (or an unreadable one) is reported as indeterminate
+    rather than opened or guessed at.
+    """
+    try:
+        tokens = shlex.split(command, comments=True)
+    except ValueError:
+        return None, True
+    if not tokens:
+        return None, False
+    head = tokens[0]
+    if Path(head).name in _SHELL_RUNNERS:
+        arguments = [t for t in tokens[1:] if not t.startswith("-")]
+        candidate = arguments[0] if arguments else ""
+    elif not _is_ccc_ref(head) and ("/" in head or head.startswith("~")):
+        candidate = head
+    else:
+        candidate = ""
+    if not candidate:
+        return None, False
+    path = Path(candidate).expanduser()
+    try:
+        inside_home = path.resolve().is_relative_to(Path.home().resolve())
+    except OSError:
+        return None, True
+    return (path, False) if inside_home else (None, True)
+
+
+def _foreign_ccc_calls(command: str) -> tuple[list[str], bool]:
+    """``ccc`` calls in a foreign *command* and in the one script it may run."""
+    names, indeterminate = _ccc_calls(command)
+    script, unresolved = _script_behind(command)
+    indeterminate = indeterminate or unresolved
+    if script is not None:
+        try:
+            body = script.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return names, True
+        more, more_indeterminate = _ccc_calls(body)
+        names.extend(more)
+        indeterminate = indeterminate or more_indeterminate
+    return names, indeterminate
+
+
+def _spawned_ccc_subcommands(settings: dict) -> tuple[list[str], bool]:
+    """Which ccc subcommands the wiring in *settings* spawns (first-seen order).
+
+    ccc's OWN wiring is read from structured knowledge, never by parsing text: a
+    ``direct`` / ``chain`` statusLine spawns ``statusline`` by construction, and a hook
+    command the installer's recognizer owns spawns ``hook``. Only FOREIGN wiring — a
+    third-party statusLine, a hook ccc does not own — is inspected as text.
+    """
+    names: dict[str, None] = {}
+    indeterminate = False
+    statusline = settings.get("statusLine")
+    command = str(statusline.get("command", "")) if isinstance(statusline, dict) else ""
+    if install.statusline_state(settings) in ("direct", "chain"):
+        names["statusline"] = None
+    elif command:
+        found, unknown = _foreign_ccc_calls(command)
+        names.update(dict.fromkeys(found))
+        indeterminate = indeterminate or unknown
+    for hook_command in install.hook_commands(settings):
+        if install._ccc_hook_arg(hook_command):  # pylint: disable=protected-access
+            names["hook"] = None
+            continue
+        found, unknown = _foreign_ccc_calls(hook_command)
+        names.update(dict.fromkeys(found))
+        indeterminate = indeterminate or unknown
+    return list(names), indeterminate
+
+
+def _section_fast_path() -> Section:
+    """Does every ccc command the wiring spawns get the short parser? (tp#115)
+
+    The status line and the hooks spawn ccc hundreds of times a minute, where building
+    all ~80 subparsers is pure overhead; ``cli._HOT_SUBCOMMANDS`` is the set that skips
+    it. This section names the subcommands the live wiring actually spawns and whether
+    each one is on that fast path — so a new high-frequency external call that misses it
+    is visible without reading any code. Purely informational: never ❌.
+    """
+    from . import cli  # pylint: disable=import-outside-toplevel
+
+    section = Section("Spawn fast path")
+    names, indeterminate = _spawned_ccc_subcommands(install.load_settings())
+    for name in names:
+        if name in cli._HOT_SUBCOMMANDS:  # pylint: disable=protected-access
+            section.checks.append(Check(OK, f"ccc {name}", "short parser"))
+        else:
+            section.checks.append(
+                Check(NA, f"ccc {name}", "full parser — fine unless spawned every few seconds")
+            )
+    if indeterminate:
+        section.checks.append(
+            Check(NA, "spawned ccc commands", "indeterminate (dynamic shell construct)")
+        )
+    if not names and not indeterminate:
+        section.checks.append(Check(NA, "spawned ccc commands", "none found in statusLine/hooks"))
+    return section
 
 
 def _section_daemon() -> Section:
@@ -498,6 +641,7 @@ def build_report(cfg: config.Config | None = None) -> Report:
         [
             _section_core(),
             _section_wiring(),
+            _section_fast_path(),
             _section_daemon(),
             _section_terminal(),
             _section_features(cfg),

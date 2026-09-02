@@ -328,3 +328,89 @@ def test_terminal_section_fails_only_on_an_explicit_denial(
 def test_report_includes_the_terminal_section(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(doctor.shutil, "which", _which_factory({"claude"}))
     assert "Terminal (iTerm2 launch path)" in doctor.render(doctor.build_report(config.Config()))
+
+
+# ------------------------- Spawn fast path (tp#115) ------------------------- #
+def _write_settings(home: Path, settings: dict) -> None:
+    import json
+
+    (home / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+
+
+def _fast_path(home: Path, monkeypatch: pytest.MonkeyPatch, settings: dict) -> dict[str, str]:
+    """The Spawn-fast-path statuses for *settings*, with *home* as $HOME (readable scripts)."""
+    monkeypatch.setenv("HOME", str(home))
+    _write_settings(home, settings)
+    section = doctor._section_fast_path()
+    assert doctor.FAIL not in {c.status for c in section.checks}  # informational only
+    return _statuses(section)
+
+
+def test_fast_path_reads_cccs_own_statusline_from_its_state_not_its_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A chained ccc statusLine is `statusline` by construction — no text parsing.
+
+    The chain script deliberately does NOT exist here: were the section reading it, the
+    missing file would surface as an indeterminate row instead of a plain ✅.
+    """
+    chain = install.chain_script_path()
+    statuses = _fast_path(
+        tmp_path,
+        monkeypatch,
+        {"statusLine": {"type": "command", "command": f"bash {chain}"}},
+    )
+    assert statuses == {"ccc statusline": doctor.OK}
+
+
+def test_fast_path_follows_one_indirection_into_a_foreign_statusline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A foreign status line's script is the case only text can answer."""
+    script = tmp_path / "my-statusline.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "# ccc install-statusline is not run here\n"
+        '"$CCC_BIN" statusline --print-glyph\n'
+        'ccc aim --session "$sid" --format bar\n'
+        "ccc frobnicate\n"
+        'ccc "$cmd"\n',
+        encoding="utf-8",
+    )
+    statuses = _fast_path(
+        tmp_path,
+        monkeypatch,
+        {"statusLine": {"type": "command", "command": f"bash {script}"}},
+    )
+    assert statuses["ccc statusline"] == doctor.OK
+    assert statuses["ccc aim"] == doctor.OK
+    assert statuses["ccc frobnicate"] == doctor.NA  # full parser — visible, not broken
+    assert statuses["spawned ccc commands"] == doctor.NA  # `ccc "$cmd"` is indeterminate
+    assert "ccc install-statusline" not in statuses  # a comment line is not a spawn
+
+
+def test_fast_path_follows_a_foreign_hook_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hook_script = tmp_path / "cc-hook.sh"
+    hook_script.write_text('#!/usr/bin/env bash\nccc hook "${1:-}" || true\n', encoding="utf-8")
+    statuses = _fast_path(
+        tmp_path,
+        monkeypatch,
+        {"hooks": {"Stop": [{"hooks": [{"command": f"bash {hook_script}"}]}]}},
+    )
+    assert statuses == {"ccc hook": doctor.OK}
+
+
+def test_fast_path_says_so_when_nothing_spawns_ccc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    statuses = _fast_path(tmp_path, monkeypatch, {})
+    assert statuses == {"spawned ccc commands": doctor.NA}
+    detail = doctor._section_fast_path().checks[0].detail
+    assert "none found" in detail
+
+
+def test_report_includes_the_fast_path_section(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor.shutil, "which", _which_factory({"claude"}))
+    assert "Spawn fast path" in doctor.render(doctor.build_report(config.Config()))

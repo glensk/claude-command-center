@@ -21,7 +21,10 @@ flags. Grouped by what they do:
 - `ccc ls` — a flat, clickable, one-line-per-session list (scripting-friendly).
 - `ccc demo [--ls] [--clean]` — a throwaway fake-data command center; safe to try with zero setup.
 - `ccc serve [--host --port]` — serve the TUI in the browser (`textual-serve`).
-- `ccc doctor` — read-only health check of the install + environment (exit 1 on any ❌).
+- `ccc doctor` — read-only health check of the install + environment (exit 1 on any ❌). Its
+  "Spawn fast path" section names the ccc subcommands the installed status line and hooks
+  spawn and whether each takes the short parser (`statusline`, `aim`, `hook`, `tab-symbol`
+  do; anything else is informational, never ❌).
 - `ccc init` — first-run wizard: environment check → consent → installers.
 
 **AIM, progress & the checkers**

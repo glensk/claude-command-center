@@ -42,28 +42,12 @@ import time
 from pathlib import Path
 
 from . import config
+from .hookspec import ALL_HOOK_ARGS, HOOK_SPEC
 
-# The wiring ccc owns, in the order it is appended to each event's hook list — the
-# SINGLE source for both the installer and the recognizer. Each entry is
-# ``(settings-event-key, matcher-or-None, ccc-hook-arg)``. Order matters for ``Stop``:
-# ``stop`` then ``release-locks`` are appended LAST so release-locks runs after any
-# foreign Stop hooks (e.g. a user's commit hook) — files are committed before their
-# locks release.
-HOOK_SPEC: tuple[tuple[str, str | None, str], ...] = (
-    ("SessionStart", None, "session-start"),
-    ("UserPromptSubmit", None, "user-prompt"),
-    ("SessionEnd", None, "session-end"),
-    ("PreCompact", None, "pre-compact"),
-    ("SubagentStop", None, "subagent-stop"),
-    ("PreToolUse", "Edit|Write|MultiEdit|NotebookEdit", "pre-tool-use"),
-    ("PostToolUse", "Edit|Write|MultiEdit|NotebookEdit", "post-tool-use"),
-    ("PostToolUse", "TodoWrite|TaskCreate|TaskUpdate", "post-tool-use"),
-    ("Stop", None, "stop"),
-    ("Stop", None, "release-locks"),
-)
-
-# Every ccc hook-arg, in spec order (for doctor's "how many of ours are wired" readout).
-ALL_HOOK_ARGS: tuple[str, ...] = tuple(arg for _, _, arg in HOOK_SPEC)
+# HOOK_SPEC / ALL_HOOK_ARGS live in the import-cheap :mod:`command_center.hookspec` (the
+# CLI reads the event names on every spawn and must not import this module for them), and
+# are re-exported here because ``install.HOOK_SPEC`` / ``install.ALL_HOOK_ARGS`` are the
+# addresses the installer, doctor and the tests use (both are read below).
 
 # The valid hook events (the second token after ``ccc hook``), used to recognise
 # ccc-owned entries on a rerun / uninstall / doctor scan — derived from HOOK_SPEC so
@@ -171,23 +155,36 @@ def _is_ccc_hook_command(command: str) -> bool:
     return _ccc_hook_arg(command) is not None
 
 
-def installed_hook_events(settings: dict) -> set[str]:
-    """The set of ccc hook-args currently wired in *settings* (for doctor)."""
-    found: set[str] = set()
+def hook_commands(settings: dict, event: str | None = None) -> list[str]:
+    """Every hook command in *settings* — ccc's and foreign — in wiring order.
+
+    With *event* set, only that settings-event key's commands (doctor's Stop-order guard
+    needs them in order). Tolerates any malformed shape a hand-edited settings.json can
+    hold; the single walk both installer and doctor read.
+    """
+    commands: list[str] = []
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
-        return found
-    for groups in hooks.values():
-        if not isinstance(groups, list):
+        return commands
+    for key, groups in hooks.items():
+        if not isinstance(groups, list) or (event is not None and key != event):
             continue
         for group in groups:
             if not isinstance(group, dict):
                 continue
             for entry in group.get("hooks", []) or []:
                 if isinstance(entry, dict):
-                    arg = _ccc_hook_arg(str(entry.get("command", "")))
-                    if arg:
-                        found.add(arg)
+                    commands.append(str(entry.get("command", "")))
+    return commands
+
+
+def installed_hook_events(settings: dict) -> set[str]:
+    """The set of ccc hook-args currently wired in *settings* (for doctor)."""
+    found: set[str] = set()
+    for command in hook_commands(settings):
+        arg = _ccc_hook_arg(command)
+        if arg:
+            found.add(arg)
     return found
 
 

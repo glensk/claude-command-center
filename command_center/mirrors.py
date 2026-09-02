@@ -76,6 +76,7 @@ from .models import (
     DEFAULT_LLM,
     AimRevision,
     Session,
+    TranscriptScan,
     iso_date,
     model_label,
     synthesize_aim_revision,
@@ -171,21 +172,35 @@ def _q(value: object) -> str:
     return f'"{escaped}"'
 
 
-def _observed_model_label(adapter: ClaudeAdapter, session: Session) -> str:
+def _observed_model_label(
+    adapter: ClaudeAdapter, session: Session, scan: TranscriptScan | None = None
+) -> str:
     """The session's OBSERVED model (from its transcript) as a ccc choice label, else "".
+
+    *scan* is the session's transcript-scan row for THIS pass (already refreshed against
+    the file by :func:`_sync_root`), so the label is read off the persisted fact and a
+    frozen transcript costs one ``stat()`` instead of a tail read per mirror. Without one
+    (a stub adapter with no ``scan_transcript``) it falls back to the live probe.
 
     ``observed_model`` is a concrete-adapter capability (like ``has_background_task`` /
     ``uses_codex_workflow``), NOT part of the ``Adapter`` protocol — probe it defensively
-    so a stub adapter degrades to "". Any read error also degrades to "": a mirror write
-    must never crash on a malformed transcript. Byte-stable: the observed model is fixed
-    for a frozen transcript and changes only when the session actually switches models.
+    so a stub adapter degrades to "". Any read error also degrades to "" (including the
+    ``OSError`` the transcript readers raise — a read failure is not the fact "no model";
+    see ``scan_transcript`` § Property P): a mirror write must never crash on a malformed
+    transcript. Byte-stable: the observed model is fixed for a frozen transcript and
+    changes only when the session actually switches models.
     """
+    if scan is not None:
+        return model_label(scan.model)
     fn = getattr(adapter, "observed_model", None)
     if fn is None:
         return ""
     try:
         return model_label(fn(session.cwd, session.session_id))
     except Exception:  # pylint: disable=broad-exception-caught
+        # Contains the OSError the transcript readers raise: a read failure is not the
+        # fact "no model" (see scan_transcript § Property P), and a mirror write must
+        # never crash on it.
         return ""
 
 
@@ -326,12 +341,15 @@ def _transcript_path(session: Session) -> Path:
     return config.claude_home() / "projects" / encoded / f"{session.session_id}.jsonl"
 
 
-def _serialize_session(session: Session, git_base: Path, adapter: ClaudeAdapter) -> str:
+def _serialize_session(
+    session: Session, git_base: Path, adapter: ClaudeAdapter, scan: TranscriptScan | None = None
+) -> str:
     """Canonical SESSION-mirror content — the full rendered conversation.
 
     Same byte-stability contract as :func:`_serialize`: pure function of the session's
     stable fields plus the transcript (mtime-cached render in ``sessionmd``); the only
-    timestamps are the ISO dates of ``created_at`` / ``last_response_at``.
+    timestamps are the ISO dates of ``created_at`` / ``last_response_at``. *scan* is this
+    pass's transcript-scan row, threaded to :func:`_observed_model_label`.
     """
     fm_lines = [
         "---",
@@ -342,7 +360,7 @@ def _serialize_session(session: Session, git_base: Path, adapter: ClaudeAdapter)
         f"repo: {_q(cwd_to_repo(session.cwd, git_base))}",
         # OBSERVED model from the transcript (see _observed_model_label); "" until a real
         # model is recorded. Same field as the running/done mirrors, for consistency.
-        f"model: {_q(_observed_model_label(adapter, session))}",
+        f"model: {_q(_observed_model_label(adapter, session, scan))}",
         # OBSERVED reasoning effort (the persisted session.effort observation, no probe).
         f"effort: {_q(session.effort or '')}",
         f"transcript: {_q(str(_transcript_path(session)))}",
@@ -366,6 +384,7 @@ def _serialize(  # noqa: PLR0913  # pylint: disable=too-many-locals,too-many-arg
     adapter: ClaudeAdapter,
     revisions: list[AimRevision],
     session_link: str = "",
+    scan: TranscriptScan | None = None,
 ) -> str:
     """Canonical mirror content for *session* (``kind`` = :data:`RUNNING` / :data:`DONE`).
 
@@ -375,7 +394,8 @@ def _serialize(  # noqa: PLR0913  # pylint: disable=too-many-locals,too-many-arg
     byte-identical. *revisions* is the session's pre-fetched AIM history (shared with the
     slug computation); *adapter* reads the prompt transcript. *session_link* is the
     session mirror's vault-relative path (no extension) — when set, ``## Transcript``
-    opens with a ``[[…|full session]]`` wikilink to the full-conversation file.
+    opens with a ``[[…|full session]]`` wikilink to the full-conversation file. *scan* is
+    this pass's transcript-scan row, threaded to :func:`_observed_model_label`.
     """
     repo_label = cwd_to_repo(session.cwd, git_base)
     checked, total = store.progress(session.session_id)
@@ -400,7 +420,7 @@ def _serialize(  # noqa: PLR0913  # pylint: disable=too-many-locals,too-many-arg
         # The OBSERVED model the session actually ran on (from the transcript) — unlike
         # llm_overseer/llm_exec, which are job-config defaults for a non-ccc-launched
         # session. "" when no real model has been recorded yet (mirrors deadline: "").
-        f"model: {_q(_observed_model_label(adapter, session))}",
+        f"model: {_q(_observed_model_label(adapter, session, scan))}",
         # The OBSERVED reasoning effort captured onto the session (session.effort); "" until
         # observed. Sits right after model:, both the runtime observations.
         f"effort: {_q(session.effort or '')}",
@@ -540,7 +560,40 @@ def _cleanup_root(root: Path, kind: str, desired: set[str], report: MirrorReport
             pass
 
 
-def _sync_root(  # noqa: PLR0913  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def _scan_for(
+    adapter: ClaudeAdapter,
+    session: Session,
+    scans: dict[str, TranscriptScan],
+    dirty: list[TranscriptScan],
+) -> TranscriptScan | None:
+    """This pass's transcript-scan row for *session*, refreshed against the file.
+
+    *scans* is the persisted table (one read per ``run_mirrors``) updated in place;
+    every row whose transcript actually changed is appended to *dirty* for ONE batched
+    write at the end of the run. A frozen transcript costs one ``stat()`` (the adapter
+    hands back the very same object); a changed one a tail read. ``None`` means "ask the
+    live probe instead" — either the adapter has no ``scan_transcript`` (stubs in tests)
+    or no transcript resolves, which :func:`_observed_model_label` renders as "" anyway.
+    """
+    scan_fn = getattr(adapter, "scan_transcript", None)
+    if scan_fn is None:
+        return None
+    prior = scans.get(session.session_id)
+    try:
+        new = scan_fn(session.cwd, session.session_id, prior)
+    except Exception:  # pylint: disable=broad-exception-caught
+        # A read failure is not a fact (see scan_transcript § Property P): persist
+        # nothing, fall back to the probe, and let the next run retry.
+        return None
+    if new is None:
+        return None
+    if new is not prior:  # identity: the same object means the file was untouched
+        scans[session.session_id] = new
+        dirty.append(new)
+    return new
+
+
+def _sync_root(  # noqa: PLR0913  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     store: Store,
     sessions: list[Session],
     kind: str,
@@ -550,6 +603,8 @@ def _sync_root(  # noqa: PLR0913  # pylint: disable=too-many-arguments,too-many-
     adapter: ClaudeAdapter,
     hist_map: dict[str, list[AimRevision]],
     link_map: dict[str, str],
+    scans: dict[str, TranscriptScan],
+    dirty: list[TranscriptScan],
 ) -> dict[str, Session]:
     """Export every session in *sessions* to *root*, then clean up stale/moved mirrors.
 
@@ -558,6 +613,11 @@ def _sync_root(  # noqa: PLR0913  # pylint: disable=too-many-arguments,too-many-
     running/done body (``_serialize``); *link_map* (session id → vault-relative session
     mirror path) feeds the ``full session`` wikilink. Returns the desired-path map so
     ``run_mirrors`` can derive the link map from the SESSION pass.
+
+    *scans* / *dirty* are the run's shared transcript-scan table and its write batch (see
+    :func:`_scan_for`): each session's row is REFRESHED here, so a standalone
+    ``ccc sync-mirrors`` right after a model switch writes the new model — it does not
+    rely on the daemon having reconciled first.
     """
     first_aim = {
         s.session_id: (hist_map[s.session_id][0].aim if hist_map[s.session_id] else (s.aim or ""))
@@ -565,8 +625,9 @@ def _sync_root(  # noqa: PLR0913  # pylint: disable=too-many-arguments,too-many-
     }
     desired = _target_paths(sessions, root, git_base, first_aim)
     for path_str, session in desired.items():
+        scan = _scan_for(adapter, session, scans, dirty)
         if kind == SESSION:
-            content = _serialize_session(session, git_base, adapter)
+            content = _serialize_session(session, git_base, adapter, scan)
         else:
             content = _serialize(
                 store,
@@ -576,6 +637,7 @@ def _sync_root(  # noqa: PLR0913  # pylint: disable=too-many-arguments,too-many-
                 adapter,
                 hist_map[session.session_id],
                 link_map.get(session.session_id, ""),
+                scan,
             )
         _write_if_changed(Path(path_str), content, session.session_id, report)
     _cleanup_root(root, kind, set(desired), report)
@@ -633,6 +695,13 @@ def run_mirrors(store: Store, cfg: config.Config) -> MirrorReport:
     Export-only: the DB is the sole source of truth. Each enabled root gets a byte-stable
     export of its set (write only on a real change) plus a ``ccc_mirror``-guarded cleanup
     of stale/moved files. A concurrent invocation returns an empty report immediately.
+
+    The persisted transcript scans are loaded ONCE and shared by all three roots, and each
+    session's row is refreshed against its file as it is exported (see :func:`_scan_for`):
+    a frozen transcript costs one ``stat()``, a changed one a tail read, and every changed
+    row is written back in a single batch at the end. That is what lets a standalone
+    ``ccc sync-mirrors`` after a model switch emit the NEW model without waiting for a
+    daemon reconcile pass.
     """
     report = MirrorReport()
     lock = _acquire_lock()
@@ -641,6 +710,8 @@ def run_mirrors(store: Store, cfg: config.Config) -> MirrorReport:
     try:
         git_base = repos.git_base()
         adapter = ClaudeAdapter()
+        scans = store.transcript_scans()
+        dirty: list[TranscriptScan] = []
         sessions = store.list_sessions(include_archived=True)
         running = [s for s in sessions if not s.draft and not s.archived and not s.done]
         done = [s for s in sessions if s.done and not s.draft]
@@ -652,7 +723,17 @@ def run_mirrors(store: Store, cfg: config.Config) -> MirrorReport:
         if cfg.mirror_sessions:
             report.sessions = [s.session_id for s in union]
             desired = _sync_root(
-                store, union, SESSION, sessions_root(cfg), git_base, report, adapter, hist_map, {}
+                store,
+                union,
+                SESSION,
+                sessions_root(cfg),
+                git_base,
+                report,
+                adapter,
+                hist_map,
+                {},
+                scans,
+                dirty,
             )
             link_map = _link_map(desired, Path(cfg.vault_root).expanduser())
         if cfg.mirror_running:
@@ -667,12 +748,27 @@ def run_mirrors(store: Store, cfg: config.Config) -> MirrorReport:
                 adapter,
                 hist_map,
                 link_map,
+                scans,
+                dirty,
             )
         if cfg.mirror_done:
             report.done = [s.session_id for s in done]
             _sync_root(
-                store, done, DONE, done_root(cfg), git_base, report, adapter, hist_map, link_map
+                store,
+                done,
+                DONE,
+                done_root(cfg),
+                git_base,
+                report,
+                adapter,
+                hist_map,
+                link_map,
+                scans,
+                dirty,
             )
+        # ONE batched write for every transcript that actually changed this run; an
+        # all-frozen run writes (and commits) nothing at all.
+        store.put_transcript_scans(dirty)
         return report
     finally:
         _release_lock(lock)

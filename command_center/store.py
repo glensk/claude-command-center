@@ -281,7 +281,8 @@ CREATE TABLE IF NOT EXISTS transcript_scan (
     model            TEXT,
     codex            INTEGER NOT NULL DEFAULT 0,
     codex_scanned_to INTEGER NOT NULL DEFAULT 0,
-    scanned_at       INTEGER NOT NULL DEFAULT 0
+    scanned_at       INTEGER NOT NULL DEFAULT 0,
+    headless         INTEGER
 );
 """
 
@@ -305,7 +306,16 @@ FROM sessions s
 _SESSION_FIELDS = frozenset(field.name for field in dataclasses.fields(Session))
 
 
-def _row_to_session(row: sqlite3.Row, keys: list[str] | None = None) -> Session:
+def _session_columns(row: sqlite3.Row) -> list[tuple[str, int]]:
+    """The ``(field name, positional index)`` pairs of *row* this build's Session knows.
+
+    A property of the SELECT, not of the row, so one call per result set is enough (see
+    :func:`_row_to_session`).
+    """
+    return [(name, i) for i, name in enumerate(row.keys()) if name in _SESSION_FIELDS]
+
+
+def _row_to_session(row: sqlite3.Row, columns: list[tuple[str, int]] | None = None) -> Session:
     # Keep only the columns THIS process's Session knows. The DB is shared by every ccc
     # process on the machine and the code is an editable install, so a long-lived TUI
     # keeps reading rows that a NEWER ccc (another session's hook, the daemon) has just
@@ -313,12 +323,16 @@ def _row_to_session(row: sqlite3.Row, keys: list[str] | None = None) -> Session:
     # argument 'no_codex'" inside the refresh worker (2026-09-02) and the TUI froze on
     # its last frame. A column this build has but the row lacks keeps the dataclass default.
     #
-    # *keys* is that intersection precomputed by the caller: every row of one SELECT has
+    # *columns* is that intersection precomputed by the caller: every row of one SELECT has
     # the same columns, so list_sessions() derives it once instead of re-intersecting ~70
     # column names per row (it does this for every session on every refresh).
-    if keys is None:
-        keys = [key for key in row.keys() if key in _SESSION_FIELDS]
-    data: dict[str, Any] = {key: row[key] for key in keys}
+    #
+    # The values are read POSITIONALLY (`tuple(row)` once, then indexed): `row["name"]`
+    # is a linear scan over the row's ~70 column names, which cost 29 ms of the 88 ms
+    # `list_sessions()` at 637 rows — 18 ms read this way.
+    columns = _session_columns(row) if columns is None else columns
+    values = tuple(row)
+    data: dict[str, Any] = {name: values[i] for name, i in columns}
     for col in _BOOL_COLUMNS:
         if col in data:
             data[col] = bool(data[col])
@@ -326,7 +340,12 @@ def _row_to_session(row: sqlite3.Row, keys: list[str] | None = None) -> Session:
 
 
 def _row_to_scan(row: sqlite3.Row) -> TranscriptScan:
-    """Build a :class:`TranscriptScan` from a ``transcript_scan`` row (bools coerced)."""
+    """Build a :class:`TranscriptScan` from a ``transcript_scan`` row (bools coerced).
+
+    ``headless`` is TRI-STATE: absent (a row an older ccc wrote before the column
+    existed) or NULL both mean "not determined yet" and stay ``None``, so the next scan
+    of that transcript re-probes rather than inheriting a bogus ``False``.
+    """
     return TranscriptScan(
         session_id=str(row["session_id"]),
         path=str(row["path"]),
@@ -336,6 +355,11 @@ def _row_to_scan(row: sqlite3.Row) -> TranscriptScan:
         codex=bool(row["codex"]),
         codex_scanned_to=int(row["codex_scanned_to"]),
         scanned_at=int(row["scanned_at"]),
+        headless=(
+            None
+            if ("headless" not in row.keys() or row["headless"] is None)
+            else bool(row["headless"])
+        ),
     )
 
 
@@ -428,22 +452,49 @@ class Store:  # pylint: disable=too-many-public-methods
     _ADDED_AIM_HISTORY_COLUMNS = {
         "short_aim": "TEXT",
     }
+    # Same, for the transcript_scan table. Nullable on purpose: NULL = "not determined
+    # yet" (a row written before the column existed, or a transcript whose first record
+    # could not be read), which the next scan re-probes — see :func:`_row_to_scan`.
+    _ADDED_TRANSCRIPT_SCAN_COLUMNS = {
+        "headless": "INTEGER",
+    }
+
+    def _add_column(self, table: str, column: str, decl: str) -> None:
+        """``ALTER TABLE`` *table* to add *column*, tolerating a peer that just did it.
+
+        Every ccc process (hooks, daemon, TUI) opens the store and runs this migration,
+        and the DDL runs in autocommit (Python's legacy transaction control only opens an
+        implicit transaction before DML), so two fresh builds can both read the PRAGMA
+        before either ALTER lands and the loser gets "duplicate column name". That is the
+        migration already being done — swallow exactly that error and nothing else.
+        """
+        try:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
 
     def _ensure_columns(self) -> None:
         existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(sessions)")}
         for column, decl in self._ADDED_COLUMNS.items():
             if column not in existing:
-                self.conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} {decl}")
+                self._add_column("sessions", column, decl)
                 if column == "config_dir":
                     self._backfill_config_dir()
         sg_existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(subgoals)")}
         for column, decl in self._ADDED_SUBGOAL_COLUMNS.items():
             if column not in sg_existing:
-                self.conn.execute(f"ALTER TABLE subgoals ADD COLUMN {column} {decl}")
+                self._add_column("subgoals", column, decl)
         ah_existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(aim_history)")}
         for column, decl in self._ADDED_AIM_HISTORY_COLUMNS.items():
             if column not in ah_existing:
-                self.conn.execute(f"ALTER TABLE aim_history ADD COLUMN {column} {decl}")
+                self._add_column("aim_history", column, decl)
+        ts_existing = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(transcript_scan)")
+        }
+        for column, decl in self._ADDED_TRANSCRIPT_SCAN_COLUMNS.items():
+            if column not in ts_existing:
+                self._add_column("transcript_scan", column, decl)
         # Partial index for the armed-fire scan (statusline chip + daemon dispatch).
         # Created HERE, not in _SCHEMA: an old DB only gains fire_at via the ALTER
         # loop above, and an index referencing a missing column would fail the open.
@@ -501,10 +552,10 @@ class Store:  # pylint: disable=too-many-public-methods
         rows = self.conn.execute(sql).fetchall()
         if not rows:
             return []
-        # One intersection for the whole result set (see _row_to_session): the columns are
+        # One intersection for the whole result set (see _session_columns): the columns are
         # a property of the SELECT, not of the row.
-        keys = [key for key in rows[0].keys() if key in _SESSION_FIELDS]
-        return [_row_to_session(r, keys) for r in rows]
+        columns = _session_columns(rows[0])
+        return [_row_to_session(r, columns) for r in rows]
 
     def delete(self, session_id: str) -> None:
         """Remove a session, its sub-goals (FK cascade) and its transcript-scan row.
@@ -834,10 +885,22 @@ class Store:  # pylint: disable=too-many-public-methods
         return {str(row["session_id"]): _row_to_scan(row) for row in rows}
 
     def put_transcript_scans(self, scans: Iterable[TranscriptScan]) -> None:
-        """Persist *scans* (INSERT OR REPLACE) in ONE transaction, ONE commit.
+        """Persist *scans* (UPSERT on ``session_id``) in ONE transaction, ONE commit.
 
         Called once per reconcile pass with only the rows whose transcript actually
         changed, so an all-frozen pass writes (and commits) nothing at all.
+
+        An UPSERT, not ``INSERT OR REPLACE``: a REPLACE deletes and re-inserts the row,
+        which resets every column THIS build does not know about (a newer ccc's — the DB
+        is shared and the code is an editable install) to its default. The explicit
+        ``DO UPDATE SET`` touches only the columns this build owns and leaves the rest of
+        the row intact. ``headless`` NULL is written as NULL (None = undetermined, so the
+        next scan of that file re-probes) — never coerced to 0.
+
+        No ordering / stale-writer guard on purpose: see ``ClaudeAdapter.scan_transcript``
+        § Property P — whichever of two concurrent scanners writes last, the next pass
+        re-derives every fact from the current file, so a stale write costs one bounded
+        re-read and never a wrong sticky fact.
         """
         payload = [
             (
@@ -849,14 +912,20 @@ class Store:  # pylint: disable=too-many-public-methods
                 int(scan.codex),
                 int(scan.codex_scanned_to),
                 int(scan.scanned_at),
+                None if scan.headless is None else int(scan.headless),
             )
             for scan in scans
         ]
         if not payload:
             return
         self.conn.executemany(
-            "INSERT OR REPLACE INTO transcript_scan (session_id, path, mtime_ns, size, model, "
-            "codex, codex_scanned_to, scanned_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO transcript_scan (session_id, path, mtime_ns, size, model, "
+            "codex, codex_scanned_to, scanned_at, headless) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET path=excluded.path, "
+            "mtime_ns=excluded.mtime_ns, size=excluded.size, model=excluded.model, "
+            "codex=excluded.codex, codex_scanned_to=excluded.codex_scanned_to, "
+            "scanned_at=excluded.scanned_at, headless=excluded.headless",
             payload,
         )
         self.conn.commit()

@@ -2111,6 +2111,12 @@ class CommandCenterApp(App[None]):
         # False until the first (stale-while-revalidate) paint has been applied, so the
         # worker knows whether to serve stored rows before the full build.
         self._first_paint_done = False
+        # Codex usage snapshots the refresh WORKER read (label → snapshot, labels per
+        # _codex_homes: "default", "private"), so the render tick never globs+stats a
+        # home's ~1900 rollout files on the UI thread. Read off-loop in _refresh_worker,
+        # installed here by _apply_rows — mutated on the UI thread ONLY. Empty until the
+        # first full build lands, so the cards paint their placeholder for ~1 s.
+        self._codex_usage: dict[str, usage.Usage | None] = {}
         # Set by the fast poll when `ccc restart-tui` asks us to restart: run() re-execs
         # the process in place (same tab) once the app has exited and the terminal restored.
         self.restart_requested = False
@@ -2336,6 +2342,14 @@ class CommandCenterApp(App[None]):
             self.refresh_data()
 
     def _refresh_worker(self) -> None:
+        """Off-loop rebuild: quick first paint, then the full build plus the Codex reads.
+
+        The Codex usage snapshots are read HERE, not in :meth:`_update_usage`: each
+        ``read_codex_usage`` is a glob+stat over every rollout file of that CODEX_HOME
+        (~1900 files, needed even to KEY its in-process cache, and 0.2-0.3 s cold), so it
+        must never run on the UI thread. They ride back to :meth:`_apply_rows` with the
+        rows in one ``call_from_thread`` handoff, which installs them for the render tick.
+        """
         # Worker thread, with its OWN per-run Store (~14 ms): sharing the UI thread's
         # connection across threads intermittently dies with InterfaceError('bad
         # parameter or other API misuse') — pysqlite does not reliably serialize
@@ -2362,6 +2376,20 @@ class CommandCenterApp(App[None]):
                     reconcile_first=False,
                 )
             self.call_from_thread(self._apply_rows, quick)
+        # One read per configured CODEX_HOME, off the UI thread (see the docstring). A
+        # failed read is a None snapshot (the card's placeholder), never an aborted build.
+        snapshots: dict[str, usage.Usage | None] = {}
+        for label, home in self._codex_homes().items():
+            try:
+                # The default home is read with NO argument on purpose: that is the call
+                # every other caller (and core.build_rows) makes, so they share one cache.
+                snapshots[label] = (
+                    usage.read_codex_usage()
+                    if label == "default"
+                    else usage.read_codex_usage(home=home)
+                )
+            except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                snapshots[label] = None
         with Store() as store:
             rows = build_rows(
                 store,
@@ -2370,17 +2398,27 @@ class CommandCenterApp(App[None]):
                 done_max_age_days=self.cfg.done_max_age_days,
                 folder_order=tuple(self.cfg.folder_order),
                 include_future=self._show_future,
+                # Hand the default home's snapshot in so the build does not read it again.
+                codex_usage=snapshots.get("default"),
             )
             self._sync_tab_badges(rows, store)  # AppleScript spawn — belongs off-loop too
         if get_current_worker().is_cancelled:
             return  # superseded by a newer refresh — let that one repaint
-        self.call_from_thread(self._apply_rows, rows)
+        # Rows AND snapshots in ONE handoff: a build that raises publishes neither.
+        self.call_from_thread(self._apply_rows, rows, snapshots)
 
-    def _apply_rows(self, rows: list[Row]) -> None:
+    def _apply_rows(
+        self, rows: list[Row], codex_usage: dict[str, usage.Usage | None] | None = None
+    ) -> None:
         # UI thread: everything the old refresh_data did AFTER build_rows, minus
         # _sync_tab_badges (now done in the worker).
         if self._editing:  # edit mode opened while the worker ran — don't clobber it
             return
+        # Install the snapshots the worker read (see _refresh_worker) — the ONLY writer of
+        # _codex_usage, and it runs on the UI thread. The quick first paint passes none,
+        # which leaves the previous map (empty at startup) in place.
+        if codex_usage is not None:
+            self._codex_usage = codex_usage
         table = self.query_one("#sessions", DataTable)
         previous = self._current
         table.clear()
@@ -2525,13 +2563,22 @@ class CommandCenterApp(App[None]):
         Claude cards read their per-account snapshot (``read_usage`` / ``read_usage
         ("work")``, private gold vs work blue accent) — WHICH account label backs each
         card is first resolved by :func:`accounts.resolve_card_label` (a no-op unless
-        ``claude_account_emails`` hard-links that card to an email); each Codex card is
-        a cheap cached read (the live ``wham/usage`` snapshot or that home's newest
-        session rollout, whichever is newer — ``read_codex_usage``); Copilot's is the
+        ``claude_account_emails`` hard-links that card to an email); Copilot's is the
         cached ``gh`` figure (``read_copilot_usage``) — all reads are cheap. Each card's
         visibility follows its own ``usage_card_*`` render gate. Only the Copilot and
         Codex *fetches* hit the network, gated separately on ``copilot_usage`` /
         ``codex_usage`` and throttled (adaptively: tighter while a job works).
+
+        The two Codex cards render the snapshot the refresh WORKER read and
+        :meth:`_apply_rows` installed in ``self._codex_usage`` — never a
+        ``read_codex_usage`` call from here: that read globs+stats every rollout file of
+        the home (see :meth:`_refresh_worker`). A tick that skipped its build re-renders
+        the SAME snapshot, so the relative reset times keep counting down. Until the first
+        full build lands (~1 s) the map is empty and the cards show the existing
+        ``render_codex_usage(None)`` placeholder; while an inline edit is open
+        (``_editing`` suppresses builds) the figures age by the edit's duration — the
+        countdown still ticks. The ``codex_usage_stale`` FETCH gate below is one stat per
+        home and stays on this thread.
         """
         try:
             private_panel = self.query_one("#usage", Static)
@@ -2560,14 +2607,12 @@ class CommandCenterApp(App[None]):
         work_panel.update(
             usage.render_work_usage(usage.read_usage(work_label) if work_label else None)
         )
-        codex_panel.update(usage.render_codex_usage(usage.read_codex_usage()))
-        # The second ChatGPT login (codex_home_private) is read the same way, just from
-        # its own CODEX_HOME; unconfigured, the card is not drawn at all (see below).
+        codex_panel.update(usage.render_codex_usage(self._codex_usage.get("default")))
+        # The second ChatGPT login (codex_home_private) is snapshotted the same way, just
+        # from its own CODEX_HOME; unconfigured, the card is not drawn at all (see below).
         codex_private_home = self._codex_private_home()
         if codex_private_home is not None:
-            codex_private_panel.update(
-                usage.render_codex_usage(usage.read_codex_usage(home=codex_private_home))
-            )
+            codex_private_panel.update(usage.render_codex_usage(self._codex_usage.get("private")))
         # Both Codex titles carry their account's e-mail, and a `codex login` can swap
         # it, so they are rebuilt every tick — the lookup is mtime-cached, hence cheap.
         # All four titles can also carry a subscription-end date that rolls at midnight

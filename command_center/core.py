@@ -104,13 +104,49 @@ def headless_leak_ids(store: Store, adapter: Adapter, live_ids: set[str]) -> set
     learned to skip the ``sdk`` entrypoint; ``prune`` removes them despite that
     inherited content. Currently-live ids are never included. Shared by ``ccc
     prune`` and the daemon's self-heal pass so both classify identically.
+
+    The verdict comes from the PERSISTED ``TranscriptScan.headless`` fact, not from
+    re-opening every transcript: probing them cost 0.52 s of every prune / daemon pass.
+    This is also the only pass that scans ARCHIVED sessions (``reconcile`` never sees
+    them), so their scan rows are created and refreshed here. The first pass after the
+    upgrade fills the column once; afterwards a frozen transcript costs one ``stat()``.
+    ``headless is None`` is "undetermined" and never prunes.
+
+    ``scan_transcript`` is a concrete-adapter capability, not part of the
+    :class:`Adapter` protocol — an adapter without it (stubs in tests) falls back to the
+    per-session ``is_oneshot_headless`` probe.
     """
-    return {
-        session.session_id
-        for session in store.list_sessions(include_archived=True)
-        if session.session_id not in live_ids
-        and adapter.is_oneshot_headless(session.cwd, session.session_id)
-    }
+    scan_fn = getattr(adapter, "scan_transcript", None)
+    if scan_fn is None:
+        return {
+            session.session_id
+            for session in store.list_sessions(include_archived=True)
+            if session.session_id not in live_ids
+            and adapter.is_oneshot_headless(session.cwd, session.session_id)
+        }
+    scans = store.transcript_scans()
+    dirty: list[TranscriptScan] = []
+    hits: set[str] = set()
+    for session in store.list_sessions(include_archived=True):
+        sid = session.session_id
+        if sid in live_ids:
+            continue
+        prior = scans.get(sid)
+        try:
+            new = scan_fn(session.cwd, sid, prior)
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            # A read failure is not a fact (see scan_transcript § Property P): persist
+            # nothing and let the next pass retry.
+            new = None
+        if new is None:  # no transcript at all → not a headless one-shot
+            continue
+        if new is not prior:  # identity: the same object means the file was untouched
+            scans[sid] = new
+            dirty.append(new)
+        if new.headless is True:  # None = undetermined → never prune on it
+            hits.add(sid)
+    store.put_transcript_scans(dirty)
+    return hits
 
 
 def orphan_launched_ids(store: Store, adapter: Adapter, live_ids: set[str]) -> set[str]:
@@ -222,7 +258,7 @@ def _uses_codex_workflow(adapter: Adapter, session: Session) -> bool:
         return False
     try:
         return bool(fn(session.cwd, session.session_id))
-    except OSError:
+    except OSError:  # a transcript read failure is contained here (see Property P)
         return False
 
 
@@ -239,6 +275,8 @@ def _observed_model(adapter: Adapter, session: Session) -> str:
     try:
         return model_label(fn(session.cwd, session.session_id))
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        # Includes the OSError ``last_model_in_file`` now raises: a read failure is not
+        # the fact "no model" (see ``scan_transcript`` § Property P).
         return ""
 
 
@@ -270,6 +308,8 @@ def _transcript_facts(
     try:
         new = scan_fn(session.cwd, sid, prior)
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        # A read failure (the OSError the transcript readers now raise) is not a fact:
+        # persist NOTHING and let the next pass retry — see scan_transcript § Property P.
         new = None
     if new is None:  # no transcript (never had a turn, or deleted)
         return "", job_hit
@@ -332,16 +372,37 @@ def _settings_effort_cached(config_dir: str, cache: dict[str, str]) -> str:
     return cache[key]
 
 
-def reconcile(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+@dataclass(frozen=True)
+class ReconcilePass:
+    """Everything one :func:`reconcile_pass` learned, so a build reads each source ONCE."""
+
+    scans: dict[str, TranscriptScan]
+    """Transcript facts (session id → :class:`TranscriptScan`), updated and persisted."""
+
+    live_by_id: dict[str, LiveSession]
+    """The pass's single ``adapter.discover()`` registry read, keyed by session id."""
+
+    sessions: list[Session]
+    """The pass's session snapshot — read once after the live loop, with the rows the
+    parking loop wrote refreshed.
+
+    It is the consistency boundary of this pass: a row another process inserts, archives
+    or deletes after the snapshot shows up one build later (the next pass), exactly the
+    class of window the old second ``list_sessions()`` had, so :func:`build_rows` renders
+    one read instead of two.
+    """
+
+
+def reconcile_pass(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
     store: Store, adapter: Adapter, codex_usage: Any = _UNSET
-) -> dict[str, TranscriptScan]:
+) -> ReconcilePass:
     """Sync the store with the live registry; park sessions that are no longer live.
 
-    Returns the transcript scans (session id → :class:`TranscriptScan`) it worked from,
-    already updated for this pass and persisted — :func:`build_rows` reuses them instead of
-    touching the transcripts a second time. *codex_usage* lets a caller that already read
-    the Codex snapshot pass it in rather than have it read twice per build; unset means
-    read it here (every other caller is unchanged).
+    The full pass, returning every source it read exactly once (see
+    :class:`ReconcilePass`) so :func:`build_rows` needs no second registry or session
+    read. :func:`reconcile` is the thin scans-only wrapper every other caller uses.
+    *codex_usage* lets a caller that already read the Codex snapshot pass it in rather
+    than have it read twice per build; unset means read it here.
     """
     snapshot = usage.read_codex_usage() if codex_usage is _UNSET else codex_usage
     codex_block = usage.codex_exhausted_window(snapshot)
@@ -407,9 +468,14 @@ def reconcile(  # pylint: disable=too-many-locals,too-many-branches,too-many-sta
                 if settings_effort:
                     fields["effort"] = settings_effort
         store.update_fields(live.session_id, **fields)
+    # The pass's ONE session read, taken HERE — after the live loop, so every write it
+    # just made (upsert_from_live, status, model, effort, config_dir, version) is already
+    # in it. See ReconcilePass.sessions for the consistency boundary this pins.
+    session_snapshot = store.list_sessions()
+    touched: set[str] = set()
     # Anything tracked but no longer in the live registry is parked (unless done or a
     # draft future job, which has no process and owns its own status until launched).
-    for session in store.list_sessions():
+    for session in session_snapshot:
         if session.session_id in live_by_id or session.draft:
             continue
         # OBSERVED model persists for parked/done sessions too (the transcript outlives the
@@ -435,10 +501,39 @@ def reconcile(  # pylint: disable=too-many-locals,too-many-branches,too-many-sta
             updates["closed_at"] = now_ms()
         if updates:
             store.update_fields(session.session_id, **updates)
+            touched.add(session.session_id)
     # One batched write for every transcript that actually changed (usually a handful of
     # live sessions); an all-frozen pass writes nothing at all.
     store.put_transcript_scans(dirty)
-    return scans
+    # Re-read ONLY the rows this pass wrote, so the caller renders what it just parked
+    # (a freshly stamped PARKED/closed_at row) instead of the pre-write snapshot.
+    sessions = list(session_snapshot)
+    if touched:
+        refreshed: list[Session] = []
+        for session in sessions:
+            if session.session_id not in touched:
+                refreshed.append(session)
+                continue
+            fresh = store.get(session.session_id)
+            if fresh is None or fresh.archived:  # deleted / archived under us → not a row
+                continue
+            refreshed.append(fresh)
+        sessions = refreshed
+    return ReconcilePass(scans=scans, live_by_id=live_by_id, sessions=sessions)
+
+
+def reconcile(
+    store: Store, adapter: Adapter, codex_usage: Any = _UNSET
+) -> dict[str, TranscriptScan]:
+    """Sync the store with the live registry; park sessions that are no longer live.
+
+    Returns the transcript scans (session id → :class:`TranscriptScan`) it worked from,
+    already updated for this pass and persisted — :func:`build_rows` reuses them instead of
+    touching the transcripts a second time. *codex_usage* lets a caller that already read
+    the Codex snapshot pass it in rather than have it read twice per build; unset means
+    read it here (every other caller is unchanged).
+    """
+    return reconcile_pass(store, adapter, codex_usage=codex_usage).scans
 
 
 DEFAULT_FOLDER_ORDER = ("home", "infra", "llms", "sdsc")
@@ -566,6 +661,7 @@ def build_rows(
     folder_order: tuple[str, ...] = DEFAULT_FOLDER_ORDER,
     include_future: bool = True,
     reconcile_first: bool = True,
+    codex_usage: Any = _UNSET,
 ) -> list[Row]:
     """Reconcile, then return display rows grouped strictly by repo category.
 
@@ -581,22 +677,31 @@ def build_rows(
     transcript scans alone — no registry reconcile, no transcript read, no usage read. That
     is the quick first paint (a caller then reconciles in the background and rebuilds); the
     rows are as fresh as the last pass that did reconcile.
+
+    ONE registry read and ONE session read per build: the reconciling path renders the
+    :class:`ReconcilePass` it just made (``discover()`` + the post-live-loop session
+    snapshot with the parked rows refreshed) rather than repeating both. *codex_usage*
+    lets the TUI worker hand in a snapshot it already read; unset means read it here.
     """
     if reconcile_first:
-        # Read the Codex snapshot ONCE and hand it to reconcile (it needs the same one).
-        codex_usage = usage.read_codex_usage()
-        scans = reconcile(store, adapter, codex_usage=codex_usage)
+        # Read the Codex snapshot ONCE and hand it to the pass (it needs the same one).
+        codex_usage = usage.read_codex_usage() if codex_usage is _UNSET else codex_usage
+        pass_ = reconcile_pass(store, adapter, codex_usage=codex_usage)
+        scans = pass_.scans
+        live_by_id = pass_.live_by_id
+        sessions = pass_.sessions
         codex_block = usage.codex_exhausted_window(codex_usage)
     else:  # quick first paint: stored rows + persisted facts only, no transcript/usage work
         scans = store.transcript_scans()
         codex_block = None
-    live_by_id: dict[str, LiveSession] = {ls.session_id: ls for ls in adapter.discover()}
+        live_by_id = {ls.session_id: ls for ls in adapter.discover()}
+        sessions = store.list_sessions()
     codex_label = codex_block[0] if codex_block else None
     codex_reset_at = codex_block[1].resets_at if codex_block else None
     now = now_ms()
     rows: list[Row] = []
     seen: set[str] = set()  # belt-and-suspenders: never emit a session id twice
-    for session in store.list_sessions():
+    for session in sessions:
         if session.session_id in seen:
             continue
         seen.add(session.session_id)

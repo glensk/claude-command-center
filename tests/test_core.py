@@ -10,7 +10,7 @@ import pytest
 
 from command_center import usage
 from command_center.core import Row, build_rows
-from command_center.models import LiveSession, Status, TranscriptScan, now_ms
+from command_center.models import LiveSession, Session, Status, TranscriptScan, now_ms
 from command_center.store import Store
 
 _DAY = 86_400_000
@@ -514,6 +514,243 @@ def test_build_rows_without_reconcile_uses_the_persisted_scans(
     assert rows["plain"].uses_codex_workflow is False
     session = store.get("plain")
     assert session is not None and session.status == Status.IDLE.value  # never reconciled
+    store.close()
+
+
+class _CountingAdapter(_StubAdapter):
+    """A stub whose registry reads are counted (``discover`` calls)."""
+
+    def __init__(self, live: list[LiveSession] | None = None) -> None:
+        self.discovers = 0
+        self._live = live or []
+
+    def discover(self) -> list[LiveSession]:
+        self.discovers += 1
+        return list(self._live)
+
+
+def _count_list_sessions(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Wrap ``Store.list_sessions`` with a call counter; returns the mutable counter."""
+    calls = {"n": 0}
+    orig = Store.list_sessions
+
+    def _counted(self: Store, include_archived: bool = False) -> list[Session]:
+        calls["n"] += 1
+        return orig(self, include_archived)
+
+    monkeypatch.setattr(Store, "list_sessions", _counted)
+    return calls
+
+
+def test_build_rows_reads_the_registry_and_the_sessions_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One registry read and one session read per build.
+
+    ``build_rows`` used to reconcile (which read both) and then read BOTH again for the
+    render — 88 ms of duplicated `list_sessions` per refresh at 639 rows, plus a second
+    registry scan. It now renders the ReconcilePass it just made.
+    """
+    store = Store(tmp_path / "s.db")
+    store.ensure("a", cwd="/repo")
+    store.ensure("b", cwd="/repo")
+    adapter = _CountingAdapter()
+    calls = _count_list_sessions(monkeypatch)
+
+    rows = build_rows(store, adapter)
+    assert {r.session.session_id for r in rows} == {"a", "b"}
+    assert calls["n"] == 1
+    assert adapter.discovers == 1
+
+    # And again for a second build (per-build, not a one-off memo).
+    build_rows(store, adapter)
+    assert calls["n"] == 2
+    assert adapter.discovers == 2
+    store.close()
+
+
+def test_build_rows_renders_the_row_the_same_pass_just_parked(tmp_path: Path) -> None:
+    """The refreshed touched row is what build_rows sees: an idle non-live session is
+    PARKED with a close stamp in the SAME build that parked it (the pre-write snapshot
+    would have shown it as still idle, one refresh behind)."""
+    store = Store(tmp_path / "s.db")
+    store.ensure("gone", cwd="/repo")
+    store.update_fields("gone", status=Status.IDLE.value)
+
+    rows = {r.session.session_id: r for r in build_rows(store, _StubAdapter())}
+    assert rows["gone"].status is Status.PARKED
+    assert rows["gone"].session.status == Status.PARKED.value
+    assert rows["gone"].session.closed_at > 0
+    store.close()
+
+
+def test_build_rows_includes_a_live_session_the_store_had_never_seen(tmp_path: Path) -> None:
+    """The session snapshot is taken AFTER the live loop, so a brand-new live session the
+    pass itself inserted is rendered by that same build."""
+    store = Store(tmp_path / "s.db")
+    assert store.list_sessions() == []
+
+    rows = {r.session.session_id: r for r in build_rows(store, _LiveAdapter("newbie", "/repo"))}
+    assert set(rows) == {"newbie"}
+    assert rows["newbie"].is_open is True
+    store.close()
+
+
+def test_build_rows_snapshot_is_the_passes_consistency_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row another process inserts AFTER this pass's snapshot shows up one build later.
+
+    That window is the documented consistency boundary of ReconcilePass.sessions — the
+    exact same class of window the old second ``list_sessions()`` had, for one read
+    instead of two.
+    """
+    db = tmp_path / "s.db"
+    store = Store(db)
+    store.ensure("known", cwd="/repo")
+
+    orig = Store.list_sessions
+    armed = {"yes": True}
+
+    def _racing(self: Store, include_archived: bool = False) -> list[Session]:
+        rows = orig(self, include_archived)
+        if armed["yes"]:  # a peer ccc process inserts a row right after our snapshot
+            armed["yes"] = False
+            with Store(db) as peer:
+                peer.ensure("late", cwd="/repo")
+        return rows
+
+    monkeypatch.setattr(Store, "list_sessions", _racing)
+    first = {r.session.session_id for r in build_rows(store, _StubAdapter())}
+    assert first == {"known"}  # "late" landed after the snapshot → not in THIS build
+
+    monkeypatch.setattr(Store, "list_sessions", orig)
+    second = {r.session.session_id for r in build_rows(store, _StubAdapter())}
+    assert second == {"known", "late"}  # the next pass sees it
+    store.close()
+
+
+def test_build_rows_accepts_a_codex_usage_snapshot_from_the_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The TUI worker already read the Codex snapshot; handing it in must not read it
+    again (and the default path still calls ``read_codex_usage()`` with no arguments)."""
+
+    def _no_usage() -> usage.Usage | None:
+        raise AssertionError("build_rows must not re-read a snapshot it was handed")
+
+    monkeypatch.setattr(usage, "read_codex_usage", _no_usage)
+    store = Store(tmp_path / "s.db")
+    store.ensure("s1", cwd="/repo")
+    store.update_fields("s1", job_type="codex")
+
+    rows = {
+        r.session.session_id: r
+        for r in build_rows(store, _StubAdapter(), codex_usage=_codex_usage(100.0))
+    }
+    assert rows["s1"].uses_codex_workflow is True
+    assert rows["s1"].codex_reset_label == "5h"  # the handed-in snapshot really was used
+    store.close()
+
+
+def test_headless_leak_ids_reads_the_persisted_fact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prune/daemon classification comes off the persisted ``headless`` fact.
+
+    Probing every transcript cost 0.52 s per pass. The first pass fills the column (for
+    ARCHIVED rows too — reconcile never sees those); the next one opens no file at all.
+    """
+    from command_center.adapters import ClaudeAdapter  # pylint: disable=import-outside-toplevel
+    from command_center.adapters import (
+        claude as claude_mod,  # pylint: disable=import-outside-toplevel
+    )
+    from command_center.core import headless_leak_ids  # pylint: disable=import-outside-toplevel
+
+    proj = tmp_path / "projects" / "-repo"
+    proj.mkdir(parents=True)
+    (proj / "junk.jsonl").write_text('{"type": "queue-operation"}\n', encoding="utf-8")
+    (proj / "real.jsonl").write_text('{"type": "last-prompt"}\n', encoding="utf-8")
+    (proj / "shelved.jsonl").write_text('{"type": "queue-operation"}\n', encoding="utf-8")
+
+    store = Store(tmp_path / "s.db")
+    for sid in ("junk", "real", "shelved", "live"):
+        store.ensure(sid, cwd="/repo")
+    store.update_fields("shelved", archived=True)
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+
+    assert headless_leak_ids(store, adapter, {"live"}) == {"junk", "shelved"}
+    persisted = store.transcript_scans()
+    assert persisted["junk"].headless is True
+    assert persisted["real"].headless is False
+    assert persisted["shelved"].headless is True  # archived rows get their row here
+    assert "live" not in persisted  # live ids are skipped entirely
+
+    # Second pass: the fact is known and the files are untouched → nothing is opened.
+    def _boom(*_args: object, **_kwargs: object) -> bool | None:
+        raise AssertionError("a persisted headless fact must not be re-probed")
+
+    monkeypatch.setattr(claude_mod, "first_record_is_queue_op", _boom)
+    assert headless_leak_ids(store, adapter, {"live"}) == {"junk", "shelved"}
+    assert store.transcript_scans() == persisted  # byte-stable: no rewrite either
+    store.close()
+
+
+def test_headless_leak_ids_falls_back_without_the_scan_capability(tmp_path: Path) -> None:
+    """A stub adapter with no ``scan_transcript`` keeps the legacy per-session probe."""
+    from command_center.core import headless_leak_ids  # pylint: disable=import-outside-toplevel
+
+    class _HeadlessStub(_StubAdapter):
+        def is_oneshot_headless(self, cwd: str, session_id: str) -> bool:
+            return session_id == "junk"
+
+    store = Store(tmp_path / "s.db")
+    for sid in ("junk", "real", "live"):
+        store.ensure(sid, cwd="/repo")
+    assert headless_leak_ids(store, _HeadlessStub(), {"live"}) == {"junk"}
+    assert store.transcript_scans() == {}  # no scan rows without the capability
+    store.close()
+
+
+def test_transcript_facts_persists_nothing_on_a_read_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transcript read failure is not a fact: nothing is persisted and the next pass
+    retries (the readers now RAISE OSError instead of reporting "no model")."""
+    from command_center import core  # pylint: disable=import-outside-toplevel
+    from command_center.adapters import ClaudeAdapter  # pylint: disable=import-outside-toplevel
+    from command_center.adapters import (
+        claude as claude_mod,  # pylint: disable=import-outside-toplevel
+    )
+
+    proj = tmp_path / "projects" / "-repo"
+    proj.mkdir(parents=True)
+    (proj / "sid.jsonl").write_text(
+        '{"type": "assistant", "message": {"role": "assistant", "model": "claude-fable-5", '
+        '"content": [{"type": "text", "text": "x"}]}}\n',
+        encoding="utf-8",
+    )
+    store = Store(tmp_path / "s.db")
+    session = store.ensure("sid", cwd="/repo")
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+
+    real = claude_mod.last_model_in_file
+    failures = {"left": 1}
+
+    def _flaky(path: Path, chunk_size: int = 65536) -> str | None:
+        if failures["left"]:
+            failures["left"] -= 1
+            raise OSError("simulated EIO")
+        return real(path, chunk_size)
+
+    monkeypatch.setattr(claude_mod, "last_model_in_file", _flaky)
+    scans: dict[str, TranscriptScan] = {}
+    dirty: list[TranscriptScan] = []
+    assert core._transcript_facts(adapter, session, scans, dirty) == ("", False)  # pylint: disable=protected-access
+    assert dirty == [] and scans == {}  # nothing learned → nothing written
+
+    assert core._transcript_facts(adapter, session, scans, dirty) == ("fable-5", False)  # pylint: disable=protected-access
+    assert [row.model for row in dirty] == ["claude-fable-5"]
     store.close()
 
 

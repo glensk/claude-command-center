@@ -19,6 +19,14 @@ Subcommands:
 # not importing textual/daemon/llm at startup. Command handlers share a uniform
 # (args) signature, so some ignore it (unused-argument). build_parser is long by
 # nature (too-many-statements).
+#
+# Hot path: Claude Code's status line spawns THREE ccc processes per render per live
+# session every ~3 s, every hook event spawns `ccc hook <event>`, and the shell
+# integration spawns `ccc tab-symbol --print "$PWD"` on every `cd` — 400+ ~90 ms
+# processes a minute with a handful of live sessions. Two costs are pure overhead
+# there: building all ~80 subparsers (~17 ms) and importing `llmrouting` (~5 ms, it
+# pulls subprocess). So `main` hands `build_parser` the ONE hot subcommand it is about
+# to run (see `_HOT_SUBCOMMANDS`) and `llmrouting` is imported only where it is used.
 # pylint: disable=import-outside-toplevel,unused-argument,too-many-statements
 
 from __future__ import annotations
@@ -38,8 +46,10 @@ import json
 import os
 import re
 import sys
+from collections.abc import Callable
+from typing import Any
 
-from . import __version__, config, llmrouting
+from . import __version__, config, hookspec
 from .adapters import ClaudeAdapter
 from .models import (
     DEFAULT_LLM,
@@ -118,6 +128,8 @@ def _spawn_sync_mirrors(cfg: config.Config) -> None:
 # --------------------------------------------------------------------------- #
 def cmd_llm_routing(_args: argparse.Namespace) -> int:
     """`ccc llm-routing` — the same table `ccc --help` embeds, on demand."""
+    from . import llmrouting
+
     print(llmrouting.render(), end="")
     return 0
 
@@ -3556,11 +3568,135 @@ def cmd_tab_symbol(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # argument parser
 # --------------------------------------------------------------------------- #
-def build_parser() -> argparse.ArgumentParser:
+_DESCRIPTION = "Command center for parked Claude Code sessions (AIM, progress, next-step)."
+
+
+# The hot subcommands, each built by ONE function used by both parser modes (see
+# build_parser). `sub` is argparse's private _SubParsersAction, hence the Any.
+def _add_statusline(sub: Any) -> None:
+    """`ccc statusline` — spawned twice per status-line render, per live session."""
+    p_sl = sub.add_parser("statusline", help="emit the two extra status-line rows for a session")
+    p_sl.add_argument(
+        "--session",
+        help="session id; omit to derive it from the session_id in the status-line JSON on stdin",
+    )
+    p_sl.add_argument(
+        "--capture-usage",
+        action="store_true",
+        help="also persist the account /usage snapshot from the status-line JSON on stdin",
+    )
+    p_sl.add_argument(
+        "--print-glyph",
+        action="store_true",
+        help="print only the current account's badge glyph (🏠/💼) and exit",
+    )
+    p_sl.set_defaults(func=cmd_statusline)
+
+
+def _add_aim(sub: Any) -> None:
+    """`ccc aim` — the status line's progress-bar lookup, once per render."""
+    p_aim = sub.add_parser("aim", help="status-line lookup of a session's done-condition")
+    p_aim.add_argument("--session")
+    p_aim.add_argument("--format", choices=["statusline", "plain", "bar"], default="statusline")
+    p_aim.set_defaults(func=cmd_aim)
+
+
+def _add_hook(sub: Any) -> None:
+    """`ccc hook <event>` — spawned by Claude Code on every hook event."""
+    p_hook = sub.add_parser("hook", help="internal: invoked by Claude Code hooks")
+    p_hook.add_argument("event", choices=hookspec.HOOK_EVENTS)
+    p_hook.set_defaults(func=cmd_hook)
+
+
+def _add_tab_symbol(sub: Any) -> None:
+    """`ccc tab-symbol` — spawned by the shell integration on every `cd`."""
+    p_sym = sub.add_parser(
+        "tab-symbol",
+        help="print a repo's deterministic badge, or claim this iTerm tab's badge",
+        description=(
+            "Prints a distinct colored emoji for a repo. With --print [PATH] it prints "
+            "the DETERMINISTIC per-repo symbol for PATH (or the cwd) — no iTerm needed, so "
+            "the cross-terminal shell badge hook (ccc install-shell) uses it on Linux and "
+            "any plain terminal. Without --print it assigns/reads the current iTerm tab's "
+            "unique badge ($ITERM_SESSION_ID), idempotent per tab, persisted under "
+            "~/.cache/iterm-tab-symbol/, so the tab title and the command-center row show "
+            "the same badge to tell same-folder sessions apart."
+        ),
+    )
+    p_sym.add_argument("path", nargs="?", help="path to symbol for --print (default: cwd)")
+    p_sym.add_argument(
+        "-p",
+        "--print",
+        dest="print_only",
+        action="store_true",
+        help="print PATH's deterministic per-repo symbol (no iTerm); for the shell hook",
+    )
+    p_sym.add_argument(
+        "-c",
+        "--color",
+        action="store_true",
+        help="with --print, also print the repo's colour (hex/name)",
+    )
+    p_sym.add_argument("-i", "--session-id", help="override $ITERM_SESSION_ID (the tab key)")
+    p_sym.add_argument(
+        "-r", "--read", action="store_true", help="print the existing badge only; do not assign"
+    )
+    p_sym.add_argument(
+        "-S",
+        "--sync",
+        action="store_true",
+        help="re-apply every tracked live tab's '<emoji> repo' title via AppleScript "
+        "(badge tabs that were already open before the hook landed)",
+    )
+    p_sym.set_defaults(func=cmd_tab_symbol)
+
+
+#: The subcommands `build_parser(only=...)` can build on their own — the ONLY thing
+#: that decides who gets the short path. Adding a high-frequency spawn here is the
+#: whole fix; `ccc doctor`'s "Spawn fast path" section reports what misses it.
+_HOT_SUBCOMMANDS: dict[str, Callable[[Any], None]] = {
+    "statusline": _add_statusline,
+    "aim": _add_aim,
+    "hook": _add_hook,
+    "tab-symbol": _add_tab_symbol,
+}
+
+
+def build_parser(only: str | None = None) -> argparse.ArgumentParser:
+    """The `ccc` parser — all ~80 subcommands, or (``only=<name>``) a single hot one.
+
+    Why: the status line spawns three ccc processes per render per live session every
+    ~3 s, each hook event one more, the shell badge hook one per `cd`. Building every
+    subparser costs ~17 ms of a ~90 ms process and is thrown away except for the one
+    subcommand that actually runs, so `main` passes the hot argv[0] as *only*.
+
+    The invariant that keeps the two modes honest: the SAME `_add_*` function builds the
+    subparser in both, so every argv form of a hot subcommand — its options, `-h`, and
+    its argparse errors — behaves and reads identically; there is no list of supported
+    forms to keep in sync. Full mode calls those functions in their original positions,
+    so `ccc -h` lists the commands in the same order as before. Short mode omits only
+    the epilog (a subcommand's help never prints the root epilog, and building it would
+    import `llmrouting`). :data:`_HOT_SUBCOMMANDS` is the ONLY thing that decides who
+    gets the short path; an unknown *only* falls back to the full parser.
+    """
+    if only is not None:
+        add_hot = _HOT_SUBCOMMANDS.get(only)
+        if add_hot is not None:
+            hot = argparse.ArgumentParser(
+                prog="ccc",
+                formatter_class=argparse.RawDescriptionHelpFormatter,
+                description=_DESCRIPTION,
+            )
+            hot.add_argument("--version", action="version", version=f"ccc {__version__}")
+            add_hot(hot.add_subparsers(dest="command"))
+            return hot
+
+    from . import llmrouting
+
     parser = argparse.ArgumentParser(
         prog="ccc",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Command center for parked Claude Code sessions (AIM, progress, next-step).",
+        description=_DESCRIPTION,
         epilog=(
             "background daemon: a launchd agent runs `ccc daemon` every few minutes to\n"
             "auto-close idle sessions, refresh summaries and fire alerts — see\n"
@@ -3583,27 +3719,9 @@ def build_parser() -> argparse.ArgumentParser:
         "llm-routing", help="which model each ccc LLM action uses now (and what it bills)"
     ).set_defaults(func=cmd_llm_routing)
 
-    p_aim = sub.add_parser("aim", help="status-line lookup of a session's done-condition")
-    p_aim.add_argument("--session")
-    p_aim.add_argument("--format", choices=["statusline", "plain", "bar"], default="statusline")
-    p_aim.set_defaults(func=cmd_aim)
+    _add_aim(sub)
 
-    p_sl = sub.add_parser("statusline", help="emit the two extra status-line rows for a session")
-    p_sl.add_argument(
-        "--session",
-        help="session id; omit to derive it from the session_id in the status-line JSON on stdin",
-    )
-    p_sl.add_argument(
-        "--capture-usage",
-        action="store_true",
-        help="also persist the account /usage snapshot from the status-line JSON on stdin",
-    )
-    p_sl.add_argument(
-        "--print-glyph",
-        action="store_true",
-        help="print only the current account's badge glyph (🏠/💼) and exit",
-    )
-    p_sl.set_defaults(func=cmd_statusline)
+    _add_statusline(sub)
 
     p_set_aim = sub.add_parser("set-aim", help="set 'this session is done when: ...'")
     p_set_aim.add_argument("text")
@@ -4259,22 +4377,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_syncm.set_defaults(func=cmd_sync_mirrors)
 
-    p_hook = sub.add_parser("hook", help="internal: invoked by Claude Code hooks")
-    p_hook.add_argument(
-        "event",
-        choices=[
-            "session-start",
-            "user-prompt",
-            "pre-tool-use",
-            "post-tool-use",
-            "stop",
-            "release-locks",
-            "session-end",
-            "pre-compact",
-            "subagent-stop",
-        ],
-    )
-    p_hook.set_defaults(func=cmd_hook)
+    _add_hook(sub)
 
     p_ih = sub.add_parser(
         "install-hooks",
@@ -4556,45 +4659,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ap.add_argument("-v", "--verbose", action="store_true", help="also print skip reasons")
     p_ap.set_defaults(func=cmd_autoprogress)
 
-    p_sym = sub.add_parser(
-        "tab-symbol",
-        help="print a repo's deterministic badge, or claim this iTerm tab's badge",
-        description=(
-            "Prints a distinct colored emoji for a repo. With --print [PATH] it prints "
-            "the DETERMINISTIC per-repo symbol for PATH (or the cwd) — no iTerm needed, so "
-            "the cross-terminal shell badge hook (ccc install-shell) uses it on Linux and "
-            "any plain terminal. Without --print it assigns/reads the current iTerm tab's "
-            "unique badge ($ITERM_SESSION_ID), idempotent per tab, persisted under "
-            "~/.cache/iterm-tab-symbol/, so the tab title and the command-center row show "
-            "the same badge to tell same-folder sessions apart."
-        ),
-    )
-    p_sym.add_argument("path", nargs="?", help="path to symbol for --print (default: cwd)")
-    p_sym.add_argument(
-        "-p",
-        "--print",
-        dest="print_only",
-        action="store_true",
-        help="print PATH's deterministic per-repo symbol (no iTerm); for the shell hook",
-    )
-    p_sym.add_argument(
-        "-c",
-        "--color",
-        action="store_true",
-        help="with --print, also print the repo's colour (hex/name)",
-    )
-    p_sym.add_argument("-i", "--session-id", help="override $ITERM_SESSION_ID (the tab key)")
-    p_sym.add_argument(
-        "-r", "--read", action="store_true", help="print the existing badge only; do not assign"
-    )
-    p_sym.add_argument(
-        "-S",
-        "--sync",
-        action="store_true",
-        help="re-apply every tracked live tab's '<emoji> repo' title via AppleScript "
-        "(badge tabs that were already open before the hook landed)",
-    )
-    p_sym.set_defaults(func=cmd_tab_symbol)
+    _add_tab_symbol(sub)
 
     p_peek = sub.add_parser(
         "peek",
@@ -4754,7 +4819,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
+    # Normalise argv FIRST: the same list decides the parser mode and is parsed, so an
+    # explicit argv and a real command line take exactly the same path.
+    argv = sys.argv[1:] if argv is None else list(argv)
+    only = argv[0] if argv and argv[0] in _HOT_SUBCOMMANDS else None
+    parser = build_parser(only=only)
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):
         # Default surface: the interactive TUI in a terminal, the flat list when piped.
