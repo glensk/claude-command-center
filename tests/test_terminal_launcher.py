@@ -146,3 +146,145 @@ def test_resume_halted_tmux_command(
     )
     assert rec.calls[-1][-1] == f"{_PIN}/x/claude-session-continue.py abc now"
     assert ["-c", str(tmp_path)] == rec.calls[-1][4:6]
+
+
+# --------------------------- rung reporting (tp#90) --------------------------- #
+def test_open_tab_reports_the_rung_that_landed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(terminal, "_iterm", lambda _c: False)
+    monkeypatch.setattr(terminal, "_iterm_api_tab", lambda _c: False)
+    monkeypatch.setattr(terminal, "_tmux_window", lambda _c, cwd=None: True)
+    assert terminal._open_tab("x", tmux_fallback=True) == terminal.LAUNCHER_TMUX
+    assert terminal._open_tab("x", tmux_fallback=False) == ""  # resume paths never tmux
+    monkeypatch.setattr(terminal, "_iterm_api_tab", lambda _c: True)
+    assert terminal._open_tab("x", tmux_fallback=False) == terminal.LAUNCHER_ITERM_API
+    monkeypatch.setattr(terminal, "_iterm", lambda _c: True)
+    assert terminal._open_tab("x", tmux_fallback=False) == terminal.LAUNCHER_ITERM_APPLESCRIPT
+    assert terminal.TAB_LAUNCHERS == {"iterm_applescript", "iterm_api"}
+    assert terminal.LAUNCHERS == terminal.TAB_LAUNCHERS | {"tmux"}
+
+
+def test_start_job_launch_names_the_rung_and_the_bool_twin_agrees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "load_config", lambda: _cfg("iterm"))
+    monkeypatch.setattr(terminal.shutil, "which", _which(_BOTH_TOOLS))
+    seen: list[str] = []
+
+    def fake_iterm(command: str) -> bool:
+        seen.append(command)
+        return False
+
+    monkeypatch.setattr(terminal, "_iterm", fake_iterm)
+    monkeypatch.setattr(terminal, "_iterm_api_tab", lambda _c: False)
+    monkeypatch.setattr(terminal.subprocess, "run", _RunRecorder())
+
+    assert terminal.start_job_launch("deadbeef") == terminal.LAUNCHER_TMUX
+    assert seen == ["ccc start-job deadbeef"]
+    assert terminal.start_job_in_new_tab("deadbeef") is True
+    assert terminal.start_job_launch("deadbeef", force=True, auto=True) == terminal.LAUNCHER_TMUX
+    assert seen[-1] == "ccc start-job --force --auto deadbeef"
+
+
+def test_api_rung_never_connects_unless_iterm_auth_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stale-cookie regression (tp#90).
+
+    With ITERM2_COOKIE/KEY inherited, the ``iterm2`` package would 401 and force a fresh
+    AppleScript cookie request with NO timeout — the exact hang the ladder must never
+    reach. So the rung must not even connect unless iTerm2's auth-disable switch is set.
+    """
+    import sys
+    import types
+
+    monkeypatch.setenv("ITERM2_COOKIE", "stale")
+    monkeypatch.setenv("ITERM2_KEY", "stale")
+    connects: list[int] = []
+
+    class _Conn:
+        @staticmethod
+        async def async_create() -> None:
+            connects.append(1)
+            raise RuntimeError("401 — with auth disabled the package raises at once, no re-auth")
+
+    fake_auth = types.ModuleType("iterm2.auth")
+    fake_auth.applescript_auth_disabled = lambda: False  # type: ignore[attr-defined]
+    fake = types.ModuleType("iterm2")
+    fake.Connection = _Conn  # type: ignore[attr-defined]
+    fake.auth = fake_auth  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "iterm2", fake)
+    monkeypatch.setitem(sys.modules, "iterm2.auth", fake_auth)
+
+    assert terminal._iterm_api_tab("echo x") is False
+    assert connects == []  # gated BEFORE any connection attempt
+
+    fake_auth.applescript_auth_disabled = lambda: True  # type: ignore[attr-defined]
+    assert terminal._iterm_api_tab("echo x") is False  # connect fails fast → False, no hang
+    assert connects == [1]
+
+
+def test_send_text_pre_checks_the_grant_with_a_bounded_apple_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prompt injection has no AppleScript rung ahead of it: a 5 s version query stands in."""
+    monkeypatch.setattr(terminal, "_iterm_api_auth_is_tcc_free", lambda: False)
+    scripts: list[tuple[str, float]] = []
+
+    def fake_osascript(script: str, timeout: float = 10) -> str | None:
+        scripts.append((script, timeout))
+        return None  # denied / pending prompt / no osascript
+
+    monkeypatch.setattr(terminal, "_osascript", fake_osascript)
+    monkeypatch.setattr(
+        terminal.subprocess, "run", lambda *a, **k: pytest.fail("must not reach the API connect")
+    )
+    assert terminal.send_text_to_session("w0t0p0:ABC", "hello") is False
+    assert scripts == [('tell application "iTerm2" to version', 5)]
+
+
+def test_degraded_launch_warning_only_on_a_mac_set_to_iterm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "load_config", lambda: _cfg("iterm"))
+    monkeypatch.setattr(terminal.shutil, "which", _which(_BOTH_TOOLS))
+    monkeypatch.setattr(terminal.sys, "platform", "darwin")
+    warning = terminal.degraded_launch_warning(terminal.LAUNCHER_TMUX)
+    assert warning.startswith("warning:") and "tmux attach -t" in warning
+    assert terminal.degraded_launch_warning(terminal.LAUNCHER_ITERM_APPLESCRIPT) == ""
+    assert terminal.degraded_launch_warning("") == ""
+    # Linux: the default "iterm" config auto-falls to tmux — intended, silent.
+    monkeypatch.setattr(terminal.sys, "platform", "linux")
+    assert terminal.degraded_launch_warning(terminal.LAUNCHER_TMUX) == ""
+    # A Mac configured for tmux: intended, silent.
+    monkeypatch.setattr(terminal.sys, "platform", "darwin")
+    monkeypatch.setattr(config, "load_config", lambda: _cfg("tmux"))
+    assert terminal.degraded_launch_warning(terminal.LAUNCHER_TMUX) == ""
+    # A Mac without osascript: automatic tmux mode — intended, silent.
+    monkeypatch.setattr(config, "load_config", lambda: _cfg("iterm"))
+    monkeypatch.setattr(
+        terminal.shutil, "which", _which({"tmux": "/usr/bin/tmux", "osascript": None})
+    )
+    assert terminal.degraded_launch_warning(terminal.LAUNCHER_TMUX) == ""
+
+
+def test_probe_launch_prints_only_a_framed_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    import shlex
+
+    monkeypatch.setattr(config, "load_config", lambda: _cfg("iterm"))
+    monkeypatch.setattr(terminal.shutil, "which", _which(_BOTH_TOOLS))
+    seen: list[str] = []
+
+    def fake_iterm(command: str) -> bool:
+        seen.append(command)
+        return True
+
+    monkeypatch.setattr(terminal, "_iterm", fake_iterm)
+    marker, launcher = terminal.probe_launch()
+    assert launcher == terminal.LAUNCHER_ITERM_APPLESCRIPT
+    prefix, nonce = marker.split(" ")
+    assert prefix == terminal.PROBE_MARKER_PREFIX and len(nonce) == 12
+    assert seen == [f"printf '%s\\n' {shlex.quote(marker)}"]  # nothing but the marker
+    # tmux mode: a window that closes itself, reported as tmux.
+    monkeypatch.setattr(config, "load_config", lambda: _cfg("tmux"))
+    monkeypatch.setattr(terminal.subprocess, "run", _RunRecorder())
+    assert terminal.probe_launch()[1] == terminal.LAUNCHER_TMUX
