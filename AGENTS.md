@@ -56,9 +56,15 @@ The invariants that keep it under a few seconds:
   and `scan_transcript` then publishes no row (every caller contains the exception and
   retries next pass). Property P (`scan_transcript` docstring): every persisted row has
   `codex_scanned_to <= size` and any identity mismatch re-derives every fact from the
-  current file, so concurrent scanners need no ordering guard on the upsert.
+  current file (the one exception is `codex=True`, sticky for the session's life: a
+  workflow use cannot un-happen, and an append-only file re-finds its marker anyway), so
+  concurrent scanners need no ordering guard on the upsert. A read that fails or finds
+  no file answers from the prior row (`core._transcript_facts`) — the row `build_rows`
+  renders — so one pass never disagrees with its own rows.
 - **Read the tail, not the file.** `last_model_in_file` walks backwards in 64 KiB blocks;
-  `codex_marker_in_file` resumes from `codex_scanned_to` (transcripts are append-only).
+  `codex_marker_in_file` resumes `len(marker)-1` bytes before `codex_scanned_to`
+  (transcripts are append-only, but a live one can be caught mid-write: the previous pass
+  may have covered only the first half of a marker).
 - **One registry read and one session read per build.** `build_rows(reconcile_first=True)`
   renders the `ReconcilePass` it just made: `discover()` once, `list_sessions()` once —
   taken AFTER the live loop, with the rows the parking loop wrote refreshed. That snapshot

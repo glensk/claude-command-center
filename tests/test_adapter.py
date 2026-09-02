@@ -355,7 +355,12 @@ def test_claude_version(tmp_path: Path) -> None:
     assert adapter.claude_version("/repo", "missing") is None
 
 
-def test_uses_codex_workflow_scans_transcript_and_mtime_caches(tmp_path: Path) -> None:
+def test_uses_codex_workflow_scans_transcript_and_mtime_caches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The in-process cache is keyed on ``(mtime_ns, size)``: an unchanged transcript is
+    answered without opening the file, a grown one is read from the recorded offset (minus
+    the marker-length rewind) and the appended marker is found."""
     from command_center.adapters import claude as claude_mod
 
     claude_mod._CODEX_WORKFLOW_CACHE.clear()
@@ -369,22 +374,28 @@ def test_uses_codex_workflow_scans_transcript_and_mtime_caches(tmp_path: Path) -
     os.utime(path, (base_mtime, base_mtime))
     assert adapter.uses_codex_workflow("/repo", "sid") is False
 
-    # Same mtime: cached false is reused, like the prompt cache for frozen transcripts.
-    path.write_text(
-        _rec(
-            type="user",
-            message={
-                "role": "user",
-                "content": f"<command-name>/{CODEX_WORKFLOW_NAME}</command-name>",
-            },
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    os.utime(path, (base_mtime, base_mtime))
-    assert adapter.uses_codex_workflow("/repo", "sid") is False
+    # Same (mtime, size) identity: the cached False is reused, the file is not even opened.
+    real = claude_mod.codex_marker_in_file
 
-    # Mtime moved: a growing transcript is re-read and the command marker is detected.
+    def _boom(*_args: object, **_kwargs: object) -> tuple[bool, int]:
+        raise AssertionError("an unchanged transcript must not be re-read")
+
+    monkeypatch.setattr(claude_mod, "codex_marker_in_file", _boom)
+    assert adapter.uses_codex_workflow("/repo", "sid") is False
+    monkeypatch.setattr(claude_mod, "codex_marker_in_file", real)
+
+    # Grown (append-only): the appended bytes are read and the command marker is detected.
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            _rec(
+                type="user",
+                message={
+                    "role": "user",
+                    "content": f"<command-name>/{CODEX_WORKFLOW_NAME}</command-name>",
+                },
+            )
+            + "\n"
+        )
     os.utime(path, (base_mtime + 1, base_mtime + 1))
     assert adapter.uses_codex_workflow("/repo", "sid") is True
     assert adapter.uses_codex_workflow("/repo", "missing") is False
@@ -593,6 +604,41 @@ def test_codex_marker_in_file_scans_a_byte_range(tmp_path: Path) -> None:
 
     # A start past the end means the file was truncated/rewritten → rescan from 0.
     assert codex_marker_in_file(present, start=size + 10_000) == (True, size)
+
+
+def test_codex_marker_split_across_two_passes_is_found_on_resume(tmp_path: Path) -> None:
+    """A live transcript can be caught mid-write: pass 1 sees only the first half of the
+    marker and records its offset; pass 2 resumes there. The resume rewinds len(marker)-1
+    bytes, so the straddling marker is found — through the raw scanner and through the
+    persisted ``scan_transcript`` contract alike."""
+    from command_center.adapters.claude import codex_marker_in_file
+
+    marker = f"<command-name>/{CODEX_WORKFLOW_NAME}"
+    plain = _rec(type="user", message={"role": "user", "content": "normal ask"}) + "\n"
+    line = _rec(type="user", message={"role": "user", "content": marker + "</command-name>"})
+    line += "\n"
+    cut = line.index(marker) + len(marker) // 2  # mid-marker (ASCII: chars == bytes)
+
+    path = tmp_path / "t.jsonl"
+    path.write_text(plain + line[:cut], encoding="utf-8")
+    found, offset = codex_marker_in_file(path)
+    assert (found, offset) == (False, path.stat().st_size)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line[cut:])
+    assert codex_marker_in_file(path, start=offset) == (True, path.stat().st_size)
+
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    proj = tmp_path / "projects" / "-repo"
+    proj.mkdir(parents=True)
+    tpath = proj / "sid.jsonl"
+    tpath.write_text(plain + line[:cut], encoding="utf-8")
+    first = adapter.scan_transcript("/repo", "sid", None)
+    assert first is not None and first.codex is False
+    assert first.codex_scanned_to == first.size  # the resume point is mid-marker
+    with tpath.open("a", encoding="utf-8") as handle:
+        handle.write(line[cut:])
+    second = adapter.scan_transcript("/repo", "sid", first)
+    assert second is not None and second.codex is True
 
 
 def test_transcript_readers_raise_on_a_read_failure(tmp_path: Path) -> None:

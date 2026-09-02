@@ -325,7 +325,11 @@ def codex_marker_in_file(path: Path, start: int = 0, chunk_size: int = 1 << 20) 
     Returns ``(found, size)``: the size is the offset the scan covered, so the next pass
     over an append-only transcript can resume there instead of re-reading the whole file
     (a full-file scan of every session cost ~7 s of a cold ``ccc ls``). Consecutive chunks
-    overlap by ``len(marker) - 1`` bytes so a marker straddling a boundary is still found.
+    overlap by ``len(marker) - 1`` bytes so a marker straddling a boundary is still found,
+    and a resume rewinds by the same ``len(marker) - 1`` bytes: a live transcript can be
+    caught mid-write, so the pass that recorded *start* may have covered the first half of
+    a marker whose second half landed later. The rewound window is one byte too short to
+    hold a whole marker, so it can never re-find one that ended at or before *start*.
     A *start* past the end means the file was truncated or rewritten under us, so the scan
     restarts from 0.
 
@@ -338,7 +342,9 @@ def codex_marker_in_file(path: Path, start: int = 0, chunk_size: int = 1 << 20) 
     overlap = len(marker) - 1
     with path.open("rb") as handle:
         size = handle.seek(0, os.SEEK_END)
-        pos = start if 0 <= start <= size else 0
+        # Cross-pass split (see the docstring): re-read the last ``overlap`` bytes before
+        # *start* — bounded, and never enough to re-find an already-covered marker.
+        pos = max(0, start - overlap) if 0 <= start <= size else 0
         handle.seek(pos)
         carry = b""  # tail of the previous chunk, in case the marker straddles
         while pos < size:
