@@ -298,17 +298,36 @@ def _sync_mirrors(store: Store, cfg: config.Config) -> None:
     """Reconcile the RUNNING/DONE/SESSION mirrors, in-process (best-effort).
 
     Gated on the ``mirror_running`` / ``mirror_done`` / ``mirror_sessions`` kill-switches;
-    a sync failure (a bad file, a disk error) is caught and logged so it can never break
-    the housekeeping pass.
+    a sync failure (a bad file, a disk error, even an ImportError) is caught and logged so
+    it can never break the housekeeping pass.
+
+    The two scrubber outcomes are surfaced as ONE stderr line each (the daemon's log is
+    the only place a background pass can speak): a withheld write means the vault is
+    stale on purpose and needs attention, a redaction means the scrubber earned its keep.
+    Only counts, reasons and LABELS are logged — never a card's content and never the
+    path of a secret.
     """
     if not (cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions):
         return
-    from . import mirrors
-
     try:
-        mirrors.run_mirrors(store, cfg)
+        from . import mirrors
+
+        report = mirrors.run_mirrors(store, cfg)
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         print(f"daemon: mirror sync failed: {exc}", file=sys.stderr)
+        return
+    if report.withheld:
+        print(
+            f"daemon: mirror scrubber withheld {len(report.withheld)} write(s) — "
+            f"{report.withheld[0][1]}",
+            file=sys.stderr,
+        )
+    if report.scrubbed:
+        labels = sorted({label for _path, card_labels in report.scrubbed for label in card_labels})
+        print(
+            f"daemon: mirror scrubber redacted {len(report.scrubbed)} card(s): {', '.join(labels)}",
+            file=sys.stderr,
+        )
 
 
 def _sync_future_files(store: Store, cfg: config.Config) -> None:

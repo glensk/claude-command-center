@@ -2578,29 +2578,49 @@ def cmd_sync_mirrors(args: argparse.Namespace) -> int:
     session, byte-stable (writes only on a real change) and ``ccc_mirror``-guarded (only
     ever touches its own generated files). Idempotent + flock-guarded — safe to fire from
     the daemon and every lifecycle command. ``-v`` prints the per-item detail log.
+
+    Every card passes the credential scrubber first (``mirror_scrub_cmd``); a card it
+    does not vouch for is NOT written and the file on disk is left alone. Exit 3 says
+    exactly that happened — the vault is intact but incomplete, so it is distinct from
+    the exit 2 of a failed pass. ``-F/--full`` lifts the per-pass scrub budgets (the
+    one-off migration of an existing vault), ``-R/--rescrub`` forgets every vouch first
+    (a new rule set); a deferred card alone is not a failure (exit 0).
     """
     from . import mirrors
 
     cfg = config.load_config()
     try:
         with Store() as store:
-            report = mirrors.run_mirrors(store, cfg)
+            report = mirrors.run_mirrors(
+                store,
+                cfg,
+                full=getattr(args, "full", False),
+                rescrub=getattr(args, "rescrub", False),
+            )
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         print(f"error: sync-mirrors failed: {exc}", file=sys.stderr)
         return 2
     print(
         f"sync-mirrors: running={len(report.running)} done={len(report.done)} "
         f"sessions={len(report.sessions)} "
-        f"written={len(report.written)} removed={len(report.removed)}"
+        f"written={len(report.written)} removed={len(report.removed)} "
+        f"vouched={len(report.vouched)} scrubbed={len(report.scrubbed)} "
+        f"withheld={len(report.withheld)} deferred={len(report.deferred)}"
     )
     if getattr(args, "verbose", False):
         for sid in report.written:
             print(f"  wrote  {sid}")
         for path in report.removed:
             print(f"  removed {path}")
+        for path, labels in report.scrubbed:
+            print(f"  scrubbed {path} [{', '.join(labels)}]")
+        for path, reason in report.withheld:
+            print(f"  withheld {path}: {reason}")
+        for path in report.deferred:
+            print(f"  deferred {path}")
         for detail in report.details:
             print(f"  {detail}")
-    return 0
+    return 3 if report.withheld else 0
 
 
 def cmd_focus_job(args: argparse.Namespace) -> int:
@@ -4374,6 +4394,18 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     )
     p_syncm.add_argument(
         "-v", "--verbose", action="store_true", help="print the per-item detail log"
+    )
+    p_syncm.add_argument(
+        "-F",
+        "--full",
+        action="store_true",
+        help="no per-pass scrub budgets: scrub every card now (one-off vault migration)",
+    )
+    p_syncm.add_argument(
+        "-R",
+        "--rescrub",
+        action="store_true",
+        help="forget every scrubber vouch first, then reconcile (re-scrub the whole tree)",
     )
     p_syncm.set_defaults(func=cmd_sync_mirrors)
 

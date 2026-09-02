@@ -1071,3 +1071,64 @@ def test_claim_close_request_unarmed_is_false(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.ensure("s1")
     assert store.claim_close_request("s1", 1_000_000, 10 * 60 * 1000) is False
+
+
+# ---------------------------------------------------------------------------
+# mirror vouches + health (tp#123)
+# ---------------------------------------------------------------------------
+def test_mirror_vouches_upsert_and_drop(tmp_path: Path) -> None:
+    from command_center.models import MirrorVouch
+
+    store = _store(tmp_path)
+    store.put_mirror_vouches([])  # no-op, no commit needed
+    store.put_mirror_vouches(
+        [
+            MirrorVouch("/v/a.md", "s1", "raw-a", "out-a", "policy", 10),
+            MirrorVouch("/v/b.md", "s2", "raw-b", "out-b", "policy", 20),
+        ]
+    )
+    assert set(store.mirror_vouches()) == {"/v/a.md", "/v/b.md"}
+    store.put_mirror_vouches([MirrorVouch("/v/a.md", "s1", "raw-a2", "out-a2", "policy2", 30)])
+    row = store.mirror_vouches()["/v/a.md"]
+    assert (row.raw_sha, row.out_sha, row.policy, row.vouched_at) == (
+        "raw-a2",
+        "out-a2",
+        "policy2",
+        30,
+    )
+    store.drop_mirror_vouches([])  # no-op
+    store.drop_mirror_vouches(["/v/b.md"])
+    assert set(store.mirror_vouches()) == {"/v/a.md"}
+    store.drop_mirror_vouches()
+    assert store.mirror_vouches() == {}
+
+
+def test_deleting_a_session_drops_its_vouches(tmp_path: Path) -> None:
+    from command_center.models import MirrorVouch
+
+    store = _store(tmp_path)
+    store.ensure("s1", cwd="/repo")
+    store.ensure("s2", cwd="/repo")
+    store.put_mirror_vouches(
+        [
+            MirrorVouch("/v/a.md", "s1", "r", "o", "p", 1),
+            MirrorVouch("/v/b.md", "s2", "r", "o", "p", 1),
+        ]
+    )
+    assert store.delete_many(["s1"]) == 1
+    assert set(store.mirror_vouches()) == {"/v/b.md"}
+
+
+def test_mirror_health_is_a_single_overwritten_row(tmp_path: Path) -> None:
+    from command_center.models import MirrorHealth
+
+    store = _store(tmp_path)
+    assert store.mirror_health() is None
+    store.put_mirror_health(
+        MirrorHealth(at=5, vouched=1, scrubbed=2, withheld=3, deferred=4, reason="x")
+    )
+    store.put_mirror_health(MirrorHealth(at=6, vouched=0, scrubbed=0, withheld=0, deferred=0))
+    assert store.mirror_health() == MirrorHealth(
+        at=6, vouched=0, scrubbed=0, withheld=0, deferred=0
+    )
+    assert store.conn.execute("SELECT COUNT(*) FROM mirror_health").fetchone()[0] == 1

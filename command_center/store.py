@@ -36,6 +36,8 @@ from .models import (
     FileLock,
     FileLockWaiter,
     LiveSession,
+    MirrorHealth,
+    MirrorVouch,
     Session,
     Status,
     Subgoal,
@@ -283,6 +285,31 @@ CREATE TABLE IF NOT EXISTS transcript_scan (
     codex_scanned_to INTEGER NOT NULL DEFAULT 0,
     scanned_at       INTEGER NOT NULL DEFAULT 0,
     headless         INTEGER
+);
+-- One row per mirror file a scrubber vouched for (see command_center.scrub): the pass
+-- that finds all four identities intact — regenerated document, bytes on disk, the
+-- mirror_scrub_cmd they came from, and the row's age — skips the subprocess entirely.
+-- Deliberately NO foreign key on session_id, for the same reason transcript_scan has
+-- none: the row is about a FILE, and a mirror pass must never fail (or cascade) on who
+-- wrote the session row first. A row whose file is gone simply stops matching.
+CREATE TABLE IF NOT EXISTS mirror_vouch (
+    path        TEXT    PRIMARY KEY,
+    session_id  TEXT    NOT NULL,
+    raw_sha     TEXT    NOT NULL,
+    out_sha     TEXT    NOT NULL,
+    policy      TEXT    NOT NULL,
+    vouched_at  INTEGER NOT NULL
+);
+-- Counters of the LAST mirror pass (single row, id = 1) so `ccc doctor` can report a
+-- withheld write without re-running the pass.
+CREATE TABLE IF NOT EXISTS mirror_health (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    at        INTEGER NOT NULL,
+    vouched   INTEGER NOT NULL DEFAULT 0,
+    scrubbed  INTEGER NOT NULL DEFAULT 0,
+    withheld  INTEGER NOT NULL DEFAULT 0,
+    deferred  INTEGER NOT NULL DEFAULT 0,
+    reason    TEXT    NOT NULL DEFAULT ''
 );
 """
 
@@ -562,19 +589,23 @@ class Store:  # pylint: disable=too-many-public-methods
 
         ``transcript_scan`` carries no foreign key (see :data:`_SCHEMA`), so its row is
         deleted explicitly — otherwise a re-created session id would inherit the facts of
-        the transcript the deleted row was scanned from.
+        the transcript the deleted row was scanned from. ``mirror_vouch`` is keyless for
+        the same reason and goes with it: a stale vouch must never speak for a file a
+        re-created session id would write.
         """
         self.conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         self.conn.execute("DELETE FROM transcript_scan WHERE session_id = ?", (session_id,))
+        self.conn.execute("DELETE FROM mirror_vouch WHERE session_id = ?", (session_id,))
         self.conn.commit()
 
     def delete_many(self, session_ids: Iterable[str]) -> int:
-        """Remove several sessions (sub-goals + transcript scans); return the count deleted."""
+        """Remove several sessions (sub-goals, scans, vouches); return the count deleted."""
         ids = [(sid,) for sid in session_ids]
         if not ids:
             return 0
         self.conn.executemany("DELETE FROM sessions WHERE session_id = ?", ids)
         self.conn.executemany("DELETE FROM transcript_scan WHERE session_id = ?", ids)
+        self.conn.executemany("DELETE FROM mirror_vouch WHERE session_id = ?", ids)
         self.conn.commit()
         return len(ids)
 
@@ -929,6 +960,102 @@ class Store:  # pylint: disable=too-many-public-methods
             payload,
         )
         self.conn.commit()
+
+    # ---- mirror vouches + health ----------------------------------------
+    def mirror_vouches(self) -> dict[str, MirrorVouch]:
+        """Every scrubber vouch, keyed by mirror path — ONE select per mirror pass.
+
+        The table has one row per mirror file and the pass needs all of them, so one
+        read beats a per-card lookup (same rationale as :meth:`transcript_scans`).
+        """
+        rows = self.conn.execute("SELECT * FROM mirror_vouch").fetchall()
+        return {
+            str(row["path"]): MirrorVouch(
+                path=str(row["path"]),
+                session_id=str(row["session_id"]),
+                raw_sha=str(row["raw_sha"]),
+                out_sha=str(row["out_sha"]),
+                policy=str(row["policy"]),
+                vouched_at=int(row["vouched_at"]),
+            )
+            for row in rows
+        }
+
+    def put_mirror_vouches(self, rows: Iterable[MirrorVouch]) -> None:
+        """Persist *rows* (UPSERT on ``path``) in ONE transaction, ONE commit.
+
+        Called once per mirror pass with only the cards a scrubber actually vouched for,
+        so a steady-state pass writes (and commits) nothing at all.
+
+        An UPSERT, not ``INSERT OR REPLACE``: a REPLACE deletes and re-inserts the row,
+        resetting every column THIS build does not know about (a newer ccc's — the DB is
+        shared and the code is an editable install) to its default. The explicit
+        ``DO UPDATE SET`` touches only the columns this build owns.
+        """
+        payload = [
+            (row.path, row.session_id, row.raw_sha, row.out_sha, row.policy, int(row.vouched_at))
+            for row in rows
+        ]
+        if not payload:
+            return
+        self.conn.executemany(
+            "INSERT INTO mirror_vouch (path, session_id, raw_sha, out_sha, policy, vouched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(path) DO UPDATE SET session_id=excluded.session_id, "
+            "raw_sha=excluded.raw_sha, out_sha=excluded.out_sha, policy=excluded.policy, "
+            "vouched_at=excluded.vouched_at",
+            payload,
+        )
+        self.conn.commit()
+
+    def drop_mirror_vouches(self, paths: Iterable[str] | None = None) -> None:
+        """Forget the vouches of *paths* (``None`` = all of them → the next pass re-scrubs).
+
+        ``ccc sync-mirrors --rescrub`` drops everything; the cleanup pass drops the rows
+        of the files it removed, so the table does not accumulate orphans.
+        """
+        if paths is None:
+            self.conn.execute("DELETE FROM mirror_vouch")
+            self.conn.commit()
+            return
+        ids = [(path,) for path in paths]
+        if not ids:
+            return
+        self.conn.executemany("DELETE FROM mirror_vouch WHERE path = ?", ids)
+        self.conn.commit()
+
+    def put_mirror_health(self, health: MirrorHealth) -> None:
+        """Overwrite the single ``mirror_health`` row with the last pass's counters."""
+        self.conn.execute(
+            "INSERT INTO mirror_health (id, at, vouched, scrubbed, withheld, deferred, reason) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET at=excluded.at, vouched=excluded.vouched, "
+            "scrubbed=excluded.scrubbed, withheld=excluded.withheld, "
+            "deferred=excluded.deferred, reason=excluded.reason",
+            (
+                int(health.at),
+                int(health.vouched),
+                int(health.scrubbed),
+                int(health.withheld),
+                int(health.deferred),
+                health.reason,
+            ),
+        )
+        self.conn.commit()
+
+    def mirror_health(self) -> MirrorHealth | None:
+        """Counters of the last mirror pass, or ``None`` when none has run yet."""
+        row = self.conn.execute("SELECT * FROM mirror_health WHERE id = 1").fetchone()
+        if row is None:
+            return None
+        return MirrorHealth(
+            at=int(row["at"]),
+            vouched=int(row["vouched"]),
+            scrubbed=int(row["scrubbed"]),
+            withheld=int(row["withheld"]),
+            deferred=int(row["deferred"]),
+            reason=str(row["reason"]),
+        )
 
     # ---- subgoals -------------------------------------------------------
     def list_subgoals(self, session_id: str) -> list[Subgoal]:

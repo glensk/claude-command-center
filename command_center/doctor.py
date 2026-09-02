@@ -34,7 +34,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, install
+from . import config, install, scrub
+from .models import MirrorHealth
 
 OK, FAIL, NA = "ok", "fail", "na"
 _SYMBOL = {OK: "✅", FAIL: "❌", NA: "−"}
@@ -532,6 +533,58 @@ def _readable(path: Path) -> bool:
         return False
 
 
+def _last_mirror_health() -> MirrorHealth | None:
+    """Counters of the last mirror pass, or ``None`` (no pass yet / unreadable store).
+
+    Read-only and best-effort: ``ccc doctor`` must work on a machine with no store at
+    all, so ANY failure to open or query it degrades to "no row" rather than raising.
+    Only called when the mirror feature is on — a doctor run with mirrors off never
+    touches the database.
+    """
+    try:
+        from .store import Store  # pylint: disable=import-outside-toplevel
+
+        with Store() as store:
+            return store.mirror_health()
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return None
+
+
+def _mirror_scrubber_check(cfg: config.Config) -> Check:
+    """The mirror credential scrubber: resolvable, and what the last pass did with it.
+
+    The mirror roots embed transcripts verbatim, so a mirror switch without a working
+    scrubber is a live-credential export waiting to happen — hence ❌ for the explicit
+    ``mirror_allow_unscrubbed`` opt-out and ❌ for an unresolvable command, both of which
+    are silent at runtime otherwise (the pass just withholds every write).
+    """
+    label = "mirrors → scrubber"
+    if not (cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions):
+        return Check(NA, label, "disabled")
+    if cfg.mirror_allow_unscrubbed:
+        return Check(
+            FAIL,
+            label,
+            "mirror_allow_unscrubbed = true — mirrors are written WITHOUT a credential scrub",
+        )
+    resolution = scrub.resolve_scrubber(cfg.mirror_scrub_cmd)
+    if not resolution.ok or resolution.scrubber is None:
+        return Check(FAIL, label, resolution.reason)
+    exe = resolution.scrubber.executable
+    health = _last_mirror_health()
+    if health is not None and health.withheld > 0:
+        return Check(
+            FAIL, label, f"{exe} — last pass withheld {health.withheld} write(s): {health.reason}"
+        )
+    detail = exe
+    if health is not None:
+        detail += (
+            f" — last pass: vouched={health.vouched} scrubbed={health.scrubbed} "
+            f"deferred={health.deferred}"
+        )
+    return Check(OK, label, detail)
+
+
 def _section_features(  # pylint: disable=too-many-branches,too-many-statements
     cfg: config.Config,
 ) -> Section:
@@ -610,6 +663,8 @@ def _section_features(  # pylint: disable=too-many-branches,too-many-statements
             )
     else:
         section.checks.append(Check(NA, "vault features → vault_root", "disabled"))
+
+    section.checks.append(_mirror_scrubber_check(cfg))
 
     if cfg.launcher == "iterm":
         if shutil.which("osascript"):

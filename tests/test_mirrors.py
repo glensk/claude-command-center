@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from scrubstub import DUMMY_VALUE, PLACEHOLDER, Stub, stub_scrubber
 
 from command_center import config, futuresync, mirrors, sessionmd
 from command_center.future_files import slugify
@@ -32,6 +34,7 @@ class Env:
     done: Path
     future: Path
     sessions: Path
+    scrubber: Stub  # the fake credential scrubber every mirror write passes through
 
 
 @pytest.fixture
@@ -49,6 +52,11 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Env]:
     future = tasks / "future"
     sessions = tasks / "sessions"
     future.mkdir(parents=True)
+    # Every mirror write passes the credential scrubber (fail closed), so the fixture
+    # points `mirror_scrub_cmd` at a hermetic stub: a passthrough unless the document
+    # holds DUMMY_VALUE. Without this the default command would resolve to a real
+    # broker client on a developer machine (or withhold everything on CI).
+    scrubber = stub_scrubber(tmp_path)
     cfg = config.Config(
         vault_root=str(vault),
         future_dir=str(future),
@@ -63,9 +71,10 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Env]:
         mirror_running=True,
         mirror_done=True,
         mirror_sessions=True,
+        mirror_scrub_cmd=scrubber.scrub_cmd,
     )
     store = Store(tmp_path / "claude" / "command-center" / "state.db")
-    yield Env(store, cfg, git_base, running, done, future, sessions)
+    yield Env(store, cfg, git_base, running, done, future, sessions, scrubber)
     store.close()
 
 
@@ -1104,3 +1113,398 @@ def test_mirror_frontmatter_carries_both_links(env: Env) -> None:
     mirrors.run_mirrors(env.store, env.cfg)
     text = _rpath(env, aim, sid).read_text(encoding="utf-8")
     assert 'session: ""' in text
+
+
+# ---------------------------------------------------------------------------
+# credential scrubbing — fail closed, vouched, budgeted (tp#123)
+# ---------------------------------------------------------------------------
+_LEAKY_AIM = "Rotate the deploy key"
+
+
+def _use_stub(env: Env, tmp_path: Path, mode: str) -> Stub:
+    """Point the fixture's ``mirror_scrub_cmd`` at a stub of *mode*."""
+    stub = stub_scrubber(tmp_path, mode)
+    env.cfg.mirror_scrub_cmd = stub.scrub_cmd
+    return stub
+
+
+def _leaky_session(env: Env, aim: str = _LEAKY_AIM) -> str:
+    """A running session whose transcript prompt carries the dummy credential value."""
+    sid = _running_session(env, aim)
+    _write_transcript(
+        env, str(env.git_base / "home" / "ccc"), sid, [f"use token {DUMMY_VALUE} to deploy"]
+    )
+    return sid
+
+
+def _vault_texts(env: Env) -> list[str]:
+    """Every file currently under the test vault (mirrors AND any temp leftovers)."""
+    vault = env.running.parent.parent
+    return [
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in vault.rglob("*")
+        if path.is_file()
+    ]
+
+
+def test_scrubber_redacts_running_and_session_cards(env: Env) -> None:
+    sid = _leaky_session(env)
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    rpath, spath = _rpath(env, _LEAKY_AIM, sid), _spath(env, _LEAKY_AIM, sid)
+    for path in (rpath, spath):
+        text = path.read_text(encoding="utf-8")
+        assert PLACEHOLDER in text and DUMMY_VALUE not in text
+    assert {path for path, _ in report.scrubbed} == {str(rpath), str(spath)}
+    assert all(labels == ("test.key",) for _, labels in report.scrubbed)
+    assert set(report.vouched) == {str(rpath), str(spath)}
+    assert report.withheld == [] and report.deferred == []
+    assert not any(DUMMY_VALUE in text for text in _vault_texts(env))
+
+
+def test_scrubber_redacts_the_done_card_after_completion(env: Env) -> None:
+    sid = _leaky_session(env)
+    mirrors.run_mirrors(env.store, env.cfg)
+    _mark_done(env, sid)
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    dpath = _dpath(env, _LEAKY_AIM, sid)
+    assert sid in report.written
+    text = dpath.read_text(encoding="utf-8")
+    assert PLACEHOLDER in text and DUMMY_VALUE not in text
+    assert not _rpath(env, _LEAKY_AIM, sid).exists()  # running card cleaned up (nothing withheld)
+    assert not any(DUMMY_VALUE in text for text in _vault_texts(env))
+
+
+def test_second_pass_is_vouched_and_spawns_no_scrubber(env: Env) -> None:
+    _leaky_session(env)
+    mirrors.run_mirrors(env.store, env.cfg)
+    calls = len(env.scrubber.calls)
+    again = mirrors.run_mirrors(env.store, env.cfg)
+    assert again.written == [] and again.vouched == [] and again.scrubbed == []
+    assert again.withheld == [] and again.deferred == []
+    assert len(env.scrubber.calls) == calls  # no subprocess at all
+
+
+def test_legacy_unscrubbed_card_is_scrubbed_on_the_first_pass(env: Env) -> None:
+    """A card written before the feature (raw == disk, no vouch) still gets scrubbed."""
+    sid = _leaky_session(env)
+    env.cfg.mirror_allow_unscrubbed = True
+    mirrors.run_mirrors(env.store, env.cfg)
+    rpath = _rpath(env, _LEAKY_AIM, sid)
+    assert DUMMY_VALUE in rpath.read_text(encoding="utf-8")
+    assert env.store.mirror_vouches() == {} and env.scrubber.calls == []
+
+    env.cfg.mirror_allow_unscrubbed = False
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert sid in report.written
+    text = rpath.read_text(encoding="utf-8")
+    assert PLACEHOLDER in text and DUMMY_VALUE not in text
+
+
+def test_vouched_card_edited_on_disk_is_rescrubbed_and_restored(env: Env) -> None:
+    sid = _running_session(env, "Edited")
+    mirrors.run_mirrors(env.store, env.cfg)
+    path = _rpath(env, "Edited", sid)
+    path.write_text(path.read_text(encoding="utf-8") + "user edit\n", encoding="utf-8")
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert sid in report.written and str(path) in report.vouched
+    assert "user edit" not in path.read_text(encoding="utf-8")
+
+
+def test_degraded_scrubber_withholds_everything_and_skips_cleanup(env: Env, tmp_path: Path) -> None:
+    sid = _leaky_session(env)
+    stale_dir = env.running / "home" / "ccc"
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    stale = stale_dir / "old-card-dead.md"
+    stale.write_text(
+        '---\nccc_mirror: "running"\nsession_id: "dead-session"\n---\n\nstale\n', encoding="utf-8"
+    )
+    _use_stub(env, tmp_path, "exit3")
+
+    report = mirrors.run_mirrors(env.store, env.cfg)
+
+    assert report.written == [] and report.vouched == [] and report.removed == []
+    assert len(report.withheld) == 2  # the session card and the running card
+    assert all("exit 3" in reason for _, reason in report.withheld)
+    assert not _rpath(env, _LEAKY_AIM, sid).exists() and not _spath(env, _LEAKY_AIM, sid).exists()
+    assert stale.exists()  # cleanup frozen for the whole pass
+    assert any("cleanup skipped" in detail for detail in report.details)
+    health = env.store.mirror_health()
+    assert health is not None and health.withheld == 2 and "exit 3" in health.reason
+    assert not any(DUMMY_VALUE in text for text in _vault_texts(env))
+
+
+def test_withheld_done_card_keeps_the_running_card(env: Env, tmp_path: Path) -> None:
+    sid = _leaky_session(env)
+    mirrors.run_mirrors(env.store, env.cfg)
+    rpath = _rpath(env, _LEAKY_AIM, sid)
+    assert rpath.exists()
+    _mark_done(env, sid)
+    _use_stub(env, tmp_path, "exit3")
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert report.withheld and report.removed == []
+    assert rpath.exists() and not _dpath(env, _LEAKY_AIM, sid).exists()
+
+
+def test_withheld_renamed_card_keeps_its_predecessor(env: Env, tmp_path: Path) -> None:
+    sid = _running_session(env, "Moved")
+    mirrors.run_mirrors(env.store, env.cfg)
+    old = _rpath(env, "Moved", sid)
+    env.store.update_fields(sid, cwd=str(env.git_base / "sdsc" / "zoho"))
+    _use_stub(env, tmp_path, "exit3")
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert report.withheld and report.removed == []
+    assert old.exists() and not _rpath(env, "Moved", sid, repo="sdsc/zoho").exists()
+
+
+@pytest.mark.parametrize(
+    "mode, needle",
+    [
+        ("empty", "no output"),
+        ("badutf8", "not valid UTF-8"),
+        ("oversize", "grew by"),
+        ("identity", "frontmatter identity"),
+    ],
+)
+def test_unusable_scrubber_output_is_withheld(
+    env: Env, tmp_path: Path, mode: str, needle: str
+) -> None:
+    sid = _running_session(env, "Plain session")
+    _use_stub(env, tmp_path, mode)
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert report.written == [] and report.vouched == []
+    assert report.withheld and needle in report.withheld[0][1]
+    assert not _rpath(env, "Plain session", sid).exists()
+
+
+def test_scrubber_timeout_is_withheld(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = _running_session(env, "Slow")
+    _use_stub(env, tmp_path, "sleep")
+    monkeypatch.setattr(mirrors, "_SCRUB_TIMEOUT_S", 0.5)
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert report.written == [] and "timed out" in report.withheld[0][1]
+    assert not _rpath(env, "Slow", sid).exists()
+
+
+def test_atomic_write_failure_leaves_no_bytes_behind(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _leaky_session(env)
+
+    def boom(_src: object, _dst: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mirrors.os, "replace", boom)
+    with pytest.raises(OSError):
+        mirrors.run_mirrors(env.store, env.cfg)
+    for root in (env.sessions, env.running):
+        leftovers = [p for p in root.rglob("*") if p.is_file()] if root.exists() else []
+        assert leftovers == []  # no target, no .tmp
+    assert not any(DUMMY_VALUE in text for text in _vault_texts(env))
+
+
+def test_remove_mirror_waits_for_the_lock_then_gives_up(
+    env: Env, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid = _running_session(env, "Lock me")
+    mirrors.run_mirrors(env.store, env.cfg)
+    path = _rpath(env, "Lock me", sid)
+    handle = mirrors._acquire_lock()  # pylint: disable=protected-access
+    assert handle is not None
+    monkeypatch.setattr(mirrors, "_REMOVE_LOCK_TIMEOUT_S", 0.3)
+    try:
+        assert mirrors.remove_mirror(env.cfg, sid) == []
+    finally:
+        mirrors._release_lock(handle)  # pylint: disable=protected-access
+    assert "lock busy" in capsys.readouterr().err
+    assert path.exists()
+    assert str(path) in mirrors.remove_mirror(env.cfg, sid)
+    assert not path.exists()
+
+
+def test_budget_defers_unvouched_cards_and_full_lifts_it(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = _running_session(env, "Budgeted")
+    monkeypatch.setattr(mirrors, "REQUIRED_BUDGET_S", 0.0)
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert report.written == [] and report.withheld == []
+    assert len(report.deferred) == 2 and env.scrubber.calls == []
+    assert not _rpath(env, "Budgeted", sid).exists()
+    health = env.store.mirror_health()
+    assert health is not None and health.deferred == 2
+
+    full = mirrors.run_mirrors(env.store, env.cfg, full=True)
+    assert sid in full.written and full.deferred == []
+    assert _rpath(env, "Budgeted", sid).exists()
+
+
+def test_deferred_rename_keeps_its_predecessor(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    sid = _running_session(env, "Renamed")
+    mirrors.run_mirrors(env.store, env.cfg)
+    old = _rpath(env, "Renamed", sid)
+    env.store.update_fields(sid, cwd=str(env.git_base / "sdsc" / "zoho"))
+    monkeypatch.setattr(mirrors, "REQUIRED_BUDGET_S", 0.0)
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert old.exists() and report.removed == []  # protected: its replacement was deferred
+    assert str(_rpath(env, "Renamed", sid, repo="sdsc/zoho")) in report.deferred
+
+
+def _expire_vouches(env: Env) -> None:
+    env.store.conn.execute(
+        "UPDATE mirror_vouch SET vouched_at = vouched_at - ?", (mirrors.VOUCH_TTL_MS + 1,)
+    )
+    env.store.conn.commit()
+
+
+def test_expired_vouch_is_revouched_without_a_rewrite(env: Env) -> None:
+    _running_session(env, "Aging")
+    mirrors.run_mirrors(env.store, env.cfg)
+    calls = len(env.scrubber.calls)
+    _expire_vouches(env)
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert report.written == [] and len(report.vouched) == 2
+    assert len(env.scrubber.calls) == calls + 2
+    assert all(
+        now_ms() - row.vouched_at < mirrors.VOUCH_TTL_MS
+        for row in env.store.mirror_vouches().values()
+    )
+
+
+def test_revouch_budget_defers_expired_cards(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    _running_session(env, "Aging slowly")
+    mirrors.run_mirrors(env.store, env.cfg)
+    calls = len(env.scrubber.calls)
+    _expire_vouches(env)
+    monkeypatch.setattr(mirrors, "REVOUCH_BUDGET_S", 0.0)
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert len(report.deferred) == 2 and report.vouched == [] and report.written == []
+    assert len(env.scrubber.calls) == calls
+
+
+def test_rescrub_forgets_every_vouch(env: Env) -> None:
+    _running_session(env, "Again")
+    mirrors.run_mirrors(env.store, env.cfg)
+    calls = len(env.scrubber.calls)
+    report = mirrors.run_mirrors(env.store, env.cfg, rescrub=True)
+    assert len(report.vouched) == 2 and report.written == []
+    assert len(env.scrubber.calls) == calls + 2
+
+
+def test_no_scrubber_configured_withholds(env: Env) -> None:
+    _running_session(env, "Nothing configured")
+    env.cfg.mirror_scrub_cmd = ""
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert report.written == [] and len(report.withheld) == 2
+    assert all("no scrubber configured" in reason for _, reason in report.withheld)
+
+
+def test_allow_unscrubbed_writes_raw_without_a_scrubber_call(env: Env) -> None:
+    sid = _leaky_session(env)
+    env.cfg.mirror_allow_unscrubbed = True
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert sid in report.written and report.vouched == [] and env.scrubber.calls == []
+    assert DUMMY_VALUE in _rpath(env, _LEAKY_AIM, sid).read_text(encoding="utf-8")
+    assert env.store.mirror_vouches() == {}
+
+
+def test_bare_command_resolves_via_env_override_then_path(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = _running_session(env, "Resolved")
+    env.cfg.mirror_scrub_cmd = "fake-broker scrub"
+    monkeypatch.setenv("SECRET_BROKER_CLIENT", str(env.scrubber.path))
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert sid in report.written and report.withheld == []
+
+    monkeypatch.delenv("SECRET_BROKER_CLIENT")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "fake-broker").symlink_to(env.scrubber.path)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+    again = mirrors.run_mirrors(env.store, env.cfg, rescrub=True)
+    assert len(again.vouched) == 2 and again.withheld == []
+
+
+def test_outdated_client_without_the_scrub_verb_is_withheld(env: Env, tmp_path: Path) -> None:
+    _running_session(env, "Old client")
+    _use_stub(env, tmp_path, "nohelp")
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert report.written == [] and "'scrub' subcommand" in report.withheld[0][1]
+
+
+def test_unresolvable_scrubber_path_is_withheld(env: Env) -> None:
+    _running_session(env, "Missing")
+    env.cfg.mirror_scrub_cmd = "/nonexistent/fake-broker scrub"
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert report.written == [] and "does not exist" in report.withheld[0][1]
+
+
+def test_mirror_health_row_tracks_the_last_pass(env: Env, tmp_path: Path) -> None:
+    _leaky_session(env)
+    mirrors.run_mirrors(env.store, env.cfg)
+    health = env.store.mirror_health()
+    assert health is not None
+    assert (health.vouched, health.scrubbed, health.withheld, health.reason) == (2, 2, 0, "")
+    # A different stub is a different policy string: every earlier vouch stops matching,
+    # so BOTH sessions' cards (2 + 2) are required again — and all four are withheld.
+    _use_stub(env, tmp_path, "exit3")
+    _running_session(env, "Another")
+    mirrors.run_mirrors(env.store, env.cfg)
+    health = env.store.mirror_health()
+    assert health is not None and health.withheld == 4 and "exit 3" in health.reason
+
+
+def test_cleanup_drops_the_vouch_rows_of_removed_files(env: Env) -> None:
+    sid = _running_session(env, "Gone soon")
+    mirrors.run_mirrors(env.store, env.cfg)
+    rpath = _rpath(env, "Gone soon", sid)
+    assert str(rpath) in env.store.mirror_vouches()
+    env.store.update_fields(sid, archived=True)
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert str(rpath) in report.removed
+    assert str(rpath) not in env.store.mirror_vouches()
+
+
+def test_daemon_sync_mirrors_logs_redactions_and_withheld_writes(
+    env: Env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import daemon
+
+    _leaky_session(env)
+    daemon._sync_mirrors(env.store, env.cfg)  # pylint: disable=protected-access
+    err = capsys.readouterr().err
+    assert "redacted 2 card(s): test.key" in err and DUMMY_VALUE not in err
+    assert "withheld" not in err
+
+    _use_stub(env, tmp_path, "exit3")  # a new policy string: the old vouches stop matching
+    _running_session(env, "Another")
+    daemon._sync_mirrors(env.store, env.cfg)  # pylint: disable=protected-access
+    err = capsys.readouterr().err
+    assert "withheld 4 write(s)" in err and "exit 3" in err
+
+
+def test_sync_mirrors_cli_exits_3_when_a_write_was_withheld(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import cli
+
+    _running_session(env, "CLI")
+    _use_stub(env, tmp_path, "exit3")
+    monkeypatch.setattr(cli.config, "load_config", lambda: env.cfg)
+    rc = cli.cmd_sync_mirrors(argparse.Namespace(verbose=True, full=False, rescrub=False))
+    out = capsys.readouterr().out
+    assert rc == 3 and "withheld=2" in out and "  withheld " in out
+
+    env.cfg.mirror_scrub_cmd = env.scrubber.scrub_cmd
+    rc = cli.cmd_sync_mirrors(argparse.Namespace(verbose=False, full=True, rescrub=True))
+    out = capsys.readouterr().out
+    assert rc == 0 and "vouched=2" in out and "withheld=0" in out
+
+
+def test_sync_mirrors_parser_flags() -> None:
+    from command_center.cli import build_parser
+
+    args = build_parser().parse_args(["sync-mirrors", "-F", "-R", "-v"])
+    assert args.full and args.rescrub and args.verbose

@@ -234,6 +234,43 @@ class TranscriptScan:
     headless: bool | None = None
 
 
+@dataclass(frozen=True)
+class MirrorVouch:
+    """One scrubber verdict: the bytes of *path* a scrubber vouched for, and when.
+
+    The mirror pass writes a card only after a scrubber returned it (see
+    :mod:`command_center.scrub`); this row is the receipt that lets the NEXT pass skip
+    the call. It vouches only while all four identities still hold — the regenerated
+    document (``raw_sha``), the bytes on disk (``out_sha``), the exact
+    ``mirror_scrub_cmd`` they came from (``policy``) and the row's age — so a changed
+    session, an edited file or a new rule set all re-scrub.
+    """
+
+    path: str  # absolute mirror path (the primary key)
+    session_id: str
+    raw_sha: str  # sha256 of the REGENERATED document handed to the scrubber
+    out_sha: str  # sha256 of the VOUCHED document written to disk
+    policy: str  # the mirror_scrub_cmd string that produced it
+    vouched_at: int  # epoch ms (see :func:`now_ms`)
+
+
+@dataclass(frozen=True)
+class MirrorHealth:
+    """Counters of the LAST mirror pass — what ``ccc doctor`` reports without a rerun.
+
+    A single row (``id = 1``): every pass that acquired the mirror lock overwrites it.
+    ``reason`` carries the first withheld reason (never content), "" when nothing was
+    withheld.
+    """
+
+    at: int  # epoch ms of the pass
+    vouched: int  # cards a scrubber vouched for this pass
+    scrubbed: int  # cards the scrubber actually CHANGED
+    withheld: int  # writes refused (fail closed)
+    deferred: int  # cards skipped by the pass budget (disk kept as-is)
+    reason: str = ""  # first withheld reason ("" = healthy)
+
+
 # Future-job model choices: which Claude model a job's overseer / executor runs on.
 # The session runs ON the overseer's model; when the executor differs, the overseer is
 # told to delegate implementation to Agent-tool subagents on the executor's model.

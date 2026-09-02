@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Fail-closed credential scrubbing through an external scrubber (the mirror invariant).
 
 The three export-only mirror roots (``running/``, ``done/``, ``sessions/``) embed prompts,
@@ -29,6 +30,16 @@ Nothing here runs at import; resolution happens per call (``extdeps.require`` ru
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
 
 import dataclasses
 import hashlib
@@ -62,7 +73,7 @@ LEAK = "leak"
 DEGRADED = "degraded"
 
 # Longest stderr excerpt a reason may quote (the scrubber's own one-line messages).
-_REASON_EXCERPT = 200
+_REASON_EXCERPT = 300
 
 
 @dataclass(frozen=True)
@@ -202,8 +213,12 @@ def resolve_scrubber(  # pylint: disable=too-many-locals,too-many-return-stateme
     except MissingExternalDependency as exc:
         # The message's FIRST line names the dependency and what needs it; the install
         # hint below it belongs in `ccc doctor`, not in a per-pass reason.
+        # The detail ("found at …, but it lacks the required 'scrub' subcommand") is the
+        # actionable part when present; otherwise the head line names what is missing.
+        # The install hint below them belongs in `ccc doctor`, not in a per-pass reason.
         head_line = next((ln.strip() for ln in str(exc).splitlines() if ln.strip()), str(exc))
-        return Resolution(None, head_line[:_REASON_EXCERPT])
+        reason = exc.detail.strip() if exc.detail else head_line
+        return Resolution(None, reason[:_REASON_EXCERPT])
     argv = (exe, *tail) if verb == "scrub" else (exe, verb)
     return Resolution(Scrubber(argv=argv, policy=policy))
 

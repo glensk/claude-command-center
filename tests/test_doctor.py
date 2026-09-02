@@ -414,3 +414,34 @@ def test_fast_path_says_so_when_nothing_spawns_ccc(
 def test_report_includes_the_fast_path_section(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(doctor.shutil, "which", _which_factory({"claude"}))
     assert "Spawn fast path" in doctor.render(doctor.build_report(config.Config()))
+
+
+# ------------------------------ mirror scrubber ------------------------------ #
+def test_mirror_scrubber_check_states(tmp_path: Path) -> None:
+    from scrubstub import stub_scrubber
+
+    from command_center.models import MirrorHealth
+    from command_center.store import Store
+
+    label = "mirrors → scrubber"
+    assert _feat(config.Config(), label) == doctor.NA  # mirrors off → never probed
+    assert (
+        _feat(config.Config(mirror_running=True, mirror_allow_unscrubbed=True), label)
+        == doctor.FAIL
+    )
+    assert (
+        _feat(config.Config(mirror_sessions=True, mirror_scrub_cmd="/nonexistent/x scrub"), label)
+        == doctor.FAIL
+    )
+    stub = stub_scrubber(tmp_path)
+    cfg = config.Config(mirror_done=True, mirror_scrub_cmd=stub.scrub_cmd)
+    check = {c.label: c for c in doctor._section_features(cfg).checks}[label]
+    assert check.status == doctor.OK and str(stub.path) in check.detail
+    with Store() as store:  # CLAUDE_HOME is pinned to tmp_path by the autouse fixture
+        store.put_mirror_health(
+            MirrorHealth(
+                at=1, vouched=0, scrubbed=0, withheld=2, deferred=0, reason="scrubber exit 3"
+            )
+        )
+    check = {c.label: c for c in doctor._section_features(cfg).checks}[label]
+    assert check.status == doctor.FAIL and "withheld 2" in check.detail

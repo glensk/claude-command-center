@@ -760,8 +760,9 @@ stderr line per pass, `ccc sync-mirrors` exits 3, and `ccc doctor` shows ❌ und
 "mirrors → scrubber".
 
 Scrubbing every card on every pass would be far too slow, so vouches are **persisted** — a
-`mirror_vouch` table in the store keyed by session and root, holding the raw content hash, the
-written hash, the policy string (the exact `mirror_scrub_cmd`) and a timestamp. The steady state
+`mirror_vouch` table in the store keyed by mirror path (a session has up to three cards, each
+vouched on its own), holding the raw content hash, the written hash, the policy string (the exact
+`mirror_scrub_cmd`) and a timestamp. The steady state
 therefore costs **no scrubber calls at all**: a card is re-scrubbed only when its content changes,
 when its file changes, or when `mirror_scrub_cmd` changes, and is re-vouched after 24 h. One
 daemon pass spends at most 120 s on required scrubs and 20 s on re-vouching; whatever does not fit

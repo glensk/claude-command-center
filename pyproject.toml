@@ -16,7 +16,11 @@ dependencies = [
     # iterm_api): sub-ms focus/lookup vs the ~620 ms AppleScript window walk. Imported
     # lazily inside methods so the package stays optional (non-mac / no API server).
     "iterm2>=2.20",
-    "extdeps",
+    # External-dependency registry engine (command_center/external_deps.py). A PEP 508
+    # direct reference on purpose: the wheel's metadata must carry the git URL so a plain
+    # `uv pip install <wheel>` (the smoke-matrix sandbox, a colleague's install) resolves
+    # it — a `[tool.uv.sources]` entry is uv-project-only and never reaches the wheel.
+    "extdeps @ git+https://github.com/glensk/extdeps",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +34,11 @@ claude-session-continue = "command_center.session_continue:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# The extdeps dependency is a PEP 508 direct (git) reference — see [project.dependencies];
+# hatchling refuses to build wheel metadata from one unless told the author means it.
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["command_center"]
@@ -58,5 +67,3 @@ markers = [
     "slow: end-to-end tests that build a wheel + spin a sandbox (deselect with -m 'not slow')",
 ]
 
-[tool.uv.sources]
-extdeps = { git = "https://github.com/glensk/extdeps" }

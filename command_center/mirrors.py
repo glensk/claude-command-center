@@ -38,9 +38,25 @@ Design invariants (do not regress; see ``PLAN_running-done-mirrors.md``):
 * **Collision-safe filenames.** ``<slug>-<hash>.md`` with a 4-hex UUID prefix,
   deterministically extended to 8 hex when two sessions in the same directory
   share the 4-hex prefix. The full UUID in the frontmatter is the identity.
+* **Scrubbed, fail closed.** These files embed prompts, replies and tool output
+  VERBATIM, so every document passes through the external scrubber
+  (:mod:`command_center.scrub`, ``mirror_scrub_cmd``) before it is written. No
+  vouch → no write: the card on disk stays as it is (stale but safe) and the
+  reason lands in ``report.withheld``. A withheld card also freezes cleanup for
+  the whole pass, so the last readable copy is never removed to make room for
+  bytes that were refused. ``mirror_allow_unscrubbed = true`` is the ONE opt-out.
+* **Vouched.** Each write is receipted in the ``mirror_vouch`` table (regenerated
+  document, written bytes, policy, timestamp — see
+  :class:`command_center.models.MirrorVouch`), so a steady-state pass spawns NO
+  scrubber at all: only a changed session, an edited/missing file, a changed
+  ``mirror_scrub_cmd`` or an expired row (:data:`VOUCH_TTL_MS`) costs a call. The
+  per-pass budgets keep a cold cache from monopolising a daemon pass — the cards
+  that do not fit are ``report.deferred`` and keep their current file.
 * **Own flock singleton.** ``app_home()/mirror_sync.lock`` serialises concurrent
   runs (the daemon backstop + the detached ``ccc sync-mirrors`` lifecycle spawns).
 """
+
+# pylint: disable=too-many-lines  # the scrubber gate doubled the module; one concern, one file
 
 from __future__ import annotations
 
@@ -54,9 +70,13 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+import contextlib
 import fcntl
 import os
 import re
+import sys
+import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,7 +84,7 @@ from typing import IO
 
 import yaml
 
-from . import config, repos
+from . import config, repos, scrub
 from .adapters import ClaudeAdapter
 from .future_files import (
     cwd_to_repo,
@@ -75,10 +95,13 @@ from .future_files import (
 from .models import (
     DEFAULT_LLM,
     AimRevision,
+    MirrorHealth,
+    MirrorVouch,
     Session,
     TranscriptScan,
     iso_date,
     model_label,
+    now_ms,
     synthesize_aim_revision,
 )
 from .peek import session_prompts
@@ -114,17 +137,41 @@ _PROMPTS_MAX_BYTES = 256 * 1024
 # the same mtime yields the same prompts, hence the same bytes.
 _PROMPT_CACHE: dict[str, tuple[float, list[str]]] = {}
 
+# How long one scrubber verdict speaks for a card. The vouch already pins the document,
+# the bytes on disk and the policy, so the TTL only bounds how long a RULE-SET change the
+# policy string did not capture (the broker's own patterns) can stay unnoticed: a full
+# re-scrub of every unchanged card, spread over the revouch budget, once a day.
+VOUCH_TTL_MS = 24 * 3600 * 1000
+# Wall-clock budgets for the scrubber calls of ONE pass (``full=True`` lifts both). The
+# REQUIRED budget covers cards with no usable vouch (new/changed/legacy) — those must be
+# scrubbed before they can be written at all; the much smaller REVOUCH budget re-vouches
+# expired-but-unchanged cards in the background, oldest first, so a daemon pass is never
+# monopolised by the day's TTL sweep.
+REQUIRED_BUDGET_S = 120.0
+REVOUCH_BUDGET_S = 20.0
+# Per-document scrub timeout, read at call time so a test can shorten it.
+_SCRUB_TIMEOUT_S = scrub.SCRUB_TIMEOUT_S
+# How long :func:`remove_mirror` waits for the flock before leaving the removal to the
+# next sync pass (it is a synchronous lifecycle call — it must not hang a command).
+_REMOVE_LOCK_TIMEOUT_S = 10.0
+
 
 # ---------------------------------------------------------------------------
 # report
 # ---------------------------------------------------------------------------
 @dataclass
-class MirrorReport:
+class MirrorReport:  # pylint: disable=too-many-instance-attributes  # per-pass tally
     """What one :func:`run_mirrors` pass saw and did.
 
     ``running`` / ``done`` are the FULL current membership of each set (their mirrors
     exist after this pass); ``written`` / ``removed`` are the ACTUAL changes this pass
     made (a byte-stable no-op leaves both empty).
+
+    The scrubber half is path-keyed (a session has up to three cards, each vouched on
+    its own): ``vouched`` cost a scrubber call this pass, ``scrubbed`` are the ones it
+    actually CHANGED (with the labels it reported — names only, never values),
+    ``withheld`` were refused (fail closed: the file on disk is untouched) and
+    ``deferred`` did not fit this pass's budget (also untouched, and re-tried next pass).
     """
 
     running: list[str] = field(default_factory=list)  # session ids currently in RUNNING
@@ -132,6 +179,10 @@ class MirrorReport:
     sessions: list[str] = field(default_factory=list)  # session ids with a SESSION mirror
     written: list[str] = field(default_factory=list)  # session ids whose file was (re)written
     removed: list[str] = field(default_factory=list)  # abs paths of stale/moved mirrors removed
+    vouched: list[str] = field(default_factory=list)  # paths a scrubber vouched for this pass
+    scrubbed: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)  # (path, labels)
+    withheld: list[tuple[str, str]] = field(default_factory=list)  # (path, reason) — not written
+    deferred: list[str] = field(default_factory=list)  # paths skipped by the pass budget
     details: list[str] = field(default_factory=list)  # free-text (relocations, collisions …)
 
     def changed(self) -> int:
@@ -219,11 +270,35 @@ def _read_frontmatter(text: str) -> dict[str, str]:
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    """Write *text* to *path* atomically (temp file in the same dir + :func:`os.replace`)."""
+    """Write *text* to *path* atomically (temp file in the same dir + :func:`os.replace`).
+
+    Only VOUCHED bytes ever reach this function (see :class:`_ScrubPass`), and the temp
+    file is unique per call and **dot-prefixed** — so a crash between the two steps can
+    never leave a half-written document where a mirror belongs, two concurrent writers
+    cannot share a temp name, and :func:`_iter_mirror_files` (which skips ``.``-prefixed
+    components) never treats a leftover as a mirror. Any failure unlinks the temp file
+    and re-raises: the caller's next pass rewrites the card.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    done = False
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(text.encode("utf-8"))
+        os.replace(tmp, path)
+        done = True
+    finally:
+        if not done:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+
+
+def _read_disk(path: str) -> str | None:
+    """Current text of the mirror at *path*, or ``None`` when it is absent/unreadable."""
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -514,16 +589,55 @@ def _target_paths(
 # ---------------------------------------------------------------------------
 # write + cleanup
 # ---------------------------------------------------------------------------
-def _write_if_changed(path: Path, content: str, session_id: str, report: MirrorReport) -> None:
-    """Atomic write ONLY when the on-disk bytes differ (byte-stable idempotence)."""
-    try:
-        existing: str | None = path.read_text(encoding="utf-8")
-    except OSError:
-        existing = None
-    if existing == content:
-        return
-    _atomic_write(path, content)
-    report.written.append(session_id)
+@dataclass
+class _Card:
+    """One desired mirror document: where it belongs and what it should say.
+
+    ``raw`` is the regenerated (UNSCRUBBED) content — it never reaches the disk until a
+    scrubber vouches for it (or ``mirror_allow_unscrubbed`` is set).
+    """
+
+    path: str  # absolute target path
+    session_id: str
+    kind: str  # RUNNING | DONE | SESSION (the ``ccc_mirror`` frontmatter value)
+    raw: str
+
+
+@dataclass
+class _Pending:
+    """A card that needs a scrubber verdict, plus the identities the vouch keys on."""
+
+    card: _Card
+    raw_sha: str  # sha256 of ``card.raw``
+    disk: str | None  # what is on disk right now (None = no file)
+    since: int = 0  # ``vouched_at`` of the expired row (revouch ordering)
+
+
+@dataclass
+class _Write:
+    """A queued write: vouched bytes for one card (phase 2 performs it)."""
+
+    path: str
+    text: str
+    session_id: str
+
+
+@dataclass
+class _Verdict:
+    """What phase 1 decided: the writes to make, the receipts, the sessions to protect."""
+
+    writes: list[_Write] = field(default_factory=list)
+    vouches: list[MirrorVouch] = field(default_factory=list)
+    protect: set[str] = field(default_factory=set)  # session ids of DEFERRED cards
+
+
+@dataclass
+class _Plan:
+    """The desired state of every enabled root, before any scrubber has spoken."""
+
+    cards: list[_Card] = field(default_factory=list)  # sessions root first, then running, done
+    roots: list[tuple[Path, str, set[str]]] = field(default_factory=list)  # (root, kind, desired)
+    dirty: list[TranscriptScan] = field(default_factory=list)  # refreshed scan rows to persist
 
 
 def _iter_mirror_files(root: Path) -> list[Path]:
@@ -539,20 +653,28 @@ def _iter_mirror_files(root: Path) -> list[Path]:
     return out
 
 
-def _cleanup_root(root: Path, kind: str, desired: set[str], report: MirrorReport) -> None:
+def _cleanup_root(
+    root: Path, kind: str, desired: set[str], report: MirrorReport, protect: set[str]
+) -> None:
     """Remove ``ccc_mirror: <kind>`` files under *root* not in *desired* (stale or moved).
 
-    Files without a matching ``ccc_mirror`` marker are never touched (decision 3).
+    Files without a matching ``ccc_mirror`` marker are never touched (decision 3), and
+    neither is a file belonging to a session in *protect* — the sessions whose card was
+    DEFERRED this pass. Their desired file may not exist yet (a rename, a running→done
+    move), so removing the predecessor would leave the session with no readable mirror
+    at all until the deferred card finally gets its scrubber call.
     """
     for path in _iter_mirror_files(root):
         if str(path) in desired:
             continue
         try:
-            marker = _read_frontmatter(path.read_text(encoding="utf-8")).get("ccc_mirror")
+            fm = _read_frontmatter(path.read_text(encoding="utf-8"))
         except OSError:
             continue
-        if marker != kind:
+        if fm.get("ccc_mirror") != kind:
             continue  # foreign / unmarked file — leave it alone
+        if fm.get("session_id") in protect:
+            continue  # its replacement was deferred — keep the predecessor
         try:
             path.unlink()
             report.removed.append(str(path))
@@ -593,55 +715,67 @@ def _scan_for(
     return new
 
 
-def _sync_root(  # noqa: PLR0913  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
-    store: Store,
+@dataclass
+class _Ctx:
+    """Everything a card serialisation needs, gathered ONCE per pass.
+
+    *hist_map* is the pre-fetched AIM history (one query, shared by all three roots)
+    threading into BOTH the first-aim slug (:func:`_target_paths`) and the running/done
+    body (:func:`_serialize`); *link_map* (session id → vault-relative SESSION mirror
+    path) feeds the ``full session`` wikilink, which is why the sessions root is planned
+    first. *scans* / *dirty* are the run's shared transcript-scan table and its write
+    batch (see :func:`_scan_for`): each session's row is REFRESHED while its card is
+    built, so a standalone ``ccc sync-mirrors`` right after a model switch writes the new
+    model — it does not rely on the daemon having reconciled first.
+    """
+
+    store: Store
+    git_base: Path
+    adapter: ClaudeAdapter
+    hist_map: dict[str, list[AimRevision]]
+    scans: dict[str, TranscriptScan]
+    dirty: list[TranscriptScan]
+    link_map: dict[str, str] = field(default_factory=dict)
+
+
+def _desired_paths(
     sessions: list[Session],
-    kind: str,
     root: Path,
     git_base: Path,
-    report: MirrorReport,
-    adapter: ClaudeAdapter,
     hist_map: dict[str, list[AimRevision]],
-    link_map: dict[str, str],
-    scans: dict[str, TranscriptScan],
-    dirty: list[TranscriptScan],
 ) -> dict[str, Session]:
-    """Export every session in *sessions* to *root*, then clean up stale/moved mirrors.
+    """Canonical mirror path → session for every session of one root (see _target_paths).
 
-    *hist_map* is the pre-fetched AIM history (one query in ``run_mirrors``, shared by
-    all three roots) threading into BOTH the first-aim slug (``_target_paths``) and the
-    running/done body (``_serialize``); *link_map* (session id → vault-relative session
-    mirror path) feeds the ``full session`` wikilink. Returns the desired-path map so
-    ``run_mirrors`` can derive the link map from the SESSION pass.
-
-    *scans* / *dirty* are the run's shared transcript-scan table and its write batch (see
-    :func:`_scan_for`): each session's row is REFRESHED here, so a standalone
-    ``ccc sync-mirrors`` right after a model switch writes the new model — it does not
-    rely on the daemon having reconciled first.
+    Content-free on purpose: the SESSION root's map is needed BEFORE any card is
+    serialised, because the running/done bodies embed its paths as wikilinks.
     """
     first_aim = {
         s.session_id: (hist_map[s.session_id][0].aim if hist_map[s.session_id] else (s.aim or ""))
         for s in sessions
     }
-    desired = _target_paths(sessions, root, git_base, first_aim)
+    return _target_paths(sessions, root, git_base, first_aim)
+
+
+def _cards_for(ctx: _Ctx, desired: dict[str, Session], kind: str) -> list[_Card]:
+    """Serialise every desired card of one root (byte-stable, still UNSCRUBBED)."""
+    cards: list[_Card] = []
     for path_str, session in desired.items():
-        scan = _scan_for(adapter, session, scans, dirty)
+        scan = _scan_for(ctx.adapter, session, ctx.scans, ctx.dirty)
         if kind == SESSION:
-            content = _serialize_session(session, git_base, adapter, scan)
+            content = _serialize_session(session, ctx.git_base, ctx.adapter, scan)
         else:
             content = _serialize(
-                store,
+                ctx.store,
                 session,
                 kind,
-                git_base,
-                adapter,
-                hist_map[session.session_id],
-                link_map.get(session.session_id, ""),
+                ctx.git_base,
+                ctx.adapter,
+                ctx.hist_map[session.session_id],
+                ctx.link_map.get(session.session_id, ""),
                 scan,
             )
-        _write_if_changed(Path(path_str), content, session.session_id, report)
-    _cleanup_root(root, kind, set(desired), report)
-    return desired
+        cards.append(_Card(path=path_str, session_id=session.session_id, kind=kind, raw=content))
+    return cards
 
 
 def _link_map(desired: dict[str, Session], vault: Path) -> dict[str, str]:
@@ -686,89 +820,286 @@ def _release_lock(handle: IO[str]) -> None:
         handle.close()
 
 
+def _wait_for_lock(timeout: float) -> IO[str] | None:
+    """Take the flock singleton, retrying for up to *timeout* seconds; ``None`` on give-up.
+
+    A polled retry rather than a blocking ``flock``: the caller is a synchronous
+    lifecycle command, so it must come back either way — bounded wait, never a hang.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        handle = _acquire_lock()
+        if handle is not None:
+            return handle
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
+
+
+# ---------------------------------------------------------------------------
+# the scrubber gate (phase 1)
+# ---------------------------------------------------------------------------
+class _ScrubPass:  # pylint: disable=too-few-public-methods  # one entry point: run()
+    """The scrubber gate for ONE mirror pass: lazy resolution, degradation, budgets.
+
+    Three properties the mirror invariant rests on:
+
+    * **Lazy.** :func:`command_center.scrub.resolve_scrubber` runs a ``<exe> -h`` probe,
+      so it is called only when a card actually needs a scrubber call — a steady-state
+      pass (every card vouched) spawns NOTHING at all.
+    * **Degrading is sticky.** A broker that fails once (exit 3, a timeout, a mangled
+      document) is not asked again this pass: the first reason is recorded and every
+      remaining card is withheld with it. A flapping broker never turns into a partial
+      export where half the cards are stale and half are fresh.
+    * **Fail closed at every branch.** Unresolvable, withheld, or vouched output that no
+      longer carries the card's own frontmatter identity — all three mean the file on
+      disk is left exactly as it is, and the reason (never content) goes to the report.
+    """
+
+    def __init__(self, policy: str, report: MirrorReport, verdict: _Verdict, now: int) -> None:
+        self.policy = policy
+        self.report = report
+        self.verdict = verdict
+        self.now = now
+        self._resolution: scrub.Resolution | None = None
+        self._degraded = ""  # first hard failure of this pass ("" while healthy)
+
+    def _blocked(self) -> str:
+        """Why no further card may be scrubbed ("" = go ahead); resolves on first use."""
+        if self._degraded:
+            return f"scrubber degraded earlier this pass: {self._degraded}"
+        if self._resolution is None:
+            self._resolution = scrub.resolve_scrubber(self.policy)
+        return "" if self._resolution.ok else self._resolution.reason
+
+    def _withhold(self, path: str, reason: str) -> None:
+        """Refuse this write and latch the scrubber DEGRADED for the rest of the pass."""
+        self.report.withheld.append((path, reason))
+        if not self._degraded:
+            self._degraded = reason
+
+    def _accept(self, pending: _Pending, result: scrub.ScrubResult) -> None:
+        """Turn one scrub result into a queued write + a vouch, or into a withheld card."""
+        card = pending.card
+        if result.withheld:
+            self._withhold(card.path, result.reason)
+            return
+        # Identity check — the caller's half of the contract (see scrub.scrub): a scrubber
+        # may only REPLACE spans, so the document must still be this card's own.
+        fm = _read_frontmatter(result.text)
+        if fm.get("ccc_mirror") != card.kind or fm.get("session_id") != card.session_id:
+            self._withhold(card.path, "scrubbed output lost its frontmatter identity")
+            return
+        out = result.text
+        self.report.vouched.append(card.path)
+        if out != card.raw:
+            self.report.scrubbed.append((card.path, result.labels))
+        if pending.disk != out:  # byte-stable: write only on a real change
+            self.verdict.writes.append(_Write(card.path, out, card.session_id))
+        self.verdict.vouches.append(
+            MirrorVouch(
+                path=card.path,
+                session_id=card.session_id,
+                raw_sha=pending.raw_sha,
+                out_sha=scrub.sha256(out),
+                policy=self.policy,
+                vouched_at=self.now,
+            )
+        )
+
+    def run(self, queue: list[_Pending], budget: float, *, full: bool) -> None:
+        """Scrub *queue* in order until *budget* seconds of calls are spent.
+
+        The budget is wall time spent in THIS queue's scrub calls; a card that no longer
+        fits is deferred (its file is kept as-is and its expired vouch, if any, stays —
+        the next pass retries it). ``full=True`` (``ccc sync-mirrors --full``) lifts the
+        budget entirely, which is what the one-off migration of an existing vault needs.
+        """
+        spent = 0.0
+        for pending in queue:
+            if not full and spent >= budget:
+                self.report.deferred.append(pending.card.path)
+                self.verdict.protect.add(pending.card.session_id)
+                continue
+            blocked = self._blocked()
+            if blocked:  # no scrubber (or a degraded one) — refuse without a spawn
+                self.report.withheld.append((pending.card.path, blocked))
+                continue
+            assert self._resolution is not None and self._resolution.scrubber is not None
+            started = time.monotonic()
+            result = scrub.scrub(
+                self._resolution.scrubber, pending.card.raw, timeout=_SCRUB_TIMEOUT_S
+            )
+            spent += time.monotonic() - started
+            self._accept(pending, result)
+
+
+def _vouched_by(row: MirrorVouch, pending: _Pending, policy: str) -> bool:
+    """Whether *row* still speaks for this card: same document, same bytes, same policy.
+
+    All four must hold. ``disk is None`` (the file was deleted) fails it, so a removed
+    mirror is re-scrubbed rather than silently re-created from a stale receipt.
+    """
+    return (
+        row.raw_sha == pending.raw_sha
+        and pending.disk is not None
+        and row.out_sha == scrub.sha256(pending.disk)
+        and row.policy == policy
+    )
+
+
+def _classify(
+    store: Store, cfg: config.Config, plan: _Plan, report: MirrorReport, *, full: bool
+) -> _Verdict:
+    """Phase 1: decide, per card, whether it may be written — and at what cost.
+
+    ``mirror_allow_unscrubbed`` is the one passthrough (raw bytes, no scrubber, no
+    vouch rows — the receipts would be lies). Otherwise every card is either already
+    vouched (skipped: no call, no write), REQUIRED (no usable vouch — new, changed,
+    edited on disk, a changed policy, or a legacy file written before this feature) or a
+    REVOUCH candidate (vouched but past :data:`VOUCH_TTL_MS`). REQUIRED cards run first,
+    in desired order; revouches follow oldest-first on their own smaller budget.
+    """
+    verdict = _Verdict()
+    if cfg.mirror_allow_unscrubbed:
+        for card in plan.cards:
+            if _read_disk(card.path) != card.raw:
+                verdict.writes.append(_Write(card.path, card.raw, card.session_id))
+        return verdict
+    policy = (cfg.mirror_scrub_cmd or "").strip()
+    vouches = store.mirror_vouches()
+    now = now_ms()
+    required: list[_Pending] = []
+    revouch: list[_Pending] = []
+    for card in plan.cards:
+        pending = _Pending(card=card, raw_sha=scrub.sha256(card.raw), disk=_read_disk(card.path))
+        row = vouches.get(card.path)
+        if row is None or not _vouched_by(row, pending, policy):
+            required.append(pending)
+            continue
+        if now - row.vouched_at < VOUCH_TTL_MS:
+            continue  # vouched and fresh — the whole point: no call, no write
+        pending.since = row.vouched_at
+        revouch.append(pending)
+    revouch.sort(key=lambda pending: pending.since)  # oldest vouch first
+    gate = _ScrubPass(policy, report, verdict, now)
+    gate.run(required, REQUIRED_BUDGET_S, full=full)
+    gate.run(revouch, REVOUCH_BUDGET_S, full=full)
+    return verdict
+
+
+def _commit(store: Store, plan: _Plan, verdict: _Verdict, report: MirrorReport) -> None:
+    """Phase 2: write the vouched bytes, persist the receipts, then clean up (or not).
+
+    Cleanup is skipped ENTIRELY while anything was withheld: a card whose new bytes were
+    refused keeps its old file, and the file cleanup would remove (the predecessor of a
+    rename, the running mirror of a session that just finished) is then the only readable
+    copy there is. One stale mirror beats no mirror.
+    """
+    for write in verdict.writes:
+        _atomic_write(Path(write.path), write.text)
+        report.written.append(write.session_id)
+    store.put_mirror_vouches(verdict.vouches)
+    if report.withheld:
+        report.details.append(f"cleanup skipped: {len(report.withheld)} write(s) withheld")
+        return
+    for root, kind, desired in plan.roots:
+        _cleanup_root(root, kind, desired, report, verdict.protect)
+    store.drop_mirror_vouches(report.removed)
+
+
 # ---------------------------------------------------------------------------
 # public API
 # ---------------------------------------------------------------------------
-def run_mirrors(store: Store, cfg: config.Config) -> MirrorReport:
-    """Reconcile the RUNNING and DONE session mirrors with the store (flock-guarded).
+def _plan_roots(store: Store, cfg: config.Config, report: MirrorReport) -> _Plan:
+    """Serialise the desired card of every session in every ENABLED root (phase 0).
 
-    Export-only: the DB is the sole source of truth. Each enabled root gets a byte-stable
-    export of its set (write only on a real change) plus a ``ccc_mirror``-guarded cleanup
-    of stale/moved files. A concurrent invocation returns an empty report immediately.
+    The SESSION root is planned first (membership = running ∪ done, INDEPENDENT of the
+    running/done kill-switches) because its desired paths are the ``full session``
+    wikilink the other two roots embed. Card order is the scrub order: sessions, running,
+    done.
+    """
+    plan = _Plan()
+    ctx = _Ctx(
+        store=store,
+        git_base=repos.git_base(),
+        adapter=ClaudeAdapter(),
+        hist_map={},
+        scans=store.transcript_scans(),
+        dirty=plan.dirty,
+    )
+    sessions = store.list_sessions(include_archived=True)
+    running = [s for s in sessions if not s.draft and not s.archived and not s.done]
+    done = [s for s in sessions if s.done and not s.draft]
+    union = running + done
+    ctx.hist_map = {s.session_id: store.list_aim_history(s.session_id) for s in union}
+    if cfg.mirror_sessions:
+        report.sessions = [s.session_id for s in union]
+        root = sessions_root(cfg)
+        desired = _desired_paths(union, root, ctx.git_base, ctx.hist_map)
+        ctx.link_map = _link_map(desired, Path(cfg.vault_root).expanduser())
+        plan.roots.append((root, SESSION, set(desired)))
+        plan.cards.extend(_cards_for(ctx, desired, SESSION))
+    if cfg.mirror_running:
+        report.running = [s.session_id for s in running]
+        root = running_root(cfg)
+        desired = _desired_paths(running, root, ctx.git_base, ctx.hist_map)
+        plan.roots.append((root, RUNNING, set(desired)))
+        plan.cards.extend(_cards_for(ctx, desired, RUNNING))
+    if cfg.mirror_done:
+        report.done = [s.session_id for s in done]
+        root = done_root(cfg)
+        desired = _desired_paths(done, root, ctx.git_base, ctx.hist_map)
+        plan.roots.append((root, DONE, set(desired)))
+        plan.cards.extend(_cards_for(ctx, desired, DONE))
+    return plan
+
+
+def run_mirrors(
+    store: Store, cfg: config.Config, *, full: bool = False, rescrub: bool = False
+) -> MirrorReport:
+    """Reconcile the RUNNING/DONE/SESSION mirrors with the store (flock-guarded).
+
+    Export-only: the DB is the sole source of truth. A pass runs in two phases — plan +
+    classify every card (which needs a scrubber call, which is already vouched, which
+    does not fit the budget), then commit: write ONLY vouched bytes, persist the
+    receipts, and clean up stale/moved files unless anything was withheld. A concurrent
+    invocation returns an empty report immediately and touches nothing.
+
+    *full* lifts the per-pass scrub budgets (the one-off migration of an existing vault);
+    *rescrub* forgets every vouch first, so the whole tree is scrubbed again (a new rule
+    set). Both are ``ccc sync-mirrors`` flags, never the daemon's.
 
     The persisted transcript scans are loaded ONCE and shared by all three roots, and each
-    session's row is refreshed against its file as it is exported (see :func:`_scan_for`):
-    a frozen transcript costs one ``stat()``, a changed one a tail read, and every changed
-    row is written back in a single batch at the end. That is what lets a standalone
-    ``ccc sync-mirrors`` after a model switch emit the NEW model without waiting for a
-    daemon reconcile pass.
+    session's row is refreshed against its file as its card is built (see
+    :func:`_scan_for`): a frozen transcript costs one ``stat()``, a changed one a tail
+    read, and every changed row is written back in a single batch at the end. That is
+    what lets a standalone ``ccc sync-mirrors`` after a model switch emit the NEW model
+    without waiting for a daemon reconcile pass.
     """
     report = MirrorReport()
     lock = _acquire_lock()
     if lock is None:  # another mirror run holds the singleton — leave it to that one
         return report
     try:
-        git_base = repos.git_base()
-        adapter = ClaudeAdapter()
-        scans = store.transcript_scans()
-        dirty: list[TranscriptScan] = []
-        sessions = store.list_sessions(include_archived=True)
-        running = [s for s in sessions if not s.draft and not s.archived and not s.done]
-        done = [s for s in sessions if s.done and not s.draft]
-        union = running + done
-        hist_map = {s.session_id: store.list_aim_history(s.session_id) for s in union}
-        # SESSION mirrors first (membership = running ∪ done, INDEPENDENT of the
-        # running/done kill-switches) so the link map can feed the other two roots.
-        link_map: dict[str, str] = {}
-        if cfg.mirror_sessions:
-            report.sessions = [s.session_id for s in union]
-            desired = _sync_root(
-                store,
-                union,
-                SESSION,
-                sessions_root(cfg),
-                git_base,
-                report,
-                adapter,
-                hist_map,
-                {},
-                scans,
-                dirty,
-            )
-            link_map = _link_map(desired, Path(cfg.vault_root).expanduser())
-        if cfg.mirror_running:
-            report.running = [s.session_id for s in running]
-            _sync_root(
-                store,
-                running,
-                RUNNING,
-                running_root(cfg),
-                git_base,
-                report,
-                adapter,
-                hist_map,
-                link_map,
-                scans,
-                dirty,
-            )
-        if cfg.mirror_done:
-            report.done = [s.session_id for s in done]
-            _sync_root(
-                store,
-                done,
-                DONE,
-                done_root(cfg),
-                git_base,
-                report,
-                adapter,
-                hist_map,
-                link_map,
-                scans,
-                dirty,
-            )
+        if rescrub:
+            store.drop_mirror_vouches()
+        plan = _plan_roots(store, cfg, report)
+        verdict = _classify(store, cfg, plan, report, full=full)
+        _commit(store, plan, verdict, report)
         # ONE batched write for every transcript that actually changed this run; an
         # all-frozen run writes (and commits) nothing at all.
-        store.put_transcript_scans(dirty)
+        store.put_transcript_scans(plan.dirty)
+        store.put_mirror_health(
+            MirrorHealth(
+                at=now_ms(),
+                vouched=len(report.vouched),
+                scrubbed=len(report.scrubbed),
+                withheld=len(report.withheld),
+                deferred=len(report.deferred),
+                reason=report.withheld[0][1] if report.withheld else "",
+            )
+        )
         return report
     finally:
         _release_lock(lock)
@@ -811,19 +1142,35 @@ def remove_mirror(cfg: config.Config, session_id: str) -> list[str]:
     Used by ``ccc unlaunch`` to drop a session's running mirror synchronously when it
     returns to FUTURE. Only touches files whose frontmatter carries ``ccc_mirror`` AND the
     matching ``session_id`` — never a foreign file.
+
+    Takes the SAME flock a mirror pass holds, waiting up to
+    :data:`_REMOVE_LOCK_TIMEOUT_S` for it: unlinking a file a concurrent pass is about to
+    ``os.replace`` into place would resurrect it. Unlike the pass this call blocks (it is
+    a user-facing lifecycle step, not a backstop), and on a busy lock it says so and
+    leaves the removal to the next pass — whose cleanup drops exactly these files anyway.
     """
+    lock = _wait_for_lock(_REMOVE_LOCK_TIMEOUT_S)
+    if lock is None:
+        print(
+            "mirrors: remove_mirror skipped — mirror sync lock busy (the next sync pass cleans up)",
+            file=sys.stderr,
+        )
+        return []
     removed: list[str] = []
-    for root in (running_root(cfg), done_root(cfg), sessions_root(cfg)):
-        for path in _iter_mirror_files(root):
-            try:
-                fm = _read_frontmatter(path.read_text(encoding="utf-8"))
-            except OSError:
-                continue
-            if not fm.get("ccc_mirror") or fm.get("session_id") != session_id:
-                continue
-            try:
-                path.unlink()
-                removed.append(str(path))
-            except OSError:
-                pass
-    return removed
+    try:
+        for root in (running_root(cfg), done_root(cfg), sessions_root(cfg)):
+            for path in _iter_mirror_files(root):
+                try:
+                    fm = _read_frontmatter(path.read_text(encoding="utf-8"))
+                except OSError:
+                    continue
+                if not fm.get("ccc_mirror") or fm.get("session_id") != session_id:
+                    continue
+                try:
+                    path.unlink()
+                    removed.append(str(path))
+                except OSError:
+                    pass
+        return removed
+    finally:
+        _release_lock(lock)
