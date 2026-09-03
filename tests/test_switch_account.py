@@ -93,7 +93,14 @@ def _jsonl(path: Path, records: list[object] | None = None) -> Path:
     return path
 
 
-def _live(cwd: str, config_dir: Path, *, pid: int = PID, status: str = "idle") -> LiveSession:
+def _live(
+    cwd: str,
+    config_dir: Path,
+    *,
+    pid: int = PID,
+    status: str = "idle",
+    status_updated_at: int = 0,
+) -> LiveSession:
     """One ALIVE registry entry for :data:`SID`."""
     return LiveSession(
         pid=pid,
@@ -102,6 +109,7 @@ def _live(cwd: str, config_dir: Path, *, pid: int = PID, status: str = "idle") -
         alive=True,
         config_dir=str(config_dir),
         raw_status=status,
+        status_updated_at=status_updated_at,
     )
 
 
@@ -1235,52 +1243,80 @@ def _write_records(path: Path, *records: dict[str, object]) -> None:
     path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
 
 
+_TOOL_USE = {
+    "type": "assistant",
+    "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash"}]},
+}
+_TOOL_RESULT = {
+    "type": "user",
+    "message": {"content": [{"type": "tool_result", "tool_use_id": "t1"}]},
+}
+_ASSISTANT_TEXT = {"type": "assistant", "message": {"content": [{"type": "text", "text": "OK"}]}}
+_PROMPT = {"type": "user", "message": {"content": "do something"}}
+_COMMAND = {"type": "user", "message": {"content": "<command-name>/x-now</command-name>"}}
+_LOCAL_ERR = {
+    "type": "user",
+    "message": {"content": "<local-command-stderr>failed</local-command-stderr>"},
+}
+_ATTACHMENT = {"type": "attachment", "attachment": {}}
+
+
 @pytest.mark.parametrize(
-    ("last", "expected"),
+    ("records", "expected"),
     [
-        ({"type": "user", "message": {"content": "<command-name>/x-now</command-name>"}}, True),
-        ({"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}}, True),
-        (
-            {"type": "user", "message": {"content": [{"type": "tool_result", "content": "x"}]}},
-            False,
-        ),
-        ({"type": "assistant", "message": {"content": [{"type": "text", "text": "OK"}]}}, False),
+        ([_PROMPT, _ASSISTANT_TEXT], False),  # a finished turn
+        ([_PROMPT, _ASSISTANT_TEXT, _ATTACHMENT, _ATTACHMENT], False),  # resume attachments
+        ([_PROMPT, _ASSISTANT_TEXT, _COMMAND, _LOCAL_ERR], False),  # a cancelled expansion
+        ([_PROMPT, _TOOL_USE], True),  # a tool is executing
+        ([_PROMPT, _TOOL_USE, _TOOL_RESULT], True),  # model generating after a result
+        ([_PROMPT, _TOOL_USE, _TOOL_RESULT, _ASSISTANT_TEXT], False),
+        ([_ASSISTANT_TEXT, _PROMPT], True),  # an unanswered prompt
     ],
 )
-def test_transcript_tail_is_user_prompt_reads_only_the_last_record(
-    tmp_path: Path, last: dict[str, object], expected: bool
+def test_transcript_turn_in_flight_reads_tool_calls_and_unanswered_prompts(
+    tmp_path: Path, records: list[dict[str, object]], expected: bool
 ) -> None:
-    """A bare user prompt as the last record ⇒ nothing generated yet; anything else ⇒ not idle."""
-    from command_center.adapters.claude import transcript_tail_is_user_prompt
+    """A pending tool_use or a bare prompt means a turn is running; finished turns, resume
+    attachments and cancelled-expansion records do not."""
+    from command_center.adapters.claude import transcript_turn_in_flight
 
     path = tmp_path / "t.jsonl"
-    _write_records(path, {"type": "assistant", "message": {"content": []}}, last)
-    assert transcript_tail_is_user_prompt(path) is expected
+    _write_records(path, *records)
+    assert transcript_turn_in_flight(path) is expected
 
 
-def test_transcript_tail_is_user_prompt_is_false_on_empty_or_broken_files(tmp_path: Path) -> None:
-    """Unknown is never idle: an empty, missing or unparsable tail answers False."""
-    from command_center.adapters.claude import transcript_tail_is_user_prompt
+def test_transcript_turn_in_flight_is_unknown_on_broken_files(tmp_path: Path) -> None:
+    """Unreadable or unparsable transcripts answer None — callers treat unknown as in flight."""
+    from command_center.adapters.claude import transcript_turn_in_flight
 
-    empty = tmp_path / "empty.jsonl"
-    empty.write_text("", encoding="utf-8")
     broken = tmp_path / "broken.jsonl"
     broken.write_text('{"type": "user"\n', encoding="utf-8")
-    assert transcript_tail_is_user_prompt(empty) is False
-    assert transcript_tail_is_user_prompt(broken) is False
-    assert transcript_tail_is_user_prompt(tmp_path / "missing.jsonl") is False
+    assert transcript_turn_in_flight(broken) is None
+    assert transcript_turn_in_flight(tmp_path / "missing.jsonl") is None
 
 
-@pytest.mark.parametrize("tail_is_prompt", [True, False])
+@pytest.mark.parametrize(
+    ("busy_age_ms", "records", "allowed"),
+    [
+        (500, [_PROMPT, _ASSISTANT_TEXT], True),  # busy stamped by this very prompt
+        (500, [_PROMPT, _ASSISTANT_TEXT, _ATTACHMENT], True),  # right after a resume
+        (500, [_PROMPT, _TOOL_USE], False),  # a tool is running
+        (60_000, [_PROMPT, _ASSISTANT_TEXT], False),  # busy for a minute: a real turn
+    ],
+)
 def test_switch_account_now_tolerates_busy_raised_by_the_prompt_being_expanded(
     two_accounts: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
-    tail_is_prompt: bool,
+    busy_age_ms: int,
+    records: list[dict[str, object]],
+    allowed: bool,
 ) -> None:
-    """Inside the session, registry 'busy' with a bare user prompt as the transcript's last
-    record is the prompt being expanded — not a turn in flight; a turn in progress still refuses."""
+    """Inside the session, a seconds-old registry 'busy' with no turn visible in the
+    transcript is the prompt being expanded — not a turn in flight; anything else refuses."""
+    from command_center.models import now_ms as _now
+
     private, _work = two_accounts
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1289,22 +1325,19 @@ def test_switch_account_now_tolerates_busy_raised_by_the_prompt_being_expanded(
     with Store() as store:
         store.ensure(SID, cwd=str(repo))
         store.update_fields(SID, iterm_session_id=ITERM)
-    _prepare_arm(monkeypatch, two_accounts, live=_live(str(repo), private, status="busy"))
-    last: dict[str, object] = (
-        {"type": "user", "message": {"content": "<command-name>/cpriv-to-cwork-now</command-name>"}}
-        if tail_is_prompt
-        else {"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}}
+    _prepare_arm(
+        monkeypatch,
+        two_accounts,
+        live=_live(str(repo), private, status="busy", status_updated_at=_now() - busy_age_ms),
     )
-    _write_records(
-        _transcript(private, str(repo)), {"type": "user", "message": {"content": "q"}}, last
-    )
+    _write_records(_transcript(private, str(repo)), *records)
     monkeypatch.setattr(cli.ClaudeAdapter, "is_halted", lambda _self, _cwd, _sid: False)
     calls: list[list[str]] = []
     monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
     rc = cli.main(["switch-account", "work", "-s", SID, "-N"])
     err = capsys.readouterr().err
-    assert (rc, len(calls)) == ((0, 1) if tail_is_prompt else (1, 0)), err
-    if not tail_is_prompt:
+    assert (rc, len(calls)) == ((0, 1) if allowed else (1, 0)), err
+    if not allowed:
         assert "mid-turn" in err
 
 

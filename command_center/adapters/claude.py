@@ -508,35 +508,78 @@ _TRANSCRIPT_TAIL_BYTES = 32 * 1024 * 1024
 _TASK_ID_RE = re.compile(r"<task-id>([A-Za-z0-9_-]+)</task-id>")
 
 
-def transcript_tail_is_user_prompt(transcript: Path) -> bool:
-    """True when the transcript's LAST record is a plain user prompt (no turn started on it).
+def transcript_turn_in_flight(transcript: Path) -> bool | None:
+    """Whether the transcript shows a turn in progress: a tool call awaiting its result, or a
+    plain user prompt nothing has answered yet.
 
-    Claude Code appends the user's prompt — a slash command included, as its
-    ``<command-name>`` record — the moment it is submitted and marks the session busy,
-    BEFORE any command expansion or model request. So a registry ``busy`` whose
-    transcript ends on such a record is "busy because of this very prompt", not a turn
-    in flight: nothing has been generated or run yet. A user record carrying a
-    ``tool_result`` block is a turn in progress and does NOT count. ``False`` on any
-    read/parse problem (unknown ⇒ not idle).
+    Claude Code stamps the registry ``busy`` the moment a prompt is submitted — BEFORE a
+    slash command's inline expansion runs and before the prompt's own record is written —
+    so ``busy`` alone cannot tell "a prompt is being expanded" from "a turn is running".
+    The transcript can: a turn in flight has an assistant ``tool_use`` with no later
+    ``tool_result`` (a tool is executing), or ends on a bare user prompt (the model is
+    generating). At expansion time the tail is the PREVIOUS turn's end — assistant text,
+    resume attachments, a cancelled prompt's ``<command-name>`` / ``<local-command-*>``
+    records — none of which is in flight. ``None`` means unknown (unreadable/unparsable):
+    callers treat it as in flight.
     """
     try:
         with transcript.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
             size = handle.tell()
-            handle.seek(max(0, size - 64 * 1024))
+            handle.seek(max(0, size - 256 * 1024))
             tail = handle.read().decode("utf-8", errors="replace")
-        lines = [line for line in tail.splitlines() if line.strip()]
-        record = json.loads(lines[-1]) if lines else None
-    except (OSError, ValueError):
-        return False
-    if not isinstance(record, dict) or record.get("type") != "user":
-        return False
-    content = (record.get("message") or {}).get("content")
+    except OSError:
+        return None
+    lines = [line for line in tail.splitlines() if line.strip()]
+    if size > 256 * 1024 and lines:
+        lines = lines[1:]  # the seek landed mid-record
+    pending_tools: set[str] = set()
+    last_kind = ""
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            return None
+        if not isinstance(record, dict) or record.get("isMeta"):
+            continue
+        kind = record.get("type")
+        content = (record.get("message") or {}).get("content")
+        if kind == "assistant":
+            last_kind = "assistant"
+            pending_tools.update(_blocks(content, "tool_use", "id"))
+        elif kind == "user":
+            results = _blocks(content, "tool_result", "tool_use_id")
+            pending_tools.difference_update(results)
+            last_kind = "result" if results else _user_prompt_kind(content)
+    # A pending tool, a prompt nobody answered, or a result the model has not continued
+    # from: the turn is running. Anything else is the quiet end of the previous one.
+    return bool(pending_tools) or last_kind in ("prompt", "result")
+
+
+def _blocks(content: object, block_type: str, key: str) -> set[str]:
+    """The *key* values of every *block_type* block in a message *content* list."""
+    if not isinstance(content, list):
+        return set()
+    return {
+        str(block.get(key) or "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == block_type
+    }
+
+
+def _user_prompt_kind(content: object) -> str:
+    """``"local"`` for a slash-command / local-command record, else ``"prompt"``."""
     if isinstance(content, str):
-        return True
-    return isinstance(content, list) and not any(
-        isinstance(block, dict) and block.get("type") == "tool_result" for block in content
-    )
+        text = content
+    elif isinstance(content, list):
+        text = " ".join(
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    else:
+        text = ""
+    return "local" if text.lstrip().startswith(("<command-", "<local-command")) else "prompt"
 
 
 def pending_background_work(transcript: Path) -> list[str] | None:

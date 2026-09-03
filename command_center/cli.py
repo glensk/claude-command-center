@@ -83,6 +83,9 @@ _SWITCH_POLL_SEC = 0.25
 # up (auto-commit + linters + scans can take a minute), and how long the tab's tty may
 # take to return to a shell prompt once the process is gone.
 _SWITCH_HOOK_WAIT_SEC = 180.0
+# `switch-account -N` inside the session: a registry "busy" younger than this, with no turn
+# visible in the transcript, is the prompt being expanded right now — not a turn to protect.
+_SWITCH_PROMPT_BUSY_MS = 15_000
 _SWITCH_READY_WAIT_SEC = 10.0
 
 
@@ -1408,12 +1411,17 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     # A session halted by a rate limit can stay registry-"busy" (its last turn never
     # completed) — that is the very case --now exists for, so a positively detected halt
     # is not mid-turn. Neither is "busy" raised by the prompt being expanded right now: a
-    # slash command's inline expansion runs after Claude Code stamped busy but before any
-    # model request, and the transcript then ends on that bare user prompt.
-    from .adapters.claude import transcript_tail_is_user_prompt
+    # slash command's inline expansion runs after Claude Code stamped busy (seconds ago)
+    # but before any model request — and the transcript shows no tool awaiting its result
+    # and no unanswered prompt (its own record is written only after the expansion).
+    from .adapters.claude import transcript_turn_in_flight
 
     busy_by_this_prompt = (
-        inside and transcript is not None and transcript_tail_is_user_prompt(transcript)
+        inside
+        and 0 < live.status_updated_at
+        and now_ms() - live.status_updated_at < _SWITCH_PROMPT_BUSY_MS
+        and transcript is not None
+        and transcript_turn_in_flight(transcript) is False
     )
     if (
         live.raw_status == "busy"
