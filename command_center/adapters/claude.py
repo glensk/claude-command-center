@@ -508,6 +508,37 @@ _TRANSCRIPT_TAIL_BYTES = 32 * 1024 * 1024
 _TASK_ID_RE = re.compile(r"<task-id>([A-Za-z0-9_-]+)</task-id>")
 
 
+def transcript_tail_is_user_prompt(transcript: Path) -> bool:
+    """True when the transcript's LAST record is a plain user prompt (no turn started on it).
+
+    Claude Code appends the user's prompt — a slash command included, as its
+    ``<command-name>`` record — the moment it is submitted and marks the session busy,
+    BEFORE any command expansion or model request. So a registry ``busy`` whose
+    transcript ends on such a record is "busy because of this very prompt", not a turn
+    in flight: nothing has been generated or run yet. A user record carrying a
+    ``tool_result`` block is a turn in progress and does NOT count. ``False`` on any
+    read/parse problem (unknown ⇒ not idle).
+    """
+    try:
+        with transcript.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 64 * 1024))
+            tail = handle.read().decode("utf-8", errors="replace")
+        lines = [line for line in tail.splitlines() if line.strip()]
+        record = json.loads(lines[-1]) if lines else None
+    except (OSError, ValueError):
+        return False
+    if not isinstance(record, dict) or record.get("type") != "user":
+        return False
+    content = (record.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return True
+    return isinstance(content, list) and not any(
+        isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+    )
+
+
 def pending_background_work(transcript: Path) -> list[str] | None:
     """Ids of background Bash tasks / agents the session started but was never told finished.
 

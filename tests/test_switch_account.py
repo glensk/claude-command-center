@@ -1226,3 +1226,109 @@ def test_has_subagent_skips_ignored_descendants(monkeypatch: pytest.MonkeyPatch)
     adapter = claude_adapter.ClaudeAdapter()
     assert adapter.has_subagent(PID) is True
     assert adapter.has_subagent(PID, frozenset({9002})) is False
+
+
+# --------------------------------------------------------------------------- #
+# 8. `-N` from a slash command's inline expansion: busy-by-this-prompt and -c
+# --------------------------------------------------------------------------- #
+def _write_records(path: Path, *records: dict[str, object]) -> None:
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("last", "expected"),
+    [
+        ({"type": "user", "message": {"content": "<command-name>/x-now</command-name>"}}, True),
+        ({"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}}, True),
+        (
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": "x"}]}},
+            False,
+        ),
+        ({"type": "assistant", "message": {"content": [{"type": "text", "text": "OK"}]}}, False),
+    ],
+)
+def test_transcript_tail_is_user_prompt_reads_only_the_last_record(
+    tmp_path: Path, last: dict[str, object], expected: bool
+) -> None:
+    """A bare user prompt as the last record ⇒ nothing generated yet; anything else ⇒ not idle."""
+    from command_center.adapters.claude import transcript_tail_is_user_prompt
+
+    path = tmp_path / "t.jsonl"
+    _write_records(path, {"type": "assistant", "message": {"content": []}}, last)
+    assert transcript_tail_is_user_prompt(path) is expected
+
+
+def test_transcript_tail_is_user_prompt_is_false_on_empty_or_broken_files(tmp_path: Path) -> None:
+    """Unknown is never idle: an empty, missing or unparsable tail answers False."""
+    from command_center.adapters.claude import transcript_tail_is_user_prompt
+
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    broken = tmp_path / "broken.jsonl"
+    broken.write_text('{"type": "user"\n', encoding="utf-8")
+    assert transcript_tail_is_user_prompt(empty) is False
+    assert transcript_tail_is_user_prompt(broken) is False
+    assert transcript_tail_is_user_prompt(tmp_path / "missing.jsonl") is False
+
+
+@pytest.mark.parametrize("tail_is_prompt", [True, False])
+def test_switch_account_now_tolerates_busy_raised_by_the_prompt_being_expanded(
+    two_accounts: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    tail_is_prompt: bool,
+) -> None:
+    """Inside the session, registry 'busy' with a bare user prompt as the transcript's last
+    record is the prompt being expanded — not a turn in flight; a turn in progress still refuses."""
+    private, _work = two_accounts
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.chdir(repo)  # inside the session: the command's own cwd IS the session cwd
+    monkeypatch.setenv("ITERM_SESSION_ID", ITERM)  # …and its tab id is in the env
+    with Store() as store:
+        store.ensure(SID, cwd=str(repo))
+        store.update_fields(SID, iterm_session_id=ITERM)
+    _prepare_arm(monkeypatch, two_accounts, live=_live(str(repo), private, status="busy"))
+    last: dict[str, object] = (
+        {"type": "user", "message": {"content": "<command-name>/cpriv-to-cwork-now</command-name>"}}
+        if tail_is_prompt
+        else {"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}}
+    )
+    _write_records(
+        _transcript(private, str(repo)), {"type": "user", "message": {"content": "q"}}, last
+    )
+    monkeypatch.setattr(cli.ClaudeAdapter, "is_halted", lambda _self, _cwd, _sid: False)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+    rc = cli.main(["switch-account", "work", "-s", SID, "-N"])
+    err = capsys.readouterr().err
+    assert (rc, len(calls)) == ((0, 1) if tail_is_prompt else (1, 0)), err
+    if not tail_is_prompt:
+        assert "mid-turn" in err
+
+
+def test_switch_account_now_cancel_prompt_exits_nonzero_after_spawning(
+    two_accounts: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``-N -c`` spawns the relauncher, then exits 1 on purpose so Claude Code cancels the
+    prompt — the status goes to stderr, where the cancelled-prompt notice shows it."""
+    private, _work = two_accounts
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("ITERM_SESSION_ID", ITERM)
+    with Store() as store:
+        store.ensure(SID, cwd=str(repo))
+        store.update_fields(SID, iterm_session_id=ITERM)
+    _prepare_arm(monkeypatch, two_accounts, live=_live(str(repo), private))
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+    rc = cli.main(["switch-account", "work", "-s", SID, "-N", "-c"])
+    err = capsys.readouterr().err
+    assert rc == 1, err
+    assert len(calls) == 1 and calls[0][0] == "switch-now", err
+    assert "relaunching now" in err and "cancelled on purpose" in err

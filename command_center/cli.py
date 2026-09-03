@@ -1407,8 +1407,20 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     # be idle: a turn in flight would be cut off mid-work.
     # A session halted by a rate limit can stay registry-"busy" (its last turn never
     # completed) — that is the very case --now exists for, so a positively detected halt
-    # is not mid-turn.
-    if live.raw_status == "busy" and not args.force and not adapter.is_halted(cwd, session_id):
+    # is not mid-turn. Neither is "busy" raised by the prompt being expanded right now: a
+    # slash command's inline expansion runs after Claude Code stamped busy but before any
+    # model request, and the transcript then ends on that bare user prompt.
+    from .adapters.claude import transcript_tail_is_user_prompt
+
+    busy_by_this_prompt = (
+        inside and transcript is not None and transcript_tail_is_user_prompt(transcript)
+    )
+    if (
+        live.raw_status == "busy"
+        and not args.force
+        and not busy_by_this_prompt
+        and not adapter.is_halted(cwd, session_id)
+    ):
         print(
             f"error: {session_id} is mid-turn — wait for it to go idle, or -f/--force to cut "
             "it off",
@@ -1427,7 +1439,7 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     if not iterm and not pane:
         print(
             f"error: no terminal is recorded for {session_id} (no iTerm tab id, no tmux pane) "
-            "— run the switch from inside that session's tab with the `!` prefix",
+            "— run the switch from inside that session (a slash command's inline expansion)",
             file=sys.stderr,
         )
         return 1
@@ -1457,12 +1469,19 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     if not spawn.spawn_ccc(spawn_args):
         print("error: could not spawn the relauncher (ccc switch-now)", file=sys.stderr)
         return 1
+    status = (
+        f"relaunching now: {session_id} → the {label!r} account in its own tab (the "
+        "detached relauncher terminates Claude, waits for the shell and types the "
+        "resume; failures land in events.log and as a desktop notification)."
+    )
+    if getattr(args, "cancel_prompt", False):
+        # Run from a slash command's inline `!` expansion: a NON-ZERO exit makes Claude
+        # Code cancel the prompt (it shows this text, sends nothing), so the switch costs
+        # no model request at all — the relauncher is already on its way.
+        print(f"{status} Prompt cancelled on purpose (-c): no model turn.", file=sys.stderr)
+        return 1
     if not quiet:
-        print(
-            f"relaunching now: {session_id} → the {label!r} account in its own tab (the "
-            "detached relauncher terminates Claude, waits for the shell and types the "
-            "resume; failures land in events.log and as a desktop notification)."
-        )
+        print(status)
     return 0
 
 
@@ -4532,6 +4551,13 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "(use via `!` inside a session whose account hit its limit, or from another tab)",
     )
     p_switch.add_argument("-q", "--quiet", action="store_true", help="suppress the summary print")
+    p_switch.add_argument(
+        "-c",
+        "--cancel-prompt",
+        action="store_true",
+        help="with -N from a slash command's inline `!` expansion: exit 1 after spawning "
+        "the relauncher so Claude Code cancels the prompt (no model request at all)",
+    )
     p_switch.set_defaults(func=cmd_switch_account)
 
     p_switchnow = sub.add_parser(
