@@ -74,6 +74,16 @@ from .store import Store
 # Seconds `ccc close-now` waits before reaping/closing, so the render + the rest of the
 # Stop-hook chain (auto-commit) settle first. Module-level so tests can monkeypatch it.
 _CLOSE_NOW_SETTLE_SEC = 2.0
+# `ccc switch-now`: how long to wait for the SIGTERM'd Claude to actually exit before
+# typing the relaunch into its tab (typing earlier would feed Claude's composer), and the
+# poll interval. A process still alive at the deadline aborts the relaunch (logged).
+_SWITCH_EXIT_WAIT_SEC = 20.0
+_SWITCH_POLL_SEC = 0.25
+# … how long that Claude's Stop-hook chain may still be running before the switch gives
+# up (auto-commit + linters + scans can take a minute), and how long the tab's tty may
+# take to return to a shell prompt once the process is gone.
+_SWITCH_HOOK_WAIT_SEC = 180.0
+_SWITCH_READY_WAIT_SEC = 10.0
 
 
 def _adapter() -> ClaudeAdapter:
@@ -93,10 +103,14 @@ def _close_arming_suppressed() -> bool:
 
 
 def resolve_session_id(adapter: ClaudeAdapter, explicit: str | None, cwd: str | None) -> str | None:
-    """Resolve a session id: explicit > $CLAUDE_SESSION_ID > the live session in *cwd*."""
+    """Resolve a session id: explicit > session env var > the live session in *cwd*.
+
+    Claude Code exports the id to tool subprocesses as ``CLAUDE_CODE_SESSION_ID``;
+    ``CLAUDE_SESSION_ID`` is kept first for callers/wrappers that set it themselves.
+    """
     if explicit:
         return explicit
-    env = os.environ.get("CLAUDE_SESSION_ID")
+    env = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID")
     if env:
         return env
     cwd = cwd or os.getcwd()
@@ -1078,6 +1092,559 @@ def cmd_close_now(args: argparse.Namespace) -> int:
             terminal.close_iterm_session(target)
         except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             pass
+    return 0
+
+
+def _transcript_visible_to(config_dir: str, session_id: str, cwd: str) -> bool:
+    """True when *config_dir*'s OWN ``projects/`` tree holds *session_id*'s transcript for *cwd*.
+
+    Exactly where ``claude --resume <id>`` run from *cwd* under that account looks —
+    ``<config_dir>/projects/<cwd with "/" → "-">/<id>.jsonl`` (the adapter's munge) — so
+    a shared store (symlinked ``projects/``) or a copied transcript must resolve HERE;
+    ``ClaudeAdapter.transcript_path`` deliberately falls back across accounts and cannot
+    answer this.
+    """
+    from pathlib import Path
+
+    if not cwd:
+        return False
+    root = Path(config_dir).expanduser() / "projects" / cwd.replace("/", "-")
+    return (root / f"{session_id}.jsonl").is_file()
+
+
+def _strict_live_entries(session_id: str) -> list[Any]:
+    """Every ALIVE registry entry for *session_id* across accounts; RAISES when discovery fails.
+
+    The fail-closed twin of ``accounts.live_conflict`` (which swallows discovery errors):
+    an account switch must not proceed on a registry it could not read.
+    """
+    return [e for e in _adapter().discover() if e.session_id == session_id and e.alive]
+
+
+def _has_control_chars(text: str) -> bool:
+    """True when *text* holds a C0 control character or DEL (unsafe to type into a shell)."""
+    return any(ord(ch) < 32 or ch == "\x7f" for ch in text)
+
+
+def _env_int(name: str) -> int:
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw.isdigit() else 0
+
+
+def _wait_until(predicate: Callable[[], bool], timeout: float, poll: float | None = None) -> bool:
+    """Poll *predicate* until true; ``False`` once *timeout* seconds passed without it."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_SWITCH_POLL_SEC if poll is None else poll)
+
+
+def _wait_pid_gone(pid: int, timeout: float) -> bool:
+    """Poll until *pid* no longer exists; ``False`` if it is still alive after *timeout* s."""
+
+    def gone() -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False  # e.g. EPERM: exists, not ours to probe further — keep waiting
+        return False
+
+    return _wait_until(gone, timeout)
+
+
+def _background_work(
+    adapter: ClaudeAdapter,
+    live_pid: int,
+    transcript: Any,
+    ignore: frozenset[int] = frozenset(),
+) -> list[str]:
+    """Why the session must NOT be relaunched yet: background work still in flight, by evidence.
+
+    Process tree (a child claude = subagent, a background Bash-tool shell) plus the
+    transcript's structured launch/completion records
+    (``adapters.claude.pending_background_work``). An unreadable transcript is a reason
+    too — unknown is refused, never assumed clear. Empty ⇒ clear to switch. *ignore*
+    is the caller's own process ancestry when it runs inside the session (the ``!``
+    prefix's Bash-tool shell must not veto the very command it is running).
+    """
+    from .adapters.claude import pending_background_work
+
+    reasons: list[str] = []
+    if live_pid > 0:
+        if adapter.has_subagent(live_pid, ignore):
+            reasons.append("a child claude process (subagent) is running")
+        if adapter.has_background_task(live_pid, ignore):
+            reasons.append("a background Bash task shell is running")
+    if transcript is None:
+        reasons.append("the session transcript could not be located — background state unknown")
+    else:
+        pending = pending_background_work(transcript)
+        if pending is None:
+            reasons.append(
+                "the session transcript is unreadable/malformed — background state unknown"
+            )
+        elif pending:
+            reasons.append("background task(s) not yet reported back: " + ", ".join(pending))
+    return reasons
+
+
+def _notify_switch(message: str) -> None:
+    """Best-effort desktop notification for a switch that could not complete."""
+    try:
+        from . import notify
+
+        notify.notify("ccc switch-account", message, config.load_config().notify)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        pass
+
+
+def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements,too-many-branches,too-many-locals,too-many-statements
+    """``ccc switch-account <label>`` — relaunch this session under another account, same tab.
+
+    Arms a one-shot relaunch-after-turn (the twin of ``mark-done --close``): the
+    release-locks Stop hook claims it once the turn — auto-commit included — is over and
+    spawns ``switch-now``, which terminates this Claude after its Stop chain, waits for
+    the shell to come back and types ``claude --resume <id>`` into this very tab under
+    the target account's env pin. The conversation continues; only the billing seat
+    changes. Every check here fails closed: a switch that could bill the wrong seat,
+    kill the wrong process, strand background work or resume nothing is refused with
+    exit 1 and nothing armed.
+    """
+    from . import accounts
+
+    adapter = _adapter()
+    session_id = resolve_session_id(adapter, args.session, None)
+    if not session_id:
+        print("error: could not resolve a session (pass -s/--session <id>)", file=sys.stderr)
+        return 1
+    quiet = args.quiet
+    if args.undo:
+        with Store() as store:
+            row = store.get(session_id)
+            armed = bool(row and (row.switch_requested_at or row.switch_config_dir))
+            if row is not None:
+                store.update_fields(session_id, switch_requested_at=0, switch_config_dir="")
+        if not armed:
+            print(f"nothing armed for {session_id} — nothing to undo", file=sys.stderr)
+            return 1
+        if not quiet:
+            print(f"disarmed: {session_id} stays on its current account")
+        return 0
+    label = (args.label or "").strip()
+    if not label:
+        print("error: an account label is required (or -u/--undo)", file=sys.stderr)
+        return 1
+    if len(config.claude_config_dirs()) < 2:
+        print(
+            "error: only one Claude account is configured (claude_accounts) — nothing to switch to",
+            file=sys.stderr,
+        )
+        return 1
+    target, err = _account_config_dir(label)
+    if err or not target:
+        print(err or f"error: unknown account {label!r}", file=sys.stderr)
+        return 1
+    if _close_arming_suppressed():
+        print(
+            "error: switch-account needs a real interactive session — refused under a "
+            "headless/SDK entrypoint (CCC_INTERNAL / sdk); nothing armed",
+            file=sys.stderr,
+        )
+        return 1
+    env_sid = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    inside = bool(env_sid) and env_sid == session_id  # this shell IS the session's own
+    if env_sid and not inside and not args.now:
+        # An arm fires from the named session's OWN Stop hooks, so it must be issued from
+        # inside it; --now is driven by the caller and may target any idle session.
+        print(
+            f"error: this shell belongs to session {env_sid}, not {session_id} — run the "
+            "switch from inside the session you want to move (or use -N/--now)",
+            file=sys.stderr,
+        )
+        return 1
+    cwd = os.getcwd()
+    try:
+        alive = _strict_live_entries(session_id)
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        print(
+            f"error: could not read the live-session registry ({exc}) — refusing", file=sys.stderr
+        )
+        return 1
+    if len(alive) > 1:
+        print(
+            f"error: {session_id} is live under two Claude accounts at once — close one of "
+            "them first",
+            file=sys.stderr,
+        )
+        return 1
+    if not alive:
+        print(
+            f"error: {session_id} is not a live session in Claude's registry — refusing",
+            file=sys.stderr,
+        )
+        return 1
+    live = alive[0]
+    # The account the session bills: inside the session the env is authoritative (and must
+    # agree with the registry); from another tab only the registry knows.
+    current = accounts.env_config_dir() if inside else (live.config_dir or "")
+    if not current:
+        print(
+            f"error: the registry does not record which account {session_id} bills — run "
+            "the switch from inside that session",
+            file=sys.stderr,
+        )
+        return 1
+    if accounts.same_config_dir(current, target):
+        print(
+            f"error: this session already bills the {label!r} account — nothing to do",
+            file=sys.stderr,
+        )
+        return 1
+    env_pid = _env_int("CLAUDE_PID") if inside else 0
+    if env_pid and live.pid > 0 and env_pid != live.pid:
+        print(
+            f"error: this shell's Claude is pid {env_pid} but the registry lists pid "
+            f"{live.pid} for {session_id} — refusing",
+            file=sys.stderr,
+        )
+        return 1
+    if inside and live.config_dir and not accounts.same_config_dir(live.config_dir, current):
+        print(
+            f"error: the registry says {session_id} runs under the "
+            f"{accounts.account_label(live.config_dir)!r} account but this shell bills "
+            f"{accounts.account_label(current)!r} — refusing",
+            file=sys.stderr,
+        )
+        return 1
+    if not inside:
+        cwd = live.cwd or cwd  # the session's own directory, not the caller's
+    if _has_control_chars(cwd):
+        print(
+            "error: the session's working directory contains control characters — refusing",
+            file=sys.stderr,
+        )
+        return 1
+    transcript = adapter.transcript_path(cwd, session_id, current)
+    # Inside the session this very command runs under the Bash tool's shell — a
+    # descendant of the session that carries the background-shell signature. Its own
+    # ancestry is excluded so a `! ccc switch-account … -N` cannot veto itself.
+    from . import terminal
+
+    own = terminal.pid_ancestry(os.getpid(), terminal.ps_table()) if inside else frozenset()
+    reasons = _background_work(adapter, live.pid, transcript, own)
+    if reasons and not args.force:
+        print(
+            "error: background work is still in flight — it would die unreported with this "
+            "process: " + "; ".join(reasons) + ". Wait for it, or pass -f/--force to switch "
+            "anyway.",
+            file=sys.stderr,
+        )
+        return 1
+    if reasons:
+        print("warning (--force): switching despite " + "; ".join(reasons), file=sys.stderr)
+    expected_email = config.claude_account_email_map().get(label)
+    if expected_email:
+        actual = accounts.account_email(target)
+        if actual != expected_email:
+            print(
+                f"error: the {label!r} account dir is logged in as {actual or 'nobody'}, "
+                f"not {expected_email} (claude_account_emails) — log in there first",
+                file=sys.stderr,
+            )
+            return 1
+    src_email, dst_email = accounts.account_email(current), accounts.account_email(target)
+    if src_email and dst_email and src_email == dst_email:
+        print(
+            f"error: both account dirs are logged in as {src_email} — switching would change "
+            "nothing but the directory",
+            file=sys.stderr,
+        )
+        return 1
+    if not _transcript_visible_to(target, session_id, cwd):
+        print(
+            f"error: the {label!r} account ({target}) cannot see this session's transcript "
+            f"for {cwd}, so `claude --resume` under it would fail with 'No conversation "
+            "found'. Share the transcript store between the accounts (symlink that "
+            "account's projects/ to the other's) and retry.",
+            file=sys.stderr,
+        )
+        return 1
+    accounts.ensure_trusted(target, cwd)  # the relaunch must not park on the trust dialog
+    if not accounts.is_trusted(target, cwd):
+        print(
+            f"error: could not confirm {cwd} is trusted for the {label!r} account — the "
+            "relaunch would park on the trust dialog; refusing",
+            file=sys.stderr,
+        )
+        return 1
+    with Store() as store:
+        store.ensure(session_id, cwd=cwd)
+        row = store.get(session_id)
+        if not args.now:
+            store.update_fields(
+                session_id,
+                switch_requested_at=now_ms(),
+                switch_config_dir=target,
+                switch_force=1 if args.force else 0,
+            )
+    if not args.now:
+        if not quiet:
+            print(
+                f"armed: {session_id} relaunches under the {label!r} account "
+                f"({accounts.account_label(current)!r} → {label!r}) in this tab as soon as "
+                "this turn ends — end the turn now (undo: ccc switch-account -u)."
+            )
+        return 0
+    # --now: no model turn is needed (the way out of a session-limit-hit account, whose
+    # prompts — slash commands included — are rejected before any turn). The session must
+    # be idle: a turn in flight would be cut off mid-work.
+    # A session halted by a rate limit can stay registry-"busy" (its last turn never
+    # completed) — that is the very case --now exists for, so a positively detected halt
+    # is not mid-turn.
+    if live.raw_status == "busy" and not args.force and not adapter.is_halted(cwd, session_id):
+        print(
+            f"error: {session_id} is mid-turn — wait for it to go idle, or -f/--force to cut "
+            "it off",
+            file=sys.stderr,
+        )
+        return 1
+    from . import spawn
+
+    iterm = (
+        os.environ.get("ITERM_SESSION_ID", "") if inside else (row.iterm_session_id if row else "")
+    )
+    pane = os.environ.get("TMUX_PANE", "") if inside else ""
+    if not pane and not inside:
+        located = terminal.tmux_pane_for_session(session_id)
+        pane = located[1] if located else ""
+    if not iterm and not pane:
+        print(
+            f"error: no terminal is recorded for {session_id} (no iTerm tab id, no tmux pane) "
+            "— run the switch from inside that session's tab with the `!` prefix",
+            file=sys.stderr,
+        )
+        return 1
+    with Store() as store:
+        store.update_fields(session_id, switch_config_dir=target)  # the SessionStart expectation
+    spawn_args = [
+        "switch-now",
+        "--session",
+        session_id,
+        "--iterm",
+        iterm or "",
+        "--tmux-pane",
+        pane or "",
+        "--config-dir",
+        target,
+        "--source-dir",
+        current,
+        "--cwd",
+        cwd,
+        "--pid",
+        str(env_pid or live.pid),
+    ]
+    if args.force:
+        spawn_args.append("--force")
+    if row is not None and row.no_codex:
+        spawn_args.append("--no-codex")
+    if not spawn.spawn_ccc(spawn_args):
+        print("error: could not spawn the relauncher (ccc switch-now)", file=sys.stderr)
+        return 1
+    if not quiet:
+        print(
+            f"relaunching now: {session_id} → the {label!r} account in its own tab (the "
+            "detached relauncher terminates Claude, waits for the shell and types the "
+            "resume; failures land in events.log and as a desktop notification)."
+        )
+    return 0
+
+
+def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements,too-many-locals,too-many-branches,too-many-statements
+    """Internal: terminate the session's Claude, wait for it to exit, type its relaunch.
+
+    Spawned detached by the ``release-locks`` Stop hook once a ``switch-account`` arm is
+    claimed; every launch fact travels in argv (the claimed snapshot + the hook's fresh
+    env) and a missing one aborts — nothing is ever defaulted. Never raises, but
+    FAIL-CLOSED at every step: text is typed into the tab only after the process is
+    bound to the hook-supplied ``$CLAUDE_PID`` (a registry pid is accepted only when it
+    sits on this tab's tty), no other live process owns the id, no background work is
+    pending (unless the arm was ``--force``d), the target is still the logged-in
+    identity it was armed for and still trusts the cwd, the source and target
+    transcript paths are the SAME file, the Stop-hook chain has finished, the process
+    is gone and the tab's tty is back at a POSIX shell prompt. Anything else aborts
+    with a log line and a desktop notification carrying the manual command; nothing is
+    typed into a tab whose owner is unknown, and no new tab is opened.
+    """
+    import signal
+    import time
+    from pathlib import Path
+
+    from . import accounts, hooks, terminal
+
+    session_id = (args.session or "").strip()
+    target = (args.config_dir or "").strip()
+    source = (getattr(args, "source_dir", "") or "").strip()
+    cwd = (getattr(args, "cwd", "") or "").strip()
+    if not session_id or not target or not source or not cwd:
+        print(
+            "switch-now: --session, --config-dir, --source-dir and --cwd are required",
+            file=sys.stderr,
+        )
+        return 1
+    if _has_control_chars(cwd):
+        print("switch-now: --cwd contains control characters — refusing", file=sys.stderr)
+        return 1
+    label = accounts.account_label(target)
+    no_codex = bool(getattr(args, "no_codex", False))
+    force = bool(getattr(args, "force", False))
+    manual = accounts.relaunch_command(accounts.LaunchTarget(target, no_codex), session_id, cwd)
+
+    def log(detail: str) -> None:
+        hooks._log_event(session_id, "switch-now", detail)  # pylint: disable=protected-access
+        print(f"switch-now: {detail}", file=sys.stderr)
+
+    def fail(reason: str) -> int:
+        log(f"{reason} — relaunch NOT typed")
+        _notify_switch(f"{session_id[:8]}: {reason}. Resume by hand: {manual}")
+        return 1
+
+    def transcripts_are_one_file() -> bool:
+        slug = cwd.replace("/", "-")
+        src = Path(source).expanduser() / "projects" / slug / f"{session_id}.jsonl"
+        dst = Path(target).expanduser() / "projects" / slug / f"{session_id}.jsonl"
+        try:
+            return src.is_file() and dst.is_file() and src.samefile(dst)
+        except OSError:
+            return False
+
+    def target_still_valid() -> str:
+        """The first reason the target account is no longer safe to relaunch into ("" = fine)."""
+        expected_email = config.claude_account_email_map().get(label)
+        if expected_email and accounts.account_email(target) != expected_email:
+            return f"the {label!r} account dir is no longer logged in as {expected_email}"
+        if not os.path.isdir(cwd):
+            return f"the working directory {cwd} is gone"
+        if not accounts.is_trusted(target, cwd):
+            return f"{cwd} is no longer trusted for the {label!r} account"
+        if not transcripts_are_one_file():
+            return "the source and target transcript paths are not the same file"
+        return ""
+
+    iterm = (getattr(args, "iterm", "") or "").strip()
+    pane = (getattr(args, "tmux_pane", "") or "").strip()
+    hint = int(getattr(args, "pid", 0) or 0)
+    table = terminal.ps_table()
+    # (1) The terminal first: its tty is what binds a registry pid and proves idleness.
+    pane_pid, tty = 0, ""
+    if pane:
+        info = terminal.tmux_pane_info(pane)
+        if info is None:
+            return fail("the tmux pane is gone")
+        pane_pid, tty = info[0], info[1]
+        if tty and not tty.startswith("/dev/"):
+            tty = f"/dev/{tty}"
+    elif iterm:
+        tty = terminal.iterm_session_tty(iterm)
+    else:
+        return fail("no terminal evidence (neither --iterm nor --tmux-pane)")
+    if not tty:
+        return fail("the tab's tty is unknown")
+    # (2) Bind the process: the hook's own $CLAUDE_PID, verified live as claude; else the
+    # single registry pid, and only when it sits on this very tty.
+    pid = hint if hint > 0 and terminal.pid_is_claude(hint, table) else 0
+    if not pid:
+        try:
+            alive = _strict_live_entries(session_id)
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            return fail("could not read the live-session registry")
+        candidates = [e.pid for e in alive if e.pid > 0]
+        if len(candidates) != 1:
+            return fail(f"{len(candidates)} live registry entries and no --pid to bind to")
+        if terminal.pid_tty(candidates[0], table) != tty:
+            return fail("the registry pid does not sit on this tab's tty")
+        pid = candidates[0]
+    if terminal.pid_tty(pid, table) != tty:
+        return fail(f"the bound pid {pid} does not sit on this tab's tty {tty}")
+    if pane and not terminal.pid_descends_from(pid, pane_pid, table):
+        return fail("the bound pid is not inside the tmux pane")
+    # (3) No other live incarnation of this id (a manual resume elsewhere, a D9 conflict).
+    try:
+        others = [e.pid for e in _strict_live_entries(session_id) if e.pid not in (0, pid)]
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return fail("could not read the live-session registry")
+    if others:
+        return fail(f"another live process ({others[0]}) also owns this session")
+    # (4) Background work would die unreported — unless the user forced past it at arm
+    # time (then nothing that appeared since is vetoed either: the arm was the decision).
+    if not force:
+        adapter = _adapter()
+        reasons = _background_work(adapter, pid, adapter.transcript_path(cwd, session_id, source))
+        if reasons:
+            return fail("background work is in flight: " + "; ".join(reasons))
+    # (5) The target must still be what it was armed as (identity, trust, one transcript).
+    invalid = target_still_valid()
+    if invalid:
+        return fail(invalid)
+    # (6) The Stop chain (auto-commit, linters, scans) must be over before the kill.
+    started = terminal.pid_start(pid)
+    if not _wait_until(
+        lambda: not terminal.live_hook_children(pid, terminal.ps_table()),
+        _SWITCH_HOOK_WAIT_SEC,
+        poll=1.0,
+    ):
+        return fail(f"Stop hooks still running after {_SWITCH_HOOK_WAIT_SEC:.0f}s")
+    # (6b) That wait can be long: re-bind on a FRESH snapshot before signalling — the same
+    # process (same start time, still claude, still on this tty), still the only live
+    # owner of the id, the target still valid.
+    table = terminal.ps_table()
+    if not terminal.pid_is_claude(pid, table) or terminal.pid_tty(pid, table) != tty:
+        return fail(f"pid {pid} is no longer this tab's claude after the hook wait")
+    if started and terminal.pid_start(pid) != started:
+        return fail(f"pid {pid} was recycled during the hook wait")
+    try:
+        others = [e.pid for e in _strict_live_entries(session_id) if e.pid not in (0, pid)]
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return fail("could not re-read the live-session registry")
+    if others:
+        return fail(f"another live process ({others[0]}) took over this session")
+    invalid = target_still_valid()
+    if invalid:
+        return fail(invalid)
+    # (7) Terminate, and wait for the process to be gone.
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    if not _wait_pid_gone(pid, _SWITCH_EXIT_WAIT_SEC):
+        return fail(f"pid {pid} still alive after {_SWITCH_EXIT_WAIT_SEC:.0f}s")
+    # (8) The tty must be back at a POSIX shell prompt (no claude left, the shell in the
+    # foreground) — keystrokes typed earlier would land anywhere but the shell.
+    if not _wait_until(
+        lambda: terminal.tty_ready_for_input(tty, terminal.ps_table()), _SWITCH_READY_WAIT_SEC
+    ):
+        return fail(f"{tty} did not return to a POSIX shell prompt")
+    time.sleep(0.5)  # prompt hooks / precmd settle
+    # (9) Re-check the target after the exit: the resume must still resolve to the very
+    # transcript this process just finished writing.
+    invalid = target_still_valid()
+    if invalid:
+        return fail(invalid)
+    # (10) Deliver into the same pane/tab. No new-tab fallback: a silent tab elsewhere
+    # would contradict what the user asked for.
+    if pane:
+        delivered, rung = terminal.tmux_send_keys(pane, manual), "tmux"
+    else:
+        delivered, rung = terminal.type_into_iterm_session(iterm, manual), "iterm"
+    if not delivered:
+        return fail(f"could not type into the {rung} session")
+    log(f"relaunched under {label!r} via {rung}")
     return 0
 
 
@@ -3940,6 +4507,69 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "-i", "--iterm", default="", help="the fresh $ITERM_SESSION_ID to close (hook-supplied)"
     )
     p_closenow.set_defaults(func=cmd_close_now)
+
+    p_switch = sub.add_parser(
+        "switch-account",
+        help="relaunch this session under another Claude account in the same tab "
+        "once the turn ends (-u to disarm)",
+    )
+    p_switch.add_argument("label", nargs="?", help="target account label (see claude_accounts)")
+    p_switch.add_argument(
+        "-s", "--session", help="the session id (default: this session / the live one in cwd)"
+    )
+    p_switch.add_argument("-u", "--undo", action="store_true", help="disarm a pending switch")
+    p_switch.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="switch even though background tasks/agents are still in flight",
+    )
+    p_switch.add_argument(
+        "-N",
+        "--now",
+        action="store_true",
+        help="relaunch immediately instead of after the turn — no model turn needed "
+        "(use via `!` inside a session whose account hit its limit, or from another tab)",
+    )
+    p_switch.add_argument("-q", "--quiet", action="store_true", help="suppress the summary print")
+    p_switch.set_defaults(func=cmd_switch_account)
+
+    p_switchnow = sub.add_parser(
+        "switch-now",
+        help="internal: SIGTERM the session's Claude, wait for it to exit and type its "
+        "relaunch under another account into its tab (spawned by switch-account)",
+    )
+    p_switchnow.add_argument("-s", "--session", help="the session id to relaunch")
+    p_switchnow.add_argument(
+        "-i", "--iterm", default="", help="the fresh $ITERM_SESSION_ID of its tab (hook-supplied)"
+    )
+    p_switchnow.add_argument(
+        "-p",
+        "--pid",
+        type=int,
+        default=0,
+        help="the fresh $CLAUDE_PID to terminate (hook-supplied)",
+    )
+    p_switchnow.add_argument(
+        "-t", "--tmux-pane", default="", help="the fresh $TMUX_PANE of its pane (hook-supplied)"
+    )
+    p_switchnow.add_argument(
+        "-S", "--source-dir", default="", help="config dir of the account the session bills now"
+    )
+    p_switchnow.add_argument(
+        "-f", "--force", action="store_true", help="the arm was forced past background work"
+    )
+    p_switchnow.add_argument(
+        "-n",
+        "--no-codex",
+        action="store_true",
+        help="relaunch with CCC_NO_CODEX=1 (the row's flag)",
+    )
+    p_switchnow.add_argument(
+        "-d", "--config-dir", default="", help="config dir of the account to relaunch under"
+    )
+    p_switchnow.add_argument("-c", "--cwd", default="", help="the session's working directory")
+    p_switchnow.set_defaults(func=cmd_switch_now)
 
     p_keep = sub.add_parser("keep", help="exempt a session from the idle reaper (--off to clear)")
     p_keep.add_argument("--session")

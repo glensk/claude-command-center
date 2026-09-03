@@ -237,6 +237,23 @@ def ensure_trusted(config_dir: str, cwd: str | Path | None = None) -> bool:
     return True
 
 
+def is_trusted(config_dir: str, cwd: str | Path | None = None) -> bool:
+    """Read back whether *cwd* carries the accepted-trust flag under *config_dir*'s account.
+
+    The success predicate :func:`ensure_trusted` deliberately is not (its ``False`` means
+    "already trusted" as well as "could not read/write"): callers that must NOT launch
+    into a trust dialog call ``ensure_trusted`` and then require this to be ``True``.
+    """
+    target = str(Path(cwd).resolve()) if cwd else os.getcwd()  # ensure_trusted's own key
+    try:
+        data = json.loads(_claude_json_path(config_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    projects = data.get("projects") if isinstance(data, dict) else None
+    entry = projects.get(target) if isinstance(projects, dict) else None
+    return isinstance(entry, dict) and entry.get(TRUST_KEY) is True
+
+
 def account_email(config_dir: str) -> str | None:
     """The email currently logged into *config_dir*'s Claude account, or ``None``.
 
@@ -548,6 +565,23 @@ def session_launch_env_prefix(session: SessionLaunch) -> str:
         for name, value in sorted(session_env_flags(session).items())
     )
     return prefix + exports
+
+
+def relaunch_command(session: SessionLaunch, session_id: str, cwd: str) -> str:
+    """The ONE-LINE shell command that relaunches *session_id* under *session*'s account.
+
+    Typed by ``ccc switch-now`` into the session's OWN, already-interactive shell once
+    the old Claude process has exited: ``cd <cwd> && ( <env pin> claude --resume <id> )``.
+    The pin is :func:`session_launch_env_prefix` — ccc's single billing pin, plus the
+    session's own env flags — and the subshell keeps its ``export`` from persisting in
+    the user's shell. ``claude`` is left to the interactive shell to resolve, so a user's
+    own alias/wrapper (permission mode, pre-flight checks) applies exactly as it does to
+    their manual launches. Never anything configurable: a typo'd launcher would be a
+    second, unchecked account selector.
+    """
+    quoted_id = shlex.quote(session_id)
+    cd_prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
+    return f"{cd_prefix}( {session_launch_env_prefix(session)}claude --resume {quoted_id} )"
 
 
 def env_config_dir() -> str:

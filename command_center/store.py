@@ -42,6 +42,7 @@ from .models import (
     Status,
     Subgoal,
     SubgoalRevision,
+    SwitchClaim,
     TranscriptScan,
     no_codex_conflict,
     now_ms,
@@ -96,6 +97,9 @@ _SESSION_COLUMNS = (
     "last_response_at",
     "closed_at",
     "close_requested_at",
+    "switch_requested_at",
+    "switch_config_dir",
+    "switch_force",
     "last_seen_pid",
     "keep",
     "auto_closed",
@@ -184,6 +188,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_response_at  INTEGER NOT NULL DEFAULT 0,
     closed_at         INTEGER NOT NULL DEFAULT 0,
     close_requested_at INTEGER NOT NULL DEFAULT 0,
+    switch_requested_at INTEGER NOT NULL DEFAULT 0,
+    switch_config_dir TEXT    NOT NULL DEFAULT '',
+    switch_force      INTEGER NOT NULL DEFAULT 0,
     last_seen_pid     INTEGER,
     keep              INTEGER NOT NULL DEFAULT 0,
     auto_closed       INTEGER NOT NULL DEFAULT 0,
@@ -466,6 +473,11 @@ class Store:  # pylint: disable=too-many-public-methods
         "closed_at": "INTEGER NOT NULL DEFAULT 0",
         # Epoch-ms a `mark-done --close` armed a close-after-turn request (0 = unarmed).
         "close_requested_at": "INTEGER NOT NULL DEFAULT 0",
+        # `ccc switch-account`: epoch-ms the relaunch-after-turn was armed (0 = unarmed) and
+        # the target account's config dir it relaunches under (claimed together).
+        "switch_requested_at": "INTEGER NOT NULL DEFAULT 0",
+        "switch_config_dir": "TEXT NOT NULL DEFAULT ''",
+        "switch_force": "INTEGER NOT NULL DEFAULT 0",
     }
     # Same, for the subgoals table (auto-progress marks its rows source='auto').
     _ADDED_SUBGOAL_COLUMNS = {
@@ -879,6 +891,85 @@ class Store:  # pylint: disable=too-many-public-methods
         )
         self.conn.commit()
         return claimed
+
+    def claim_after_turn(
+        self, session_id: str, now: int, ttl_ms: int
+    ) -> tuple[str, SwitchClaim | None]:
+        """Atomically claim THE after-turn action armed for *session_id* — close beats switch.
+
+        Returns ``("close", None)``, ``("switch", SwitchClaim)`` or ``("", None)``,
+        exactly once per arm: the read and the clearing writes run inside ONE ``BEGIN
+        IMMEDIATE`` transaction, so two concurrent Stop-hook callers can never both win
+        nor split a close and a switch between them. A tab about to close has nowhere
+        to relaunch, so a switch armed alongside a close is dropped. A switch claim
+        returns the immutable launch snapshot (target, force, the row's ``no_codex`` and
+        cwd) and keeps ``switch_config_dir`` as the account the resumed session is
+        EXPECTED to start under (consumed by :meth:`pop_switch_expectation`); every other
+        outcome clears all switch state. Stamps older than *ttl_ms* are cleared without
+        being claimed, so a stale arm can never fire in a later, unrelated turn.
+        """
+        threshold = now - ttl_ms
+        if self.conn.in_transaction:
+            self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT close_requested_at, switch_requested_at, switch_config_dir, "
+                "switch_force, no_codex, cwd FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                self.conn.commit()
+                return "", None
+            close_at, switch_at = int(row[0] or 0), int(row[1] or 0)
+            target = str(row[2] or "")
+            kind: str = ""
+            claim: SwitchClaim | None = None
+            if close_at > threshold:
+                kind = "close"
+            elif switch_at > threshold and target:
+                kind = "switch"
+                claim = SwitchClaim(
+                    target=target,
+                    force=bool(row[3]),
+                    no_codex=bool(row[4]),
+                    cwd=str(row[5] or ""),
+                )
+            if kind == "switch":
+                self.conn.execute(
+                    "UPDATE sessions SET close_requested_at = 0, switch_requested_at = 0, "
+                    "switch_force = 0 WHERE session_id = ?",
+                    (session_id,),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE sessions SET close_requested_at = 0, switch_requested_at = 0, "
+                    "switch_config_dir = '', switch_force = 0 WHERE session_id = ?",
+                    (session_id,),
+                )
+        except sqlite3.Error:
+            self.conn.rollback()
+            raise
+        self.conn.commit()
+        return kind, claim
+
+    def pop_switch_expectation(self, session_id: str) -> str:
+        """Return and clear the account a claimed ``switch-account`` expected to land on.
+
+        ``""`` when none is pending. Consumed by the SessionStart hook of the relaunched
+        session (an intentional switch must not print the account-drift heads-up) and by
+        ``ccc switch-account --undo``.
+        """
+        row = self.conn.execute(
+            "SELECT switch_config_dir FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        target = str(row[0] or "") if row is not None else ""
+        if target:
+            self.conn.execute(
+                "UPDATE sessions SET switch_config_dir = '' WHERE session_id = ?", (session_id,)
+            )
+            self.conn.commit()
+        return target
 
     def upsert_from_live(self, live: LiveSession) -> None:
         """Reconcile a live registry entry, preserving user-authored fields.

@@ -150,13 +150,6 @@ DEFAULTS: dict[str, object] = {
     # even after such a drift. Empty (the default) ⇒ no hard link, today's pure
     # path-based behaviour (see ``accounts.resolve_card_label``).
     "claude_account_emails": [],
-    # The user's OWN per-account shell launcher, for `ccc switch-account` (relaunch a live
-    # session under another account in the SAME tab): ``"label=command"`` entries, e.g.
-    # ``["private=cpriv", "work=cwork"]`` — the shell function/alias that pins that account
-    # the way the user always launches it (wrapper flags, permission mode, …). The typed
-    # relaunch is then ``<command> --resume <id>``. Empty (the default) ⇒ the generic
-    # subshell form ``( <account env pin> claude --resume <id> )``.
-    "claude_account_launchers": [],
     # When each paid subscription renews, so a card can advertise its own cancel-by date:
     # ``"card=YYYY-MM-DD"`` entries over the four cards in ``SUBSCRIPTION_CARDS``, e.g.
     # ``["claude_private=auto", "codex_private=2026-09-30"]``. The date is appended to
@@ -455,36 +448,6 @@ def parse_claude_account_emails(entries: list[str]) -> dict[str, str]:
     return emails
 
 
-def claude_account_launcher_map() -> dict[str, str]:
-    """Map each Claude account label → the user's own shell launcher for it (see DEFAULTS).
-
-    Parses the ``claude_account_launchers`` config key. Empty ⇒ ``{}``: every account
-    relaunches through the generic env-pinned ``claude --resume`` form.
-    """
-    return parse_claude_account_launchers(load_config().claude_account_launchers)
-
-
-def parse_claude_account_launchers(entries: list[str]) -> dict[str, str]:
-    """Pure ``"label=command"`` parser behind :func:`claude_account_launcher_map`.
-
-    Same tolerance as :func:`parse_claude_account_emails`: an entry with no ``=``, a
-    blank command, or a label failing ``_ACCOUNT_LABEL_RE`` is SKIPPED without crashing.
-    The command is kept verbatim (it is typed into the user's interactive shell, where
-    a function or alias name is exactly what is wanted) — only a newline is refused,
-    since the relauncher submits ONE line.
-    """
-    launchers: dict[str, str] = {}
-    for entry in entries:
-        label, sep, raw = entry.partition("=")
-        if not sep:
-            continue  # no "=" → not a "label=command" entry
-        label, raw = label.strip(), raw.strip()
-        if not raw or "\n" in raw or not _ACCOUNT_LABEL_RE.match(label):
-            continue
-        launchers[label] = raw
-    return launchers
-
-
 # The four FIXED usage cards a subscription-end date can be pinned to. These are CARD
 # keys, not account labels: the two Claude cards are keyed by the account label they
 # render (see SUBSCRIPTION_CARD_ACCOUNTS), the two Codex ones by which CODEX_HOME they
@@ -647,7 +610,6 @@ class Config:
     codex_homes_extra: list[str] = field(default_factory=list)  # "label=path" per extra login
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
-    claude_account_launchers: list[str] = field(default_factory=list)  # "label=shell command"
     subscription_ends: list[str] = field(default_factory=list)  # "card=YYYY-MM-DD|auto"
     job_account: str = ""  # "" = default account, a label = pin, "auto" = burn-rate routing
     usage_card_private: bool = True

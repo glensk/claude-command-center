@@ -100,6 +100,21 @@ HALTED_RESUME_ICON = "▶"
 HALTED_RESUME_HELP = "live — rate-limit halt; auto-resumes when that account's limit resets"
 
 
+@dataclass(frozen=True)
+class SwitchClaim:
+    """The immutable launch snapshot a claimed ``switch-account`` hands to ``switch-now``.
+
+    Read in the same transaction that claims the arm, so the relauncher never falls
+    back to defaults for facts the launch depends on (the account pin, the session's
+    ``no_codex`` flag, its cwd, whether the user forced past background work).
+    """
+
+    target: str
+    force: bool = False
+    no_codex: bool = False
+    cwd: str = ""
+
+
 @dataclass
 class LiveSession:
     """A session currently registered in ``~/.claude/sessions/<pid>.json``."""
@@ -424,6 +439,12 @@ class Session:
     # Epoch-ms when a close-after-turn was requested (`mark-done --close`); 0 = none.
     # The release-locks Stop hook atomically claims it and spawns the detached closer.
     close_requested_at: int = 0
+    # `ccc switch-account`: epoch-ms the relaunch-after-turn was armed (0 = none) and the
+    # target account's config dir. Claimed together by the release-locks Stop hook, which
+    # spawns the detached relauncher (`ccc switch-now`).
+    switch_requested_at: int = 0
+    switch_config_dir: str = ""
+    switch_force: int = 0  # 1 = `switch-account --force`: skip the background-work veto
     last_seen_pid: int | None = None
     keep: bool = False  # exempt from the idle reaper
     auto_closed: bool = False

@@ -350,12 +350,29 @@ def _run_done_check(command: str, cwd: str) -> bool:
     return checks.run_exit0(command, cwd, timeout=30)
 
 
+def _switch_landed_as_expected(store: Store, sid: str) -> bool:
+    """Consume a claimed ``switch-account`` expectation; True when this start matches it.
+
+    An intentional relaunch under the expected account makes the "last ran under another
+    account" heads-up noise. The expectation is consumed either way — a start under some
+    OTHER account keeps its warning.
+    """
+    expected = store.pop_switch_expectation(sid)
+    if not expected:
+        return False
+    from . import accounts  # lazy, like ensure_current_session
+
+    return accounts.same_config_dir(expected, accounts.env_config_dir())
+
+
 def handle_session_start(payload: dict[str, Any]) -> int:
     sid = _session_id(payload)
     if not sid:
         return 0
     with Store() as store:
         session, switch_warning = ensure_current_session(store, sid, payload.get("cwd", ""))
+        if switch_warning and _switch_landed_as_expected(store, sid):
+            switch_warning = None
         # The iTerm tab id itself is stamped inside ensure_current_session (every
         # hook event, self-healing) — here we only need the env value for the badge.
         iterm = os.environ.get("ITERM_SESSION_ID")
@@ -576,7 +593,8 @@ def handle_release_locks(payload: dict[str, Any]) -> int:
     if sid:
         with Store() as store:
             store.release_all_file_locks(sid)
-            if store.claim_close_request(sid, now_ms(), CLOSE_REQUEST_TTL_MS):
+            kind, claim = store.claim_after_turn(sid, now_ms(), CLOSE_REQUEST_TTL_MS)
+            if kind == "close":
                 from . import spawn  # lazy, like _maybe_grade_after_turn
 
                 spawn.spawn_ccc(
@@ -588,6 +606,37 @@ def handle_release_locks(payload: dict[str, Any]) -> int:
                         os.environ.get("ITERM_SESSION_ID", ""),
                     ]
                 )
+            elif kind == "switch" and claim is not None:
+                # `ccc switch-account`: the relauncher terminates this Claude once its Stop
+                # chain is over, waits for the shell to come back and types the resume into
+                # this very tab under the target account's env pin. Everything the launch
+                # depends on travels in argv — the claimed snapshot plus this hook's own env
+                # (fresh iTerm/tmux ids, $CLAUDE_PID, the account this process bills).
+                from . import accounts, spawn  # lazy, like _maybe_grade_after_turn
+
+                args = [
+                    "switch-now",
+                    "--session",
+                    sid,
+                    "--iterm",
+                    os.environ.get("ITERM_SESSION_ID", ""),
+                    "--tmux-pane",
+                    os.environ.get("TMUX_PANE", ""),
+                    "--config-dir",
+                    claim.target,
+                    "--source-dir",
+                    accounts.env_config_dir(),
+                    "--cwd",
+                    str(payload.get("cwd") or claim.cwd or ""),
+                ]
+                pid = os.environ.get("CLAUDE_PID", "").strip()
+                if pid.isdigit():
+                    args += ["--pid", pid]
+                if claim.force:
+                    args.append("--force")
+                if claim.no_codex:
+                    args.append("--no-codex")
+                spawn.spawn_ccc(args)
     return 0
 
 

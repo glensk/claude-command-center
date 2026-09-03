@@ -21,6 +21,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from typing import Any
 
 # Named tab colors → RGB (iTerm2 tab background). Hex "#rrggbb" is also accepted.
 _TAB_COLORS: dict[str, tuple[int, int, int]] = {
@@ -930,6 +931,239 @@ def send_text_to_session(iterm_session_id: str, text: str) -> bool:
 
         return bool(asyncio.run(_go()))
     except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
+def type_into_iterm_session(iterm_session_id: str, text: str) -> bool:
+    """Type *text* + Return into an EXISTING iTerm session located by ``$ITERM_SESSION_ID``.
+
+    The same-tab relaunch path of ``ccc switch-now``: once the session's Claude process
+    has exited its tab runs only the shell, so AppleScript ``write text`` (which submits
+    with a newline) is enough. First rung: the bounded ``osascript`` path
+    :func:`close_iterm_session` uses (locates the session by id across every window);
+    second: the Python-API :func:`send_text_to_session`. ``False`` when neither
+    delivered. Callers MUST have confirmed the process is gone — text typed while Claude
+    still owns the tty lands in its composer, not in the shell.
+    """
+    uuid = (iterm_session_id or "").split(":")[-1].strip()
+    if not uuid or not text:
+        return False
+    escaped = _as_quote(text)
+    script = f'''
+    tell application "iTerm2"
+        repeat with aWindow in windows
+            repeat with aTab in tabs of aWindow
+                repeat with aSession in sessions of aTab
+                    if id of aSession is "{uuid}" then
+                        tell aSession to write text "{escaped}"
+                        return "ok"
+                    end if
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    return ""
+    '''
+    out = _osascript(script)
+    if out is not None and out.strip() == "ok":
+        return True
+    return send_text_to_session(iterm_session_id, text)
+
+
+def iterm_session_tty(iterm_session_id: str) -> str:
+    """The tty (``/dev/ttysNNN``) of the iTerm session with ``$ITERM_SESSION_ID``, or ``""``."""
+    uuid = (iterm_session_id or "").split(":")[-1].strip()
+    if not uuid:
+        return ""
+    out = _osascript(
+        f'''
+    tell application "iTerm2"
+        repeat with aWindow in windows
+            repeat with aTab in tabs of aWindow
+                repeat with aSession in sessions of aTab
+                    if id of aSession is "{uuid}" then
+                        return tty of aSession
+                    end if
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    return ""
+    '''
+    )
+    return (out or "").strip()
+
+
+def tmux_pane_info(pane_id: str) -> tuple[int, str] | None:
+    """``(pane_pid, pane_tty)`` of tmux pane *pane_id* (e.g. ``%3``), or None when unknown."""
+    tmux = shutil.which("tmux")
+    if tmux is None or not pane_id:
+        return None
+    try:
+        out = subprocess.run(
+            [tmux, "display-message", "-p", "-t", pane_id, "#{pane_pid}\t#{pane_tty}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    pid_text, _sep, tty = out.stdout.strip().partition("\t")
+    if not pid_text.isdigit():
+        return None
+    return int(pid_text), tty.strip()
+
+
+def ps_table() -> dict[int, Any]:
+    """One live ``ps`` pass as ``{pid: PsRow(ppid, tty, stat, command)}`` (snapshot's reader)."""
+    from . import snapshot  # pylint: disable=import-outside-toplevel
+
+    return snapshot.read_ps()
+
+
+def pid_descends_from(pid: int, ancestor: int, table: dict[int, Any]) -> bool:
+    """True when *ancestor* is *pid* itself or one of its parents (bounded walk over *table*)."""
+    if pid <= 0 or ancestor <= 0:
+        return False
+    seen: set[int] = set()
+    current = pid
+    while current > 0 and current not in seen:
+        if current == ancestor:
+            return True
+        seen.add(current)
+        row = table.get(current)
+        current = row.ppid if row is not None else 0
+    return False
+
+
+def pid_tty(pid: int, table: dict[int, Any]) -> str:
+    """The controlling tty of *pid* as ``/dev/<name>`` (``""`` when none/unknown)."""
+    from . import snapshot  # pylint: disable=import-outside-toplevel
+
+    row = table.get(pid)
+    return snapshot.normalize_tty(row.tty) if row is not None else ""
+
+
+def pid_start(pid: int) -> str:
+    """The process start time of *pid* as ``ps`` prints it (``""`` when gone/unknown).
+
+    Captured before a long wait and compared after it: a recycled pid (the process
+    exited and the number was handed to a newcomer) shows a different start time, so
+    the newcomer is never signalled.
+    """
+    if pid <= 0:
+        return ""
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def pid_ancestry(pid: int, table: dict[int, Any]) -> frozenset[int]:
+    """*pid* and every parent above it (bounded walk over *table*)."""
+    chain: set[int] = set()
+    current = pid
+    while current > 0 and current not in chain:
+        chain.add(current)
+        row = table.get(current)
+        current = row.ppid if row is not None else 0
+    return frozenset(chain)
+
+
+def pid_is_claude(pid: int, table: dict[int, Any]) -> bool:
+    """True when *pid* is in *table* and its command line names a ``claude`` program."""
+    row = table.get(pid) if pid > 0 else None
+    return row is not None and "claude" in row.command
+
+
+def live_hook_children(pid: int, table: dict[int, Any]) -> list[str]:
+    """Command lines of *pid*'s descendants that look like Claude Code hook processes.
+
+    A Stop turn is over only when none remain: the settings.json hook commands (and any
+    wrapper around them) carry ``hook`` in their command line, while long-lived children
+    such as MCP servers do not.
+    """
+    children: dict[int, list[int]] = {}
+    for child, row in table.items():
+        children.setdefault(row.ppid, []).append(child)
+    found: list[str] = []
+    stack = list(children.get(pid, []))
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        row = table.get(current)
+        if row is None:
+            continue
+        if "hook" in row.command.lower():
+            found.append(row.command)
+        stack.extend(children.get(current, []))
+    return found
+
+
+# Only shells that execute the POSIX relaunch line (`export`, `&&`, `( … )`) as typed:
+# fish/tcsh/csh would mis-parse it, so a tab running one of them is never "ready".
+_SHELL_NAMES = frozenset({"zsh", "bash", "sh", "dash", "ksh"})
+
+
+def tty_ready_for_input(tty: str, table: dict[int, Any]) -> bool:
+    """True when *tty* is owned by an idle shell: no ``claude`` on it, foreground = a shell.
+
+    ``ps``'s ``+`` stat flag marks the foreground process group; after Claude exits the
+    login shell reclaims it. Any foreground process that is not a shell (or any surviving
+    ``claude``) means typed text would reach the wrong program — so not ready.
+    """
+    from . import snapshot  # pylint: disable=import-outside-toplevel
+
+    want = snapshot.normalize_tty(tty)
+    if not want:
+        return False
+    on_tty = [row for row in table.values() if snapshot.normalize_tty(row.tty) == want]
+    if not on_tty or any("claude" in row.command for row in on_tty):
+        return False
+    foreground = [row for row in on_tty if "+" in row.stat]
+    if not foreground:
+        return False
+    for row in foreground:
+        words = row.command.split()
+        name = words[0].rsplit("/", 1)[-1].lstrip("-") if words else ""
+        if name not in _SHELL_NAMES:
+            return False
+    return True
+
+
+def tmux_send_keys(pane_id: str, text: str) -> bool:
+    """Type *text* + Enter into tmux pane *pane_id* (the tmux twin of the iTerm typer)."""
+    tmux = shutil.which("tmux")
+    if tmux is None or not pane_id or not text:
+        return False
+    try:
+        subprocess.run(
+            [tmux, "send-keys", "-t", pane_id, "-l", text],
+            capture_output=True,
+            timeout=5,
+            check=True,
+        )
+        subprocess.run(
+            [tmux, "send-keys", "-t", pane_id, "Enter"],
+            capture_output=True,
+            timeout=5,
+            check=True,
+        )
+        return True
+    except (subprocess.SubprocessError, OSError):
         return False
 
 

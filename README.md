@@ -155,7 +155,10 @@ your install and environment). Inside a Claude Code session, the slash commands 
 `/next-step` `/done` `/block` `/deadline` (installed by `ccc init`) drive the same
 actions from the prompt, and the `ccc-mark-done-and-close` skill (shipped by default)
 lets you say "mark this session as done" to finish AND close the session — its terminal
-pane/tab closes itself after the turn. For automations that just changed ccc's own code or config (an
+pane/tab closes itself after the turn. With two Claude accounts configured,
+`ccc switch-account <label>` moves the live session to the other subscription in the
+same tab after the turn (the conversation continues via `claude --resume`; see
+docs/reference.md). For automations that just changed ccc's own code or config (an
 editable install), `ccc restart-tui` bounces the running TUI in its **own** terminal tab
 so the new code loads — no manual keystroke; it exits 0 once the TUI is back, 1 if none
 is running.

@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .. import config
@@ -501,6 +502,82 @@ def _is_claude_program(command: str) -> bool:
     if not head:
         return False
     return os.path.basename(head[0]) == "claude"
+
+
+_TRANSCRIPT_TAIL_BYTES = 32 * 1024 * 1024
+_TASK_ID_RE = re.compile(r"<task-id>([A-Za-z0-9_-]+)</task-id>")
+
+
+def pending_background_work(transcript: Path) -> list[str] | None:
+    """Ids of background Bash tasks / agents the session started but was never told finished.
+
+    Claude Code does not expose in-process background work anywhere else on disk, but
+    the transcript records both ends of it in STRUCTURED fields: a launch is a record
+    whose ``toolUseResult`` carries ``backgroundTaskId`` (a ``run_in_background`` Bash
+    task) or ``status == "async_launched"`` with an ``agentId`` (a background agent);
+    it ends with a ``TaskStop`` tool call that did not error, or with an ``attachment``
+    record of ``commandMode == "task-notification"`` whose prompt names the id in
+    ``<task-id>…</task-id>``. Launched minus ended = still in flight (order kept).
+
+    ``None`` means UNKNOWN — the file could not be read, or a record other than the
+    (possibly still being written) last line is not JSON — and callers must treat it
+    as "refuse", never as "clear". Only the last 32 MB are scanned, which comfortably
+    covers any session's background history.
+    """
+    try:
+        with transcript.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _TRANSCRIPT_TAIL_BYTES))
+            raw = handle.read()
+    except OSError:
+        return None
+    lines = raw.split(b"\n")
+    if size > _TRANSCRIPT_TAIL_BYTES:
+        lines = lines[1:]  # the seek landed mid-record: drop the partial first line
+    launched: list[str] = []
+    ended: set[str] = set()
+    stops: dict[str, str] = {}  # TaskStop tool_use id -> task id it targets
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            if index == len(lines) - 1:
+                continue  # a partial last line is the live process mid-write, not corruption
+            return None
+        if not isinstance(record, dict):
+            return None
+        result = record.get("toolUseResult")
+        if isinstance(result, dict):
+            task_id = result.get("backgroundTaskId")
+            if (
+                not (isinstance(task_id, str) and task_id)
+                and result.get("status") == "async_launched"
+            ):
+                task_id = result.get("agentId")
+            if isinstance(task_id, str) and task_id and task_id not in launched:
+                launched.append(task_id)
+        attachment = record.get("attachment")
+        if isinstance(attachment, dict) and attachment.get("commandMode") == "task-notification":
+            ended.update(_TASK_ID_RE.findall(str(attachment.get("prompt") or "")))
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") == "TaskStop":
+                params = block.get("input")
+                target = params.get("task_id") if isinstance(params, dict) else None
+                if isinstance(target, str) and isinstance(block.get("id"), str):
+                    stops[block["id"]] = target
+            elif block.get("type") == "tool_result" and block.get("tool_use_id") in stops:
+                if not block.get("is_error"):
+                    ended.add(stops[block["tool_use_id"]])
+    return [task_id for task_id in launched if task_id not in ended]
 
 
 def _children_map() -> dict[int, list[tuple[int, str]]]:
@@ -1124,42 +1201,39 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
                 pass
         return live.updated_at or live.status_updated_at or live.started_at
 
-    def has_subagent(self, pid: int) -> bool:
+    def has_subagent(self, pid: int, ignore: frozenset[int] = frozenset()) -> bool:
         """Best-effort: True if *pid* has a descendant ``claude`` process (a subagent).
 
         Claude Code does not expose subagents on disk, so this looks for a live
         child ``claude`` process (e.g. a ``claude -p`` subagent) in the process
-        tree. It will not detect in-process Task agents.
+        tree. It will not detect in-process Task agents. Pids in *ignore* (and their
+        subtrees) are skipped — a caller running INSIDE the session passes its own
+        ancestry so the shell it was typed into never counts as background work.
         """
-        if pid <= 0:
-            return False
-        children = _children_map()
-        seen: set[int] = set()
-        stack = [pid]
-        while stack:
-            parent = stack.pop()
-            for child_pid, command in children.get(parent, []):
-                if child_pid in seen:
-                    continue
-                seen.add(child_pid)
-                if _is_claude_program(command):
-                    return True
-                stack.append(child_pid)
-        return False
+        return self._descendant_matches(pid, _is_claude_program, ignore)
 
-    def has_background_task(self, pid: int) -> bool:
+    def has_background_task(self, pid: int, ignore: frozenset[int] = frozenset()) -> bool:
         """Best-effort: True if *pid* has a live descendant Bash-tool shell.
 
         See ``_BG_SHELL_SIGNATURE``. Walks the same cached process tree as
         :meth:`has_subagent`. Combined with an *idle* raw status (see
         ``models.derive_status``) a match means the session spawned a background task
         that is still running. Deterministic and stateless — recomputed from the live
-        process tree each refresh, so it clears the instant the task exits.
+        process tree each refresh, so it clears the instant the task exits. *ignore*
+        as in :meth:`has_subagent` (a ``!``-prefixed command's own Bash-tool shell
+        carries the signature too, and must not veto itself).
         """
+        return self._descendant_matches(pid, lambda cmd: _BG_SHELL_SIGNATURE in cmd, ignore)
+
+    @staticmethod
+    def _descendant_matches(
+        pid: int, matches: Callable[[str], bool], ignore: frozenset[int]
+    ) -> bool:
+        """True when any descendant of *pid* (skipping *ignore* subtrees) satisfies *matches*."""
         if pid <= 0:
             return False
         children = _children_map()
-        seen: set[int] = set()
+        seen: set[int] = set(ignore)
         stack = [pid]
         while stack:
             parent = stack.pop()
@@ -1167,7 +1241,7 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
                 if child_pid in seen:
                     continue
                 seen.add(child_pid)
-                if _BG_SHELL_SIGNATURE in command:
+                if matches(command):
                     return True
                 stack.append(child_pid)
         return False
