@@ -1758,10 +1758,10 @@ def test_abbrev_email_squeezes_the_local_part_and_never_the_domain() -> None:
     # Ignored when it would not actually be shorter: three segments cost more than "first…".
     assert usage.abbrev_email("a.b.c.dee@example.org", squeeze_local=True) == "a…@example.org"
     # Within one cell of ``first…`` the initials win — they keep the segment that tells
-    # two logins of the same person apart (``al.gl.de`` vs ``al.gl``), which
-    # ``albert…`` would hide.
-    assert usage.abbrev_email("albert.glensk.de@example.org", squeeze_local=True) == (
-        "al.gl.de@example.org"
+    # two logins of the same person apart (``al.gr.de`` vs ``al.gr``), which
+    # ``alice…`` would hide.
+    assert usage.abbrev_email("alice.gray.de@example.org", squeeze_local=True) == (
+        "al.gr.de@example.org"
     )
     # An undotted local part has no segments to initialize — the default rule stands.
     assert usage.abbrev_email("developer@example.org", squeeze_local=True) == "de…er@example.org"
