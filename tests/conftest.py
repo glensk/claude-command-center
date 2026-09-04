@@ -25,6 +25,10 @@ purpose (``test_tabsymbol``, ``test_tui``) still point the cache at their own
 
 from __future__ import annotations
 
+import base64
+import json
+import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -178,3 +182,218 @@ def _reset_config_memo() -> None:
     from command_center import config as _config
 
     _config.invalidate_config_cache()
+
+
+# --------------------------------------------------------------------------- #
+# Three Codex seats — the fixture the runner / seat-order tests share
+#
+# `quota._canonical_codex_homes()` hard-codes `default = Path.home()/".codex"`, so a
+# seat fixture can only be hermetic under a TEMP $HOME. Everything below therefore
+# builds a whole fake account (temp HOME + temp CCC_HOME) and hands back the env a
+# subprocess needs; in-process tests additionally patch `Path.home`.
+# --------------------------------------------------------------------------- #
+def _jwt(email: str) -> str:
+    """A syntactically valid, unsigned JWT whose payload carries *email*.
+
+    ``usage.codex_account_email`` decodes ``auth.json``'s ``tokens.id_token`` to name
+    the account behind a seat; without three base64url segments it reports nothing and
+    every seat renders as "unknown account".
+    """
+
+    def seg(data: dict) -> str:
+        raw = base64.urlsafe_b64encode(json.dumps(data).encode("utf-8")).decode("ascii")
+        return raw.rstrip("=")
+
+    return f"{seg({'alg': 'none'})}.{seg({'email': email})}.signature"
+
+
+@dataclass
+class SeatFixture:
+    """Three configured Codex seats plus the fake-codex control channel."""
+
+    home: Path  # the temp $HOME (default seat lives at $HOME/.codex)
+    ccc_home: Path  # the temp $CCC_HOME (config.toml + cooldowns.json)
+    seats: dict[str, Path]  # label -> CODEX_HOME
+    control: Path  # $FAKE_CODEX_CONTROL (scenario per home)
+    log: Path  # $FAKE_CODEX_LOG (one JSON line per fake-codex call)
+    cic_config: Path  # $CODEX_IN_CLAUDE_CONFIG (the account pin lives here)
+    workdir: Path  # a git-free directory to point `-C` at
+
+    def scenarios(self, **by_label: object) -> None:
+        """Script the fake codex per seat: ``fixture.scenarios(private="refuse_quota")``.
+
+        A value may be a bare scenario name or a dict (``{"scenario": …, "reply": …,
+        "resets_at": …}``); an unscripted seat answers ``ok``.
+        """
+        table = {str(self.seats[label]): value for label, value in by_label.items()}
+        self.control.write_text(json.dumps(table), encoding="utf-8")
+
+    def reorder(self, *labels: str) -> None:
+        """Rewrite ``codex_seat_order`` (and drop the config memo) for this fixture.
+
+        Write tests need ``de`` to lead: it is the only seat whose ``config.toml``
+        declares ``hardened-rw``, so a write run on any other seat is refused before
+        codex is ever launched.
+        """
+        from command_center import config as _config
+
+        path = self.ccc_home / "command-center" / "config.toml"
+        ranked = ", ".join(f'"{label}"' for label in labels)
+        lines = [
+            line
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("codex_seat_order")
+        ]
+        path.write_text("\n".join([*lines, f"codex_seat_order = [{ranked}]"]) + "\n", "utf-8")
+        _config.invalidate_config_cache()
+
+    def reset_log(self) -> None:
+        """Forget every recorded fake-codex call (a second phase in one test)."""
+        self.log.unlink(missing_ok=True)
+
+    def calls(self) -> list[dict]:
+        """Every fake-codex invocation so far, in order."""
+        try:
+            text = self.log.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+    def call_homes(self) -> list[str]:
+        """The seat LABELS the fake was invoked under, in order — the hop trace."""
+        by_path = {str(path): label for label, path in self.seats.items()}
+        return [by_path.get(call["home"], call["home"]) for call in self.calls()]
+
+    def stdin_of(self, index: int) -> str:
+        """The prompt the *index*-th (1-based) fake-codex call received on stdin."""
+        return Path(f"{self.log}.stdin.{index}").read_text(encoding="utf-8")
+
+    def env(self, **extra: str) -> dict[str, str]:
+        """A scrubbed environment for a SUBPROCESS run against this fixture."""
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in ("CODEX_HOME", "CCC_NO_CODEX", "CODEX_IN_CLAUDE_IGNORE_QUOTA")
+        }
+        env.update(
+            {
+                "HOME": str(self.home),
+                "CCC_HOME": str(self.ccc_home),
+                "CLAUDE_HOME": str(self.ccc_home),
+                "CODEX_IN_CLAUDE_CONFIG": str(self.cic_config),
+                "CODEX_IN_CLAUDE_RUNS_DIR": str(self.home / "runs"),
+                "CODEX_IN_CLAUDE_COST_LOG": str(self.home / "cost-history.jsonl"),
+                "CODEX_IN_CLAUDE_SLOT_DIR": str(self.home / "slots"),
+                "FAKE_CODEX_CONTROL": str(self.control),
+                "FAKE_CODEX_LOG": str(self.log),
+            }
+        )
+        env.update(extra)
+        return env
+
+
+_SEAT_CONFIGS = {
+    # label: (extra config.toml body, e-mail)
+    "default": ("", "team@example.org"),
+    "private": ('[mcp_servers.alpha]\ncommand = "true"\n', "private@example.org"),
+    "de": (
+        '[permissions.hardened-rw]\nextends = ":workspace"\n\n'
+        '[mcp_servers.beta]\ncommand = "true"\n\n'
+        '[mcp_servers.gamma]\ncommand = "true"\n',
+        "de@example.org",
+    ),
+}
+
+
+def make_three_seats(tmp_path: Path, order: list[str] | None = None) -> SeatFixture:
+    """Build the three-seat account under *tmp_path* (no monkeypatching).
+
+    Each seat gets a DIFFERENT ``config.toml`` on purpose: only ``de`` declares
+    ``hardened-rw`` (so a write run on another seat is refused before launch), and the
+    three declare different MCP servers — which is what proves the runner rebuilds the
+    argv per seat instead of reusing the first seat's flags.
+    """
+    home = tmp_path / "acct"
+    seats = {
+        "default": home / ".codex",
+        "private": home / "seats" / "private",
+        "de": home / "seats" / "de",
+    }
+    for label, path in seats.items():
+        path.mkdir(parents=True, exist_ok=True)
+        extra, email = _SEAT_CONFIGS[label]
+        (path / "config.toml").write_text(
+            'default_permissions = "hardened-ro"\n\n'
+            '[permissions.hardened-ro]\nextends = ":read-only"\n\n' + extra,
+            encoding="utf-8",
+        )
+        (path / "auth.json").write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {"id_token": _jwt(email), "access_token": "x", "account_id": "a"},
+                }
+            ),
+            encoding="utf-8",
+        )
+    ccc_home = tmp_path / "ccc"
+    (ccc_home / "command-center").mkdir(parents=True, exist_ok=True)
+    listed = order if order is not None else ["private", "de", "default"]
+    ranked = ", ".join(f'"{label}"' for label in listed)
+    (ccc_home / "command-center" / "config.toml").write_text(
+        f'codex_home_private = "{seats["private"]}"\n'
+        f'codex_homes_extra = ["de={seats["de"]}"]\n'
+        f"codex_seat_order = [{ranked}]\n"
+        "codex_usage = false\n",
+        encoding="utf-8",
+    )
+    workdir = tmp_path / "work"
+    workdir.mkdir(parents=True, exist_ok=True)
+    return SeatFixture(
+        home=home,
+        ccc_home=ccc_home,
+        seats=seats,
+        control=tmp_path / "fake-codex-control.json",
+        log=tmp_path / "fake-codex-log.jsonl",
+        cic_config=tmp_path / "codex-in-claude.json",
+        workdir=workdir,
+    )
+
+
+@pytest.fixture()
+def three_seats(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SeatFixture:
+    """The three-seat account, wired into THIS process (temp HOME included).
+
+    ``Path.home()`` is patched as well as ``$HOME``: ``quota._canonical_codex_homes``
+    calls it directly, so an env-only pin would still resolve the developer's real
+    ``~/.codex`` as the default seat and read their actual credentials.
+    """
+    from command_center import codex_launch, config, usage
+
+    fixture = make_three_seats(tmp_path)
+    for key, value in fixture.env().items():
+        if key in (
+            "HOME",
+            "CCC_HOME",
+            "CLAUDE_HOME",
+            "CODEX_IN_CLAUDE_CONFIG",
+            "CODEX_IN_CLAUDE_RUNS_DIR",
+            "CODEX_IN_CLAUDE_COST_LOG",
+            "CODEX_IN_CLAUDE_SLOT_DIR",
+            "FAKE_CODEX_CONTROL",
+            "FAKE_CODEX_LOG",
+        ):
+            monkeypatch.setenv(key, value)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("CCC_NO_CODEX", raising=False)
+    monkeypatch.delenv("CODEX_IN_CLAUDE_IGNORE_QUOTA", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fixture.home))
+    monkeypatch.setattr(
+        codex_launch,
+        "resolve_codex",
+        lambda: str(Path(__file__).parent / "fakes" / "fake_codex.py"),
+    )
+    config.invalidate_config_cache()
+    usage._codex_cache.clear()  # noqa: SLF001
+    usage._codex_email_cache.clear()  # noqa: SLF001
+    return fixture

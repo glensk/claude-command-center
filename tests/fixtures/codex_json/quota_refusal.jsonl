@@ -1,0 +1,8 @@
+// CAPTURED LIVE 2026-09-04 from codex 0.152.1 (`codex exec --json --ephemeral`), sanitized.
+// A real quota refusal: rc 1, NO --output-last-message file written, stderr held only
+// "Reading additional input from stdin...". Note what is ABSENT: no codex_error_info and
+// no rate_limits — those live in the rollout file, which --ephemeral suppresses.
+{"type":"thread.started","thread_id":"01a06cfb-4dbf-7782-969f-40811d81c71d"}
+{"type":"turn.started"}
+{"type":"error","message":"Your workspace is out of credits. Add credits to continue."}
+{"type":"turn.failed","error":{"message":"Your workspace is out of credits. Add credits to continue."}}

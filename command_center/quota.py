@@ -77,6 +77,12 @@ from . import config, usage
 # bill; windows carry ``evidence_at``; cooldown-backed rows carry ``block_scope``.
 # A v1 consumer reading a v2 payload could misattribute the ``codex`` row, so the
 # version is bumped and old consumers fail closed to "no opinion" — by design.
+#
+# v2 stayed v2 on 2026-09-04: the seat-order fields are purely ADDITIVE. New keys:
+# ``codex_next_attempt`` (the honest name — the runner hops on a run-time refusal, so
+# this names the FIRST try; ``best_codex_account`` is now its alias),
+# ``codex_seat_order`` (one ranked row per seat) and ``codex_seat_order_unknown``.
+# ``codex_pin`` appears ONLY while the pin governs selection (see codex_seat_order).
 SCHEMA_VERSION = 2
 
 # Provider states. Only BLOCKED may remove a rung from a ladder; UNKNOWN deliberately
@@ -173,6 +179,11 @@ class ProviderQuota:
     urgency: float | None = None  # %/hour burn needed to exhaust by reset (Claude only)
     email: str = ""  # billable identity behind a Codex home (auth.json id_token)
     block_scope: str = ""  # cooldown-backed blocks: the entry's scope (e.g. "auth", "hold")
+    # Advisory prose about the seat that must NEVER change ``state``: an unproven
+    # entitlement (``plan_type == "free"``), a renewal date that has passed. It is
+    # rendered next to the row so a seat that is technically usable but suspicious is
+    # visible, without a measurement doubt silently deleting a working rung.
+    note: str = ""
 
 
 def _cooldowns_path() -> Path:
@@ -500,7 +511,34 @@ def _canonical_codex_homes() -> dict[str, Path]:
     return homes
 
 
-def _codex_seat_quota(
+def _subscription_card(label: str) -> str:
+    """The ``subscription_ends`` card key a Codex seat *label* advertises its date on."""
+    if label == "default":
+        return "codex"
+    if label == "private":
+        return "codex_private"
+    return f"codex_{label}"
+
+
+def _codex_seat_note(label: str, live: usage.Usage | None, today: str = "") -> str:
+    """Advisory prose for one seat — NEVER a state (see :attr:`ProviderQuota.note`).
+
+    Two facts a technically-usable seat's windows cannot show: a ``free`` plan (the
+    entitlement may not cover the request — that refusal arrives at run time as
+    ``usage_not_included``) and a ``subscription_ends`` date that has passed.
+    """
+    parts: list[str] = []
+    if live is not None and (live.plan_type or "").strip().lower() == "free":
+        parts.append("plan free — entitlement unproven")
+    # ISO-8601 dates compare correctly as strings, and config.parse_subscription_ends
+    # has already rejected anything that is not a real day — no date parsing needed.
+    ends = config.subscription_end_map().get(_subscription_card(label), "")
+    if ends and ends != "auto" and ends < (today or time.strftime("%Y-%m-%d")):
+        parts.append(f"renewal date {ends} passed")
+    return " · ".join(parts)
+
+
+def _codex_seat_quota(  # pylint: disable=too-many-return-statements
     pid: str, label: str, home: Path, now: int, cooldowns: dict[str, dict]
 ) -> ProviderQuota:
     """Resolve ONE Codex/ChatGPT seat from its cached window snapshot."""
@@ -513,6 +551,25 @@ def _codex_seat_quota(
         quota = _cooldown_quota(pid, "codex", cooldowns[pid])
         quota.account, quota.email = label, email
         return quota
+    # No auth.json = no login here (or a keyring store this reader cannot see). UNKNOWN,
+    # never BLOCKED: "we could not measure it" must not delete a rung — the run-time
+    # refusal classifier is what turns a real auth failure into a block.
+    if not (home.expanduser() / "auth.json").is_file():
+        return ProviderQuota(
+            id=pid,
+            kind="codex",
+            state=UNKNOWN,
+            reason="no auth.json (login? keyring store?)",
+            source="windows",
+            account=label,
+            email=email,
+        )
+    try:
+        live = usage.read_codex_live(home)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        live = None  # advisory only; a bad cache never fails the row
+    note = _codex_seat_note(label, live)
+    free_plan = live is not None and (live.plan_type or "").strip().lower() == "free"
     snap = usage.read_codex_usage(now, home)
     if snap is None:
         return ProviderQuota(
@@ -523,6 +580,8 @@ def _codex_seat_quota(
             source="windows",
             account=label,
             email=email,
+            risky=free_plan,
+            note=note,
         )
     windows: dict[str, WindowState] = {}
     for name, win, stale_after in (
@@ -553,6 +612,7 @@ def _codex_seat_quota(
             captured_at=snap.blocked_at or snap.captured_at,
             account=label,
             email=snap.email or email,
+            note=note,
         )
     verdict, reason, blocked_by, resets_at, risky = _verdict_from_windows(windows.values())
     return ProviderQuota(
@@ -565,9 +625,10 @@ def _codex_seat_quota(
         blocked_by=blocked_by,
         resets_at=resets_at,
         captured_at=snap.captured_at,
-        risky=risky,
+        risky=risky or free_plan,
         account=label,
         email=snap.email or email,
+        note=note,
     )
 
 
@@ -607,21 +668,86 @@ def _codex_pin_label(homes: dict[str, Path]) -> str:
     return ""
 
 
-def select_codex_account(rows: list[ProviderQuota], pin_label: str) -> str:
-    """The provider id of the Codex seat delegation should bill, or ``""``.
+def resolve_seat_order(
+    configured: list[str], homes: dict[str, Path]
+) -> tuple[list[str], list[str]]:
+    """``(order, unknown)`` — the configured seat order resolved against real *homes*.
 
-    Precedence (debate-settled): seats under a hold or any BLOCKED/DISABLED verdict
-    are excluded FIRST; an eligible pin wins; otherwise the first eligible seat in
-    team→private order. When nothing is eligible the answer is ``""`` — the executor
-    (:func:`codex_in_claude._codex_home`) then falls back pin-else-default loudly,
-    because a debate the user explicitly requested must still be able to run.
+    Pure. *order* is every configured label naming a real home (first occurrence wins),
+    then every home NOT listed, in canonical order — a login the user forgot to rank is
+    still tried, last, instead of vanishing. *unknown* is every configured label with no
+    home: reported, never fatal (a seat can be unconfigured while its name stays listed).
+    """
+    order: list[str] = []
+    unknown: list[str] = []
+    for label in configured:
+        if label in homes:
+            if label not in order:
+                order.append(label)
+        elif label not in unknown:
+            unknown.append(label)
+    for label in homes:
+        if label not in order:
+            order.append(label)
+    return order, unknown
+
+
+def codex_seat_order_labels(homes: dict[str, Path]) -> list[str]:
+    """The seat labels in the order every Codex consumer should TRY them."""
+    return resolve_seat_order(config.codex_seat_order(), homes)[0]
+
+
+def codex_seat_candidates(
+    rows: list[ProviderQuota], pin_label: str, order: list[str]
+) -> list[ProviderQuota]:
+    """The eligible seats, in attempt order — the ONE ranking every consumer uses.
+
+    Eligible = not BLOCKED and not DISABLED (UNKNOWN stays runnable: fail-open). The
+    ranking is *order*, with two refinements: an ACTIVE account pin goes first, but only
+    while NO explicit order is configured (an order is the stronger statement of intent,
+    so a leftover pin must not silently reshuffle it — debate objection O2); and a row
+    whose label is not in *order* at all (a home that vanished between two reads) is
+    kept, last, in row order rather than silently dropped.
     """
     eligible = [row for row in rows if row.state not in (BLOCKED, DISABLED)]
-    if pin_label:
-        pinned = next((row for row in eligible if row.account == pin_label), None)
+    by_label: dict[str, ProviderQuota] = {}
+    for row in eligible:
+        by_label.setdefault(row.account, row)
+    candidates: list[ProviderQuota] = []
+    taken: set[int] = set()
+
+    def _add(row: ProviderQuota) -> None:
+        if id(row) not in taken:
+            taken.add(id(row))
+            candidates.append(row)
+
+    if pin_label and not config.codex_seat_order():
+        pinned = by_label.get(pin_label)
         if pinned is not None:
-            return pinned.id
-    return eligible[0].id if eligible else ""
+            _add(pinned)
+    for label in order:
+        ranked = by_label.get(label)
+        if ranked is not None:
+            _add(ranked)
+    for row in eligible:
+        if row.account not in order:
+            _add(row)
+    return candidates
+
+
+def select_codex_account(
+    rows: list[ProviderQuota], pin_label: str, order: list[str] | None = None
+) -> str:
+    """The provider id of the Codex seat the NEXT attempt should bill, or ``""``.
+
+    The first of :func:`codex_seat_candidates`; ``order=None`` ranks by the row order the
+    caller handed us (the pre-order behaviour). ``""`` = nothing eligible, which since
+    2026-09-04 is terminal for the executor too: :func:`codex_in_claude.run_with_fallback`
+    starts NO process rather than call a seat the oracle just said is held.
+    """
+    ranking = [row.account for row in rows] if order is None else order
+    candidates = codex_seat_candidates(rows, pin_label, ranking)
+    return candidates[0].id if candidates else ""
 
 
 def _copilot_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
@@ -731,6 +857,10 @@ def snapshot(
     homes = _canonical_codex_homes()
     codex_rows = _codex_quotas(now, cooldowns)
     pin_label = _codex_pin_label(homes)
+    configured = config.codex_seat_order()
+    order, unknown_labels = resolve_seat_order(configured, homes)
+    candidates = codex_seat_candidates(codex_rows, pin_label, order)
+    next_attempt = candidates[0].id if candidates else ""
 
     providers = [
         _copilot_quota(now, cooldowns),
@@ -747,12 +877,19 @@ def snapshot(
         # decision owned by each caller's ladder config, not a quota fact this module can
         # know. Only Claude-account ranking is a quota-domain decision.
         "best_claude_account": best,
-        # The Codex seat delegation (codex-debate / codex-implement / ccc's own codex
-        # calls) should bill: pin > eligibility > team-first. "" = nothing eligible.
-        "best_codex_account": select_codex_account(codex_rows, pin_label),
+        # The Codex seat the next attempt bills. ``best_codex_account`` is the v2 name
+        # kept for existing consumers; ``codex_next_attempt`` is the honest one — the
+        # runner hops on a run-time refusal, so this is a first try, not a verdict.
+        "best_codex_account": next_attempt,
+        "codex_next_attempt": next_attempt,
+        "codex_seat_order": _seat_order_rows(codex_rows, order, candidates, pin_label),
         "providers": [_provider_dict(q) for q in providers],
     }
-    if pin_label:
+    if unknown_labels:
+        result["codex_seat_order_unknown"] = unknown_labels
+    # Only an ACTIVE pin is reported: with an explicit order configured the pin governs
+    # nothing, and advertising it here would have every consumer render a lie.
+    if pin_label and not configured:
         from . import codex_in_claude  # local: display metadata only
 
         result["codex_pin"] = {
@@ -760,6 +897,46 @@ def snapshot(
             "until": str(codex_in_claude.load_config().get("codex_home_until") or ""),
         }
     return result
+
+
+def _seat_order_rows(
+    rows: list[ProviderQuota],
+    order: list[str],
+    candidates: list[ProviderQuota],
+    pin_label: str,
+) -> list[dict[str, Any]]:
+    """One ranked dict per seat label in *order* — the ``codex_seat_order`` payload.
+
+    ``configured_rank`` is the seat's place in the resolved order (1-based);
+    ``attempt_rank`` its place among the ELIGIBLE candidates, ``None`` when skipped.
+    """
+    by_label = {row.account: row for row in rows}
+    attempt_rank = {id(row): idx + 1 for idx, row in enumerate(candidates)}
+    out: list[dict[str, Any]] = []
+    for index, label in enumerate(order, 1):
+        row = by_label.get(label)
+        if row is None:
+            continue
+        out.append(
+            {
+                "configured_rank": index,
+                "attempt_rank": attempt_rank.get(id(row)),
+                "id": row.id,
+                "label": label,
+                "email": row.email,
+                "state": row.state,
+                "reason": row.reason,
+                "blocked_by": row.blocked_by,
+                "resets_at": row.resets_at,
+                "windows": {
+                    name: {"used_pct": win.used_pct, "resets_at": win.resets_at}
+                    for name, win in row.windows.items()
+                },
+                "note": row.note,
+                "pinned": label == pin_label,
+            }
+        )
+    return out
 
 
 def _provider_dict(quota: ProviderQuota) -> dict[str, Any]:
@@ -799,6 +976,7 @@ def _rehydrate(raw: dict[str, Any]) -> ProviderQuota:
         urgency=raw.get("urgency"),
         email=raw.get("email", ""),
         block_scope=raw.get("block_scope", ""),
+        note=raw.get("note", ""),
     )
 
 

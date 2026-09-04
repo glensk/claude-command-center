@@ -183,4 +183,7 @@ diff and ask how to proceed.
   stamps the resolved model into this file's `description:` as a `[codex …]` marker
   (`codex-in-claude sync-skills` re-stamps it) — don't hand-edit that marker.
   (`delegate-review` is this command's short config key.)
+- Which ChatGPT login pays is automatic (`codex-in-claude order` shows/sets the seat order and
+  falls through when one is held/exhausted/refusing) — the round's SECOND output line names the
+  seat it actually used, e.g. `seat: private (<the login that paid>)`.
 - Kill switch: honor a user request to skip; `CCC_NO_CODEX=1` disables the codex automation.

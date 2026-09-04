@@ -1,0 +1,6 @@
+// SYNTHETIC (not captured): a failure that is NOT the seat's fault. It must classify as
+// kind "" — no hop, no cooldown — or a transient would block a healthy login for an hour.
+{"type":"thread.started","thread_id":"01a06cfb-4dbf-7782-969f-40811d81c002"}
+{"type":"turn.started"}
+{"type":"error","message":"server_overloaded: please retry"}
+{"type":"turn.failed","error":{"message":"server_overloaded: please retry"}}

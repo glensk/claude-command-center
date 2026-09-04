@@ -1586,6 +1586,9 @@ def test_quota_reports_codex_blocked_with_the_filled_window_and_its_reset(
     )
     _blocked_snapshot(tmp_path, monkeypatch, healthy)
     usage._codex_cache.clear()
+    # A seat with no auth.json is UNKNOWN (fail-open, "we could not measure it"), so the
+    # fixture home carries one — the verdict under test is the refusal, not the login.
+    (tmp_path / "auth.json").write_text("{}", encoding="utf-8")
     prov = quota._codex_seat_quota("codex", "default", tmp_path, _NOW, {})
     assert prov.state == quota.BLOCKED
     assert prov.blocked_by == "five_hour"

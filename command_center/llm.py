@@ -223,77 +223,76 @@ def run_codex(prompt: str, model: str = "") -> str | None:
     """Headless ``codex exec`` text generation. Returns the final message, or ``None``.
 
     Shells out to OpenAI's Codex CLI instead of ``claude`` so cheap derived text (the
-    short-AIM label) costs Codex/ChatGPT quota, not Claude tokens. The launch goes through
-    the one policy in :mod:`command_center.codex_launch`: the named ``hardened-ro``
-    permission profile (never ``--sandbox``, which forces the legacy sandbox and drops the
-    profile's deny rules), a throwaway empty ``-C`` root so this text call can neither be
-    confused with — nor write into — a repo, ``--ephemeral`` so it leaves no session file,
-    and one ``-c mcp_servers.<name>.enabled=false`` per configured server so no MCP
-    handshake can hang it. It deliberately does NOT pass ``--ignore-user-config``: that
-    would also drop the permission profiles this run depends on. The final assistant
-    message is captured cleanly via ``--output-last-message`` (no event noise). Never
-    raises: any failure (no ``codex`` on PATH, a refused launch, non-zero exit, timeout)
+    short-AIM label) costs Codex/ChatGPT quota, not Claude tokens. It goes through the
+    ONE runner (:func:`command_center.codex_in_claude.run_with_fallback`), so this
+    call gets the same seat order and run-time fallback as every other Codex use: a
+    held or refusing seat is skipped, not discovered by failing on it.
+
+    The launch policy itself is :mod:`command_center.codex_launch`: the named
+    ``hardened-ro`` permission profile (never ``--sandbox``, which forces the legacy
+    sandbox and drops the profile's deny rules), a throwaway empty ``-C`` root so this
+    text call can neither be confused with — nor write into — a repo, ``--ephemeral``
+    so it leaves no session file, and one ``-c mcp_servers.<name>.enabled=false`` per
+    server THAT SEAT declares so no MCP handshake can hang it. It deliberately does NOT
+    pass ``--ignore-user-config``: that would also drop the permission profiles this run
+    depends on. The final assistant message is captured cleanly via
+    ``--output-last-message``; the prompt travels on stdin. Never raises: any failure
+    (no ``codex`` on PATH, a refused launch, no eligible seat, non-zero exit, timeout)
     returns ``None`` so callers fall back to the full AIM. Empty *model* lets Codex pick
     its default model.
     """
-    # Bill the seat the shared selector picks (pin/holds-aware) instead of whatever
-    # CODEX_HOME the ambient environment happens to carry — ccc's own short calls used
-    # to silently spend the default (team) seat even while it was pinned away or held.
-    try:
-        from .codex_in_claude import codex_exec_env  # lazy: keep module import light
+    from . import codex_in_claude  # lazy: keep module import light
 
-        env = codex_exec_env()
-    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-        env = dict(os.environ)
-    env["CCC_INTERNAL"] = "1"
-    env["AI_NO_AUTOCOMMIT"] = "1"
-    codex_home = Path(env["CODEX_HOME"]) if env.get("CODEX_HOME") else None
-    try:
-        codex_bin = codex_launch.resolve_codex()
-        perm_args = codex_launch.permission_args(False, codex_home=codex_home)
-        mcp_args = codex_launch.mcp_disable_args(codex_home)
-    except codex_launch.CodexLaunchError:
-        return None
-    out_path = ""
     workdir = ""
     try:
-        handle, out_path = tempfile.mkstemp(prefix="ccc-codex-", suffix=".txt")
-        os.close(handle)
+        codex_bin = codex_launch.resolve_codex()
+    except codex_launch.CodexLaunchError:
+        return None
+    try:
         workdir = tempfile.mkdtemp(prefix="ccc-codex-cwd-")
-        cmd = [
-            codex_bin,
-            "exec",
-            *perm_args,
-            *mcp_args,
-            "--ephemeral",
-            "--skip-git-repo-check",
-            "-C",
-            workdir,
-            "--color",
-            "never",
-            "--output-last-message",
-            out_path,
-        ]
-        if model:
-            cmd += ["-m", model]
-        cmd.append(prompt)
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120, env=env, check=False
+
+        def build_cmd(
+            _cand: object, out_path: str, perm_args: list[str], mcp_args: list[str]
+        ) -> list[str]:
+            cmd = [
+                codex_bin,
+                "exec",
+                "--json",
+                *perm_args,
+                *mcp_args,
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "-C",
+                workdir,
+                "--color",
+                "never",
+                "--output-last-message",
+                out_path,
+            ]
+            if model:
+                cmd += ["-m", model]
+            cmd.append("-")  # prompt on stdin
+            return cmd
+
+        result = codex_in_claude.run_with_fallback(
+            prompt=prompt,
+            build_cmd=build_cmd,
+            write=False,
+            workdir=workdir,
+            total_timeout=120,
+            idle_timeout=60,
+            purpose="short-aim",
+            model=model or "(default)",
+            effort="",
+            heartbeat_meta={"model": model or "(default)", "repo": workdir, "write": False},
+            persistent=False,
         )
-        if result.returncode != 0:
-            return None
-        text = Path(out_path).read_text(encoding="utf-8", errors="replace").strip()
-        return text or None
-    except (subprocess.SubprocessError, OSError):
+    except (subprocess.SubprocessError, OSError, codex_launch.CodexLaunchError):
         return None
     finally:
-        if out_path:
-            try:
-                os.unlink(out_path)
-            except OSError:
-                pass
         if workdir:
             shutil.rmtree(workdir, ignore_errors=True)
+    return (result.reply.strip() or None) if result.ok else None
 
 
 def _guarded_env(purpose: str = "", note: str = "") -> dict[str, str]:

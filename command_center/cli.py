@@ -3104,14 +3104,58 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
         print(f"  {mark} {prov['id']:<14} {state:<10} {age:<12} {unblocks:<16} {detail}")
     if snap["best_claude_account"]:
         print(f"best Claude account (spends what resets soonest): {snap['best_claude_account']}")
-    best_codex = snap.get("best_codex_account", "")
-    pin = snap.get("codex_pin") or {}
-    pin_note = f"  [pin: {pin['account']} until {pin.get('until') or '∞'}]" if pin else ""
-    if best_codex:
-        print(f"codex seat for delegation (pin/holds-aware): {best_codex}{pin_note}")
-    else:
-        print(f"codex seat for delegation: none eligible (holds/blocks){pin_note}")
+    _print_codex_seat_footer(snap, now)
     return 0
+
+
+def _print_codex_seat_footer(snap: dict[str, Any], now: int) -> None:
+    """The Codex seat block: the ranked order, the next attempt, notes and the pin.
+
+    One line that answers "which login will the next Codex call bill, and why" —
+    ranked, so a seat that is skipped shows WHERE in the order it sits and what holds
+    it. The old two-line "codex seat for delegation: <id>" said only the winner, which
+    made a silently-skipped seat invisible.
+    """
+    from . import usage  # pylint: disable=import-outside-toplevel
+
+    rows = snap.get("codex_seat_order") or []
+    ladder = " → ".join(
+        f"{row.get('configured_rank', '?')} {row.get('label', '?')} "
+        f"{_QUOTA_MARK.get(str(row.get('state')), ' ')}"
+        + (
+            f" ({row['blocked_by']})"
+            if row.get("blocked_by") and row.get("state") != "available"
+            else ""
+        )
+        for row in rows
+    )
+    next_attempt = str(snap.get("codex_next_attempt") or snap.get("best_codex_account") or "")
+    if next_attempt:
+        tail = f"next attempt: {next_attempt}"
+    else:
+        resets = [
+            int(row.get("resets_at") or 0) for row in rows if int(row.get("resets_at") or 0) > now
+        ]
+        when = f" (earliest reset {usage.format_reset(min(resets), now)})" if resets else ""
+        tail = f"next attempt: none eligible{when}"
+    print(f"codex seats: {ladder or '(none configured)'}     {tail}")
+    notes = [f"{row['label']}: {row['note']}" for row in rows if row.get("note")]
+    if notes:
+        print(
+            " " * len("codex seats: ")
+            + "⚠ "
+            + " · ".join(notes)
+            + " · change: codex-in-claude order <label…>"
+        )
+    pin = snap.get("codex_pin") or {}
+    if pin:
+        print(f"pin: {pin['account']} until {pin.get('until') or '∞'}")
+    else:
+        # No ``codex_pin`` while a row IS flagged pinned means the pin exists but an
+        # explicit order overrules it — say so, or the user keeps re-setting a dead knob.
+        ignored = next((row for row in rows if row.get("pinned")), None)
+        if ignored is not None:
+            print(f"pin: {ignored['label']} (ignored: explicit order set)")
 
 
 def cmd_resume_halted(args: argparse.Namespace) -> int:

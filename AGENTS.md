@@ -160,9 +160,12 @@ label). See the multi-account section of [docs/reference.md](docs/reference.md).
 
 ## The codex launch policy (do not regress)
 
-`command_center/codex_launch.py` is the ONE place a `codex exec` command line is built —
-`codex_in_claude.cmd_delegate` and `llm.run_codex` both go through it, and nothing else may
-assemble codex argv. Three invariants:
+`command_center/codex_launch.py` is the ONE place a `codex exec` command line is built, and
+`codex_in_claude.run_with_fallback` is the ONE place ccc STARTS one — `delegate`, the machine
+`run` subcommand and `llm.run_codex` all go through the runner, and nothing else may assemble
+or spawn codex argv. External consumers (`codex-review.py`, sdsc-automations' checker) call
+`codex-in-claude run -j` instead of `codex exec`, so they inherit the seat order, the run-time
+fallback and the typed errors for free. Three invariants:
 
 1. **Never emit `-s`/`--sandbox`.** Codex ≥ 0.150 uses NAMED permission profiles
    (`-c default_permissions="hardened-ro"` / `…="hardened-rw"`); the legacy flag overrides the
@@ -180,6 +183,22 @@ assemble codex argv. Three invariants:
 Refusals raise `CodexLaunchError` → exit 2 at the CLI boundary (`CodexMissing` → exit 4). Tests:
 `tests/test_codex_launch.py`. The profile TOML lives in the user's `config.toml`, documented in
 [docs/reference.md](docs/reference.md) § "Codex launch policy".
+
+Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_codex_order.py`):
+
+4. **The seat is chosen per attempt, not per process.** `codex_homes_in_order()` re-reads the
+   `codex_seat_order` + cooldown state before EVERY attempt; a run-time refusal (`quota` /
+   `entitlement` / `auth`, classified only from the `--json` `error`/`turn.failed` events, never
+   from item text or the prompt) records a block and hops to the next seat. A task failure, a
+   timeout, a stall and a write-mode refusal that already touched the worktree do NOT hop.
+   Zero eligible seats ⇒ **no process at all** and `error.kind = all_seats_unavailable`.
+5. **Per-seat argv, always rebuilt.** `permission_args(write, codex_home=cand.home)` and
+   `mcp_disable_args(cand.home)` are recomputed for each attempt with a fresh `-o` file — the
+   first seat's profile or MCP flags must never leak onto the second.
+6. **The prompt travels on stdin** (argv ends with `-`): a repo map plus a revision round
+   exceeds `ARG_MAX`, and an argv prompt is readable by every `ps` on the machine.
+7. **The process GROUP is swept on every exit**, leader alive or not, and the heartbeat carries
+   `codex_pgid` + `runner_pid` so a consumer's last-resort timeout can kill the group directly.
 
 ## The `no_codex` job flag (do not regress)
 

@@ -137,6 +137,14 @@ DEFAULTS: dict[str, object] = {
     # so an account pin on that home is honoured. Labels are validated
     # ``^[a-z0-9][a-z0-9_-]*$`` and may not re-use the fixed ``default``/``private``.
     "codex_homes_extra": [],
+    # The ORDER every Codex consumer tries the seats in: labels of
+    # ``quota._canonical_codex_homes`` (``default`` / ``private`` / a
+    # ``codex_homes_extra`` label), e.g. ``["private", "de", "default"]``. Empty (the
+    # default) = the canonical order default -> private -> extras. Unknown labels are
+    # ignored; a configured seat missing from the list is appended in canonical order.
+    # A non-empty order makes the ``codex-in-claude home`` account pin INERT for
+    # selection — an explicit order is the stronger statement.
+    "codex_seat_order": [],
     # Multi-account Claude Code. ``claude_accounts`` maps labels to config dirs, one
     # ``"label=path"`` entry per line (list[str] so save_config round-trips it). Empty
     # (the default) ⇒ a single ``{"private": claude_home()}`` account, i.e. today's
@@ -366,6 +374,43 @@ def parse_codex_homes_extra(entries: list[str]) -> dict[str, Path]:
             continue  # never shadow a built-in seat; a duplicate keeps the first entry
         homes[label] = Path(raw).expanduser()
     return homes
+
+
+def codex_seat_order() -> list[str]:
+    """The configured Codex seat order, raw — stripped, deduped, strings only.
+
+    The labels of :func:`command_center.quota._canonical_codex_homes` in the order every
+    Codex consumer should TRY them (``["private", "de", "default"]``). Empty — the
+    default — means the canonical order (``default`` -> ``private`` -> extras).
+
+    Deliberately unvalidated here: ``quota.resolve_seat_order`` decides which of these
+    labels exist on this machine (and reports the rest as ``unknown``), so a login that
+    is temporarily unconfigured never turns the whole order into a hard error.
+    """
+    seen: list[str] = []
+    for raw in load_config().codex_seat_order:
+        label = str(raw).strip()
+        if label and label not in seen:
+            seen.append(label)
+    return seen
+
+
+def unknown_config_keys() -> list[str]:
+    """Keys in the on-disk ``config.toml`` that :data:`DEFAULTS` does not know, sorted.
+
+    :func:`save_config` re-emits ONLY ``DEFAULTS`` keys, so any other key in the file —
+    a hand-added setting, a typo, a key from a newer ccc — is silently DROPPED by a
+    save. A writer that rewrites the config on the user's behalf checks this first and
+    refuses rather than deleting something it never read. ``[]`` when the file is
+    missing or unparsable (nothing would be lost that is not already lost).
+    """
+    path = config_path()
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    return sorted(str(key) for key in data if key not in DEFAULTS)
 
 
 def codex_homes() -> dict[str, Path]:
@@ -608,6 +653,7 @@ class Config:
     codex_usage_refresh_active_sec: int = 200
     codex_home_private: str = ""  # second CODEX_HOME ("" = no second Codex card)
     codex_homes_extra: list[str] = field(default_factory=list)  # "label=path" per extra login
+    codex_seat_order: list[str] = field(default_factory=list)  # seat labels, "" = canonical order
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
     subscription_ends: list[str] = field(default_factory=list)  # "card=YYYY-MM-DD|auto"

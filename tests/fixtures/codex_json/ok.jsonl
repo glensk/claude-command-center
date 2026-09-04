@@ -1,0 +1,6 @@
+// CAPTURED LIVE 2026-09-04 from codex 0.152.1 (`codex exec --json --ephemeral`), sanitized.
+// A successful trivial round: rc 0, the reply ("OK") also written to the -o file.
+{"type":"thread.started","thread_id":"01a06cfb-5cd0-7cb0-836d-e053998a7c64"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"OK"}}
+{"type":"turn.completed","usage":{"input_tokens":15175,"cached_input_tokens":10624,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}

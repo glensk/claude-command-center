@@ -49,7 +49,7 @@ codex-in-claude.py usage [--json]                            # Codex 5h + weekly
 codex-in-claude.py headroom [--json]                         # learned optional-offload reserve
 codex-in-claude.py delegate [--write] [--scout] -C <repo> "<task>"  # one round; prints model first
 codex-in-claude.py home                                      # which CODEX_HOME (account) Codex bills now
-codex-in-claude.py home -j                                   # machine-readable: {home, source, label, email, until}
+codex-in-claude.py home -j                                   # machine-readable: {home, source, label, email, until, order, candidates, pin_active}
 codex-in-claude.py home ~/.codex-private -u 2026-09-07       # pin ALL Codex use to the 2nd login until that date (inclusive)
 codex-in-claude.py home -c                                   # drop the pin
 ```
@@ -64,18 +64,139 @@ of `codex_homes_extra`. A path outside those maps to no seat label, so the selec
 the pin as absent and ignores it; add the login to `codex_homes_extra` first
 (`codex_homes_extra = ["de=~/.codex-de"]`) and it gains its own `codex:de` quota row.
 
-Since 2026-09-01 the pin is one input to a quota-aware **selector**, not the whole
-answer: `_codex_home()` resolves `$CODEX_HOME` → `ccc quota`'s verdicts (an
-administrative hold or a blocked seat is excluded FIRST, then an eligible pin wins,
-then team→private order; nothing eligible falls back pin-else-default with a stderr
-warning) — so `ccc quota -m codex -H -U <stamp> -R "team seat reserved"` really keeps
-every Codex consumer off the team seat, pin or no pin. `ccc quota`'s footer and
-`best_codex_account` in its JSON show the same selection; `codex-review.py` consumes
-it via `home -j` (falling back to its local pin read only when the CLI is missing),
-and ccc's own `llm.run_codex` (short-AIM/scoring text) bills the selected seat too.
+Since 2026-09-04 the pin is the WEAKEST selector: it applies only while no explicit
+**seat order** is configured (see the next section). With an order set, `home <path>`
+still records the pin and says so — `(pin ignored: explicit order set)` — but nothing
+reads it. `$CODEX_HOME` in the environment remains the one hard override: it pins ONE
+seat with no fallback at all.
 
 `--for all` is a real reset: it moves `default` **and** clears the per-command pins, which
 would otherwise shadow it. A bare `set-model <slug>` (no `--for`) only moves `default`.
+
+## Seat order, next attempt and runtime fallback
+
+Every Codex consumer — `delegate`, the machine `run` subcommand, ccc's own
+`llm.run_codex`, `codex-review.py`, sdsc-automations' checker — tries the configured
+ChatGPT logins **in one user-defined order** and **falls through at run time** when a
+seat is held, exhausted, unpaid or refusing. One runner
+(`codex_in_claude.run_with_fallback`) implements it, so there is one behaviour and one
+set of tests. The trigger was concrete: on 2026-09-04 every `codex exec` inherited
+`~/.codex` (a team seat out of credits, on an administrative hold), failed with
+`codex exited 1`, and the two healthy paid logins on the same machine were never tried.
+
+```commands
+codex-in-claude order                        # the ranked table + next attempt
+codex-in-claude order private de default     # set it (this also CLEARS the account pin)
+codex-in-claude order -c                     # back to the canonical default → private → extras
+codex-in-claude order -j                     # {configured, order, unknown, next_attempt, candidates, pin}
+ai set codex-order private de default        # the front door (delegates to the above)
+ai routing                                   # shows the order + the next attempt
+```
+
+```
+1  private   ✅ available  5h 0% · wk 60%   you@example.org  ← next attempt
+2  de        ✅ available  5h 12% · wk 3%   you.second@example.org
+3  default   ⛔ blocked    hold: team seat reserved (unblocks in 2d 7h)
+pin: de until 2026-09-30  (ignored: explicit order set)
+```
+
+The order is stored as `codex_seat_order` in ccc's `config.toml`, next to the seat
+registry (`codex_home_private`, `codex_homes_extra`) that defines the labels. Empty (the
+package default) means the canonical order `default → private → extras`. Unknown labels
+are reported, never fatal; a configured login missing from the list is appended rather
+than dropped. `order <labels>` refuses a label naming no login, and refuses to rewrite a
+`config.toml` that carries keys ccc does not know (the writer re-emits only known keys
+and would delete them) — edit the key by hand in that case.
+
+**Eligibility** is `ccc quota`'s verdict: a seat is skipped when it is BLOCKED (a 100 %
+live window, a recorded refusal, an administrative hold) or DISABLED. UNKNOWN stays
+runnable — failing to measure a seat must not delete it. Two advisory signals never
+change the verdict: a `free` plan (`plan free — entitlement unproven`) and a
+`subscription_ends` date that has passed. `ccc quota` shows the whole ladder:
+
+```
+codex seats: 1 private ✅ → 2 de ✅ → 3 default ⛔ (hold)     next attempt: codex:private
+             ⚠ private: renewal date 2026-09-30 passed · change: codex-in-claude order <label…>
+```
+
+**Run-time fallback.** The runner re-reads the candidates before every attempt (so a hold
+written mid-run removes a seat), rebuilds that seat's permission profile and MCP flags,
+takes a fresh `-o` file, and enforces ONE wall-clock budget across all attempts. A
+refusal is classified **only** from the `codex exec --json` `error` / `turn.failed`
+events — the server's `codex_error_info` code when present, else its own message against
+narrow allowlists; item text and the prompt are never read, so a task that merely
+mentions "rate limit" cannot look like one. When the stream carries no failure event at
+all, the last 40 stderr lines are the fallback. Anything unrecognised (e.g.
+`server_overloaded`) is a **task** failure: no hop, no cooldown.
+
+| classified | recorded block                       | hops? |
+| :--------- | :----------------------------------- | :---- |
+| quota      | until the exhausted window resets (else 1 h) | yes |
+| entitlement| 24 h, scope `entitlement`            | yes   |
+| auth       | 24 h, scope `auth`                   | yes   |
+| (none)     | nothing                              | no    |
+
+A success clears that seat's OBSERVED block (never an administrative hold). **Zero
+eligible seats start no process at all** and report `all_seats_unavailable` with the
+earliest reset — a refusal we can predict is not worth a round trip.
+
+**Write mode and resume.** With `--write`, a refusal hops only when codex demonstrably
+did nothing: no `item.completed` other than `agent_message`/`reasoning`, and a `git
+status` that is readable and unchanged. Otherwise the round is journalled and reported as
+`### SEAT-REFUSED-MIDRUN <seat> — review the worktree` (exit 6); a worktree state that
+could not be read counts as "changed". `--resume <id>` searches every seat's journal and
+BINDS to the home that recorded the session — a resume never hops, because there is
+nothing to resume on another seat.
+
+**Environment.** `CCC_NO_CODEX=1` in the runner's own environment is the kill switch:
+zero candidates, zero processes, `error.kind = disabled`. A genuinely inherited
+`$CODEX_HOME` makes exactly one candidate (label `explicit` when ccc does not know that
+path, and then its refusals are recorded nowhere). Consumers pass their environment
+through untouched; the runner sets `CCC_NO_CODEX=1 CCC_INTERNAL=1 AI_NO_AUTOCOMMIT=1` on
+the **child** only.
+
+### `codex-in-claude run` — the machine entry point
+
+```commands
+codex-in-claude run -j -C <repo> -m gpt-5.6-sol -e low -t 300 -p debate 'reply OK'
+some-tool | codex-in-claude run -j -C <repo> -n 2 -      # prompt on stdin
+```
+
+Read-only, ephemeral (`-P/--persist` keeps and journals the session), no delegate
+contract and no repo map — the thinnest wrapper around the runner, for tools that would
+otherwise call `codex exec` themselves. Text mode prints `model:` then `seat:` then the
+reply; `-j` prints ONE JSON object:
+
+```json
+{"schema_version": 1, "model": "gpt-5.6-sol", "effort": "low", "ok": true,
+ "runner_pid": 4242, "seat": {"label": "de", "id": "codex:de", "home": "…", "email": "…"},
+ "attempts": [{"seat": "private", "home": "…", "elapsed_s": 3.2, "outcome": "refused:quota"},
+              {"seat": "de", "home": "…", "elapsed_s": 41.0, "outcome": "ok"}],
+ "reply": "…", "error": null, "session_id": "…"}
+```
+
+Exit codes match `delegate`: 0 ok, 2 usage, 3 unknown model, 4 no codex, 5 timeout/stall,
+6 codex failed / refused mid-run, 8 no eligible seat (or `-n` budget spent). On failure
+`error` is `{"kind", "message", "earliest_reset"}` with `kind` one of `disabled`,
+`all_seats_unavailable`, `attempts_exhausted`, `codex_failed`, `timeout`, `stalled`,
+`seat_refused_midrun`, `no_codex`.
+
+`delegate` prints the same `seat: <label> (<email>)` line as its SECOND stdout line
+(`[fallback]` appended on a hop), right after the guaranteed `model:` line.
+
+### Killing a run from outside (last resort)
+
+The runner starts codex in its own process group and sweeps that group (SIGTERM, ≤2 s,
+SIGKILL) on every exit — including when codex itself already exited, which is how a
+forked background child used to survive. A consumer with its own outer timeout should:
+
+1. `SIGTERM` the runner (it relays into codex's group) and wait ≤ 5 s;
+2. if it is still alive, read `codex_pgid` from the runner's heartbeat
+   (`~/.config/codex-in-claude/runs/<runner_pid>.json`, refreshed every 5 s; `runner_pid`
+   is also in the `-j` envelope) and `os.killpg(codex_pgid, SIGKILL)`;
+3. then `SIGKILL` the runner.
+
+Launch the runner with `start_new_session=True` so step 1 can `killpg` its group too.
 
 ### The model is visible in the slash-command help
 

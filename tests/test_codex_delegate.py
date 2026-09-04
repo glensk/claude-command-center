@@ -402,7 +402,7 @@ def test_delegate_records_cost_snapshots_and_purpose_without_stdout_preamble(
         Path(cmd[cmd.index("-o") + 1]).write_text("ok", encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(cic, "codex_cost_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(cic, "codex_cost_snapshot", lambda *_a, **_k: next(snapshots))
     monkeypatch.setattr(cic, "_exec_codex", fake_run)
     assert cic.cmd_delegate(_ns(purpose="debate")) == cic.EX_OK
     assert capsys.readouterr().out.splitlines()[0] == "model: gpt-5.6-sol (effort xhigh)"
@@ -418,6 +418,9 @@ def test_delegate_records_cost_snapshots_and_purpose_without_stdout_preamble(
             "effort": "xhigh",
             "before": {"300": {"used_percent": 10.0, "resets_at": 2_000_100_000}},
             "after": {"300": {"used_percent": 11.5, "resets_at": 2_000_100_000}},
+            # The seat that billed the run: $CODEX_HOME here is a tmp dir ccc does not
+            # know, so it is the "explicit" seat rather than a registered label.
+            "seat": "explicit",
         }
     ]
 
@@ -465,8 +468,9 @@ def test_delegate_scout_is_readonly_plan(cic: ModuleType, monkeypatch: pytest.Mo
     """--scout forces read-only (even with --write) and uses the PLAN contract, no diff."""
     captured: dict[str, list[str]] = {}
 
-    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         captured["cmd"] = cmd
+        captured["stdin"] = [str(kwargs.get("stdin_text") or "")]
         Path(cmd[cmd.index("-o") + 1]).write_text("### PLAN\n1. ...", encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
@@ -475,7 +479,9 @@ def test_delegate_scout_is_readonly_plan(cic: ModuleType, monkeypatch: pytest.Mo
     assert cic.cmd_delegate(_ns(scout=True, write=True)) == cic.EX_OK
     assert 'default_permissions="hardened-ro"' in captured["cmd"]
     assert 'default_permissions="hardened-rw"' not in captured["cmd"]
-    prompt = captured["cmd"][-1]
+    # The prompt travels on stdin (argv ends with "-"), never in argv.
+    assert captured["cmd"][-1] == "-"
+    prompt = captured["stdin"][0]
     assert "SCOUTING" in prompt and "### PLAN" in prompt and "NOT write" in prompt
 
 

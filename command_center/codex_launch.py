@@ -355,6 +355,63 @@ def read_journal(codex_home: Path | None = None) -> list[LaunchRecord]:
     return records
 
 
+def resolve_resume_any(
+    ref: str, *, write: bool, homes: dict[str, Path] | None = None
+) -> tuple[LaunchRecord, Path]:
+    """Resolve ``--resume`` *ref* across EVERY seat's journal → ``(record, its home)``.
+
+    A codex session lives in exactly ONE ``CODEX_HOME``, and since the runner picks the
+    seat at run time the session id a previous round reported may well sit in a journal
+    the CURRENT selection would never look at. Searching every *homes* entry (plus the
+    effective one, for an unregistered ``$CODEX_HOME``) is what makes ``--resume <id>``
+    keep working across a seat hop; the returned home is then BOUND for the run — a
+    resume never falls back to another seat, because there is nothing to resume there.
+
+    *homes* is the caller's seat registry (``codex_in_claude.canonical_codex_homes()``);
+    this module deliberately does not reach for it itself — the launch policy owns argv,
+    not the account list, and importing the registry here would add an import cycle.
+    ``None`` searches only the effective home.
+
+    ``last`` means the newest record across all searched homes, not the newest of
+    whichever home happens to be selected. Every other guard of :func:`resolve_resume`
+    still applies (ccc-journalled, same read/write mode, root still acceptable).
+    """
+    wanted = (ref or "").strip()
+    if not wanted:
+        raise CodexLaunchError("--resume needs a codex session id (or `last`)")
+    homes = dict(homes or {})
+    active = active_codex_home()
+    if not any(str(home) == str(active) for home in homes.values()):
+        homes["explicit"] = active
+    found: list[tuple[LaunchRecord, Path]] = []
+    for home in homes.values():
+        for record in read_journal(home):
+            if wanted in ("last", record.session_id):
+                found.append((record, home))
+    if not found:
+        raise CodexLaunchError(
+            f"refusing --resume {wanted}: no such session in any seat's {JOURNAL_NAME} — "
+            "only codex sessions ccc launched can be resumed."
+        )
+    record, home = max(found, key=lambda pair: pair[0].ts)
+    if record.write != write:
+        had = "write" if record.write else "read-only"
+        want = "write" if write else "read-only"
+        raise CodexLaunchError(
+            f"refusing --resume {record.session_id}: it was launched {had}, but this round "
+            f"asks for {want}. `codex exec resume` inherits the original permissions — "
+            "start a fresh session for the other mode."
+        )
+    try:
+        resolve_workdir(record.resolved_cwd, write=write)
+    except CodexLaunchError as exc:
+        raise CodexLaunchError(
+            f"refusing --resume {record.session_id}: its workspace root is no longer "
+            f"acceptable — {exc}"
+        ) from exc
+    return record, home
+
+
 def resolve_resume(ref: str, *, write: bool, codex_home: Path | None = None) -> LaunchRecord:
     """The journal record ``--resume`` *ref* names, or refuse with the reason.
 

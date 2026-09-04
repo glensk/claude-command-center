@@ -1,0 +1,6 @@
+// SYNTHETIC (not captured): the same event shape as the real 2026-09-04 refusal with an
+// entitlement message + codex_error_info. Reproducing a real one needs an unentitled seat.
+{"type":"thread.started","thread_id":"01a06cfb-4dbf-7782-969f-40811d81c000"}
+{"type":"turn.started"}
+{"type":"error","message":"This model is not included in your plan.","codex_error_info":{"type":"usage_not_included"}}
+{"type":"turn.failed","error":{"message":"This model is not included in your plan.","codex_error_info":{"type":"usage_not_included"}}}
