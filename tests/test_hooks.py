@@ -452,3 +452,58 @@ def test_release_locks_unarmed_never_spawns(home: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
     hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
     assert calls == []
+
+
+# --------------------------------------------------------------------------- #
+# SubagentStart/SubagentStop — the in-process subagent counter switch-account reads
+# --------------------------------------------------------------------------- #
+def test_subagent_start_stop_counts_in_flight_subagents_and_floors_at_zero(home: Path) -> None:
+    """Each start increments, each stop decrements, and a stop without a start stays at 0.
+
+    The counter is the only evidence of an IN-PROCESS Agent-tool subagent (no child
+    process, and its transcript record can lag), so it must never drift: two parallel
+    subagents read 2, and an extra SubagentStop (one whose start predates the column)
+    must not push it negative and mask a real one.
+    """
+    payload = {"session_id": "s1", "cwd": "/repo"}
+    store = Store()
+    hooks.handle_subagent_start(payload)
+    assert store.active_subagents("s1") == 1
+    hooks.handle_subagent_start(payload)
+    assert store.active_subagents("s1") == 2
+    hooks.handle_subagent_stop(payload)
+    assert store.active_subagents("s1") == 1
+    hooks.handle_subagent_stop(payload)
+    assert store.active_subagents("s1") == 0
+    hooks.handle_subagent_stop(payload)  # unpaired stop
+    assert store.active_subagents("s1") == 0
+
+
+def test_subagent_start_records_parent_activity_and_logs_the_event(home: Path) -> None:
+    """The parent's last_response_at advances and the event log names the start."""
+    hooks.handle_subagent_start({"session_id": "s1", "cwd": "/repo"})
+    got = Store().get("s1")
+    assert got is not None and got.last_response_at > 0
+    log = (home / "command-center" / "events.log").read_text(encoding="utf-8")
+    assert "subagent-start" in log
+
+
+def test_session_start_resets_a_stranded_subagent_count(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session that died mid-subagent never fired its stop — the new start clears it."""
+    monkeypatch.delenv("ITERM_SESSION_ID", raising=False)
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.bump_subagents("s1", 3)
+    hooks.handle_session_start({"session_id": "s1", "cwd": "/repo"})
+    assert store.active_subagents("s1") == 0
+
+
+def test_session_end_resets_the_subagent_count(home: Path) -> None:
+    """The process is going: no subagent of it survives, so the counter cannot linger."""
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.bump_subagents("s1", 2)
+    hooks.handle_session_end({"session_id": "s1", "cwd": "/repo"})
+    assert store.active_subagents("s1") == 0

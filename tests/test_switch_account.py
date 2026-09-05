@@ -655,6 +655,45 @@ def test_switch_account_refuses_background_work_unless_forced(
     assert "warning (--force)" in capsys.readouterr().err
 
 
+def test_background_work_reports_the_in_process_subagent_counter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An in-process Agent-tool subagent vetoes on the store counter alone.
+
+    It runs INSIDE the session's process (no child ``claude``, no background shell) and
+    its ``async_launched`` record can reach the transcript after this check reads it —
+    the SubagentStart/SubagentStop count is the only evidence there is.
+    """
+    monkeypatch.setattr(claude_adapter, "_children_map", lambda: {})
+    adapter = claude_adapter.ClaudeAdapter()
+    transcript = _jsonl(tmp_path / f"{SID}.jsonl")  # readable, nothing pending
+    assert cli._background_work(adapter, 0, transcript) == []
+    assert cli._background_work(adapter, 0, transcript, active_subagents=0) == []
+    reasons = cli._background_work(adapter, 0, transcript, active_subagents=2)
+    assert reasons == [
+        "2 in-process subagent(s) still running (SubagentStart/SubagentStop counter)"
+    ]
+
+
+def test_switch_account_feeds_the_stored_subagent_count_into_the_veto(
+    two_accounts: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arm path reads the counter from the store and hands it to ``_background_work``."""
+    _prepare_arm(monkeypatch, two_accounts)
+    with Store() as store:
+        store.ensure(SID, cwd=os.getcwd())
+        store.bump_subagents(SID, 2)
+    seen: dict[str, Any] = {}
+
+    def spy(*_args: Any, **kwargs: Any) -> list[str]:
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(cli, "_background_work", spy)
+    assert cli.main(["switch-account", "work", "-s", SID]) == 0
+    assert seen["active_subagents"] == 2
+
+
 @pytest.mark.parametrize("drift", ["target-not-its-email", "both-dirs-one-identity"])
 def test_switch_account_refuses_account_identity_drift(
     two_accounts: tuple[Path, Path],

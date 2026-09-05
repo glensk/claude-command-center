@@ -371,6 +371,10 @@ def handle_session_start(payload: dict[str, Any]) -> int:
         return 0
     with Store() as store:
         session, switch_warning = ensure_current_session(store, sid, payload.get("cwd", ""))
+        # A fresh (or resumed) session has no in-flight subagents: whatever the previous
+        # incarnation was running died with it and never fired its SubagentStop, and a
+        # stranded count would veto every `switch-account` for this id from here on.
+        store.reset_subagents(sid)
         if switch_warning and _switch_landed_as_expected(store, sid):
             switch_warning = None
         # The iTerm tab id itself is stamped inside ensure_current_session (every
@@ -672,14 +676,36 @@ def handle_pre_compact(payload: dict[str, Any]) -> int:
     return 0
 
 
+def handle_subagent_start(payload: dict[str, Any]) -> int:
+    """A subagent of the session started — count it and record parent activity.
+
+    The counter is the ONLY evidence ``ccc switch-account`` has of an IN-PROCESS
+    Agent-tool subagent: it spawns no child ``claude`` process (so the process-tree probe
+    misses it) and its launch record can land in the transcript after the switch check
+    read the file. :meth:`handle_subagent_stop` decrements it; SessionStart/SessionEnd
+    reset it so a crash cannot strand a phantom.
+    """
+    sid = _session_id(payload)
+    if not sid:
+        return 0
+    _log_event(sid, "subagent-start", "")
+    with Store() as store:
+        ensure_current_session(store, sid, payload.get("cwd", ""))
+        store.bump_subagents(sid, +1)
+        store.update_fields(sid, last_response_at=now_ms())
+    return 0
+
+
 def handle_subagent_stop(payload: dict[str, Any]) -> int:
-    """A subagent of the session finished — log it and record parent activity."""
+    """A subagent of the session finished — uncount it and record parent activity."""
     sid = _session_id(payload)
     if not sid:
         return 0
     _log_event(sid, "subagent-stop", "")
     with Store() as store:
         ensure_current_session(store, sid, payload.get("cwd", ""))
+        # Floored at 0: a stop whose start predates the counter never drives it negative.
+        store.bump_subagents(sid, -1)
         store.update_fields(sid, last_response_at=now_ms())
     return 0
 
@@ -691,6 +717,7 @@ def handle_session_end(payload: dict[str, Any]) -> int:
     with Store() as store:
         store.release_all_file_locks(sid)  # never leave a closed session holding a file
         session, _ = ensure_current_session(store, sid, payload.get("cwd", ""))
+        store.reset_subagents(sid)  # the process is going: no subagent of it survives
         fields: dict[str, Any] = {"last_response_at": now_ms(), "needs_summary": True}
         if (
             session.done_check_cmd
@@ -714,6 +741,7 @@ _HANDLERS = {
     "release-locks": handle_release_locks,
     "session-end": handle_session_end,
     "pre-compact": handle_pre_compact,
+    "subagent-start": handle_subagent_start,
     "subagent-stop": handle_subagent_stop,
 }
 

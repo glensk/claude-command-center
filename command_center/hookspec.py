@@ -31,6 +31,10 @@ HOOK_SPEC: tuple[tuple[str, str | None, str], ...] = (
     ("UserPromptSubmit", None, "user-prompt"),
     ("SessionEnd", None, "session-end"),
     ("PreCompact", None, "pre-compact"),
+    # SubagentStart/SubagentStop bracket every IN-PROCESS Agent-tool subagent: the pair
+    # keeps the per-session `active_subagents` counter `switch-account` refuses on (a
+    # running in-process subagent has no child process and may not be in the transcript yet).
+    ("SubagentStart", None, "subagent-start"),
     ("SubagentStop", None, "subagent-stop"),
     ("PreToolUse", "Edit|Write|MultiEdit|NotebookEdit", "pre-tool-use"),
     ("PostToolUse", "Edit|Write|MultiEdit|NotebookEdit", "post-tool-use"),

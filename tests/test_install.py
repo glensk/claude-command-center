@@ -35,7 +35,14 @@ def _stop_commands(settings: dict) -> list[str]:
 def test_install_hooks_fresh_creates_all_events(_claude_home: Path) -> None:
     assert install.install_hooks() == 0
     settings = _load(_claude_home)
-    for event in ("SessionStart", "UserPromptSubmit", "SessionEnd", "PreCompact", "SubagentStop"):
+    for event in (
+        "SessionStart",
+        "UserPromptSubmit",
+        "SessionEnd",
+        "PreCompact",
+        "SubagentStart",  # the in-process subagent counter switch-account reads
+        "SubagentStop",
+    ):
         assert event in settings["hooks"]
     # PreToolUse + PostToolUse carry their matcher objects.
     pre = settings["hooks"]["PreToolUse"][0]

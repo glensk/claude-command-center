@@ -27,6 +27,7 @@ diff; `-u/--uninstall` removes only ccc-owned entries.
 | **release-locks**   | drops every file lock the session holds (wired *after* any commit step — see below) |
 | **SessionEnd**      | final reconcile so the row parks cleanly                                          |
 | **PreCompact**      | preserves state across a context compaction                                       |
+| **SubagentStart**   | counts in-process subagents so `switch-account` refuses while one runs            |
 | **SubagentStop**    | keeps sub-agent activity from being mistaken for the main turn ending             |
 
 Headless `claude -p` runs never create rows: the hooks bail when

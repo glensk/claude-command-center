@@ -799,6 +799,53 @@ def test_close_requested_at_column_migrates_and_roundtrips(tmp_path: Path) -> No
         assert got is not None and got.close_requested_at == 1234567890
 
 
+def test_active_subagents_counter_floors_at_zero_and_resets(tmp_path: Path) -> None:
+    # The SubagentStart/SubagentStop counter `switch-account` vetoes on: it must survive
+    # unpaired events (a stop whose start predates the column would otherwise drive it
+    # negative and hide a real subagent) and be resettable after a crash.
+    store = _store(tmp_path)
+    store.ensure("s1", cwd="/repo")
+    assert store.active_subagents("s1") == 0
+    assert store.bump_subagents("s1", 1) == 1
+    assert store.bump_subagents("s1", 1) == 2
+    assert store.bump_subagents("s1", -1) == 1
+    assert store.bump_subagents("s1", -1) == 0
+    assert store.bump_subagents("s1", -1) == 0  # floored, never negative
+    assert store.active_subagents("s1") == 0
+    store.bump_subagents("s1", 3)
+    store.reset_subagents("s1")
+    assert store.active_subagents("s1") == 0
+    # An untracked session has no counter and vetoes nothing.
+    assert store.bump_subagents("nosuch", 1) == 0
+    assert store.active_subagents("nosuch") == 0
+
+
+def test_active_subagents_column_migrates_onto_existing_db(tmp_path: Path) -> None:
+    # Guards the _SESSION_COLUMNS whitelist + the ALTER-in-place migration for
+    # active_subagents: a pre-migration DB gains it (default 0) and the counter works on
+    # the row that predates it.
+    import sqlite3
+
+    from command_center import store as store_mod
+
+    db = tmp_path / "legacy.db"
+    legacy_schema = store_mod._SCHEMA.replace(
+        "    active_subagents  INTEGER NOT NULL DEFAULT 0,\n", ""
+    )
+    conn = sqlite3.connect(db)
+    conn.executescript(legacy_schema)
+    conn.execute("INSERT INTO sessions (session_id, cwd) VALUES ('old', '/repo/old')")
+    conn.commit()
+    conn.close()
+    with Store(db) as store:  # opening runs _ensure_columns → ALTER adds active_subagents
+        row = store.get("old")
+        assert row is not None
+        assert row.active_subagents == 0  # NOT NULL default after the migration
+        assert store.bump_subagents("old", 1) == 1
+        got = store.get("old")
+        assert got is not None and got.active_subagents == 1
+
+
 def _scan(session_id: str, **over: object) -> TranscriptScan:
     """A TranscriptScan for *session_id* with sane defaults, overridable per field."""
     fields: dict[str, object] = {

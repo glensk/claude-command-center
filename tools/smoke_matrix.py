@@ -86,6 +86,7 @@ _HOOK_EVENTS = frozenset(
         "user-prompt",
         "session-end",
         "pre-compact",
+        "subagent-start",
         "subagent-stop",
         "pre-tool-use",
         "post-tool-use",

@@ -1167,19 +1167,29 @@ def _background_work(
     live_pid: int,
     transcript: Any,
     ignore: frozenset[int] = frozenset(),
+    *,
+    active_subagents: int = 0,
 ) -> list[str]:
     """Why the session must NOT be relaunched yet: background work still in flight, by evidence.
 
     Process tree (a child claude = subagent, a background Bash-tool shell) plus the
     transcript's structured launch/completion records
-    (``adapters.claude.pending_background_work``). An unreadable transcript is a reason
-    too — unknown is refused, never assumed clear. Empty ⇒ clear to switch. *ignore*
-    is the caller's own process ancestry when it runs inside the session (the ``!``
-    prefix's Bash-tool shell must not veto the very command it is running).
+    (``adapters.claude.pending_background_work``) plus *active_subagents*, the store's
+    SubagentStart/SubagentStop counter (``Store.active_subagents``) — an IN-PROCESS
+    Agent-tool subagent runs inside the session's own process, so it shows up in neither
+    of the first two until its launch record reaches the transcript. An unreadable
+    transcript is a reason too — unknown is refused, never assumed clear. Empty ⇒ clear to
+    switch. *ignore* is the caller's own process ancestry when it runs inside the session
+    (the ``!`` prefix's Bash-tool shell must not veto the very command it is running).
     """
     from .adapters.claude import pending_background_work
 
     reasons: list[str] = []
+    if active_subagents > 0:
+        reasons.append(
+            f"{active_subagents} in-process subagent(s) still running "
+            "(SubagentStart/SubagentStop counter)"
+        )
     if live_pid > 0:
         if adapter.has_subagent(live_pid, ignore):
             reasons.append("a child claude process (subagent) is running")
@@ -1341,7 +1351,9 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     from . import terminal
 
     own = terminal.pid_ancestry(os.getpid(), terminal.ps_table()) if inside else frozenset()
-    reasons = _background_work(adapter, live.pid, transcript, own)
+    with Store() as store:
+        in_process = store.active_subagents(session_id)
+    reasons = _background_work(adapter, live.pid, transcript, own, active_subagents=in_process)
     if reasons and not args.force:
         print(
             "error: background work is still in flight — it would die unreported with this "
@@ -1612,7 +1624,14 @@ def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     # time (then nothing that appeared since is vetoed either: the arm was the decision).
     if not force:
         adapter = _adapter()
-        reasons = _background_work(adapter, pid, adapter.transcript_path(cwd, session_id, source))
+        with Store() as store:
+            in_process = store.active_subagents(session_id)
+        reasons = _background_work(
+            adapter,
+            pid,
+            adapter.transcript_path(cwd, session_id, source),
+            active_subagents=in_process,
+        )
         if reasons:
             return fail("background work is in flight: " + "; ".join(reasons))
     # (5) The target must still be what it was armed as (identity, trust, one transcript).
@@ -5125,8 +5144,9 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         description=(
             "Install (or update) the Claude Code hook entries ccc owns — SessionStart, "
             "UserPromptSubmit, Pre/PostToolUse, Stop (+ release-locks last), SessionEnd, "
-            "PreCompact, SubagentStop — as `<ccc> hook <event>` commands. Idempotent: a "
-            "rerun replaces ccc's own entries in place and never touches foreign hooks. "
+            "PreCompact, SubagentStart, SubagentStop — as `<ccc> hook <event>` commands. "
+            "Idempotent: a rerun replaces ccc's own entries in place and never touches "
+            "foreign hooks. "
             "settings.json is backed up (settings.json.ccc-backup-<UTCts>) before writing, "
             "and written symlink-safely (through a stow symlink to its real target)."
         ),

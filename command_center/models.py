@@ -445,6 +445,10 @@ class Session:
     switch_requested_at: int = 0
     switch_config_dir: str = ""
     switch_force: int = 0  # 1 = `switch-account --force`: skip the background-work veto
+    # In-flight IN-PROCESS Agent-tool subagents (SubagentStart − SubagentStop, floored
+    # at 0 and reset on session start/end). > 0 vetoes a `switch-account` relaunch: such
+    # a subagent has no child process and may not be in the transcript yet.
+    active_subagents: int = 0
     last_seen_pid: int | None = None
     keep: bool = False  # exempt from the idle reaper
     auto_closed: bool = False

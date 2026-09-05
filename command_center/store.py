@@ -101,6 +101,7 @@ _SESSION_COLUMNS = (
     "switch_requested_at",
     "switch_config_dir",
     "switch_force",
+    "active_subagents",
     "last_seen_pid",
     "keep",
     "auto_closed",
@@ -192,6 +193,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     switch_requested_at INTEGER NOT NULL DEFAULT 0,
     switch_config_dir TEXT    NOT NULL DEFAULT '',
     switch_force      INTEGER NOT NULL DEFAULT 0,
+    active_subagents  INTEGER NOT NULL DEFAULT 0,
     last_seen_pid     INTEGER,
     keep              INTEGER NOT NULL DEFAULT 0,
     auto_closed       INTEGER NOT NULL DEFAULT 0,
@@ -510,6 +512,10 @@ class Store:  # pylint: disable=too-many-public-methods
         "switch_requested_at": "INTEGER NOT NULL DEFAULT 0",
         "switch_config_dir": "TEXT NOT NULL DEFAULT ''",
         "switch_force": "INTEGER NOT NULL DEFAULT 0",
+        # In-flight IN-PROCESS Agent-tool subagents, kept by the SubagentStart/
+        # SubagentStop hook pair (see bump_subagents): the one signal a subagent with
+        # no child process and no transcript record yet still shows up in.
+        "active_subagents": "INTEGER NOT NULL DEFAULT 0",
     }
     # Same, for the subgoals table (auto-progress marks its rows source='auto').
     _ADDED_SUBGOAL_COLUMNS = {
@@ -1002,6 +1008,47 @@ class Store:  # pylint: disable=too-many-public-methods
             )
             self.conn.commit()
         return target
+
+    # ---- in-process subagents (SubagentStart/SubagentStop) ---------------
+    def bump_subagents(self, session_id: str, delta: int) -> int:
+        """Add *delta* to the session's in-flight subagent count; return the new value.
+
+        The counter the ``SubagentStart``/``SubagentStop`` hook pair keeps, and the only
+        evidence ``switch-account`` has of an IN-PROCESS Agent-tool subagent: it spawns no
+        child ``claude`` process and its launch record can reach the transcript later than
+        the switch check reads it. One statement does the read-modify-write (SQLite
+        serializes it), so two hooks firing at once cannot lose an increment, and the
+        ``MAX(0, …)`` floor keeps a stray ``SubagentStop`` (one whose start predates the
+        column, or a reset in between) from driving the count negative. ``0`` when the row
+        does not exist — an untracked session vetoes nothing.
+        """
+        self.conn.execute(
+            "UPDATE sessions SET active_subagents = MAX(0, active_subagents + ?), "
+            "updated_at = ? WHERE session_id = ?",
+            (delta, now_ms(), session_id),
+        )
+        self.conn.commit()
+        return self.active_subagents(session_id)
+
+    def active_subagents(self, session_id: str) -> int:
+        """In-flight in-process subagents for *session_id* (``0`` when the row is absent)."""
+        row = self.conn.execute(
+            "SELECT active_subagents FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        return int(row[0] or 0) if row is not None else 0
+
+    def reset_subagents(self, session_id: str) -> None:
+        """Zero the counter — a crash/restart must never leave a phantom subagent behind.
+
+        Called from the SessionStart and SessionEnd hooks: a session that died mid-subagent
+        never fired the matching ``SubagentStop``, and a stuck count would veto every later
+        ``switch-account`` for that id.
+        """
+        self.conn.execute(
+            "UPDATE sessions SET active_subagents = 0, updated_at = ? WHERE session_id = ?",
+            (now_ms(), session_id),
+        )
+        self.conn.commit()
 
     def upsert_from_live(self, live: LiveSession) -> None:
         """Reconcile a live registry entry, preserving user-authored fields.
