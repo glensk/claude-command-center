@@ -1927,6 +1927,86 @@ def test_inline_edit_prompt_visibility_and_subgoals(
     assert draft.prompt == "run the better thing"
 
 
+def test_inline_edit_long_prompt_keeps_caret_in_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Walking the caret down a prompt taller than the pane scrolls the pane after it.
+
+    The edit boxes are grow-to-fit, so they never scroll inside themselves: without the
+    pane following the caret, ``down`` past the fold left the caret invisible and the end
+    of a long prompt unreachable (nothing could be appended to it).
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _seed(tmp_path)
+    draft_sid = "draft-long-prompt"
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft(
+        draft_sid,
+        "/Users/x/repo",
+        "Prepare draft",
+        prompt="\n".join(f"line {i}" for i in range(120)),
+    )
+    store.close()
+
+    from textual.containers import VerticalScroll
+    from textual.widgets import TextArea
+
+    from command_center.views.tui import CommandCenterApp, SessionTable
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            app.cfg.aim_score_on_set = False
+            table = app.query_one("#sessions", SessionTable)
+            table.move_cursor(row=table.get_row_index(draft_sid))
+            table.focus()
+            await pilot.pause()
+
+            await pilot.press("e")
+            await pilot.pause()
+            prompt = app.query_one("#edit-prompt", TextArea)
+            prompt.focus()
+            await pilot.pause()
+            wrap = app.query_one("#detail-wrap", VerticalScroll)
+
+            def caret_visible() -> bool:
+                view = wrap.scrollable_content_region
+                return view.y <= prompt.cursor_screen_offset.y < view.y + view.height
+
+            # The box really is taller than the pane — otherwise the test proves nothing.
+            assert prompt.outer_size.height > wrap.scrollable_content_region.height
+            assert caret_visible()
+            offscreen = 0
+            for _ in range(130):  # down past the last line, then some
+                await pilot.press("down")
+                offscreen += not caret_visible()
+            assert offscreen == 0
+            assert prompt.cursor_location[0] == 119  # reached the end of the prompt
+
+            await pilot.press("end")
+            for char in "tail":
+                await pilot.press(char)
+            assert caret_visible()
+
+            for _ in range(140):  # …and all the way back up
+                await pilot.press("up")
+            assert caret_visible()
+            assert prompt.cursor_location == (0, 0)
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app._editing is False
+
+    asyncio.run(scenario())
+
+    store = Store(tmp_path / "command-center" / "state.db")
+    draft = store.get(draft_sid)
+    store.close()
+    assert draft is not None
+    assert (draft.prompt or "").splitlines()[-1] == "line 119tail"
+
+
 def test_draft_next_step_cell_shows_models_readout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -40,6 +40,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.coordinate import Coordinate
+from textual.css.query import NoMatches
+from textual.errors import NoWidget
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.suggester import Suggester
@@ -5047,6 +5049,39 @@ class CommandCenterApp(App[None]):
         wrap = self.query_one("#detail-wrap", VerticalScroll)
         oversized = row.outer_size.height >= wrap.scrollable_content_region.height
         row.scroll_visible(animate=False, top=oversized)
+
+    def on_text_area_selection_changed(self, event: TextArea.SelectionChanged) -> None:
+        """Follow the caret with the detail pane while an edit-mode box is being typed in.
+
+        The ``/aim``, ``prompt:`` and ``sub-goals`` boxes are grow-to-fit (``height:
+        auto``), so they never scroll inside themselves — Textual's own
+        ``scroll_cursor_visible`` finds nothing to scroll and returns. A long prompt then
+        walks the caret straight past the bottom of ``#detail-wrap``: it disappears, and
+        with it any way to reach the end of the text and append to it. The PANE is the
+        thing that scrolls here, so move it instead.
+        """
+        if not self._editing or not event.text_area.has_focus:
+            return
+        # After the refresh: typing a new line regrows the box, and the caret's screen row
+        # is only final once that taller layout has been arranged.
+        self.call_after_refresh(self._scroll_caret_into_view, event.text_area)
+
+    def _scroll_caret_into_view(self, area: TextArea) -> None:
+        """Nudge ``#detail-wrap`` vertically by the least amount that reveals *area*'s caret."""
+        if not self._editing or not area.is_mounted or not area.has_focus:
+            return
+        try:
+            wrap = self.query_one("#detail-wrap", VerticalScroll)
+            view = wrap.scrollable_content_region
+            caret_y = area.cursor_screen_offset.y
+        except (NoMatches, NoWidget):
+            return  # pane torn down (or not laid out yet) between message and callback
+        if view.height <= 0:
+            return
+        if caret_y < view.y:
+            wrap.scroll_relative(y=caret_y - view.y, animate=False)
+        elif caret_y >= view.y + view.height:
+            wrap.scroll_relative(y=caret_y - (view.y + view.height - 1), animate=False)
 
     def action_exit_edit(self) -> None:
         """Save changed inline-edit fields and return to the session table.
