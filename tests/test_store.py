@@ -999,6 +999,75 @@ def test_two_concurrent_store_inits_both_migrate_and_read_headless(tmp_path: Pat
     assert seen == [None, None]
 
 
+def _flaky_wal(monkeypatch: pytest.MonkeyPatch, failures: int) -> list[str]:
+    """Make the first *failures* ``PRAGMA journal_mode=WAL`` calls raise SQLITE_BUSY.
+
+    ``sqlite3.Connection`` is a C type, so the raise is injected through a subclass
+    handed to ``sqlite3.connect`` as its ``factory``, not by patching a method.
+    """
+    from command_center import store as store_mod
+
+    tries: list[str] = []
+    real_connect = sqlite3.connect
+
+    class _Flaky(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if sql == "PRAGMA journal_mode=WAL":
+                tries.append(sql)
+                if len(tries) <= failures:
+                    raise sqlite3.OperationalError("database is locked")
+            return super().execute(sql, *args)
+
+    monkeypatch.setattr(
+        store_mod.sqlite3,
+        "connect",
+        lambda *args, **kwargs: real_connect(*args, factory=_Flaky, **kwargs),
+    )
+    return tries
+
+
+def test_store_init_retries_the_wal_pragma_a_peer_is_holding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peer mid-mode-switch must be waited out, not raised at, out of the constructor.
+
+    ``PRAGMA journal_mode`` is the one statement SQLite does not run the busy handler
+    for — it returns SQLITE_BUSY immediately — so two ccc processes opening the same
+    fresh DB in the same instant used to kill one of them (a hook dying while the TUI
+    started).
+    """
+    tries = _flaky_wal(monkeypatch, failures=2)
+    with Store(tmp_path / "fresh.db") as store:
+        mode = store.conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert str(mode).lower() == "wal"
+    assert len(tries) == 3  # two refusals waited out, the third took
+
+
+def test_store_init_still_raises_when_the_wal_retries_run_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backoff is bounded — a genuinely stuck DB fails loudly, never hangs a hook."""
+    from command_center import store as store_mod
+
+    monkeypatch.setattr(store_mod, "_WAL_RETRY_SLEEP", 0.0)
+    tries = _flaky_wal(monkeypatch, failures=99)
+    with pytest.raises(sqlite3.OperationalError):
+        Store(tmp_path / "stuck.db")
+    assert len(tries) == store_mod._WAL_RETRIES  # pylint: disable=protected-access
+
+
+def test_store_init_skips_the_wal_pragma_when_already_in_wal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every open after the first takes no lock at all — the mode is read, not rewritten."""
+    db = tmp_path / "state.db"
+    Store(db).close()  # first open switches the mode
+    tries = _flaky_wal(monkeypatch, failures=99)  # any WAL write would now raise
+    with Store(db) as store:
+        assert store.get_transcript_scan("nope") is None
+    assert tries == []
+
+
 def test_put_transcript_scans_upsert_preserves_a_newer_builds_column(tmp_path: Path) -> None:
     # INSERT OR REPLACE deletes and re-inserts the row, resetting every column THIS build
     # does not know about (a newer ccc's — the DB is shared and the code is an editable

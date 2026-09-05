@@ -22,6 +22,7 @@ import dataclasses
 import json
 import re
 import sqlite3
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -397,6 +398,14 @@ def _row_to_scan(row: sqlite3.Row) -> TranscriptScan:
     )
 
 
+# ``PRAGMA journal_mode=WAL`` ignores the busy timeout (see Store._enable_wal), so it
+# gets its own small backoff: 5 tries with a growing 30ms step ≈ 0.45s worst case, far
+# more than the microseconds a peer holds the mode switch, and bounded so a genuinely
+# stuck DB still fails loudly instead of hanging a hook.
+_WAL_RETRIES = 5
+_WAL_RETRY_SLEEP = 0.03
+
+
 class Store:  # pylint: disable=too-many-public-methods
     """Thin wrapper over the SQLite database."""
 
@@ -405,14 +414,37 @@ class Store:  # pylint: disable=too-many-public-methods
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, check_same_thread=check_same_thread)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
         # Concurrent sessions/daemon/TUI all write; wait out a peer's write lock
         # instead of erroring (matters for the atomic BEGIN IMMEDIATE in acquire_file_lock).
         self.conn.execute("PRAGMA busy_timeout=3000")
+        self._enable_wal()
+        self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
         self._ensure_columns()
+
+    def _enable_wal(self) -> None:
+        """Put the DB in WAL mode, retrying briefly — the one pragma the busy timeout misses.
+
+        Switching journal mode takes an exclusive lock, and SQLite does NOT run the busy
+        handler for ``PRAGMA journal_mode``: it returns SQLITE_BUSY straight away. Two ccc
+        processes opening the same DB in the same instant (a hook firing while the TUI
+        starts) therefore made one of them raise ``database is locked`` out of the
+        constructor. A DB already in WAL needs no lock at all, so the read below skips the
+        write entirely on every open after the first, and the retry only ever runs while a
+        peer holds the mode switch.
+        """
+        row = self.conn.execute("PRAGMA journal_mode").fetchone()
+        if row is not None and str(row[0]).lower() == "wal":
+            return
+        for attempt in range(_WAL_RETRIES):
+            try:
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                return
+            except sqlite3.OperationalError:
+                if attempt == _WAL_RETRIES - 1:
+                    raise
+                time.sleep(_WAL_RETRY_SLEEP * (attempt + 1))
 
     # Columns added after the initial schema; ALTER existing DBs in place.
     _ADDED_COLUMNS = {
