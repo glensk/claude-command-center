@@ -19,6 +19,7 @@ import re
 import subprocess
 import time
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 from .. import config
@@ -30,6 +31,7 @@ from ..models import (
     TranscriptScan,
     now_ms,
 )
+from ..session_continue import parse_limit_message
 
 # A genuine invocation of the Codex workflow records the slash command as a
 # ``<command-name>/codex-implement-task-and-claude-review`` tag in the transcript.
@@ -102,7 +104,8 @@ def _resolve_registry_group(entries: list[LiveSession]) -> LiveSession:
     chosen = max(alive or entries, key=lambda e: e.updated_at)
     homes = {e.config_dir for e in alive}
     if len(homes) > 1:
-        from .. import accounts
+        # accounts ⇄ adapters cycle keeps this import local
+        from .. import accounts  # pylint: disable=import-outside-toplevel
 
         first, second = sorted(homes)[:2]
         accounts.warn_conflict(chosen.session_id, first, second)
@@ -211,9 +214,12 @@ def _queued_prompt_text(record: dict) -> str | None:
     ``origin.kind == "peer"`` is a ``<cross-session-message>`` injected by another
     Claude session. A missing ``origin`` is human (older Claude Code wrote none).
     """
-    if not isinstance(record, dict) or record.get("type") != "attachment":
-        return None
-    if record.get("isMeta") or record.get("isSidechain"):
+    if (
+        not isinstance(record, dict)
+        or record.get("type") != "attachment"
+        or record.get("isMeta")
+        or record.get("isSidechain")
+    ):
         return None
     attachment = record.get("attachment")
     if not isinstance(attachment, dict) or attachment.get("type") != "queued_command":
@@ -437,28 +443,38 @@ def _collect_events(
         queued = _queued_prompt_text(record)
         if queued is not None:
             events.append(SessionEvent(kind="prompt", text=queued))
-        return
-    if rtype == "user":
-        prompt = _user_prompt_text(record)
-        if prompt is not None:
-            events.append(SessionEvent(kind="prompt", text=prompt))
-        # The same user record may (also) carry tool_result blocks — pair them.
+    elif rtype == "user":
+        _collect_user_events(record, events, pending)
+    elif rtype == "assistant" and not record.get("isMeta"):
         message = record.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        if isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_result":
-                    continue
-                event = pending.pop(str(block.get("tool_use_id", "")), None)
-                if event is not None:
-                    event.tool_result = _tool_result_text(block.get("content"))
-        return
-    if rtype != "assistant" or record.get("isMeta"):
-        return
+        if isinstance(message, dict):
+            _collect_assistant_events(message.get("content"), events, pending)
+
+
+def _collect_user_events(
+    record: dict, events: list[SessionEvent], pending: dict[str, SessionEvent]
+) -> None:
+    """A user record: the typed prompt and/or the ``tool_result`` blocks answering tools."""
+    prompt = _user_prompt_text(record)
+    if prompt is not None:
+        events.append(SessionEvent(kind="prompt", text=prompt))
+    # The same user record may (also) carry tool_result blocks — pair them.
     message = record.get("message")
-    if not isinstance(message, dict):
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
         return
-    content = message.get("content")
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        event = pending.pop(str(block.get("tool_use_id", "")), None)
+        if event is not None:
+            event.tool_result = _tool_result_text(block.get("content"))
+
+
+def _collect_assistant_events(
+    content: object, events: list[SessionEvent], pending: dict[str, SessionEvent]
+) -> None:
+    """An assistant message's text and ``tool_use`` blocks; thinking blocks are skipped."""
     if isinstance(content, str):
         if content.strip():
             events.append(SessionEvent(kind="text", text=content))
@@ -624,32 +640,11 @@ def pending_background_work(transcript: Path) -> list[str] | None:
             return None
         if not isinstance(record, dict):
             return None
-        result = record.get("toolUseResult")
-        if isinstance(result, dict):
-            task_id = result.get("backgroundTaskId")
-            if (
-                not (isinstance(task_id, str) and task_id)
-                and result.get("status") == "async_launched"
-            ):
-                task_id = result.get("agentId")
-            if isinstance(task_id, str) and task_id and task_id not in launched:
-                launched.append(task_id)
+        task_id = _launched_task_id(record)
+        if task_id and task_id not in launched:
+            launched.append(task_id)
         ended.update(_notification_task_ids(record))
-        message = record.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "tool_use" and block.get("name") == "TaskStop":
-                params = block.get("input")
-                target = params.get("task_id") if isinstance(params, dict) else None
-                if isinstance(target, str) and isinstance(block.get("id"), str):
-                    stops[block["id"]] = target
-            elif block.get("type") == "tool_result" and block.get("tool_use_id") in stops:
-                if not block.get("is_error"):
-                    ended.add(stops[block["tool_use_id"]])
+        _track_task_stops(record, stops, ended)
     return [task_id for task_id in launched if task_id not in ended]
 
 
@@ -689,6 +684,36 @@ def _notification_task_ids(record: dict[str, object]) -> set[str]:
         if text.lstrip().startswith("<task-notification>"):
             ids.update(_TASK_ID_RE.findall(text))
     return ids
+
+
+def _launched_task_id(record: dict[str, object]) -> str | None:
+    """The id of the background Bash task / agent *record* reports launched, else ``None``."""
+    result = record.get("toolUseResult")
+    if not isinstance(result, dict):
+        return None
+    task_id = result.get("backgroundTaskId")
+    if not (isinstance(task_id, str) and task_id) and result.get("status") == "async_launched":
+        task_id = result.get("agentId")
+    return task_id if isinstance(task_id, str) and task_id else None
+
+
+def _track_task_stops(record: dict[str, object], stops: dict[str, str], ended: set[str]) -> None:
+    """Note ``TaskStop`` calls (*stops*: tool_use id → task); successful ones land in *ended*."""
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use" and block.get("name") == "TaskStop":
+            params = block.get("input")
+            target = params.get("task_id") if isinstance(params, dict) else None
+            if isinstance(target, str) and isinstance(block.get("id"), str):
+                stops[block["id"]] = target
+        elif block.get("type") == "tool_result" and block.get("tool_use_id") in stops:
+            if not block.get("is_error"):
+                ended.add(stops[block["tool_use_id"]])
 
 
 def _children_map() -> dict[int, list[tuple[int, str]]]:
@@ -1280,10 +1305,6 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         ``--wait-only`` probe cannot see — so auto-resume can back off until then
         instead of relaunching into it every window.
         """
-        from datetime import datetime
-
-        from ..session_continue import parse_limit_message
-
         path = self.transcript_path(cwd, session_id)
         if path is None:
             return 0
