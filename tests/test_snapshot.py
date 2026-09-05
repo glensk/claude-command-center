@@ -609,6 +609,9 @@ class FakeSession:
             raise RuntimeError("pane died")
         self.sent.append(text)
 
+    async def async_get_variable(self, name: str) -> str:
+        return "zsh"  # an idle shell: _await_shell settles at once
+
     async def async_set_name(self, name: str) -> None:
         self.renamed = name
 
@@ -675,6 +678,224 @@ def test_deliver_collects_per_pane_failures_without_aborting() -> None:
     failures = asyncio.run(snapshot._deliver([(actions[0], broken), (actions[1], good)]))
     assert len(failures) == 1 and "/a" in failures[0]
     assert good.sent == ["cd /b\n"]  # the later pane still got its command
+
+
+class SettlingSession(FakeSession):
+    """A pane whose ``jobName`` walks a scripted startup: login → rc children → shell."""
+
+    def __init__(self, name: str, log: list[str], jobs: list[str]) -> None:
+        super().__init__(name, log)
+        self.jobs = list(jobs)
+        self.polls: list[str] = []
+
+    async def async_get_variable(self, name: str) -> str:
+        job = self.jobs.pop(0) if len(self.jobs) > 1 else self.jobs[0]
+        self.polls.append(job)
+        return job
+
+
+@pytest.fixture(autouse=True)
+def _fast_shell_polls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(snapshot, "_SHELL_POLL_SECONDS", 0.0)
+
+
+def test_is_shell_job_recognises_login_shells_and_paths() -> None:
+    assert snapshot.is_shell_job("zsh") and snapshot.is_shell_job("-zsh")
+    assert snapshot.is_shell_job("/bin/bash") and snapshot.is_shell_job("fish")
+    assert not snapshot.is_shell_job("login") and not snapshot.is_shell_job("python3.14")
+    assert not snapshot.is_shell_job("") and not snapshot.is_shell_job(None)
+
+
+def test_await_shell_waits_for_the_shell_to_stay_idle_across_polls() -> None:
+    log: list[str] = []
+    pane = SettlingSession("p", log, ["login", "zsh", "starship", "zsh", "lsd", "zsh"])
+    assert asyncio.run(snapshot._await_shell(pane)) is True
+    # a lone "zsh" between two startup children never counts: 3 consecutive polls needed
+    assert pane.polls == ["login", "zsh", "starship", "zsh", "lsd", "zsh", "zsh", "zsh"]
+
+
+def test_await_shell_gives_up_after_the_timeout_and_reports_it() -> None:
+    log: list[str] = []
+    stuck = SettlingSession("p", log, ["python3"])
+    assert asyncio.run(snapshot._await_shell(stuck, timeout=0.0)) is False
+
+
+def test_await_shell_types_anyway_when_the_pane_has_no_variables() -> None:
+    class Mute:
+        async def async_get_variable(self, name: str) -> str:
+            raise RuntimeError("no such variable")
+
+    assert asyncio.run(snapshot._await_shell(Mute())) is False
+
+
+def test_deliver_waits_for_every_pane_before_typing(monkeypatch: pytest.MonkeyPatch) -> None:
+    log: list[str] = []
+    slow = SettlingSession("slow", log, ["login", "obsidian_settings.sh", "zsh"])
+    fast = SettlingSession("fast", log, ["zsh"])
+    actions = [
+        snapshot.PaneAction(command="cd /slow", kind="shell", cwd="/slow"),
+        snapshot.PaneAction(command="cd /fast", kind="shell", cwd="/fast"),
+    ]
+    failures = asyncio.run(snapshot._deliver([(actions[0], slow), (actions[1], fast)]))
+    assert failures == []
+    assert slow.polls[:3] == ["login", "obsidian_settings.sh", "zsh"]  # waited through startup
+    assert slow.sent == ["cd /slow\n"] and fast.sent == ["cd /fast\n"]
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1 against fake iTerm windows/tabs (the just-created-object gotcha)
+# --------------------------------------------------------------------------- #
+class FakeTab:
+    """A tab exactly as the Python API hands it back right after creation.
+
+    ``current_session`` is ``None`` — ``active_session_id`` only arrives with a later
+    layout notification — while ``sessions`` already lists the one real session.
+    """
+
+    def __init__(self, session: FakeSession | None) -> None:
+        self.sessions = [session] if session else []
+        self.current_session = None
+        self.selected = False
+
+    async def async_select(self) -> None:
+        self.selected = True
+
+
+class FakeWindow:
+    """A fresh window: ``current_tab`` is ``None`` too (``selected_tab_id`` unset)."""
+
+    def __init__(self, log: list[str], sessions: list[FakeSession | None]) -> None:
+        self.log = log
+        self.tabs = [FakeTab(sessions[0])]
+        self.current_tab = None
+        self._pending = list(sessions[1:])
+        self.frame: object = None
+
+    async def async_create_tab(self) -> FakeTab:
+        self.log.append("create_tab")
+        tab = FakeTab(self._pending.pop(0))
+        self.tabs.append(tab)
+        return tab
+
+    async def async_set_frame(self, frame: object) -> None:
+        self.frame = frame
+
+
+def _fake_iterm(monkeypatch: pytest.MonkeyPatch, log: list[str], *windows: FakeWindow) -> None:
+    """Route ``iterm2.Window.async_create`` / ``async_get_app`` to the fakes, logging both."""
+    import iterm2  # pylint: disable=import-outside-toplevel
+
+    queue = list(windows)
+
+    async def create(connection: object) -> FakeWindow:
+        log.append("create_window")
+        return queue.pop(0)
+
+    async def get_app(connection: object) -> object:
+        log.append("get_app")
+        return object()
+
+    monkeypatch.setattr(iterm2.Window, "async_create", staticmethod(create))
+    monkeypatch.setattr(iterm2, "async_get_app", get_app)
+
+
+def test_build_window_addresses_fresh_tabs_through_sessions_not_current_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: every pane of a restore was skipped because ``current_tab`` and
+    ``current_session`` are ``None`` on objects the API has just created."""
+    log: list[str] = []
+    first, second = FakeSession("t0", log), FakeSession("t1", log)
+    window = FakeWindow(log, [first, second])
+    _fake_iterm(monkeypatch, log, window)
+    plan = snapshot.WindowPlan(
+        tabs=[
+            snapshot.TabPlan(_leaf("a")),
+            snapshot.TabPlan(snapshot.PlanNode("horizontal", [_leaf("b"), _leaf("c")])),
+        ]
+    )
+    built, leaves, lost = asyncio.run(snapshot._build_window(object(), plan))
+    assert built is window and lost == []
+    assert [a.title for a, _ in leaves] == ["a", "b", "c"]
+    assert [s.name for _, s in leaves] == ["t0", "t1", "t1.h1"]
+    assert log == ["create_window", "create_tab", "t1 -H-> t1.h1"]
+
+
+def test_build_window_reports_a_sessionless_tab_per_pane_and_keeps_going(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log: list[str] = []
+    window = FakeWindow(log, [FakeSession("t0", log), None, FakeSession("t2", log)])
+    _fake_iterm(monkeypatch, log, window)
+    live = snapshot.PaneAction(command=None, kind="claude", cwd="/live", skipped=True)
+    plan = snapshot.WindowPlan(
+        tabs=[
+            snapshot.TabPlan(_leaf("a")),
+            snapshot.TabPlan(snapshot.PlanNode("vertical", [_leaf("b"), live, _leaf("c")])),
+            snapshot.TabPlan(_leaf("d")),
+        ]
+    )
+    _, leaves, lost = asyncio.run(snapshot._build_window(object(), plan))
+    assert [a.title for a, _ in leaves] == ["a", "d"]  # the later tab is still built
+    assert len(lost) == 2 and all("no session for tab 2" in text for text in lost)
+    assert all(text.startswith("shell pane in /x") for text in lost)  # skipped pane not counted
+
+
+def test_sole_session_falls_back_to_current_session_only_for_odd_tabs() -> None:
+    class Odd:
+        sessions = ["s1", "s2"]
+        current_session = "s2"
+
+    class Fresh:
+        sessions = ["only"]
+        current_session = None
+
+    class Empty:
+        sessions: list[object] = []
+        current_session = None
+
+    assert snapshot._sole_session(Fresh()) == "only"
+    assert snapshot._sole_session(Odd()) == "s2"
+    assert snapshot._sole_session(Empty()) is None
+    assert snapshot._sole_session(None) is None
+
+
+def test_execute_plan_installs_the_app_delegate_then_delivers_every_pane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``-y`` skips the guard (the only other ``async_get_app`` caller) — the executor must
+    install the delegate itself or ``async_create_tab`` asserts; and every planned pane
+    of every window gets its command."""
+    log: list[str] = []
+    w1 = FakeWindow(log, [FakeSession("w1t0", log), FakeSession("w1t1", log)])
+    w2 = FakeWindow(log, [FakeSession("w2t0", log)])
+    _fake_iterm(monkeypatch, log, w1, w2)
+    plan = [
+        snapshot.WindowPlan(
+            selected_tab=1, tabs=[snapshot.TabPlan(_leaf("a")), snapshot.TabPlan(_leaf("b"))]
+        ),
+        snapshot.WindowPlan(tabs=[snapshot.TabPlan(_leaf("c"))]),
+    ]
+    failures = asyncio.run(snapshot.execute_plan(object(), plan))
+    assert failures == []
+    assert log[:2] == ["get_app", "create_window"]  # delegate first, tabs after
+    typed = [t.sessions[0].sent for w in (w1, w2) for t in w.tabs]
+    assert typed == [["echo a\n"], ["echo b\n"], ["echo c\n"]]
+    assert w1.tabs[1].selected and not w1.tabs[0].selected
+    assert snapshot.report_restore(snapshot.plan_actions(plan), failures) == 0
+
+
+def test_execute_plan_counts_lost_panes_as_failures_in_the_report(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log: list[str] = []
+    window = FakeWindow(log, [FakeSession("t0", log), None])
+    _fake_iterm(monkeypatch, log, window)
+    plan = [snapshot.WindowPlan(tabs=[snapshot.TabPlan(_leaf("a")), snapshot.TabPlan(_leaf("b"))])]
+    failures = asyncio.run(snapshot.execute_plan(object(), plan))
+    assert len(failures) == 1 and failures[0].startswith("window 1: shell pane in /x")
+    assert snapshot.report_restore(snapshot.plan_actions(plan), failures) == 1
+    assert "restored 1 pane(s), skipped 0, failed 1" in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------- #

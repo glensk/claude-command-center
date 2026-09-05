@@ -25,7 +25,10 @@ Layering — everything below the iTerm boundary is pure and unit-tested:
   ``lsof`` cwd read.
 * **Restore** — the pure :func:`build_plan` turns a snapshot into per-pane actions
   (skip / resume / re-run / note), and a two-phase async executor builds the whole empty
-  layout first, then delivers each pane's command.
+  layout first, then delivers each pane's command. Fresh tabs are addressed through
+  ``tab.sessions`` — never ``current_session`` (see :func:`_sole_session`) — and the
+  command is typed once the pane's foreground job has settled on the idle shell
+  (:func:`_await_shell`, bounded), never into a shell still running its startup files.
 
 Safety model: commands are rebuilt ONLY from exact ``KERN_PROCARGS2`` argv captured from
 your own processes, re-quoted element-by-element with :func:`shlex.quote`. Free-text
@@ -1129,8 +1132,39 @@ async def _split_pane(session: Any, vertical: bool) -> Any:
     return await session.async_split_pane(vertical=vertical)
 
 
-async def _build_window(connection: Any, window_plan: WindowPlan) -> tuple[Any, list[Any]]:
-    """Phase 1 for one window: create it, size it, add its tabs and rebuild every split."""
+def _sole_session(tab: Any) -> Any:
+    """The one session of a tab the Python API has just created (``None`` if it has none).
+
+    Never key a fresh tab off ``Tab.current_session`` (or a fresh window off
+    ``Window.current_tab``): the ``active_session_id`` / ``selected_tab_id`` behind them
+    are only filled in by a later layout notification, so on a just-created object both
+    answer ``None`` — which once made the executor skip EVERY pane of a restore while
+    the report still counted them as restored. A fresh tab has exactly one session and
+    ``tab.sessions`` lists it; ``current_session`` is only the fallback for an odd tab.
+    """
+    sessions = list(getattr(tab, "sessions", None) or [])
+    if len(sessions) == 1:
+        return sessions[0]
+    return getattr(tab, "current_session", None)
+
+
+def _first_tab(window: Any) -> Any:
+    """The tab a fresh window was created with (see :func:`_sole_session`)."""
+    tabs = list(getattr(window, "tabs", None) or [])
+    if tabs:
+        return tabs[0]
+    return getattr(window, "current_tab", None)
+
+
+async def _build_window(
+    connection: Any, window_plan: WindowPlan
+) -> tuple[Any, list[tuple[PaneAction, Any]], list[str]]:
+    """Phase 1 for one window: create it, size it, add its tabs and rebuild every split.
+
+    Returns the window, its ``(action, session)`` leaves and the failures of tabs iTerm
+    handed back without a session — one line per pane that consequently gets nothing,
+    in the same wording :func:`_deliver` uses, so :func:`report_restore` counts them.
+    """
     import iterm2  # pylint: disable=import-outside-toplevel
 
     window = await iterm2.Window.async_create(connection)
@@ -1145,21 +1179,71 @@ async def _build_window(connection: Any, window_plan: WindowPlan) -> tuple[Any, 
             await window.async_set_frame(box)
         except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             pass  # multi-monitor clamping is out of scope (documented v1 limitation)
-    leaves: list[Any] = []
+    leaves: list[tuple[PaneAction, Any]] = []
+    failures: list[str] = []
     for index, tab_plan in enumerate(window_plan.tabs):
-        tab = window.current_tab if index == 0 else await window.async_create_tab()
-        if tab is None:
-            continue
-        session = tab.current_session
+        tab = _first_tab(window) if index == 0 else await window.async_create_tab()
+        session = _sole_session(tab) if tab is not None else None
         if session is None:
+            for action in iter_actions(tab_plan.tree):
+                if not action.skipped:
+                    failures.append(
+                        f"{action.kind} pane in {action.cwd or '?'}: iTerm2 returned no "
+                        f"session for tab {index + 1}"
+                    )
             continue
         leaves.extend(await layout_tree(tab_plan.tree, session, _split_pane))
-    return window, leaves
+    return window, leaves, failures
+
+
+# A fresh pane is "quiet" once its foreground job has been the idle shell for this many
+# consecutive polls; past the timeout the command is typed anyway (the tty queues it).
+_SHELL_NAMES = frozenset({"zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh", "csh", "nu"})
+_SHELL_POLL_SECONDS = 0.25
+_SHELL_STABLE_POLLS = 3
+_SHELL_WAIT_TIMEOUT = 20.0
+
+
+def is_shell_job(job_name: str | None) -> bool:
+    """True when iTerm's ``jobName`` names an interactive shell (``-zsh`` → ``zsh``)."""
+    name = os.path.basename(str(job_name or "").strip()).lstrip("-")
+    return name in _SHELL_NAMES
+
+
+async def _await_shell(session: Any, timeout: float | None = None) -> bool:
+    """Wait until *session*'s foreground job has settled on the idle shell.
+
+    A just-created pane runs ``login`` → the shell's startup files (each child program
+    shows up as ``jobName``) → the prompt. Text typed earlier is queued by the tty and
+    normally survives all of that, but a startup program that flushes the tty input
+    would eat it — so, like the AppleScript rung's ``repeat while is processing``, the
+    executor types only into a quiet pane. Returns False when the timeout ran out (the
+    caller types anyway rather than stranding the restore on one slow ``.zshrc``).
+    """
+    limit = _SHELL_WAIT_TIMEOUT if timeout is None else timeout
+    stable = 0
+    waited = 0.0
+    while waited < limit:
+        try:
+            job = await session.async_get_variable("jobName")
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            return False  # no variables at all: nothing to wait for, type anyway
+        stable = stable + 1 if is_shell_job(job) else 0
+        if stable >= _SHELL_STABLE_POLLS:
+            return True
+        await asyncio.sleep(_SHELL_POLL_SECONDS)
+        waited += _SHELL_POLL_SECONDS
+    return False
 
 
 async def _deliver(leaves: Sequence[tuple[PaneAction, Any]]) -> list[str]:
-    """Phase 2: type each pane's command, restore non-claude names; collect failures."""
+    """Phase 2: type each pane's command, restore non-claude names; collect failures.
+
+    Every pane that gets a command is first awaited to a quiet shell — concurrently, so
+    a window of many tabs waits for its slowest startup once, not per tab.
+    """
     failures: list[str] = []
+    await asyncio.gather(*(_await_shell(session) for action, session in leaves if action.command))
     for action, session in leaves:
         if action.command:
             try:
@@ -1182,14 +1266,22 @@ async def execute_plan(connection: Any, plan: Sequence[WindowPlan]) -> list[str]
     desk rather than a half-typed one, and no pane receives text before its neighbours
     exist. Returns the list of per-pane failure descriptions (empty ⇒ everything landed).
     """
+    import iterm2  # pylint: disable=import-outside-toplevel
+
+    # ``Window.async_create_tab`` asserts on ``Window.delegate``, which ONLY
+    # ``async_get_app`` installs. The guard's ``collect_raw`` used to be the sole caller,
+    # so ``-y`` (which skips the guard) failed every multi-tab window with a bare
+    # AssertionError. Install it here, where the tabs are created.
+    await iterm2.async_get_app(connection)
     failures: list[str] = []
     built: list[tuple[Any, int, list[tuple[PaneAction, Any]]]] = []
     for index, window_plan in enumerate(plan):
         try:
-            window, leaves = await _build_window(connection, window_plan)
+            window, leaves, lost = await _build_window(connection, window_plan)
         except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             failures.append(f"window {index + 1}: {exc}")
             continue
+        failures.extend(f"window {index + 1}: {text}" for text in lost)
         built.append((window, window_plan.selected_tab, leaves))
     for window, selected, leaves in built:
         failures.extend(await _deliver(leaves))

@@ -397,8 +397,11 @@ frames best-effort, tabs, then each tab's splits rebuilt recursively — child 0
 pane it was handed, each later child is split off the previous one), then every pane
 receives its command and non-Claude panes get their recorded title back. A failure
 half-way therefore leaves a usable, if bare, desk rather than a half-typed one; per-pane
-failures are collected and reported. **Exit 0** = everything restored or cleanly skipped;
-**1** = any pane errored (or a guard refused).
+failures are collected and reported — including a tab iTerm hands back without a
+session, which counts as a failure for each of its panes rather than a silent skip.
+Commands are typed as soon as the pane exists: the tty queues them until the shell has
+finished its startup files, so a slow `.zshrc` costs nothing. **Exit 0** = everything
+restored or cleanly skipped; **1** = any pane errored (or a guard refused).
 
 **Guards.**
 

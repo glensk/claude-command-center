@@ -323,6 +323,14 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
   overrides where present); `tabcolor.dedupe_live` recolours open tabs that would share one
   id-chip colour, writing only the per-tab colour cache + its `.manual` marker (the two files
   the status line already honours). Linux hotkey samples: `assets/hotkeys-linux/` (keyd/xremap).
+- **iTerm2 Python-API seam** — `snapshot.py`'s executor and `terminal.py`'s API rung.
+  Two gotchas of the `iterm2` package: an object it has *just created* answers `None`
+  for `Window.current_tab` / `Tab.current_session` (their ids arrive with a later layout
+  notification) — address a fresh tab through `window.tabs[0]` / `tab.sessions[0]`
+  (`snapshot._sole_session`), never through `current_*`; and `Window.async_create_tab`
+  asserts on `Window.delegate`, which only `iterm2.async_get_app(connection)` installs —
+  call it before creating tabs. Text may be sent to a fresh pane immediately; the tty
+  queues it until the shell's startup files are done (verified, multi-second `.zshrc`).
 - **TUI liveness** — `watchdog.py` is the self-heal for a wedged TUI (stalled timers, or
   an exit that hangs): heartbeat + exit-grace verdicts, the `tui-watchdog.log` wedge
   report with every thread's Python stack, terminal restore, capped in-place re-exec;
