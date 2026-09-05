@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from command_center.adapters import ClaudeAdapter
+from command_center.adapters.claude import events_in_file, pending_background_work
 from command_center.models import CODEX_WORKFLOW_NAME
 
 
@@ -1107,8 +1108,6 @@ def test_events_in_file_pairs_tools_and_filters(tmp_path: Path) -> None:
 
 def test_events_prompts_align_with_all_user_prompts(tmp_path: Path) -> None:
     """Prompt events use the SAME filter as all_user_prompts → identical (N) indexing."""
-    from command_center.adapters.claude import events_in_file
-
     lone_notification = "<task-notification><task-id>a</task-id></task-notification>"
     records: list[dict] = [
         {"type": "user", "message": {"role": "user", "content": "one"}},
@@ -1124,4 +1123,144 @@ def test_events_prompts_align_with_all_user_prompts(tmp_path: Path) -> None:
 
 def test_session_events_missing_transcript(tmp_path: Path) -> None:
     adapter = ClaudeAdapter(claude_home=tmp_path)
-    assert adapter.session_events("/Users/x/none", "missing") == []
+    assert not adapter.session_events("/Users/x/none", "missing")
+
+
+# --------------------------------------------------------------------------- #
+# pending_background_work — the switch-account / close veto's transcript evidence
+# --------------------------------------------------------------------------- #
+def _launch(task_id: str, *, agent: bool = False) -> str:
+    """The tool-result record Claude Code writes when background work starts."""
+    result: dict[str, object] = (
+        {"status": "async_launched", "agentId": task_id} if agent else {"backgroundTaskId": task_id}
+    )
+    return _rec(
+        type="user",
+        toolUseResult=result,
+        message={
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": f"tu-{task_id}", "content": "ok"}],
+        },
+    )
+
+
+def _notice(task_id: str) -> str:
+    return (
+        f"<task-notification>\n<task-id>{task_id}</task-id>\n<status>completed</status>\n"
+        "<summary>done</summary>\n</task-notification>"
+    )
+
+
+def test_pending_background_work_credits_every_notification_shape(tmp_path: Path) -> None:
+    """A finished task is finished whichever record shape carried its notification.
+
+    Claude Code ≤ 2.0 wrote an ``attachment`` of ``commandMode == "task-notification"``;
+    current versions write a ``user`` record whose content IS the notification (a string,
+    or text blocks), and one that lands mid-turn is queued first (``queue-operation``
+    enqueue/remove). Knowing only the first shape reported 28 finished tasks as in flight
+    and vetoed a switch (2026-09-05).
+    """
+    transcript = tmp_path / "t.jsonl"
+    records = [
+        _launch("b-att"),
+        _launch("b-user-str"),
+        _launch("b-user-blocks"),
+        _launch("b-queued"),
+        _launch("a-agent", agent=True),
+        _launch("b-open"),
+        _rec(
+            type="attachment",
+            attachment={
+                "type": "queued_command",
+                "prompt": _notice("b-att"),
+                "commandMode": "task-notification",
+            },
+        ),
+        _rec(
+            type="user",
+            userType="external",
+            message={"role": "user", "content": _notice("b-user-str")},
+        ),
+        _rec(
+            type="user",
+            message={
+                "role": "user",
+                "content": [{"type": "text", "text": _notice("b-user-blocks")}],
+            },
+        ),
+        _rec(type="queue-operation", operation="enqueue", content=_notice("b-queued")),
+        _rec(
+            type="queue-operation",
+            operation="remove",
+            reason="absorbed_mid_turn",
+            content=_notice("b-queued"),
+        ),
+        _rec(type="user", message={"role": "user", "content": _notice("a-agent")}),
+        # A prompt that merely QUOTES a task id is not a notification: b-open stays open.
+        _rec(
+            type="user",
+            message={"role": "user", "content": "why is <task-id>b-open</task-id> slow?"},
+        ),
+        _rec(type="queue-operation", operation="enqueue", content="see <task-id>b-open</task-id>"),
+    ]
+    transcript.write_text("\n".join(records) + "\n", encoding="utf-8")
+    assert pending_background_work(transcript) == ["b-open"]
+
+
+def test_pending_background_work_taskstop_ends_a_task_and_malformed_is_unknown(
+    tmp_path: Path,
+) -> None:
+    transcript = tmp_path / "t.jsonl"
+    stop = _rec(
+        type="assistant",
+        message={
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "stop-1",
+                    "name": "TaskStop",
+                    "input": {"task_id": "b-1"},
+                }
+            ],
+        },
+    )
+    stopped = _rec(
+        type="user",
+        message={
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "stop-1", "content": "ok"}],
+        },
+    )
+    failed_stop = _rec(
+        type="assistant",
+        message={
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "stop-2",
+                    "name": "TaskStop",
+                    "input": {"task_id": "b-2"},
+                }
+            ],
+        },
+    )
+    stop_error = _rec(
+        type="user",
+        message={
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "stop-2", "is_error": True, "content": "no"}
+            ],
+        },
+    )
+    records = [_launch("b-1"), _launch("b-2"), stop, stopped, failed_stop, stop_error]
+    transcript.write_text("\n".join(records) + "\n", encoding="utf-8")
+    assert pending_background_work(transcript) == ["b-2"]  # order kept, failed stop ≠ ended
+    # A torn last line is the live process mid-write; a broken earlier record is unknown.
+    transcript.write_text("\n".join(records) + '\n{"type": "user", "mess', encoding="utf-8")
+    assert pending_background_work(transcript) == ["b-2"]
+    transcript.write_text("\n".join([records[0], "{not json", records[1]]) + "\n", encoding="utf-8")
+    assert pending_background_work(transcript) is None
+    assert pending_background_work(tmp_path / "missing.jsonl") is None

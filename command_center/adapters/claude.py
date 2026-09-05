@@ -589,9 +589,10 @@ def pending_background_work(transcript: Path) -> list[str] | None:
     the transcript records both ends of it in STRUCTURED fields: a launch is a record
     whose ``toolUseResult`` carries ``backgroundTaskId`` (a ``run_in_background`` Bash
     task) or ``status == "async_launched"`` with an ``agentId`` (a background agent);
-    it ends with a ``TaskStop`` tool call that did not error, or with an ``attachment``
-    record of ``commandMode == "task-notification"`` whose prompt names the id in
-    ``<task-id>…</task-id>``. Launched minus ended = still in flight (order kept).
+    it ends with a ``TaskStop`` tool call that did not error, or with a
+    ``<task-notification>`` naming the id in ``<task-id>…</task-id>`` — in ANY of the
+    shapes Claude Code has written one (``_notification_task_ids``). Launched minus
+    ended = still in flight (order kept).
 
     ``None`` means UNKNOWN — the file could not be read, or a record other than the
     (possibly still being written) last line is not JSON — and callers must treat it
@@ -633,9 +634,7 @@ def pending_background_work(transcript: Path) -> list[str] | None:
                 task_id = result.get("agentId")
             if isinstance(task_id, str) and task_id and task_id not in launched:
                 launched.append(task_id)
-        attachment = record.get("attachment")
-        if isinstance(attachment, dict) and attachment.get("commandMode") == "task-notification":
-            ended.update(_TASK_ID_RE.findall(str(attachment.get("prompt") or "")))
+        ended.update(_notification_task_ids(record))
         message = record.get("message")
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
@@ -652,6 +651,44 @@ def pending_background_work(transcript: Path) -> list[str] | None:
                 if not block.get("is_error"):
                     ended.add(stops[block["tool_use_id"]])
     return [task_id for task_id in launched if task_id not in ended]
+
+
+def _notification_task_ids(record: dict[str, object]) -> set[str]:
+    """Task ids a ``<task-notification>`` carried by *record* reports finished.
+
+    Claude Code has delivered the notice in three record shapes, and a scanner that
+    knows only one reports finished work as in flight (28 false "pending" tasks vetoed
+    a switch on 2026-09-05): an ``attachment`` record of ``commandMode ==
+    "task-notification"`` (its ``prompt``, ≤ 2.0); a ``user`` record whose message
+    content IS the notification text — a string or ``text`` blocks (current); and a
+    ``queue-operation`` whose ``content`` is one queued while a turn ran (``enqueue``,
+    and the ``remove`` that later absorbs it). The task is over the moment any of them
+    exists. Free text must START with the ``<task-notification>`` tag so a prompt that
+    merely quotes a ``<task-id>`` does not count.
+    """
+    texts: list[str] = []
+    attachment = record.get("attachment")
+    if isinstance(attachment, dict) and attachment.get("commandMode") == "task-notification":
+        return set(_TASK_ID_RE.findall(str(attachment.get("prompt") or "")))
+    kind = record.get("type")
+    if kind == "queue-operation":
+        texts.append(str(record.get("content") or ""))
+    elif kind == "user":
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.extend(
+                str(block.get("text") or "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+    ids: set[str] = set()
+    for text in texts:
+        if text.lstrip().startswith("<task-notification>"):
+            ids.update(_TASK_ID_RE.findall(text))
+    return ids
 
 
 def _children_map() -> dict[int, list[tuple[int, str]]]:
