@@ -87,6 +87,11 @@ _SWITCH_HOOK_WAIT_SEC = 180.0
 # visible in the transcript, is the prompt being expanded right now — not a turn to protect.
 _SWITCH_PROMPT_BUSY_MS = 15_000
 _SWITCH_READY_WAIT_SEC = 10.0
+# `switch-account -p` with no text: the prompt the relaunched session submits by itself.
+# A resume alone parks at an idle composer — the conversation survived the seat change,
+# but nobody is driving it, so the work the switch was made FOR stalls until the user
+# types. This is that one word, and it is what `/cwork-to-cpriv` & co. send.
+SWITCH_CONTINUE_PROMPT = "continue"
 
 
 def _adapter() -> ClaudeAdapter:
@@ -1226,9 +1231,11 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     spawns ``switch-now``, which terminates this Claude after its Stop chain, waits for
     the shell to come back and types ``claude --resume <id>`` into this very tab under
     the target account's env pin. The conversation continues; only the billing seat
-    changes. Every check here fails closed: a switch that could bill the wrong seat,
-    kill the wrong process, strand background work or resume nothing is refused with
-    exit 1 and nothing armed.
+    changes. With ``-p/--prompt`` that resume carries a prompt (bare ``-p`` =
+    :data:`SWITCH_CONTINUE_PROMPT`), so the relaunched session picks the work back up by
+    itself instead of parking at an idle composer. Every check here fails closed: a
+    switch that could bill the wrong seat, kill the wrong process, strand background work
+    or resume nothing is refused with exit 1 and nothing armed.
     """
     from . import accounts
 
@@ -1243,7 +1250,9 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
             row = store.get(session_id)
             armed = bool(row and (row.switch_requested_at or row.switch_config_dir))
             if row is not None:
-                store.update_fields(session_id, switch_requested_at=0, switch_config_dir="")
+                store.update_fields(
+                    session_id, switch_requested_at=0, switch_config_dir="", switch_prompt=""
+                )
         if not armed:
             print(f"nothing armed for {session_id} — nothing to undo", file=sys.stderr)
             return 1
@@ -1253,6 +1262,16 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     label = (args.label or "").strip()
     if not label:
         print("error: an account label is required (or -u/--undo)", file=sys.stderr)
+        return 1
+    # The prompt the relaunched session submits itself. -C wins over -p whatever the
+    # order, so a slash command can hard-code `-p` and still be overridden per call.
+    prompt = "" if getattr(args, "no_continue", False) else (getattr(args, "prompt", "") or "")
+    if _has_control_chars(prompt):
+        print(
+            "error: --prompt contains control characters — the resume line is TYPED into "
+            "a shell, so a newline would submit it early; refusing",
+            file=sys.stderr,
+        )
         return 1
     if len(config.claude_config_dirs()) < 2:
         print(
@@ -1408,13 +1427,15 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
                 switch_requested_at=now_ms(),
                 switch_config_dir=target,
                 switch_force=1 if args.force else 0,
+                switch_prompt=prompt,
             )
     if not args.now:
         if not quiet:
+            carries = f" and submits {prompt!r} there" if prompt else ""
             print(
                 f"armed: {session_id} relaunches under the {label!r} account "
                 f"({accounts.account_label(current)!r} → {label!r}) in this tab as soon as "
-                "this turn ends — end the turn now (undo: ccc switch-account -u)."
+                f"this turn ends{carries} — end the turn now (undo: ccc switch-account -u)."
             )
         return 0
     # --now: no model turn is needed (the way out of a session-limit-hit account, whose
@@ -1482,6 +1503,8 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
         "--pid",
         str(env_pid or live.pid),
     ]
+    if prompt:
+        spawn_args += ["--prompt", prompt]
     if args.force:
         spawn_args.append("--force")
     if row is not None and row.no_codex:
@@ -1492,7 +1515,8 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     status = (
         f"relaunching now: {session_id} → the {label!r} account in its own tab (the "
         "detached relauncher terminates Claude, waits for the shell and types the "
-        "resume; failures land in events.log and as a desktop notification)."
+        f"resume{f' + {prompt!r}' if prompt else ''}; failures land in events.log and as "
+        "a desktop notification)."
     )
     if getattr(args, "cancel_prompt", False):
         # Run from a slash command's inline `!` expansion: a NON-ZERO exit makes Claude
@@ -1520,6 +1544,10 @@ def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     is gone and the tab's tty is back at a POSIX shell prompt. Anything else aborts
     with a log line and a desktop notification carrying the manual command; nothing is
     typed into a tab whose owner is unknown, and no new tab is opened.
+
+    ``--prompt`` rides along into that typed line as Claude Code's positional prompt, so
+    the resumed session submits a turn on the new seat instead of parking idle. It is one
+    control-character-free line — the whole command is typed into a shell.
     """
     import signal
     import time
@@ -1540,10 +1568,16 @@ def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     if _has_control_chars(cwd):
         print("switch-now: --cwd contains control characters — refusing", file=sys.stderr)
         return 1
+    prompt = (getattr(args, "prompt", "") or "").strip()
+    if _has_control_chars(prompt):
+        print("switch-now: --prompt contains control characters — refusing", file=sys.stderr)
+        return 1
     label = accounts.account_label(target)
     no_codex = bool(getattr(args, "no_codex", False))
     force = bool(getattr(args, "force", False))
-    manual = accounts.relaunch_command(accounts.LaunchTarget(target, no_codex), session_id, cwd)
+    manual = accounts.relaunch_command(
+        accounts.LaunchTarget(target, no_codex), session_id, cwd, prompt
+    )
 
     def log(detail: str) -> None:
         hooks._log_event(session_id, "switch-now", detail)  # pylint: disable=protected-access
@@ -4621,6 +4655,23 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         help="relaunch immediately instead of after the turn — no model turn needed "
         "(use via `!` inside a session whose account hit its limit, or from another tab)",
     )
+    p_switch.add_argument(
+        "-p",
+        "--prompt",
+        nargs="?",
+        const=SWITCH_CONTINUE_PROMPT,
+        default="",
+        metavar="TEXT",
+        help="submit TEXT in the relaunched session so it keeps working instead of "
+        f"parking at an idle composer (bare -p sends {SWITCH_CONTINUE_PROMPT!r})",
+    )
+    p_switch.add_argument(
+        "-C",
+        "--no-continue",
+        action="store_true",
+        help="relaunch WITHOUT a prompt — overrides -p whatever the order (the way to "
+        "opt a single `/cwork-to-cpriv` call out of the auto-continue)",
+    )
     p_switch.add_argument("-q", "--quiet", action="store_true", help="suppress the summary print")
     p_switch.add_argument(
         "-c",
@@ -4666,6 +4717,12 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "-d", "--config-dir", default="", help="config dir of the account to relaunch under"
     )
     p_switchnow.add_argument("-c", "--cwd", default="", help="the session's working directory")
+    p_switchnow.add_argument(
+        "-P",  # -p is this parser's --pid
+        "--prompt",
+        default="",
+        help="prompt to append to the typed resume so the session continues by itself",
+    )
     p_switchnow.set_defaults(func=cmd_switch_now)
 
     p_keep = sub.add_parser("keep", help="exempt a session from the idle reaper (--off to clear)")

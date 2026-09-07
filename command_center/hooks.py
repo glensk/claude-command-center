@@ -636,6 +636,8 @@ def handle_release_locks(payload: dict[str, Any]) -> int:
                 pid = os.environ.get("CLAUDE_PID", "").strip()
                 if pid.isdigit():
                     args += ["--pid", pid]
+                if claim.prompt:
+                    args += ["--prompt", claim.prompt]
                 if claim.force:
                     args.append("--force")
                 if claim.no_codex:

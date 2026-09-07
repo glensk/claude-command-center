@@ -137,7 +137,12 @@ hashes `CLAUDE_CONFIG_DIR` into its Keychain service name whenever the var is SE
 default account (the first `claude_accounts` entry) must have it **UNSET** and any other
 account **SET** to its configured spelling; `CLAUDE_SECURESTORAGE_CONFIG_DIR` is always
 stripped. Use `launch_env` / `apply_to_environ` / `launch_env_prefix` — three renderings of
-that one rule. `sessions.config_dir` records the account a session last ran under; `""`
+that one rule. `accounts.relaunch_command` is the single renderer of the line `switch-now`
+TYPES into a tab — including `switch-account -p/--prompt`'s positional prompt (bare `-p` =
+`cli.SWITCH_CONTINUE_PROMPT`, what `/cwork-to-cpriv` sends so the relaunched session drives
+itself instead of parking idle): shell-quote there, and reject control characters at BOTH
+CLI boundaries, since a newline in that string submits the typed line early.
+`sessions.config_dir` records the account a session last ran under; `""`
 means **unknown and fails closed** on every launch-shaped surface (`cmd_resume`,
 `cmd_resume_job`, `cmd_start_job`, and `jump._resume_selected`) when several accounts are
 configured — the shared `accounts.live_conflict` also refuses an id live under two accounts

@@ -567,7 +567,7 @@ def session_launch_env_prefix(session: SessionLaunch) -> str:
     return prefix + exports
 
 
-def relaunch_command(session: SessionLaunch, session_id: str, cwd: str) -> str:
+def relaunch_command(session: SessionLaunch, session_id: str, cwd: str, prompt: str = "") -> str:
     """The ONE-LINE shell command that relaunches *session_id* under *session*'s account.
 
     Typed by ``ccc switch-now`` into the session's OWN, already-interactive shell once
@@ -578,10 +578,17 @@ def relaunch_command(session: SessionLaunch, session_id: str, cwd: str) -> str:
     own alias/wrapper (permission mode, pre-flight checks) applies exactly as it does to
     their manual launches. Never anything configurable: a typo'd launcher would be a
     second, unchecked account selector.
+
+    A non-empty *prompt* is appended as Claude Code's positional ``[prompt]``, so the
+    resumed session submits that turn itself instead of parking at an idle prompt — the
+    same ``claude --resume <id> "<prompt>"`` shape ``ccc fire-attached`` execs. It is
+    shell-quoted here; the caller owns rejecting control characters (the whole line is
+    TYPED into a shell, where a newline would submit early).
     """
     quoted_id = shlex.quote(session_id)
     cd_prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
-    return f"{cd_prefix}( {session_launch_env_prefix(session)}claude --resume {quoted_id} )"
+    tail = f" {shlex.quote(prompt)}" if prompt else ""
+    return f"{cd_prefix}( {session_launch_env_prefix(session)}claude --resume {quoted_id}{tail} )"
 
 
 def env_config_dir() -> str:

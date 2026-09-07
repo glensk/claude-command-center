@@ -101,6 +101,7 @@ _SESSION_COLUMNS = (
     "switch_requested_at",
     "switch_config_dir",
     "switch_force",
+    "switch_prompt",
     "active_subagents",
     "last_seen_pid",
     "keep",
@@ -193,6 +194,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     switch_requested_at INTEGER NOT NULL DEFAULT 0,
     switch_config_dir TEXT    NOT NULL DEFAULT '',
     switch_force      INTEGER NOT NULL DEFAULT 0,
+    switch_prompt     TEXT    NOT NULL DEFAULT '',
     active_subagents  INTEGER NOT NULL DEFAULT 0,
     last_seen_pid     INTEGER,
     keep              INTEGER NOT NULL DEFAULT 0,
@@ -512,6 +514,8 @@ class Store:  # pylint: disable=too-many-public-methods
         "switch_requested_at": "INTEGER NOT NULL DEFAULT 0",
         "switch_config_dir": "TEXT NOT NULL DEFAULT ''",
         "switch_force": "INTEGER NOT NULL DEFAULT 0",
+        # The prompt the relaunched session submits by itself (`switch-account -p`).
+        "switch_prompt": "TEXT NOT NULL DEFAULT ''",
         # In-flight IN-PROCESS Agent-tool subagents, kept by the SubagentStart/
         # SubagentStop hook pair (see bump_subagents): the one signal a subagent with
         # no child process and no transcript record yet still shows up in.
@@ -940,8 +944,9 @@ class Store:  # pylint: disable=too-many-public-methods
         IMMEDIATE`` transaction, so two concurrent Stop-hook callers can never both win
         nor split a close and a switch between them. A tab about to close has nowhere
         to relaunch, so a switch armed alongside a close is dropped. A switch claim
-        returns the immutable launch snapshot (target, force, the row's ``no_codex`` and
-        cwd) and keeps ``switch_config_dir`` as the account the resumed session is
+        returns the immutable launch snapshot (target, force, the row's ``no_codex``,
+        cwd and the prompt the resumed session submits) and keeps ``switch_config_dir``
+        as the account the resumed session is
         EXPECTED to start under (consumed by :meth:`pop_switch_expectation`); every other
         outcome clears all switch state. Stamps older than *ttl_ms* are cleared without
         being claimed, so a stale arm can never fire in a later, unrelated turn.
@@ -953,7 +958,8 @@ class Store:  # pylint: disable=too-many-public-methods
         try:
             row = self.conn.execute(
                 "SELECT close_requested_at, switch_requested_at, switch_config_dir, "
-                "switch_force, no_codex, cwd FROM sessions WHERE session_id = ?",
+                "switch_force, no_codex, cwd, switch_prompt FROM sessions "
+                "WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
             if row is None:
@@ -972,17 +978,19 @@ class Store:  # pylint: disable=too-many-public-methods
                     force=bool(row[3]),
                     no_codex=bool(row[4]),
                     cwd=str(row[5] or ""),
+                    prompt=str(row[6] or ""),
                 )
             if kind == "switch":
                 self.conn.execute(
                     "UPDATE sessions SET close_requested_at = 0, switch_requested_at = 0, "
-                    "switch_force = 0 WHERE session_id = ?",
+                    "switch_force = 0, switch_prompt = '' WHERE session_id = ?",
                     (session_id,),
                 )
             else:
                 self.conn.execute(
                     "UPDATE sessions SET close_requested_at = 0, switch_requested_at = 0, "
-                    "switch_config_dir = '', switch_force = 0 WHERE session_id = ?",
+                    "switch_config_dir = '', switch_force = 0, switch_prompt = '' "
+                    "WHERE session_id = ?",
                     (session_id,),
                 )
         except sqlite3.Error:

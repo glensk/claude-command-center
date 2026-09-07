@@ -157,8 +157,9 @@ actions from the prompt, and the `ccc-mark-done-and-close` skill (shipped by def
 lets you say "mark this session as done" to finish AND close the session — its terminal
 pane/tab closes itself after the turn. With two Claude accounts configured,
 `ccc switch-account <label>` moves the live session to the other subscription in the
-same tab after the turn (the conversation continues via `claude --resume`; see
-docs/reference.md). For automations that just changed ccc's own code or config (an
+same tab after the turn (the conversation continues via `claude --resume`, and with
+`-p` the relaunched session submits a first prompt — `continue` by default — so it
+keeps working on the new seat instead of parking idle; see docs/reference.md). For automations that just changed ccc's own code or config (an
 editable install), `ccc restart-tui` bounces the running TUI in its **own** terminal tab
 so the new code loads — no manual keystroke; it exits 0 once the TUI is back, 1 if none
 is running.

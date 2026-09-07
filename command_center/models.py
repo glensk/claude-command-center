@@ -106,13 +106,15 @@ class SwitchClaim:
 
     Read in the same transaction that claims the arm, so the relauncher never falls
     back to defaults for facts the launch depends on (the account pin, the session's
-    ``no_codex`` flag, its cwd, whether the user forced past background work).
+    ``no_codex`` flag, its cwd, whether the user forced past background work, the
+    prompt the resumed session submits by itself).
     """
 
     target: str
     force: bool = False
     no_codex: bool = False
     cwd: str = ""
+    prompt: str = ""
 
 
 @dataclass
@@ -445,6 +447,9 @@ class Session:
     switch_requested_at: int = 0
     switch_config_dir: str = ""
     switch_force: int = 0  # 1 = `switch-account --force`: skip the background-work veto
+    # `switch-account -p/--prompt`: the prompt the relaunched session submits by itself
+    # ("" = none, it parks idle). Typed as `claude --resume <id> "<prompt>"`.
+    switch_prompt: str = ""
     # In-flight IN-PROCESS Agent-tool subagents (SubagentStart − SubagentStop, floored
     # at 0 and reset on session start/end). > 0 vetoes a `switch-account` relaunch: such
     # a subagent has no child process and may not be in the transcript yet.

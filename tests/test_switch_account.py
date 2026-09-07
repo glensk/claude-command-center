@@ -278,10 +278,17 @@ def test_claim_after_turn_returns_the_switch_snapshot_exactly_once(tmp_path: Pat
             switch_config_dir="/target",
             switch_force=1,
             no_codex=True,
+            switch_prompt="continue",
         )
         assert store.claim_after_turn(SID, now_ms(), 60_000) == (
             "switch",
-            SwitchClaim(target="/target", force=True, no_codex=True, cwd="/repo"),
+            SwitchClaim(
+                target="/target",
+                force=True,
+                no_codex=True,
+                cwd="/repo",
+                prompt="continue",
+            ),
         )
         row = store.get(SID)
         assert row is not None
@@ -291,6 +298,7 @@ def test_claim_after_turn_returns_the_switch_snapshot_exactly_once(tmp_path: Pat
             "/target",
             0,
         )
+        assert row.switch_prompt == ""  # spent with the claim, never fired twice
         assert store.claim_after_turn(SID, now_ms(), 60_000) == ("", None)
 
 
@@ -319,11 +327,13 @@ def test_claim_after_turn_close_beats_switch_and_drops_every_switch_column(
             switch_requested_at=now_ms(),
             switch_config_dir="/target",
             switch_force=1,
+            switch_prompt="continue",
         )
         assert store.claim_after_turn(SID, now_ms(), 60_000) == ("close", None)
         row = store.get(SID)
         assert row is not None
         assert (row.switch_requested_at, row.switch_config_dir, row.switch_force) == (0, "", 0)
+        assert row.switch_prompt == ""
 
 
 def test_claim_after_turn_has_one_winner_across_two_connections(tmp_path: Path) -> None:
@@ -356,7 +366,7 @@ def test_pop_switch_expectation_is_one_shot(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 # 2. hooks — release-locks spawns the relauncher, SessionStart consumes the arm
 # --------------------------------------------------------------------------- #
-def _arm_switch(work: Path, *, force: int = 0, no_codex: bool = False) -> None:
+def _arm_switch(work: Path, *, force: int = 0, no_codex: bool = False, prompt: str = "") -> None:
     """Arm a fresh switch-after-turn for :data:`SID` in the default store."""
     with Store() as store:
         store.ensure(SID, cwd="/stored")
@@ -366,6 +376,7 @@ def _arm_switch(work: Path, *, force: int = 0, no_codex: bool = False) -> None:
             switch_config_dir=str(work),
             switch_force=force,
             no_codex=no_codex,
+            switch_prompt=prompt,
         )
 
 
@@ -404,6 +415,31 @@ def test_release_locks_spawns_one_switch_now_with_the_full_hook_evidence(
     ]
     assert hooks.handle_release_locks({"session_id": SID, "cwd": "/payload"}) == 0
     assert len(calls) == 1  # the claim is one-shot: a second Stop spawns nothing
+
+
+def test_release_locks_carries_the_claimed_prompt_into_the_relauncher(
+    two_accounts: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An armed prompt travels in argv, so the resumed session submits it by itself."""
+    _private, work = two_accounts
+    _arm_switch(work, prompt="continue")
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+    assert hooks.handle_release_locks({"session_id": SID, "cwd": "/payload"}) == 0
+    argv = calls[0]
+    assert argv[argv.index("--prompt") + 1] == "continue"
+
+
+def test_release_locks_omits_the_prompt_flag_when_none_was_armed(
+    two_accounts: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No armed prompt = no flag: the session lands idle exactly as it always did."""
+    _private, work = two_accounts
+    _arm_switch(work)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+    hooks.handle_release_locks({"session_id": SID, "cwd": "/payload"})
+    assert "--prompt" not in calls[0]
 
 
 def test_release_locks_omits_force_no_codex_and_a_nonnumeric_pid(
@@ -493,17 +529,61 @@ def test_switch_account_force_records_the_flag(
     assert row is not None and row.switch_force == 1
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        ([], ""),  # the default is unchanged: a bare switch lands idle
+        (["-p"], cli.SWITCH_CONTINUE_PROMPT),
+        (["-p", "pick up the re-route"], "pick up the re-route"),
+        (["-p", "-C"], ""),  # -C wins over -p whatever the order
+        (["-C", "-p"], ""),
+    ],
+)
+def test_switch_account_arms_the_prompt_the_flags_ask_for(
+    two_accounts: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    expected: str,
+) -> None:
+    """``-p`` (bare = "continue") is stored for the relaunch; ``-C`` clears it."""
+    _prepare_arm(monkeypatch, two_accounts)
+    assert cli.main(["switch-account", "work", "-s", SID, *argv]) == 0
+    with Store() as store:
+        row = store.get(SID)
+    assert row is not None and row.switch_prompt == expected
+
+
+def test_switch_account_refuses_a_prompt_with_control_characters(
+    two_accounts: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The resume is TYPED into a shell — a newline would submit the line early."""
+    _prepare_arm(monkeypatch, two_accounts)
+    assert cli.main(["switch-account", "work", "-s", SID, "-p", "go\nrm -rf /"]) == 1
+    assert "control characters" in capsys.readouterr().err
+    with Store() as store:
+        row = store.get(SID)
+    assert row is None or row.switch_requested_at == 0
+
+
 def test_switch_account_undo_disarms_once_then_reports_nothing_armed(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """``-u`` clears an arm and a second ``-u`` fails loudly instead of pretending."""
     with Store() as store:
         store.ensure(SID, cwd="/repo")
-        store.update_fields(SID, switch_requested_at=now_ms(), switch_config_dir="/target")
+        store.update_fields(
+            SID,
+            switch_requested_at=now_ms(),
+            switch_config_dir="/target",
+            switch_prompt="continue",
+        )
     assert cli.main(["switch-account", "-u", "-s", SID]) == 0
     with Store() as store:
         row = store.get(SID)
     assert row is not None and (row.switch_requested_at, row.switch_config_dir) == (0, "")
+    assert row.switch_prompt == ""
     assert cli.main(["switch-account", "-u", "-s", SID]) == 1
     assert "nothing armed" in capsys.readouterr().err
 
@@ -762,6 +842,28 @@ def test_switch_account_now_spawns_the_relauncher_without_arming_a_turn(
     assert (row.switch_config_dir, row.switch_requested_at) == (str(work), 0)
 
 
+def test_switch_account_now_spawns_the_relauncher_with_the_continue_prompt(
+    two_accounts: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The quota escape hatch (`/cwork-to-cpriv`) hands the prompt straight to switch-now."""
+    private, _work = two_accounts
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with Store() as store:
+        store.ensure(SID, cwd=str(repo))
+        store.update_fields(SID, iterm_session_id=ITERM)
+    _prepare_arm(monkeypatch, two_accounts, live=_live(str(repo), private), inside=False)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+    assert cli.main(["switch-account", "work", "-s", SID, "-N", "-p"]) == 0
+    argv = calls[0]
+    assert argv[argv.index("--prompt") + 1] == cli.SWITCH_CONTINUE_PROMPT
+    # -N arms nothing, so the prompt must not linger in the row either.
+    with Store() as store:
+        row = store.get(SID)
+    assert row is not None and row.switch_prompt == ""
+
+
 @pytest.mark.parametrize("halted", [False, True])
 def test_switch_account_now_refuses_a_busy_session_unless_it_is_rate_limit_halted(
     two_accounts: tuple[Path, Path],
@@ -827,6 +929,36 @@ def test_switch_now_types_the_exact_relaunch_into_the_iterm_tab(
     assert env.notes == []
     log = (config.app_home() / "events.log").read_text(encoding="utf-8")
     assert "relaunched under" in log and "'work'" in log
+
+
+def test_switch_now_types_the_resume_with_the_prompt_appended(
+    tmp_path: Path, two_accounts: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prompt is Claude Code's positional argument, shell-quoted as one word."""
+    _private, work = two_accounts
+    env = _prepare_now(tmp_path, monkeypatch, two_accounts)
+    env.args.prompt = "pick up the re-route"
+    assert cli.cmd_switch_now(env.args) == 0
+    expected = (
+        f"cd {shlex.quote(env.args.cwd)} && ( unset CLAUDE_SECURESTORAGE_CONFIG_DIR; "
+        f"export CLAUDE_CONFIG_DIR={shlex.quote(str(work))}; claude --resume {SID} "
+        "'pick up the re-route' )"
+    )
+    assert env.typed["iterm"] == [(ITERM, expected)]
+
+
+def test_switch_now_refuses_a_prompt_with_control_characters(
+    tmp_path: Path,
+    two_accounts: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Nothing is signalled or typed when the prompt could break the typed line."""
+    env = _prepare_now(tmp_path, monkeypatch, two_accounts)
+    env.args.prompt = "go\rrm -rf /"
+    assert cli.cmd_switch_now(env.args) == 1
+    assert "control characters" in capsys.readouterr().err
+    assert env.kill.signals == [] and env.typed == {"iterm": [], "tmux": []}
 
 
 def test_switch_now_carries_the_no_codex_flag_into_the_typed_command(
@@ -1070,6 +1202,29 @@ def test_relaunch_command_adds_the_no_codex_kill_switch(
         accounts.LaunchTarget(str(work), no_codex=True), SID, "/repo"
     )
     assert "export CCC_NO_CODEX=1" in command
+
+
+def test_relaunch_command_appends_a_shell_quoted_prompt(
+    two_accounts: tuple[Path, Path],
+) -> None:
+    """The prompt is one quoted word after the id — `claude --resume <id> "<prompt>"`."""
+    _private, work = two_accounts
+    command = accounts.relaunch_command(
+        accounts.LaunchTarget(str(work)), SID, "/repo", "keep going; now"
+    )
+    assert command.endswith(f"claude --resume {SID} 'keep going; now' )")
+
+
+def test_relaunch_command_without_a_prompt_is_byte_identical_to_before(
+    two_accounts: tuple[Path, Path],
+) -> None:
+    """The default stays the bare resume: no trailing space, no empty argument."""
+    _private, work = two_accounts
+    target = accounts.LaunchTarget(str(work))
+    assert accounts.relaunch_command(target, SID, "/repo", "") == accounts.relaunch_command(
+        target, SID, "/repo"
+    )
+    assert accounts.relaunch_command(target, SID, "/repo").endswith(f"claude --resume {SID} )")
 
 
 def test_relaunch_command_omits_the_cd_without_a_cwd(two_accounts: tuple[Path, Path]) -> None:
