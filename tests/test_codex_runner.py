@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -747,6 +748,352 @@ def test_runner_sigterm_relay_kills_codex_group(tmp_path: Path) -> None:
     time.sleep(9)
     assert not sentinel.exists()
     assert _group_gone(pgid)
+
+
+# ── progress watchdog + sleep guard (2026-09-08) ──────────────────────────────────
+#
+# The seven-hour hang: this laptop idle-slept one minute after an unattended debate
+# round launched (`pmset sleep 1`, no assertion held), and the woken codex 0.152.1
+# looped `{"type":"error","message":"Reconnecting... waiting for network …"}` on stdout
+# plus `ERROR codex_models_manager` on stderr FOREVER. The old watchdog counted every
+# line as activity, so nothing fired. What is guarded below: only PROGRESS resets the
+# idle clock, the allowance shrinks the moment codex names the network or the machine
+# is caught suspended, a run that never gets a model response is killed at startup,
+# and a caffeinate assertion is held for exactly the run.
+
+# A recording `caffeinate` that never exits by itself: it logs its argv + its OWN pid
+# (`exec` keeps it) so a test can prove the runner released the assertion it took.
+# `$FAKE_CAFFEINATE_HOLD=0` makes it return at once — used only to warm it up.
+_FAKE_CAFFEINATE = r"""#!/bin/sh
+args=""
+sep=""
+for arg in "$@"; do
+  args="$args$sep\"$arg\""
+  sep=", "
+done
+printf '{"argv": [%s], "pid": %s}\n' "$args" "$$" >> "$FAKE_CAFFEINATE_LOG"
+exec sleep "${FAKE_CAFFEINATE_HOLD:-60}"
+"""
+
+
+def _fake_caffeinate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Put the recording ``caffeinate`` first on ``$PATH``; return its JSON-lines log.
+
+    The warm-up run is not cosmetic: macOS charges ~350 ms of syspolicy checking to the
+    FIRST ``execve`` of a newly written executable, and a happy-path round is over in
+    ~200 ms — so without it the runner's release SIGTERM reaches the fake before it has
+    executed a single line and the call is never recorded. A warmed script spawns in
+    ~8 ms, like the real ``caffeinate`` would.
+    """
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    script = bindir / "caffeinate"
+    script.write_text(_FAKE_CAFFEINATE, encoding="utf-8")
+    script.chmod(0o755)
+    log = tmp_path / "caffeinate-calls.jsonl"
+    subprocess.run(  # warm-up: log elsewhere, `sleep 0`, exit immediately
+        [str(script), "-warmup"],
+        env={
+            **os.environ,
+            "FAKE_CAFFEINATE_LOG": str(tmp_path / "caffeinate-warmup.jsonl"),
+            "FAKE_CAFFEINATE_HOLD": "0",
+        },
+        timeout=30,
+        check=True,
+    )
+    monkeypatch.setenv("FAKE_CAFFEINATE_LOG", str(log))
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    return log
+
+
+def _caffeinate_calls(log: Path) -> list[dict]:
+    """Every fake-caffeinate invocation so far, in order."""
+    try:
+        text = log.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def _pid_gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def _eventually(probe: Callable[[], bool], seconds: float) -> bool:
+    """Poll *probe* for up to *seconds* — a kill is a signal, not an instant."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if probe():
+            return True
+        time.sleep(0.05)
+    return probe()
+
+
+@pytest.mark.slow
+def test_network_trouble_lines_are_not_progress(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A LOUD dead-network loop is a stall: those lines never reset the idle clock."""
+    three_seats.scenarios(private="network_dead")
+    started = time.monotonic()
+    assert cic.cmd_run(_run_ns(three_seats, timeout=0, idle_timeout=3)) == cic.EX_NETWORK
+    assert time.monotonic() - started < 15
+    error = _envelope(capsys)["error"]
+    assert error["kind"] == "network"
+    assert "network" in error["message"]
+    assert _eventually(lambda: _group_gone(three_seats.calls()[0]["pgid"]), 3)
+
+
+@pytest.mark.slow
+def test_network_idle_allowance_shrinks(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Once codex names the network the generous plain allowance no longer applies."""
+    monkeypatch.setenv("CODEX_IN_CLAUDE_NET_IDLE", "2")
+    three_seats.scenarios(private="network_dead")
+    started = time.monotonic()
+    assert cic.cmd_run(_run_ns(three_seats, timeout=0, idle_timeout=60)) == cic.EX_NETWORK
+    assert time.monotonic() - started < 15  # the 60s allowance was NOT the one in force
+    assert _envelope(capsys)["error"]["kind"] == "network"
+
+
+@pytest.mark.slow
+def test_startup_guard_kills_a_run_without_model_response(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`thread.started` + `turn.started` are emitted LOCALLY and prove nothing."""
+    monkeypatch.setenv("CODEX_IN_CLAUDE_STARTUP_TIMEOUT", "2")
+    three_seats.scenarios(private="silent_after_start")
+    started = time.monotonic()
+    assert cic.cmd_run(_run_ns(three_seats, timeout=0, idle_timeout=60)) == cic.EX_TIMEOUT
+    assert time.monotonic() - started < 15
+    error = _envelope(capsys)["error"]
+    assert error["kind"] == "startup_timeout"
+    assert "model response" in error["message"]
+
+
+@pytest.mark.slow
+def test_trouble_followed_by_progress_is_not_killed(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A reconnect FLAP that recovers must not be killed — trouble is not a verdict."""
+    monkeypatch.setenv("CODEX_IN_CLAUDE_NET_IDLE", "1")
+    three_seats.scenarios(private={"scenario": "trouble_then_ok", "reply": "recovered"})
+    assert cic.cmd_run(_run_ns(three_seats, timeout=0, idle_timeout=5)) == cic.EX_OK
+    assert _envelope(capsys)["reply"] == "recovered"
+
+
+@pytest.mark.slow
+def test_suspended_machine_is_detected_and_reported(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 1s tick that took an hour = the machine slept; the report SAYS so."""
+    calls = 0
+
+    def slept_clock() -> float:
+        """Wall clock that jumps an hour between two supervision ticks."""
+        nonlocal calls
+        calls += 1
+        return time.time() + (3600.0 if calls > 3 else 0.0)
+
+    monkeypatch.setattr(cic, "_wall_clock", slept_clock)
+    monkeypatch.setenv("CODEX_IN_CLAUDE_POST_SLEEP_IDLE", "2")
+    three_seats.scenarios(private="hang")
+    started = time.monotonic()
+    assert cic.cmd_run(_run_ns(three_seats, timeout=0, idle_timeout=60)) == cic.EX_NETWORK
+    assert time.monotonic() - started < 15
+    error = _envelope(capsys)["error"]
+    assert error["kind"] == "slept"
+    assert "suspended" in error["message"]
+
+
+@pytest.mark.slow
+def test_caffeinate_is_held_for_the_run_and_released(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`caffeinate -i -w <codex pid>` for exactly the run — on the ok AND killed paths."""
+    monkeypatch.delenv("CODEX_IN_CLAUDE_NO_CAFFEINATE", raising=False)
+    log = _fake_caffeinate(tmp_path, monkeypatch)
+    three_seats.scenarios(private={"scenario": "ok", "reply": "awake"})
+    assert cic.cmd_run(_run_ns(three_seats, json=False)) == cic.EX_OK
+    assert _eventually(lambda: len(_caffeinate_calls(log)) == 1, 3)
+    held = _caffeinate_calls(log)[0]
+    assert held["argv"] == ["-i", "-w", str(three_seats.calls()[0]["pgid"])]
+    assert _eventually(lambda: _pid_gone(int(held["pid"])), 3)
+
+    three_seats.scenarios(private="network_dead")
+    assert cic.cmd_run(_run_ns(three_seats, timeout=0, idle_timeout=3)) == cic.EX_NETWORK
+    assert _eventually(lambda: len(_caffeinate_calls(log)) == 2, 3)
+    killed = _caffeinate_calls(log)[1]
+    assert killed["argv"] == ["-i", "-w", str(three_seats.calls()[1]["pgid"])]
+    assert _eventually(lambda: _pid_gone(int(killed["pid"])), 3)
+
+
+@pytest.mark.slow
+def test_no_caffeinate_when_opted_out(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`$CODEX_IN_CLAUDE_NO_CAFFEINATE=1` takes no assertion at all."""
+    log = _fake_caffeinate(tmp_path, monkeypatch)
+    monkeypatch.setenv("CODEX_IN_CLAUDE_NO_CAFFEINATE", "1")
+    three_seats.scenarios(private={"scenario": "ok", "reply": "no assertion"})
+    assert cic.cmd_run(_run_ns(three_seats, json=False)) == cic.EX_OK
+    assert _caffeinate_calls(log) == []
+
+
+@pytest.mark.parametrize(
+    ("line", "stderr", "expected"),
+    [
+        pytest.param(
+            '{"type":"error","message":"Reconnecting... waiting for network '
+            '(Connection failed: error sending request)"}',
+            False,
+            (False, False, True),
+            id="stdout-error-event-is-network-trouble",
+        ),
+        pytest.param(
+            '{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"hi"}}',
+            False,
+            (True, True, False),
+            id="stdout-item-is-progress-and-work",
+        ),
+        pytest.param(
+            '{"type":"thread.started","thread_id":"x"}',
+            False,
+            (True, False, False),
+            id="stdout-thread-start-is-progress-but-not-work",
+        ),
+        pytest.param(
+            '{"type":"item.completed","item":{"id":"i","type":"error","message":"Falling back '
+            'from WebSockets to HTTPS transport. stream disconnected before completion"}}',
+            False,
+            (False, False, True),
+            id="stdout-error-ITEM-is-network-trouble",
+        ),
+        pytest.param(
+            "2026-09-08T06:50:08.463644Z ERROR codex_models_manager::manager: failed to "
+            "refresh available models: Connection failed: error sending request",
+            True,
+            (False, False, True),
+            id="stderr-ERROR-log-is-network-trouble",
+        ),
+        pytest.param(
+            "2026-09-08T06:50:08.463644Z WARN something unrelated",
+            True,
+            (False, False, False),
+            id="stderr-WARN-log-is-trouble-but-not-network",
+        ),
+        pytest.param(
+            "Reading additional input from stdin...",
+            True,
+            (True, False, False),
+            id="stderr-plain-line-is-progress",
+        ),
+        pytest.param(
+            "not json at all",
+            False,
+            (True, False, False),
+            id="stdout-unknown-output-is-never-a-reason-to-kill",
+        ),
+        pytest.param("", False, (False, False, False), id="blank-stdout-is-nothing"),
+        pytest.param("   \n", True, (False, False, False), id="blank-stderr-is-nothing"),
+    ],
+)
+def test_classify_output_line(line: str, stderr: bool, expected: tuple[bool, bool, bool]) -> None:
+    """The watchdog's ONLY input: progress / work / network for one output line."""
+    verdict = cic.classify_output_line(line, stderr=stderr)
+    assert (verdict.progress, verdict.work, verdict.network) == expected
+
+
+@pytest.mark.slow
+def test_heartbeat_carries_health_fields(three_seats: SeatFixture, tmp_path: Path) -> None:
+    """The heartbeat publishes the health the runner decides on: idle/slept/trouble."""
+    heartbeat = tmp_path / "hb-health.json"
+    seen: list[dict] = []
+    fake = str(Path(__file__).parent / "fakes" / "fake_codex.py")
+    env = {**os.environ, "CODEX_HOME": str(three_seats.seats["private"])}
+    three_seats.scenarios(private="network_dead")
+    done = threading.Event()
+
+    def watch() -> None:
+        while not done.is_set():
+            try:
+                seen.append(json.loads(heartbeat.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                pass
+            done.wait(0.05)
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        with pytest.raises(cic.CodexStalledError) as excinfo:
+            cic._exec_codex(  # noqa: SLF001
+                [fake, "exec"],
+                env=env,
+                timeout=0,
+                idle_timeout=7,  # >= 6 ticks, so the tick-5 heartbeat is reached
+                heartbeat_path=heartbeat,
+                heartbeat_meta={"model": "m"},
+                stdin_text="",
+            )
+    finally:
+        done.set()
+        watcher.join(timeout=3)
+    assert excinfo.value.reason == "network"
+    troubled = [snap for snap in seen if int(snap.get("trouble") or 0) >= 1]
+    assert troubled, "no heartbeat reported the trouble lines codex was printing"
+    assert "caffeinate_pid" in troubled[0]  # None without caffeinate / with the opt-out
+    assert troubled[0]["slept_s"] == 0
+    assert not heartbeat.exists()  # removed on exit
+
+
+def test_exit_codes_for_new_kinds(capsys: pytest.CaptureFixture[str]) -> None:
+    """A dead network / a slept machine is EX_NETWORK; no model response is EX_TIMEOUT."""
+    for kind, code in (
+        ("network", cic.EX_NETWORK),
+        ("slept", cic.EX_NETWORK),
+        ("startup_timeout", cic.EX_TIMEOUT),
+    ):
+        assert cic._run_exit_code(cic.RunResult(error_kind=kind)) == code  # noqa: SLF001
+        result = cic.RunResult(error_kind=kind, error_message=f"{kind} killed the round")
+        assert cic._run_error_exit(result) == code  # noqa: SLF001
+        assert f"ERROR: {kind} killed the round" in capsys.readouterr().err
+
+
+def test_runs_view_shows_health(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`runs` shows WHY a live round is quiet: caffeinated, slept, trouble lines."""
+    runs = three_seats.home / "runs"  # RUNS_DIR is resolved at import, before the fixture
+    runs.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cic, "RUNS_DIR", runs)
+    (runs / "live.json").write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "model": "m",
+                "effort": "low",
+                "repo": "/r",
+                "elapsed_s": 125,
+                "idle_s": 7,
+                "lines": 3,
+                "last_line": "x",
+                "caffeinate_pid": 4242,
+                "slept_s": 125,
+                "trouble": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert cic.cmd_runs(argparse.Namespace(json=False)) == cic.EX_OK
+    out = capsys.readouterr().out
+    assert "caffeinated" in out
+    assert "slept 2m05s" in out
+    assert "3 trouble line(s) since progress" in out
 
 
 # ── end to end, through the real executable ───────────────────────────────────────

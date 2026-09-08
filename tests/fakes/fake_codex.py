@@ -34,6 +34,15 @@ Scenarios (see ``tests/test_codex_runner.py``):
                                   runner's group sweep must kill
 ``leader_exits_leaving_grandchild``
                                   rc 0 immediately, grandchild still running
+``network_dead``                  the 2026-09-07 seven-hour hang: the two LOCAL start
+                                  events, then "Reconnecting... waiting for network"
+                                  error events on stdout plus ``ERROR
+                                  codex_models_manager`` log lines on stderr, forever —
+                                  loud output that is TROUBLE, never progress
+``silent_after_start``            the two local start events, then total silence: codex
+                                  never got a model response (the startup guard's case)
+``trouble_then_ok``               three reconnect error events and THEN a real reply — a
+                                  flap the progress watchdog must NOT kill
 """
 
 from __future__ import annotations
@@ -250,6 +259,87 @@ def main() -> int:  # pylint: disable=too-many-branches,too-many-return-statemen
             )
         )
         _spawn_grandchild()
+        if out_path:
+            Path(out_path).write_text(reply, encoding="utf-8")
+        return 0
+
+    if scenario == "network_dead":
+        # Codex 0.152.1 on a dead connection: it announces the (locally emitted) thread
+        # and turn, never gets a model response, and then reconnects FOREVER. Every line
+        # below is trouble — an any-output watchdog stays quiet for hours on this stream.
+        print(
+            json.dumps(
+                {"type": "thread.started", "thread_id": "01a06cfb-0000-7000-8000-000000000005"}
+            )
+        )
+        print(json.dumps({"type": "turn.started"}), flush=True)
+        _spawn_grandchild()
+        deadline = time.monotonic() + 40
+        next_log = 0.0
+        while time.monotonic() < deadline:
+            print(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": (
+                            "Reconnecting... waiting for network "
+                            "(Connection failed: error sending request)"
+                        ),
+                    }
+                ),
+                flush=True,
+            )
+            if time.monotonic() >= next_log:
+                next_log = time.monotonic() + 0.5
+                print(
+                    "2026-09-08T06:50:08.463644Z ERROR codex_models_manager::manager: "
+                    "failed to refresh available models: Connection failed: error sending request",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            time.sleep(0.2)
+        return 0
+
+    if scenario == "silent_after_start":
+        print(
+            json.dumps(
+                {"type": "thread.started", "thread_id": "01a06cfb-0000-7000-8000-000000000006"}
+            )
+        )
+        print(json.dumps({"type": "turn.started"}), flush=True)
+        time.sleep(40)
+        return 0
+
+    if scenario == "trouble_then_ok":
+        print(
+            json.dumps(
+                {"type": "thread.started", "thread_id": "01a06cfb-0000-7000-8000-000000000007"}
+            )
+        )
+        print(json.dumps({"type": "turn.started"}), flush=True)
+        for attempt in (2, 3, 4):
+            print(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": (
+                            f"Reconnecting... {attempt}/5 (stream disconnected before "
+                            "completion: Connection refused (os error 61))"
+                        ),
+                    }
+                ),
+                flush=True,
+            )
+            time.sleep(0.2)
+        print(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"id": "item_0", "type": "agent_message", "text": reply},
+                }
+            )
+        )
+        print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10}}), flush=True)
         if out_path:
             Path(out_path).write_text(reply, encoding="utf-8")
         return 0

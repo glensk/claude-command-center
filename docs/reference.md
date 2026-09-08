@@ -967,8 +967,10 @@ codex-in-claude.py get-model --for debate
 `delegate` runs are **supervised**: `codex exec` lives in its own process group (killed whole
 on timeout, stall, or parent death — never an orphan editing the workspace), the wall timeout
 scales with effort (low 600s … xhigh 2700s; `-t 0` = no wall, the recommended mode when a task
-just takes as long as it takes), and an idle watchdog (`-i`, default 900s of silence) culls
-hung runs. Each run heartbeats a tiny JSON and reports its codex session as `### SESSION`:
+just takes as long as it takes), and a progress watchdog (`-i`, default 900s without a
+progress line — codex's own error/reconnect output does NOT count; see
+[docs/codex.md](codex.md#progress-watchdog-and-the-sleep-guard)) culls hung runs. Each run
+heartbeats a tiny JSON and reports its codex session as `### SESSION`:
 
 ```commands
 codex-in-claude.py delegate -t 0 --write -C <repo> "task…"   # unbounded, stall-guarded

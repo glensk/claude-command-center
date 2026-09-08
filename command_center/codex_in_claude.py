@@ -38,7 +38,8 @@ Claude Code's slash-command help never drifts from the config.
 
 ``delegate`` exit codes (the skill branches on these):
   0 ok | 2 usage | 3 invalid-model | 4 codex-missing-or-auth | 5 timeout-or-stall |
-  6 codex-nonzero | 7 bad-patch (reserved) | 8 quota-exhausted (skipped, see below).
+  6 codex-nonzero | 7 bad-patch (reserved) | 8 quota-exhausted (skipped, see below) |
+  9 network-dead-or-machine-slept (killed after codex stopped making progress).
 
 Launch policy: every ``codex exec`` line is assembled by
 :mod:`command_center.codex_launch` — the named ``hardened-ro``/``hardened-rw`` permission
@@ -59,10 +60,15 @@ Supervision: ``codex exec`` runs in its own process group and the WHOLE tree is 
 wall timeout, idle stall, or parent SIGTERM/SIGINT — a killed delegate can never leave
 codex editing the workspace behind the caller's back. The wall timeout defaults by effort
 (``DEFAULT_TIMEOUTS``: low 600 s .. xhigh 2700 s; ``-t`` overrides, ``-t 0`` = no wall at
-all — the recommended mode when the task simply takes as long as it takes), an idle
-watchdog (``-i``, default 900 s of total silence) converts hangs into fast failures, codex
-stderr is streamed through (``codex› `` prefix) for live progress, and the prompt itself
-tells codex its time budget so it spends the clock implementing instead of exploring.
+all — the recommended mode when the task simply takes as long as it takes), a PROGRESS
+watchdog converts hangs into fast failures (``-i``, default 900 s without a non-error codex
+event; 120 s once codex itself reports network trouble, 180 s after the machine was
+suspended, 240 s for the first model response after launch — codex 0.152.1 otherwise loops
+"Reconnecting... waiting for network" forever, and its error lines used to keep the old
+any-output watchdog alive), a ``caffeinate -i`` assertion held for exactly the run keeps the
+laptop from idle-sleeping under it (the 2026-09-07 seven-hour hang), codex stderr is
+streamed through (``codex› `` prefix) for live progress, and the prompt itself tells codex
+its time budget so it spends the clock implementing instead of exploring.
 
 Watchability + rounds: every run refreshes a heartbeat JSON under ``RUNS_DIR``; ``runs``
 lists all in-flight delegates (elapsed, idle seconds, output volume, last line) from one
@@ -102,6 +108,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -136,9 +143,27 @@ SLOT_DIR = Path(
 # every xhigh run on a non-trivial repo time out during discovery.
 # ``-t 0`` disables the wall entirely (the idle watchdog still guards stalls).
 DEFAULT_TIMEOUTS = {"low": 600, "medium": 900, "high": 1500, "xhigh": 2700}
-# Kill a run after this long with NO output at all (network hang / wedged CLI),
-# clamped to the wall timeout. 0 disables.
+# Kill a run after this long with NO PROGRESS (network hang / wedged CLI), clamped to the
+# wall timeout. 0 disables every idle-based kill. Progress = a non-error codex event, or a
+# stderr line that is not an ERROR/WARN log line — see :func:`classify_output_line`.
 DEFAULT_IDLE_TIMEOUT = 900
+# Progress-aware supervision (2026-09-08, after the seven-hour debate hang). Codex 0.152.1
+# never gives up on a dead connection: after five reconnects it loops
+# ``{"type":"error","message":"Reconnecting... waiting for network …"}`` on stdout and
+# ``ERROR codex_models_manager`` lines on stderr FOREVER. The old watchdog counted every
+# such line as activity, so it never fired. Now only PROGRESS resets it, and the allowance
+# shrinks the moment codex itself reports network trouble, or after the machine slept.
+NET_IDLE_TIMEOUT = 120  # $CODEX_IN_CLAUDE_NET_IDLE (0 = keep the plain idle allowance)
+POST_SLEEP_IDLE_TIMEOUT = 180  # $CODEX_IN_CLAUDE_POST_SLEEP_IDLE (0 = plain allowance)
+# No non-error ``item.*`` event this many AWAKE seconds after launch = codex never got a
+# model response. ``thread.started`` / ``turn.started`` are emitted locally and prove
+# nothing: the no-egress reproduction printed both, then looped on errors.
+DEFAULT_STARTUP_TIMEOUT = 240  # $CODEX_IN_CLAUDE_STARTUP_TIMEOUT (0 disables)
+# A 1 s supervision tick that took longer than this = the machine was suspended (lid
+# closed, or idle sleep where no assertion could be held). Only AWAKE time is charged to
+# the idle/startup allowances, and each tick is credited at most TICK_CAP_S of it.
+SLEEP_GAP_S = 30.0
+TICK_CAP_S = 5.0
 
 # Heartbeat files for in-flight delegate runs (see ``runs``): one small JSON per
 # running delegate, refreshed every few seconds, removed on exit. Lets a caller
@@ -174,6 +199,7 @@ BuildCmd = Callable[["SeatCandidate", str, list[str], list[str]], list[str]]
 EX_OK, EX_USAGE = 0, 2
 EX_INVALID_MODEL, EX_NO_CODEX, EX_TIMEOUT, EX_CODEX_FAIL, EX_BAD_PATCH = 3, 4, 5, 6, 7
 EX_QUOTA = 8  # skipped: Codex quota exhausted (>=100% used on a live window)
+EX_NETWORK = 9  # killed: codex reported a dead network / the machine slept; no progress
 
 
 def _effective_timeout(explicit: int | None, effort: str) -> int:
@@ -197,6 +223,7 @@ def _write_heartbeat(  # pylint: disable=too-many-positional-arguments
     out_buf: list[str],
     err_buf: list[str],
     codex_pgid: int | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> None:
     """Atomically refresh one run's heartbeat JSON (never fatal).
 
@@ -219,6 +246,7 @@ def _write_heartbeat(  # pylint: disable=too-many-positional-arguments
         "lines": len(out_buf) + len(err_buf),
         "last_line": last_line[:200],
         "updated": int(time.time()),
+        **(extra or {}),  # sleep-aware idle_s, slept_s, trouble, caffeinate_pid
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,12 +258,197 @@ def _write_heartbeat(  # pylint: disable=too-many-positional-arguments
 
 
 class CodexStalledError(RuntimeError):
-    """Codex produced no output for longer than the idle watchdog allows."""
+    """Codex stopped making progress and the supervising loop killed it.
 
-    def __init__(self, idle_seconds: int, stderr_text: str) -> None:
-        super().__init__(f"no codex output for {idle_seconds}s")
+    ``reason`` names the allowance that ran out: ``"stalled"`` (plain silence),
+    ``"network"`` (codex itself kept reporting connection trouble), ``"slept"`` (the
+    machine was suspended since the last progress) or ``"startup"`` (no model response
+    since launch). ``idle_seconds`` are AWAKE seconds — time spent suspended is excluded.
+    """
+
+    def __init__(  # pylint: disable=too-many-positional-arguments
+        self,
+        idle_seconds: int,
+        stderr_text: str,
+        *,
+        reason: str = "stalled",
+        stdout_text: str = "",
+        slept_seconds: int = 0,
+        last_trouble: str = "",
+    ) -> None:
+        super().__init__(f"no codex progress for {idle_seconds}s ({reason})")
         self.idle_seconds = idle_seconds
         self.stderr_text = stderr_text
+        self.reason = reason
+        self.stdout_text = stdout_text
+        self.slept_seconds = slept_seconds
+        self.last_trouble = last_trouble
+
+
+def _env_seconds(name: str, default: int) -> int:
+    """``$name`` as non-negative whole seconds; *default* when unset, empty or garbage."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+# Rust ``tracing`` log lines codex writes to stderr: ``2026-09-08T06:50:08.463644Z ERROR …``.
+_LOG_LINE_RE = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z\s+(?:ERROR|WARN)\b")
+# Wording codex uses for a dead / flapping connection (stdout error events AND stderr logs).
+_NET_TROUBLE_RE = re.compile(
+    r"waiting for network|connection failed|error sending request|connection refused|"
+    r"failed to refresh available models|failed to connect to websocket|"
+    r"stream disconnected|reconnecting|network is unreachable|dns error|timed out",
+    re.IGNORECASE,
+)
+# Event types that prove the MODEL answered. A locally emitted thread/turn start does not.
+_WORK_EVENT_PREFIXES = ("item.", "turn.completed", "turn.failed")
+
+
+@dataclass(frozen=True)
+class LineVerdict:
+    """What one line of codex output says about the run's health."""
+
+    progress: bool  # resets the idle watchdog
+    work: bool  # proves codex got a model response (ends the startup window)
+    network: bool  # a trouble line that names the network
+
+
+def classify_output_line(line: str, *, stderr: bool) -> LineVerdict:
+    """Progress, or trouble? — the watchdog's only input (see the module constants).
+
+    stdout is ``codex exec --json``: an ``error`` event, or an item of type ``error``
+    (e.g. "Falling back from WebSockets to HTTPS transport"), is TROUBLE; every other
+    event is progress, and ``item.*`` / ``turn.completed`` / ``turn.failed`` also count
+    as *work*. A non-JSON stdout line is unknown output and counts as progress (the
+    conservative choice: never kill on something we do not understand). stderr: an
+    ``ERROR``/``WARN`` log line is trouble, anything else ("Reading additional input
+    from stdin...") is progress. A blank line is neither.
+    """
+    text = line.strip()
+    if not text:
+        return LineVerdict(progress=False, work=False, network=False)
+    if stderr:
+        trouble = bool(_LOG_LINE_RE.match(text))
+        return LineVerdict(not trouble, False, trouble and bool(_NET_TROUBLE_RE.search(text)))
+    event = _json_event(text)
+    if event is None:
+        return LineVerdict(True, False, False)  # unknown output: never a reason to kill
+    kind = str(event.get("type") or "")
+    item = event.get("item")
+    item_type = str(item.get("type") or "") if isinstance(item, dict) else ""
+    if kind == "error" or item_type == "error":
+        return LineVerdict(False, False, bool(_NET_TROUBLE_RE.search(text)))
+    return LineVerdict(True, kind.startswith(_WORK_EVENT_PREFIXES), False)
+
+
+def _json_event(text: str) -> dict | None:
+    """*text* as one ``codex exec --json`` event object, or ``None`` for anything else."""
+    if not text.startswith("{"):
+        return None
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+@dataclass(frozen=True)
+class _HealthSnapshot:
+    progress: int  # progress lines so far
+    trouble: int  # trouble lines since the last progress line
+    network: int  # of those, the ones naming the network
+    last_trouble: str
+    started_work: bool
+
+
+class _RunHealth:
+    """What the two reader threads learned about the run, polled by the supervisor."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._progress = 0
+        self._trouble = 0
+        self._network = 0
+        self._last_trouble = ""
+        self._started_work = False
+
+    def note(self, line: str, *, stderr: bool) -> None:
+        """Account one output line (called from the reader threads)."""
+        verdict = classify_output_line(line, stderr=stderr)
+        with self._lock:
+            if verdict.progress:
+                self._progress += 1
+                self._trouble = 0
+                self._network = 0
+                self._started_work = self._started_work or verdict.work
+            elif line.strip():
+                self._trouble += 1
+                self._network += int(verdict.network)
+                self._last_trouble = line.strip()[:300]
+
+    def snapshot(self) -> _HealthSnapshot:
+        """A consistent read of the counters."""
+        with self._lock:
+            return _HealthSnapshot(
+                self._progress,
+                self._trouble,
+                self._network,
+                self._last_trouble,
+                self._started_work,
+            )
+
+
+# Injectable wall clock, so a test can simulate a suspended machine (a jump between ticks).
+_wall_clock: Callable[[], float] = time.time
+
+
+def _hold_awake(codex_pid: int) -> subprocess.Popen[bytes] | None:
+    """``caffeinate -i -w <codex pid>``: no idle sleep while codex runs (macOS only).
+
+    The 2026-09-07 debate hang: this laptop idle-sleeps after ONE minute (``pmset -g
+    custom`` → ``sleep 1``), so an unattended round was suspended seven minutes after
+    launch and spent the night in Sleep/DarkWake cycles. ``-i`` blocks exactly that —
+    idle sleep, on AC and battery alike — and nothing else: no display, no user-active
+    assertion. ``-w`` ties the assertion to codex's lifetime and :func:`_release_awake`
+    ends it on every exit path of the supervisor, so it cannot outlive the round. Other
+    ``caffeinate`` holders on the machine are neither reused nor touched. Opt out with
+    ``$CODEX_IN_CLAUDE_NO_CAFFEINATE=1``; a platform without ``caffeinate`` gets none.
+    A closed lid still sleeps the machine — that case is the ``slept`` watchdog's job.
+    """
+    if os.environ.get("CODEX_IN_CLAUDE_NO_CAFFEINATE"):
+        return None
+    exe = shutil.which("caffeinate")
+    if not exe:
+        return None
+    try:
+        return subprocess.Popen(  # pylint: disable=consider-using-with  # reaped by _release_awake
+            [exe, "-i", "-w", str(codex_pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+
+
+def _release_awake(holder: subprocess.Popen[bytes] | None) -> None:
+    """End our own caffeinate assertion (SIGTERM, 2 s, SIGKILL); an exited holder is fine."""
+    if holder is None or holder.poll() is not None:
+        return
+    with contextlib.suppress(OSError):
+        holder.terminate()
+    try:
+        holder.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            holder.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            holder.wait(timeout=1)
 
 
 def _group_is_gone(pgid: int) -> bool:
@@ -258,6 +471,7 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
     heartbeat_path: Path | None = None,
     heartbeat_meta: dict[str, Any] | None = None,
     stdin_text: str | None = None,
+    startup_timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``codex exec`` supervised; the process TREE can never outlive us.
 
@@ -278,11 +492,22 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
     - codex's stderr is streamed line-by-line to our stderr (prefixed
       ``codex› ``) so a caller watching the output file can SEE whether codex is
       exploring, editing, or hung — instead of total silence until the end;
-    - an idle watchdog (``idle_timeout`` seconds with no output on either
-      stream) converts a wedged run into a fast, diagnosable failure.
+    - a ``caffeinate -i`` assertion is held for exactly as long as codex runs (macOS), so
+      the laptop's idle sleep cannot suspend the round (:func:`_hold_awake`);
+    - a PROGRESS watchdog converts a wedged run into a fast, diagnosable failure. It
+      charges AWAKE seconds since the last progress line (:func:`classify_output_line`:
+      codex's own ``error`` events and ``ERROR``/``WARN`` log lines are trouble, not
+      progress — codex 0.152.1 loops "Reconnecting... waiting for network" forever on a
+      dead connection, and those lines kept the old any-output watchdog alive for
+      hours). The allowance is *idle_timeout*, shrunk to ``NET_IDLE_TIMEOUT`` once codex
+      reports network trouble and to ``POST_SLEEP_IDLE_TIMEOUT`` once a supervision
+      tick took longer than ``SLEEP_GAP_S`` (the machine was suspended); *startup_timeout*
+      (default ``$CODEX_IN_CLAUDE_STARTUP_TIMEOUT`` / ``DEFAULT_STARTUP_TIMEOUT``) awake
+      seconds without any ``item.*`` event means codex never got a model response.
 
-    Raises FileNotFoundError (binary missing), subprocess.TimeoutExpired (wall),
-    or CodexStalledError (idle) — partial output attached to the last two.
+    Raises FileNotFoundError (binary missing), subprocess.TimeoutExpired (wall), or
+    CodexStalledError (reason ``stalled`` / ``network`` / ``slept`` / ``startup``) — the
+    partial output is attached to the last two.
     """
     proc = subprocess.Popen(  # pylint: disable=consider-using-with  # lifetime managed by the finally sweep
         cmd,
@@ -297,9 +522,10 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
         codex_pgid: int | None = os.getpgid(proc.pid)
     except (ProcessLookupError, PermissionError):  # pragma: no cover - raced its own exit
         codex_pgid = proc.pid
+    awake_holder = _hold_awake(proc.pid)
     out_buf: list[str] = []
     err_buf: list[str] = []
-    last_activity = [time.monotonic()]
+    health = _RunHealth()
 
     def feed_stdin() -> None:
         """Hand codex the prompt, then close stdin (a broken pipe is not our problem)."""
@@ -311,11 +537,11 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
         with contextlib.suppress(OSError, ValueError):
             proc.stdin.close()
 
-    def reader(stream: Any, buf: list[str], tee: bool) -> None:
+    def reader(stream: Any, buf: list[str], stderr: bool) -> None:
         for line in stream:
             buf.append(line)
-            last_activity[0] = time.monotonic()
-            if tee:
+            health.note(line, stderr=stderr)
+            if stderr:
                 shown = line if len(line) <= 400 else line[:400] + "…\n"
                 sys.stderr.write("codex› " + shown)
                 sys.stderr.flush()
@@ -348,6 +574,16 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(codex_pgid, signal.SIGKILL)
 
+    def stalled(reason: str, seconds: float, snap: _HealthSnapshot) -> CodexStalledError:
+        return CodexStalledError(
+            int(seconds),
+            "".join(err_buf),
+            reason=reason,
+            stdout_text="".join(out_buf),
+            slept_seconds=int(slept),
+            last_trouble=snap.last_trouble,
+        )
+
     previous: dict[int, Any] = {}
 
     def relay(signum: int, _frame: Any) -> None:
@@ -360,39 +596,84 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
     if threading.current_thread() is threading.main_thread():
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous[sig] = signal.signal(sig, relay)
+    if startup_timeout is None:
+        startup_timeout = _env_seconds("CODEX_IN_CLAUDE_STARTUP_TIMEOUT", DEFAULT_STARTUP_TIMEOUT)
+    net_idle = _env_seconds("CODEX_IN_CLAUDE_NET_IDLE", NET_IDLE_TIMEOUT)
+    post_sleep_idle = _env_seconds("CODEX_IN_CLAUDE_POST_SLEEP_IDLE", POST_SLEEP_IDLE_TIMEOUT)
     start = time.monotonic()
+    prev_wall = _wall_clock()
+    awake_elapsed = awake_idle = slept = 0.0
+    slept_since_progress = False
+    seen_progress = 0
     tick = 0
     try:
         while True:
+            snap = health.snapshot()
             if heartbeat_path is not None and tick % 5 == 0:
                 _write_heartbeat(
                     heartbeat_path,
                     heartbeat_meta or {},
                     start,
-                    last_activity[0],
+                    time.monotonic() - awake_idle,
                     out_buf,
                     err_buf,
                     codex_pgid,
+                    extra={
+                        "idle_s": int(awake_idle),
+                        "slept_s": int(slept),
+                        "trouble": snap.trouble,
+                        "caffeinate_pid": awake_holder.pid if awake_holder else None,
+                    },
                 )
             tick += 1
             try:
                 proc.wait(timeout=1)
                 break
             except subprocess.TimeoutExpired:
-                now = time.monotonic()
-                if timeout and now - start >= timeout:
-                    kill_group()
-                    raise subprocess.TimeoutExpired(
-                        cmd, timeout, output="".join(out_buf), stderr="".join(err_buf)
-                    ) from None
-                if idle_timeout and now - last_activity[0] >= idle_timeout:
-                    kill_group()
-                    raise CodexStalledError(int(now - last_activity[0]), "".join(err_buf)) from None
+                pass
+            now_wall = _wall_clock()
+            gap = max(0.0, now_wall - prev_wall)
+            prev_wall = now_wall
+            if gap > SLEEP_GAP_S:
+                slept += gap
+                slept_since_progress = True
+                sys.stderr.write(
+                    f"runner› the machine was suspended for ~{int(gap)}s — codex's connections "
+                    "may be dead; watching for progress\n"
+                )
+                sys.stderr.flush()
+            awake_gap = min(gap, TICK_CAP_S)
+            awake_elapsed += awake_gap
+            snap = health.snapshot()
+            if snap.progress != seen_progress:
+                seen_progress, awake_idle, slept_since_progress = snap.progress, 0.0, False
+            else:
+                awake_idle += awake_gap
+            if timeout and time.monotonic() - start >= timeout:
+                kill_group()
+                raise subprocess.TimeoutExpired(
+                    cmd, timeout, output="".join(out_buf), stderr="".join(err_buf)
+                ) from None
+            limit = idle_timeout
+            if limit and snap.network and net_idle:
+                limit = min(limit, net_idle)
+            if limit and slept_since_progress and post_sleep_idle:
+                limit = min(limit, post_sleep_idle)
+            if limit and awake_idle >= limit:
+                kill_group()
+                reason = (
+                    "slept" if slept_since_progress else "network" if snap.network else "stalled"
+                )
+                raise stalled(reason, awake_idle, snap) from None
+            if startup_timeout and not snap.started_work and awake_elapsed >= startup_timeout:
+                kill_group()
+                raise stalled("startup", awake_elapsed, snap) from None
         for thread in threads:
             thread.join(timeout=2)
         return subprocess.CompletedProcess(cmd, proc.returncode, "".join(out_buf), "".join(err_buf))
     finally:
         kill_group()
+        _release_awake(awake_holder)
         for signum, handler in previous.items():
             signal.signal(signum, handler)
         if heartbeat_path is not None:
@@ -2147,11 +2428,17 @@ def cmd_runs(args: argparse.Namespace) -> int:
         return EX_OK
     for data in rows:
         elapsed, idle = int(data.get("elapsed_s", 0)), int(data.get("idle_s", 0))
+        slept, trouble = int(data.get("slept_s") or 0), int(data.get("trouble") or 0)
+        health = (
+            (" · caffeinated" if data.get("caffeinate_pid") else "")
+            + (f" · slept {slept // 60}m{slept % 60:02d}s" if slept else "")
+            + (f" · {trouble} trouble line(s) since progress" if trouble else "")
+        )
         print(
             f"pid {data['pid']} · {data.get('model', '?')}/{data.get('effort', '?')}"
             f"{' · write' if data.get('write') else ''} · {data.get('repo', '?')} · "
             f"elapsed {elapsed // 60}m{elapsed % 60:02d}s · idle {idle}s · "
-            f"{data.get('lines', 0)} lines · last: {data.get('last_line', '')!r}"
+            f"{data.get('lines', 0)} lines{health} · last: {data.get('last_line', '')!r}"
         )
     return EX_OK
 
@@ -2446,7 +2733,9 @@ class RunAttempt:
     seat: str
     home: str
     elapsed_s: float
-    outcome: str  # "ok" | "refused:<kind>" | "failed" | "timeout" | "stalled" | "skipped:exhausted"
+    # "ok" | "refused:<kind>" | "failed" | "timeout" | "stalled" | "network" | "slept" |
+    # "startup_timeout" | "skipped:exhausted"
+    outcome: str
 
 
 @dataclass
@@ -2458,7 +2747,7 @@ class RunResult:  # pylint: disable=too-many-instance-attributes  # flat result 
     seat: SeatCandidate | None = None
     attempts: list[RunAttempt] = field(default_factory=list)
     # "" | disabled | all_seats_unavailable | attempts_exhausted | codex_failed |
-    # timeout | stalled | seat_refused_midrun | no_codex
+    # timeout | stalled | network | slept | startup_timeout | seat_refused_midrun | no_codex
     error_kind: str = ""
     error_message: str = ""
     earliest_reset: int | None = None
@@ -2749,7 +3038,9 @@ def run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,
                 result, cand, exc, attempt_started, kind="timeout", budget=total_timeout
             )
         except CodexStalledError as exc:
-            return _killed_result(result, cand, exc, attempt_started, kind="stalled")
+            return _killed_result(
+                result, cand, exc, attempt_started, kind=_STALL_KINDS.get(exc.reason, "stalled")
+            )
         elapsed = time.monotonic() - attempt_started
         events = parse_json_events(proc.stdout or "")
         failure = classify_codex_failure(proc.returncode, events, proc.stderr or "")
@@ -2814,6 +3105,46 @@ def run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,
     return _no_seat_result(result)
 
 
+# CodexStalledError.reason -> RunResult.error_kind
+_STALL_KINDS = {
+    "stalled": "stalled",
+    "network": "network",
+    "slept": "slept",
+    "startup": "startup_timeout",
+}
+
+
+def _stall_headline(exc: CodexStalledError) -> str:
+    """The human explanation for a progress-watchdog kill, by its reason."""
+    slept = f"~{exc.slept_seconds // 60}m{exc.slept_seconds % 60:02d}s"
+    if exc.reason == "network":
+        return (
+            "Codex lost its network connection: it kept reporting connection trouble and made "
+            f"no progress for {exc.idle_seconds}s awake (whole process tree killed). Check the "
+            "network/VPN and retry."
+        )
+    if exc.reason == "slept":
+        return (
+            f"The machine was suspended for {slept} during this round and Codex made no "
+            f"progress for {exc.idle_seconds}s after waking (whole process tree killed). The "
+            "runner's caffeinate assertion blocks IDLE sleep only — a closed lid or battery "
+            "sleep still suspends the round; keep the lid open and retry."
+        )
+    if exc.reason == "startup":
+        return (
+            f"Codex never got a model response: no item event within {exc.idle_seconds}s awake "
+            "of launch (whole process tree killed). The network is down or model discovery "
+            "hung; check the network/VPN and retry."
+        )
+    text = (
+        f"Codex stalled — no progress for {exc.idle_seconds}s (whole process tree killed). "
+        "Likely a hung network/CLI; retry, or tune --idle-timeout."
+    )
+    if exc.slept_seconds:
+        text += f" The machine was suspended for {slept} during the run."
+    return text
+
+
 def _killed_result(
     result: RunResult,
     cand: SeatCandidate,
@@ -2823,18 +3154,19 @@ def _killed_result(
     kind: str,
     budget: int = 0,
 ) -> RunResult:
-    """Fill *result* in for a run WE killed (wall timeout or idle stall). Terminal.
+    """Fill *result* in for a run WE killed (wall timeout or the progress watchdog). Terminal.
 
     A kill says nothing about the seat, so there is no hop and no cooldown; what the
     caller needs is the session id, so the very same context can be resumed instead of
-    paying for the discovery again.
+    paying for the discovery again — and, for a watchdog kill, WHY: ``network``, ``slept``
+    and ``startup_timeout`` each name their cause and the fix, so a debate transcript says
+    "the laptop slept" instead of "Codex failed".
     """
     if isinstance(exc, CodexStalledError):
-        stderr_text, stdout_text = exc.stderr_text, ""
-        headline = (
-            f"Codex stalled — no output for {exc.idle_seconds}s (whole process tree killed). "
-            "Likely a hung network/CLI; retry, or tune --idle-timeout."
-        )
+        stderr_text, stdout_text = exc.stderr_text, exc.stdout_text
+        headline = _stall_headline(exc)
+        if exc.last_trouble:
+            headline += f" Codex's last report: {exc.last_trouble}"
     else:
         stderr_text, stdout_text = str(exc.stderr or ""), str(exc.output or "")
         headline = (
@@ -2877,6 +3209,9 @@ def _run_error_exit(result: RunResult) -> int:
         "no_codex": EX_NO_CODEX,
         "timeout": EX_TIMEOUT,
         "stalled": EX_TIMEOUT,
+        "startup_timeout": EX_TIMEOUT,
+        "network": EX_NETWORK,
+        "slept": EX_NETWORK,
         "codex_failed": EX_CODEX_FAIL,
         "seat_refused_midrun": EX_CODEX_FAIL,
     }.get(kind, EX_CODEX_FAIL)
@@ -3223,6 +3558,9 @@ def _run_exit_code(result: RunResult) -> int:
         "no_codex": EX_NO_CODEX,
         "timeout": EX_TIMEOUT,
         "stalled": EX_TIMEOUT,
+        "startup_timeout": EX_TIMEOUT,
+        "network": EX_NETWORK,
+        "slept": EX_NETWORK,
     }.get(result.error_kind, EX_CODEX_FAIL)
 
 
@@ -3398,8 +3736,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         metavar="SECS",
-        help="kill the run after this long with NO codex output "
-        "(default min(900, wall timeout), or 900 with -t 0; 0 disables the stall watchdog)",
+        help="kill the run after this long with NO codex PROGRESS — codex's own error events "
+        "and ERROR/WARN log lines do not count (default min(900, wall timeout), or 900 "
+        "with -t 0; shrinks to 120 once codex reports network trouble and to 180 after "
+        "the machine slept; 0 disables every idle-based kill)",
     )
     p_del.add_argument(
         "-R",
@@ -3493,7 +3833,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         metavar="SECS",
-        help="kill the run after this long with NO codex output (0 disables)",
+        help="kill the run after this long with NO codex PROGRESS (default 900; 120 once codex "
+        "reports network trouble, 180 after the machine slept; 0 disables)",
     )
     p_run.add_argument(
         "-p",

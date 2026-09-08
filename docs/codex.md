@@ -176,13 +176,51 @@ reply; `-j` prints ONE JSON object:
 ```
 
 Exit codes match `delegate`: 0 ok, 2 usage, 3 unknown model, 4 no codex, 5 timeout/stall,
-6 codex failed / refused mid-run, 8 no eligible seat (or `-n` budget spent). On failure
-`error` is `{"kind", "message", "earliest_reset"}` with `kind` one of `disabled`,
+6 codex failed / refused mid-run, 8 no eligible seat (or `-n` budget spent), 9 network
+dead / machine slept (killed after codex stopped making progress). On failure `error` is
+`{"kind", "message", "earliest_reset"}` with `kind` one of `disabled`,
 `all_seats_unavailable`, `attempts_exhausted`, `codex_failed`, `timeout`, `stalled`,
-`seat_refused_midrun`, `no_codex`.
+`network`, `slept`, `startup_timeout`, `seat_refused_midrun`, `no_codex`.
 
 `delegate` prints the same `seat: <label> (<email>)` line as its SECOND stdout line
 (`[fallback]` appended on a hop), right after the guaranteed `model:` line.
+
+### Progress watchdog and the sleep guard
+
+Why: on 2026-09-07 an unattended debate round hung seven hours — the laptop idle-slept
+seven minutes after launch (one minute after the display-on assertion dropped: `pmset -g
+custom` → `sleep 1`, and the runner held nothing) and the woken codex 0.152.1 looped on a
+dead connection all morning, too loudly for the old any-output watchdog to notice.
+
+**Progress** — the only thing that resets the idle clock — is a non-`error`
+`codex exec --json` event on stdout (`item.*` / `turn.completed` / `turn.failed` also
+count as *work*: proof the model answered), a stderr line that is not an `ERROR`/`WARN`
+log line (`Reading additional input from stdin...`), or a stdout line that is not JSON at
+all (unknown output is never a reason to kill). **Trouble** is codex's own `error` events
+(`{"type":"error","message":"Reconnecting... waiting for network (Connection failed:
+error sending request)"}` — the seven-hour stream), an `item` of type `error` (`Falling
+back from WebSockets to HTTPS transport…`), and `ERROR`/`WARN` `tracing` logs on stderr
+(`… ERROR codex_models_manager::manager: failed to refresh available models: …`).
+
+Allowances are AWAKE seconds: 900 s of no progress normally (`-i/--idle-timeout`, clamped
+to the wall), 120 s once codex names the network, 180 s after the machine was suspended,
+240 s for the first model response (`thread.started` / `turn.started` are emitted locally
+and prove nothing). A 1 s supervision tick that took more than 30 s means the machine
+slept — the gap is charged to nothing (a tick credits at most 5 s of awake time), so
+suspended time eats no allowance, it only shrinks the one that applies after the wake.
+Knobs: `CODEX_IN_CLAUDE_NET_IDLE`, `CODEX_IN_CLAUDE_POST_SLEEP_IDLE`,
+`CODEX_IN_CLAUDE_STARTUP_TIMEOUT` (`0` disables each); `-i 0` disables every idle-based
+kill. A kill is reported as `network`, `slept` or `startup_timeout` with its own cause and
+fix, so a transcript says "the laptop slept" instead of "Codex failed".
+
+On macOS the runner holds `caffeinate -i -w <codex pid>` for exactly the run and releases
+it on every exit path; other `caffeinate` holders are neither reused nor touched. `-i`
+blocks IDLE sleep only — a closed lid or a battery sleep still suspends the round, which
+is what the `slept` watchdog is for. Opt out with `CODEX_IN_CLAUDE_NO_CAFFEINATE=1`; a
+platform without `caffeinate` gets none. The heartbeat's `idle_s` is now awake seconds
+since the last progress line, beside `slept_s`, `trouble` (trouble lines since the last
+progress) and `caffeinate_pid`, and `runs` appends `· caffeinated`, `· slept 2m05s` and
+`· 3 trouble line(s) since progress` to the row — a quiet round explains itself.
 
 ### Killing a run from outside (last resort)
 
