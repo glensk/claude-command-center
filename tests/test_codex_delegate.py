@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import time
+from datetime import date, timedelta
 from pathlib import Path
 from types import ModuleType
 
@@ -1053,14 +1054,17 @@ def test_cmd_home_sets_and_clears_pin(
     monkeypatch.delenv("CODEX_HOME", raising=False)
     home = tmp_path / "second"
     home.mkdir()
-    ns = argparse.Namespace(path=str(home), until="2026-09-07", clear=False)
+    # A pin in the PAST reads back as "expired", so the date must stay in the future: the
+    # literal "2026-09-07" this test used went stale the day after it was written.
+    until = (date.today() + timedelta(days=30)).isoformat()
+    ns = argparse.Namespace(path=str(home), until=until, clear=False)
     assert cic.cmd_home(ns) == cic.EX_USAGE  # no auth.json yet
     (home / "auth.json").write_text("{}", encoding="utf-8")
     assert cic.cmd_home(ns) == cic.EX_OK
     out = capsys.readouterr().out
-    assert str(home) in out and "until 2026-09-07" in out
+    assert str(home) in out and f"until {until}" in out
     saved = json.loads(cfg_path.read_text(encoding="utf-8"))
-    assert saved["codex_home"] == str(home) and saved["codex_home_until"] == "2026-09-07"
+    assert saved["codex_home"] == str(home) and saved["codex_home_until"] == until
     bad = argparse.Namespace(path=str(home), until="next monday", clear=False)
     assert cic.cmd_home(bad) == cic.EX_USAGE
     assert cic.cmd_home(argparse.Namespace(path=None, until=None, clear=True)) == cic.EX_OK
