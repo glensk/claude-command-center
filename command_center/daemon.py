@@ -67,6 +67,7 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
     claude_refreshed: bool = False  # routine Claude /usage OAuth fetch; excluded from is_empty()
     codex_refreshed: bool = False  # routine live Codex usage fetch; excluded from is_empty()
     resume_spawned: bool = False  # spawned the resume-halted watcher; excluded from is_empty()
+    limit_switched: list[str] = field(default_factory=list)  # sessions moved off a capped seat
     temps_swept: int = 0  # orphaned usage temp files reclaimed; excluded from is_empty()
 
     def is_empty(self) -> bool:
@@ -77,6 +78,7 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
             or self.progressed
             or self.alerted
             or self.pruned
+            or self.limit_switched
             or self.scored
             or self.short_aimed
             or self.assessed
@@ -172,6 +174,17 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
         reconcile(store, adapter)
         live = {ls.session_id: ls for ls in adapter.discover()}
         now = now_ms()
+
+        # Rate-limit failover BACKSTOP — deliberately the first thing after reconcile and
+        # isolated in its own try/except. The primary trigger is the in-session StopFailure
+        # hook; this pass exists for the halts it could not serve (a session started before
+        # the hook was wired, a worker killed at the 10 s hook timeout, a switch refused once
+        # because background work was in flight and now unblocked). It must not sit behind
+        # the summary/usage steps, which are fallible and slow: a launchd StartInterval is a
+        # cadence, not a deadline, and a raise upstream would silently drop the recovery for
+        # that whole pass (Codex O12).
+        if cfg.auto_switch_on_limit and not dry_run:
+            _run_limit_switch(store, adapter, live, report)
 
         # Mirror each FUTURE job (draft) to its Obsidian markdown file and import file edits
         # back (in-process backstop for the launchd WatchPaths trigger). Placed after
@@ -578,6 +591,33 @@ def _deliver_attached_prompts(
         # tab; fire-attached consumes the lease via its one-shot claim.
         terminal.fire_attached_in_new_tab(job.session_id)
         notify("⏳ parked prompt resuming in a new tab", _label(job), cfg.notify)
+
+
+def _run_limit_switch(
+    store: Store, adapter: ClaudeAdapter, live: dict, report: DaemonReport
+) -> None:
+    """Hand every halted live session to the failover decision; never raise into the pass.
+
+    One session per pass at most, like ``resume``'s stagger: a limit that capped several
+    sessions at once would otherwise dump all of them onto the other seat in one go.
+    """
+    from . import limitswitch  # pylint: disable=import-outside-toplevel  # module convention
+
+    for session in store.list_sessions():
+        live_session = live.get(session.session_id)
+        if live_session is None or not live_session.alive or session.done:
+            continue
+        if not adapter.is_halted(session.cwd, session.session_id):
+            continue
+        try:
+            switched, detail = limitswitch.run(session.session_id, session.cwd)
+        except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            limitswitch.log_event(session.session_id, f"backstop error: {exc}")
+            continue
+        if switched:
+            report.limit_switched.append(session.session_id)
+            limitswitch.log_event(session.session_id, f"backstop: {detail}")
+            return
 
 
 def _spawn_resume_watcher(cfg: config.Config, report: DaemonReport, dry_run: bool) -> None:

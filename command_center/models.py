@@ -450,6 +450,26 @@ class Session:
     # `switch-account -p/--prompt`: the prompt the relaunched session submits by itself
     # ("" = none, it parks idle). Typed as `claude --resume <id> "<prompt>"`.
     switch_prompt: str = ""
+    # --- automatic rate-limit failover (limitswitch.py) ------------------------------
+    # The halt this session's failover is about: the transcript record's uuid. It is the
+    # IDENTITY that makes a halt handle-once — `is_halted` stays true after the relaunch
+    # (it ignores trailing user records) until the first assistant record lands on the new
+    # seat, so "still halted" alone would re-fire the switch and mis-attribute the OLD
+    # account's limit to the new one.
+    limit_switch_halt_id: str = ""
+    # claimed -> dispatched -> terminated -> delivered -> started, or failed/refused. Only
+    # an EMPTY state (or a different halt id) lets a new claim in; every other value means
+    # this halt is already owned, so two workers cannot both relaunch the same tab.
+    limit_switch_state: str = ""
+    limit_switch_at: int = 0  # epoch-ms the claim was taken (TTL for a dead worker)
+    limit_switch_source: str = ""  # config dir that HIT the limit (the halt's account)
+    limit_switch_target: str = ""  # config dir it is moving to
+    limit_switch_pid: int = 0  # the claude process that halted
+    limit_switch_pid_start: str = ""  # its start stamp: a recycled pid is not the same process
+    limit_switch_reason: str = ""  # why it refused / how it ended (shown by `ccc switch-on-limit`)
+    limit_switch_retry_not_before: int = 0  # reason-specific backoff for a REFUSAL
+    limit_switch_day: str = ""  # UTC date of the success counter below
+    limit_switch_successes: int = 0  # successful switches that day (refusals never count)
     # In-flight IN-PROCESS Agent-tool subagents (SubagentStart − SubagentStop, floored
     # at 0 and reset on session start/end). > 0 vetoes a `switch-account` relaunch: such
     # a subagent has no child process and may not be in the transcript yet.

@@ -192,6 +192,25 @@ DEFAULTS: dict[str, object] = {
     "sync_tab_titles": True,  # daemon keeps every live tab's iTerm title in sync with its badge
     "daemon_interval_sec": 300,  # launchd StartInterval for `ccc daemon`
     "resume_halted": False,  # auto-resume session-limit-halted sessions on reset (INERT: off)
+    # Rate-limit FAILOVER: a session halted by "You've hit your … limit" relaunches itself
+    # on another configured account (same tab, conversation kept) instead of waiting for the
+    # reset. Trigger: the StopFailure hook; backstop: the daemon pass. See limitswitch.py.
+    "auto_switch_on_limit": False,  # (INERT: off)
+    # Trust policy for that AUTOMATIC relaunch. "require" = the target account must ALREADY
+    # trust the cwd (read-only check, nothing written); "ensure" = write the trust flag the
+    # way the human-invoked paths do. Anything else (typo, empty, missing) resolves to
+    # "require": automation must never widen what a seat may execute on its own.
+    "auto_switch_trust": "require",
+    # Allowed automatic transitions, "from>to" per entry (labels from claude_accounts).
+    # Empty = every configured pair, which for a two-account setup is private <-> work.
+    # Quota availability is not billing authorization: a third account added later must not
+    # become an automatic target by accident.
+    "auto_switch_targets": [],
+    # The prompt the relaunched session submits itself ("" = land idle at the composer).
+    "auto_switch_prompt": "continue",
+    # Cap on SUCCESSFUL automatic switches per session per day (refusals do not count —
+    # they carry their own reason-specific backoff).
+    "auto_switch_max_per_day": 4,
     "resume_stagger_sec": 120,  # min seconds between resumes across different repos (anti-herd)
     "resume_poll_sec": 30,  # resume-halted watcher poll interval
     "resume_max_attempts": 3,  # give up auto-resuming a session after this many failed tries
@@ -286,6 +305,7 @@ INERT_DEFAULT_KEYS: tuple[str, ...] = (
     "claude_usage",  # no keychain read / Claude OAuth /usage fetch
     "codex_usage",  # no Codex auth.json read / chatgpt.com usage fetch
     "resume_halted",  # no resume watcher / continue-script spawns
+    "auto_switch_on_limit",  # no automatic account failover on a rate-limit halt
     "reap",  # never auto-close a stranger's sessions un-asked
     "short_aim",  # no codex/claude short-label generation
     "aim_score_on_set",  # no LLM AIM-score refine
@@ -460,6 +480,63 @@ def parse_claude_accounts(entries: list[str]) -> dict[str, Path]:
             continue  # blank path or a label that could smuggle a path separator
         dirs[label] = Path(raw).expanduser().resolve()
     return dirs or {"private": claude_home()}
+
+
+# The only value that turns the automatic relaunch's trust check into a trust WRITE.
+_TRUST_ENSURE = "ensure"
+
+
+def auto_switch_trust_policy(cfg: Config | None = None) -> str:
+    """``"ensure"`` only when the config says exactly that; ``"require"`` for everything else.
+
+    The config is raw TOML with no coercion (:func:`load_config` copies values straight
+    into :class:`Config`), so a typo, a bool, ``None`` or a missing key must not be able to
+    grant an automatic relaunch permission to WRITE ``hasTrustDialogAccepted`` into another
+    account's ``.claude.json``. Fail closed: anything that is not the literal string
+    ``"ensure"`` (case/space-insensitive) is ``"require"`` — the target account must already
+    trust the directory, and the automatic path only ever READS the flag.
+    """
+    raw = (cfg or load_config()).auto_switch_trust
+    ensure = isinstance(raw, str) and raw.strip().lower() == _TRUST_ENSURE
+    return _TRUST_ENSURE if ensure else "require"
+
+
+def parse_auto_switch_targets(entries: object) -> set[tuple[str, str]]:
+    """Parse ``auto_switch_targets`` (``["work>private", …]``) into ``{(from, to)}``.
+
+    Mirrors :func:`parse_claude_accounts`'s tolerance: a malformed entry is skipped, never
+    raised on. An empty result means "no explicit allow-list" — see
+    :func:`auto_switch_allowed`, which then falls back to every configured pair.
+    """
+    out: set[tuple[str, str]] = set()
+    if not isinstance(entries, list):
+        return out
+    for entry in entries:
+        if not isinstance(entry, str) or ">" not in entry:
+            continue
+        source, _, target = entry.partition(">")
+        source, target = source.strip(), target.strip()
+        if source and target and source != target:
+            out.add((source, target))
+    return out
+
+
+def auto_switch_allowed(source: str, target: str, cfg: Config | None = None) -> bool:
+    """True when an automatic ``source -> target`` account failover is authorized.
+
+    Quota availability is not a billing authorization: a third account added to
+    ``claude_accounts`` must not silently become an automatic target. With an explicit
+    ``auto_switch_targets`` allow-list only its pairs are permitted; with none, every
+    CONFIGURED pair is (for the two-account setup this feature was built for that is exactly
+    private <-> work). Both labels must still be configured accounts.
+    """
+    if not source or not target or source == target:
+        return False
+    labels = set(claude_config_dirs())
+    if source not in labels or target not in labels:
+        return False
+    allowed = parse_auto_switch_targets((cfg or load_config()).auto_switch_targets)
+    return (source, target) in allowed if allowed else True
 
 
 def claude_account_email_map() -> dict[str, str]:
@@ -673,6 +750,11 @@ class Config:
     sync_tab_titles: bool = True
     daemon_interval_sec: int = 300
     resume_halted: bool = False
+    auto_switch_on_limit: bool = False
+    auto_switch_trust: str = "require"
+    auto_switch_targets: list[str] = field(default_factory=list)
+    auto_switch_prompt: str = "continue"
+    auto_switch_max_per_day: int = 4
     resume_stagger_sec: int = 120
     resume_poll_sec: int = 30
     resume_max_attempts: int = 3

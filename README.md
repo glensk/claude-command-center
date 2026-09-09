@@ -100,6 +100,7 @@ and some are macOS-first (they drive iTerm2 / Karabiner). Honest table:
 | Obsidian mirrors + dashboards | every session as a searchable markdown note; job-launch buttons                              | an Obsidian vault + a credential scrubber                          | `ccc obsidian-setup`, mirror flags   |
 | Background daemon + alerts    | reaps idle sessions, regenerates summaries, desktop-notifies                                 | launchd (macOS) / systemd --user (Linux); `notify-send` on Linux   | `ccc daemon --install`               |
 | Auto-resume halted            | resumes rate-limit-halted sessions once the limit resets (machine must stay on)              | `claude-session-continue`                                          | `resume_halted`                      |
+| Rate-limit failover           | a halted session relaunches itself on an account that still has quota, same tab              | a second account in `claude_accounts`                              | `auto_switch_on_limit`               |
 | Cross-session file locks      | serializes edits when several sessions share one checkout                                    | Claude Code hooks                                                  | `file_lock_enabled` (default on)     |
 | Codex delegation              | hand implementation to OpenAI Codex; Claude only verifies. Every Codex call tries the ChatGPT logins in the configured order (`codex-in-claude order`) and falls through at run time when one is held, exhausted or refusing | `codex` CLI                                                        | `-j codex` jobs / slash command      |
 | Copilot usage card            | month-to-date GitHub Copilot spend in the TUI                                                | `gh` CLI + a Copilot seat                                          | `copilot_usage`                      |
@@ -113,6 +114,14 @@ and the provider is pluggable.
 
 A few features that don't fit in a one-liner but are the reason people keep it running:
 
+- **Rate-limit failover — the other seat instead of the clock.** When a turn dies on a
+  session/weekly limit, `auto_switch_on_limit` relaunches that session on another
+  configured account **in its own tab**, conversation intact, and lets it carry on. The
+  trigger is Claude Code's `StopFailure` hook (it fires no `Stop` for a halted turn), with
+  the daemon as a backstop, so recovery takes seconds rather than the rest of the window.
+  It refuses to act on a transient server 429, on a halt it already handled, on a target
+  that is capped too or that the allow-list does not permit — and it only ever **reads**
+  the target account's folder-trust flag, never grants it.
 - **Auto-resume after a rate-limit reset.** When an account hits its session/weekly
   limit, its tracked sessions go `|| halted`. Turn on `resume_halted` and a watcher
   resumes them the moment that limit clears — staggered across repos, serial within a

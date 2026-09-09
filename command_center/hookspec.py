@@ -36,6 +36,11 @@ HOOK_SPEC: tuple[tuple[str, str | None, str], ...] = (
     # running in-process subagent has no child process and may not be in the transcript yet).
     ("SubagentStart", None, "subagent-start"),
     ("SubagentStop", None, "subagent-stop"),
+    # A turn that DIED (rate limit, auth, overload). Claude Code fires no `Stop` for it —
+    # measured 2026-09-09: a session-limit halt leaves the Stop chain silent — so this is
+    # the ONLY in-session signal that an account ran out mid-turn, and it is what
+    # `auto_switch_on_limit` reacts to (see command_center/limitswitch.py).
+    ("StopFailure", None, "stop-failure"),
     ("PreToolUse", "Edit|Write|MultiEdit|NotebookEdit", "pre-tool-use"),
     ("PostToolUse", "Edit|Write|MultiEdit|NotebookEdit", "post-tool-use"),
     ("PostToolUse", "TodoWrite|TaskCreate|TaskUpdate", "post-tool-use"),

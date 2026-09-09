@@ -311,10 +311,14 @@ def will_auto_resume(
 
 def candidates(store: Store, adapter: ClaudeAdapter) -> list[Candidate]:
     """Halted sessions eligible for auto-resume (alive HALTED or parked-after-429)."""
+    from . import limitswitch  # pylint: disable=import-outside-toplevel  # cycle-free at call time
+
     out: list[Candidate] = []
     for session in store.list_sessions():
         if not is_resumable(session, adapter):
             continue
+        if limitswitch.hold_active(session):
+            continue  # a failover owns this halt: it will come back on the OTHER seat
         if not adapter.is_halted(session.cwd, session.session_id):
             continue
         out.append(
@@ -710,7 +714,11 @@ def _launch_resume(
     script = _resolve_continue_script(cfg)
     if not script:
         return False
-    return terminal.resume_halted_in_new_tab(cwd, session_id, script, config_dir, no_codex=no_codex)
+    # require_trust=True: this relaunch is a MACHINE decision (the watcher, not a human), so
+    # it may only read the target's trust flag, never write it (Codex O13).
+    return terminal.resume_halted_in_new_tab(
+        cwd, session_id, script, config_dir, no_codex=no_codex, require_trust=True
+    )
 
 
 def _consume_reset_signal(state: QueueState, account: str) -> None:
@@ -800,7 +808,33 @@ def apply_actions(
     cfg: config.Config,
 ) -> None:
     """Perform the planner's effects (mutates *state* for reset-wait bookkeeping)."""
+    from . import limitswitch  # pylint: disable=import-outside-toplevel  # cycle-free at call time
+
     for action in actions:
+        # Re-checked HERE, not only in the planner: `plan()` also acts on queue entries
+        # recorded in earlier ticks, so a session that left `candidates()` (because a
+        # rate-limit failover claimed it) can still carry a "reap + launch" pair — and the
+        # reap SIGTERMs the live process and CLOSES ITS TAB, the very tab the failover is
+        # about to relaunch into (Codex O2/O16). The trust gate is evaluated here too, ahead
+        # of any destructive step, so a revoked flag refuses instead of killing first and
+        # refusing at launch time.
+        session_row = store.get(action.session_id)
+        if session_row is not None and limitswitch.hold_active(session_row):
+            _log("skip", action.session_id, "a rate-limit failover owns this session")
+            continue
+        if session_row is not None and action.kind in ("reap", "launch_resume"):
+            from .accounts import is_trusted  # pylint: disable=import-outside-toplevel
+
+            if session_row.config_dir and not is_trusted(
+                session_row.config_dir, action.cwd or session_row.cwd
+            ):
+                _fail_reason = "target account does not trust " + (action.cwd or session_row.cwd)
+                entry = state.entries.get(action.session_id)
+                if entry is not None:
+                    entry.state = "failed"
+                    entry.fail_reason = _fail_reason
+                _log("refuse", action.session_id, _fail_reason)
+                continue
         if action.kind == "reap":
             _reap_fresh(adapter, store, action.session_id)
             _log("reap", action.session_id, "killed stuck REPL before relaunch")

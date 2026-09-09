@@ -830,6 +830,29 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
                     groups.setdefault(live.session_id, []).append(live)
         return [_resolve_registry_group(entries) for entries in groups.values()]
 
+    def discover_raw(self, session_id: str = "") -> list[LiveSession]:
+        """Every live registry entry, UNCOLLAPSED — one per ``sessions/<pid>.json``.
+
+        :meth:`discover` returns one row per session id (``_resolve_registry_group``), which
+        is right for display but wrong for a destructive uniqueness check: "is this id live
+        under two accounts?" cannot be answered from a list that can only ever hold one row
+        per id — the collapsed row merely carries ``conflict=True``, and a caller that takes
+        the billing account from its own environment never looks at it (Codex O4). Callers
+        that are about to SIGTERM a process use this instead. Filtered to *session_id* when
+        given; dead entries are included (the caller decides what ``alive`` must mean).
+        """
+        out: list[LiveSession] = []
+        for home in self.homes.values():
+            sessions_dir = home / "sessions"
+            if not sessions_dir.is_dir():
+                continue
+            home_str = str(home)
+            for path in sessions_dir.glob("*.json"):
+                live = self._parse_registry_entry(path, home_str)
+                if live is not None and (not session_id or live.session_id == session_id):
+                    out.append(live)
+        return out
+
     def _parse_registry_entry(self, path: Path, home_str: str) -> LiveSession | None:
         """Parse one ``sessions/<pid>.json`` into a stamped :class:`LiveSession`."""
         try:
@@ -1216,6 +1239,33 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
             if isinstance(record, dict):
                 records.append(record)
         return records
+
+    def halt_record(
+        self, cwd: str, session_id: str, config_dir: str = "", path: Path | None = None
+    ) -> dict | None:
+        """The last main-chain assistant record when it is a rate-limit halt, else ``None``.
+
+        The evidence :meth:`is_halted` reduces to a bool, returned whole so a caller can
+        take the halt's IDENTITY from it (``uuid``, ``timestamp``) instead of re-deciding
+        "is this session halted?" later, when the answer no longer says WHICH account or
+        WHICH halt it was (see limitswitch.py). *path* short-circuits resolution for a
+        caller that already has the transcript (the ``StopFailure`` hook payload carries
+        it); everything else is :meth:`is_halted`'s own scan, unchanged.
+        """
+        target = path if path is not None else self.transcript_path(cwd, session_id, config_dir)
+        if target is None:
+            return None
+        last_assistant: dict | None = None
+        for record in self._tail_records(target):
+            if record.get("isSidechain"):
+                continue
+            if record.get("type") == "assistant":
+                last_assistant = record
+        if last_assistant is None or not last_assistant.get("isApiErrorMessage"):
+            return None
+        if _RATE_LIMIT_RE.search(_assistant_text(last_assistant)) is None:
+            return None
+        return last_assistant
 
     def is_halted(self, cwd: str, session_id: str) -> bool:
         """True if the session's last main-chain *assistant* turn is a rate-limit halt.

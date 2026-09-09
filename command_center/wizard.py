@@ -78,7 +78,16 @@ GROUP_B_VAULT: tuple[str, ...] = GROUP_B_FUTURE + GROUP_B_MIRRORS
 #: Group C — offered individually, each behind its own dependency / caveat.
 GROUP_C: tuple[str, ...] = ("copilot_usage", "resume_halted", "reap")
 #: Inert keys intentionally NOT surfaced as a wizard question (secondary cost knobs).
-UNMAPPED_INERT: tuple[str, ...] = ("verify_subgoals_llm", "claude_usage", "codex_usage")
+#: ``auto_switch_on_limit`` is here rather than in a group on purpose: the rate-limit
+#: failover is meaningless until ``claude_accounts`` lists a SECOND account, which this
+#: wizard does not configure — offering it on a first run would ask for consent to bill a
+#: seat that does not exist yet.
+UNMAPPED_INERT: tuple[str, ...] = (
+    "verify_subgoals_llm",
+    "claude_usage",
+    "codex_usage",
+    "auto_switch_on_limit",
+)
 
 #: Anchor keys always written when the user supplies a vault (even if == default).
 ANCHOR_KEYS: tuple[str, ...] = ("vault_root",)

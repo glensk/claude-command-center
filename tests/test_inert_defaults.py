@@ -36,6 +36,7 @@ _EXPECTED_INERT_KEYS = {
     "claude_usage",
     "codex_usage",
     "resume_halted",
+    "auto_switch_on_limit",
     "reap",
     "short_aim",
     "aim_score_on_set",

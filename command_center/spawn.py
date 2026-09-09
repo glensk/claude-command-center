@@ -32,12 +32,25 @@ import shutil
 import subprocess
 
 
-def spawn_ccc(args: list[str]) -> bool:
-    """Launch ``ccc <args…>`` detached + non-blocking. Return True if it started."""
+def spawn_ccc(args: list[str], *, internal: bool = True) -> bool:
+    """Launch ``ccc <args…>`` detached + non-blocking. Return True if it started.
+
+    ``internal=False`` drops the ``CCC_INTERNAL`` marker (``AI_NO_AUTOCOMMIT`` stays). It
+    exists for ONE caller: the ``StopFailure`` worker, whose job is to run
+    ``switch-account -N``, and ``cli._close_arming_suppressed()`` refuses exactly that under
+    ``CCC_INTERNAL`` — the marker means "this is a headless helper, it has no tab to move",
+    which is true of a grader but false of a worker acting on a real interactive session.
+    Everything the marker protects (no recursive hook rows) is still handled: the worker
+    runs no Claude session of its own.
+    """
     exe = shutil.which("ccc")
     if not exe:
         return False
-    env = {**os.environ, "CCC_INTERNAL": "1", "AI_NO_AUTOCOMMIT": "1"}
+    env = {**os.environ, "AI_NO_AUTOCOMMIT": "1"}
+    if internal:
+        env["CCC_INTERNAL"] = "1"
+    else:
+        env.pop("CCC_INTERNAL", None)
     try:
         # Deliberately not a `with` block: the child must outlive this call (detached).
         subprocess.Popen(  # noqa: S603  # pylint: disable=consider-using-with

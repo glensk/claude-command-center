@@ -78,6 +78,7 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 - `ccc install-hooks` · `ccc install-statusline` · `ccc install-commands` · `ccc install-shell` — the individual installers `ccc init` runs.
 - `ccc daemon [--install|--uninstall|--status|--dry-run]` — the background housekeeper (launchd on macOS, systemd `--user` on Linux).
 - `ccc resume-halted [--watch|--dry-run]` — auto-resume rate-limit-halted sessions once the limit resets.
+- `ccc switch-on-limit` (`-s/--session`, `-c/--cwd`, `-t/--transcript`, `-D/--dry-run`) — the rate-limit FAILOVER for one halted session: move it to an account that still has quota instead of waiting for the reset. Spawned by the `StopFailure` hook the instant a turn dies on a limit, and called by the daemon as a backstop. `-D` prints the decision and changes nothing. Exit 0 = a switch was dispatched, 1 = nothing to do (the reason is printed and appended to `events.log`).
 - `ccc toggle-idle` · `ccc tab-symbol` · `ccc tag` · `ccc copilot-usage` · `ccc codex-usage` — mute idle popups / per-repo badge / typed @tags / refresh Copilot usage / refresh the live OpenAI Codex usage.
 - `ccc restart-tui` — restart the running ccc TUI in its own tab (for automations that changed ccc's code/config).
 
@@ -1378,6 +1379,58 @@ On **Linux**, `ccc daemon --install` writes a **systemd `--user`** service + tim
 a `<label>-future-sync.path` unit replaces launchd's `WatchPaths` when a vault feature is
 on. `ccc doctor`'s Daemon section is platform-aware. See
 [linux.md](linux.md) for the full Ubuntu daemon walkthrough.
+
+### Rate-limit failover — switch seats instead of waiting (`auto_switch_on_limit`)
+
+The fast rung of halt recovery, and the one that preempts the reset-based rung below: when
+a session's account hits its session (5 h) or weekly limit mid-turn, ccc relaunches that
+session on another configured account **in its own tab**, conversation intact, and (by
+default) submits `continue` there — the same thing `/cwork-to-cpriv` does by hand, without
+waiting for someone to notice. **Off by default** (`auto_switch_on_limit`, inert on a fresh
+install); it needs a second account in `claude_accounts`.
+
+**The trigger is a hook, not a poller.** Claude Code fires **no `Stop`** for a turn that
+dies on a rate limit (measured 2026-09-09: a session halted at 15:30:48 and its stop-hook
+status log shows the previous chain at 15:26:36, the next only at 15:48). It does fire
+`StopFailure` with `error: "rate_limit"`, carrying `session_id`, `cwd`, `transcript_path`
+and the message — so `ccc hook stop-failure` acts within a second. The daemon pass repeats
+the check as a **backstop** for halts the hook could not serve (a session started before
+the hook was wired, a worker killed at the 10 s hook timeout, a switch refused once because
+background work was in flight). A launchd `StartInterval` is a cadence, not a deadline: the
+backstop is "the next pass", not a guarantee.
+
+**What it refuses, and why:**
+
+- **A transient server 429.** "Server is temporarily limiting requests (not your usage
+  limit)" also arrives as `error: "rate_limit"` — both accounts share that server, so
+  moving is pointless. Only the usage-limit shape in the transcript record counts.
+- **A halt it has already handled.** `is_halted` stays true after the relaunch (it ignores
+  trailing user records) until the first assistant record lands on the new seat, so the halt
+  is identified by its transcript record's `uuid` and claimed exactly once — the hook worker
+  and the daemon backstop race on purpose, and the store's compare-and-swap picks the winner.
+- **An unauthorized target.** Quota is not billing authorization: `auto_switch_targets`
+  (`["private>work", …]`, empty = every configured pair) decides which transitions may
+  happen at all, and the target must be logged in as its `claude_account_emails` identity.
+- **A target with no quota.** One model-scoped `ccc quota` reading filters blocked accounts
+  and ranks the rest by urgency (the allowance that resets soonest is spent first). If every
+  authorized account is capped too, nothing moves and the reset rung below takes over.
+- **A target that does not already trust the cwd.** Automatic recovery **reads**
+  `hasTrustDialogAccepted`, never writes it — granting a second seat permission to execute
+  in a folder no human approved for it is not a machine decision. `auto_switch_trust =
+  "ensure"` opts back into writing it; anything but that literal string means `"require"`.
+- **A session with work in flight, or a human decision already armed.** Background tasks,
+  in-process subagents, a `mark-done --close` or an armed `switch-account` all stand the
+  automation down; a refusal carries a reason-specific backoff and never consumes
+  `auto_switch_max_per_day` (which counts successes only).
+
+The relaunch itself is the ordinary `switch-account <label> -N` path, so every guard it
+already had applies — plus three re-checks immediately before the SIGTERM (the claim is
+still ours, no background work appeared, the session still sits on the SAME halt), because
+the wait for the Stop chain can be minutes long and automatic mode never passes `--force`.
+Every outcome, including every refusal, is one `limit-switch` line in `events.log`.
+
+While a failover owns a session, the reset-based watcher below stands down — in its planner
+**and** in its executor, since that executor reaps the live process and closes its tab.
 
 ### Auto-resume rate-limit-halted sessions
 

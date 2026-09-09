@@ -35,15 +35,18 @@ def _stop_commands(settings: dict) -> list[str]:
 def test_install_hooks_fresh_creates_all_events(_claude_home: Path) -> None:
     assert install.install_hooks() == 0
     settings = _load(_claude_home)
-    for event in (
-        "SessionStart",
-        "UserPromptSubmit",
-        "SessionEnd",
-        "PreCompact",
-        "SubagentStart",  # the in-process subagent counter switch-account reads
-        "SubagentStop",
-    ):
-        assert event in settings["hooks"]
+    # Spec-driven on purpose: a hook event added to HOOK_SPEC but not installed (or an
+    # event installed under a name `ccc hook` does not accept) is the failure mode this
+    # guards — the rate-limit failover's StopFailure hook was exactly that shape.
+    from command_center import hookspec
+
+    for event, _matcher, arg in hookspec.HOOK_SPEC:
+        assert event in settings["hooks"], f"{event} is in HOOK_SPEC but was not installed"
+        commands = [
+            hook["command"] for group in settings["hooks"][event] for hook in group.get("hooks", [])
+        ]
+        assert any(cmd.endswith(f"hook {arg}") for cmd in commands), f"{arg} not wired"
+        assert arg in hookspec.HOOK_EVENTS  # else `ccc hook <arg>` is rejected by argparse
     # PreToolUse + PostToolUse carry their matcher objects.
     pre = settings["hooks"]["PreToolUse"][0]
     assert pre["matcher"] == "Edit|Write|MultiEdit|NotebookEdit"

@@ -102,6 +102,17 @@ _SESSION_COLUMNS = (
     "switch_config_dir",
     "switch_force",
     "switch_prompt",
+    "limit_switch_halt_id",
+    "limit_switch_state",
+    "limit_switch_at",
+    "limit_switch_source",
+    "limit_switch_target",
+    "limit_switch_pid",
+    "limit_switch_pid_start",
+    "limit_switch_reason",
+    "limit_switch_retry_not_before",
+    "limit_switch_day",
+    "limit_switch_successes",
     "active_subagents",
     "last_seen_pid",
     "keep",
@@ -195,6 +206,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     switch_config_dir TEXT    NOT NULL DEFAULT '',
     switch_force      INTEGER NOT NULL DEFAULT 0,
     switch_prompt     TEXT    NOT NULL DEFAULT '',
+    limit_switch_halt_id TEXT NOT NULL DEFAULT '',
+    limit_switch_state TEXT   NOT NULL DEFAULT '',
+    limit_switch_at   INTEGER NOT NULL DEFAULT 0,
+    limit_switch_source TEXT  NOT NULL DEFAULT '',
+    limit_switch_target TEXT  NOT NULL DEFAULT '',
+    limit_switch_pid  INTEGER NOT NULL DEFAULT 0,
+    limit_switch_pid_start TEXT NOT NULL DEFAULT '',
+    limit_switch_reason TEXT  NOT NULL DEFAULT '',
+    limit_switch_retry_not_before INTEGER NOT NULL DEFAULT 0,
+    limit_switch_day  TEXT    NOT NULL DEFAULT '',
+    limit_switch_successes INTEGER NOT NULL DEFAULT 0,
     active_subagents  INTEGER NOT NULL DEFAULT 0,
     last_seen_pid     INTEGER,
     keep              INTEGER NOT NULL DEFAULT 0,
@@ -410,6 +432,11 @@ _WAL_RETRIES = 5
 _WAL_RETRY_SLEEP = 0.03
 
 
+# Claim states that mean "this halt is finished with" — a new claim may take the row, but
+# never for the SAME halt id (handle-once across the hook and the daemon backstop).
+_LIMIT_SWITCH_TERMINAL: tuple[str, ...] = ("started", "failed", "refused", "abandoned")
+
+
 class Store:  # pylint: disable=too-many-public-methods
     """Thin wrapper over the SQLite database."""
 
@@ -516,6 +543,19 @@ class Store:  # pylint: disable=too-many-public-methods
         "switch_force": "INTEGER NOT NULL DEFAULT 0",
         # The prompt the relaunched session submits by itself (`switch-account -p`).
         "switch_prompt": "TEXT NOT NULL DEFAULT ''",
+        # `auto_switch_on_limit`: the per-session failover claim (limitswitch.py). The halt
+        # id + state pair is the ownership token; the rest is the evidence a retry needs.
+        "limit_switch_halt_id": "TEXT NOT NULL DEFAULT ''",
+        "limit_switch_state": "TEXT NOT NULL DEFAULT ''",
+        "limit_switch_at": "INTEGER NOT NULL DEFAULT 0",
+        "limit_switch_source": "TEXT NOT NULL DEFAULT ''",
+        "limit_switch_target": "TEXT NOT NULL DEFAULT ''",
+        "limit_switch_pid": "INTEGER NOT NULL DEFAULT 0",
+        "limit_switch_pid_start": "TEXT NOT NULL DEFAULT ''",
+        "limit_switch_reason": "TEXT NOT NULL DEFAULT ''",
+        "limit_switch_retry_not_before": "INTEGER NOT NULL DEFAULT 0",
+        "limit_switch_day": "TEXT NOT NULL DEFAULT ''",
+        "limit_switch_successes": "INTEGER NOT NULL DEFAULT 0",
         # In-flight IN-PROCESS Agent-tool subagents, kept by the SubagentStart/
         # SubagentStop hook pair (see bump_subagents): the one signal a subagent with
         # no child process and no transcript record yet still shows up in.
@@ -998,6 +1038,173 @@ class Store:  # pylint: disable=too-many-public-methods
             raise
         self.conn.commit()
         return kind, claim
+
+    # ------------------------------------------------------------------ limit failover
+    def claim_limit_switch(  # pylint: disable=too-many-arguments
+        self,
+        session_id: str,
+        *,
+        halt_id: str,
+        source: str,
+        pid: int,
+        pid_start: str,
+        now: int,
+        ttl_ms: int,
+    ) -> bool:
+        """Atomically take ownership of ONE halt's failover. True only for the winner.
+
+        The hook and the daemon backstop observe the same halt, and two hook workers can
+        race on a retried turn; a "no attempt in the last N seconds" timestamp read
+        separately from its write is not ownership (Codex O1). Read and write therefore run
+        in ONE ``BEGIN IMMEDIATE`` transaction, and the token is the halt's IDENTITY, not
+        the session: a claim is granted only when the row carries no claim for this halt id
+        and no LIVE claim for another one.
+
+        A claim older than *ttl_ms* is stale (its worker died between dispatch and outcome)
+        and is taken over; a halt id that already reached a terminal state is never
+        re-claimed, which is what makes a halt handle-once across both triggers.
+        """
+        if self.conn.in_transaction:
+            self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT limit_switch_halt_id, limit_switch_state, limit_switch_at "
+                "FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                self.conn.commit()
+                return False
+            prior_id, prior_state, prior_at = str(row[0] or ""), str(row[1] or ""), int(row[2] or 0)
+            if prior_id == halt_id and prior_state:
+                self.conn.commit()  # this exact halt is owned or already finished
+                return False
+            if (
+                prior_state
+                and prior_state not in _LIMIT_SWITCH_TERMINAL
+                and prior_at > now - ttl_ms
+            ):
+                self.conn.commit()  # another live worker owns a different halt
+                return False
+            self.conn.execute(
+                "UPDATE sessions SET limit_switch_halt_id = ?, limit_switch_state = 'claimed', "
+                "limit_switch_at = ?, limit_switch_source = ?, limit_switch_target = '', "
+                "limit_switch_pid = ?, limit_switch_pid_start = ?, limit_switch_reason = '' "
+                "WHERE session_id = ?",
+                (halt_id, now, source, int(pid), pid_start, session_id),
+            )
+        except sqlite3.Error:
+            self.conn.rollback()
+            raise
+        self.conn.commit()
+        return True
+
+    def limit_switch_owns(self, session_id: str, halt_id: str, states: tuple[str, ...]) -> bool:
+        """True when *session_id*'s failover claim is still for *halt_id* and in *states*.
+
+        The pre-SIGTERM re-check (Codex O6/O16): a claim that was cleared, taken over or
+        already finished while the relauncher waited for the Stop chain must abort the kill.
+        """
+        row = self.conn.execute(
+            "SELECT limit_switch_halt_id, limit_switch_state FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return bool(row) and str(row[0] or "") == halt_id and str(row[1] or "") in states
+
+    def set_limit_switch_state(
+        self,
+        session_id: str,
+        state: str,
+        *,
+        reason: str = "",
+        target: str = "",
+        retry_not_before: int = -1,
+        count_success: bool = False,
+        day: str = "",
+        now: int = 0,
+    ) -> None:
+        """Advance the claim (dispatched / terminated / delivered / started / refused / failed).
+
+        Dispatch is NOT recovery (Codex O7): ``switch-account`` returns success once the
+        detached relauncher is spawned, and that child can still refuse, or terminate Claude
+        and then fail to type the resume. Each stage is therefore recorded separately, and a
+        SUCCESS is the only thing that increments the daily counter — a refusal (background
+        work in flight, target blocked) carries its own ``retry_not_before`` instead, so
+        refusals can never consume the day's switch budget.
+        """
+        sets = ["limit_switch_state = ?", "limit_switch_reason = ?"]
+        params: list[object] = [state, reason]
+        if target:
+            sets.append("limit_switch_target = ?")
+            params.append(target)
+        if retry_not_before >= 0:
+            sets.append("limit_switch_retry_not_before = ?")
+            params.append(retry_not_before)
+        if now:
+            sets.append("limit_switch_at = ?")
+            params.append(now)
+        if count_success and day:
+            row = self.conn.execute(
+                "SELECT limit_switch_day, limit_switch_successes FROM sessions "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            prior_day = str(row[0] or "") if row else ""
+            prior_n = int(row[1] or 0) if row else 0
+            sets += ["limit_switch_day = ?", "limit_switch_successes = ?"]
+            params += [day, (prior_n + 1) if prior_day == day else 1]
+        params.append(session_id)
+        self.conn.execute(
+            f"UPDATE sessions SET {', '.join(sets)} WHERE session_id = ?", tuple(params)
+        )
+        self.conn.commit()
+
+    def arbitrate_now_switch(
+        self, session_id: str, target: str, *, now: int, ttl_ms: int, override: bool
+    ) -> str:
+        """Set the ``-N`` launch expectation, arbitrating a pending arm. "" = ok, else a reason.
+
+        ``switch_config_dir`` is shared: it is both the armed target :meth:`claim_after_turn`
+        fires and the account the resumed session is EXPECTED to start under. Writing it
+        blindly (as the ``--now`` path used to) left a live arm's ``switch_requested_at``,
+        ``switch_force`` and ``switch_prompt`` in place pointing at a NEW target — the next
+        Stop hook would then relaunch with the old arm's force flag and prompt, and a pending
+        ``mark-done --close`` could survive into the resumed session and close its tab
+        (Codex O3). One transaction now decides: with *override* (an explicit human ``-N``)
+        the stale arm is cleared and the expectation set; without it (the AUTOMATIC path) a
+        live arm or close REFUSES the switch — someone else's decision is already in flight.
+        """
+        threshold = now - ttl_ms
+        if self.conn.in_transaction:
+            self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT close_requested_at, switch_requested_at FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            close_at = int(row[0] or 0) if row else 0
+            switch_at = int(row[1] or 0) if row else 0
+            live = ""
+            if close_at > threshold:
+                live = "a close-after-turn is armed for this session (mark-done --close)"
+            elif switch_at > threshold:
+                live = "a switch-after-turn is already armed for this session"
+            if live and not override:
+                self.conn.commit()
+                return live
+            self.conn.execute(
+                "UPDATE sessions SET switch_config_dir = ?, switch_requested_at = 0, "
+                "switch_force = 0, switch_prompt = '', close_requested_at = 0 "
+                "WHERE session_id = ?",
+                (target, session_id),
+            )
+        except sqlite3.Error:
+            self.conn.rollback()
+            raise
+        self.conn.commit()
+        return ""
 
     def pop_switch_expectation(self, session_id: str) -> str:
         """Return and clear the account a claimed ``switch-account`` expected to land on.

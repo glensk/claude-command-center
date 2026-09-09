@@ -451,7 +451,13 @@ def resume_in_new_tab(
 
 
 def resume_halted_in_new_tab(
-    cwd: str, session_id: str, script_path: str, config_dir: str = "", *, no_codex: bool = False
+    cwd: str,
+    session_id: str,
+    script_path: str,
+    config_dir: str = "",
+    *,
+    no_codex: bool = False,
+    require_trust: bool = False,
 ) -> bool:
     """Open a new terminal tab that resumes a rate-limit-halted session.
 
@@ -473,7 +479,18 @@ def resume_halted_in_new_tab(
 
     if not cwd or not os.path.isdir(cwd) or not script_path:
         return False
-    ensure_trusted(config_dir, cwd)
+    if require_trust:
+        # AUTOMATIC recovery never establishes trust — it requires it. Writing
+        # `hasTrustDialogAccepted` on a machine decision grants a seat permission to execute
+        # in a folder no human approved for it (Codex O9/O13); the human-invoked callers keep
+        # the default and still pre-trust, because an unattended launch must not park on the
+        # dialog.
+        from .accounts import is_trusted  # pylint: disable=import-outside-toplevel
+
+        if not is_trusted(config_dir, cwd):
+            return False
+    else:
+        ensure_trusted(config_dir, cwd)
     prefix = session_launch_env_prefix(LaunchTarget(config_dir, no_codex))
     if _launcher_mode() == "tmux":
         return _tmux_window(

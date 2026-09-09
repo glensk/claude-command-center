@@ -581,6 +581,45 @@ def _post_tool_todos(payload: dict[str, Any]) -> int:
     return 0
 
 
+# Claude Code's StopFailure error kinds that mean "this account ran out", not "this request
+# was bad". Only a rate limit can be recovered by moving the session to another seat.
+_FAILOVER_ERRORS = frozenset({"rate_limit"})
+
+
+def handle_stop_failure(payload: dict[str, Any]) -> int:
+    """A turn DIED. When it died on a rate limit, hand the halt to the failover worker.
+
+    This is the only in-session signal that an account ran out mid-turn: Claude Code fires
+    no ``Stop`` for a rate-limit halt (measured 2026-09-09 — the stop-hook status log stays
+    silent across the halt), so without this hook the recovery waits for the daemon pass.
+
+    Deliberately does almost nothing itself. The decision needs the live registry, a quota
+    read and — on success — a relauncher that outlives this process, while the hook runs
+    under a 10 s timeout inside the session that is about to be terminated. So it filters
+    (rate limit, feature on) and spawns the detached worker, which re-reads everything.
+    The spawn is NOT marked ``CCC_INTERNAL``: that marker makes ``switch-account`` refuse.
+    """
+    if str(payload.get("error") or "") not in _FAILOVER_ERRORS:
+        return 0
+    sid = _session_id(payload)
+    if not sid:
+        return 0
+    cwd = str(payload.get("cwd") or "")
+    _log_event(sid, "stop-failure", f"{payload.get('error')} — cwd={cwd}")
+    if not config.load_config().auto_switch_on_limit:
+        return 0
+    from . import spawn  # lazy, like _maybe_grade_after_turn
+
+    args = ["switch-on-limit", "--session", sid]
+    if cwd:
+        args += ["--cwd", cwd]
+    transcript = str(payload.get("transcript_path") or "")
+    if transcript:
+        args += ["--transcript", transcript]
+    spawn.spawn_ccc(args, internal=False)
+    return 0
+
+
 def handle_release_locks(payload: dict[str, Any]) -> int:
     """Release all of the session's file locks — the Stop floor.
 
@@ -740,6 +779,7 @@ _HANDLERS = {
     "pre-tool-use": handle_pre_tool_use,
     "post-tool-use": handle_post_tool_use,
     "stop": handle_stop,
+    "stop-failure": handle_stop_failure,
     "release-locks": handle_release_locks,
     "session-end": handle_session_end,
     "pre-compact": handle_pre_compact,

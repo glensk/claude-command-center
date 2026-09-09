@@ -1245,6 +1245,12 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
         print("error: could not resolve a session (pass -s/--session <id>)", file=sys.stderr)
         return 1
     quiet = args.quiet
+    # Automatic mode (the rate-limit failover, limitswitch.py). It differs from a human
+    # `-N` in exactly three fail-closed ways: --force is impossible, trust is only READ
+    # (never established), and a live manual arm/close REFUSES instead of being overwritten.
+    auto = bool(getattr(args, "auto", False))
+    if auto:
+        args.force = False
     if args.undo:
         with Store() as store:
             row = store.get(session_id)
@@ -1323,6 +1329,19 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
         )
         return 1
     live = alive[0]
+    # A D9 conflict — the id RUNNING under two accounts — must refuse explicitly. It cannot
+    # be caught by `len(alive) > 1` above: `discover()` collapses a group into ONE row
+    # (`_resolve_registry_group`), so that branch is unreachable; the collapsed row instead
+    # carries `conflict=True` with a blanked `config_dir`, which an in-session caller (whose
+    # `current` comes from its own env) would otherwise sail straight past and SIGTERM one of
+    # two live processes (Codex O4). The uncollapsed read below is the evidence.
+    if getattr(live, "conflict", False) or len(_adapter().discover_raw(session_id)) > 1:
+        print(
+            f"error: {session_id} is live under two Claude accounts at once — close one of "
+            "them first",
+            file=sys.stderr,
+        )
+        return 1
     # The account the session bills: inside the session the env is authoritative (and must
     # agree with the registry); from another tab only the registry knows.
     current = accounts.env_config_dir() if inside else (live.config_dir or "")
@@ -1410,7 +1429,13 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
             file=sys.stderr,
         )
         return 1
-    accounts.ensure_trusted(target, cwd)  # the relaunch must not park on the trust dialog
+    # An AUTOMATIC switch never establishes trust: measured on this machine, 111 folders are
+    # trusted for private and 111 for work but only 102 for both, so `ensure_trusted` here
+    # would grant a second seat permission to run in 9 folders no human ever approved
+    # (Codex O9). The human-invoked paths keep the old behaviour, and `auto_switch_trust =
+    # "ensure"` opts back into it deliberately.
+    if not auto or config.auto_switch_trust_policy() == "ensure":
+        accounts.ensure_trusted(target, cwd)  # the relaunch must not park on the trust dialog
     if not accounts.is_trusted(target, cwd):
         print(
             f"error: could not confirm {cwd} is trusted for the {label!r} account — the "
@@ -1485,7 +1510,21 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
         )
         return 1
     with Store() as store:
-        store.update_fields(session_id, switch_config_dir=target)  # the SessionStart expectation
+        # The SessionStart expectation shares `switch_config_dir` with an ARMED
+        # switch-after-turn, so writing it blindly used to leave a live arm's
+        # `switch_requested_at` / `switch_force` / `switch_prompt` pointing at the new target
+        # — the next Stop hook would then relaunch with the old arm's force flag and prompt,
+        # and a pending `mark-done --close` could survive into the resumed session and close
+        # its tab (Codex O3). One transaction arbitrates: an explicit human `-N` supersedes
+        # the arm, the automatic path stands down.
+        from .hooks import CLOSE_REQUEST_TTL_MS  # the arm's own TTL, one definition
+
+        blocked = store.arbitrate_now_switch(
+            session_id, target, now=now_ms(), ttl_ms=CLOSE_REQUEST_TTL_MS, override=not auto
+        )
+    if blocked:
+        print(f"error: {blocked} — refusing to switch automatically", file=sys.stderr)
+        return 1
     spawn_args = [
         "switch-now",
         "--session",
@@ -1507,6 +1546,11 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
         spawn_args += ["--prompt", prompt]
     if args.force:
         spawn_args.append("--force")
+    if auto:
+        spawn_args.append("--auto")
+        halt_id = str(getattr(args, "auto_halt_id", "") or "")
+        if halt_id:
+            spawn_args += ["--halt-id", halt_id]
     if row is not None and row.no_codex:
         spawn_args.append("--no-codex")
     if not spawn.spawn_ccc(spawn_args):
@@ -1527,6 +1571,33 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     if not quiet:
         print(status)
     return 0
+
+
+def cmd_switch_on_limit(args: argparse.Namespace) -> int:
+    """``ccc switch-on-limit`` — the automatic rate-limit failover for one session.
+
+    Spawned detached by the ``StopFailure`` hook (instantly, on the halt) and called by the
+    daemon backstop (for halts whose hook never ran). Both race on purpose: the claim in
+    :func:`limitswitch.run` decides which one acts, so the same halt is never recovered
+    twice. Exit 0 = a switch was dispatched, 1 = nothing to do (the reason is printed).
+    """
+    from pathlib import Path
+
+    from . import limitswitch
+
+    session_id = resolve_session_id(_adapter(), args.session, None)
+    if not session_id:
+        print("error: could not resolve a session (pass -s/--session <id>)", file=sys.stderr)
+        return 1
+    transcript = Path(args.transcript) if getattr(args, "transcript", "") else None
+    switched, detail = limitswitch.run(
+        session_id,
+        getattr(args, "cwd", "") or "",
+        transcript_path=transcript,
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    print(f"{'switched' if switched else 'no switch'}: {detail}")
+    return 0 if switched else 1
 
 
 def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements,too-many-locals,too-many-branches,too-many-statements
@@ -1697,6 +1768,37 @@ def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     invalid = target_still_valid()
     if invalid:
         return fail(invalid)
+    # (6c) AUTOMATIC switches only: the decision was taken by a worker, not a human, and the
+    # wait above can be minutes long. Nothing may be killed on a stale decision (Codex O6),
+    # so re-verify the three things that can have changed since: the failover claim is still
+    # ours, no background work appeared, and the session is still sitting on THE SAME halt —
+    # a new turn (the user typed something, an auto-retry succeeded) means the limit is no
+    # longer what this process is recovering from.
+    if getattr(args, "auto", False):
+        halt_id = (getattr(args, "halt_id", "") or "").strip()
+        adapter = _adapter()
+        with Store() as store:
+            in_process = store.active_subagents(session_id)
+            owned = (
+                store.limit_switch_owns(session_id, halt_id, ("claimed", "dispatched"))
+                if halt_id
+                else True
+            )
+        if not owned:
+            return fail("the failover claim is no longer ours (another worker took over)")
+        reasons = _background_work(
+            adapter,
+            pid,
+            adapter.transcript_path(cwd, session_id, source),
+            active_subagents=in_process,
+        )
+        if reasons:
+            return fail("background work appeared during the wait: " + "; ".join(reasons))
+        record = adapter.halt_record(cwd, session_id, source)
+        if record is None:
+            return fail("the session is no longer halted — nothing to recover")
+        if halt_id and str(record.get("uuid") or "") != halt_id:
+            return fail("a different halt is now current — re-deciding rather than killing")
     # (7) Terminate, and wait for the process to be gone.
     try:
         os.kill(pid, signal.SIGTERM)
@@ -4680,6 +4782,13 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         help="with -N from a slash command's inline `!` expansion: exit 1 after spawning "
         "the relauncher so Claude Code cancels the prompt (no model request at all)",
     )
+    p_switch.add_argument(
+        "-A",
+        "--auto",
+        action="store_true",
+        help="automatic (rate-limit failover) mode: never --force, trust is only READ, and a "
+        "live manual arm/close refuses the switch instead of being overwritten",
+    )
     p_switch.set_defaults(func=cmd_switch_account)
 
     p_switchnow = sub.add_parser(
@@ -4723,7 +4832,44 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         default="",
         help="prompt to append to the typed resume so the session continues by itself",
     )
+    p_switchnow.add_argument(
+        "-A",
+        "--auto",
+        action="store_true",
+        help="the rate-limit failover decided this: re-check claim, background work and the "
+        "halt itself immediately before the kill",
+    )
+    p_switchnow.add_argument(
+        "-H", "--halt-id", default="", help="with --auto: the halt record this recovery owns"
+    )
     p_switchnow.set_defaults(func=cmd_switch_now)
+
+    p_onlimit = sub.add_parser(
+        "switch-on-limit",
+        help="move a rate-limit-halted session to an account that still has quota "
+        "(the StopFailure hook's worker; also the daemon backstop)",
+        description=(
+            "Decide and perform the automatic account failover for ONE halted session.\n\n"
+            "  ccc switch-on-limit -s <id> -D    what it WOULD do, changing nothing\n"
+            "  ccc switch-on-limit -s <id>       claim the halt and relaunch on the other seat\n\n"
+            "Refuses (with the reason) when the halt is a transient server 429 rather than a "
+            "usage limit, when every authorized account is rate-limited too, when the target "
+            "does not already trust the cwd, when background work is in flight, or when "
+            "another worker already owns the halt."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_onlimit.add_argument("-s", "--session", default="", help="the halted session id")
+    p_onlimit.add_argument(
+        "-c", "--cwd", default="", help="its working directory (else: the registry's)"
+    )
+    p_onlimit.add_argument(
+        "-t", "--transcript", default="", help="its transcript path (the hook payload carries it)"
+    )
+    p_onlimit.add_argument(
+        "-D", "--dry-run", action="store_true", help="print the decision, change nothing"
+    )
+    p_onlimit.set_defaults(func=cmd_switch_on_limit)
 
     p_keep = sub.add_parser("keep", help="exempt a session from the idle reaper (--off to clear)")
     p_keep.add_argument("--session")
