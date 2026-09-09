@@ -28,10 +28,104 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(
+    request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin ``$HOME`` AND ``Path.home()`` under ``tmp_path`` for every test.
+
+    ``CLAUDE_HOME`` / ``CODEX_HOME`` were already pinned below, but the Codex SEAT
+    registry does not read either: ``quota._canonical_codex_homes`` calls ``Path.home()``
+    directly and hard-codes ``$HOME/.codex`` as the ``default`` seat. So on any machine
+    with real Codex logins the seat ranking under test silently included the developer's
+    own seats — the tp#212 failure exactly: two pin tests ranked the real ``~/.codex``
+    ahead of their fixture pin and failed on that machine only.
+
+    ``CCC_HOME`` is pinned too, so ``config.app_home()`` (the cooldown store, the seat
+    attempt ledger) never lands in the real tree. The config memo and the per-home Codex
+    caches are dropped, because both are keyed on paths this fixture has just moved.
+
+    Opt out with ``@pytest.mark.real_home`` — ONLY for a test that genuinely cannot be
+    made hermetic.
+    """
+    if request.node.get_closest_marker("real_home"):
+        return
+    # Deliberately NOT ``tmp_path / "home"``: several tests build their own fake ``home``
+    # dir there and would collide with this one.
+    home = tmp_path / "_isolated_home"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CCC_HOME", str(tmp_path / "ccc-home"))
+    # Resolved from ``$HOME`` on every call, not frozen: a test that re-points ``$HOME``
+    # itself (``three_seats``, the ``resolve_workdir`` guards) must still be believed.
+    monkeypatch.setattr(
+        Path, "home", classmethod(lambda _cls: Path(os.environ.get("HOME") or home))
+    )
+    from command_center import config as _config
+    from command_center import usage as _usage
+
+    _config.invalidate_config_cache()
+    _usage._codex_cache.clear()  # noqa: SLF001
+    _usage._codex_email_cache.clear()  # noqa: SLF001
+
+
+def _under_tmp(path: Path, roots: tuple[Path, ...]) -> bool:
+    """True when *path* lives under one of the throwaway *roots*."""
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:  # pragma: no cover - resolve() fails only on exotic filesystems
+        resolved = Path(str(path))
+    return any(resolved == root or root in resolved.parents for root in roots)
+
+
+@pytest.fixture(autouse=True)
+def _guard_real_codex_reads(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail loudly when a test reads a Codex home outside the throwaway roots.
+
+    :func:`_isolate_home` prevents the leak; this proves it. Every reader that touches a
+    ``CODEX_HOME`` (rollout files, ``auth.json``, the live usage cache) is wrapped, so a
+    future refactor that reintroduces a bare ``Path.home()/".codex"`` read fails a test
+    instead of quietly re-reading the developer's real credentials.
+    """
+    if request.node.get_closest_marker("real_home"):
+        return
+    from command_center import codex_in_claude as _cic
+    from command_center import usage as _usage
+
+    roots = (
+        tmp_path_factory.getbasetemp().resolve(),
+        Path("/private/tmp").resolve(),
+        Path("/tmp").resolve(),  # noqa: S108  # the pytest basetemp itself lives here
+    )
+
+    def _wrap(module: object, name: str, home_arg: int) -> None:
+        original = getattr(module, name)
+
+        def guarded(*args: object, **kwargs: object) -> object:
+            home = kwargs.get("home")
+            if home is None and len(args) > home_arg:
+                home = args[home_arg]
+            if isinstance(home, Path) and not _under_tmp(home, roots):
+                raise AssertionError(f"test read a Codex home outside tmp: {home}")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, guarded)
+
+    _wrap(_usage, "read_codex_usage", 1)
+    _wrap(_usage, "read_codex_live", 0)
+    _wrap(_usage, "codex_account_email", 0)
+    _wrap(_cic, "_codex_rate_snapshot", 0)
 
 
 @pytest.fixture(autouse=True)
@@ -246,6 +340,58 @@ class SeatFixture:
         ]
         path.write_text("\n".join([*lines, f"codex_seat_order = [{ranked}]"]) + "\n", "utf-8")
         _config.invalidate_config_cache()
+
+    def measure(self, *labels: str, used_pct: float = 20.0, week_offset: int = 5 * 86400) -> None:
+        """Leave a fresh 5h + weekly reading in each named seat's rollouts (all = every seat).
+
+        A seat with no weekly window is UNMEASURED, and since the fill policy landed a
+        WRITE run refuses to start on one (plan D5) — a seat that might refuse mid-edit
+        leaves a worktree to review. Tests about write behaviour therefore need seats
+        that are measurably healthy; tests about ROUTING deliberately leave them
+        unmeasured, which is the fixture's default.
+        """
+        now = int(time.time())
+        for label in labels or tuple(self.seats):
+            day = self.seats[label] / "sessions" / "2026" / "09" / "09"
+            day.mkdir(parents=True, exist_ok=True)
+            (day / "rollout-2026-09-09T09-00-00-measure.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "rate_limits": {
+                                "primary": {
+                                    "used_percent": used_pct,
+                                    "resets_at": now + 3600,
+                                    "window_minutes": 300,
+                                },
+                                "secondary": {
+                                    "used_percent": used_pct,
+                                    "resets_at": now + week_offset,
+                                    "window_minutes": 10080,
+                                },
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        from command_center import usage as _usage
+
+        _usage._codex_cache.clear()  # noqa: SLF001
+
+    def forget_attempts(self) -> None:
+        """Wipe the per-seat attempt ledger — the fill policy's round-robin memory.
+
+        A second PHASE in one test is a fresh scenario, but the ledger is not: an
+        attempt recorded by phase 1 moves phase 2's probe onto another seat. Clearing it
+        makes the phase start from the canonical ranking again.
+        """
+        from command_center import quota as _quota
+
+        _quota._seat_attempts_path().unlink(missing_ok=True)  # noqa: SLF001
 
     def reset_log(self) -> None:
         """Forget every recorded fake-codex call (a second phase in one test)."""

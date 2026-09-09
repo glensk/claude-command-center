@@ -225,7 +225,7 @@ def run_codex(prompt: str, model: str = "") -> str | None:
     Shells out to OpenAI's Codex CLI instead of ``claude`` so cheap derived text (the
     short-AIM label) costs Codex/ChatGPT quota, not Claude tokens. It goes through the
     ONE runner (:func:`command_center.codex_in_claude.run_with_fallback`), so this
-    call gets the same seat order and run-time fallback as every other Codex use: a
+    call gets the same seat policy and run-time fallback as every other Codex use: a
     held or refusing seat is skipped, not discovered by failing on it.
 
     The launch policy itself is :mod:`command_center.codex_launch`: the named
@@ -235,8 +235,12 @@ def run_codex(prompt: str, model: str = "") -> str | None:
     so it leaves no session file, and one ``-c mcp_servers.<name>.enabled=false`` per
     server THAT SEAT declares so no MCP handshake can hang it. It deliberately does NOT
     pass ``--ignore-user-config``: that would also drop the permission profiles this run
-    depends on. The final assistant message is captured cleanly via
-    ``--output-last-message``; the prompt travels on stdin. Never raises: any failure
+    depends on. ``--ephemeral`` is conditional since 2026-09-09 (plan D6, debate O2):
+    the ``--json`` stream carries no ``rate_limits``, so with the ``codex_usage`` opt-in
+    OFF the rollout file is the only record of what this call cost its seat, and the
+    ``fill`` policy needs that measurement to route the next one. The final assistant
+    message is captured cleanly via ``--output-last-message``; the prompt travels on
+    stdin. Never raises: any failure
     (no ``codex`` on PATH, a refused launch, no eligible seat, non-zero exit, timeout)
     returns ``None`` so callers fall back to the full AIM. Empty *model* lets Codex pick
     its default model.
@@ -260,7 +264,7 @@ def run_codex(prompt: str, model: str = "") -> str | None:
                 "--json",
                 *perm_args,
                 *mcp_args,
-                "--ephemeral",
+                *(["--ephemeral"] if codex_in_claude.ephemeral_default() else []),
                 "--skip-git-repo-check",
                 "-C",
                 workdir,

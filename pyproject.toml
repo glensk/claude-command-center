@@ -65,5 +65,6 @@ no_implicit_optional = true
 testpaths = ["tests"]
 markers = [
     "slow: end-to-end tests that build a wheel + spin a sandbox (deselect with -m 'not slow')",
+    "real_home: opt OUT of the tmp-HOME isolation in tests/conftest.py (see _isolate_home)",
 ]
 

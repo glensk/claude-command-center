@@ -163,6 +163,11 @@ _WHAM_SEVEN_DAY_SEC = 7 * 86400
 _APPSERVER_INIT_ID = 1
 _APPSERVER_LIMITS_ID = 2
 _APPSERVER_TIMEOUT_SEC = 20
+# Default HTTP timeout for the live Codex usage endpoint. A caller fetching inside a
+# budget (the Codex runner's best-effort refresh, plan D6) passes a smaller one; below
+# _APPSERVER_TIMEOUT_SEC the 401/403 app-server fallback cannot finish within it and is
+# skipped rather than started.
+_WHAM_TIMEOUT_SEC = 15.0
 # (auth.json path, mtime_ns) -> the account e-mail parsed out of its id_token JWT. The
 # TUI asks for both cards' titles on every 5 s tick, so the decode is memoized on the
 # file's own mtime and re-runs only when `codex login` rewrites it.
@@ -237,6 +242,12 @@ class Usage:  # pylint: disable=too-many-instance-attributes  # flat snapshot re
     live: bool = False
     email: str = ""  # account the figures belong to (live payload / auth.json JWT)
     plan_type: str = ""  # e.g. "team" / "plus" — as reported by the live payload
+    # Codex/rollout only: the newest ``rate_limits`` event carried a non-null window
+    # whose duration could not be determined, so the figures below may be missing a
+    # window entirely. ROUTING ignores it (an unmeasurable seat stays runnable —
+    # fail-open), the offload gate fails CLOSED on it (plan D4). Live snapshots, whose
+    # windows are duration-labelled by the endpoint itself, never set it.
+    malformed: bool = False
 
     def is_empty(self) -> bool:
         return self.five_hour is None and self.seven_day is None
@@ -1386,12 +1397,18 @@ def _parse_wham_usage(data: object, now: int) -> Usage | None:
     )
 
 
-def _get_wham_usage_body(token: str, account_id: str) -> tuple[str | None, int]:
+def _get_wham_usage_body(
+    token: str, account_id: str, timeout: float = _WHAM_TIMEOUT_SEC
+) -> tuple[str | None, int]:
     """GET the live usage endpoint as ``(body, http_status)``; never raises.
 
     ``status`` is the HTTP code on an HTTP error (401/403 = the token needs refreshing,
     which is what triggers the ``codex app-server`` fallback), ``200`` on success and
     ``0`` for a transport-level failure.
+
+    *timeout* is capped by a caller fetching inside a budget (the runner's pre-selection
+    refresh, plan D6 / debate O13): a best-effort measurement must never eat the run's
+    own deadline.
     """
     req = urllib.request.Request(  # noqa: S310  # fixed https:// endpoint
         _WHAM_USAGE_URL,
@@ -1403,7 +1420,9 @@ def _get_wham_usage_body(token: str, account_id: str) -> tuple[str | None, int]:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310  # fixed https://
+        with urllib.request.urlopen(  # noqa: S310  # fixed https://
+            req, timeout=max(1.0, float(timeout))
+        ) as resp:
             return resp.read().decode("utf-8"), 200
     except urllib.error.HTTPError as err:
         return None, int(err.code)
@@ -1532,7 +1551,9 @@ def _write_codex_usage(home: Path, snap: Usage, now: int) -> None:
         pass
 
 
-def fetch_codex_usage(home: Path | None = None, now: int | None = None) -> Usage | None:
+def fetch_codex_usage(
+    home: Path | None = None, now: int | None = None, *, timeout: float | None = None
+) -> Usage | None:
     """Fetch *home*'s live Codex usage and cache it; ``None`` on any failure.
 
     Token from ``<home>/auth.json`` → HTTPS GET :data:`_WHAM_USAGE_URL` →
@@ -1541,20 +1562,28 @@ def fetch_codex_usage(home: Path | None = None, now: int | None = None) -> Usage
     :func:`_fetch_codex_usage_appserver` (which refreshes and writes the token back).
     Best-effort throughout: a missing/API-key ``auth.json``, an HTTP or timeout error, or
     a malformed body all return ``None`` with NO write, so callers keep the last cache.
+
+    *timeout* caps the HTTP call for a caller fetching inside a budget (plan D6, debate
+    O13). When one is given and is smaller than the app-server fallback's own need
+    (:data:`_APPSERVER_TIMEOUT_SEC`) that fallback is SKIPPED rather than started: a
+    ~20 s subprocess launched under a 5 s budget cannot finish and only steals the
+    caller's remaining time. A caller that passes NO timeout is not on a budget, so it
+    keeps the fallback (this is the out-of-band refresh path, unchanged).
     """
     home = config.codex_home() if home is None else home
     now = int(time.time()) if now is None else now
     tokens = _codex_auth_tokens(home)
     if tokens is None:
         return None
-    body, status = _get_wham_usage_body(*tokens)
+    budget = _WHAM_TIMEOUT_SEC if timeout is None else float(timeout)
+    body, status = _get_wham_usage_body(*tokens, timeout=budget)
     snap: Usage | None = None
     if body is not None:
         try:
             snap = _parse_wham_usage(json.loads(body), now)
         except (json.JSONDecodeError, ValueError):
             return None
-    elif status in (401, 403):
+    elif status in (401, 403) and (timeout is None or budget >= _APPSERVER_TIMEOUT_SEC):
         snap = _fetch_codex_usage_appserver(home, now)
     if snap is None:
         return None
@@ -1668,6 +1697,7 @@ def _codex_rollout_snapshot(files: list[Path], now: int) -> Usage | None:
         captured_at=freshest.captured_at or now,
         five_hour=windows.get(_FIVE_HOUR_MINUTES),
         seven_day=windows.get(_SEVEN_DAY_MINUTES),
+        malformed=freshest.malformed,
     )
 
 
@@ -1695,6 +1725,7 @@ def _staple_refusal(snapshot: Usage | None, refusal: object, now: int) -> Usage:
         live=snapshot.live if snapshot is not None else False,
         email=snapshot.email if snapshot is not None else "",
         plan_type=snapshot.plan_type if snapshot is not None else "",
+        malformed=snapshot.malformed if snapshot is not None else False,
     )
 
 

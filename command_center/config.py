@@ -23,6 +23,7 @@ import copy
 import datetime
 import os
 import re
+import sys
 import tempfile
 import tomllib
 from dataclasses import dataclass, field
@@ -122,6 +123,15 @@ DEFAULTS: dict[str, object] = {
     # Settings -> Usage page shows) with the token in `$CODEX_HOME/auth.json`, instead of
     # only replaying the rate_limits blocks Codex leaves in its rollout files (which are
     # as old as the last Codex turn). RENDER stays gated by usage_card_codex/_codex_private.
+    #
+    # It is ALSO the Codex routing FEEDBACK switch (plan D6, tp#212). ON: the runner
+    # refreshes the attempted seat's live figures after every attempt (and every stale
+    # candidate once, before selection), so ``codex_seat_policy = "fill"`` re-ranks on
+    # fresh evidence. OFF: ``codex-in-claude run`` and ``llm.run_codex`` drop
+    # ``--ephemeral`` (they stay UNJOURNALLED) so codex's own rollout file carries the
+    # ``rate_limits`` block that measures the seat — the ``codex exec --json`` stream
+    # carries none (verified live 2026-09-09, debate O2). ``run --ephemeral`` forces the
+    # old, unmeasurable behaviour back.
     "codex_usage": False,  # fetch the live chatgpt.com Codex usage endpoint (INERT: off)
     "codex_usage_refresh_sec": 600,  # min sec between idle live Codex usage fetches per home
     # While any job is WORKING/SNOOZED the fetch throttle drops to this shorter "active"
@@ -142,9 +152,23 @@ DEFAULTS: dict[str, object] = {
     # ``codex_homes_extra`` label), e.g. ``["private", "de", "default"]``. Empty (the
     # default) = the canonical order default -> private -> extras. Unknown labels are
     # ignored; a configured seat missing from the list is appended in canonical order.
-    # A non-empty order makes the ``codex-in-claude home`` account pin INERT for
-    # selection — an explicit order is the stronger statement.
+    # Under the default ``fill`` policy this is the TIEBREAK / display order; under
+    # ``order`` it is the ranking itself, and a non-empty order then makes the
+    # ``codex-in-claude home`` account pin INERT for selection.
     "codex_seat_order": [],
+    # HOW the seats are ranked (the maintainer's routing ruling, 2026-09-09):
+    #
+    # ``fill``  (the default) — spend the seat whose WEEKLY allowance resets soonest, so
+    #   an allowance that is about to renew is used up instead of wasted. Seats whose
+    #   weekly resets fall within 12 h of each other are one cohort and are filled
+    #   equally (least-used first, then round-robin); ``codex_seat_order`` is only the
+    #   deterministic tiebreak and the display order.
+    # ``order`` — the strict 2026-09-04 behaviour: try the seats in ``codex_seat_order``,
+    #   full stop. Kept as the operational escape hatch.
+    #
+    # Anything else falls back to ``fill`` with one stderr note. Set it with
+    # ``codex-in-claude policy fill|order`` (or ``ai set codex-policy``).
+    "codex_seat_policy": "fill",
     # Multi-account Claude Code. ``claude_accounts`` maps labels to config dirs, one
     # ``"label=path"`` entry per line (list[str] so save_config round-trips it). Empty
     # (the default) ⇒ a single ``{"private": claude_home()}`` account, i.e. today's
@@ -413,6 +437,35 @@ def codex_seat_order() -> list[str]:
         if label and label not in seen:
             seen.append(label)
     return seen
+
+
+# ``codex_seat_policy`` is read on every seat ranking (several times per run); a
+# misspelled value must be reported, but not once per call.
+_SEAT_POLICY_WARNED = False
+CODEX_SEAT_POLICIES = ("fill", "order")
+
+
+def codex_seat_policy() -> str:
+    """How the Codex seats are RANKED: ``"fill"`` (the default) or ``"order"``.
+
+    ``fill`` spends the seat whose weekly allowance resets soonest — the closer a seat
+    is to its reset, the more of its unused allowance is about to be thrown away.
+    ``order`` is the strict 2026-09-04 behaviour, kept as the escape hatch.
+
+    An unrecognised value degrades to ``fill`` with ONE stderr note rather than raising:
+    a typo in a config key must not take every Codex consumer on the machine offline.
+    """
+    global _SEAT_POLICY_WARNED  # pylint: disable=global-statement
+    raw = str(load_config().codex_seat_policy or "").strip().lower()
+    if raw in CODEX_SEAT_POLICIES:
+        return raw
+    if not _SEAT_POLICY_WARNED:
+        _SEAT_POLICY_WARNED = True
+        print(
+            f"⚠️  codex_seat_policy={raw!r} is not fill|order — using fill",
+            file=sys.stderr,
+        )
+    return "fill"
 
 
 def unknown_config_keys() -> list[str]:
@@ -731,6 +784,7 @@ class Config:
     codex_home_private: str = ""  # second CODEX_HOME ("" = no second Codex card)
     codex_homes_extra: list[str] = field(default_factory=list)  # "label=path" per extra login
     codex_seat_order: list[str] = field(default_factory=list)  # seat labels, "" = canonical order
+    codex_seat_policy: str = "fill"  # "fill" (resets-soonest first) | "order" (strict)
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
     subscription_ends: list[str] = field(default_factory=list)  # "card=YYYY-MM-DD|auto"

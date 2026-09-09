@@ -12,6 +12,7 @@ import json
 import os
 import stat
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
@@ -35,9 +36,49 @@ def _git_repo(path: Path) -> Path:
     return path
 
 
+def _measurable_seat(home: Path) -> None:
+    """Make *home* look like a LOGGED-IN seat with a fresh weekly reading.
+
+    Since the fill routing landed (tp#212) a ``--write`` run refuses to start on a seat
+    whose weekly window is unknown (plan D5), so a fixture home that stands in for a real
+    login needs an ``auth.json`` and one populated ``rate_limits`` event — otherwise the
+    launch-policy tests fail on routing instead of on what they assert.
+    """
+    now = int(time.time())
+    (home / "auth.json").write_text("{}", encoding="utf-8")
+    day = home / "sessions" / "2026" / "09" / "09"
+    day.mkdir(parents=True, exist_ok=True)
+    (day / "rollout-fixture.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "timestamp": now,
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 5.0,
+                            "resets_at": now + 3600,
+                            "window_minutes": 300,
+                        },
+                        "secondary": {
+                            "used_percent": 5.0,
+                            "resets_at": now + 5 * 86400,
+                            "window_minutes": 10080,
+                        },
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _write_config(home: Path, *, hardened_rw: bool = False, mcp: tuple[str, ...] = ()) -> Path:
     """Write a minimal ``$CODEX_HOME/config.toml`` and return the home dir."""
     home.mkdir(parents=True, exist_ok=True)
+    _measurable_seat(home)
     text = (
         'default_permissions = "hardened-ro"\n\n[permissions.hardened-ro]\nextends = ":read-only"\n'
     )

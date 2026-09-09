@@ -7,7 +7,10 @@ failure mode is silent:
 * a seat missing from the configured list is still tried (appended), and a label naming
   no login is reported rather than dropping a real seat to nowhere;
 * the account pin is INERT once an explicit order exists — two competing "use this seat"
-  knobs is how a run ends up on a seat nobody chose;
+  knobs is how a run ends up on a seat nobody chose. Since 2026-09-09 that rule belongs
+  to the ``order`` POLICY only (plan D1/D3): under the default ``fill`` the order is a
+  tiebreak, so it cannot outrank a pin. Tests that assert the strict behaviour therefore
+  pin ``config.codex_seat_policy`` to ``"order"`` explicitly;
 * writing the order never eats config keys ccc does not know (`save_config` re-emits only
   `DEFAULTS`), and never leaves a stale pin behind.
 """
@@ -53,6 +56,7 @@ def test_resolve_seat_order_appends_missing_dedupes_and_reports_unknown(tmp_path
 def test_codex_seat_candidates_honour_the_order_and_skip_blocked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(config, "codex_seat_policy", lambda: "order")
     monkeypatch.setattr(config, "codex_seat_order", lambda: ["private", "de", "default"])
     rows = [_row("codex", "default"), _row("codex:private", "private"), _row("codex:de", "de")]
     order = quota.codex_seat_order_labels(_homes(tmp_path))
@@ -70,13 +74,25 @@ def test_codex_seat_candidates_honour_the_order_and_skip_blocked(
 
 
 def test_pin_leads_only_while_no_order_is_configured(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The pin is a preference; an explicit order is an instruction that outranks it."""
+    """Under `order`, the pin is a preference and an explicit order outranks it."""
+    monkeypatch.setattr(config, "codex_seat_policy", lambda: "order")
     rows = [_row("codex", "default"), _row("codex:private", "private"), _row("codex:de", "de")]
     order = ["private", "de", "default"]
     monkeypatch.setattr(config, "codex_seat_order", lambda: [])
     assert quota.codex_seat_candidates(rows, "de", order)[0].id == "codex:de"
     monkeypatch.setattr(config, "codex_seat_order", lambda: list(order))
     assert quota.codex_seat_candidates(rows, "de", order)[0].id == "codex:private"
+
+
+def test_pin_leads_under_fill_even_with_an_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Under `fill` the order is only a tiebreak, so it cannot disarm the pin (plan D3)."""
+    monkeypatch.setattr(config, "codex_seat_policy", lambda: "fill")
+    rows = [_row("codex", "default"), _row("codex:private", "private"), _row("codex:de", "de")]
+    order = ["private", "de", "default"]
+    monkeypatch.setattr(config, "codex_seat_order", lambda: list(order))
+    ranked = quota.rank_codex_seats(rows, "de", order, now=_NOW, attempts={})
+    assert ranked[0].row.id == "codex:de"
+    assert ranked[0].reason == "pin"
 
 
 def test_select_codex_account_keeps_its_two_argument_contract(
@@ -186,7 +202,14 @@ def test_snapshot_carries_the_ranked_seat_order_and_next_attempt(
         "windows",
         "note",
         "pinned",
+        # additive since 2026-09-09 (plan D9) — the fill policy's own vocabulary
+        "cohort",
+        "measured",
+        "probe",
+        "rank_reason",
+        "malformed",
     }
+    assert snap["codex_seat_policy"] == "fill"
     assert rows[0]["state"] == quota.BLOCKED
     assert rows[1]["email"] == "de@example.org"
     assert "codex_pin" not in snap  # no pin set
@@ -204,7 +227,7 @@ def test_quota_footer_names_the_ladder_and_the_next_attempt(
     )
     assert cli.main(["quota"]) == 0
     out = capsys.readouterr().out
-    assert "codex seats: 1 private ⛔ (hold) → 2 de ❔ → 3 default ❔" in out
+    assert "codex seats [fill]: 1 private ⛔ (hold) → 2 de ❔ → 3 default ❔" in out
     assert "next attempt: codex:de" in out
     _ = three_seats
 
@@ -223,16 +246,23 @@ def test_quota_footer_reports_none_eligible_with_the_earliest_reset(
     _ = three_seats
 
 
-def test_quota_footer_flags_an_ignored_pin_and_a_note(
+def test_quota_footer_honours_the_pin_under_fill_and_flags_it_under_order(
     three_seats: SeatFixture, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The footer must say which knob actually governs — it differs per policy (D1/D3)."""
     cic.save_config({"codex_home": str(three_seats.seats["de"]), "codex_home_until": None})
     monkeypatch.setattr(config, "subscription_end_map", lambda: {"codex_private": "2020-01-31"})
     assert cli.main(["quota"]) == 0
     out = capsys.readouterr().out
-    assert "pin: de (ignored: explicit order set)" in out
+    assert "pin: de until ∞" in out  # fill: the order is a tiebreak, the pin governs
     assert "⚠ private: renewal date 2020-01-31 passed" in out
     assert "change: codex-in-claude order <label…>" in out
+
+    monkeypatch.setattr(config, "codex_seat_policy", lambda: "order")
+    assert cli.main(["quota"]) == 0
+    out = capsys.readouterr().out
+    assert "codex seats [order]:" in out
+    assert "pin: de (ignored: explicit order set)" in out
 
 
 # ── the `order` CLI ───────────────────────────────────────────────────────────────
@@ -253,10 +283,12 @@ def test_order_show_lists_every_seat_ranked(
     )
     assert cic.cmd_order(_order()) == cic.EX_OK
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    assert lines[0].startswith("1  private")
-    assert "⛔ blocked" in lines[0] and "hold: private held" in lines[0] and "unblocks" in lines[0]
-    assert lines[1].startswith("2  de") and "← next attempt" in lines[1]
-    assert lines[2].startswith("3  default")
+    assert lines[0].startswith("policy: fill —")  # the ranking rule, before the table
+    assert lines[1].startswith("1  private")
+    assert "⛔ blocked" in lines[1] and "hold: private held" in lines[1] and "unblocks" in lines[1]
+    assert lines[2].startswith("2  de") and "← next attempt" in lines[2]
+    assert "unmeasured" in lines[2] or "cohort" in lines[2]  # the rank_reason column
+    assert lines[3].startswith("3  default")
     _ = three_seats
 
 
@@ -267,7 +299,8 @@ def test_order_set_persists_clears_the_pin_and_shows_the_table(
     assert cic.cmd_order(_order(labels=["de", "default", "private"])) == cic.EX_OK
     out = capsys.readouterr().out
     assert "pin cleared (order is authoritative)" in out
-    assert "codex seat order: de → default → private" in out
+    # under `fill` the order is named for what it is: a tiebreak
+    assert "codex seat tiebreak order: de → default → private" in out
     assert config.codex_seat_order() == ["de", "default", "private"]
     assert cic.load_config()["codex_home"] is None
     # the other config keys survived the rewrite
@@ -327,9 +360,16 @@ def test_order_json_shape(three_seats: SeatFixture, capsys: pytest.CaptureFixtur
     assert payload["configured"] == ["private", "ghost"]
     assert payload["order"] == ["private", "default", "de"]  # unlisted seats appended
     assert payload["unknown"] == ["ghost"]
-    assert payload["next_attempt"] == "codex:private"
+    assert payload["policy"] == "fill"
+    assert payload["next_attempt"] == "codex:de"  # fill: the registered pin governs
     assert [c["rank"] for c in payload["candidates"]] == [1, 2, 3]
-    assert payload["pin"] == {"label": "de", "until": "2099-01-01", "active": False}
+    assert payload["candidates"][0]["reason"] == "pin"
+    assert payload["pin"] == {
+        "label": "de",
+        "until": "2099-01-01",
+        "active": True,
+        "inert_because": "",
+    }
 
 
 def test_order_show_reports_unknown_labels(
@@ -349,24 +389,42 @@ def test_order_show_reports_unknown_labels(
 
 # ── the `home` CLI under an order ─────────────────────────────────────────────────
 def test_home_json_carries_order_candidates_and_pin_state(
-    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cic.save_config({"codex_home": str(three_seats.seats["de"]), "codex_home_until": "2099-01-01"})
+    monkeypatch.setattr(config, "codex_seat_policy", lambda: "order")
     assert cic.cmd_home(argparse.Namespace(path=None, until=None, clear=False, json=True)) == (
         cic.EX_OK
     )
     payload = json.loads(capsys.readouterr().out)
     assert payload["schema_version"] == 1
     assert payload["order"] == ["private", "de", "default"]
+    assert payload["policy"] == "order"
     assert payload["pin_active"] is False  # an explicit order makes the pin inert
     assert payload["home"] == payload["candidates"][0]["home"] == str(three_seats.seats["private"])
     assert payload["label"] == "private"
     assert payload["source"] == "codex_seat_order"
 
 
-def test_home_warns_when_a_pin_is_set_under_an_order(
+def test_home_json_under_fill_lets_the_registered_pin_govern(
     three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Same config, `fill` policy: the pin leads and `source` says so (plan D3)."""
+    cic.save_config({"codex_home": str(three_seats.seats["de"]), "codex_home_until": "2099-01-01"})
+    assert cic.cmd_home(argparse.Namespace(path=None, until=None, clear=False, json=True)) == (
+        cic.EX_OK
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["policy"] == "fill"
+    assert payload["pin_active"] is True
+    assert payload["home"] == str(three_seats.seats["de"])
+    assert payload["source"].startswith("config pin")
+
+
+def test_home_warns_when_a_pin_is_set_under_an_order(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config, "codex_seat_policy", lambda: "order")
     args = argparse.Namespace(
         path=str(three_seats.seats["de"]), until=None, clear=False, json=False
     )

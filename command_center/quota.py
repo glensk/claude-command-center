@@ -57,6 +57,11 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=too-many-lines
+# One oracle, one file, on purpose: the cooldown store, the per-provider resolvers and
+# the Codex seat ranking share the WindowState/ProviderQuota vocabulary and the fail-open
+# rules documented above, and splitting them would put the rules a reader must hold in
+# their head in three places. It crossed 1000 lines with the `fill` seat policy (tp#212).
 import json
 import time
 from collections.abc import Iterable
@@ -83,6 +88,12 @@ from . import config, usage
 # this names the FIRST try; ``best_codex_account`` is now its alias),
 # ``codex_seat_order`` (one ranked row per seat) and ``codex_seat_order_unknown``.
 # ``codex_pin`` appears ONLY while the pin governs selection (see codex_seat_order).
+#
+# v2 stayed v2 again on 2026-09-09 (tp#212), same reason — every seat-routing field is
+# ADDITIVE: top-level ``codex_seat_policy``, and per ``codex_seat_order`` row ``cohort``,
+# ``measured``, ``probe``, ``rank_reason`` and ``malformed``. ``codex_pin`` now follows
+# ``codex_in_claude.pin_active()``, which under the ``fill`` policy is true even with an
+# explicit order configured.
 SCHEMA_VERSION = 2
 
 # Provider states. Only BLOCKED may remove a rung from a ladder; UNKNOWN deliberately
@@ -124,6 +135,33 @@ _FABLE_MODEL_HINTS = ("fable",)
 _FABLE_EVIDENCE_STALE_SEC = usage._FABLE_STALE_AFTER_SEC  # noqa: SLF001
 
 _COOLDOWNS_NAME = "cooldowns.json"
+# One line per Codex seat: when a physical attempt was last made on it. Two jobs (plan
+# D2/D7): the deterministic round-robin tiebreak inside a cohort (no new usage evidence
+# arrives between two short runs — see :func:`rank_codex_seats`), and the once-a-day
+# claim that lets ONE unmeasured seat be probed.
+_SEAT_ATTEMPTS_NAME = "codex-seat-attempts.json"
+
+# ── the ``fill`` policy's constants (plan D2, debate O1/O2/O5/O7) ────────────────────
+# Two weekly resets this close together are "about equally urgent": the seats form ONE
+# cohort and are filled equally rather than strictly ordered. 12 h is half a day — a
+# gap larger than that makes the earlier seat meaningfully more urgent.
+_FILL_COHORT_TOLERANCE_SEC = 12 * 3600
+# A 5-hour window renewing within the hour with at least half of it unused is allowance
+# that is about to evaporate: spend it first, inside its cohort.
+_SESSION_SOON_SEC = 3600
+_SESSION_UNUSED_MAX_PCT = 50.0
+# Weekly-usage bucket width for "fill them equally": two seats within 5 % of each other
+# are treated as equally used, so the round-robin tiebreak (not a 0.3 % difference)
+# decides which one is billed next.
+_FILL_BUCKET_PCT = 5.0
+# An unmeasured seat is worth ONE read-only probe per day — enough to discover a fresh
+# seat (the tp#212 trigger: a completely unused team seat was invisible), few enough
+# that a permanently unmeasurable home cannot soak up every run.
+_PROBE_INTERVAL_SEC = 24 * 3600
+# A refusal stapled from a rollout is evidence with an expiry (plan D8, debate O12):
+# past its exhausted window's reset it proves nothing, and with no window known at all
+# it is re-checked after 5 h — the length of the shortest Codex window.
+_REFUSAL_RECHECK_SEC = 5 * 3600
 
 # Cooldown entry kinds. ``observed`` is a provider's own rejection with a retry
 # deadline; ``hold`` is an ADMINISTRATIVE reservation ("do not use this seat until…")
@@ -184,6 +222,10 @@ class ProviderQuota:
     # rendered next to the row so a seat that is technically usable but suspicious is
     # visible, without a measurement doubt silently deleting a working rung.
     note: str = ""
+    # The seat's newest usage snapshot carried a window whose duration could not be
+    # determined. Routing IGNORES it (fail-open: an unmeasurable seat stays runnable);
+    # :func:`codex_in_claude.seat_headroom` fails closed on it (plan D4).
+    malformed: bool = False
 
 
 def _cooldowns_path() -> Path:
@@ -315,6 +357,102 @@ def clear_block(
         usage._atomic_write_json(  # noqa: SLF001
             path, {"version": SCHEMA_VERSION, "providers": current}
         )
+    return True
+
+
+def _seat_attempts_path() -> Path:
+    """Path of the per-seat attempt ledger (beside the cooldown store)."""
+    return config.app_home() / _SEAT_ATTEMPTS_NAME
+
+
+def _read_seat_attempts_unlocked() -> dict[str, int]:
+    """The attempt map, or ``{}`` when absent/corrupt/foreign-shaped. Never raises."""
+    try:
+        raw = _seat_attempts_path().read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    entries = data.get("attempts") if isinstance(data, dict) else None
+    if not isinstance(entries, dict):
+        return {}
+    out: dict[str, int] = {}
+    for pid, value in entries.items():
+        try:
+            out[str(pid)] = int(value)
+        except (TypeError, ValueError):
+            continue  # one bad row must not blank the whole ledger
+    return out
+
+
+def read_seat_attempts() -> dict[str, int]:
+    """``{provider id: last physical attempt, epoch seconds}``. Never raises.
+
+    The ledger is advisory in both of its jobs (round-robin tiebreak, probe rate limit),
+    so a missing or corrupt file is simply "nothing attempted yet" — losing it costs one
+    extra probe, never a wrong verdict.
+    """
+    return _read_seat_attempts_unlocked()
+
+
+def _write_seat_attempts(current: dict[str, int]) -> None:
+    """Persist the attempt map (caller holds the lock)."""
+    usage._atomic_write_json(  # noqa: SLF001
+        _seat_attempts_path(), {"version": SCHEMA_VERSION, "attempts": current}
+    )
+
+
+def record_seat_attempt(pid: str, now: int | None = None) -> None:
+    """Record that a physical attempt is being made on *pid*, now. No-op for ``""``.
+
+    An empty pid is an unregistered ``$CODEX_HOME``: it has no row to rank and no probe
+    to rate-limit, so recording it would only invent an id. Read-modify-write under the
+    same :func:`usage._flock` as :func:`record_block` — two concurrent runners marking
+    different seats must not drop one another's entries.
+    """
+    if not pid:
+        return
+    now = int(time.time()) if now is None else int(now)
+    path = _seat_attempts_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with usage._flock(path.with_suffix(".lock")):  # noqa: SLF001
+            current = _read_seat_attempts_unlocked()
+            current[pid] = now
+            _write_seat_attempts(current)
+    except OSError:
+        pass  # the ledger is advisory; a read-only home must not fail a run
+
+
+def claim_probe(pid: str, now: int | None = None, interval: int = _PROBE_INTERVAL_SEC) -> bool:
+    """Atomically claim the once-per-*interval* probe of unmeasured seat *pid*.
+
+    True only when the stored attempt is absent or older than ``now - interval``; the
+    claim WRITES ``now``, so it is also the attempt record (plan D7, debate O9). Two
+    runners racing for the same fresh seat therefore produce exactly one probe — the
+    loser re-ranks without it instead of spending a second round trip on a seat nobody
+    can measure yet.
+
+    A crash between the claim and the launch postpones that seat's next probe by up to
+    *interval*. That is the accepted trade: the alternative (claim on success) lets N
+    concurrent runners all probe the same seat.
+    """
+    if not pid:
+        return False
+    now = int(time.time()) if now is None else int(now)
+    path = _seat_attempts_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with usage._flock(path.with_suffix(".lock")):  # noqa: SLF001
+            current = _read_seat_attempts_unlocked()
+            if int(current.get(pid, 0)) > now - int(interval):
+                return False
+            current[pid] = now
+            _write_seat_attempts(current)
+    except OSError:
+        return False  # cannot claim ⇒ do not probe (another runner may hold the file)
     return True
 
 
@@ -600,20 +738,34 @@ def _codex_seat_quota(  # pylint: disable=too-many-return-statements
             key=lambda state: state.resets_at,
             default=None,
         )
-        return ProviderQuota(
-            id=pid,
-            kind="codex",
-            state=BLOCKED,
-            reason=snap.blocked_reason,
-            source="refusal",
-            windows=windows,
-            blocked_by=full.name if full is not None else "refusal",
-            resets_at=full.resets_at if full is not None else 0,
-            captured_at=snap.blocked_at or snap.captured_at,
-            account=label,
-            email=snap.email or email,
-            note=note,
+        observed = snap.blocked_at or snap.captured_at
+        # A refusal read out of a ROLLOUT file has no expiry of its own, so without this
+        # it blocks the seat forever (plan D8, debate O12): an 8-day-old refusal whose
+        # window has long since reset would keep a healthy paid seat out of the ladder.
+        # Past the reset — or past 5 h when no window is known — it stops being evidence
+        # and the seat falls through to whatever its windows say (UNKNOWN when they are
+        # all stale, which is eligible and remeasurable).
+        expired = (
+            full.resets_at <= now if full is not None else observed + _REFUSAL_RECHECK_SEC < now
         )
+        if not expired:
+            return ProviderQuota(
+                id=pid,
+                kind="codex",
+                state=BLOCKED,
+                reason=snap.blocked_reason,
+                source="refusal",
+                windows=windows,
+                blocked_by=full.name if full is not None else "refusal",
+                resets_at=full.resets_at if full is not None else 0,
+                captured_at=observed,
+                account=label,
+                email=snap.email or email,
+                note=note,
+                malformed=snap.malformed,
+            )
+        age = _compact_duration(now - observed) if observed else "unknown-age"
+        note = " · ".join(part for part in (note, f"refusal {age} old — remeasure") if part)
     verdict, reason, blocked_by, resets_at, risky = _verdict_from_windows(windows.values())
     return ProviderQuota(
         id=pid,
@@ -629,6 +781,7 @@ def _codex_seat_quota(  # pylint: disable=too-many-return-statements
         account=label,
         email=snap.email or email,
         note=note,
+        malformed=snap.malformed,
     )
 
 
@@ -697,42 +850,293 @@ def codex_seat_order_labels(homes: dict[str, Path]) -> list[str]:
     return resolve_seat_order(config.codex_seat_order(), homes)[0]
 
 
-def codex_seat_candidates(
-    rows: list[ProviderQuota], pin_label: str, order: list[str]
-) -> list[ProviderQuota]:
-    """The eligible seats, in attempt order — the ONE ranking every consumer uses.
+@dataclass(frozen=True)
+class SeatRank:
+    """One eligible Codex seat with its place in the ranking and WHY it is there.
 
-    Eligible = not BLOCKED and not DISABLED (UNKNOWN stays runnable: fail-open). The
-    ranking is *order*, with two refinements: an ACTIVE account pin goes first, but only
-    while NO explicit order is configured (an order is the stronger statement of intent,
-    so a leftover pin must not silently reshuffle it — debate objection O2); and a row
-    whose label is not in *order* at all (a home that vanished between two reads) is
-    kept, last, in row order rather than silently dropped.
+    ``cohort`` is 1-based and only set for a measured seat under the ``fill`` policy
+    (the pin, the probe, an unmeasured seat and every seat under ``order`` have none).
+    ``reason`` is rendered verbatim by ``codex-in-claude order`` and ``ccc quota -j``,
+    so it must read as an explanation, not as a key.
     """
-    eligible = [row for row in rows if row.state not in (BLOCKED, DISABLED)]
+
+    row: ProviderQuota
+    cohort: int | None
+    reason: str
+    measured: bool
+    probe: bool = False
+
+
+def _compact_duration(seconds: int) -> str:
+    """``5d 12h`` / ``2h 5m`` / ``40m`` — at most two units, for a ``rank_reason``."""
+    secs = max(0, int(seconds))
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    if days:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    if hours:
+        return f"{hours}h {mins}m" if mins else f"{hours}h"
+    return f"{mins}m"
+
+
+def _measured_week(row: ProviderQuota) -> WindowState | None:
+    """The seat's FRESH weekly window, or ``None`` when it is unmeasured.
+
+    "Measured" is deliberately the weekly window alone: the ``fill`` policy ranks by
+    when the weekly allowance renews, so a seat with only a 5-hour reading cannot be
+    placed in a cohort at all (plan D2).
+    """
+    win = row.windows.get("seven_day")
+    return win if win is not None and not win.stale else None
+
+
+def _session_soon(row: ProviderQuota, now: int) -> bool:
+    """True when this seat's 5-hour allowance renews within the hour and is half unused.
+
+    That allowance is about to be thrown away, so inside its cohort the seat is spent
+    first (plan D2). A window that is already mostly used has nothing left to waste.
+    """
+    win = row.windows.get("five_hour")
+    return (
+        win is not None
+        and not win.stale
+        and win.resets_at - now <= _SESSION_SOON_SEC
+        and win.used_pct <= _SESSION_UNUSED_MAX_PCT
+    )
+
+
+def _configured_rank(label: str, order: list[str]) -> int:
+    """The seat's place in the configured order; unlisted seats sort after every listed one."""
+    return order.index(label) if label in order else len(order)
+
+
+def _probe_due(pid: str, attempts: dict[str, int], now: int) -> bool:
+    """True when *pid* has had no physical attempt for :data:`_PROBE_INTERVAL_SEC`."""
+    return int(attempts.get(pid, 0)) + _PROBE_INTERVAL_SEC < now
+
+
+def _fill_reason(
+    row: ProviderQuota, cohort: int, week: WindowState, now: int, last_attempt: int
+) -> str:
+    """The human sentence explaining why a measured seat sits where it does."""
+    parts = [f"weekly resets in {_compact_duration(week.resets_at - now)}"]
+    five = row.windows.get("five_hour")
+    if _session_soon(row, now) and five is not None:
+        parts.append(
+            f"session renews in {_compact_duration(five.resets_at - now)}, "
+            f"{100.0 - five.used_pct:.0f}% unused"
+        )
+    parts.append(f"{week.used_pct:.0f}% used")
+    if last_attempt:
+        parts.append(f"last attempt {_compact_duration(now - last_attempt)} ago")
+    return f"cohort {cohort}: " + " · ".join(parts)
+
+
+def _order_ranking(
+    eligible: list[ProviderQuota], pin_label: str, order: list[str]
+) -> list[SeatRank]:
+    """The strict 2026-09-04 ranking, kept verbatim as the ``order`` policy.
+
+    An ACTIVE account pin goes first, but only while NO explicit order is configured (an
+    order is the stronger statement of intent, so a leftover pin must not silently
+    reshuffle it — debate objection O2); a row whose label is not in *order* at all (a
+    home that vanished between two reads) is kept, last, in row order rather than
+    silently dropped. No probe: this policy promotes nothing on its own.
+    """
     by_label: dict[str, ProviderQuota] = {}
     for row in eligible:
         by_label.setdefault(row.account, row)
-    candidates: list[ProviderQuota] = []
+    ranked: list[ProviderQuota] = []
     taken: set[int] = set()
 
     def _add(row: ProviderQuota) -> None:
         if id(row) not in taken:
             taken.add(id(row))
-            candidates.append(row)
+            ranked.append(row)
 
     if pin_label and not config.codex_seat_order():
         pinned = by_label.get(pin_label)
         if pinned is not None:
             _add(pinned)
     for label in order:
-        ranked = by_label.get(label)
-        if ranked is not None:
-            _add(ranked)
+        listed = by_label.get(label)
+        if listed is not None:
+            _add(listed)
     for row in eligible:
         if row.account not in order:
             _add(row)
-    return candidates
+    return [
+        SeatRank(row=row, cohort=None, reason="order", measured=_measured_week(row) is not None)
+        for row in ranked
+    ]
+
+
+def _cohorts(
+    measured: list[ProviderQuota], weeks: dict[int, WindowState]
+) -> list[list[ProviderQuota]]:
+    """Group seats whose weekly resets are within :data:`_FILL_COHORT_TOLERANCE_SEC`.
+
+    Earliest reset first. A seat joins the cohort of its LEADER (not of its predecessor)
+    so a long chain of 11-hour gaps cannot merge a whole week into one cohort.
+    """
+    groups: list[list[ProviderQuota]] = []
+    leader = 0
+    for row in sorted(measured, key=lambda r: weeks[id(r)].resets_at):
+        reset = weeks[id(row)].resets_at
+        if not groups or reset - leader > _FILL_COHORT_TOLERANCE_SEC:
+            groups.append([row])
+            leader = reset
+        else:
+            groups[-1].append(row)
+    return groups
+
+
+def _fill_ranking(  # pylint: disable=too-many-locals
+    eligible: list[ProviderQuota],
+    pin_label: str,
+    order: list[str],
+    *,
+    now: int,
+    attempts: dict[str, int],
+    probe: bool,
+) -> list[SeatRank]:
+    """The ``fill`` routing rule, made concrete (plan D2, debate O1/O2/O5/O7).
+
+    Precedence: an eligible active pin, then the ONE due probe, then the measured seats
+    grouped into cohorts by weekly reset (earliest cohort first), then the unmeasured
+    remainder in configured order.
+
+    Cohorts are what makes "fill the seat that renews next" survive Codex's
+    counterexample: a seat at 92 % resetting in 2 h and one at 0 % resetting in 20 h are
+    NOT interchangeable — the first is about to throw its remainder away, so it leads
+    even though it is the more-used seat. Within one cohort the seats are close enough
+    in urgency that filling them equally is right, so the sort is
+    ``(session renewing soon, 5 % usage bucket, oldest attempt, configured rank)``: the
+    bucket keeps a 0.3 % difference from pinning every run onto one seat, and the
+    attempt ledger then alternates deterministically when no new measurement has
+    arrived between two short runs (debate O2).
+
+    Deliberately absent: any projection of a PASSED reset (a reset that has gone by
+    proves nothing about usage since), any ``subscription_ends`` term (advisory only),
+    and any ``risky`` demotion — the write floor in the runner is the safety valve.
+    """
+    position = {id(row): index for index, row in enumerate(eligible)}
+
+    def _configured(rows: list[ProviderQuota]) -> list[ProviderQuota]:
+        return sorted(rows, key=lambda r: (_configured_rank(r.account, order), position[id(r)]))
+
+    ranks: list[SeatRank] = []
+    taken: set[int] = set()
+
+    by_label: dict[str, ProviderQuota] = {}
+    for row in eligible:
+        by_label.setdefault(row.account, row)
+    pinned = by_label.get(pin_label) if pin_label else None
+    if pinned is not None:
+        taken.add(id(pinned))
+        ranks.append(
+            SeatRank(
+                row=pinned,
+                cohort=None,
+                reason="pin",
+                measured=_measured_week(pinned) is not None,
+            )
+        )
+
+    unmeasured = [row for row in eligible if id(row) not in taken and _measured_week(row) is None]
+    if probe:
+        due = next(
+            (row for row in _configured(unmeasured) if _probe_due(row.id, attempts, now)), None
+        )
+        if due is not None:
+            taken.add(id(due))
+            ranks.append(
+                SeatRank(
+                    row=due,
+                    cohort=None,
+                    reason="probe: unmeasured, no attempt in 24h",
+                    measured=False,
+                    probe=True,
+                )
+            )
+
+    weeks = {
+        id(row): week
+        for row in eligible
+        if id(row) not in taken and (week := _measured_week(row)) is not None
+    }
+    measured = [row for row in eligible if id(row) in weeks]
+    for index, group in enumerate(_cohorts(measured, weeks), 1):
+        ordered = sorted(
+            group,
+            key=lambda r: (
+                not _session_soon(r, now),
+                int(weeks[id(r)].used_pct // _FILL_BUCKET_PCT),
+                int(attempts.get(r.id, 0)),
+                _configured_rank(r.account, order),
+                position[id(r)],
+            ),
+        )
+        for row in ordered:
+            taken.add(id(row))
+            ranks.append(
+                SeatRank(
+                    row=row,
+                    cohort=index,
+                    reason=_fill_reason(
+                        row, index, weeks[id(row)], now, int(attempts.get(row.id, 0))
+                    ),
+                    measured=True,
+                )
+            )
+
+    for row in _configured([r for r in eligible if id(r) not in taken]):
+        ranks.append(SeatRank(row=row, cohort=None, reason="unmeasured", measured=False))
+    return ranks
+
+
+def rank_codex_seats(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    rows: list[ProviderQuota],
+    pin_label: str,
+    order: list[str],
+    *,
+    policy: str | None = None,
+    now: int | None = None,
+    attempts: dict[str, int] | None = None,
+    probe: bool = True,
+) -> list[SeatRank]:
+    """The eligible seats, best first, each carrying WHY — the ONE ranking, explained.
+
+    Eligible = not BLOCKED and not DISABLED (UNKNOWN stays runnable: fail-open; a seat
+    we merely failed to measure must never be deleted). *policy* defaults to
+    :func:`config.codex_seat_policy`, *now* to the clock and *attempts* to the ledger,
+    so the whole function is PURE when a caller injects them — which is what makes the
+    ranking testable without a filesystem.
+
+    *probe* is False for write runs: promoting an unmeasured seat is a read-only
+    experiment, and a write round on a seat that may refuse mid-edit is exactly the
+    ``SEAT-REFUSED-MIDRUN`` review the runner exists to avoid.
+    """
+    policy = config.codex_seat_policy() if policy is None else policy
+    now = int(time.time()) if now is None else int(now)
+    attempts = read_seat_attempts() if attempts is None else attempts
+    eligible = [row for row in rows if row.state not in (BLOCKED, DISABLED)]
+    if policy == "order":
+        return _order_ranking(eligible, pin_label, order)
+    return _fill_ranking(eligible, pin_label, order, now=now, attempts=attempts, probe=probe)
+
+
+def codex_seat_candidates(
+    rows: list[ProviderQuota],
+    pin_label: str,
+    order: list[str],
+    *,
+    policy: str | None = None,
+    now: int | None = None,
+) -> list[ProviderQuota]:
+    """The eligible seats in attempt order — :func:`rank_codex_seats` without the reasons."""
+    return [rank.row for rank in rank_codex_seats(rows, pin_label, order, policy=policy, now=now)]
 
 
 def select_codex_account(
@@ -858,9 +1262,10 @@ def snapshot(
     codex_rows = _codex_quotas(now, cooldowns)
     pin_label = _codex_pin_label(homes)
     configured = config.codex_seat_order()
+    policy = config.codex_seat_policy()
     order, unknown_labels = resolve_seat_order(configured, homes)
-    candidates = codex_seat_candidates(codex_rows, pin_label, order)
-    next_attempt = candidates[0].id if candidates else ""
+    ranks = rank_codex_seats(codex_rows, pin_label, order, policy=policy, now=now)
+    next_attempt = ranks[0].row.id if ranks else ""
 
     providers = [
         _copilot_quota(now, cooldowns),
@@ -882,16 +1287,21 @@ def snapshot(
         # runner hops on a run-time refusal, so this is a first try, not a verdict.
         "best_codex_account": next_attempt,
         "codex_next_attempt": next_attempt,
-        "codex_seat_order": _seat_order_rows(codex_rows, order, candidates, pin_label),
+        # How the ranking was produced — "fill" (weekly-reset-soonest first) or the
+        # strict "order". Consumers render it so a surprising next attempt is legible.
+        "codex_seat_policy": policy,
+        "codex_seat_order": _seat_order_rows(codex_rows, order, ranks, pin_label),
         "providers": [_provider_dict(q) for q in providers],
     }
     if unknown_labels:
         result["codex_seat_order_unknown"] = unknown_labels
-    # Only an ACTIVE pin is reported: with an explicit order configured the pin governs
-    # nothing, and advertising it here would have every consumer render a lie.
-    if pin_label and not configured:
-        from . import codex_in_claude  # local: display metadata only
+    # Only an ACTIVE pin is reported: a pin that governs nothing (an explicit order under
+    # the ``order`` policy, an unregistered path) advertised here would have every
+    # consumer render a lie. Under ``fill`` a registered pin DOES govern, so it appears
+    # even with an order configured — ``pin_active`` is the one authority (plan D3/D9).
+    from . import codex_in_claude  # local: display metadata only
 
+    if pin_label and codex_in_claude.pin_active():
         result["codex_pin"] = {
             "account": pin_label,
             "until": str(codex_in_claude.load_config().get("codex_home_until") or ""),
@@ -902,25 +1312,29 @@ def snapshot(
 def _seat_order_rows(
     rows: list[ProviderQuota],
     order: list[str],
-    candidates: list[ProviderQuota],
+    ranks: list[SeatRank],
     pin_label: str,
 ) -> list[dict[str, Any]]:
     """One ranked dict per seat label in *order* — the ``codex_seat_order`` payload.
 
+    The row ORDER stays the configured one (it is the table every consumer renders);
+    the ranking is carried by ``attempt_rank`` plus the ``fill`` fields ``cohort`` /
+    ``measured`` / ``probe`` / ``rank_reason``, which are additive (plan D9).
     ``configured_rank`` is the seat's place in the resolved order (1-based);
     ``attempt_rank`` its place among the ELIGIBLE candidates, ``None`` when skipped.
     """
     by_label = {row.account: row for row in rows}
-    attempt_rank = {id(row): idx + 1 for idx, row in enumerate(candidates)}
+    by_id = {id(rank.row): (index, rank) for index, rank in enumerate(ranks, 1)}
     out: list[dict[str, Any]] = []
     for index, label in enumerate(order, 1):
         row = by_label.get(label)
         if row is None:
             continue
+        attempt_rank, rank = by_id.get(id(row), (None, None))
         out.append(
             {
                 "configured_rank": index,
-                "attempt_rank": attempt_rank.get(id(row)),
+                "attempt_rank": attempt_rank,
                 "id": row.id,
                 "label": label,
                 "email": row.email,
@@ -934,6 +1348,11 @@ def _seat_order_rows(
                 },
                 "note": row.note,
                 "pinned": label == pin_label,
+                "cohort": rank.cohort if rank is not None else None,
+                "measured": rank.measured if rank is not None else _measured_week(row) is not None,
+                "probe": rank.probe if rank is not None else False,
+                "rank_reason": rank.reason if rank is not None else "",
+                "malformed": row.malformed,
             }
         )
     return out
@@ -977,6 +1396,7 @@ def _rehydrate(raw: dict[str, Any]) -> ProviderQuota:
         email=raw.get("email", ""),
         block_scope=raw.get("block_scope", ""),
         note=raw.get("note", ""),
+        malformed=bool(raw.get("malformed", False)),
     )
 
 

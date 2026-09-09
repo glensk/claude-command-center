@@ -3270,6 +3270,10 @@ def _print_codex_seat_footer(snap: dict[str, Any], now: int) -> None:
     ranked, so a seat that is skipped shows WHERE in the order it sits and what holds
     it. The old two-line "codex seat for delegation: <id>" said only the winner, which
     made a silently-skipped seat invisible.
+
+    The ``[fill]`` / ``[order]`` tag names the POLICY that produced the ranking (plan
+    D9): under ``fill`` the next attempt is the seat whose weekly allowance resets
+    soonest, so the configured order alone no longer explains it.
     """
     from . import usage  # pylint: disable=import-outside-toplevel
 
@@ -3293,11 +3297,12 @@ def _print_codex_seat_footer(snap: dict[str, Any], now: int) -> None:
         ]
         when = f" (earliest reset {usage.format_reset(min(resets), now)})" if resets else ""
         tail = f"next attempt: none eligible{when}"
-    print(f"codex seats: {ladder or '(none configured)'}     {tail}")
+    policy = str(snap.get("codex_seat_policy") or "fill")
+    print(f"codex seats [{policy}]: {ladder or '(none configured)'}     {tail}")
     notes = [f"{row['label']}: {row['note']}" for row in rows if row.get("note")]
     if notes:
         print(
-            " " * len("codex seats: ")
+            " " * len(f"codex seats [{policy}]: ")
             + "⚠ "
             + " · ".join(notes)
             + " · change: codex-in-claude order <label…>"

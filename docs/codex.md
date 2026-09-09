@@ -73,51 +73,141 @@ seat with no fallback at all.
 `--for all` is a real reset: it moves `default` **and** clears the per-command pins, which
 would otherwise shadow it. A bare `set-model <slug>` (no `--for`) only moves `default`.
 
-## Seat order, next attempt and runtime fallback
+## Seat policy: fill (default) or order — next attempt and runtime fallback
 
 Every Codex consumer — `delegate`, the machine `run` subcommand, ccc's own
-`llm.run_codex`, `codex-review.py`, sdsc-automations' checker — tries the configured
-ChatGPT logins **in one user-defined order** and **falls through at run time** when a
-seat is held, exhausted, unpaid or refusing. One runner
-(`codex_in_claude.run_with_fallback`) implements it, so there is one behaviour and one
-set of tests. The trigger was concrete: on 2026-09-04 every `codex exec` inherited
-`~/.codex` (a team seat out of credits, on an administrative hold), failed with
-`codex exited 1`, and the two healthy paid logins on the same machine were never tried.
+`llm.run_codex`, `codex-review.py`, sdsc-automations' checker — goes through one runner
+(`codex_in_claude.run_with_fallback`), so "which login is billed, and what happens when
+it says no" has one behaviour and one set of tests. It **falls through at run time** when
+a seat is held, exhausted, unpaid or refusing. The trigger was concrete: on 2026-09-04
+every `codex exec` inherited `~/.codex` (a team seat out of credits, on an administrative
+hold), failed with `codex exited 1`, and the two healthy paid logins on the same machine
+were never tried.
+
+*Which* seat leads is `codex_seat_policy`:
+
+| policy           | ranking                                                                 |
+| :--------------- | :---------------------------------------------------------------------- |
+| `fill` (default) | the seat whose **weekly allowance resets soonest**; `codex_seat_order` is only the tiebreak and the display order |
+| `order`          | strictly `codex_seat_order` — the 2026-09-04 behaviour, kept as the escape hatch |
 
 ```commands
-codex-in-claude order                        # the ranked table + next attempt
-codex-in-claude order private de default     # set it (this also CLEARS the account pin)
+codex-in-claude policy                       # which policy is active, in one sentence
+codex-in-claude policy order                 # switch to the strict order (fill = back)
+codex-in-claude order                        # the ranked table + next attempt + reasons
+codex-in-claude order private de default     # set the order/tiebreak (also CLEARS the pin)
 codex-in-claude order -c                     # back to the canonical default → private → extras
-codex-in-claude order -j                     # {configured, order, unknown, next_attempt, candidates, pin}
-ai set codex-order private de default        # the front door (delegates to the above)
-ai routing                                   # shows the order + the next attempt
+codex-in-claude order -j                     # {configured, order, unknown, policy, next_attempt, candidates, pin}
+ai set codex-policy fill                     # the front door (delegates to `policy`)
+ai set codex-order private de default        # the front door (delegates to `order`)
+ai routing                                   # shows the policy, the order and the next attempt
 ```
 
 ```
-1  private   ✅ available  5h 0% · wk 60%   you@example.org  ← next attempt
-2  de        ✅ available  5h 12% · wk 3%   you.second@example.org
+policy: fill — spend the seat whose weekly allowance resets soonest; codex_seat_order is the tiebreak
+1  private   ✅ available  5h 0% · wk 60%   you@example.org  ·  cohort 1: weekly resets in 1d 4h · 60% used  ← next attempt
+2  de        ✅ available  5h 12% · wk 3%   you.second@example.org  ·  cohort 2: weekly resets in 5d 12h · 3% used
 3  default   ⛔ blocked    hold: team seat reserved (unblocks in 2d 7h)
-pin: de until 2026-09-30  (ignored: explicit order set)
+pin: de until 2026-09-30
 ```
+
+### Why "fill", and how a cohort works
+
+The rule (2026-09-09): *"the closer a seat comes to its weekly reset, the more we must
+make sure it is used up — never waste tokens."* Taken literally, "spend the seat
+that resets soonest" survives the obvious counterexample. A seat at **92 % used with 2 h
+to go** has 8 % about to evaporate; a seat at **0 % used with 20 h to go** loses nothing
+by waiting — so the 92 % seat leads, even though it is the more-used one.
+
+Seats whose weekly resets fall within **12 h** of each other are one **cohort**: they are
+about equally urgent, so inside a cohort they are filled *equally* rather than ordered:
+
+1. a **5-hour window renewing within the hour with ≥ 50 % unused** goes first (that
+   allowance is about to be thrown away);
+2. then the lowest **weekly usage, in 5 % buckets** — a 0.3 % difference must not pin
+   every run onto one seat;
+3. then the **oldest attempt** (`codex-seat-attempts.json`), which is what alternates two
+   equal seats deterministically when two short runs leave no new measurement;
+4. then the configured order.
+
+Cohorts are ordered earliest-reset-first. Deliberately absent: any projection of a reset
+that has already passed (it proves nothing about usage since), any `subscription_ends`
+term (advisory only) and any `risky` demotion — the write floor below is the safety valve.
+
+A seat with **no fresh weekly reading is UNMEASURED** and ranks last, with one exception:
+one unmeasured seat per ranking is promoted to a single read-only **probe**, at most once
+per 24 h per seat, claimed under a lock (`quota.claim_probe`) so two concurrent runners
+never probe the same seat. That is how a brand-new login gets measured at all.
+
+### The account pin, and enrolling a seat
+
+Under `fill` an active pin leads — the order is only a tiebreak, so it cannot outrank an
+explicit "use this seat". Under `order` an explicit `codex_seat_order` makes the pin inert
+(two competing "use this seat" knobs is how a run ends up on a seat nobody chose).
+
+Either way the pinned path **must be a registered seat**: one of `~/.codex`,
+`codex_home_private`, or a `codex_homes_extra` login. `codex-in-claude home <path>`
+refuses anything else and prints the key that enrolls it; a pre-existing unregistered pin
+is reported and ignored. An unregistered home has no `codex:<label>` quota row, so its
+refusals could be recorded nowhere and its usage ranked never — while the pin would
+outrank three seats that ARE measurable.
 
 The order is stored as `codex_seat_order` in ccc's `config.toml`, next to the seat
 registry (`codex_home_private`, `codex_homes_extra`) that defines the labels. Empty (the
 package default) means the canonical order `default → private → extras`. Unknown labels
 are reported, never fatal; a configured login missing from the list is appended rather
-than dropped. `order <labels>` refuses a label naming no login, and refuses to rewrite a
-`config.toml` that carries keys ccc does not know (the writer re-emits only known keys
-and would delete them) — edit the key by hand in that case.
+than dropped. `order <labels>` and `policy <value>` refuse a label naming no login / an
+unknown policy, and refuse to rewrite a `config.toml` that carries keys ccc does not know
+(the writer re-emits only known keys and would delete them) — edit the key by hand then.
 
 **Eligibility** is `ccc quota`'s verdict: a seat is skipped when it is BLOCKED (a 100 %
 live window, a recorded refusal, an administrative hold) or DISABLED. UNKNOWN stays
 runnable — failing to measure a seat must not delete it. Two advisory signals never
 change the verdict: a `free` plan (`plan free — entitlement unproven`) and a
-`subscription_ends` date that has passed. `ccc quota` shows the whole ladder:
+`subscription_ends` date that has passed. A refusal stapled from a rollout file **expires**
+once its exhausted window's reset has passed (or after 5 h when no window is known), so a
+week-old refusal can no longer hold a paid seat out of the ladder for good; the row then
+falls back to its windows and is remeasurable. `ccc quota` shows the whole ladder, tagged
+with the policy that ranked it:
 
 ```
-codex seats: 1 private ✅ → 2 de ✅ → 3 default ⛔ (hold)     next attempt: codex:private
-             ⚠ private: renewal date 2026-09-30 passed · change: codex-in-claude order <label…>
+codex seats [fill]: 1 private ✅ → 2 de ✅ → 3 default ⛔ (hold)     next attempt: codex:private
+                    ⚠ private: renewal date 2026-09-30 passed · change: codex-in-claude order <label…>
 ```
+
+`ccc quota -j` carries the same, machine-readable: a top-level `codex_seat_policy`, and
+per `codex_seat_order` row the additive `cohort`, `measured`, `probe`, `rank_reason` and
+`malformed`. `codex_pin` appears whenever the pin actually governs.
+
+### The offload gate is asked of the whole seat pool
+
+`codex-in-claude headroom` answers "may optional work be offloaded to Codex at all"
+(CLAUDE.md's Codex offload gate; debates deliberately bypass it). Since 2026-09-09 it
+evaluates **every eligible seat**, not one home's rollout files — the bug it fixes is
+exact: a completely fresh team seat at 0 %/0 % was invisible, so the gate answered
+`DENIED (unknown — newest rate_limits event is older than 6h)` while a whole paid seat sat
+idle. Each seat is judged from the same quota row the ranking used (live snapshot +
+rollout + cooldowns), and the pool takes the best verdict: any `allowed` allows and names
+that seat, else `reserve`, else `unknown`, else `blocked`.
+
+```
+seat: default (openai.account@example.org)
+5h: 0% used, resets in 4h 12m, reserve 35% (reserve_source bootstrap), ALLOWED
+7d: 0% used, resets in 5d 3h, reserve 35% (reserve_source bootstrap), ALLOWED
+offload: ALLOWED
+private: blocked — included usage limit reached (no credit overflow)
+de: reserve — at least one live window is inside its reserve
+```
+
+Exit codes are unchanged (0 allowed, 1 reserve/blocked, 3 unknown) and the JSON payload is
+additive: `seat` (the label the verdict is about) and `seats[]` (every seat's own verdict).
+It still fails **closed** per seat — no fresh window, a snapshot older than 6 h, or a
+window whose duration could not be read are all `unknown`. Routing itself keeps failing
+**open** on the same row; the asymmetry is the point.
+
+The same verdict is available as an EXECUTION mode: `run -H` / `delegate -H` filter every
+candidate through it before each attempt and record `skipped:reserve` / `skipped:unknown`
+instead of billing the seat.
 
 **Run-time fallback.** The runner re-reads the candidates before every attempt (so a hold
 written mid-run removes a seat), rebuilds that seat's permission profile and MCP flags,
@@ -160,12 +250,14 @@ the **child** only.
 ```commands
 codex-in-claude run -j -C <repo> -m gpt-5.6-sol -e low -t 300 -p debate 'reply OK'
 some-tool | codex-in-claude run -j -C <repo> -n 2 -      # prompt on stdin
+codex-in-claude run -H -C <repo> 'reply OK'             # only seats outside their reserve
+codex-in-claude delegate -w -F 15 -C <repo> 'fix it'    # write: need 15% left on every window
+codex-in-claude run -E -C <repo> 'reply OK'             # force --ephemeral (leaves no measurement)
 ```
 
-Read-only, ephemeral (`-P/--persist` keeps and journals the session), no delegate
-contract and no repo map — the thinnest wrapper around the runner, for tools that would
-otherwise call `codex exec` themselves. Text mode prints `model:` then `seat:` then the
-reply; `-j` prints ONE JSON object:
+Read-only, no delegate contract and no repo map — the thinnest wrapper around the runner,
+for tools that would otherwise call `codex exec` themselves. Text mode prints `model:`
+then `seat:` then the reply; `-j` prints ONE JSON object:
 
 ```json
 {"schema_version": 1, "model": "gpt-5.6-sol", "effort": "low", "ok": true,
@@ -184,6 +276,29 @@ dead / machine slept (killed after codex stopped making progress). On failure `e
 
 `delegate` prints the same `seat: <label> (<email>)` line as its SECOND stdout line
 (`[fallback]` appended on a hop), right after the guaranteed `model:` line.
+
+**Session files are the measurement.** The `codex exec --json` stream carries no
+`rate_limits` event at all (verified live 2026-09-09), so an ephemeral run leaves nothing
+that says what it cost the seat it just billed — and the `fill` policy needs that to route
+the next one. So while `codex_usage` is **off**, `run` and `llm.run_codex` keep their
+session file (no `--ephemeral`) and the rollout's `rate_limits` block does the measuring;
+they stay UNJOURNALLED either way (only `-P/--persist` journals, which is what `--resume`
+needs). With `codex_usage` **on** they are ephemeral again and the runner fetches the live
+figures itself: every stale candidate once before selection and the attempted seat once
+after, inside hard budgets (20 s aggregate, 15 s per fetch, and no post-attempt fetch
+without 15 s of the call's budget left) and best-effort throughout. `run -E/--ephemeral`
+forces the old behaviour back.
+
+**Write runs hold a floor.** A write round that dies half-way leaves a worktree to review
+(`### SEAT-REFUSED-MIDRUN`), so `delegate --write` refuses to START on a seat that is one
+round from empty: an UNMEASURED seat is skipped (`skipped:unmeasured` — the floor cannot be
+checked on it; `-F 0` waives the floor and that skip together, which is how a fresh install
+with no usage data anywhere still starts its first write run), and so is any seat
+with less than `-F/--min-remaining` percent left on a live window (default: the learned P95
+cost of one round once ten debate samples exist, else 10 %; `-F 0` disables it). Write runs
+also never promote a probe — an unmeasured seat is a read-only experiment. A `--resume`
+binds to exactly one seat, so it gets NO floor and no headroom filter: there is no second
+seat to move to, and the documented trade-off is a possible `SEAT-REFUSED-MIDRUN` review.
 
 ### Progress watchdog and the sleep guard
 

@@ -19,6 +19,13 @@ drive it with two environment variables:
 Scenarios (see ``tests/test_codex_runner.py``):
 
 ``ok``                            success; writes the reply to the ``-o`` file
+``ok_rollout``                    success AND a rollout with a windowed ``rate_limits``
+                                  event at ``used_pct`` (both windows), so the seat is
+                                  MEASURABLE afterwards — what a non-ephemeral run
+                                  really leaves behind
+``premium_only``                  success AND a rollout whose newest block is the
+                                  WINDOWLESS ``premium`` shape a short exec logs: the
+                                  run happened and measured nothing
 ``refuse_quota``                  the REAL 2026-09-04 refusal stream + rc 1, and a
                                   rollout file with an exhausted window so the
                                   cooldown deadline can be derived from it
@@ -146,6 +153,80 @@ def _write_rollout(resets_at: int) -> None:
     )
 
 
+def _write_windowed_rollout(used_pct: float, resets_at: int, week_resets_at: int) -> None:
+    """Leave a normal, populated ``rate_limits`` event in this seat's rollouts."""
+    home = Path(os.environ.get("CODEX_HOME", ""))
+    if not home.name:
+        return
+    day = home / "sessions" / "2026" / "09" / "09"
+    day.mkdir(parents=True, exist_ok=True)
+    path = day / f"rollout-2026-09-09T12-00-00-{int(time.time() * 1000)}.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "timestamp": int(time.time()),
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "primary": {
+                            "used_percent": used_pct,
+                            "resets_at": resets_at,
+                            "window_minutes": 300,
+                        },
+                        "secondary": {
+                            "used_percent": used_pct,
+                            "resets_at": week_resets_at,
+                            "window_minutes": 10080,
+                        },
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_premium_rollout() -> None:
+    """Leave the WINDOWLESS ``premium`` block a short ``codex exec`` really writes.
+
+    Both windows null: the run is recorded, but it measured nothing. This is why the
+    fill policy needs a round-robin tiebreak — see tests/test_usage.py's
+    ``_CODEX_PREMIUM_NULL`` for the shape captured in the wild.
+    """
+    home = Path(os.environ.get("CODEX_HOME", ""))
+    if not home.name:
+        return
+    day = home / "sessions" / "2026" / "09" / "09"
+    day.mkdir(parents=True, exist_ok=True)
+    path = day / f"rollout-2026-09-09T12-00-00-{int(time.time() * 1000)}-premium.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "timestamp": int(time.time()),
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "premium",
+                        "limit_name": None,
+                        "primary": None,
+                        "secondary": None,
+                        "credits": {"has_credits": False, "unlimited": False, "balance": None},
+                        "individual_limit": None,
+                        "plan_type": None,
+                        "rate_limit_reached_type": None,
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _spawn_grandchild() -> None:
     """A descendant in the SAME process group, so only a group sweep reaches it."""
     sentinel = os.environ.get("FAKE_CODEX_SENTINEL", "")
@@ -177,7 +258,16 @@ def main() -> int:  # pylint: disable=too-many-branches,too-many-return-statemen
     reply = str(control.get("reply") or f"OK {os.environ.get('CODEX_HOME', '')}")
     out_path = _out_path(argv)
 
-    if scenario == "ok":
+    if scenario in ("ok", "ok_rollout", "premium_only"):
+        if scenario == "ok_rollout":
+            now = int(time.time())
+            _write_windowed_rollout(
+                float(control.get("used_pct") or 0.0),
+                int(control.get("resets_at") or (now + 3600)),
+                int(control.get("week_resets_at") or (now + 5 * 86400)),
+            )
+        elif scenario == "premium_only":
+            _write_premium_rollout()
         print(
             json.dumps(
                 {

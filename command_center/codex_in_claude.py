@@ -120,9 +120,12 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
 from . import codex_launch
+
+if TYPE_CHECKING:  # pragma: no cover - runtime import is local: quota imports THIS module
+    from . import quota
 
 DEFAULT_MODEL = "gpt-5.6-sol"  # newest/best per the Codex catalog
 COMMANDS = ("delegate-review", "debate")  # codex-related commands this manager governs
@@ -182,9 +185,6 @@ _SESSION_RE = re.compile(
     r"session id:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
 )
 
-# A rate-limit window is hard-exhausted at 100 % (mirrors quota._EXHAUSTED_PCT). The
-# runner SKIPS such a seat before launching and tries the next one.
-_EXHAUSTED_PERCENT = 100.0
 # Less wall-clock than this left in the whole call's budget is not worth a launch: the
 # run would be killed during codex's own startup and buy nothing but a cost row.
 _MIN_ATTEMPT_SECONDS = 5
@@ -764,6 +764,19 @@ _COST_HISTORY_SECONDS = 90 * 24 * 3600
 _FIVE_HOUR_MINUTES = 5 * 60
 _SEVEN_DAY_MINUTES = 7 * 24 * 60
 
+# ── routing feedback budgets (plan D6, debate O13) ──────────────────────────────────
+# A measurement is best-effort garnish on a run, never a reason for it to be late: the
+# whole pre-selection refresh shares ONE 20 s budget, each fetch is capped at 15 s, and
+# the post-attempt fetch only runs while at least that much of the call budget is left.
+_REFRESH_BUDGET_SEC = 20.0
+_REFRESH_FETCH_TIMEOUT_SEC = 15.0
+# The write-mode floor when no learned round cost exists yet: a seat with less than a
+# tenth of a window left is not where a run that may EDIT files should start.
+_WRITE_FLOOR_BOOTSTRAP_PCT = 10.0
+# The learned weekly reserve is 3 rounds + 10 % (see _headroom_reserve); dividing it back
+# out recovers the P95 cost of ONE round, which is what a single write run needs.
+_ROUNDS_PER_RESERVE = 3.3
+
 
 # --------------------------------------------------------------------------- #
 # Clickable-terminal helpers (OSC 8) — per repo convention.
@@ -1185,6 +1198,28 @@ def cmd_set_model(args: argparse.Namespace) -> int:
 _SEAT_MARK = {"available": "✅", "blocked": "⛔", "unknown": "❔", "disabled": "🚫"}
 
 
+_POLICY_BLURB = {
+    "fill": (
+        "policy: fill — spend the seat whose weekly allowance resets soonest; "
+        "codex_seat_order is the tiebreak"
+    ),
+    "order": (
+        "policy: order — try the seats strictly in codex_seat_order; "
+        "the account pin is inert while one is configured"
+    ),
+}
+
+
+def _seat_policy() -> str:
+    """The configured seat policy, ``"fill"`` on any failure (the package default)."""
+    try:
+        from . import config  # pylint: disable=import-outside-toplevel  # cheap, per-call
+
+        return config.codex_seat_policy()
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return "fill"
+
+
 def _seat_order_state() -> tuple[list[str], list[str], list[str]]:
     """``(configured, order, unknown)`` — the seat order as config + reality see it."""
     try:
@@ -1199,7 +1234,12 @@ def _seat_order_state() -> tuple[list[str], list[str], list[str]]:
 
 
 def _candidate_dicts(candidates: list[SeatCandidate]) -> list[dict[str, Any]]:
-    """The ``candidates`` array shared by ``home -j`` and ``order -j``."""
+    """The ``candidates`` array shared by ``home -j`` and ``order -j``.
+
+    ``reason`` / ``cohort`` / ``measured`` carry the ranker's verdict for that seat so a
+    machine consumer sees WHY the order is what it is (plan D9); they are empty/``None``
+    for a candidate the ranker did not produce (an explicit ``$CODEX_HOME``).
+    """
     return [
         {
             "rank": index,
@@ -1207,20 +1247,36 @@ def _candidate_dicts(candidates: list[SeatCandidate]) -> list[dict[str, Any]]:
             "id": cand.pid,
             "home": str(cand.home),
             "email": cand.email,
+            "reason": cand.reason,
+            "cohort": cand.cohort,
+            "measured": cand.measured,
         }
         for index, cand in enumerate(candidates, 1)
     ]
 
 
 def _pin_payload(cfg: dict) -> dict[str, Any] | None:
-    """``{"label", "until", "active"}`` for the account pin, or ``None`` when unset."""
+    """``{"label", "until", "active", "inert_because"}`` for the pin, or ``None``.
+
+    ``inert_because`` is empty while the pin governs; otherwise it names WHICH rule
+    disarmed it, because "not a registered seat" (plan D3) and "an explicit order under
+    the ``order`` policy" ask for entirely different fixes.
+    """
     pinned = pinned_codex_home(cfg)
     if pinned is None:
         return None
+    active = pin_active(cfg)
+    if active:
+        inert = ""
+    elif not _is_registered_seat(pinned):
+        inert = "not a registered seat"
+    else:
+        inert = "explicit order set"
     return {
         "label": _seat_candidate_for(pinned).label,
         "until": str(cfg.get("codex_home_until") or ""),
-        "active": pin_active(cfg),
+        "active": active,
+        "inert_because": inert,
     }
 
 
@@ -1235,8 +1291,15 @@ def cmd_home(  # pylint: disable=too-many-branches,too-many-return-statements,to
     ``auth.json``, i.e. a completed ``CODEX_HOME=<PATH> codex login``); ``-u/--until``
     bounds it (ISO date, inclusive); ``-c/--clear`` removes it.
 
-    Since 2026-09-04 the pin is INERT whenever ``codex_seat_order`` is configured (see
-    ``order``): setting one then only warns. An explicit ``$CODEX_HOME`` still overrides
+    ``PATH`` must be a REGISTERED seat — one of ``quota._canonical_codex_homes()``
+    (``~/.codex``, ``codex_home_private``, a ``codex_homes_extra`` login). An
+    unregistered home has no ``codex:<label>`` quota row, so its refusals could be
+    recorded nowhere and its usage ranked never, yet the pin would outrank three
+    measurable seats (plan D3, debate O8). The refusal names the key that enrolls it.
+
+    Under the ``order`` policy the pin is INERT whenever ``codex_seat_order`` is
+    configured (see ``order``): setting one then only warns. Under ``fill`` the order is
+    merely a tiebreak, so the pin governs. An explicit ``$CODEX_HOME`` still overrides
     everything, and is the only way to force one specific seat with no fallback.
     """
     cfg = load_config()
@@ -1254,6 +1317,14 @@ def cmd_home(  # pylint: disable=too-many-branches,too-many-return-statements,to
                 file=sys.stderr,
             )
             return EX_USAGE
+        if not _is_registered_seat(home):
+            label = home.name.lstrip(".").removeprefix("codex-") or "seat"
+            print(
+                f"error: {home} is not a registered seat — add it to ccc's config.toml: "
+                f'codex_homes_extra = ["{label}={home}"] (or codex_home_private), then pin it',
+                file=sys.stderr,
+            )
+            return EX_USAGE
         if args.until:
             try:
                 date.fromisoformat(args.until)
@@ -1263,7 +1334,9 @@ def cmd_home(  # pylint: disable=too-many-branches,too-many-return-statements,to
         cfg["codex_home"] = str(home)
         cfg["codex_home_until"] = args.until or None
         save_config(cfg)
-        if _seat_order_state()[0]:
+        # Only the ``order`` policy lets an order outrank a pin; under ``fill`` the order
+        # is a tiebreak and the pin really does govern, so the warning would be a lie.
+        if _seat_policy() == "order" and _seat_order_state()[0]:
             print(
                 "warning: an explicit codex_seat_order is configured — this pin is recorded "
                 "but IGNORED for selection (clear the order with `codex-in-claude order -c`).",
@@ -1276,11 +1349,16 @@ def cmd_home(  # pylint: disable=too-many-branches,too-many-return-statements,to
     candidates = codex_homes_in_order()
     effective = _codex_home()
     configured, order, _unknown = _seat_order_state()
+    policy = _seat_policy()
+    stray_pin = pinned_codex_home(cfg)
+    unregistered_pin = stray_pin is not None and not _is_registered_seat(stray_pin)
     if os.environ.get("CODEX_HOME"):
         source = "env $CODEX_HOME"
     elif pin_active(cfg):
         until = cfg.get("codex_home_until")
         source = f"config pin (until {until}, inclusive)" if until else "config pin (no expiry)"
+    elif policy == "fill":
+        source = "fill"
     elif configured:
         source = "codex_seat_order"
     else:
@@ -1310,6 +1388,7 @@ def cmd_home(  # pylint: disable=too-many-branches,too-many-return-statements,to
                     "order": order,
                     "candidates": _candidate_dicts(candidates),
                     "pin_active": pin_active(cfg),
+                    "policy": policy,
                 }
             )
         )
@@ -1319,22 +1398,39 @@ def cmd_home(  # pylint: disable=too-many-branches,too-many-return-statements,to
         line += "  (no eligible seat)"
     if order:
         line += "  ·  order: " + " → ".join(order)
-    if pinned_codex_home(cfg) is not None and not pin_active(cfg):
-        line += "  (pin ignored: explicit order set)"
+    if stray_pin is not None and not pin_active(cfg):
+        line += (
+            "  (pin ignored: not a registered seat)"
+            if unregistered_pin
+            else "  (pin ignored: explicit order set)"
+        )
     print(line)
+    if unregistered_pin:
+        print(
+            f"pin: {stray_pin} is not a registered seat — ignored (clear with -c)",
+            file=sys.stderr,
+        )
     return EX_OK
 
 
 def _seat_table_lines(now: int | None = None) -> list[str]:
-    """The ranked seat table ``order`` prints — one line per configured seat."""
+    """The ranked seat table ``order`` prints — one line per configured seat.
+
+    The first line names the POLICY, and every seat line ends with the ranker's own
+    ``rank_reason`` (``cohort 1: weekly resets in 5d 12h · 12% used`` / ``probe: …`` /
+    ``unmeasured``). Under ``fill`` the configured order no longer explains the next
+    attempt, so a table without the reason column would look arbitrary (plan D9).
+    """
     now_ts = int(time.time()) if now is None else int(now)
     try:
         from . import quota  # pylint: disable=import-outside-toplevel
 
-        rows = quota.snapshot(now=now_ts).get("codex_seat_order") or []
+        snap = quota.snapshot(now=now_ts)
+        rows = snap.get("codex_seat_order") or []
+        policy = str(snap.get("codex_seat_policy") or "fill")
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return [f"(seat states unavailable: {type(exc).__name__}: {exc})"]
-    lines: list[str] = []
+    lines: list[str] = [_POLICY_BLURB.get(policy, _POLICY_BLURB["fill"])]
     for row in rows:
         state = str(row.get("state") or "unknown")
         mark = _SEAT_MARK.get(state, " ")
@@ -1361,6 +1457,8 @@ def _seat_table_lines(now: int | None = None) -> list[str]:
         line = "  ".join(part for part in bits if part)
         if row.get("email"):
             line += f"  {row['email']}"
+        if row.get("rank_reason"):
+            line += f"  ·  {row['rank_reason']}"
         if row.get("attempt_rank") == 1:
             line += "  ← next attempt"
         if row.get("note"):
@@ -1372,16 +1470,20 @@ def _seat_table_lines(now: int | None = None) -> list[str]:
 def cmd_order(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements,too-many-branches
     """``order [LABEL …] [-c] [-j]`` — show or set the Codex seat order.
 
-    The order is the sequence every Codex consumer TRIES the logins in — ccc's own
-    calls, ``delegate``, ``run`` and the debate driver alike. It lives in ccc's
-    ``config.toml`` (``codex_seat_order``), next to the seat registry that defines the
-    labels, and it is the AUTHORITATIVE selector: setting one clears (and thereafter
-    ignores) the ``home`` account pin, because two competing "use this seat" knobs is
-    exactly how a run ends up on a seat nobody chose.
+    What the order MEANS depends on ``codex_seat_policy`` (see ``policy``), and the
+    table's first line says which is active:
 
-    Setting refuses an unknown label (a typo would silently drop a seat to the end of
-    the order) and refuses to rewrite a ``config.toml`` carrying keys ccc does not
-    know, because the writer re-emits only known keys and would delete them.
+    * under ``fill`` (the default) it is the deterministic TIEBREAK inside a cohort and
+      the display order — the ranking itself is "spend the weekly allowance that resets
+      soonest";
+    * under ``order`` it is the ranking, and the AUTHORITATIVE selector: setting one
+      clears (and thereafter ignores) the ``home`` account pin, because two competing
+      "use this seat" knobs is exactly how a run ends up on a seat nobody chose.
+
+    Setting still clears the pin under both policies (one knob at a time), refuses an
+    unknown label (a typo would silently drop a seat to the end of the order) and
+    refuses to rewrite a ``config.toml`` carrying keys ccc does not know, because the
+    writer re-emits only known keys and would delete them.
     """
     labels: list[str] = [str(label).strip() for label in (getattr(args, "labels", None) or [])]
     labels = [label for label in labels if label]
@@ -1413,7 +1515,8 @@ def cmd_order(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
             cfg["codex_home_until"] = None
             save_config(cfg)
             print("pin cleared (order is authoritative)")
-        print("codex seat order: " + (" → ".join(labels) if labels else "(canonical: default → …)"))
+        noun = "codex seat tiebreak order" if _seat_policy() == "fill" else "codex seat order"
+        print(f"{noun}: " + (" → ".join(labels) if labels else "(canonical: default → …)"))
 
     configured, order, unknown = _seat_order_state()
     candidates = codex_homes_in_order()
@@ -1426,6 +1529,7 @@ def cmd_order(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
                     "configured": configured,
                     "order": order,
                     "unknown": unknown,
+                    "policy": _seat_policy(),
                     "next_attempt": candidates[0].pid if candidates else "",
                     "candidates": _candidate_dicts(candidates),
                     "pin": _pin_payload(cfg),
@@ -1437,12 +1541,53 @@ def cmd_order(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
         print(line)
     pin = _pin_payload(cfg)
     if pin is not None:
-        suffix = "" if pin["active"] else "  (ignored: explicit order set)"
+        suffix = "" if pin["active"] else f"  (ignored: {pin['inert_because']})"
         print(f"pin: {pin['label']} until {pin['until'] or '∞'}{suffix}")
     if unknown:
         print(f"unknown labels in config: {', '.join(unknown)}")
     if not candidates:
         print("next attempt: none eligible")
+    return EX_OK
+
+
+def cmd_policy(args: argparse.Namespace) -> int:
+    """``policy [fill|order] [-j]`` — show or set HOW the Codex seats are ranked.
+
+    ``fill`` (the package default): spend the seat whose WEEKLY allowance resets
+    soonest, because that is the allowance about to be thrown away; seats resetting
+    within 12 h of each other are one cohort and are filled equally. ``order``: the
+    strict 2026-09-04 ``codex_seat_order``, kept as the operational escape hatch.
+
+    Writing goes through the same unknown-key guard as ``order`` — ``save_config``
+    re-emits only keys ccc knows, so a config carrying a hand-added key would lose it.
+    """
+    from . import config  # pylint: disable=import-outside-toplevel
+
+    value = str(getattr(args, "policy", None) or "").strip().lower()
+    if value:
+        if value not in config.CODEX_SEAT_POLICIES:
+            print(
+                f"error: unknown policy {value!r} — choose: "
+                f"{', '.join(config.CODEX_SEAT_POLICIES)}",
+                file=sys.stderr,
+            )
+            return EX_USAGE
+        stray = config.unknown_config_keys()
+        if stray:
+            print(
+                f"refusing to rewrite config.toml: unknown keys {', '.join(stray)} would be "
+                "dropped — remove them or edit codex_seat_policy by hand",
+                file=sys.stderr,
+            )
+            return EX_USAGE
+        cfg_toml = config.load_config()
+        cfg_toml.codex_seat_policy = value
+        config.save_config(cfg_toml)
+    policy = _seat_policy()
+    if getattr(args, "json", False):
+        print(json.dumps({"schema_version": 1, "policy": policy}))
+        return EX_OK
+    print(_POLICY_BLURB.get(policy, _POLICY_BLURB["fill"]))
     return EX_OK
 
 
@@ -1588,27 +1733,60 @@ def pinned_codex_home(cfg: dict | None = None, today: date | None = None) -> Pat
     return Path(str(raw)).expanduser()
 
 
+def _is_registered_seat(home: Path) -> bool:
+    """True when *home* is one of the seats ccc's config registers (resolved paths).
+
+    A pin at an unregistered path governs NOTHING (plan D3, debate O8): it has no
+    ``codex:<label>`` quota row, so its refusals could not be recorded, its usage could
+    not be ranked, and it would silently outrank three seats that ARE measurable.
+    """
+    known = canonical_codex_homes()
+    if not known:
+        return True  # registry unreadable: cannot verify ⇒ do not veto a real pin
+    for path in known.values():
+        try:
+            if path.expanduser().resolve() == home.expanduser().resolve():
+                return True
+        except OSError:  # pragma: no cover - resolve() fails only on exotic filesystems
+            if str(path) == str(home):
+                return True
+    return False
+
+
 def pin_active(cfg: dict | None = None) -> bool:
     """True when the account pin actually GOVERNS seat selection.
 
-    A pin is inert the moment the user configures an explicit ``codex_seat_order``:
-    an ordered list is the stronger statement of intent, and a forgotten pin silently
-    reshuffling it is exactly the surprise the order exists to remove (debate objection
-    O2). :func:`pinned_codex_home` keeps reporting the pin either way — it is still
+    Two gates, both from the reconciled design:
+
+    * the pinned path must be a REGISTERED seat (plan D3, debate O8). ``codex-in-claude
+      home PATH`` refuses to record anything else, but a pin written before that rule
+      existed — or by hand — is reported and ignored rather than obeyed.
+    * under the ``order`` policy a pin is inert the moment an explicit
+      ``codex_seat_order`` is configured: an ordered list is the stronger statement of
+      intent, and a forgotten pin silently reshuffling it is exactly the surprise the
+      order exists to remove (debate objection O2). Under ``fill`` (the default) the
+      order is only a tiebreak, so it cannot outrank an explicit pin and the pin leads.
+
+    :func:`pinned_codex_home` keeps reporting the pin either way — it is still
     introspectable, it just decides nothing.
     """
-    if pinned_codex_home(cfg) is None:
+    pinned = pinned_codex_home(cfg)
+    if pinned is None:
         return False
     try:
         from . import config  # pylint: disable=import-outside-toplevel  # cheap, per-call
 
-        return not config.codex_seat_order()
+        if not _is_registered_seat(pinned):
+            return False
+        if config.codex_seat_policy() == "order":
+            return not config.codex_seat_order()
+        return True
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return True  # a config read that fails must not silently disable a real pin
 
 
 @dataclass(frozen=True)
-class SeatCandidate:
+class SeatCandidate:  # pylint: disable=too-many-instance-attributes  # flat seat record
     """One Codex seat the runner may try: its label, home, account and provider id.
 
     ``pid`` is the ``quota`` provider id (``codex`` / ``codex:private`` / ``codex:de``)
@@ -1616,12 +1794,22 @@ class SeatCandidate:
     somewhere unregistered. An empty ``pid`` means "record nothing about this seat":
     a refusal from an unknown home has no row to block and would otherwise be
     misattributed to whichever seat happened to share its label.
+
+    The four ranking fields travel WITH the candidate because the runner needs them per
+    attempt: ``probe`` says this seat is the one due read-only probe (the runner must
+    win :func:`command_center.quota.claim_probe` before launching it — plan D7),
+    ``measured`` gates write runs (plan D5), and ``reason``/``cohort`` are what the
+    machine payloads render.
     """
 
     label: str
     home: Path
     email: str
     pid: str
+    reason: str = ""
+    cohort: int | None = None
+    measured: bool = False
+    probe: bool = False
 
 
 def canonical_codex_homes() -> dict[str, Path]:
@@ -1665,7 +1853,7 @@ def _seat_candidate_for(home: Path) -> SeatCandidate:
     return SeatCandidate(label=label, home=home, email=email, pid=pid)
 
 
-def codex_homes_in_order(now: int | None = None) -> list[SeatCandidate]:
+def codex_homes_in_order(now: int | None = None, *, probe: bool = True) -> list[SeatCandidate]:
     """The Codex seats to TRY, best first — the single source of truth for every runner.
 
     Three regimes, in this order:
@@ -1675,9 +1863,19 @@ def codex_homes_in_order(now: int | None = None) -> list[SeatCandidate]:
        error and start no process.
     2. an inherited ``$CODEX_HOME`` ⇒ exactly ONE candidate, that home. An explicit
        environment override is a hard instruction, not a preference: it never hops.
-    3. otherwise ``quota``'s ranking — the cooldown store, the configured
-       ``codex_seat_order`` and (only while no order is configured) the account pin,
-       via :func:`command_center.quota.codex_seat_candidates`.
+    3. otherwise ``quota``'s ranking via :func:`command_center.quota.rank_codex_seats` —
+       the cooldown store plus the configured ``codex_seat_policy``:
+
+       * ``fill`` (the default): an eligible REGISTERED account pin first, then the ONE
+         unmeasured seat whose daily probe is due, then the measured seats grouped into
+         weekly-reset cohorts (earliest cohort first, filled equally inside it), then
+         the remaining unmeasured seats in configured order;
+       * ``order``: the strict ``codex_seat_order``, pin first only while no order is
+         configured, and never a probe.
+
+    *probe* is False for a WRITE run: promoting an unmeasured seat is a read-only
+    experiment (plan D5). A candidate carrying ``probe=True`` must not be launched until
+    :func:`command_center.quota.claim_probe` has been won — the ranker only MARKS it.
 
     An empty list in regime 3 means every seat is held/blocked, and that is FINAL:
     there is deliberately no "fall back to the default seat anyway" any more (debate
@@ -1699,7 +1897,7 @@ def codex_homes_in_order(now: int | None = None) -> list[SeatCandidate]:
         rows = quota._codex_quotas(now_ts, quota.read_cooldowns(now_ts))  # noqa: SLF001
         order = quota.codex_seat_order_labels(homes)
         pin = quota._codex_pin_label(homes)  # noqa: SLF001
-        ranked = quota.codex_seat_candidates(rows, pin, order)
+        ranked = quota.rank_codex_seats(rows, pin, order, now=now_ts, probe=probe)
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         print(
             f"⚠️  Codex seat selection failed ({type(exc).__name__}: {exc}) — no seat tried",
@@ -1707,9 +1905,18 @@ def codex_homes_in_order(now: int | None = None) -> list[SeatCandidate]:
         )
         return []
     return [
-        SeatCandidate(label=row.account, home=homes[row.account], email=row.email, pid=row.id)
-        for row in ranked
-        if row.account in homes
+        SeatCandidate(
+            label=rank.row.account,
+            home=homes[rank.row.account],
+            email=rank.row.email,
+            pid=rank.row.id,
+            reason=rank.reason,
+            cohort=rank.cohort,
+            measured=rank.measured,
+            probe=rank.probe,
+        )
+        for rank in ranked
+        if rank.row.account in homes
     ]
 
 
@@ -2237,70 +2444,189 @@ def _format_window_duration(window_minutes: int) -> str:
     return f"{window_minutes}m"
 
 
-def codex_headroom(now: int | None = None) -> dict[str, Any]:
-    """Structured quota-reserve decision for optional Codex offloads.
+def _headroom_window_rows(row: quota.ProviderQuota, now: int) -> list[dict[str, Any]]:
+    """One dict per window of *row*, each with its reserve and its own verdict.
 
-    Missing, malformed, or older-than-six-hours quota data fails closed. This policy
-    governs optional offload work only; debate callers intentionally remain always allowed.
+    A STALE window (its reset has passed, or the reading predates its own duration) is
+    still listed — the user wants to see it — but is marked and given the ``unknown``
+    verdict, and :func:`seat_headroom` judges the seat only on the fresh ones. A reading
+    from a window that no longer exists must neither allow nor deny anything.
     """
-    now_ts = int(time.time()) if now is None else now
-    snapshot = _codex_rate_snapshot()
+    minutes_of = {"five_hour": _FIVE_HOUR_MINUTES, "seven_day": _SEVEN_DAY_MINUTES}
     rows: list[dict[str, Any]] = []
-    if snapshot is not None:
-        for minutes, window in sorted(snapshot.windows.items()):
-            reserve, reserve_source = _headroom_reserve(minutes)
-            remaining = 100.0 - window.used_percent
-            reset_fresh = window.resets_at <= now_ts + _HEADROOM_RESET_FRESH_SECONDS
-            rows.append(
-                {
-                    "duration": _format_window_duration(minutes),
-                    "window_minutes": minutes,
-                    "used_percent": window.used_percent,
-                    "remaining_percent": remaining,
-                    "resets_at": window.resets_at,
-                    "resets_in_seconds": window.resets_at - now_ts,
-                    "reserve_percent": reserve,
-                    "reserve_source": reserve_source,
-                    "reset_fresh": reset_fresh,
-                    "verdict": "allowed" if reset_fresh or remaining >= reserve else "reserve",
-                }
-            )
+    for name, win in row.windows.items():
+        minutes = minutes_of.get(name)
+        if minutes is None:
+            continue
+        reserve, reserve_source = _headroom_reserve(minutes)
+        remaining = 100.0 - win.used_pct
+        reset_fresh = win.resets_at <= now + _HEADROOM_RESET_FRESH_SECONDS
+        rows.append(
+            {
+                "duration": _format_window_duration(minutes),
+                "window_minutes": minutes,
+                "used_percent": win.used_pct,
+                "remaining_percent": remaining,
+                "resets_at": win.resets_at,
+                "resets_in_seconds": win.resets_at - now,
+                "reserve_percent": reserve,
+                "reserve_source": reserve_source,
+                "reset_fresh": reset_fresh,
+                "stale": win.stale,
+                "verdict": (
+                    "unknown"
+                    if win.stale
+                    else ("allowed" if reset_fresh or remaining >= reserve else "reserve")
+                ),
+            }
+        )
+    rows.sort(key=lambda entry: int(entry["window_minutes"]))
+    return rows
 
-    state: str
-    reason: str
-    # A recorded refusal outranks every window reading: the windows can show ample
-    # headroom (they are a *plan allowance*, orthogonal to the workspace credit balance)
-    # while Codex rejects every call. Checked first so the gate cannot go ALLOWED the
-    # moment a window happens to roll over.
-    refusal = codex_refusal()
-    if refusal is not None:
-        state, reason = "blocked", f"Codex is refusing calls: {refusal_label(refusal.reached_type)}"
-    elif snapshot is None:
-        state, reason = "unknown", "no usable rate_limits event"
-    elif snapshot.malformed:
-        state, reason = "unknown", "rate_limits event contains a malformed window"
-    elif not rows:
-        state, reason = "unknown", "rate_limits event has no usable windows"
-    elif now_ts - snapshot.captured_at > _HEADROOM_STALE_AFTER_SECONDS:
-        state, reason = "unknown", "newest rate_limits event is older than 6h"
-    elif any(row["verdict"] == "reserve" for row in rows):
+
+def seat_headroom(row: quota.ProviderQuota, now: int) -> dict[str, Any]:
+    """ONE seat's offload verdict, from the same quota row the ranking used.
+
+    Deliberately the quota row and not a second rollout read (plan D4, debate O4): the
+    row already merges the live snapshot, the rollout and the cooldown store, so the
+    gate and the selector can no longer disagree — an old rollout at 100 % used to veto
+    a seat whose newer live reading said 40 %.
+
+    Fails CLOSED on every measurement doubt, because this gate only ever governs
+    OPTIONAL offload work: no fresh window, a snapshot older than
+    :data:`_HEADROOM_STALE_AFTER_SECONDS`, or a ``malformed`` window (a non-null window
+    whose duration could not be read — it may be the very window that is full) all
+    report ``unknown``. Routing itself keeps failing OPEN on the same row; the
+    asymmetry is the point.
+    """
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    windows = _headroom_window_rows(row, now)
+    fresh = [win for win in windows if not win["stale"]]
+    if row.state == quota.BLOCKED:
+        state, reason = "blocked", row.reason or "seat is blocked"
+    elif row.malformed:
+        state, reason = "unknown", "usage snapshot contains a malformed window"
+    elif not fresh:
+        state, reason = "unknown", "no usage snapshot"
+    elif now - row.captured_at > _HEADROOM_STALE_AFTER_SECONDS:
+        state, reason = "unknown", "newest usage snapshot is older than 6h"
+    elif any(win["verdict"] == "reserve" for win in fresh):
         state, reason = "reserve", "at least one live window is inside its reserve"
     else:
         state, reason = "allowed", "every live window has sufficient headroom"
-
     if state in ("unknown", "blocked"):
-        for row in rows:
-            row["verdict"] = state
+        for win in windows:
+            win["verdict"] = state
+    return {
+        "label": row.account,
+        "id": row.id,
+        "email": row.email,
+        "state": state,
+        "reason": reason,
+        "captured_at": row.captured_at or None,
+        "windows": windows,
+    }
+
+
+def _headroom_rows(now: int) -> list[tuple[SeatCandidate, quota.ProviderQuota]]:
+    """The candidate seats paired with their quota rows, in attempt order.
+
+    A registered candidate reuses the row :func:`command_center.quota._codex_quotas`
+    already built; an unregistered explicit ``$CODEX_HOME`` gets one built on the spot
+    so it is judged by exactly the same rules instead of falling into a second code path.
+    """
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    candidates = codex_homes_in_order(now)
+    if not candidates:
+        return []
+    cooldowns = quota.read_cooldowns(now)
+    by_pid = {row.id: row for row in quota._codex_quotas(now, cooldowns)}  # noqa: SLF001
+    pairs: list[tuple[SeatCandidate, quota.ProviderQuota]] = []
+    for cand in candidates:
+        row = by_pid.get(cand.pid) if cand.pid else None
+        if row is None:
+            row = quota._codex_seat_quota(  # noqa: SLF001
+                cand.pid, cand.label, cand.home, now, cooldowns
+            )
+        pairs.append((cand, row))
+    return pairs
+
+
+def codex_headroom(now: int | None = None) -> dict[str, Any]:
+    """Structured quota-reserve decision for optional Codex offloads — over the POOL.
+
+    The question this answers is "may optional work be offloaded to Codex at all", and
+    since 2026-09-09 (plan D4, tp#212) it is asked of every eligible SEAT, not of one
+    home's rollout files. That was the concrete bug: a completely fresh team seat at
+    0 %/0 % was invisible to the gate, which read the pinned home, found nothing newer
+    than six hours and answered ``DENIED (unknown)`` while a whole paid seat sat idle.
+
+    The pool verdict is the best seat's: any ``allowed`` allows (and names that seat),
+    else ``reserve``, else ``unknown``, else ``blocked``. Candidates come from
+    :func:`codex_homes_in_order`, so ``$CODEX_HOME`` narrows the question to one seat
+    and ``CCC_NO_CODEX`` answers ``blocked`` with no seats at all.
+
+    Missing, malformed, or older-than-six-hours data still fails closed per seat. This
+    policy governs optional offload work only; debate callers intentionally remain
+    always allowed.
+    """
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    now_ts = int(time.time()) if now is None else now
+    pairs = _headroom_rows(now_ts)
+    seats = [seat_headroom(row, now_ts) for _cand, row in pairs]
+    chosen: dict[str, Any] | None = None
+    for wanted in ("allowed", "reserve", "unknown", "blocked"):
+        chosen = next((seat for seat in seats if seat["state"] == wanted), None)
+        if chosen is not None:
+            break
+    if chosen is None:
+        state = "blocked"
+        reason = (
+            "Codex disabled (CCC_NO_CODEX)"
+            if os.environ.get("CCC_NO_CODEX")
+            else "no eligible seat"
+        )
+        label, windows, captured = "", [], None
+    else:
+        state = str(chosen["state"])
+        label = str(chosen["label"])
+        windows = list(chosen["windows"])
+        captured = chosen["captured_at"]
+        reason = {
+            "allowed": f"seat {label} has headroom",
+            "reserve": "every measurable seat is inside its reserve",
+        }.get(state, str(chosen["reason"]))
+    refused_by, refused_at = "", None
+    if state == "blocked":
+        # Kept verbatim for the pre-pool consumers: the raw ``rate_limit_reached_type``
+        # of the CHOSEN seat's own refusal, else the recorded cooldown's scope.
+        chosen_cand = next((cand for cand, _row in pairs if cand.label == label), None)
+        refusal = codex_refusal(chosen_cand.home) if chosen_cand is not None else None
+        if refusal is not None:
+            refused_by, refused_at = refusal.reached_type, refusal.captured_at
+        else:
+            entry = quota.read_cooldowns(now_ts).get(
+                chosen_cand.pid if chosen_cand is not None else ""
+            )
+            if entry:
+                refused_by = str(entry.get("scope") or "")
+                refused_at = int(entry.get("observed_at") or 0) or None
     return {
         "state": state,
         "offload_allowed": state == "allowed",
         "reason": reason,
-        "refused_by": refusal.reached_type if refusal is not None else "",
-        "refused_at": refusal.captured_at if refusal is not None else None,
-        "captured_at": snapshot.captured_at if snapshot is not None else None,
+        "refused_by": refused_by,
+        "refused_at": refused_at,
+        "captured_at": captured,
         "stale_after_seconds": _HEADROOM_STALE_AFTER_SECONDS,
         "reset_fresh_within_seconds": _HEADROOM_RESET_FRESH_SECONDS,
-        "windows": rows,
+        "windows": windows,
+        # Additive (plan D4): which seat the verdict is about, and every seat's own.
+        "seat": label,
+        "seats": seats,
     }
 
 
@@ -2477,11 +2803,26 @@ def cmd_usage(args: argparse.Namespace) -> int:
 
 
 def cmd_headroom(args: argparse.Namespace) -> int:
-    """Report whether optional Codex offloads can spend quota beyond the reserve."""
+    """Report whether optional Codex offloads can spend quota beyond the reserve.
+
+    The verdict is the whole seat POOL's (plan D4): the ``seat:`` line names the seat it
+    is about, the window lines are that seat's, and one line per OTHER seat says why it
+    did not win — so "DENIED (unknown)" can no longer hide a fresh, idle paid seat.
+    """
     decision = codex_headroom()
     if args.json:
         print(json.dumps(decision))
     else:
+        if decision.get("seat"):
+            email = next(
+                (
+                    str(seat.get("email") or "")
+                    for seat in decision.get("seats") or []
+                    if seat.get("label") == decision["seat"]
+                ),
+                "",
+            )
+            print(f"seat: {decision['seat']}" + (f" ({email})" if email else ""))
         for window in decision["windows"]:
             print(
                 f"{window['duration']}: {window['used_percent']:.0f}% used, "
@@ -2498,6 +2839,9 @@ def cmd_headroom(args: argparse.Namespace) -> int:
             print(f"offload: DENIED (reserve zone — {decision['reason']})")
         else:
             print(f"offload: DENIED (unknown — {decision['reason']})")
+        for seat in decision.get("seats") or []:
+            if seat.get("label") != decision.get("seat"):
+                print(f"{seat['label']}: {seat['state']} — {seat['reason']}")
     # "blocked" shares the reserve exit code: the documented contract is 0 = offload
     # allowed, non-zero = keep the work on Claude, and 3 already means "no usable data".
     return {"allowed": 0, "reserve": 1, "blocked": 1, "unknown": 3}[decision["state"]]
@@ -2734,7 +3078,9 @@ class RunAttempt:
     home: str
     elapsed_s: float
     # "ok" | "refused:<kind>" | "failed" | "timeout" | "stalled" | "network" | "slept" |
-    # "startup_timeout" | "skipped:exhausted"
+    # "startup_timeout" | "skipped:exhausted" | "skipped:unmeasured" (write run, no weekly
+    # reading) | "skipped:below-floor" (-F/--min-remaining) | "skipped:reserve" /
+    # "skipped:unknown" (-H/--headroom)
     outcome: str
 
 
@@ -2897,6 +3243,191 @@ def _attempt_codex(  # pylint: disable=too-many-locals
     return proc, reply, before
 
 
+def ephemeral_default() -> bool:
+    """Whether ``run`` / :func:`command_center.llm.run_codex` pass ``--ephemeral``.
+
+    The rule is the mirror image of the routing feedback (plan D6, debate O2): the
+    ``codex exec --json`` stream carries NO ``rate_limits`` event (verified live
+    2026-09-09 — four events, none of them a limit block), so an ephemeral run leaves
+    NOTHING behind that measures the seat it just billed. With ``codex_usage`` OFF the
+    rollout file is the only offline measurement there is, so these calls keep it (they
+    stay UNJOURNALLED either way — only ``run -P`` journals); with it ON the runner
+    fetches the live figures itself and the session file is pure litter again.
+
+    A config read that fails answers True: leaving no session file is the conservative
+    side of this choice.
+    """
+    try:
+        from . import config  # pylint: disable=import-outside-toplevel
+
+        return bool(config.load_config().codex_usage)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return True
+
+
+def _usage_feedback_on() -> bool:
+    """True when the live-usage opt-in (``codex_usage``) is configured."""
+    return ephemeral_default()
+
+
+def write_floor_percent() -> float:
+    """The default ``--min-remaining`` for a WRITE run, as a percentage.
+
+    A write round that dies half-way through leaves a worktree to review
+    (``SEAT-REFUSED-MIDRUN``), so it must not START on a seat that is one round from
+    empty. Once ten debate samples exist the learned P95 cost of a single round is the
+    honest floor; before that, a flat tenth of the window (plan D5).
+    """
+    reserve, source = _headroom_reserve(_SEVEN_DAY_MINUTES)
+    if source != "learned":
+        return _WRITE_FLOOR_BOOTSTRAP_PCT
+    return reserve / _ROUNDS_PER_RESERVE
+
+
+def _candidate_row(cand: SeatCandidate, now: int) -> quota.ProviderQuota:
+    """*cand*'s quota row — the SAME evidence the ranking used (plan D5, debate O4).
+
+    The runner used to preflight with a bare rollout read, which could veto a seat whose
+    newer live snapshot said it was fine. Going through the row means selection and
+    preflight can never disagree; an unregistered ``$CODEX_HOME`` gets a row built for
+    its own path rather than a second code path.
+    """
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    cooldowns = quota.read_cooldowns(now)
+    if cand.pid:
+        for row in quota._codex_quotas(now, cooldowns):  # noqa: SLF001
+            if row.id == cand.pid:
+                return row
+    return quota._codex_seat_quota(cand.pid, cand.label, cand.home, now, cooldowns)  # noqa: SLF001
+
+
+def _below_floor(row: quota.ProviderQuota, floor: float) -> str:
+    """The name of a fresh window with less than *floor* % left, or ``""``."""
+    for name, win in sorted(row.windows.items()):
+        if not win.stale and (100.0 - win.used_pct) < floor:
+            return name
+    return ""
+
+
+def _pre_selection_refresh(candidates: list[SeatCandidate], budget: float) -> None:
+    """Refresh every stale/unmeasured candidate's live figures, once, inside *budget*.
+
+    Best effort in the strongest sense: each fetch is capped, the aggregate is capped,
+    and every failure is swallowed (plan D6, debate O13). Ranking on slightly old
+    numbers is a mild inefficiency; making a run wait on the network is a regression.
+    A module-level function so tests can monkeypatch the whole step.
+    """
+    from . import config, usage  # pylint: disable=import-outside-toplevel
+
+    try:
+        stale_after = int(config.load_config().codex_usage_refresh_sec)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        stale_after = 600
+    now = int(time.time())
+    deadline = time.monotonic() + budget
+    seen: set[str] = set()
+    for cand in candidates:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        home = str(cand.home)
+        if home in seen:
+            continue
+        seen.add(home)
+        try:
+            row = _candidate_row(cand, now)
+            if row.captured_at and now - row.captured_at <= stale_after and row.windows:
+                continue
+            usage.fetch_codex_usage(cand.home, now, timeout=min(_REFRESH_FETCH_TIMEOUT_SEC, left))
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            continue  # a seat we could not measure simply stays where the ranking put it
+
+
+def _post_attempt_refresh(cand: SeatCandidate, budget: float) -> None:
+    """Re-measure the seat we just billed, so the NEXT ranking sees what it cost.
+
+    Only worth doing when there is real time left (*budget*): a fetch started with five
+    seconds of the call's deadline remaining cannot finish and would only delay the
+    caller's own error. Monkeypatchable, and every failure is swallowed.
+    """
+    from . import usage  # pylint: disable=import-outside-toplevel
+
+    if budget < _REFRESH_FETCH_TIMEOUT_SEC:
+        return
+    try:
+        usage.fetch_codex_usage(cand.home, timeout=_REFRESH_FETCH_TIMEOUT_SEC)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        pass
+
+
+def _budget_left(total_timeout: int, started: float) -> float:
+    """Seconds left of the whole call's budget; a huge number when it is unlimited."""
+    if not total_timeout:
+        return float(_REFRESH_BUDGET_SEC * 10)
+    return float(total_timeout) - (time.monotonic() - started)
+
+
+def _record_attempt(cand: SeatCandidate) -> None:
+    """Stamp *cand* into the attempt ledger — the round-robin tiebreak's only input."""
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    with contextlib.suppress(Exception):
+        quota.record_seat_attempt(cand.pid)
+
+
+def _claim_probe(cand: SeatCandidate) -> bool:
+    """Win the once-a-day probe of unmeasured seat *cand*; False ⇒ someone else has it."""
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    try:
+        return quota.claim_probe(cand.pid)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return False  # cannot claim ⇒ do not probe; the ranking has other seats
+
+
+def _skip_reason(  # pylint: disable=too-many-return-statements  # one per skip outcome
+    cand: SeatCandidate,
+    *,
+    ignore_quota: bool,
+    write: bool,
+    min_remaining_pct: float,
+    headroom: bool,
+) -> str:
+    """The ``RunAttempt.outcome`` for a seat that must NOT be launched, or ``""``.
+
+    Every check reads ONE quota row (plan D5, debate O4), so the preflight cannot
+    contradict the ranking that produced the candidate. Order matters: proven-exhausted
+    first (the cheapest and most certain), then the write-mode rules, then the optional
+    headroom gate.
+    """
+    if ignore_quota and not (write or min_remaining_pct or headroom):
+        return ""  # nothing left to check — do not pay for a quota row
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    now = int(time.time())
+    try:
+        row = _candidate_row(cand, now)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return ""  # a row we cannot build proves nothing — fail open, as everywhere else
+    if not ignore_quota and row.state == quota.BLOCKED:
+        return "skipped:exhausted"
+    if write and min_remaining_pct > 0 and quota._measured_week(row) is None:  # noqa: SLF001
+        # A write run on a seat with no weekly reading may refuse mid-edit, and the
+        # review that costs is exactly what the runner exists to avoid (plan D5). The
+        # skip exists to make the floor checkable, so it goes with the floor: `-F 0`
+        # ("no floor, I accept the risk") waives both — otherwise a fresh install with
+        # no usage data anywhere could never start a write run at all.
+        return "skipped:unmeasured"
+    if min_remaining_pct and _below_floor(row, min_remaining_pct):
+        return "skipped:below-floor"
+    if headroom:
+        state = str(seat_headroom(row, now)["state"])
+        if state != "allowed":
+            return f"skipped:{state}"
+    return ""
+
+
 def _no_seat_result(result: RunResult, now: int | None = None) -> RunResult:
     """Fill *result* in as ``all_seats_unavailable``, with per-seat evidence."""
     lines, earliest = seat_status_report(now)
@@ -2926,6 +3457,8 @@ def run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,
     persistent: bool = True,
     max_attempts: int = 0,
     on_attempt: Callable[[SeatCandidate, int], None] | None = None,
+    headroom: bool = False,
+    min_remaining_pct: float = 0.0,
 ) -> RunResult:
     """Run one Codex round, hopping seats on a REFUSAL — the only launcher in ccc.
 
@@ -2951,6 +3484,22 @@ def run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,
       on top of it.
     * **``resume_home`` binds to one seat.** ``codex exec resume`` re-attaches to a
       session that exists in exactly one ``CODEX_HOME``; hopping would resume nothing.
+      A resume therefore gets NO write floor and NO headroom filter either — there is no
+      second seat to move to, so a filter could only turn a runnable resume into a
+      refusal. The documented trade-off is a possible ``SEAT-REFUSED-MIDRUN`` review
+      (plan D5).
+    * **Four skip reasons, all evaluated from the seat's QUOTA ROW** (plan D5, debate
+      O4), before any process: ``skipped:exhausted`` (the row is BLOCKED — a window at
+      100 %, a live refusal or a hold), ``skipped:unmeasured`` (a WRITE run with a floor
+      refuses a seat whose weekly window is unknown — the floor cannot be checked there;
+      ``min_remaining_pct == 0`` waives both), ``skipped:below-floor``
+      (``min_remaining_pct``) and, in ``--headroom`` mode, ``skipped:reserve`` /
+      ``skipped:unknown``. Using the row rather than a second rollout read is what stops
+      an old rollout at 100 % from vetoing a seat whose newer live reading says 40 %.
+    * **Feedback, when ``codex_usage`` is on** (plan D6): every stale candidate is
+      refreshed once before selection and the attempted seat once after, both inside
+      hard budgets and both best-effort. With the opt-in off, ``run`` keeps its session
+      file instead (see :func:`ephemeral_default`) so the rollout measures the seat.
 
     Never raises for a seat problem — everything is reported through
     :attr:`RunResult.error_kind`. :class:`codex_launch.CodexLaunchError` (a launch this
@@ -2962,32 +3511,51 @@ def run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,
         result.error_kind = "disabled"
         result.error_message = "Codex disabled (CCC_NO_CODEX)"
         return result
+    # The deadline starts BEFORE the refresh: a best-effort measurement must be spent
+    # out of the call's budget, never added on top of it (plan D5, debate O13).
+    heartbeat_path = RUNS_DIR / f"{os.getpid()}.json"
+    started = time.monotonic()
+    # A resume binds to one seat, so promoting an unmeasured seat would be meaningless;
+    # a write run refuses to experiment at all (plan D5/D7).
+    probe_ok = resume_home is None and not write
     if resume_home is not None:
         pending = [_seat_candidate_for(resume_home)]
     else:
-        pending = codex_homes_in_order()
+        if _usage_feedback_on():
+            with contextlib.suppress(Exception):
+                _pre_selection_refresh(codex_homes_in_order(probe=probe_ok), _REFRESH_BUDGET_SEC)
+        pending = codex_homes_in_order(probe=probe_ok)
     if not pending:
         return _no_seat_result(result)
 
-    heartbeat_path = RUNS_DIR / f"{os.getpid()}.json"
-    started = time.monotonic()
     attempted: set[str] = set()
     physical = 0
     while True:
         if attempted and resume_home is None:
-            pending = codex_homes_in_order()  # a hold written mid-run removes a seat
+            # a hold written mid-run removes a seat
+            pending = codex_homes_in_order(probe=probe_ok)
         pending = [c for c in pending if str(c.home) not in attempted]
         if not pending:
             break
         cand = pending[0]
         attempted.add(str(cand.home))
-        if not ignore_quota:
-            used_pct, _ = read_codex_usage(home=cand.home)
-            if used_pct is not None and used_pct >= _EXHAUSTED_PERCENT:
-                result.attempts.append(
-                    RunAttempt(cand.label, str(cand.home), 0.0, "skipped:exhausted")
-                )
-                continue
+        skip = _skip_reason(
+            cand,
+            ignore_quota=ignore_quota,
+            write=write and resume_home is None,
+            min_remaining_pct=0.0 if resume_home is not None else min_remaining_pct,
+            headroom=headroom and resume_home is None,
+        )
+        if skip:
+            result.attempts.append(RunAttempt(cand.label, str(cand.home), 0.0, skip))
+            continue
+        if cand.probe and not _claim_probe(cand):
+            # Another runner took today's probe of this unmeasured seat: re-rank WITHOUT
+            # it rather than spend a second round trip on the same experiment (plan D7).
+            probe_ok = False
+            attempted.discard(str(cand.home))
+            pending = codex_homes_in_order(probe=False)
+            continue
         if max_attempts and physical >= max_attempts:
             result.error_kind = "attempts_exhausted"
             result.error_message = (
@@ -3009,6 +3577,9 @@ def run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,
             remaining = max(1, remaining)
         if on_attempt is not None:
             on_attempt(cand, physical)
+        if not cand.probe:
+            # A claimed probe already wrote its attempt record — the claim IS the record.
+            _record_attempt(cand)
         physical += 1
         attempt_started = time.monotonic()
         try:
@@ -3042,6 +3613,11 @@ def run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,
                 result, cand, exc, attempt_started, kind=_STALL_KINDS.get(exc.reason, "stalled")
             )
         elapsed = time.monotonic() - attempt_started
+        if _usage_feedback_on():
+            # Re-measure what this attempt actually cost, so the NEXT ranking (this call's
+            # own hop included) is not made on pre-attempt figures. Never fatal.
+            with contextlib.suppress(Exception):
+                _post_attempt_refresh(cand, _budget_left(total_timeout, started))
         events = parse_json_events(proc.stdout or "")
         failure = classify_codex_failure(proc.returncode, events, proc.stderr or "")
         result.proc = proc
@@ -3232,6 +3808,19 @@ def _idle_timeout_for(explicit: int | None, wall_timeout: int) -> int:
     return DEFAULT_IDLE_TIMEOUT  # an unlimited wall still guards stalls
 
 
+def _min_remaining_pct(args: argparse.Namespace, *, write: bool) -> float:
+    """Resolve ``-F/--min-remaining``: explicit value, else the write floor, else none.
+
+    A READ-ONLY run has no floor by default — the worst case is a refusal and a hop. A
+    WRITE run defaults to :func:`write_floor_percent`, because a seat that runs out
+    mid-edit costs a worktree review. ``-F 0`` disables it explicitly (plan D5).
+    """
+    raw = getattr(args, "min_remaining", None)
+    if raw is not None:
+        return max(0.0, float(raw))
+    return write_floor_percent() if write else 0.0
+
+
 def _wants_ignore_quota(args: argparse.Namespace) -> bool:
     """``-Q`` or ``$CODEX_IN_CLAUDE_IGNORE_QUOTA=1`` — skip the per-seat preflight."""
     return bool(getattr(args, "ignore_quota", False)) or (
@@ -3384,6 +3973,8 @@ def cmd_delegate(args: argparse.Namespace) -> int:  # pylint: disable=too-many-r
                 ignore_quota=_wants_ignore_quota(args),
                 persistent=True,
                 max_attempts=max(0, int(getattr(args, "max_attempts", 0) or 0)),
+                headroom=bool(getattr(args, "headroom", False)),
+                min_remaining_pct=_min_remaining_pct(args, write=write),
                 on_attempt=lambda cand, index: print(_seat_line(cand, index), flush=True),
             )
     except codex_launch.CodexLaunchError as exc:
@@ -3432,6 +4023,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     effort = args.effort or resolve_effort()
     shown_effort = effort or effort_of(model)
     as_json = bool(getattr(args, "json", False))
+    ephemeral = bool(getattr(args, "ephemeral", False)) or ephemeral_default()
     if not as_json:
         print(f"model: {model} (effort {shown_effort})", flush=True)
     try:
@@ -3451,8 +4043,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     ) -> list[str]:
         """A read-only, MCP-free ``codex exec`` for one seat; prompt on stdin."""
         cmd = [codex_bin, "exec", "--json"]
-        if not persist:
-            cmd.append("--ephemeral")  # leave no session file behind
+        if not persist and ephemeral:
+            # `--ephemeral` leaves no session file — and therefore no `rate_limits`
+            # block, which is the ONLY offline measurement of what this run cost (the
+            # --json stream carries none). So it is dropped whenever the live-usage
+            # opt-in is off, unless -E/--ephemeral asks for it (plan D6, debate O2).
+            # The run stays UNJOURNALLED either way: only -P journals.
+            cmd.append("--ephemeral")
         cmd += [*perm_args, *mcp_args, "-o", out_path, "-m", model, "-C", str(workdir)]
         if workdir.skip_git_check:
             cmd.append("--skip-git-repo-check")
@@ -3482,6 +4079,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             ignore_quota=_wants_ignore_quota(args),
             persistent=persist,
             max_attempts=max(0, int(getattr(args, "max_attempts", 0) or 0)),
+            headroom=bool(getattr(args, "headroom", False)),
+            min_remaining_pct=_min_remaining_pct(args, write=False),
             on_attempt=(
                 None
                 if as_json
@@ -3607,6 +4206,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  codex-in-claude.py headroom --json          # optional-offload quota gate\n"
             "  codex-in-claude.py delegate --write -C . 'add retry to fetch()'\n"
             "  codex-in-claude order private de default    # seat order (+ clears the pin)\n"
+            "  codex-in-claude policy fill                 # rank by weekly reset, not order\n"
             "  codex-in-claude run -j -C . 'reply OK'      # machine entry point (-j envelope)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3794,6 +4394,23 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="stop after N physical seat attempts (default 0 = try every eligible seat)",
     )
+    p_del.add_argument(
+        "-H",
+        "--headroom",
+        action="store_true",
+        help="only bill a seat whose live windows are outside their reserve (the same "
+        "verdict `headroom` reports, per seat); others are skipped as skipped:reserve",
+    )
+    p_del.add_argument(
+        "-F",
+        "--min-remaining",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="skip a seat with less than PCT%% left on any live window (default: 0 for a "
+        "read-only run, the learned single-round cost for --write; 0 disables the floor "
+        "AND lets a write run start on a seat with no weekly reading)",
+    )
     p_del.set_defaults(func=cmd_delegate)
 
     p_run = sub.add_parser(
@@ -3863,6 +4480,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the per-seat quota preflight (try a seat even at >=100%% used)",
     )
     p_run.add_argument(
+        "-E",
+        "--ephemeral",
+        action="store_true",
+        help="force --ephemeral (no session file). Default: ephemeral only while "
+        "codex_usage is on — the rollout is otherwise the only record of what the run cost",
+    )
+    p_run.add_argument(
+        "-H",
+        "--headroom",
+        action="store_true",
+        help="only bill a seat whose live windows are outside their reserve (the same "
+        "verdict `headroom` reports, per seat); others are skipped as skipped:reserve",
+    )
+    p_run.add_argument(
+        "-F",
+        "--min-remaining",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="skip a seat with less than PCT%% left on any live window (default: 0 for a "
+        "read-only run, the learned single-round cost for --write; 0 disables the floor "
+        "AND lets a write run start on a seat with no weekly reading)",
+    )
+    p_run.add_argument(
         "-j",
         "--json",
         action="store_true",
@@ -3930,6 +4571,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="machine-readable: {configured, order, unknown, next_attempt, candidates, pin}",
     )
     p_order.set_defaults(func=cmd_order)
+
+    p_policy = sub.add_parser(
+        "policy",
+        help="show/set HOW the seats are ranked (fill = resets-soonest first | order)",
+        description=(
+            "`fill` (default) spends the seat whose WEEKLY allowance resets soonest — the "
+            "allowance about to be thrown away — filling seats that reset within 12h of "
+            "each other equally; `codex_seat_order` is then only the tiebreak. `order` "
+            "tries the seats strictly in that configured order. No argument = show."
+        ),
+    )
+    p_policy.add_argument(
+        "policy", nargs="?", choices=("fill", "order"), help="the policy to set (omit = show)"
+    )
+    p_policy.add_argument("-j", "--json", action="store_true", help="machine-readable: {policy}")
+    p_policy.set_defaults(func=cmd_policy)
 
     p_runs = sub.add_parser(
         "runs", help="list in-flight delegate runs (elapsed/idle/last output, one line each)"

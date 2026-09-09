@@ -67,6 +67,9 @@ def _run_ns(seats: SeatFixture, **kw: object) -> argparse.Namespace:
         "max_attempts": 0,
         "persist": False,
         "ignore_quota": False,
+        "ephemeral": False,
+        "headroom": False,
+        "min_remaining": None,
         "json": True,
     }
     base.update(kw)
@@ -94,6 +97,8 @@ def _delegate_ns(seats: SeatFixture, **kw: object) -> argparse.Namespace:
         "show_prompt": False,
         "max_attempts": 0,
         "ignore_quota": False,
+        "headroom": False,
+        "min_remaining": None,
     }
     base.update(kw)
     return argparse.Namespace(**base)
@@ -251,7 +256,10 @@ def test_single_deadline_across_attempts(
     assert three_seats.call_homes() == ["private"]
 
     # And the budget is shared: what attempt 1 spends, attempt 2 does not get back.
+    # The ledger is wiped first: phase 1 recorded an attempt on `private`, which under
+    # the fill policy's round-robin would move this phase's first try to another seat.
     three_seats.reset_log()
+    three_seats.forget_attempts()
     three_seats.scenarios(private="refuse_quota", de={"scenario": "ok", "reply": "de"})
     seen: list[int] = []
     real_exec = cic._exec_codex  # noqa: SLF001
@@ -324,6 +332,7 @@ def test_write_mode_midrun_refusal_stops_and_journals(
 ) -> None:
     """A refusal AFTER codex touched the worktree is terminal and reported for review."""
     three_seats.reorder("de", "default", "private")  # only `de` declares hardened-rw
+    three_seats.measure()  # a write run refuses an UNMEASURED seat (plan D5)
     three_seats.scenarios(de="midrun_write", default={"scenario": "ok", "reply": "team"})
     subprocess.run(["git", "init", "-q"], cwd=three_seats.workdir, check=True)
     args = _delegate_ns(three_seats, write=True, max_attempts=0)
@@ -348,6 +357,7 @@ def test_write_mode_clean_refusal_hops(three_seats: SeatFixture) -> None:
     """A refusal with an UNTOUCHED worktree is safe to retry on the next seat."""
     subprocess.run(["git", "init", "-q"], cwd=three_seats.workdir, check=True)
     three_seats.reorder("de", "default", "private")  # only `de` declares hardened-rw
+    three_seats.measure()  # a write run refuses an UNMEASURED seat (plan D5)
     three_seats.scenarios(de="refuse_quota", default={"scenario": "ok", "reply": "team"})
     # `default` has no hardened-rw profile either, so the write run is refused there —
     # what matters is that the runner GOT there, i.e. it hopped off the clean refusal.
@@ -359,6 +369,7 @@ def test_write_mode_clean_refusal_hops(three_seats: SeatFixture) -> None:
 def test_write_refused_on_seat_without_rw_profile(three_seats: SeatFixture) -> None:
     """No [permissions.hardened-rw] on the leading seat ⇒ exit 2, codex never runs."""
     subprocess.run(["git", "init", "-q"], cwd=three_seats.workdir, check=True)
+    three_seats.measure()  # a write run refuses an UNMEASURED seat before the profile check
     three_seats.scenarios()
     assert cic.cmd_delegate(_delegate_ns(three_seats, write=True)) == cic.EX_USAGE
     assert three_seats.calls() == []
@@ -396,7 +407,7 @@ def test_argv_rebuilt_per_seat_mcp_and_profile(three_seats: SeatFixture) -> None
     assert "mcp_servers.gamma.enabled=false" in second
     assert "mcp_servers.alpha.enabled=false" not in second
     for argv in (first, second):
-        assert argv[:3] == ["exec", "--json"] + ["--ephemeral"]
+        assert argv[:2] == ["exec", "--json"]  # no --ephemeral: codex_usage is off
         assert argv[argv.index("-C") + 1] == str(three_seats.workdir)
         assert argv[argv.index("-m") + 1] == _MODEL
         assert "model_reasoning_effort=low" in argv
@@ -420,16 +431,39 @@ def test_argv_never_uses_legacy_sandbox_flag(three_seats: SeatFixture) -> None:
         assert "-s" not in call["argv"] and "--sandbox" not in call["argv"]
 
 
-def test_argv_ephemeral_for_run_and_persistent_for_delegate(three_seats: SeatFixture) -> None:
-    """`run` leaves no session behind; `delegate` keeps and journals one."""
+def test_argv_ephemeral_follows_the_usage_opt_in(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run` keeps its session file while `codex_usage` is OFF — that IS the measurement.
+
+    The `--json` stream carries no `rate_limits`, so an ephemeral run leaves nothing
+    that says what it cost the seat it billed (plan D6, debate O2). It stays
+    UNJOURNALLED either way: only `-P` journals.
+    """
     three_seats.scenarios(private={"scenario": "ok", "reply": "hi"})
     assert cic.cmd_run(_run_ns(three_seats, json=False)) == cic.EX_OK
-    assert "--ephemeral" in three_seats.calls()[0]["argv"]
+    assert "--ephemeral" not in three_seats.calls()[0]["argv"]
     assert codex_journal(three_seats.seats["private"]) == []
 
+    # -E forces the old behaviour back
+    three_seats.reset_log()
+    assert cic.cmd_run(_run_ns(three_seats, json=False, ephemeral=True)) == cic.EX_OK
+    assert "--ephemeral" in three_seats.calls()[0]["argv"]
+
+    # and so does the opt-in, because then the runner measures the seat live instead
+    three_seats.reset_log()
+    monkeypatch.setattr(cic, "ephemeral_default", lambda: True)
+    monkeypatch.setattr(cic, "_post_attempt_refresh", lambda _cand, _budget: None)
+    monkeypatch.setattr(cic, "_pre_selection_refresh", lambda _cands, _budget: None)
+    assert cic.cmd_run(_run_ns(three_seats, json=False)) == cic.EX_OK
+    assert "--ephemeral" in three_seats.calls()[0]["argv"]
+
+
+def test_delegate_keeps_and_journals_its_session(three_seats: SeatFixture) -> None:
+    """`delegate` never goes ephemeral: its session is journalled so `--resume` works."""
+    three_seats.scenarios(private={"scenario": "ok", "reply": "hi"})
     assert cic.cmd_delegate(_delegate_ns(three_seats)) == cic.EX_OK
-    delegate_argv = three_seats.calls()[1]["argv"]
-    assert "--ephemeral" not in delegate_argv
+    assert "--ephemeral" not in three_seats.calls()[0]["argv"]
     assert codex_journal(three_seats.seats["private"])
 
 
@@ -925,7 +959,9 @@ def test_caffeinate_is_held_for_the_run_and_released(
     assert held["argv"] == ["-i", "-w", str(three_seats.calls()[0]["pgid"])]
     assert _eventually(lambda: _pid_gone(int(held["pid"])), 3)
 
-    three_seats.scenarios(private="network_dead")
+    # Every seat, because the fill policy's round-robin moves the leading seat after
+    # phase 1's recorded attempt — and a network kill is terminal, so only one runs.
+    three_seats.scenarios(private="network_dead", de="network_dead", default="network_dead")
     assert cic.cmd_run(_run_ns(three_seats, timeout=0, idle_timeout=3)) == cic.EX_NETWORK
     assert _eventually(lambda: len(_caffeinate_calls(log)) == 2, 3)
     killed = _caffeinate_calls(log)[1]

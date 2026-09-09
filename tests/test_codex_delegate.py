@@ -18,6 +18,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from conftest import SeatFixture
 
 from command_center import codex_launch
 from command_center.models import job_launch_prefix
@@ -35,6 +36,53 @@ def _load_engine() -> ModuleType:
     import command_center.codex_in_claude as engine
 
     return engine
+
+
+def _seat_auth(home: Path) -> None:
+    """Give *home* the ``auth.json`` a seat needs to be MEASURABLE at all.
+
+    ``quota._codex_seat_quota`` reports a home without one as UNKNOWN ("no auth.json"),
+    and since the seat routing landed (tp#212) an UNKNOWN seat is skipped by a write run
+    and by ``--headroom``. Every fixture home that stands in for a real login therefore
+    needs one.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "auth.json").write_text("{}", encoding="utf-8")
+
+
+def _healthy_rollout(home: Path, *, now: int | None = None) -> None:
+    """Leave a fresh, half-empty 5h + weekly reading in *home*'s rollouts.
+
+    A write ``delegate`` refuses a seat whose weekly window is unmeasured (plan D5), so
+    the tests that exercise the LAUNCH policy need a seat that is measurably fine.
+    """
+    now = int(time.time()) if now is None else now
+    day = home / "sessions" / "2026" / "09" / "09"
+    day.mkdir(parents=True, exist_ok=True)
+    (day / "rollout-2026-09-09T10-00-00-fixture.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 10.0,
+                            "resets_at": now + 3600,
+                            "window_minutes": 300,
+                        },
+                        "secondary": {
+                            "used_percent": 20.0,
+                            "resets_at": now + 5 * 86400,
+                            "window_minutes": 10080,
+                        },
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _write_codex_config(home: Path, *, hardened_rw: bool) -> Path:
@@ -64,6 +112,11 @@ def cic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     monkeypatch.setenv("CODEX_IN_CLAUDE_CONFIG", str(tmp_path / "config.json"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    # A LOGGED-IN, measurable seat: the seat routing skips an unmeasured home in write
+    # mode, so a fixture home with no auth.json / no windows would make every launch
+    # test fail on routing instead of on the behaviour it is testing.
+    _seat_auth(tmp_path / "codex")
+    _healthy_rollout(tmp_path / "codex")
     monkeypatch.setattr(mod, "list_models", lambda **_: list(_FAKE_CATALOG))
     return mod
 
@@ -125,6 +178,7 @@ def _install_headroom_fixture(
     name: str,
 ) -> None:
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _seat_auth(tmp_path)
     rollout = tmp_path / "sessions" / "2033" / "05" / "18" / "rollout-fixture.jsonl"
     rollout.parent.mkdir(parents=True)
     rollout.write_text((_HEADROOM_FIXTURES / name).read_text(encoding="utf-8"), encoding="utf-8")
@@ -182,17 +236,19 @@ def test_codex_windows_are_keyed_by_duration_not_position(
 def test_headroom_reset_within_ten_minutes_counts_as_fresh(
     cic: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    snapshot = cic._CodexRateSnapshot(
+    """A window at 99% that resets in 10 minutes is not a reason to hold work back.
+
+    Stubbed at ``usage.read_codex_usage`` — the seat's quota row is what the pool gate
+    reads now (plan D4), not a second rollout scan.
+    """
+    from command_center import usage
+
+    snapshot = usage.Usage(
         captured_at=_HEADROOM_NOW,
-        windows={
-            300: cic._CodexRateWindow(
-                used_percent=99.0,
-                resets_at=_HEADROOM_NOW + 600,
-                window_minutes=300,
-            )
-        },
+        five_hour=usage.Window(used_percentage=99.0, resets_at=_HEADROOM_NOW + 600),
+        seven_day=None,
     )
-    monkeypatch.setattr(cic, "_codex_rate_snapshot", lambda: snapshot)
+    monkeypatch.setattr(usage, "read_codex_usage", lambda _n=None, _h=None: snapshot)
     decision = cic.codex_headroom(now=_HEADROOM_NOW)
     assert decision["state"] == "allowed"
     assert decision["windows"][0]["reset_fresh"] is True
@@ -1026,14 +1082,24 @@ def test_pinned_codex_home_honours_inclusive_expiry(tmp_path: Path) -> None:
     assert cic.pinned_codex_home({"codex_home": str(tmp_path), "codex_home_until": "soon"}) is None
 
 
-def test_codex_home_resolution_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_codex_home_resolution_order(
+    three_seats: SeatFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """env $CODEX_HOME > an active pin > the ranking, on REGISTERED seats only.
+
+    On the ``three_seats`` fixture rather than bare ``tmp_path`` (tp#212): a pin at an
+    unregistered path governs nothing since plan D3, and the old test also ranked the
+    developer's REAL ``~/.codex`` ahead of its own pin, so it failed on any machine with
+    a real Codex login.
+    """
     from command_center import codex_in_claude as cic
 
+    three_seats.reorder()  # canonical order: default -> private -> de
     cfg_path = tmp_path / "config.json"
     monkeypatch.setenv("CODEX_IN_CLAUDE_CONFIG", str(cfg_path))
     monkeypatch.delenv("CODEX_HOME", raising=False)
     assert cic._codex_home() == Path.home() / ".codex"  # pylint: disable=protected-access
-    pinned = tmp_path / "private"
+    pinned = three_seats.seats["de"]
     cfg_path.write_text(json.dumps({"codex_home": str(pinned)}), encoding="utf-8")
     assert cic._codex_home() == pinned  # pylint: disable=protected-access
     assert cic.codex_exec_env({})["CODEX_HOME"] == str(pinned)
@@ -1043,33 +1109,98 @@ def test_codex_home_resolution_order(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 
 def test_cmd_home_sets_and_clears_pin(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    three_seats: SeatFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """The pin round-trip, on a REGISTERED seat (tp#212 / plan D3).
+
+    ``de`` is one of the fixture's configured logins; an unregistered path is refused
+    outright now (see ``test_cmd_home_refuses_an_unregistered_path``), so this test can
+    no longer use a bare ``tmp_path`` directory — and it no longer competes with the
+    developer's real ``~/.codex`` for the top of the ranking.
+    """
+    import argparse
+
+    from command_center import codex_in_claude as cic
+
+    three_seats.reorder()
+    cfg_path = tmp_path / "config.json"
+    monkeypatch.setenv("CODEX_IN_CLAUDE_CONFIG", str(cfg_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    home = three_seats.seats["de"]
+    auth = home / "auth.json"
+    saved_auth = auth.read_text(encoding="utf-8")
+    auth.unlink()
+    # A pin in the PAST reads back as "expired", so the date must stay in the future: the
+    # literal "2026-09-07" this test used went stale the day after it was written.
+    until = (date.today() + timedelta(days=30)).isoformat()
+    ns = argparse.Namespace(path=str(home), until=until, clear=False, json=False)
+    assert cic.cmd_home(ns) == cic.EX_USAGE  # no auth.json yet
+    auth.write_text(saved_auth, encoding="utf-8")
+    assert cic.cmd_home(ns) == cic.EX_OK
+    out = capsys.readouterr().out
+    assert str(home) in out and f"until {until}" in out
+    saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert saved["codex_home"] == str(home) and saved["codex_home_until"] == until
+    bad = argparse.Namespace(path=str(home), until="next monday", clear=False, json=False)
+    assert cic.cmd_home(bad) == cic.EX_USAGE
+    assert (
+        cic.cmd_home(argparse.Namespace(path=None, until=None, clear=True, json=False)) == cic.EX_OK
+    )
+    saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert saved["codex_home"] is None
+
+
+def test_cmd_home_refuses_an_unregistered_path(
+    three_seats: SeatFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A pin outside the seat registry is refused, with the enrollment hint (plan D3)."""
     import argparse
 
     from command_center import codex_in_claude as cic
 
     cfg_path = tmp_path / "config.json"
     monkeypatch.setenv("CODEX_IN_CLAUDE_CONFIG", str(cfg_path))
-    monkeypatch.delenv("CODEX_HOME", raising=False)
-    home = tmp_path / "second"
-    home.mkdir()
-    # A pin in the PAST reads back as "expired", so the date must stay in the future: the
-    # literal "2026-09-07" this test used went stale the day after it was written.
-    until = (date.today() + timedelta(days=30)).isoformat()
-    ns = argparse.Namespace(path=str(home), until=until, clear=False)
-    assert cic.cmd_home(ns) == cic.EX_USAGE  # no auth.json yet
-    (home / "auth.json").write_text("{}", encoding="utf-8")
-    assert cic.cmd_home(ns) == cic.EX_OK
-    out = capsys.readouterr().out
-    assert str(home) in out and f"until {until}" in out
-    saved = json.loads(cfg_path.read_text(encoding="utf-8"))
-    assert saved["codex_home"] == str(home) and saved["codex_home_until"] == until
-    bad = argparse.Namespace(path=str(home), until="next monday", clear=False)
-    assert cic.cmd_home(bad) == cic.EX_USAGE
-    assert cic.cmd_home(argparse.Namespace(path=None, until=None, clear=True)) == cic.EX_OK
-    saved = json.loads(cfg_path.read_text(encoding="utf-8"))
-    assert saved["codex_home"] is None
+    stray = tmp_path / "codex-stray"
+    stray.mkdir()
+    (stray / "auth.json").write_text("{}", encoding="utf-8")
+    ns = argparse.Namespace(path=str(stray), until=None, clear=False, json=False)
+    assert cic.cmd_home(ns) == cic.EX_USAGE
+    err = capsys.readouterr().err
+    assert "is not a registered seat" in err
+    assert 'codex_homes_extra = ["stray=' in err
+    assert not cfg_path.exists()  # nothing was written
+    _ = three_seats
+
+
+def test_home_ignores_a_preexisting_unregistered_pin(
+    three_seats: SeatFixture, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A pin written before the enrollment rule is REPORTED and ignored, never obeyed."""
+    import argparse
+
+    from command_center import codex_in_claude as cic
+
+    stray = tmp_path / "codex-legacy"
+    stray.mkdir()
+    (stray / "auth.json").write_text("{}", encoding="utf-8")
+    cic.save_config({"codex_home": str(stray), "codex_home_until": None})
+    assert cic.pin_active() is False
+    assert (
+        cic.cmd_home(argparse.Namespace(path=None, until=None, clear=False, json=False))
+        == cic.EX_OK
+    )
+    captured = capsys.readouterr()
+    assert "(pin ignored: not a registered seat)" in captured.out
+    assert "is not a registered seat — ignored (clear with -c)" in captured.err
+    # the effective home is a real seat, never the stray path
+    assert str(stray) not in captured.out.splitlines()[0].split("[")[0]
+    _ = three_seats
 
 
 def test_cmd_home_json_labels_a_codex_homes_extra_pin(

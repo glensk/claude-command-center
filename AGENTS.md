@@ -169,7 +169,7 @@ label). See the multi-account section of [docs/reference.md](docs/reference.md).
 `codex_in_claude.run_with_fallback` is the ONE place ccc STARTS one — `delegate`, the machine
 `run` subcommand and `llm.run_codex` all go through the runner, and nothing else may assemble
 or spawn codex argv. External consumers (`codex-review.py`, sdsc-automations' checker) call
-`codex-in-claude run -j` instead of `codex exec`, so they inherit the seat order, the run-time
+`codex-in-claude run -j` instead of `codex exec`, so they inherit the seat POLICY, the run-time
 fallback and the typed errors for free. Three invariants:
 
 1. **Never emit `-s`/`--sandbox`.** Codex ≥ 0.150 uses NAMED permission profiles
@@ -192,11 +192,17 @@ Refusals raise `CodexLaunchError` → exit 2 at the CLI boundary (`CodexMissing`
 Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_codex_order.py`):
 
 4. **The seat is chosen per attempt, not per process.** `codex_homes_in_order()` re-reads the
-   `codex_seat_order` + cooldown state before EVERY attempt; a run-time refusal (`quota` /
+   quota rows + cooldown state before EVERY attempt; a run-time refusal (`quota` /
    `entitlement` / `auth`, classified only from the `--json` `error`/`turn.failed` events, never
    from item text or the prompt) records a block and hops to the next seat. A task failure, a
    timeout, a stall and a write-mode refusal that already touched the worktree do NOT hop.
    Zero eligible seats ⇒ **no process at all** and `error.kind = all_seats_unavailable`.
+   *Which* seat leads is `codex_seat_policy` (`quota.rank_codex_seats`, pure and injectable):
+   `fill` (the default) spends the seat whose WEEKLY allowance resets soonest — seats resetting
+   within 12 h of each other are one cohort, filled equally by 5 % usage bucket then by the
+   `codex-seat-attempts.json` ledger — while `order` is the strict `codex_seat_order`. The
+   account pin leads under `fill` but only enrolled paths may be pinned; under `order` an
+   explicit order disarms it. See [docs/codex.md](docs/codex.md) § "Seat policy".
 5. **Per-seat argv, always rebuilt.** `permission_args(write, codex_home=cand.home)` and
    `mcp_disable_args(cand.home)` are recomputed for each attempt with a fresh `-o` file — the
    first seat's profile or MCP flags must never leak onto the second.
