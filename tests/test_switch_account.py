@@ -892,6 +892,142 @@ def test_switch_account_now_refuses_a_busy_session_unless_it_is_rate_limit_halte
         assert "mid-turn" in capsys.readouterr().err
 
 
+# The state test behind `-K` (`/cwork-to-cpriv`): a switch must not turn an idle session
+# into a running one (2026-09-09): a long-idle session moved to the other seat relaunched
+# and started working, because the slash command hard-coded `-p`.
+_HALT_TEXT = "You've hit your session limit \u00b7 resets 6:40pm"
+_OVERLOAD_TEXT = "Server is temporarily limiting requests (not your usage limit) \u00b7 retrying"
+
+
+def _halt_records(text: str) -> list[object]:
+    """A transcript whose last main-chain assistant record is an API-error halt."""
+    return [
+        {"type": "user", "message": {"role": "user", "content": "go"}},
+        {
+            "type": "assistant",
+            "uuid": "halt-1",
+            "timestamp": "2026-09-09T13:30:48.440Z",
+            "isApiErrorMessage": True,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+        },
+    ]
+
+
+def _prompt_of(argv: list[str]) -> str:
+    """The ``--prompt`` value ``switch-now`` was spawned with ("" when there is none)."""
+    return argv[argv.index("--prompt") + 1] if "--prompt" in argv else ""
+
+
+def _run_switch_k(
+    two_accounts: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    records: list[object] | None = None,
+    status: str = "idle",
+    extra: tuple[str, ...] = (),
+) -> tuple[int, list[list[str]]]:
+    """Run ``switch-account work -N -K`` against a transcript and return (code, spawns)."""
+    private, _work = two_accounts
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    with Store() as store:
+        store.ensure(SID, cwd=str(repo))
+        store.update_fields(SID, iterm_session_id=ITERM)
+    _prepare_arm(
+        monkeypatch, two_accounts, live=_live(str(repo), private, status=status), inside=False
+    )
+    if records is not None:
+        _jsonl(_transcript(private, str(repo)), records)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+    code = cli.main(["switch-account", "work", "-s", SID, "-N", "-K", *extra])
+    return code, calls
+
+
+def test_switch_account_k_keeps_an_idle_session_idle(
+    two_accounts: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Nothing interrupted this session, so the relaunch carries NO prompt — and says so."""
+    code, calls = _run_switch_k(two_accounts, monkeypatch, tmp_path)
+    assert code == 0
+    assert _prompt_of(calls[0]) == ""
+    assert "lands IDLE" in capsys.readouterr().out
+
+
+def test_switch_account_k_continues_a_usage_limit_halt(
+    two_accounts: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A turn that died on the account's usage limit is unfinished work: it resumes."""
+    code, calls = _run_switch_k(
+        two_accounts, monkeypatch, tmp_path, records=_halt_records(_HALT_TEXT)
+    )
+    assert code == 0
+    assert _prompt_of(calls[0]) == cli.SWITCH_CONTINUE_PROMPT
+
+
+def test_switch_account_k_ignores_a_server_side_overload_halt(
+    two_accounts: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A transient 429 is not the user's allowance — the other seat hits the same server."""
+    code, calls = _run_switch_k(
+        two_accounts, monkeypatch, tmp_path, records=_halt_records(_OVERLOAD_TEXT)
+    )
+    assert code == 0
+    assert _prompt_of(calls[0]) == ""
+
+
+def test_switch_account_k_continues_a_turn_that_force_cut_off(
+    two_accounts: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``-f`` on a live turn interrupts real work, so the relaunch picks it back up."""
+    code, calls = _run_switch_k(two_accounts, monkeypatch, tmp_path, status="busy", extra=("-f",))
+    assert code == 0
+    assert _prompt_of(calls[0]) == cli.SWITCH_CONTINUE_PROMPT
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [(("-p", "do the thing"), "do the thing"), (("-C",), ""), (("-p",), "continue")],
+)
+def test_switch_account_explicit_prompt_flags_beat_the_k_gate(
+    two_accounts: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    extra: tuple[str, ...],
+    expected: str,
+) -> None:
+    """``-K`` only DECIDES an open question: -p/-C answered it, halt or not."""
+    code, calls = _run_switch_k(
+        two_accounts, monkeypatch, tmp_path, records=_halt_records(_HALT_TEXT), extra=extra
+    )
+    assert code == 0
+    assert _prompt_of(calls[0]) == expected
+
+
+def test_switch_account_without_k_never_probes_the_halt(
+    two_accounts: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The automatic failover (limitswitch, explicit -p) must not pay for the state test."""
+    monkeypatch.setattr(
+        cli, "_usage_limit_halt", lambda *_a, **_k: pytest.fail("gate ran without -K")
+    )
+    private, _work = two_accounts
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    with Store() as store:
+        store.ensure(SID, cwd=str(repo))
+        store.update_fields(SID, iterm_session_id=ITERM)
+    _prepare_arm(monkeypatch, two_accounts, live=_live(str(repo), private), inside=False)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+    assert cli.main(["switch-account", "work", "-s", SID, "-N", "-p"]) == 0
+    assert _prompt_of(calls[0]) == cli.SWITCH_CONTINUE_PROMPT
+
+
 def test_switch_account_now_refuses_without_any_terminal_evidence(
     two_accounts: tuple[Path, Path],
     monkeypatch: pytest.MonkeyPatch,

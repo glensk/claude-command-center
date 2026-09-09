@@ -47,7 +47,7 @@ import os
 import re
 import sys
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import __version__, config, hookspec
 from .adapters import ClaudeAdapter
@@ -71,6 +71,9 @@ from .models import (
 )
 from .store import Store
 
+if TYPE_CHECKING:  # pragma: no cover - pathlib stays a local import at runtime
+    from pathlib import Path
+
 # Seconds `ccc close-now` waits before reaping/closing, so the render + the rest of the
 # Stop-hook chain (auto-commit) settle first. Module-level so tests can monkeypatch it.
 _CLOSE_NOW_SETTLE_SEC = 2.0
@@ -90,7 +93,10 @@ _SWITCH_READY_WAIT_SEC = 10.0
 # `switch-account -p` with no text: the prompt the relaunched session submits by itself.
 # A resume alone parks at an idle composer — the conversation survived the seat change,
 # but nobody is driving it, so the work the switch was made FOR stalls until the user
-# types. This is that one word, and it is what `/cwork-to-cpriv` & co. send.
+# types. This is that one word. `/cwork-to-cpriv` & co. no longer hard-code it: they send
+# `-K`, which submits it only when the session's work was really interrupted (a usage-limit
+# halt or a -f'd live turn), so switching seats never turns an idle session into a running
+# one (2026-09-09 ruling: the state is the session's, not the switch's, to decide).
 SWITCH_CONTINUE_PROMPT = "continue"
 
 
@@ -1223,6 +1229,33 @@ def _notify_switch(message: str) -> None:
         pass
 
 
+def _usage_limit_halt(
+    adapter: ClaudeAdapter,
+    session_id: str,
+    cwd: str,
+    config_dir: str,
+    transcript: Path | None,
+) -> bool:
+    """True iff this session's last main-chain turn died on its account's USAGE limit.
+
+    The state test behind ``switch-account -K``: a halt means an unfinished turn, which
+    is the one condition under which a relaunch should keep working by itself. Reuses
+    :func:`limitswitch.observe` rather than :meth:`ClaudeAdapter.is_halted` for its one
+    extra distinction — a transient server-side 429 ("not your usage limit") is also a
+    halt but not a reason to carry on: the other seat hits the same overloaded server.
+    Never raises: an unreadable transcript answers "not interrupted", so the relaunch
+    lands idle (the recoverable side — the user types one word) instead of running
+    unattended work nobody asked for.
+    """
+    from . import limitswitch
+
+    try:
+        obs = limitswitch.observe(adapter, session_id, cwd, config_dir, transcript_path=transcript)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return False
+    return obs is not None and obs.usage_limit
+
+
 def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements,too-many-branches,too-many-locals,too-many-statements
     """``ccc switch-account <label>`` — relaunch this session under another account, same tab.
 
@@ -1233,7 +1266,10 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     the target account's env pin. The conversation continues; only the billing seat
     changes. With ``-p/--prompt`` that resume carries a prompt (bare ``-p`` =
     :data:`SWITCH_CONTINUE_PROMPT`), so the relaunched session picks the work back up by
-    itself instead of parking at an idle composer. Every check here fails closed: a
+    itself instead of parking at an idle composer. ``-K`` decides that from the session's
+    own state instead — ``continue`` only when its work was really interrupted (see
+    :func:`_usage_limit_halt`) — so a switch preserves what the session was doing:
+    interrupted work resumes, an idle session lands idle. Every check here fails closed: a
     switch that could bill the wrong seat, kill the wrong process, strand background work
     or resume nothing is refused with exit 1 and nothing armed.
     """
@@ -1272,6 +1308,14 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     # The prompt the relaunched session submits itself. -C wins over -p whatever the
     # order, so a slash command can hard-code `-p` and still be overridden per call.
     prompt = "" if getattr(args, "no_continue", False) else (getattr(args, "prompt", "") or "")
+    # -K/--continue-if-interrupted: decide the auto-continue from the session's STATE
+    # instead of hard-coding it (see `_interrupted_continue`). An explicit -p (any text)
+    # or -C answers the question outright, so the gate only runs when neither did.
+    gate_continue = (
+        bool(getattr(args, "continue_if_interrupted", False))
+        and not prompt
+        and not getattr(args, "no_continue", False)
+    )
     if _has_control_chars(prompt):
         print(
             "error: --prompt contains control characters — the resume line is TYPED into "
@@ -1383,6 +1427,10 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
         )
         return 1
     transcript = adapter.transcript_path(cwd, session_id, current)
+    if gate_continue and _usage_limit_halt(adapter, session_id, cwd, current, transcript):
+        # The turn DIED on this account's usage limit: its work is unfinished, so the
+        # relaunch carries it on. This is the switch's original reason for existing.
+        prompt = SWITCH_CONTINUE_PROMPT
     # Inside the session this very command runs under the Bash tool's shell — a
     # descendant of the session that carries the background-shell signature. Its own
     # ancestry is excluded so a `! ccc switch-account … -N` cannot veto itself.
@@ -1493,6 +1541,10 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
             file=sys.stderr,
         )
         return 1
+    if gate_continue and not prompt and live.raw_status == "busy" and not busy_by_this_prompt:
+        # Only reachable with -f: a REAL turn was just cut off mid-work, which -K counts as
+        # interrupted for the same reason a halt is — the relaunch resumes it.
+        prompt = SWITCH_CONTINUE_PROMPT
     from . import spawn
 
     iterm = (
@@ -1556,11 +1608,20 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     if not spawn.spawn_ccc(spawn_args):
         print("error: could not spawn the relauncher (ccc switch-now)", file=sys.stderr)
         return 1
+    # -K with no prompt: say WHY nothing will be submitted, or the silent idle composer
+    # reads as a broken auto-continue rather than the deliberate state-preserving one.
+    landing = (
+        " It lands IDLE: nothing interrupted this session's work (no usage-limit halt), so "
+        "the switch leaves it exactly as it was — type your next prompt there, or re-run "
+        "with -p to auto-continue."
+        if gate_continue and not prompt
+        else ""
+    )
     status = (
         f"relaunching now: {session_id} → the {label!r} account in its own tab (the "
         "detached relauncher terminates Claude, waits for the shell and types the "
         f"resume{f' + {prompt!r}' if prompt else ''}; failures land in events.log and as "
-        "a desktop notification)."
+        f"a desktop notification).{landing}"
     )
     if getattr(args, "cancel_prompt", False):
         # Run from a slash command's inline `!` expansion: a NON-ZERO exit makes Claude
@@ -4778,6 +4839,15 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="relaunch WITHOUT a prompt — overrides -p whatever the order (the way to "
         "opt a single `/cwork-to-cpriv` call out of the auto-continue)",
+    )
+    p_switch.add_argument(
+        "-K",
+        "--continue-if-interrupted",
+        action="store_true",
+        help=f"send {SWITCH_CONTINUE_PROMPT!r} ONLY if the session's work was actually "
+        "interrupted — its turn died on this account's usage limit, or -f cut a live turn "
+        "off. An idle session stays idle, so the switch never changes what the session was "
+        "doing (this is what `/cwork-to-cpriv` sends; -p/-C still decide it outright)",
     )
     p_switch.add_argument("-q", "--quiet", action="store_true", help="suppress the summary print")
     p_switch.add_argument(
