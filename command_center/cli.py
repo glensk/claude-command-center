@@ -3700,7 +3700,9 @@ def cmd_hook(args: argparse.Namespace) -> int:
 def cmd_install_hooks(args: argparse.Namespace) -> int:
     from . import install
 
-    return install.install_hooks(dry_run=args.dry_run, uninstall=args.uninstall)
+    return install.install_hooks(
+        dry_run=args.dry_run, uninstall=args.uninstall, force=getattr(args, "force", False)
+    )
 
 
 def cmd_install_statusline(args: argparse.Namespace) -> int:
@@ -5424,7 +5426,10 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
             "UserPromptSubmit, Pre/PostToolUse, Stop (+ release-locks last), SessionEnd, "
             "PreCompact, SubagentStart, SubagentStop — as `<ccc> hook <event>` commands. "
             "Idempotent: a rerun replaces ccc's own entries in place and never touches "
-            "foreign hooks. "
+            "foreign hooks. REFUSES (exit 1, nothing written) when a foreign hook already "
+            "spawns `ccc hook` itself — a hand-wired forwarder script — because installing "
+            "next to it would run every ccc hook twice per event; remove the forwarder or "
+            "pass -f/--force to install anyway. "
             "settings.json is backed up (settings.json.ccc-backup-<UTCts>) before writing, "
             "and written symlink-safely (through a stow symlink to its real target)."
         ),
@@ -5435,6 +5440,13 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     )
     p_ih.add_argument(
         "-u", "--uninstall", action="store_true", help="remove only ccc-owned hook entries"
+    )
+    p_ih.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="install even when a foreign hook forwards to `ccc hook` (every event it is "
+        "wired on will run ccc twice — knowingly)",
     )
     p_ih.set_defaults(func=cmd_install_hooks)
 

@@ -7,9 +7,12 @@ the work (a ``claude -p`` call) outlives the caller. Two hard requirements:
 * **Detached** — ``start_new_session=True`` puts the child in its own session /
   process group so Claude Code's kill of the hook process tree at the 5 s hook
   timeout does not reap a mid-flight grader.
-* **Guarded** — ``CCC_INTERNAL=1`` makes the child's own Claude Code hooks no-op
-  (no recursion, no junk session rows); ``AI_NO_AUTOCOMMIT=1`` keeps the
-  auto-commit Stop hook from firing inside it.
+* **Guarded** — ``CCC_INTERNAL=1`` marks the child ccc-internal: its own detached
+  ccc spawns are suppressed and ``switch-account`` refuses in it, so nothing
+  recurses. It does NOT no-op the child's Claude Code hooks — what keeps a helper
+  ``claude -p`` from creating a session row is ``hooks._is_headless()``
+  (``CLAUDE_CODE_ENTRYPOINT`` starting with ``sdk``). ``AI_NO_AUTOCOMMIT=1`` keeps
+  the auto-commit Stop hook from firing inside it.
 
 Never raises. Single function so tests have one place to monkeypatch (and must —
 never fork a real ``ccc`` in a unit test).

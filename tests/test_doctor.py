@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import config, doctor, install
+from command_center import config, doctor, hookroutes, install
 
 
 def _which_factory(present: set[str]):
@@ -414,6 +414,139 @@ def test_fast_path_says_so_when_nothing_spawns_ccc(
 def test_report_includes_the_fast_path_section(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(doctor.shutil, "which", _which_factory({"claude"}))
     assert "Spawn fast path" in doctor.render(doctor.build_report(config.Config()))
+
+
+# ------------------- hook wiring exactness / duplicate path (tp#222) ------------------- #
+#: A hand-wired forwarder: foreign to the installer, yet it spawns `ccc hook` itself.
+_FORWARDER_BODY = '#!/usr/bin/env bash\nccc hook "${1:-}" || true\n'
+#: A wrapper that execs its own arguments — the hook behind `--` is invisible in its body.
+_WRAPPER_BODY = '#!/bin/bash\n"$@"\n'
+
+
+def _ccc_wiring() -> dict:
+    """settings.json holding exactly ccc's own hook entries (`/opt/ccc hook <event>`)."""
+    return install.build_hooks_settings({}, "/opt/ccc", uninstall=False)
+
+
+def _with_hook(settings: dict, event: str, command: str) -> dict:
+    """*settings* plus one extra hook *command* wired on *event*."""
+    groups = settings.setdefault("hooks", {}).setdefault(event, [])
+    groups.append({"hooks": [{"type": "command", "command": command}]})
+    return settings
+
+
+def _script(home: Path, name: str, body: str) -> Path:
+    path = home / name
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def _wiring(home: Path, monkeypatch: pytest.MonkeyPatch, settings: dict) -> doctor.Section:
+    """The Wiring section for *settings*, with *home* as $HOME (readable hook scripts)."""
+    monkeypatch.setenv("HOME", str(home))
+    _write_settings(home, settings)
+    return doctor._section_wiring()
+
+
+def _detail(section: doctor.Section, label: str) -> str:
+    return next(c.detail for c in section.checks if c.label == label)
+
+
+def test_duplicate_hook_path_flags_a_foreign_forwarder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The incident shape: a `cc-hook.sh <event>` entry next to ccc's own direct ones."""
+    script = _script(tmp_path, "cc-hook.sh", _FORWARDER_BODY)
+    section = _wiring(
+        tmp_path,
+        monkeypatch,
+        _with_hook(_ccc_wiring(), "SessionStart", f"{script} session-start"),
+    )
+    assert _statuses(section)["duplicate hook path"] == doctor.FAIL
+    detail = _detail(section, "duplicate hook path")
+    assert "cc-hook.sh" in detail and "twice" in detail
+    # ccc's own wiring is untouched and complete — only the extra path is the problem.
+    assert _statuses(section)["hooks wired"] == doctor.OK
+
+
+def test_duplicate_hook_path_sees_through_a_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run-stop-hook.sh "label" -- <forwarder> stop`: the wrapper's body says nothing."""
+    forwarder = _script(tmp_path, "cc-hook.sh", _FORWARDER_BODY)
+    wrapper = _script(tmp_path, "run-stop-hook.sh", _WRAPPER_BODY)
+    section = _wiring(
+        tmp_path,
+        monkeypatch,
+        _with_hook(_ccc_wiring(), "Stop", f'{wrapper} "cc-hook stop" -- {forwarder} stop'),
+    )
+    assert _statuses(section)["duplicate hook path"] == doctor.FAIL
+    assert "cc-hook.sh" in _detail(section, "duplicate hook path")
+
+
+def test_duplicate_hook_path_ok_for_cccs_own_wiring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    section = _wiring(tmp_path, monkeypatch, _ccc_wiring())
+    assert _statuses(section)["duplicate hook path"] == doctor.OK
+    assert "only path" in _detail(section, "duplicate hook path")
+
+
+def test_duplicate_hook_path_ignores_an_unrelated_foreign_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain commit hook does not reach ccc — it must not colour the check at all."""
+    section = _wiring(tmp_path, monkeypatch, _with_hook(_ccc_wiring(), "Stop", "/my/commit.sh"))
+    assert _statuses(section)["duplicate hook path"] == doctor.OK
+
+
+def test_duplicate_hook_path_is_na_for_a_dynamic_foreign_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A command built at runtime could hide anything: informational, never ❌."""
+    section = _wiring(tmp_path, monkeypatch, _with_hook(_ccc_wiring(), "Stop", 'bash -c "$X"'))
+    assert _statuses(section)["duplicate hook path"] == doctor.NA
+    assert "unresolved" in _detail(section, "duplicate hook path")
+
+
+def test_hooks_wired_fails_on_a_duplicated_ccc_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two identical ccc entries run ccc twice — a set of hook-args cannot see that."""
+    section = _wiring(
+        tmp_path, monkeypatch, _with_hook(_ccc_wiring(), "Stop", "/opt/ccc hook stop")
+    )
+    assert _statuses(section)["hooks wired"] == doctor.FAIL
+    assert "Stop/stop \u00d72" in _detail(section, "hooks wired")
+
+
+def test_hooks_wired_ok_only_for_the_exact_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    section = _wiring(tmp_path, monkeypatch, _ccc_wiring())
+    assert _statuses(section)["hooks wired"] == doctor.OK
+    assert "exactly once" in _detail(section, "hooks wired")
+
+
+def test_foreign_hook_routes_classifies_offender_unknown_and_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shared helper itself: (offenders, indeterminate) by display name."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    forwarder = _script(tmp_path, "cc-hook.sh", _FORWARDER_BODY)
+    dynamic = _script(tmp_path, "dyn.sh", '#!/usr/bin/env bash\nccc "$1"\n')
+    commands = [
+        "/opt/ccc hook stop",  # ccc's own: never a duplicate path to itself
+        f"{forwarder} stop",
+        f"bash {dynamic}",
+        "/my/commit.sh",
+    ]
+    offenders, indeterminate = hookroutes.foreign_hook_routes(
+        commands, lambda cmd: cmd.startswith("/opt/ccc ")
+    )
+    assert offenders == ["cc-hook.sh"]
+    assert indeterminate == ["dyn.sh"]
+    assert hookroutes.foreign_hook_routes(["/my/commit.sh"], lambda _c: False) == ([], [])
 
 
 # ------------------------------ mirror scrubber ------------------------------ #

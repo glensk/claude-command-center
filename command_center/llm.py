@@ -6,9 +6,12 @@ with the user's subscription, no API key needed). It NEVER raises — any failur
 returns ``(None, None)`` so the daemon degrades gracefully and simply keeps the
 previous summary / next step.
 
-Recursion guard: the subprocess runs with ``CCC_INTERNAL=1`` (so ``cc-hook.sh``
-skips and we don't create junk session rows) and ``AI_NO_AUTOCOMMIT=1`` (so the
-auto-commit Stop hook doesn't fire).
+Recursion guard: the subprocess runs with ``CCC_INTERNAL=1``, which marks it
+ccc-internal (detached ccc spawns are suppressed, ``switch-account`` refuses), and
+``AI_NO_AUTOCOMMIT=1`` (so the auto-commit Stop hook doesn't fire). What keeps such a
+helper ``claude -p`` run from creating a session row is the hook-side guard
+``hooks._is_headless()`` (``CLAUDE_CODE_ENTRYPOINT`` starting with ``sdk``), not this
+marker.
 """
 
 from __future__ import annotations
@@ -302,8 +305,11 @@ def run_codex(prompt: str, model: str = "") -> str | None:
 def _guarded_env(purpose: str = "", note: str = "") -> dict[str, str]:
     """Env for a headless helper subprocess (the same guards the claude/codex runners set).
 
-    ``CCC_INTERNAL=1`` so ``cc-hook.sh`` skips (no junk session rows / no recursion) and
-    ``AI_NO_AUTOCOMMIT=1`` so the auto-commit Stop hook does not fire. A non-empty
+    ``CCC_INTERNAL=1`` marks the subprocess ccc-internal — detached ccc spawns are
+    suppressed and ``switch-account`` refuses inside it, so nothing recurses; the guard
+    that keeps its hooks from creating a session row is ``hooks._is_headless()``
+    (``CLAUDE_CODE_ENTRYPOINT`` starting with ``sdk``). ``AI_NO_AUTOCOMMIT=1`` so the
+    auto-commit Stop hook does not fire. A non-empty
     *purpose* / *note* is exported as ``CCC_LLM_PURPOSE`` / ``CCC_LLM_NOTE`` so an
     external command (``llm_custom_command``, the ``custom`` score rung, or any wrapper
     around the CLIs below) can log or route each call per action.

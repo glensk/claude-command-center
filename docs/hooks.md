@@ -5,7 +5,7 @@ in the status line. `ccc init` wires both; you can also install them individuall
 inspect them with `ccc doctor`.
 
 ```commands
-ccc install-hooks [-n] [-u]            # merge ccc's hook entries into settings.json
+ccc install-hooks [-n] [-u] [-f]       # merge ccc's hook entries into settings.json
 ccc install-statusline [-c] [-n] [-u]  # wire the status line (-c chains an existing one)
 ccc doctor                             # read-only: which hooks + statusline are wired
 ```
@@ -14,6 +14,13 @@ ccc doctor                             # read-only: which hooks + statusline are
 in place, never touches foreign hooks, backs up `settings.json` before writing, and writes
 symlink-safely (through a stow symlink to its real target). `-n/--dry-run` prints a unified
 diff; `-u/--uninstall` removes only ccc-owned entries.
+
+ccc's entries must be the **only path to `ccc hook`**. A hand-wired forwarder script that
+also calls `ccc hook <event>` is foreign to the installer — which preserves foreign hooks by
+contract — so it survives every install and every event it is wired on then runs ccc
+**twice**. `ccc install-hooks` therefore refuses to install next to one (`-f/--force`
+installs anyway) and `ccc doctor` reports it as ❌ `duplicate hook path`. Let the installer
+own the wiring: delete the forwarder, don't wrap it.
 
 ## What each hook does
 

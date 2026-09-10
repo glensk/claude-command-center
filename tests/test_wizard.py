@@ -152,6 +152,32 @@ def test_yes_with_vault_but_no_scrubber_leaves_mirrors_off(
     assert "no scrubber configured" in out
 
 
+def test_a_refused_install_hooks_exits_1_and_the_rest_still_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    _claude_home: Path,
+    _stub_installers: dict[str, int],
+) -> None:
+    """`install-hooks` refuses next to a `ccc hook` forwarder (tp#222): say so, exit 1.
+
+    The other installers are independent of the hook wiring, so they still run — but
+    `ccc init` must not report success on a machine whose hooks were never wired.
+    """
+
+    def refuse(*_a, **_k) -> int:
+        _stub_installers["hooks"] = _stub_installers.get("hooks", 0) + 1
+        return 1
+
+    monkeypatch.setattr(install, "install_hooks", refuse)
+
+    assert wizard.run(_args(yes=True)) == 1
+
+    assert "install-hooks refused" in capsys.readouterr().out
+    assert _stub_installers["hooks"] == 1
+    assert _stub_installers["statusline"] and _stub_installers["commands"]
+    assert _stub_installers["shell"] and _stub_installers["doctor"]
+
+
 # ------------------------------ -m minimal ------------------------------ #
 def test_minimal_writes_no_feature_flags_and_runs_no_installers(
     _claude_home: Path, _stub_installers: dict[str, int]

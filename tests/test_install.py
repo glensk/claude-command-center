@@ -8,6 +8,7 @@ uninstall), dry-run writing nothing, symlink-target writes, and the statusline i
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -120,6 +121,101 @@ def test_uninstall_removes_only_ccc_entries(_claude_home: Path) -> None:
     assert _stop_commands(settings) == ["/my/commit.sh"]
     # Events that were entirely ccc-owned are removed cleanly.
     assert "SessionStart" not in settings.get("hooks", {})
+
+
+# --------------------- hooks: the duplicate-path refusal (tp#222) --------------------- #
+#: A hand-wired forwarder script: foreign to the installer, yet it spawns `ccc hook`.
+_FORWARDER_BODY = '#!/usr/bin/env bash\nccc hook "${1:-}" || true\n'
+
+
+def _forwarder(home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Write a forwarder under $HOME and wire it on SessionStart; return its path."""
+    monkeypatch.setenv("HOME", str(home))  # _script_behind only reads inside $HOME
+    script = home / "cc-hook.sh"
+    script.write_text(_FORWARDER_BODY, encoding="utf-8")
+    (home / "settings.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command": f"{script} session-start"}]}
+                    ]
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return script
+
+
+def test_install_hooks_refuses_next_to_a_forwarder(
+    _claude_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Installing next to a `ccc hook` forwarder would run every ccc hook twice."""
+    _forwarder(_claude_home, monkeypatch)
+    before = (_claude_home / "settings.json").read_text(encoding="utf-8")
+
+    assert install.install_hooks() == 1
+
+    out = capsys.readouterr().out
+    assert "refused" in out and "cc-hook.sh" in out and "-f/--force" in out
+    assert (_claude_home / "settings.json").read_text(encoding="utf-8") == before
+    assert not list(_claude_home.glob("settings.json.ccc-backup-*")), "refusal backed up"
+    assert install.installed_hook_events(install.load_settings()) == set()
+
+
+def test_install_hooks_dry_run_refuses_and_writes_nothing(
+    _claude_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _forwarder(_claude_home, monkeypatch)
+    before = (_claude_home / "settings.json").read_text(encoding="utf-8")
+
+    assert install.install_hooks(dry_run=True) == 1
+
+    assert "refused" in capsys.readouterr().out
+    assert (_claude_home / "settings.json").read_text(encoding="utf-8") == before
+
+
+def test_install_hooks_force_installs_next_to_a_forwarder(
+    _claude_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    script = _forwarder(_claude_home, monkeypatch)
+
+    assert install.install_hooks(force=True) == 0
+
+    assert "--force" in capsys.readouterr().out
+    settings = _load(_claude_home)
+    assert install.installed_hook_events(settings) == set(install.ALL_HOOK_ARGS)
+    assert f"{script} session-start" in install.hook_commands(settings)  # foreign, still there
+
+
+def test_uninstall_works_with_a_forwarder_present(
+    _claude_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removal is never refused — it only takes ccc's own entries out."""
+    script = _forwarder(_claude_home, monkeypatch)
+    install.install_hooks(force=True)
+
+    assert install.install_hooks(uninstall=True) == 0
+
+    settings = _load(_claude_home)
+    assert install.installed_hook_events(settings) == set()
+    assert install.hook_commands(settings) == [f"{script} session-start"]
+
+
+def test_installed_hook_wiring_counts_duplicates(_claude_home: Path) -> None:
+    """The Counter doctor compares with HOOK_SPEC — a set could not see a double-wire."""
+    install.install_hooks()
+    assert install.installed_hook_wiring(install.load_settings()) == Counter(install.HOOK_SPEC)
+
+    settings = _load(_claude_home)
+    settings["hooks"]["Stop"].append(
+        {"hooks": [{"type": "command", "command": "/opt/ccc hook stop"}]}
+    )
+    wiring = install.installed_hook_wiring(settings)
+    assert wiring[("Stop", None, "stop")] == 2
+    assert install.installed_hook_events(settings) == set(install.ALL_HOOK_ARGS)  # blind to it
 
 
 # ------------------------------ dry-run writes nothing ------------------------------ #

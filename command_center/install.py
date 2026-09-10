@@ -7,7 +7,9 @@ Two installers share this module:
   <event>``). It is **idempotent** (a ccc-owned entry is recognised by its command
   invoking the ``ccc`` binary with ``hook <known-event>``; a rerun replaces ccc's own
   entries in place and never duplicates or touches foreign hooks) and reversible
-  (``uninstall`` strips only ccc-owned entries).
+  (``uninstall`` strips only ccc-owned entries). Because foreign entries are preserved,
+  it **refuses** to install next to a foreign hook that spawns ``ccc hook`` itself (a
+  forwarder script) — that would run every one of ccc's hooks twice per event.
 * :func:`install_statusline` sets ccc's status-line command, or — when a foreign
   statusLine already exists — generates a **chain script** that runs the original first
   and appends ccc's rows.
@@ -39,9 +41,11 @@ import shlex
 import shutil
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 from . import config
+from .hookroutes import foreign_hook_routes
 from .hookspec import ALL_HOOK_ARGS, HOOK_SPEC
 
 # HOOK_SPEC / ALL_HOOK_ARGS live in the import-cheap :mod:`command_center.hookspec` (the
@@ -155,27 +159,39 @@ def _is_ccc_hook_command(command: str) -> bool:
     return _ccc_hook_arg(command) is not None
 
 
-def hook_commands(settings: dict, event: str | None = None) -> list[str]:
-    """Every hook command in *settings* — ccc's and foreign — in wiring order.
+def hook_entries(settings: dict, event: str | None = None) -> list[tuple[str, str | None, str]]:
+    """Every hook entry in *settings* as ``(event key, matcher or None, command)``.
 
-    With *event* set, only that settings-event key's commands (doctor's Stop-order guard
-    needs them in order). Tolerates any malformed shape a hand-edited settings.json can
-    hold; the single walk both installer and doctor read.
+    Wiring order, ccc's entries and foreign ones alike; with *event* set, only that
+    settings-event key. Tolerates any malformed shape a hand-edited settings.json can
+    hold; the single walk every reader here and in doctor goes through — the triple is
+    exactly :data:`HOOK_SPEC`'s shape, so a wiring can be compared against the spec.
     """
-    commands: list[str] = []
+    entries: list[tuple[str, str | None, str]] = []
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
-        return commands
+        return entries
     for key, groups in hooks.items():
         if not isinstance(groups, list) or (event is not None and key != event):
             continue
         for group in groups:
             if not isinstance(group, dict):
                 continue
+            raw_matcher = group.get("matcher")
+            matcher = raw_matcher if isinstance(raw_matcher, str) and raw_matcher else None
             for entry in group.get("hooks", []) or []:
                 if isinstance(entry, dict):
-                    commands.append(str(entry.get("command", "")))
-    return commands
+                    entries.append((str(key), matcher, str(entry.get("command", ""))))
+    return entries
+
+
+def hook_commands(settings: dict, event: str | None = None) -> list[str]:
+    """Every hook command in *settings* — ccc's and foreign — in wiring order.
+
+    With *event* set, only that settings-event key's commands (doctor's Stop-order guard
+    needs them in order).
+    """
+    return [command for _event, _matcher, command in hook_entries(settings, event)]
 
 
 def installed_hook_events(settings: dict) -> set[str]:
@@ -186,6 +202,22 @@ def installed_hook_events(settings: dict) -> set[str]:
         if arg:
             found.add(arg)
     return found
+
+
+def installed_hook_wiring(settings: dict) -> Counter[tuple[str, str | None, str]]:
+    """ccc's wiring in *settings*, counted by ``(event key, matcher, ccc hook-arg)``.
+
+    The exact-multiplicity counterpart of :func:`installed_hook_events` (a set, kept as
+    is for compatibility): compared with ``Counter(HOOK_SPEC)`` it tells a half install
+    from a double one, which a set cannot — two identical ``ccc hook stop`` entries look
+    perfectly healthy in a set, while Claude Code runs both.
+    """
+    counts: Counter[tuple[str, str | None, str]] = Counter()
+    for event, matcher, command in hook_entries(settings):
+        arg = _ccc_hook_arg(command)
+        if arg:
+            counts[(event, matcher, arg)] += 1
+    return counts
 
 
 def _strip_ccc_hooks(settings: dict) -> None:
@@ -239,10 +271,31 @@ def build_hooks_settings(settings: dict, ccc: str, *, uninstall: bool) -> dict:
     return result
 
 
-def install_hooks(*, dry_run: bool = False, uninstall: bool = False) -> int:
-    """Merge (or remove) ccc's hook wiring in ``settings.json``. Returns an exit code."""
+def install_hooks(*, dry_run: bool = False, uninstall: bool = False, force: bool = False) -> int:
+    """Merge (or remove) ccc's hook wiring in ``settings.json``. Returns an exit code.
+
+    **Refuses** (exit 1, nothing written or backed up, ``--dry-run`` included) when a
+    FOREIGN hook entry already spawns ``ccc hook`` itself — a hand-wired forwarder
+    script. Foreign hooks are preserved by contract, so installing next to one wires
+    every event it carries twice and each ccc hook runs twice per event; the only
+    correct outcomes are removing it or *knowingly* keeping it (``force``). An
+    unresolvable foreign command never refuses, and ``uninstall`` never does either: it
+    only takes ccc's own entries out.
+    """
     path = settings_path()
     settings = load_settings(path)
+    if not uninstall:
+        offenders, _unresolved = foreign_hook_routes(hook_commands(settings), _is_ccc_hook_command)
+        if offenders:
+            names = ", ".join(offenders)
+            if not force:
+                print(
+                    f"ccc hooks: refused — forwarder(s) to `ccc hook` already wired: {names}; "
+                    "every event they carry would run ccc twice. Remove them, or pass "
+                    "-f/--force to install anyway"
+                )
+                return 1
+            print(f"ccc hooks: --force: installing next to {names}")
     ccc = ccc_binary()
     new_settings = build_hooks_settings(settings, ccc, uninstall=uninstall)
     return _apply(path, settings, new_settings, dry_run=dry_run, label="hooks")

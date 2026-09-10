@@ -321,7 +321,13 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
 - **Installer layer** — `command_center/install.py` owns the hook + status-line wiring
   merged into `$CLAUDE_HOME/settings.json` (`ccc install-hooks` / `install-statusline`;
   symlink-safe atomic writes with timestamped backups, idempotent). `doctor.py` is the
-  read-only `ccc doctor` health check.
+  read-only `ccc doctor` health check. Foreign hooks are preserved by contract, so ccc's
+  entries must be the ONLY path to `ccc hook`: `hookroutes.py` answers "does this foreign
+  hook command also spawn `ccc hook`?" for both sides — `install-hooks` refuses to install
+  next to such a forwarder (`-f/--force` overrides) and doctor reports it as ❌ `duplicate
+  hook path`. It must never import `install` or `doctor` (the caller passes the commands
+  and the ownership predicate); doctor's "hooks wired" check compares a `Counter` of the
+  installed wiring with `HOOK_SPEC`, since a set cannot see a double-wired entry.
 - **Onboarding layer** — `wizard.py` (`ccc init`) is the first-run flow (env detection,
   consent checklist, minimal `config.toml`, then the installers, incl. `install-shell`).
   `install_commands.py` (`ccc install-commands`) copies the slash commands; `obsidian.py`

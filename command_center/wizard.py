@@ -379,14 +379,23 @@ def _interactive_profile(env: Env) -> tuple[Profile, bool]:
 # --------------------------------------------------------------------------- #
 # installer phase
 # --------------------------------------------------------------------------- #
-def _run_installers(profile: Profile, *, codex: bool, ask: bool) -> None:
-    """Run (or offer to run) each installer, reusing the existing implementations."""
+def _run_installers(profile: Profile, *, codex: bool, ask: bool) -> int:
+    """Run (or offer to run) each installer; return how many FAILED.
+
+    ``install-hooks`` can refuse (a foreign hook forwarder already spawns ``ccc hook``,
+    see :func:`install.install_hooks`) — the wizard reports it, keeps going with the
+    other installers (none of them depends on the hook wiring) and hands the count up,
+    so ``ccc init`` does not exit 0 on a machine whose hooks were never wired.
+    """
+    failed = 0
 
     def offer(label: str, default: bool = True) -> bool:
         return _ask_yes_no(f"Run {label}?", default=default) if ask else True
 
     if offer("install-hooks"):
-        install.install_hooks()
+        if install.install_hooks() != 0:
+            failed += 1
+            print("❌ install-hooks refused (see above) — fix and rerun: ccc install-hooks")
     if offer("install-statusline"):
         state = install.statusline_state(install.load_settings())
         install.install_statusline(chain=state == "foreign")
@@ -398,6 +407,7 @@ def _run_installers(profile: Profile, *, codex: bool, ask: bool) -> None:
         obsidian.run_setup(root=profile.vault_root)
     if sys.platform == "darwin" and offer("daemon --install (launchd agent)"):
         launchd.install()
+    return failed
 
 
 # --------------------------------------------------------------------------- #
@@ -456,15 +466,16 @@ def run(args) -> int:  # pylint: disable=too-many-branches
         print(f"\nbacked up previous config → {backup}")
     print(f"wrote config → {config.config_path()}")
 
+    failed_installers = 0
     if not minimal:
         print("\ninstallers:")
-        _run_installers(profile, codex=codex_opt, ask=interactive)
+        failed_installers = _run_installers(profile, codex=codex_opt, ask=interactive)
 
     _print_linux_hotkey_pointer()
 
     print("\n" + "=" * 60)
     doctor.run(config.load_config())
-    return 0
+    return 1 if failed_installers else 0
 
 
 def _print_linux_hotkey_pointer() -> None:

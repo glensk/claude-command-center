@@ -26,15 +26,20 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
-import re
-import shlex
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config, install, scrub
+
+# The command-text analysis behind "duplicate hook path" and the Spawn-fast-path section
+# lives in :mod:`command_center.hookroutes` — the ``install-hooks`` preflight answers
+# "does this foreign hook also spawn `ccc hook`?" from the same helpers, and neither of
+# them may import the other. ``doctor._foreign_ccc_calls`` stays the address it was.
+from .hookroutes import _foreign_ccc_calls, foreign_hook_routes
 from .models import MirrorHealth
 
 OK, FAIL, NA = "ok", "fail", "na"
@@ -102,17 +107,8 @@ def _section_core() -> Section:
 def _section_wiring() -> Section:
     section = Section("Wiring (settings.json)")
     settings = install.load_settings()
-    wired = install.installed_hook_events(settings)
-    expected = set(install.ALL_HOOK_ARGS)
-    if wired >= expected:
-        section.checks.append(Check(OK, "hooks wired", f"all {len(expected)} ccc events"))
-    elif wired:
-        missing = ", ".join(sorted(expected - wired))
-        section.checks.append(
-            Check(FAIL, "hooks wired", f"partial — missing: {missing} (ccc install-hooks)")
-        )
-    else:
-        section.checks.append(Check(FAIL, "hooks wired", "none — run ccc install-hooks"))
+    section.checks.append(_hooks_wired_check(settings))
+    section.checks.append(_duplicate_hook_path_check(settings))
 
     state = install.statusline_state(settings)
     if state == "direct":
@@ -131,6 +127,66 @@ def _section_wiring() -> Section:
         section.checks.append(Check(FAIL, "statusline wired", "none — run ccc install-statusline"))
     section.checks.append(_stop_order_check(settings))
     return section
+
+
+def _hooks_wired_check(settings: dict) -> Check:
+    """Is EXACTLY ccc's wiring in place — every entry once, no extra ccc entry? (tp#222)
+
+    Counted, not set-compared: two identical ``ccc hook stop`` entries are a double-run
+    (Claude Code executes every entry wired on an event), and a set of hook-args cannot
+    see the difference. Missing entries stay the louder finding — they mean ccc is half
+    wired — so they are reported first.
+    """
+    wired = install.installed_hook_wiring(settings)
+    if not wired:
+        return Check(FAIL, "hooks wired", "none — run ccc install-hooks")
+    expected: Counter[tuple[str, str | None, str]] = Counter(install.HOOK_SPEC)
+    missing = expected - wired
+    if missing:
+        names = ", ".join(sorted({arg for _event, _matcher, arg in missing}))
+        return Check(FAIL, "hooks wired", f"partial — missing: {names} (ccc install-hooks)")
+    extra = wired - expected
+    if extra:
+        keys = sorted(extra, key=lambda k: (k[0], k[2], k[1] or ""))
+        detail = ", ".join(
+            f"{event}/{arg} ×{wired[(event, matcher, arg)]}" for event, matcher, arg in keys
+        )
+        return Check(
+            FAIL, "hooks wired", f"duplicate/unexpected ccc entries: {detail} (ccc install-hooks)"
+        )
+    return Check(
+        OK, "hooks wired", f"all {len(set(install.ALL_HOOK_ARGS))} ccc events, each exactly once"
+    )
+
+
+def _duplicate_hook_path_check(settings: dict) -> Check:
+    """Is ccc's own wiring the ONLY path to ``ccc hook``? (tp#222)
+
+    A hand-wired forwarder (``cc-hook.sh <event>`` whose body calls ``ccc hook "$1"``)
+    is FOREIGN to the installer, which preserves foreign hooks by contract — so it sits
+    next to ccc's entries and every event it is wired on runs ccc twice, with nothing
+    saying so. ``install-hooks`` refuses to install next to one; this names it after the
+    fact. A foreign command whose route cannot be resolved is − (informational).
+    """
+    label = "duplicate hook path"
+    offenders, indeterminate = foreign_hook_routes(
+        install.hook_commands(settings),
+        install._is_ccc_hook_command,  # pylint: disable=protected-access
+    )
+    if offenders:
+        return Check(
+            FAIL,
+            label,
+            f"forwarder(s) to `ccc hook`: {', '.join(offenders)} — every event they carry "
+            "runs ccc twice; remove them, ccc install-hooks owns the wiring",
+        )
+    if indeterminate:
+        return Check(
+            NA,
+            label,
+            f"{len(indeterminate)} foreign hook command(s) unresolved (dynamic shell construct)",
+        )
+    return Check(OK, label, "none — ccc's entries are the only path to `ccc hook`")
 
 
 def _stop_order_check(settings: dict) -> Check:
@@ -162,98 +218,6 @@ def _stop_order_check(settings: dict) -> Check:
 # --------------------------------------------------------------------------- #
 # spawn fast path (which ccc subcommands the wiring spawns, and how they parse)
 # --------------------------------------------------------------------------- #
-#: Shell interpreters whose first non-option argument is the script they run.
-_SHELL_RUNNERS = frozenset({"bash", "sh", "zsh"})
-#: Tokens that mean "the ccc binary" in a hand-written or generated command.
-_CCC_BIN_REFS = frozenset({"ccc", "$CCC_BIN", "${CCC_BIN}"})
-#: What a ccc subcommand looks like (anything else after `ccc` is not one we can name).
-_SUBCOMMAND = re.compile(r"^[a-z][a-z-]*$")
-
-
-def _is_ccc_ref(token: str) -> bool:
-    """Whether *token* refers to the ccc binary (a name, a path to it, or $CCC_BIN)."""
-    return token in _CCC_BIN_REFS or token.endswith("/ccc")
-
-
-def _ccc_calls(text: str) -> tuple[list[str], bool]:
-    """The ``ccc <subcommand>`` calls in *text*, plus "a call site was indeterminate".
-
-    Line-based and shell-aware rather than a regex: comment lines are skipped (a
-    `# ccc install-statusline` in a header is documentation, not a spawn) and each
-    remaining line is tokenized with :mod:`shlex`, so quoting is honoured. A ccc
-    reference whose next token is not a literal subcommand (``ccc "$cmd"``, a flag, end
-    of line) is reported as indeterminate instead of guessed at.
-    """
-    names: list[str] = []
-    indeterminate = False
-    for raw in text.splitlines():
-        line = raw.lstrip()
-        if not line or line.startswith("#"):
-            continue
-        try:
-            tokens = shlex.split(line, comments=True)
-        except ValueError:  # unbalanced quotes: this line stays unknown
-            indeterminate = True
-            continue
-        for index, token in enumerate(tokens):
-            if not _is_ccc_ref(token):
-                continue
-            following = tokens[index + 1] if index + 1 < len(tokens) else ""
-            if _SUBCOMMAND.match(following):
-                names.append(following)
-            else:
-                indeterminate = True
-    return names, indeterminate
-
-
-def _script_behind(command: str) -> tuple[Path | None, bool]:
-    """The ONE script *command* runs and may be read, plus "resolution failed".
-
-    Follows a single explicit indirection — ``bash|sh|zsh <path> …`` or a bare
-    executable path — and only inside ``$HOME``: doctor is a read-only probe, not a
-    crawler, so a script elsewhere (or an unreadable one) is reported as indeterminate
-    rather than opened or guessed at.
-    """
-    try:
-        tokens = shlex.split(command, comments=True)
-    except ValueError:
-        return None, True
-    if not tokens:
-        return None, False
-    head = tokens[0]
-    if Path(head).name in _SHELL_RUNNERS:
-        arguments = [t for t in tokens[1:] if not t.startswith("-")]
-        candidate = arguments[0] if arguments else ""
-    elif not _is_ccc_ref(head) and ("/" in head or head.startswith("~")):
-        candidate = head
-    else:
-        candidate = ""
-    if not candidate:
-        return None, False
-    path = Path(candidate).expanduser()
-    try:
-        inside_home = path.resolve().is_relative_to(Path.home().resolve())
-    except OSError:
-        return None, True
-    return (path, False) if inside_home else (None, True)
-
-
-def _foreign_ccc_calls(command: str) -> tuple[list[str], bool]:
-    """``ccc`` calls in a foreign *command* and in the one script it may run."""
-    names, indeterminate = _ccc_calls(command)
-    script, unresolved = _script_behind(command)
-    indeterminate = indeterminate or unresolved
-    if script is not None:
-        try:
-            body = script.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return names, True
-        more, more_indeterminate = _ccc_calls(body)
-        names.extend(more)
-        indeterminate = indeterminate or more_indeterminate
-    return names, indeterminate
-
-
 def _spawned_ccc_subcommands(settings: dict) -> tuple[list[str], bool]:
     """Which ccc subcommands the wiring in *settings* spawns (first-seen order).
 
