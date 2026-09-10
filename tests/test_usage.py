@@ -7,6 +7,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from datetime import UTC, date, datetime
@@ -2072,14 +2073,14 @@ def test_app_server_fallback_skips_unrelated_notifications(
     )
     captured: dict[str, object] = {}
 
-    def _run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        captured["cmd"] = cmd
-        captured["env"] = kwargs.get("env")
-        captured["input"] = kwargs.get("input")
-        captured["timeout"] = kwargs.get("timeout")
-        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+    def _exchange(exe: str, frames: str, env: dict[str, str], timeout: float) -> str:
+        captured["exe"] = exe
+        captured["env"] = env
+        captured["input"] = frames
+        captured["timeout"] = timeout
+        return stdout
 
-    monkeypatch.setattr(usage.subprocess, "run", _run)
+    monkeypatch.setattr(usage, "_appserver_exchange", _exchange)
     home = tmp_path / "codex"
     snap = usage._fetch_codex_usage_appserver(home, now=_LIVE_NOW)
 
@@ -2088,7 +2089,7 @@ def test_app_server_fallback_skips_unrelated_notifications(
     assert snap.five_hour == usage.Window(used_percentage=100.0, resets_at=1788095849)
     assert snap.seven_day == usage.Window(used_percentage=23.0, resets_at=1788643641)
     assert snap.blocked_reason == "included usage limit reached (no credit overflow)"
-    assert captured["cmd"] == ["/usr/bin/codex", "app-server"]
+    assert captured["exe"] == "/usr/bin/codex"
     assert captured["env"]["CODEX_HOME"] == str(home)  # type: ignore[index]
     assert "account/rateLimits/read" in str(captured["input"])
     assert captured["timeout"] == usage._APPSERVER_TIMEOUT_SEC
@@ -2096,6 +2097,80 @@ def test_app_server_fallback_skips_unrelated_notifications(
     # No `codex` on PATH → no fallback at all.
     monkeypatch.setattr(usage.shutil, "which", lambda _name: None)
     assert usage._fetch_codex_usage_appserver(home, now=_LIVE_NOW) is None
+
+
+_FAKE_APP_SERVER = """\
+import json, os, select, sys, time
+
+def _readline():
+    buf = bytearray()
+    while True:
+        chunk = os.read(0, 1)
+        if not chunk:
+            return None  # EOF
+        buf += chunk
+        if chunk == b"\\n":
+            return bytes(buf)
+
+while True:
+    line = _readline()
+    if line is None:
+        sys.exit(0)  # the real server tears down on stdin EOF, dropping queued work
+    req = json.loads(line)
+    if req.get("id") == 1:
+        print(json.dumps({"id": 1, "result": {"userAgent": "fake"}}), flush=True)
+    elif req.get("id") == 2:
+        time.sleep(float(os.environ.get("FAKE_DELAY", "0.3")))
+        ready, _, _ = select.select([0], [], [], 0)
+        if ready and os.read(0, 1) == b"":
+            sys.exit(0)  # EOF arrived before we answered: no reply, like codex 0.153.4
+        print(json.dumps({"method": "remoteControl/status/changed", "params": {}}), flush=True)
+        print(json.dumps({"id": 2, "result": {"rateLimits": {
+            "limitId": "codex",
+            "primary": {"usedPercent": 0, "windowDurationMins": 300, "resetsAt": 1789071170},
+            "secondary": {"usedPercent": 8, "windowDurationMins": 10080, "resetsAt": 1789577295},
+            "planType": "team", "rateLimitReachedType": None}}}), flush=True)
+"""
+
+
+def _install_fake_app_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A ``codex`` stand-in that mimics 0.153.4: exits on stdin EOF before answering."""
+    exe = tmp_path / "codex"
+    exe.write_text(f"#!{sys.executable}\n{_FAKE_APP_SERVER}")
+    exe.chmod(0o755)
+    monkeypatch.setattr(usage.shutil, "which", lambda name: str(exe) if name == "codex" else None)
+    return exe
+
+
+def test_app_server_fallback_holds_stdin_open_until_the_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``codex app-server`` (0.153.4) exits on stdin EOF *before* answering a queued
+    ``account/rateLimits/read`` — closing stdin right after writing (the old
+    ``subprocess.run(input=…)`` exchange) therefore lost the reply every time and the
+    401/403 fallback silently produced nothing. stdin must stay open until the answer."""
+    _install_fake_app_server(tmp_path, monkeypatch)
+    home = tmp_path / "home"
+
+    snap = usage._fetch_codex_usage_appserver(home, now=_LIVE_NOW)
+
+    assert snap is not None
+    assert snap.plan_type == "team" and snap.live is True
+    assert snap.five_hour == usage.Window(used_percentage=0.0, resets_at=1789071170)
+    assert snap.seven_day == usage.Window(used_percentage=8.0, resets_at=1789577295)
+
+
+def test_app_server_fallback_gives_up_at_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server that never answers costs at most the timeout, and returns ``None``."""
+    _install_fake_app_server(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_DELAY", "30")
+    monkeypatch.setattr(usage, "_APPSERVER_TIMEOUT_SEC", 1.0)
+    started = time.monotonic()
+
+    assert usage._fetch_codex_usage_appserver(tmp_path / "home", now=_LIVE_NOW) is None
+    assert time.monotonic() - started < 6.0
 
 
 def test_codex_usage_stale_tracks_the_cache_mtime(tmp_path: Path) -> None:

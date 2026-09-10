@@ -53,6 +53,7 @@ import fcntl
 import hashlib
 import json
 import os
+import select
 import shutil
 import subprocess
 import tempfile
@@ -1470,6 +1471,65 @@ def _appserver_usage(limits: object, now: int) -> Usage | None:
     )
 
 
+def _appserver_exchange(exe: str, frames: str, env: dict[str, str], timeout: float) -> str:
+    """Run ``codex app-server``, feed it *frames*, return every stdout line it printed.
+
+    stdin is held OPEN until the ``account/rateLimits/read`` reply (our request id) has
+    arrived or *timeout* has elapsed: ``codex`` 0.153.4 shuts the server down on stdin
+    EOF *before* answering a request that is still queued (observed 2026-09-10 — a
+    ``subprocess.run(input=…)`` exchange got only the ``initialize`` reply back and the
+    fallback silently returned nothing), so closing stdin right after writing is exactly
+    what kills the answer. stdout is read as raw bytes under ``select`` so a text buffer
+    can never hide a line that has already arrived. The child is terminated on the way
+    out whatever happened; whatever it printed is returned for parsing.
+    """
+    collected = bytearray()
+    try:
+        proc = subprocess.Popen(  # noqa: S603
+            [exe, "app-server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return ""
+    assert proc.stdin is not None and proc.stdout is not None  # noqa: S101  # Popen(PIPE)
+    deadline = time.monotonic() + max(0.1, float(timeout))
+    answer = f'"id":{_APPSERVER_LIMITS_ID}'.encode()
+    try:
+        try:
+            proc.stdin.write(frames.encode("utf-8"))
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return ""
+        fd = proc.stdout.fileno()
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
+            if not ready:
+                break
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break  # EOF: the server exited on its own
+            collected.extend(chunk)
+            # Stop as soon as the line carrying our reply is complete.
+            if answer in collected and collected.rfind(b"\n") > collected.find(answer):
+                break
+    finally:
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
+        with contextlib.suppress(OSError):
+            proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=2)
+    return collected.decode("utf-8", errors="replace")
+
+
 def _fetch_codex_usage_appserver(home: Path, now: int | None = None) -> Usage | None:
     """Ask the official ``codex app-server`` for the rate limits; ``None`` on any failure.
 
@@ -1477,9 +1537,9 @@ def _fetch_codex_usage_appserver(home: Path, now: int | None = None) -> Usage | 
     has expired and only ``codex`` itself may refresh it (it writes the new one back).
     Three JSON-RPC frames go in on stdin (``initialize`` → ``initialized`` →
     ``account/rateLimits/read``); the answer arrives in ~2.5 s among unrelated
-    notifications, so every stdout line without OUR request id is skipped. Hard timeout
-    (:data:`_APPSERVER_TIMEOUT_SEC`), after which the child is killed and whatever it had
-    already printed is still parsed.
+    notifications, so every stdout line without OUR request id is skipped. stdin stays
+    open until that answer (or :data:`_APPSERVER_TIMEOUT_SEC`) — see
+    :func:`_appserver_exchange` for why closing it early loses the reply.
     """
     exe = shutil.which("codex")
     if not exe:
@@ -1497,22 +1557,8 @@ def _fetch_codex_usage_appserver(home: Path, now: int | None = None) -> Usage | 
     ]
     stdin = "".join(json.dumps(frame) + "\n" for frame in frames)
     env = dict(os.environ, CODEX_HOME=str(home.expanduser()))
-    try:
-        proc = subprocess.run(  # noqa: S603
-            [exe, "app-server"],
-            input=stdin,
-            capture_output=True,
-            text=True,
-            timeout=_APPSERVER_TIMEOUT_SEC,
-            env=env,
-            check=False,
-        )
-        out = proc.stdout
-    except subprocess.TimeoutExpired as expired:
-        out = expired.stdout if isinstance(expired.stdout, str) else ""
-    except (subprocess.SubprocessError, OSError, ValueError):
-        return None
-    for line in (out or "").splitlines():
+    out = _appserver_exchange(exe, stdin, env, _APPSERVER_TIMEOUT_SEC)
+    for line in out.splitlines():
         try:
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
