@@ -183,7 +183,7 @@ RUNS_DIR = Path(
 )
 
 # Heartbeat contract v1 — the cross-tool keys the Claude Code statusline reader
-# (mydotfiles ``bin/cc-waiting.py``) consumes from every heartbeat writer (this runner
+# (``cc-waiting.py`` in the user's dotfiles) consumes from every heartbeat writer (this runner
 # and ``cc-heartbeat.py`` for headless claude children). ``proc_start`` is the runner's
 # own ``ps -o lstart=`` token, fetched under a pinned TZ/locale so writer and reader
 # compare identical strings — the process identity a stale file can never fake.

@@ -983,8 +983,8 @@ codex-in-claude.py delegate -n "task…"                 # dry run: show assembl
 
 The heartbeat (`$CODEX_IN_CLAUDE_RUNS_DIR/<runner_pid>.json`, default
 `~/.config/codex-in-claude/runs/`, refreshed every 5 s, file 0600 in a 0700 directory) follows
-the cross-tool **heartbeat contract v1** the Claude Code statusline reads (mydotfiles
-`bin/cc-waiting.py`, tp#221): `schema_version` 1, `writer`, `tool` (`codex`), `pid` +
+the cross-tool **heartbeat contract v1** the Claude Code statusline reads (`cc-waiting.py`
+in the user's dotfiles, tp#221): `schema_version` 1, `writer`, `tool` (`codex`), `pid` +
 `proc_start` (the runner's `ps -o lstart=` token under `TZ=UTC LC_ALL=C` — its identity),
 `child_pid` + `child_proc_start` (the `codex exec` process), `child_state`, `account` (the seat
 label), `model`, `model_source`, `effort`, `interval_s`, `started`, `updated`, `next_due`,
