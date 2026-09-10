@@ -756,7 +756,8 @@ def test_delegate_pointer_hint_for_xhigh(
     assert "consider -e high" not in capsys.readouterr().err
 
 
-def test_exec_codex_writes_and_removes_heartbeat(cic: ModuleType, tmp_path: Path) -> None:
+def test_exec_codex_writes_and_retains_final_heartbeat(cic: ModuleType, tmp_path: Path) -> None:
+    """The heartbeat exists while codex runs and STAYS as a final ``ended`` record afterwards."""
     import threading
 
     fake = _fake_codex(tmp_path, "sleep 2\nexit 0\n")
@@ -784,7 +785,9 @@ def test_exec_codex_writes_and_removes_heartbeat(cic: ModuleType, tmp_path: Path
     watcher.join()
     assert result.returncode == 0
     assert seen == [True]  # heartbeat existed while running (also proves -t 0 works)
-    assert not hb.exists()  # and was removed on exit
+    final = json.loads(hb.read_text(encoding="utf-8"))  # retained: normal completion is visible
+    assert final["ended"] and final["child_state"] == "gone"
+    assert final["schema_version"] == 1 and final["tool"] == "codex"
 
 
 def test_prompt_time_budget_note(cic: ModuleType) -> None:

@@ -169,14 +169,99 @@ SLEEP_GAP_S = 30.0
 TICK_CAP_S = 5.0
 
 # Heartbeat files for in-flight delegate runs (see ``runs``): one small JSON per
-# running delegate, refreshed every few seconds, removed on exit. Lets a caller
-# check progress cheaply (one file read) instead of tailing full transcripts.
+# running delegate, refreshed every few seconds. Lets a caller check progress
+# cheaply (one file read) instead of tailing full transcripts. On exit the file is
+# NOT removed: one retained final record (``ended`` set, ``child_state`` "gone") stays
+# behind so a reader that saw the run alive can tell normal completion from a crash;
+# ``_prune_ended_heartbeats`` (and the statusline's ``cc-heartbeat.py gc``) drop it
+# after ``HEARTBEAT_ENDED_RETENTION_S``.
 RUNS_DIR = Path(
     os.environ.get(
         "CODEX_IN_CLAUDE_RUNS_DIR",
         str(Path.home() / ".config" / "codex-in-claude" / "runs"),
     )
 )
+
+# Heartbeat contract v1 — the cross-tool keys the Claude Code statusline reader
+# (mydotfiles ``bin/cc-waiting.py``) consumes from every heartbeat writer (this runner
+# and ``cc-heartbeat.py`` for headless claude children). ``proc_start`` is the runner's
+# own ``ps -o lstart=`` token, fetched under a pinned TZ/locale so writer and reader
+# compare identical strings — the process identity a stale file can never fake.
+HEARTBEAT_SCHEMA_VERSION = 1
+HEARTBEAT_INTERVAL_S = 5  # the loop writes on every ``HEARTBEAT_INTERVAL_S``-th 1 s tick
+HEARTBEAT_ENDED_RETENTION_S = 600
+_PS_IDENTITY_ENV = {"TZ": "UTC", "LC_ALL": "C"}
+_LSTART_RE = re.compile(r"^[A-Za-z]{3} [A-Za-z]{3} [ \d]\d \d\d:\d\d:\d\d \d{4}$")
+
+
+def _heartbeat_writer() -> str:
+    """``codex-in-claude/<version>`` — which writer produced a heartbeat record."""
+    try:
+        from importlib.metadata import version  # pylint: disable=import-outside-toplevel
+
+        return f"codex-in-claude/{version('claude-command-center')}"
+    except Exception:  # noqa: BLE001  # pragma: no cover - metadata missing in odd installs
+        return "codex-in-claude/0"
+
+
+def _lstart_of(pid: int) -> str | None:
+    """The exact ``ps -o lstart=`` start token of *pid* under ``TZ=UTC LC_ALL=C``.
+
+    Whitespace-normalised (``Thu Sep 10 11:58:50 2026``); ``None`` when ps fails, times
+    out (1 s) or prints something that is not a start token.
+    """
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=False,
+            env={**os.environ, **_PS_IDENTITY_ENV},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    token = " ".join(proc.stdout.split())
+    return token if _LSTART_RE.match(token) else None
+
+
+@dataclass(frozen=True)
+class HeartbeatIdentity:
+    """Who a heartbeat is about: the runner and the ``codex exec`` child it supervises."""
+
+    started: int  # epoch of this attempt's start
+    proc_start: str | None  # the runner's own lstart token
+    child_pid: int | None
+    child_proc_start: str | None
+
+
+def _secure_heartbeat_dir(path: Path) -> None:
+    """Create the heartbeat directory 0700 and tighten anything already in it (once)."""
+    path.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o700)
+    for entry in path.glob("*.json"):
+        with contextlib.suppress(OSError):
+            os.chmod(entry, 0o600)
+
+
+def _prune_ended_heartbeats(runs_dir: Path, now: float | None = None) -> None:
+    """Drop retained final records older than ``HEARTBEAT_ENDED_RETENTION_S`` (never fatal)."""
+    now = time.time() if now is None else now
+    try:
+        entries = sorted(runs_dir.glob("*.json"))[:64]
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            data = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        ended = data.get("ended") if isinstance(data, dict) else None
+        if isinstance(ended, (int, float)) and now - ended > HEARTBEAT_ENDED_RETENTION_S:
+            with contextlib.suppress(OSError):
+                entry.unlink()
+
 
 # codex exec prints its session id in the startup banner; captured so a later
 # round (or a retry after a kill) can `codex exec resume <id>` with the
@@ -215,7 +300,7 @@ def _session_id_of(text: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _write_heartbeat(  # pylint: disable=too-many-positional-arguments
+def _write_heartbeat(  # pylint: disable=too-many-positional-arguments,too-many-locals
     path: Path,
     meta: dict[str, Any],
     started: float,
@@ -224,6 +309,7 @@ def _write_heartbeat(  # pylint: disable=too-many-positional-arguments
     err_buf: list[str],
     codex_pgid: int | None = None,
     extra: dict[str, Any] | None = None,
+    identity: HeartbeatIdentity | None = None,
 ) -> None:
     """Atomically refresh one run's heartbeat JSON (never fatal).
 
@@ -233,25 +319,49 @@ def _write_heartbeat(  # pylint: disable=too-many-positional-arguments
     alive ``os.killpg(codex_pgid, SIGKILL)`` it directly. Without the pgid a consumer
     can only kill the runner, and codex's own process group — a nested group, because
     the runner starts it with ``start_new_session`` — outlives it.
+
+    The contract-v1 keys (``schema_version`` … ``progress_at``) are what the statusline
+    reader joins on; ``extra`` may override any of them (the loop passes the sleep-aware
+    ``idle_s``, the real ``progress_at``, ``child_state`` and, on exit, ``ended``). The
+    file is 0600 in a 0700 directory: it names the repo, the seat and the last output line.
     """
     now = time.monotonic()
+    wall = int(time.time())
     last_line = next((line.strip() for line in reversed(err_buf or out_buf) if line.strip()), "")
+    ident = identity or HeartbeatIdentity(int(wall - (now - started)), None, None, None)
     payload = {
+        "schema_version": HEARTBEAT_SCHEMA_VERSION,
+        "writer": _heartbeat_writer(),
+        "tool": "codex",
         "pid": os.getpid(),
         "runner_pid": os.getpid(),
+        "proc_start": ident.proc_start,
         "codex_pgid": codex_pgid,
+        "child_pid": ident.child_pid,
+        "child_proc_start": ident.child_proc_start,
+        "child_state": "running",
         **meta,
+        "account": meta.get("seat"),
+        "model_source": "requested",
+        "interval_s": HEARTBEAT_INTERVAL_S,
+        "started": ident.started,
         "elapsed_s": int(now - started),
         "idle_s": int(now - last_activity),
+        "progress_at": ident.started,
         "lines": len(out_buf) + len(err_buf),
         "last_line": last_line[:200],
-        "updated": int(time.time()),
-        **(extra or {}),  # sleep-aware idle_s, slept_s, trouble, caffeinate_pid
+        "updated": wall,
+        "next_due": wall + HEARTBEAT_INTERVAL_S,
+        **(extra or {}),  # sleep-aware idle_s, progress_at, child_state, slept_s, trouble, ended
     }
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _secure_heartbeat_dir(path.parent)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()  # a crashed writer's leftover would make O_EXCL refuse
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload))
         tmp.replace(path)
     except OSError:
         pass
@@ -606,10 +716,40 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
     slept_since_progress = False
     seen_progress = 0
     tick = 0
+    # Contract-v1 identity: fetched once per attempt (two ps calls) only when a
+    # heartbeat is wanted; ``progress_at`` is the WALL clock of the last PROGRESS line —
+    # trouble chatter and a suspended machine never move it (the reader trusts it).
+    started_epoch = int(time.time())
+    progress_at = started_epoch
+    identity: HeartbeatIdentity | None = None
+    if heartbeat_path is not None:
+        identity = HeartbeatIdentity(
+            started=started_epoch,
+            proc_start=_lstart_of(os.getpid()),
+            child_pid=proc.pid,
+            child_proc_start=_lstart_of(proc.pid),
+        )
+        _prune_ended_heartbeats(heartbeat_path.parent)
+
+    def heartbeat_extra(snap: _HealthSnapshot, *, ended: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "idle_s": int(awake_idle),
+            "progress_at": progress_at,
+            "child_state": "gone" if ended or proc.poll() is not None else "running",
+            "slept_s": int(slept),
+            "trouble": snap.trouble,
+            "caffeinate_pid": awake_holder.pid if awake_holder else None,
+        }
+        if ended:
+            payload["ended"] = int(time.time())
+        return payload
+
     try:
         while True:
             snap = health.snapshot()
-            if heartbeat_path is not None and tick % 5 == 0:
+            if snap.progress != seen_progress:
+                progress_at = int(time.time())
+            if heartbeat_path is not None and tick % HEARTBEAT_INTERVAL_S == 0:
                 _write_heartbeat(
                     heartbeat_path,
                     heartbeat_meta or {},
@@ -618,12 +758,8 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
                     out_buf,
                     err_buf,
                     codex_pgid,
-                    extra={
-                        "idle_s": int(awake_idle),
-                        "slept_s": int(slept),
-                        "trouble": snap.trouble,
-                        "caffeinate_pid": awake_holder.pid if awake_holder else None,
-                    },
+                    extra=heartbeat_extra(snap),
+                    identity=identity,
                 )
             tick += 1
             try:
@@ -677,8 +813,19 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
         for signum, handler in previous.items():
             signal.signal(signum, handler)
         if heartbeat_path is not None:
-            with contextlib.suppress(OSError):
-                heartbeat_path.unlink()
+            # The retained final record: a reader that saw this run alive can tell a
+            # normal exit (``ended`` set) from a crash (file stale, pid gone, no ``ended``).
+            _write_heartbeat(
+                heartbeat_path,
+                heartbeat_meta or {},
+                start,
+                time.monotonic() - awake_idle,
+                out_buf,
+                err_buf,
+                codex_pgid,
+                extra=heartbeat_extra(health.snapshot(), ended=True),
+                identity=identity,
+            )
             with contextlib.suppress(OSError):
                 heartbeat_path.with_suffix(".tmp").unlink()
 
@@ -2725,18 +2872,23 @@ def _concurrency_slot(ceiling: int, poll: float = 3.0) -> Iterator[None]:
 def cmd_runs(args: argparse.Namespace) -> int:
     """List in-flight delegate runs from their heartbeat files (one cheap read each).
 
-    The supervised runner refreshes a tiny JSON per run every ~5s and removes it
-    on exit, so this shows elapsed/idle time, output volume, and the last output
-    line of every live delegate WITHOUT reading any transcript. Heartbeats whose
-    process is gone (crash, SIGKILL) are cleaned up on sight.
+    The supervised runner refreshes a tiny JSON per run every ~5s, so this shows
+    elapsed/idle time, output volume, and the last output line of every live delegate
+    WITHOUT reading any transcript. A run that exited normally leaves a final record
+    with ``ended`` set: not listed here, left for the retention prune (the statusline
+    reader still wants it for a few minutes). Heartbeats whose process is gone WITHOUT
+    that record (crash, SIGKILL) are cleaned up on sight.
     """
     rows: list[dict[str, Any]] = []
+    _prune_ended_heartbeats(RUNS_DIR)
     for path in sorted(RUNS_DIR.glob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             pid = int(data["pid"])
         except (OSError, ValueError, KeyError, json.JSONDecodeError):
             continue
+        if data.get("ended"):
+            continue  # normal completion, retained on purpose
         try:
             os.kill(pid, 0)  # liveness probe only
         except ProcessLookupError:

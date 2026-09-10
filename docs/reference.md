@@ -981,6 +981,20 @@ codex-in-claude.py delegate -P notes/map.md "task…"    # curated repo map (-M 
 codex-in-claude.py delegate -n "task…"                 # dry run: show assembled prompt, launch nothing
 ```
 
+The heartbeat (`$CODEX_IN_CLAUDE_RUNS_DIR/<runner_pid>.json`, default
+`~/.config/codex-in-claude/runs/`, refreshed every 5 s, file 0600 in a 0700 directory) follows
+the cross-tool **heartbeat contract v1** the Claude Code statusline reads (mydotfiles
+`bin/cc-waiting.py`, tp#221): `schema_version` 1, `writer`, `tool` (`codex`), `pid` +
+`proc_start` (the runner's `ps -o lstart=` token under `TZ=UTC LC_ALL=C` — its identity),
+`child_pid` + `child_proc_start` (the `codex exec` process), `child_state`, `account` (the seat
+label), `model`, `model_source`, `effort`, `interval_s`, `started`, `updated`, `next_due`,
+`progress_at` (wall clock of the last PROGRESS line — reconnect chatter and a suspended
+machine never move it), `idle_s`, `lines`, `last_line`, plus the runner's own `runner_pid`,
+`codex_pgid`, `elapsed_s`, `slept_s`, `trouble`, `caffeinate_pid`. On exit the file is NOT
+removed: one final record with `ended` and `child_state: gone` stays for 10 minutes so a
+reader that saw the run alive can tell normal completion from a crash; `runs` skips those
+records and prunes them past the retention window (`cc-heartbeat.py gc` does the same).
+
 The prompt is auto-prefixed with the repo's `repo_scope_short.md` (else a git top-level
 summary) so codex starts oriented, and it is told its time budget explicitly.
 

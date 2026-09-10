@@ -26,6 +26,7 @@ import argparse
 import io
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -747,7 +748,8 @@ def test_heartbeat_carries_codex_pgid(three_seats: SeatFixture, tmp_path: Path) 
     assert seen, "no heartbeat was written"
     assert seen[0]["runner_pid"] == os.getpid()
     assert isinstance(seen[0]["codex_pgid"], int) and seen[0]["codex_pgid"] > 0
-    assert not heartbeat.exists()  # removed on exit
+    final = json.loads(heartbeat.read_text(encoding="utf-8"))  # retained final record
+    assert final["ended"] and final["child_state"] == "gone"
 
 
 @pytest.mark.slow
@@ -1084,7 +1086,8 @@ def test_heartbeat_carries_health_fields(three_seats: SeatFixture, tmp_path: Pat
     assert troubled, "no heartbeat reported the trouble lines codex was printing"
     assert "caffeinate_pid" in troubled[0]  # None without caffeinate / with the opt-out
     assert troubled[0]["slept_s"] == 0
-    assert not heartbeat.exists()  # removed on exit
+    final = json.loads(heartbeat.read_text(encoding="utf-8"))  # retained final record
+    assert final["ended"] and final["child_state"] == "gone"
 
 
 def test_exit_codes_for_new_kinds(capsys: pytest.CaptureFixture[str]) -> None:
@@ -1130,6 +1133,170 @@ def test_runs_view_shows_health(
     assert "caffeinated" in out
     assert "slept 2m05s" in out
     assert "3 trouble line(s) since progress" in out
+
+
+# ── heartbeat contract v1 (tp#221: the statusline reader joins on these keys) ─────
+_CONTRACT_KEYS: dict[str, type | tuple[type, ...]] = {
+    "schema_version": int,
+    "writer": str,
+    "tool": str,
+    "pid": int,
+    "proc_start": (str, type(None)),
+    "child_pid": int,
+    "child_proc_start": (str, type(None)),
+    "child_state": str,
+    "account": (str, type(None)),
+    "model_source": str,
+    "interval_s": int,
+    "started": int,
+    "updated": int,
+    "next_due": int,
+    "progress_at": int,
+    "idle_s": int,
+    "lines": int,
+    "last_line": str,
+}
+
+
+def _collect_heartbeats(
+    three_seats: SeatFixture, heartbeat: Path, scenario: str, **exec_kwargs: object
+) -> tuple[list[dict], BaseException | None]:
+    """Run the fake under supervision, sampling every heartbeat write; (snapshots, raised)."""
+    seen: list[dict] = []
+    fake = str(Path(__file__).parent / "fakes" / "fake_codex.py")
+    env = {**os.environ, "CODEX_HOME": str(three_seats.seats["private"])}
+    three_seats.scenarios(private=scenario)
+    done = threading.Event()
+
+    def watch() -> None:
+        while not done.is_set():
+            try:
+                snap = json.loads(heartbeat.read_text(encoding="utf-8"))
+                if not seen or snap != seen[-1]:
+                    seen.append(snap)
+            except (OSError, ValueError):
+                pass
+            done.wait(0.05)
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    raised: BaseException | None = None
+    try:
+        cic._exec_codex(  # noqa: SLF001
+            [fake, "exec"],
+            env=env,
+            heartbeat_path=heartbeat,
+            heartbeat_meta={"model": "m", "effort": "low", "repo": "/r", "seat": "private"},
+            stdin_text="",
+            **exec_kwargs,  # type: ignore[arg-type]
+        )
+    except Exception as exc:  # noqa: BLE001  # the scenario decides how the run ends
+        raised = exc
+    finally:
+        done.set()
+        watcher.join(timeout=3)
+    return seen, raised
+
+
+def test_heartbeat_carries_contract_v1_keys(three_seats: SeatFixture, tmp_path: Path) -> None:
+    """Every write carries the typed cross-tool keys; the final record stays, with ``ended``."""
+    heartbeat = tmp_path / "hb-contract.json"
+    seen, raised = _collect_heartbeats(three_seats, heartbeat, "hang", timeout=3)
+    assert isinstance(raised, subprocess.TimeoutExpired)
+    assert seen, "no heartbeat was written"
+    live = seen[0]
+    for key, kind in _CONTRACT_KEYS.items():
+        assert key in live, f"missing {key}"
+        assert isinstance(live[key], kind), f"{key}: {live[key]!r} is not {kind}"
+    assert live["schema_version"] == cic.HEARTBEAT_SCHEMA_VERSION == 1
+    assert live["writer"].startswith("codex-in-claude/")
+    assert live["tool"] == "codex"
+    assert live["interval_s"] == cic.HEARTBEAT_INTERVAL_S == 5
+    assert live["next_due"] == live["updated"] + 5
+    assert live["account"] == "private"
+    assert live["model_source"] == "requested"
+    assert live["child_pid"] == live["codex_pgid"]
+    assert live["child_state"] == "running"
+    if live["proc_start"] is not None:
+        assert re.match(r"^\w{3} \w{3} [ \d]\d \d\d:\d\d:\d\d \d{4}$", live["proc_start"])
+    final = json.loads(heartbeat.read_text(encoding="utf-8"))
+    assert final["ended"] >= final["started"]
+    assert final["child_state"] == "gone"
+    assert final["pid"] == os.getpid()
+
+
+def test_heartbeat_file_modes(three_seats: SeatFixture, tmp_path: Path) -> None:
+    """0600 files in a 0700 directory, whatever the umask: the record names repo + seat + output."""
+    runs = tmp_path / "runs"
+    heartbeat = runs / "hb-modes.json"
+    previous = os.umask(0o022)
+    try:
+        seen, _ = _collect_heartbeats(three_seats, heartbeat, "hang", timeout=2)
+    finally:
+        os.umask(previous)
+    assert seen
+    assert heartbeat.stat().st_mode & 0o777 == 0o600
+    assert runs.stat().st_mode & 0o777 == 0o700
+
+
+def test_heartbeat_progress_at_ignores_trouble_and_sleep(
+    three_seats: SeatFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``progress_at`` is the wall clock of the last PROGRESS line — reconnect chatter and a
+    suspended machine never move it (Codex O14)."""
+    heartbeat = tmp_path / "hb-progress.json"
+    real_wall = cic._wall_clock  # noqa: SLF001
+    calls = {"n": 0}
+
+    def jumping_wall() -> float:
+        calls["n"] += 1
+        # One simulated 10-minute suspend AFTER the tick-5 heartbeat (call 1 seeds
+        # prev_wall, then one call per tick): the awake-idle credit is capped per tick
+        # (TICK_CAP_S), so the run is killed a few ticks after the jump and the final
+        # record — not a later periodic write — is what carries ``slept_s``.
+        return real_wall() + (600.0 if calls["n"] > 7 else 0.0)
+
+    monkeypatch.setattr(cic, "_wall_clock", jumping_wall)
+    seen, raised = _collect_heartbeats(
+        three_seats, heartbeat, "network_dead", timeout=0, idle_timeout=12
+    )
+    assert isinstance(raised, cic.CodexStalledError)
+    assert getattr(raised, "reason", None) in ("network", "slept")
+    final = json.loads(heartbeat.read_text(encoding="utf-8"))
+    troubled = [snap for snap in [*seen, final] if int(snap.get("trouble") or 0) >= 1]
+    assert troubled, "no heartbeat reported the trouble lines"
+    stamps = {snap["progress_at"] for snap in troubled}
+    assert len(stamps) == 1, f"progress_at moved on trouble-only output: {sorted(stamps)}"
+    first_progress = troubled[0]["progress_at"]
+    assert troubled[0]["started"] <= first_progress <= troubled[0]["updated"]
+    assert int(final.get("slept_s") or 0) >= 600, "the sleep jump was not recorded"
+    assert final["progress_at"] == first_progress
+    assert final["ended"] and final["child_state"] == "gone"
+
+
+def test_runs_skips_ended_and_prunes_old_ended(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A retained final record is neither listed nor deleted on sight; a stale one is pruned."""
+    runs = three_seats.home / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cic, "RUNS_DIR", runs)
+    fresh = runs / "ended-fresh.json"
+    stale = runs / "ended-stale.json"
+    base = {
+        "pid": os.getpid(),
+        "model": "m",
+        "effort": "low",
+        "repo": "/r",
+        "last_line": "ENDEDLINE",
+    }
+    fresh.write_text(json.dumps({**base, "ended": int(time.time()) - 5}), encoding="utf-8")
+    stale.write_text(json.dumps({**base, "ended": int(time.time()) - 5000}), encoding="utf-8")
+    assert cic.cmd_runs(argparse.Namespace(json=False)) == cic.EX_OK
+    out = capsys.readouterr().out
+    assert "ENDEDLINE" not in out
+    assert fresh.exists(), "a fresh final record must survive a listing"
+    assert not stale.exists(), "a final record past the retention window must be pruned"
 
 
 # ── end to end, through the real executable ───────────────────────────────────────
