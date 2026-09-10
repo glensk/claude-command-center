@@ -245,6 +245,13 @@ DEFAULTS: dict[str, object] = {
     "file_lock_enabled": True,  # serialize same-file edits across sessions (PreToolUse lock)
     "file_lock_ttl_sec": 1800,  # a held lock past this with no edit is stale -> reclaimable
     "file_lock_wait_sec": 0,  # >0: PreToolUse polls a held lock this long before denying (0 = deny)
+    # The Stop-time lock lease. Claude Code runs the hooks of one event in PARALLEL, so
+    # when a turn ends a foreign auto-commit hook may still be committing its files for a
+    # minute or more; the Stop hook therefore leases the session's locks instead of
+    # dropping them (store.protect_locks) and the lease expires on its own.
+    "stop_barrier_enabled": True,  # hold file locks past the turn until the Stop chain can finish
+    "stop_barrier_wait_sec": 180,  # how long that lease protects them (clamped to 0..900)
+    "stop_barrier_settle_sec": 2,  # settle between drain scans before a close-now/switch-now kill
     "split_ratio": 0.6,  # TUI: left (table) fraction of the width, 0..1
     "tab_title": "!!!",  # iTerm tab title set when ccc starts ("" = leave alone)
     "tab_color": "red",  # iTerm tab color when ccc starts (name or #rrggbb; "" = none)
@@ -819,6 +826,9 @@ class Config:
     file_lock_enabled: bool = True
     file_lock_ttl_sec: int = 1800
     file_lock_wait_sec: int = 0
+    stop_barrier_enabled: bool = True
+    stop_barrier_wait_sec: int = 180
+    stop_barrier_settle_sec: int = 2
     split_ratio: float = 0.6
     tab_title: str = "!!!"
     tab_color: str = "red"
@@ -897,6 +907,20 @@ def invalidate_config_cache() -> None:
     _CONFIG_MEMO = None
 
 
+def _clamped_int(value: int, low: int, high: int, fallback: int) -> int:
+    """*value* coerced to an int inside ``low..high``; *fallback* when it is not a number.
+
+    A hand-edited config.toml can put anything in a numeric key (tomllib happily yields a
+    string or a list), and :func:`load_config` must never raise: every caller of it is a
+    hot path, and one that did raise would take the hooks, the TUI and the daemon with it.
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return max(low, min(high, number))
+
+
 def load_config() -> Config:
     """Load config from TOML, layered over ``DEFAULTS`` (memoized on the file's identity).
 
@@ -938,6 +962,11 @@ def load_config() -> Config:
             loaded_from_disk = False
     cfg = Config(**{key: data[key] for key in DEFAULTS if key in data})  # type: ignore[arg-type]
     cfg.loaded_from_disk = loaded_from_disk
+    # The one range-checked setting: the Stop lease bounds how long a peer can be refused a
+    # file after its holder's turn ended, so a hand-edited 10_000 would strand a contended
+    # file for hours. Clamped SILENTLY — this runs in the PreToolUse/Stop hot path, where a
+    # printed warning would land in a hook's stdout (a Claude Code protocol channel).
+    cfg.stop_barrier_wait_sec = _clamped_int(cfg.stop_barrier_wait_sec, 0, 900, 180)
     if loaded_from_disk:
         _CONFIG_MEMO = (memo_key, copy.deepcopy(cfg))
     return cfg

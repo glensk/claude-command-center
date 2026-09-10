@@ -429,6 +429,7 @@ def test_release_locks_claims_armed_close_and_spawns_once(
     from command_center.models import now_ms
 
     monkeypatch.setenv("ITERM_SESSION_ID", "w0t1p0:LIVE-UUID")
+    monkeypatch.setenv("CLAUDE_PID", "8123")  # the process close-now must bind and reap
     store = Store()
     store.ensure("s1", cwd="/repo")
     store.update_fields("s1", close_requested_at=now_ms())  # mark-done --close armed it
@@ -436,7 +437,9 @@ def test_release_locks_claims_armed_close_and_spawns_once(
     monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
 
     hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
-    assert calls == [["close-now", "--session", "s1", "--iterm", "w0t1p0:LIVE-UUID"]]
+    assert calls == [
+        ["close-now", "--session", "s1", "--iterm", "w0t1p0:LIVE-UUID", "--pid", "8123"]
+    ]
     assert store.get("s1").close_requested_at == 0  # type: ignore[union-attr]  # claimed & cleared
 
     # The one-shot request cannot re-fire on a later Stop.
@@ -452,6 +455,77 @@ def test_release_locks_unarmed_never_spawns(home: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
     hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
     assert calls == []
+
+
+def test_release_locks_leases_the_locks_instead_of_deleting_them(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Stop floor stamps the locks (Claude Code runs Stop hooks in PARALLEL, so a
+    foreign auto-commit may still be committing these very files) and still claims the
+    armed after-turn action and still drops the session's own pending waits."""
+    from command_center.models import now_ms
+
+    monkeypatch.setenv("ITERM_SESSION_ID", "w0t1p0:LIVE-UUID")
+    monkeypatch.delenv("CLAUDE_PID", raising=False)  # a non-numeric/absent pid is simply omitted
+    _set_cfg(stop_barrier_enabled=True, stop_barrier_wait_sec=180)
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.ensure("s2", cwd="/repo")
+    store.acquire_file_lock("s1", "/repo/f.py", now_ms(), {"s1", "s2"}, 30 * 60 * 1000)
+    store.acquire_file_lock("s2", "/repo/g.py", now_ms(), {"s1", "s2"}, 30 * 60 * 1000)
+    store.add_waiter("s1", "/repo/g.py", now_ms())  # s1's OWN pending wait
+    store.add_waiter("s2", "/repo/f.py", now_ms())  # s2 queued on s1's file
+    store.update_fields("s1", close_requested_at=now_ms())  # mark-done --close armed it
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+
+    before = now_ms()
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+
+    deadline = store.protection_deadline("/repo/f.py")
+    assert before + 179_000 <= deadline <= now_ms() + 180_000  # leased, not deleted
+    assert store.acquire_file_lock("s2", "/repo/f.py", now_ms(), {"s2"}, 30 * 60 * 1000) == "s1"
+    assert [w.session_id for w in store.waiters_on_my_locks("s2")] == []  # our own wait dropped
+    assert [w.session_id for w in store.waiters_on_my_locks("s1")] == ["s2"]  # s2 still queued
+    assert calls == [
+        ["close-now", "--session", "s1", "--iterm", "w0t1p0:LIVE-UUID"]
+    ]  # no $CLAUDE_PID
+
+
+def test_release_locks_releases_at_once_when_the_barrier_is_off(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``stop_barrier_enabled = false`` keeps the pre-lease behaviour verbatim."""
+    from command_center.models import now_ms
+
+    _set_cfg(stop_barrier_enabled=False)
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.acquire_file_lock("s1", "/repo/f.py", now_ms(), {"s1"}, 30 * 60 * 1000)
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+    assert store.list_file_locks({"s1"}, 30 * 60 * 1000, now_ms()) == []  # deleted outright
+
+
+def test_session_end_keeps_leased_locks_and_drops_the_rest(home: Path) -> None:
+    """A session that exits must not hand a peer a file its Stop chain may still commit."""
+    from command_center.models import now_ms
+
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    ttl = 30 * 60 * 1000
+    store.acquire_file_lock("s1", "/repo/leased.py", now_ms(), {"s1"}, ttl)
+    store.acquire_file_lock("s1", "/repo/plain.py", now_ms(), {"s1"}, ttl)
+    store.protect_locks("s1", now_ms() + 180_000)
+    store.acquire_file_lock("s1", "/repo/plain.py", now_ms(), {"s1"}, ttl)  # a new turn on it
+
+    hooks.handle_session_end({"session_id": "s1", "cwd": "/repo"})
+
+    assert store.protection_deadline("/repo/plain.py") == 0  # unleased row: gone
+    assert [lk.file_path for lk in store.list_file_locks(set(), ttl, now_ms())] == [
+        "/repo/leased.py"
+    ]
+    # Once the lease expires the row stops denying anything (and any peer reclaims it).
+    assert store.list_file_locks(set(), ttl, now_ms() + 180_001) == []
 
 
 # --------------------------------------------------------------------------- #

@@ -17,6 +17,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+import os
 import shlex
 import shutil
 import subprocess
@@ -473,8 +474,6 @@ def resume_halted_in_new_tab(
     string is ``_as_quote``-escaped before it is embedded in the AppleScript
     ``"..."`` literal, so a cwd/path containing a double-quote can't break out.
     """
-    import os
-
     from .accounts import LaunchTarget, ensure_trusted, session_launch_env_prefix
 
     if not cwd or not os.path.isdir(cwd) or not script_path:
@@ -1106,9 +1105,15 @@ def pid_is_claude(pid: int, table: dict[int, Any]) -> bool:
 def live_hook_children(pid: int, table: dict[int, Any]) -> list[str]:
     """Command lines of *pid*'s descendants that look like Claude Code hook processes.
 
-    A Stop turn is over only when none remain: the settings.json hook commands (and any
-    wrapper around them) carry ``hook`` in their command line, while long-lived children
-    such as MCP servers do not.
+    The plain substring probe: the settings.json hook commands (and most wrappers around
+    them) carry ``hook`` in their command line, while long-lived children such as MCP
+    servers do not. An EMPTY result is not proof that the Stop chain finished — a foreign
+    ``/repo/scripts/commit.sh`` names no hook, and ``ps`` itself can fail.
+
+    NOT used by ``close-now`` / ``switch-now`` any more: the two paths that KILL a process
+    go through the tri-state :func:`drain_state` (this substring rule, widened by the
+    readable foreign hook commands, plus an explicit ``unknown``). This stays the documented
+    plain probe — and the over-match :func:`drain_state` builds on.
     """
     children: dict[int, list[int]] = {}
     for child, row in table.items():
@@ -1128,6 +1133,183 @@ def live_hook_children(pid: int, table: dict[int, Any]) -> list[str]:
             found.append(row.command)
         stack.extend(children.get(current, []))
     return found
+
+
+#: Tri-state answer of :func:`drain_state` — the ONLY question the two destructive paths
+#: (``close-now`` / ``switch-now``) ask about a session's Stop-hook chain.
+#: ``running`` = a hook process is still up, ``drained`` = none was seen, ``unknown`` =
+#: the observation itself failed. "Cannot tell" therefore means "do not kill", never
+#: "release a lock" — the lock lease (``Store.protect_locks``) is what protects the files.
+DRAIN_RUNNING = "running"
+DRAIN_DRAINED = "drained"
+DRAIN_UNKNOWN = "unknown"
+
+# Shell noise that is never a hook command word.
+_TOKEN_NOISE = frozenset({"--", "&&", "||", "|", ";", "&", "then", "else"})
+# Words shorter than this are too generic to match a command line on.
+_MIN_TOKEN_LEN = 4
+# MULTI-PURPOSE executables a hook may merely be wrapped in. Tokenising one would match
+# every unrelated child of the observed claude — a background Bash-tool `zsh`, a `python3`
+# MCP server, `ccc statusline` — and report the Stop chain as RUNNING forever, so no close
+# could ever happen. The hook itself is still matched by its own path, which the very same
+# command line carries (`/bin/zsh /repo/commit.sh` → `commit.sh`).
+_GENERIC_EXECUTABLES = frozenset(
+    {
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ksh",
+        "fish",
+        "csh",
+        "tcsh",
+        "env",
+        "node",
+        "deno",
+        "bun",
+        "npx",
+        "perl",
+        "ruby",
+        "uv",
+        "uvx",
+        "ccc",
+    }
+)
+
+
+def _is_generic_executable(base: str) -> bool:
+    """True when *base* names an interpreter/multi-purpose binary, not a hook."""
+    return base in _GENERIC_EXECUTABLES or base.startswith("python")
+
+
+def _command_tokens(command: str) -> set[str]:
+    """Match tokens for one hook command: every path-looking word plus its basename."""
+    tokens: set[str] = set()
+    for raw in command.split():
+        word = raw.strip("\"'`()[]{},").strip()
+        if len(word) < _MIN_TOKEN_LEN or word in _TOKEN_NOISE or "/" not in word:
+            continue
+        base = word.rsplit("/", 1)[-1].lower()
+        if _is_generic_executable(base):
+            continue
+        tokens.add(word.lower())
+        if len(base) >= _MIN_TOKEN_LEN:
+            tokens.add(base)
+    return tokens
+
+
+def stop_hook_tokens(cwd: str) -> set[str]:
+    """Match tokens for the FOREIGN ``Stop`` hook commands of every scope ccc can READ.
+
+    Those are the account's ``settings.json`` (:func:`install.settings_path`) plus, when
+    *cwd* is a real directory, ``<cwd>/.claude/settings.json`` and
+    ``<cwd>/.claude/settings.local.json``.
+
+    **ccc's own two Stop entries are deliberately excluded.** They already carry ``hook`` in
+    their command line, so :func:`drain_state`'s substring over-match covers them anyway —
+    what they must never contribute is the bare ``…/bin/ccc`` path, because that binary is
+    MULTI-PURPOSE: the status line alone spawns ``ccc statusline`` / ``ccc aim`` as children
+    of the observed ``claude`` every few seconds, and a token matching every ccc invocation
+    would report a Stop chain as perpetually RUNNING — no two clean scans, so ``close-now``
+    and ``switch-now`` would time out and refuse forever.
+
+    A best-effort observation aid, never a correctness boundary: Claude Code also merges
+    hooks from **plugin** and **managed** scopes that live in no file ccc reads (verified on
+    this machine: an enabled ``codex`` plugin registers a ``Stop`` hook ``node
+    "${CLAUDE_PLUGIN_ROOT}/scripts/stop-review-gate-hook.mjs"``), and such a scope is
+    covered only by :func:`drain_state`'s ``hook`` substring over-match. The guarantee that
+    a peer cannot edit a file mid-commit comes from the Stop lease
+    (:meth:`command_center.store.Store.protect_locks`), not from this function.
+
+    Never raises: an unreadable or invalid settings file contributes nothing.
+    """
+    from pathlib import Path  # pylint: disable=import-outside-toplevel
+
+    from . import install  # pylint: disable=import-outside-toplevel
+
+    is_ccc = install._ccc_hook_arg  # pylint: disable=protected-access
+    scopes: list[dict] = [install.load_settings()]
+    try:
+        project = Path(cwd) if cwd else None
+        if project is not None and project.is_dir():
+            scopes.append(install.load_settings(project / ".claude" / "settings.json"))
+            scopes.append(install.load_settings(project / ".claude" / "settings.local.json"))
+    except OSError:
+        pass
+    tokens: set[str] = set()
+    for settings in scopes:
+        for _event, _matcher, command in install.hook_entries(settings, "Stop"):
+            if is_ccc(command) is None:  # foreign only — never the ccc binary's own path
+                tokens |= _command_tokens(command)
+    return tokens
+
+
+def drain_state(
+    pid: int, table: dict[int, Any], tokens: set[str], exclude: set[int]
+) -> tuple[str, list[str]]:
+    """Has *pid*'s Stop-hook chain drained? ``(state, still-running command lines)``.
+
+    ``DRAIN_UNKNOWN`` is returned whenever the OBSERVATION failed rather than the chain
+    being quiet: an empty *table* (``snapshot.read_ps`` returns ``{}`` on ANY failure, so
+    an empty table is a failed pass, never proof of quiet), a non-positive *pid*, a *pid*
+    absent from the table, or a *pid* that is no longer a ``claude`` process. Otherwise
+    every descendant of *pid* is walked and counts as a live hook when its command line
+    holds ``hook`` (the deliberate over-match :func:`live_hook_children` uses) or any token
+    of *tokens* (:func:`stop_hook_tokens`); pids in *exclude* — the caller's own branch,
+    see :func:`own_branch_pids` — are skipped, their children are not.
+
+    Best effort by construction: hooks contributed by Claude Code **plugins** or by a
+    managed-settings file appear in no file ccc reads, so they are covered only by the
+    ``hook`` over-match, and a foreign wrapper naming neither can be missed. The two
+    callers therefore treat anything but ``DRAIN_DRAINED`` as "do not kill"; the files
+    themselves are protected by the Stop lease, not by this predicate.
+    """
+    if not table or pid <= 0 or pid not in table or not pid_is_claude(pid, table):
+        return DRAIN_UNKNOWN, []
+    children: dict[int, list[int]] = {}
+    for child, row in table.items():
+        children.setdefault(row.ppid, []).append(child)
+    running: list[str] = []
+    stack = list(children.get(pid, []))
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        row = table.get(current)
+        if row is None:
+            continue
+        stack.extend(children.get(current, []))
+        if current in exclude:
+            continue
+        command = row.command.lower()
+        if "hook" in command or any(token in command for token in tokens):
+            running.append(row.command)
+    return (DRAIN_RUNNING, running) if running else (DRAIN_DRAINED, [])
+
+
+def own_branch_pids(pid: int, table: dict[int, Any]) -> set[int]:
+    """This process's own ancestor chain beneath *pid* (what a drain scan must ignore).
+
+    ``ccc close-now`` / ``ccc switch-now`` run inside the very process tree they observe
+    (spawned by the Stop hook whose chain they wait out), so their own branch would look
+    like a hook that never finishes. Walked from ``os.getpid()`` up the ``ppid`` links and
+    stopped at *pid*, at init, or at the first pid the table does not know — and taken from
+    a FRESH *table* by every caller on every scan, never cached, so a recycled pid can
+    never stale the exclusion (identity is the snapshot the row came from).
+    """
+    chain: set[int] = set()
+    if pid <= 0:
+        return chain
+    current = os.getpid()
+    while current > 1 and current != pid and current not in chain:
+        row = table.get(current)
+        if row is None:
+            break
+        chain.add(current)
+        current = row.ppid
+    return chain
 
 
 # Only shells that execute the POSIX relaunch line (`export`, `&&`, `( … )`) as typed:

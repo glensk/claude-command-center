@@ -74,18 +74,24 @@ from .store import Store
 if TYPE_CHECKING:  # pragma: no cover - pathlib stays a local import at runtime
     from pathlib import Path
 
-# Seconds `ccc close-now` waits before reaping/closing, so the render + the rest of the
-# Stop-hook chain (auto-commit) settle first. Module-level so tests can monkeypatch it.
+# Seconds `ccc close-now` waits before reaping/closing when the Stop barrier is OFF
+# (`stop_barrier_enabled = false`, the escape hatch for a machine whose `ps` cannot be
+# read): a bare settle, which proves nothing about the Stop chain. With the barrier on,
+# close-now waits for the chain to look DRAINED instead (`_wait_for_stop_drain`) and
+# refuses to signal anything when it cannot tell. Module-level so tests can monkeypatch it.
 _CLOSE_NOW_SETTLE_SEC = 2.0
+# Seconds between two drain scans (`_wait_for_stop_drain`), and the render grace taken
+# after a proven drain, before the SIGTERM.
+_DRAIN_POLL_SEC = 1.0
+_CLOSE_NOW_RENDER_SEC = 0.5
 # `ccc switch-now`: how long to wait for the SIGTERM'd Claude to actually exit before
 # typing the relaunch into its tab (typing earlier would feed Claude's composer), and the
 # poll interval. A process still alive at the deadline aborts the relaunch (logged).
 _SWITCH_EXIT_WAIT_SEC = 20.0
 _SWITCH_POLL_SEC = 0.25
-# … how long that Claude's Stop-hook chain may still be running before the switch gives
-# up (auto-commit + linters + scans can take a minute), and how long the tab's tty may
-# take to return to a shell prompt once the process is gone.
-_SWITCH_HOOK_WAIT_SEC = 180.0
+# … and how long the tab's tty may take to return to a shell prompt once the process is
+# gone. How long the Stop-hook chain may still be running before the switch gives up is
+# `stop_barrier_wait_sec` — the same window the lock lease covers.
 # `switch-account -N` inside the session: a registry "busy" younger than this, with no turn
 # visible in the transcript, is the prompt being expanded right now — not a turn to protect.
 _SWITCH_PROMPT_BUSY_MS = 15_000
@@ -730,7 +736,14 @@ def cmd_lock_release(args: argparse.Namespace) -> int:
 
 
 def cmd_locks(args: argparse.Namespace) -> int:
-    """List every active (live holder + non-stale) cross-session file lock."""
+    """List every cross-session file lock that currently DENIES an edit.
+
+    Two kinds: an ordinary lock (live holder, not past ``file_lock_ttl_sec``) and a row
+    under the Stop LEASE — ``protected_until`` still in the future, so the turn ended and
+    the session's files may still be being committed. A leased row is listed even when its
+    holder is gone or its TTL stale (it still denies acquisition) and carries the moment it
+    frees itself, so ``ccc locks`` can never show "no lock" while an edit is refused.
+    """
     from datetime import datetime
 
     from .models import short_id
@@ -750,7 +763,11 @@ def cmd_locks(args: argparse.Namespace) -> int:
             if lock.acquired_at
             else "—"
         )
-        print(f"  {short_id(lock.session_id)}  since {held}  {lock.file_path}")
+        lease = ""
+        if lock.protected_until > now:
+            frees_in = max(1, round((lock.protected_until - now) / 1000))
+            lease = f"  (committing — frees in {frees_in}s)"
+        print(f"  {short_id(lock.session_id)}  since {held}  {lock.file_path}{lease}")
     return 0
 
 
@@ -1041,17 +1058,129 @@ def cmd_mark_done(args: argparse.Namespace) -> int:
     return 0
 
 
+def _live_session_pid(session_id: str) -> int:
+    """PID of the FIRST live, non-conflicting registry entry for *session_id* (0 = none).
+
+    Never raises: a registry that cannot be read answers "no pid", which every caller
+    treats as "nothing to reap" (and ``close-now`` as a reason to close NOTHING).
+    """
+    try:
+        for live in _adapter().discover():
+            if live.session_id != session_id or not live.alive or live.conflict:
+                continue
+            return live.pid if live.pid > 0 else 0
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return 0
+    return 0
+
+
+def _notify_close_now(message: str) -> None:
+    """Best-effort desktop notification for a close-after-turn that was refused."""
+    try:
+        from . import notify
+
+        notify.notify("ccc mark-done --close", message, config.load_config().notify)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        pass
+
+
+def _command_names(commands: list[str]) -> list[str]:
+    """Short, de-duplicated names for *commands* — the readable half of a refusal reason."""
+    from . import install  # lazy: never on the hot spawn path
+
+    names: dict[str, None] = {}
+    for command in commands:
+        name = install.hook_command_name(command)
+        if name:
+            names[name] = None
+    return list(names)
+
+
+def _close_now_abort(session_id: str, reason: str) -> int:
+    """Refuse a close: log it, notify, and leave BOTH the process and the tab alive."""
+    from . import hooks
+
+    detail = f"{reason} — NOT closed"
+    hooks._log_event(session_id, "close-now", detail)  # pylint: disable=protected-access
+    print(f"close-now: {detail}", file=sys.stderr)
+    _notify_close_now(
+        f"{session_id[:8]}: {reason}. Close it by hand: "
+        f"ccc mark-done --close --session {session_id}"
+    )
+    return 1
+
+
+def _sigterm(pid: int) -> bool:
+    """SIGTERM *pid*; ``False`` when it was already gone (or not ours to signal)."""
+    import signal
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    return True
+
+
+def _close_now_reap(session_id: str, pid: int, cfg: config.Config) -> tuple[str, bool]:
+    """Wait out *pid*'s Stop chain, then reap it — ``(refusal reason, reaped)``.
+
+    An empty reason means the close may proceed. FAIL-CLOSED: an unbindable pid, a timeout
+    with hooks still running, an unobservable chain, or an identity that changed during the
+    wait each return a reason and signal NOTHING. The identity re-check runs on a FRESH
+    snapshot immediately before the SIGTERM, so a pid recycled during a minutes-long wait is
+    never signalled.
+    """
+    import time
+
+    from . import terminal
+
+    if pid <= 0:
+        return "no live Claude pid (neither --pid nor registry)", False
+    with Store() as store:
+        bound = store.get(session_id)
+    started = terminal.pid_start(pid)
+    state, running = _wait_for_stop_drain(
+        pid,
+        (bound.cwd if bound else "") or "",
+        cfg.stop_barrier_wait_sec,
+        cfg.stop_barrier_settle_sec,
+    )
+    if state == terminal.DRAIN_RUNNING:
+        names = ", ".join(_command_names(running)) or "unnamed hook process(es)"
+        return f"Stop hooks still running after {cfg.stop_barrier_wait_sec}s: {names}", False
+    if state != terminal.DRAIN_DRAINED:
+        return "the Stop chain could not be observed (ps unreadable or pid gone)", False
+    time.sleep(_CLOSE_NOW_RENDER_SEC)  # let the tab render the turn's last output
+    table = terminal.ps_table()
+    if not terminal.pid_is_claude(pid, table) or terminal.pid_start(pid) != started:
+        return f"pid {pid} is no longer this session's claude after the Stop wait", False
+    return "", _sigterm(pid)
+
+
 def cmd_close_now(args: argparse.Namespace) -> int:
-    """Internal: SIGTERM the session's Claude process, then close its terminal pane/tab.
+    """Internal: wait out the Stop chain, then SIGTERM the session's Claude and close its tab.
 
     Spawned detached by the ``release-locks`` Stop hook once a ``mark-done --close`` request
-    is claimed. Best-effort at every step and NEVER raises: it settles briefly (so the
-    render + the rest of the Stop chain, incl. auto-commit, finish), reaps a FRESH matching
-    Claude PID, then closes the hosting tmux pane (first match) or the iTerm pane/tab — the
-    latter only on fresh evidence (a hook-supplied ``--iterm`` id, or a live PID reaped this
-    run), never on stale-store-only evidence.
+    is claimed. Claude Code runs every hook of one event in PARALLEL, so nothing here can be
+    ordered "after the auto-commit": this command WAITS for the session's Stop-hook chain to
+    look drained (:func:`_wait_for_stop_drain`, bounded by ``stop_barrier_wait_sec``) and is
+    FAIL-CLOSED — a timeout with hooks still running, an unobservable state, a pid it cannot
+    resolve, or a pid whose identity changed during the wait each leave the process AND the
+    tab alive with an ``events.log`` line, a desktop notification and exit 1. "Close after
+    this turn" is not authorization to kill an unfinished commit. The file locks are leased
+    across that window anyway (:meth:`command_center.store.Store.protect_locks`), so even a
+    kill that does land mid-commit cannot hand a half-written file to a peer.
+
+    ``--pid`` is the hook's ``$CLAUDE_PID``; without it the single live registry entry for
+    the session is used. Identity (still ``claude``, same start time) is re-verified on a
+    FRESH snapshot immediately before the SIGTERM, so a recycled pid is never signalled.
+    With ``stop_barrier_enabled = false`` the pre-lease behaviour is kept verbatim — a short
+    settle, then reap + close — as the escape hatch on a machine whose ``ps`` cannot be read.
+
+    Never raises. The terminal close is best-effort: the hosting tmux pane (first match) or
+    the iTerm pane/tab, the latter only on fresh evidence (a hook-supplied ``--iterm`` id, or
+    a live PID reaped this run), never on stale-store-only evidence.
     """
-    import signal
     import subprocess
     import time
 
@@ -1060,25 +1189,22 @@ def cmd_close_now(args: argparse.Namespace) -> int:
     session_id = args.session
     if not session_id:
         return 0
-    time.sleep(_CLOSE_NOW_SETTLE_SEC)
-    reaped_pid = False
-    # (1) Reap a fresh, matching, non-conflicting live Claude PID.
-    try:
-        for live in _adapter().discover():
-            if live.session_id != session_id or not live.alive or live.conflict:
-                continue
-            if live.pid > 0:
-                try:
-                    os.kill(live.pid, signal.SIGTERM)
-                    reaped_pid = True
-                except OSError:
-                    pass
-            break
-    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-        pass
+    cfg = config.load_config()
+    if not cfg.stop_barrier_enabled:
+        # (1) Escape hatch: the pre-lease blind settle, then reap what the registry names.
+        time.sleep(_CLOSE_NOW_SETTLE_SEC)
+        pid = _live_session_pid(session_id)
+        reaped_pid = pid > 0 and _sigterm(pid)
+    else:
+        # (2) Bind the process (the hook's $CLAUDE_PID, else the live registry entry), wait
+        #     for its Stop chain and reap it — or refuse and touch nothing.
+        pid = int(getattr(args, "pid", 0) or 0) or _live_session_pid(session_id)
+        reason, reaped_pid = _close_now_reap(session_id, pid, cfg)
+        if reason:
+            return _close_now_abort(session_id, reason)
     with Store() as store:
         session = store.get(session_id)
-    # (2) Terminal close, first match wins. (a) tmux pane.
+    # (3) Terminal close, first match wins. (a) tmux pane.
     try:
         located = terminal.tmux_pane_for_session(session_id)
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
@@ -1156,6 +1282,57 @@ def _wait_until(predicate: Callable[[], bool], timeout: float, poll: float | Non
         if time.monotonic() >= deadline:
             return False
         time.sleep(_SWITCH_POLL_SEC if poll is None else poll)
+
+
+def _wait_for_stop_drain(
+    pid: int, cwd: str, wait_sec: float, settle_sec: float
+) -> tuple[str, list[str]]:
+    """Wait until *pid*'s Stop-hook chain looks drained: ``(state, still-running commands)``.
+
+    The shared waiter of the two DESTRUCTIVE paths (``close-now`` / ``switch-now``), which
+    must decide when to kill a process. Every scan takes a FRESH ``ps`` table, recomputes
+    the caller's own branch from it (:func:`terminal.own_branch_pids` — never a cached pid
+    identity) and asks :func:`terminal.drain_state`. ``terminal.DRAIN_DRAINED`` is returned
+    only after TWO consecutive clean scans at least *settle_sec* apart, so a hook sibling
+    that had not been spawned yet when the first scan ran is still caught; an
+    ``DRAIN_UNKNOWN`` scan (``ps`` unreadable, pid gone) resets that counter and the poll
+    continues. On expiry of *wait_sec* the LAST observed state comes back with the commands
+    still seen — and a single unconfirmed clean scan is downgraded to ``DRAIN_UNKNOWN``,
+    because one scan is not proof of a drain.
+
+    This is a best-effort observation, NOT the correctness boundary: plugin- and
+    managed-scope hooks are invisible to it. It exists so a close/switch does not kill a
+    Claude process while its Stop hooks are still committing; the files themselves are
+    protected by the Stop lease (:meth:`command_center.store.Store.protect_locks`), which
+    is why "cannot tell" here means "do not kill" and never "release a lock".
+    """
+    import time
+
+    from . import terminal
+
+    tokens = terminal.stop_hook_tokens(cwd)
+    deadline = time.monotonic() + wait_sec
+    state: str = terminal.DRAIN_UNKNOWN
+    running: list[str] = []
+    clean_since: float | None = None
+    while True:
+        table = terminal.ps_table()
+        state, running = terminal.drain_state(
+            pid, table, tokens, terminal.own_branch_pids(pid, table)
+        )
+        now = time.monotonic()
+        if state == terminal.DRAIN_DRAINED:
+            if clean_since is not None and now - clean_since >= settle_sec:
+                return state, []
+            if clean_since is None:
+                clean_since = now
+        else:
+            clean_since = None
+        if time.monotonic() >= deadline:
+            if state == terminal.DRAIN_DRAINED:  # clean, but never confirmed by a 2nd scan
+                return terminal.DRAIN_UNKNOWN, []
+            return state, running
+        time.sleep(_DRAIN_POLL_SEC)
 
 
 def _wait_pid_gone(pid: int, timeout: float) -> bool:
@@ -1260,11 +1437,13 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     """``ccc switch-account <label>`` — relaunch this session under another account, same tab.
 
     Arms a one-shot relaunch-after-turn (the twin of ``mark-done --close``): the
-    release-locks Stop hook claims it once the turn — auto-commit included — is over and
-    spawns ``switch-now``, which terminates this Claude after its Stop chain, waits for
-    the shell to come back and types ``claude --resume <id>`` into this very tab under
-    the target account's env pin. The conversation continues; only the billing seat
-    changes. With ``-p/--prompt`` that resume carries a prompt (bare ``-p`` =
+    release-locks Stop hook claims it when the turn ends and spawns ``switch-now``, which
+    waits for this Claude's Stop-hook chain to look DRAINED (same-event hooks run in
+    parallel, so nothing can be ordered after a foreign auto-commit — and a state it cannot
+    observe refuses the kill), terminates the process, waits for the shell to come back and
+    types ``claude --resume <id>`` into this very tab under the target account's env pin.
+    The conversation continues; only the billing seat changes. With ``-p/--prompt`` that
+    resume carries a prompt (bare ``-p`` =
     :data:`SWITCH_CONTINUE_PROMPT`), so the relaunched session picks the work back up by
     itself instead of parking at an idle composer. ``-K`` decides that from the session's
     own state instead — ``continue`` only when its work was really interrupted (see
@@ -1672,8 +1851,9 @@ def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     sits on this tab's tty), no other live process owns the id, no background work is
     pending (unless the arm was ``--force``d), the target is still the logged-in
     identity it was armed for and still trusts the cwd, the source and target
-    transcript paths are the SAME file, the Stop-hook chain has finished, the process
-    is gone and the tab's tty is back at a POSIX shell prompt. Anything else aborts
+    transcript paths are the SAME file, the Stop-hook chain has been OBSERVED drained
+    (an unobservable state aborts — see :func:`_wait_for_stop_drain`), the process is gone
+    and the tab's tty is back at a POSIX shell prompt. Anything else aborts
     with a log line and a desktop notification carrying the manual command; nothing is
     typed into a tab whose owner is unknown, and no new tab is opened.
 
@@ -1804,14 +1984,18 @@ def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     invalid = target_still_valid()
     if invalid:
         return fail(invalid)
-    # (6) The Stop chain (auto-commit, linters, scans) must be over before the kill.
+    # (6) The Stop chain (auto-commit, linters, scans) must be over before the kill. The
+    # shared tri-state predicate: only a PROVEN drain may proceed — "cannot tell" aborts.
+    cfg = config.load_config()
     started = terminal.pid_start(pid)
-    if not _wait_until(
-        lambda: not terminal.live_hook_children(pid, terminal.ps_table()),
-        _SWITCH_HOOK_WAIT_SEC,
-        poll=1.0,
-    ):
-        return fail(f"Stop hooks still running after {_SWITCH_HOOK_WAIT_SEC:.0f}s")
+    state, running = _wait_for_stop_drain(
+        pid, cwd, cfg.stop_barrier_wait_sec, cfg.stop_barrier_settle_sec
+    )
+    if state != terminal.DRAIN_DRAINED:
+        if state == terminal.DRAIN_RUNNING:
+            names = ", ".join(_command_names(running)) or "unnamed hook process(es)"
+            return fail(f"Stop hooks still running after {cfg.stop_barrier_wait_sec}s ({names})")
+        return fail("the Stop chain could not be observed (ps unreadable or pid gone)")
     # (6b) That wait can be long: re-bind on a FRESH snapshot before signalling — the same
     # process (same start time, still claude, still on this tty), still the only live
     # owner of the id, the target still valid.
@@ -4800,6 +4984,13 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_closenow.add_argument(
         "-i", "--iterm", default="", help="the fresh $ITERM_SESSION_ID to close (hook-supplied)"
     )
+    p_closenow.add_argument(
+        "-p",
+        "--pid",
+        type=int,
+        default=0,
+        help="the hook's $CLAUDE_PID; the process to reap (fail closed when it no longer matches)",
+    )
     p_closenow.set_defaults(func=cmd_close_now)
 
     p_switch = sub.add_parser(
@@ -5423,7 +5614,8 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         help="merge ccc's hook wiring into $CLAUDE_HOME/settings.json (idempotent)",
         description=(
             "Install (or update) the Claude Code hook entries ccc owns — SessionStart, "
-            "UserPromptSubmit, Pre/PostToolUse, Stop (+ release-locks last), SessionEnd, "
+            "UserPromptSubmit, Pre/PostToolUse, Stop (+ release-locks, appended last — "
+            "cosmetic: same-event hooks run in parallel), SessionEnd, "
             "PreCompact, SubagentStart, SubagentStop — as `<ccc> hook <event>` commands. "
             "Idempotent: a rerun replaces ccc's own entries in place and never touches "
             "foreign hooks. REFUSES (exit 1, nothing written) when a foreign hook already "

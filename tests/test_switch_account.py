@@ -229,10 +229,18 @@ def _prepare_now(
     for name, value in (
         ("_SWITCH_POLL_SEC", 0.0),
         ("_SWITCH_EXIT_WAIT_SEC", 0.05),
-        ("_SWITCH_HOOK_WAIT_SEC", 0.05),
         ("_SWITCH_READY_WAIT_SEC", 0.05),
+        ("_DRAIN_POLL_SEC", 0.0),
     ):
         monkeypatch.setattr(cli, name, value)
+    # The Stop-chain wait is the shared tri-state predicate now; it is exercised for real
+    # in tests/test_terminal.py, so here only its VERDICT is stubbed (DRAINED = proceed).
+    cfg = config.load_config()
+    cfg.stop_barrier_wait_sec, cfg.stop_barrier_settle_sec = 1, 0
+    config.save_config(cfg)
+    monkeypatch.setattr(terminal, "stop_hook_tokens", lambda _cwd: set())
+    monkeypatch.setattr(terminal, "own_branch_pids", lambda _pid, _table: set())
+    monkeypatch.setattr(terminal, "drain_state", lambda *_args: (terminal.DRAIN_DRAINED, []))
     monkeypatch.setattr("time.sleep", lambda _seconds: None)
     monkeypatch.setattr(terminal, "ps_table", lambda: {})
     monkeypatch.setattr(terminal, "iterm_session_tty", lambda _sid: TTY)
@@ -241,7 +249,6 @@ def _prepare_now(
     monkeypatch.setattr(terminal, "pid_tty", lambda _pid, _table: TTY)
     monkeypatch.setattr(terminal, "pid_start", lambda _pid: START)
     monkeypatch.setattr(terminal, "pid_descends_from", lambda *_args: True)
-    monkeypatch.setattr(terminal, "live_hook_children", lambda *_args: [])
     monkeypatch.setattr(terminal, "tty_ready_for_input", lambda *_args: True)
     monkeypatch.setattr(cli, "_background_work", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
@@ -1232,10 +1239,26 @@ def test_switch_now_waits_out_the_stop_hook_chain_before_the_kill(
 ) -> None:
     """Hook children that never finish (auto-commit, linters) time out instead of being cut off."""
     env = _prepare_now(tmp_path, monkeypatch, two_accounts)
-    monkeypatch.setattr(terminal, "live_hook_children", lambda *_args: ["run-stop-hook.sh"])
+    monkeypatch.setattr(
+        cli,
+        "_wait_for_stop_drain",
+        lambda *_args: (terminal.DRAIN_RUNNING, ["/bin/zsh /me/.claude/run-stop-hook.sh"]),
+    )
     assert cli.cmd_switch_now(env.args) == 1
     assert env.kill.signals == []
     assert env.notes and "Stop hooks still running" in env.notes[0]
+    assert "run-stop-hook.sh" in env.notes[0]
+
+
+def test_switch_now_refuses_when_the_stop_chain_cannot_be_observed(
+    tmp_path: Path, two_accounts: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UNKNOWN (an unreadable ps, a pid that vanished) is fail-closed: nothing is signalled."""
+    env = _prepare_now(tmp_path, monkeypatch, two_accounts)
+    monkeypatch.setattr(cli, "_wait_for_stop_drain", lambda *_args: (terminal.DRAIN_UNKNOWN, []))
+    assert cli.cmd_switch_now(env.args) == 1
+    assert env.kill.signals == []
+    assert env.notes and "could not be observed" in env.notes[0]
 
 
 def test_switch_now_refuses_a_pid_recycled_during_the_hook_wait(
@@ -1437,7 +1460,8 @@ def test_pid_is_claude_matches_only_a_known_claude_command() -> None:
 
 
 def test_live_hook_children_finds_hook_processes_but_not_mcp_servers() -> None:
-    """A Stop turn is over when no hook-looking descendant remains; MCP servers never count."""
+    """The plain substring probe (no caller in ccc since tp#225; ``drain_state`` builds on it):
+    a hook-looking descendant is found, an MCP server never counts."""
     found = terminal.live_hook_children(200, _ps_table())
     assert found == ["/bin/bash /Users/x/.claude/hooks/run-stop-hook.sh"]
     assert terminal.live_hook_children(300, _ps_table()) == []

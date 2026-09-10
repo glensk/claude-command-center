@@ -291,11 +291,16 @@ CREATE TABLE IF NOT EXISTS subgoal_history (
     drift_json     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_subgoal_history_session ON subgoal_history(session_id);
+-- Cross-session advisory file locks. `protected_until` is the Stop-time LEASE (epoch ms):
+-- the Stop hook stamps the session's rows instead of deleting them, because Claude Code runs
+-- the hooks of one event in PARALLEL and a foreign auto-commit hook may still be committing
+-- those files. A leased row is unacquirable by any peer until the stamp expires (0 = none).
 CREATE TABLE IF NOT EXISTS file_locks (
-    file_path    TEXT    PRIMARY KEY,
-    session_id   TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-    acquired_at  INTEGER NOT NULL DEFAULT 0,
-    refreshed_at INTEGER NOT NULL DEFAULT 0
+    file_path       TEXT    PRIMARY KEY,
+    session_id      TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    acquired_at     INTEGER NOT NULL DEFAULT 0,
+    refreshed_at    INTEGER NOT NULL DEFAULT 0,
+    protected_until INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_file_locks_session ON file_locks(session_id);
 CREATE TABLE IF NOT EXISTS file_lock_waiters (
@@ -579,6 +584,11 @@ class Store:  # pylint: disable=too-many-public-methods
     _ADDED_TRANSCRIPT_SCAN_COLUMNS = {
         "headless": "INTEGER",
     }
+    # Same, for the file_locks table. 0 = no Stop-time lease, which is what every row
+    # written before the column existed correctly means (see :meth:`protect_locks`).
+    _ADDED_FILE_LOCK_COLUMNS = {
+        "protected_until": "INTEGER NOT NULL DEFAULT 0",
+    }
 
     def _add_column(self, table: str, column: str, decl: str) -> None:
         """``ALTER TABLE`` *table* to add *column*, tolerating a peer that just did it.
@@ -616,6 +626,10 @@ class Store:  # pylint: disable=too-many-public-methods
         for column, decl in self._ADDED_TRANSCRIPT_SCAN_COLUMNS.items():
             if column not in ts_existing:
                 self._add_column("transcript_scan", column, decl)
+        fl_existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(file_locks)")}
+        for column, decl in self._ADDED_FILE_LOCK_COLUMNS.items():
+            if column not in fl_existing:
+                self._add_column("file_locks", column, decl)
         # Partial index for the armed-fire scan (statusline chip + daemon dispatch).
         # Created HERE, not in _SCHEMA: an old DB only gains fire_at via the ALTER
         # loop above, and an index referencing a missing column would fail the open.
@@ -686,6 +700,12 @@ class Store:  # pylint: disable=too-many-public-methods
         the transcript the deleted row was scanned from. ``mirror_vouch`` is keyless for
         the same reason and goes with it: a stale vouch must never speak for a file a
         re-created session id would write.
+
+        **The one exception to the Stop-time lease:** ``file_locks.session_id`` is
+        ``ON DELETE CASCADE``, so deleting a session row also erases its PROTECTED locks,
+        bypassing the SessionEnd rule in :meth:`release_unprotected_file_locks`. That is
+        deliberate — deleting a session row is an explicit operator action, not the
+        automatic end of a turn.
         """
         self.conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         self.conn.execute("DELETE FROM transcript_scan WHERE session_id = ?", (session_id,))
@@ -693,7 +713,11 @@ class Store:  # pylint: disable=too-many-public-methods
         self.conn.commit()
 
     def delete_many(self, session_ids: Iterable[str]) -> int:
-        """Remove several sessions (sub-goals, scans, vouches); return the count deleted."""
+        """Remove several sessions (sub-goals, scans, vouches); return the count deleted.
+
+        Carries the same ``ON DELETE CASCADE`` exception as :meth:`delete`: the sessions'
+        PROTECTED file locks go with them, bypassing the Stop-time lease.
+        """
         ids = [(sid,) for sid in session_ids]
         if not ids:
             return 0
@@ -1852,31 +1876,52 @@ class Store:  # pylint: disable=too-many-public-methods
 
         Returns ``None`` when the caller now holds it — freshly taken, reclaimed from an
         invalid holder, or already held by the caller (TTL refreshed). Otherwise returns the
-        **live** holder's session id (contention; the caller must queue/wait).
+        holder's session id (contention; the caller must queue/wait).
 
-        A held lock is honoured only when its holder is in *live_ids* AND fresh
-        (``now - refreshed_at < ttl_ms``); a stale or dead-holder row is reclaimed. The
-        check-then-write runs inside ``BEGIN IMMEDIATE`` so concurrent acquirers from other
+        Four branches, in this order:
+
+        1. **Ours** (or no row at all) → upsert: take/refresh it and clear
+           ``protected_until`` — an edit means a NEW turn started on that file, so any lease
+           the previous one left is void.
+        2. **Someone else's, ``protected_until > now``** → DENY, whatever the holder's
+           liveness and whatever the TTL. Its turn is over but a foreign Stop hook may still
+           be committing those bytes (the lease :meth:`protect_locks` stamps).
+        3. **Someone else's, ``0 < protected_until <= now``** → RECLAIM, again whatever the
+           liveness and the TTL: an expired lease means the turn finished and nobody
+           released the row. Load-bearing — without it a leased row would then sit under the
+           1800 s ``file_lock_ttl_sec`` instead of the ~180 s lease.
+        4. **Someone else's, ``protected_until == 0``** → the ordinary rule, unchanged: the
+           lock is honoured only while its holder is in *live_ids* AND fresh
+           (``now - refreshed_at < ttl_ms``); a stale or dead-holder row is reclaimed.
+
+        The check-then-write runs inside ``BEGIN IMMEDIATE`` so concurrent acquirers from other
         processes serialise (one wins, the rest see contention) rather than both "winning".
         """
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             row = self.conn.execute(
-                "SELECT session_id, refreshed_at FROM file_locks WHERE file_path = ?",
+                "SELECT session_id, refreshed_at, protected_until FROM file_locks "
+                "WHERE file_path = ?",
                 (file_path,),
             ).fetchone()
             if row is not None and row["session_id"] != session_id:
                 holder = str(row["session_id"])
-                fresh = (now - int(row["refreshed_at"])) < ttl_ms
-                if holder in live_ids and fresh:
+                protected_until = int(row["protected_until"] or 0)
+                if protected_until > now:
                     self.conn.commit()
-                    return holder
+                    return holder  # branch 2: leased — a commit may still be reading it
+                if protected_until == 0:  # branch 4: no lease → the liveness/TTL rule
+                    fresh = (now - int(row["refreshed_at"])) < ttl_ms
+                    if holder in live_ids and fresh:
+                        self.conn.commit()
+                        return holder
+                # branch 3 (expired lease) falls through to the upsert.
             # Free, mine, or reclaimable: upsert me as holder (keep acquired_at if already mine).
             self.conn.execute(
-                "INSERT INTO file_locks (file_path, session_id, acquired_at, refreshed_at) "
-                "VALUES (?, ?, ?, ?) "
+                "INSERT INTO file_locks (file_path, session_id, acquired_at, refreshed_at, "
+                "protected_until) VALUES (?, ?, ?, ?, 0) "
                 "ON CONFLICT(file_path) DO UPDATE SET session_id = excluded.session_id, "
-                "refreshed_at = excluded.refreshed_at, acquired_at = CASE "
+                "refreshed_at = excluded.refreshed_at, protected_until = 0, acquired_at = CASE "
                 "WHEN file_locks.session_id = excluded.session_id "
                 "THEN file_locks.acquired_at ELSE excluded.acquired_at END",
                 (file_path, session_id, now, now),
@@ -1911,6 +1956,56 @@ class Store:  # pylint: disable=too-many-public-methods
         self.conn.commit()
         return cur.rowcount
 
+    def protect_locks(self, session_id: str, until_ms: int) -> int:
+        """Lease every lock *session_id* holds until *until_ms*; return how many rows.
+
+        This is the **Stop-time lease**. The Stop hook stamps the session's locks instead of
+        deleting them: Claude Code runs the hooks of one event in PARALLEL, so a foreign
+        auto-commit hook can still be committing this turn's files when the turn ends. A
+        stamped row is unacquirable by any other session (see :meth:`acquire_file_lock`) and
+        it is NOT deleted here — it stays until the stamp expires or the holder edits the
+        file again, which clears it because that is a new turn.
+
+        ``MAX(protected_until, ?)`` keeps it idempotent and monotonic: a second call in the
+        same turn only ever extends the window, never shortens it. The session's own pending
+        waits are cleared, exactly as :meth:`release_all_file_locks` did.
+        """
+        cur = self.conn.execute(
+            "UPDATE file_locks SET protected_until = MAX(protected_until, ?) WHERE session_id = ?",
+            (until_ms, session_id),
+        )
+        self.conn.execute("DELETE FROM file_lock_waiters WHERE session_id = ?", (session_id,))
+        self.conn.commit()
+        return cur.rowcount
+
+    def protection_deadline(self, file_path: str) -> int:
+        """Epoch ms until which *file_path*'s lock is leased to its holder (0 = not leased).
+
+        A deliberately separate read: :meth:`acquire_file_lock` keeps its ``str | None``
+        return, and only the denial path — which must tell the refused peer how long the
+        wait is bounded by — pays for this second query.
+        """
+        row = self.conn.execute(
+            "SELECT protected_until FROM file_locks WHERE file_path = ?", (file_path,)
+        ).fetchone()
+        return int(row["protected_until"] or 0) if row is not None else 0
+
+    def release_unprotected_file_locks(self, session_id: str, now: int) -> int:
+        """Drop *session_id*'s locks except those still leased; return the number released.
+
+        SessionEnd uses this instead of :meth:`release_all_file_locks`: a session that exits
+        must never hand a peer a file its own Stop chain may still be committing, so a row
+        whose ``protected_until`` is still in the future outlives its holder and frees itself
+        when the lease expires. The session's own pending waits go either way.
+        """
+        cur = self.conn.execute(
+            "DELETE FROM file_locks WHERE session_id = ? AND protected_until <= ?",
+            (session_id, now),
+        )
+        self.conn.execute("DELETE FROM file_lock_waiters WHERE session_id = ?", (session_id,))
+        self.conn.commit()
+        return cur.rowcount
+
     def add_waiter(self, session_id: str, file_path: str, now: int) -> None:
         """Record that *session_id* is waiting to edit *file_path* (idempotent)."""
         self.conn.execute(
@@ -1931,17 +2026,29 @@ class Store:  # pylint: disable=too-many-public-methods
         return [FileLockWaiter(r["file_path"], str(r["session_id"]), int(r["since"])) for r in rows]
 
     def list_file_locks(self, live_ids: set[str], ttl_ms: int, now: int) -> list[FileLock]:
-        """Every currently-valid lock (held by a live session, not past its TTL)."""
+        """Every lock that can still refuse an edit, with its lease deadline.
+
+        Two arms: a currently-valid lock (held by a live session, not past its TTL) OR a row
+        under a future ``protected_until`` lease. The second arm matters because such a row
+        denies acquisition whatever its holder's liveness or freshness (see
+        :meth:`acquire_file_lock`) — ``ccc locks`` and the TUI must never show "no lock"
+        while an edit is being refused.
+        """
         rows = self.conn.execute(
-            "SELECT file_path, session_id, acquired_at, refreshed_at FROM file_locks "
-            "ORDER BY refreshed_at"
+            "SELECT file_path, session_id, acquired_at, refreshed_at, protected_until "
+            "FROM file_locks ORDER BY refreshed_at"
         ).fetchall()
         return [
             FileLock(
-                r["file_path"], str(r["session_id"]), int(r["acquired_at"]), int(r["refreshed_at"])
+                r["file_path"],
+                str(r["session_id"]),
+                int(r["acquired_at"]),
+                int(r["refreshed_at"]),
+                int(r["protected_until"] or 0),
             )
             for r in rows
-            if str(r["session_id"]) in live_ids and (now - int(r["refreshed_at"])) < ttl_ms
+            if (str(r["session_id"]) in live_ids and (now - int(r["refreshed_at"])) < ttl_ms)
+            or int(r["protected_until"] or 0) > now
         ]
 
     def set_subgoal_checked(self, subgoal_id: int, checked: bool) -> None:

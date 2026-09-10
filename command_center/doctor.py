@@ -45,6 +45,19 @@ from .models import MirrorHealth
 OK, FAIL, NA = "ok", "fail", "na"
 _SYMBOL = {OK: "✅", FAIL: "❌", NA: "−"}
 
+#: Claude Code's own hook timeout when an entry declares none (seconds). A Stop hook may
+#: therefore run this long even where settings.json says nothing at all.
+CLAUDE_HOOK_DEFAULT_TIMEOUT_SEC = 60
+#: The managed-settings file an administrator can deploy — a hook scope ccc can neither
+#: read nor enumerate. Module-level so tests can point them somewhere hermetic.
+_MANAGED_SETTINGS_DARWIN = Path("/Library/Application Support/ClaudeCode/managed-settings.json")
+_MANAGED_SETTINGS_POSIX = Path("/etc/claude-code/managed-settings.json")
+
+
+def _managed_settings_path() -> Path:
+    """Where a managed-settings file would live on this platform."""
+    return _MANAGED_SETTINGS_DARWIN if sys.platform == "darwin" else _MANAGED_SETTINGS_POSIX
+
 
 @dataclass
 class Check:
@@ -125,7 +138,7 @@ def _section_wiring() -> Section:
         )
     else:
         section.checks.append(Check(FAIL, "statusline wired", "none — run ccc install-statusline"))
-    section.checks.append(_stop_order_check(settings))
+    section.checks.append(_stop_hook_timeout_coverage_check(settings))
     return section
 
 
@@ -189,29 +202,105 @@ def _duplicate_hook_path_check(settings: dict) -> Check:
     return Check(OK, label, "none — ccc's entries are the only path to `ccc hook`")
 
 
-def _stop_order_check(settings: dict) -> Check:
-    """WARN when ccc's ``release-locks`` Stop hook is not the LAST Stop entry.
+def _stop_coverage_blocker(
+    settings: dict, details: list[tuple[str, str | None, str, int | None, str]]
+) -> str:
+    """Why the Stop-hook timeout coverage cannot be PROVEN COMPLETE — ``""`` when it can.
 
-    close-after-done + lock-release must run AFTER foreign Stop hooks (e.g. the user's
-    auto-commit) so this turn's work is committed before the pane/tab closes and the locks
-    drop. Install enforces this; a later foreign append can break it — this guards that.
-    Recognised via the same matcher install.py uses for ccc-owned entries.
+    Three ways to be blind: a Stop entry that is not a readable ``command``, an enabled
+    plugin (its hooks live in the plugin's own ``hooks.json`` — measured: the
+    ``openai-codex`` plugin registers a ``Stop`` hook), or a managed-settings file. The
+    returned reason is a bare clause, composed by the caller — because being blind to ONE
+    scope never makes a readable, over-long hook safe: an unreadable scope can only push the
+    true maximum HIGHER, so a FAIL from the readable scopes still stands and is reported.
     """
-    commands = install.hook_commands(settings, "Stop")
-    positions = [
-        i
-        for i, cmd in enumerate(commands)
-        if install._ccc_hook_arg(cmd) == "release-locks"  # pylint: disable=protected-access
+    unreadable = [d for d in details if d[4] != "command" or not d[2].strip()]
+    if unreadable:
+        count = len(unreadable)
+        return (
+            f"{count} Stop {'entry' if count == 1 else 'entries'} ccc cannot read "
+            "(not a command entry / empty command)"
+        )
+    plugins = settings.get("enabledPlugins")
+    if isinstance(plugins, dict) and plugins:
+        count = len(plugins)
+        return (
+            f"{count} enabled {'plugin' if count == 1 else 'plugins'} may add Stop hooks "
+            "ccc cannot read"
+        )
+    managed = _managed_settings_path()
+    try:
+        present = managed.is_file()
+    except OSError:
+        present = False
+    if present:
+        return f"managed settings ({managed}) may add Stop hooks ccc cannot read"
+    return ""
+
+
+def _stop_hook_timeout_coverage_check(settings: dict) -> Check:
+    """Can a foreign Stop hook still be running when the lock lease expires?
+
+    Registration order proves nothing — Claude Code runs every hook of one event in
+    PARALLEL — so the meaningful question is the WINDOW, not the position: ``release-locks``
+    LEASES the session's file locks for ``stop_barrier_wait_sec``
+    (:meth:`command_center.store.Store.protect_locks`), and a foreign Stop hook (an
+    auto-commit, a linter sweep) still running when that lease expires can be writing a file
+    a peer is already allowed to edit again. This compares the longest DECLARED foreign Stop
+    timeout — an omitted one means Claude Code's own
+    :data:`CLAUDE_HOOK_DEFAULT_TIMEOUT_SEC` — against that window, and says plainly that a
+    declared timeout is an upper bound, never proof that the hook finished.
+
+    A readable breach is reported FIRST, even when a scope is unreadable
+    (:func:`_stop_coverage_blocker`): an invisible plugin scope cannot make a visible 300 s
+    hook safe, it can only raise the true maximum further, so the blocker is appended to the
+    FAIL instead of hiding it. Only when nothing readable breaches the window does a blocker
+    turn the check NA — carrying what IS measurable, so the reader still learns the longest
+    readable timeout. NA also when ``release-locks`` is not wired at all (no window to
+    compare against).
+    """
+    label = "Stop-hook timeout coverage"
+    details = install.hook_entry_details(settings, "Stop")
+    is_ccc = install._ccc_hook_arg  # pylint: disable=protected-access
+    if not any(is_ccc(command) == "release-locks" for _e, _m, command, _t, _k in details):
+        return Check(NA, label, "ccc release-locks not wired")
+    barrier = config.load_config().stop_barrier_wait_sec
+    foreign = [
+        (timeout if timeout is not None else CLAUDE_HOOK_DEFAULT_TIMEOUT_SEC, command)
+        for _e, _m, command, timeout, _k in details
+        if is_ccc(command) is None
     ]
-    if not positions:
-        return Check(NA, "Stop-hook order", "ccc release-locks not wired")
-    if positions[-1] == len(commands) - 1:
-        return Check(OK, "Stop-hook order", "release-locks runs last (after foreign Stop hooks)")
+    blocker = _stop_coverage_blocker(settings, details)
+    longest, name = 0, ""
+    if foreign:
+        longest, command = max(foreign, key=lambda item: item[0])
+        name = install.hook_command_name(command)
+    if foreign and longest > barrier:
+        detail = (
+            f"{name} may run {longest}s > stop_barrier_wait_sec ({barrier}s) — the lock "
+            "lease can expire while that hook is still writing the session's files "
+            "(raise stop_barrier_wait_sec)"
+        )
+        return Check(FAIL, label, f"{detail} (and {blocker})" if blocker else detail)
+    measured = (
+        f"longest readable foreign Stop timeout {longest}s ({name}) <= "
+        f"stop_barrier_wait_sec ({barrier}s)"
+        if foreign
+        else f"no readable foreign Stop hooks; the lock lease covers {barrier}s"
+    )
+    if blocker:
+        return Check(NA, label, f"cannot prove coverage: {blocker}; {measured}")
+    if not foreign:
+        return Check(
+            OK,
+            label,
+            f"no foreign Stop hooks; the lock lease covers {barrier}s "
+            "(a declared timeout is an upper bound, not proof a hook finished)",
+        )
     return Check(
-        FAIL,
-        "Stop-hook order",
-        "release-locks not last — close-after-done & lock-release must run after foreign "
-        "Stop hooks like auto-commit (ccc install-hooks)",
+        OK,
+        label,
+        f"{measured} — a declared timeout is an upper bound, NOT proof the hook finished",
     )
 
 

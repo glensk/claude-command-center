@@ -1304,19 +1304,174 @@ def test_mark_done_quiet_produces_no_stdout(
 
 
 # ---- close-now -------------------------------------------------------------
+_CLOSE_PID = 4321
+_CLOSE_START = "Tue Sep  2 23:00:00 2026"
+
+
 def _no_settle(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "_CLOSE_NOW_SETTLE_SEC", 0.0)  # don't actually sleep
+    monkeypatch.setattr(cli, "_CLOSE_NOW_RENDER_SEC", 0.0)
+
+
+def _barrier(enabled: bool) -> None:
+    """Write the Stop-barrier switch (and a fast lease window) into this test's config."""
+    from command_center import config
+
+    cfg = config.load_config()
+    cfg.stop_barrier_enabled = enabled
+    cfg.stop_barrier_wait_sec = 1
+    cfg.stop_barrier_settle_sec = 0
+    config.save_config(cfg)
+
+
+def _quiet_tree() -> dict[int, object]:
+    """The bound claude plus a long-lived non-hook child (an MCP server) — a drained chain."""
+    from command_center.snapshot import PsRow
+
+    return {
+        _CLOSE_PID: PsRow(1, "ttys009", "S+", "claude"),
+        5000: PsRow(_CLOSE_PID, "ttys009", "S", "node /opt/mcp/server.js"),
+    }
+
+
+def _stub_drain_probes(monkeypatch: pytest.MonkeyPatch, table: dict[int, object]) -> None:
+    """Run the REAL waiter against a stubbed ``ps`` — no process, no sleeping."""
+    from command_center import terminal
+
+    monkeypatch.setattr(cli, "_DRAIN_POLL_SEC", 0.0)
+    monkeypatch.setattr(terminal, "ps_table", lambda: table)
+    monkeypatch.setattr(terminal, "stop_hook_tokens", lambda _cwd: set())
+    monkeypatch.setattr(terminal, "pid_start", lambda _pid: _CLOSE_START)
+
+
+def _refusals(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Capture the desktop notification a refused close fires."""
+    notes: list[str] = []
+    monkeypatch.setattr(cli, "_notify_close_now", notes.append)
+    return notes
+
+
+def test_close_now_sigterms_the_bound_pid_once_the_chain_is_drained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The proven-drained path: SIGTERM the --pid the hook bound, then close its tab."""
+    import signal
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _barrier(True)
+    _no_settle(monkeypatch)
+    _stub_drain_probes(monkeypatch, _quiet_tree())
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
+    closed: list[str] = []
+    monkeypatch.setattr("command_center.terminal.close_iterm_session", closed.append)
+    args = argparse.Namespace(session="s1", iterm="w0t1p0:FRESH", pid=_CLOSE_PID)
+    assert cli.cmd_close_now(args) == 0
+    assert killed == [(_CLOSE_PID, signal.SIGTERM)]
+    assert closed == ["w0t1p0:FRESH"]
+
+
+def test_close_now_refuses_while_stop_hooks_are_still_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hook that outlives the wait leaves the process AND the tab alive (exit 1)."""
+    from command_center import terminal
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _barrier(True)
+    _no_settle(monkeypatch)
+    _stub_drain_probes(monkeypatch, _quiet_tree())
+    monkeypatch.setattr(
+        cli,
+        "_wait_for_stop_drain",
+        lambda *_a: (terminal.DRAIN_RUNNING, ["/bin/zsh /home/me/.claude/run-stop-hook.sh"]),
+    )
+    notes = _refusals(monkeypatch)
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    closed: list[str] = []
+    monkeypatch.setattr("command_center.terminal.close_iterm_session", closed.append)
+    monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
+    args = argparse.Namespace(session="s1", iterm="w0t1p0:FRESH", pid=_CLOSE_PID)
+    assert cli.cmd_close_now(args) == 1
+    assert killed == [] and closed == []
+    assert notes and "Stop hooks still running" in notes[0] and "run-stop-hook.sh" in notes[0]
+    assert "NOT closed" in (tmp_path / "command-center" / "events.log").read_text(encoding="utf-8")
+
+
+def test_close_now_refuses_when_the_chain_cannot_be_observed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty ps table is a FAILED observation, never proof of quiet — nothing is killed."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _barrier(True)
+    _no_settle(monkeypatch)
+    _stub_drain_probes(monkeypatch, {})  # snapshot.read_ps returns {} on any failure
+    notes = _refusals(monkeypatch)
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    closed: list[str] = []
+    monkeypatch.setattr("command_center.terminal.close_iterm_session", closed.append)
+    monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
+    args = argparse.Namespace(session="s1", iterm="w0t1p0:FRESH", pid=_CLOSE_PID)
+    assert cli.cmd_close_now(args) == 1
+    assert killed == [] and closed == []
+    assert notes and "could not be observed" in notes[0]
+
+
+def test_close_now_refuses_a_pid_recycled_during_the_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A different start time means the number was handed to a newcomer — never signal it."""
+    from command_center import terminal
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _barrier(True)
+    _no_settle(monkeypatch)
+    _stub_drain_probes(monkeypatch, _quiet_tree())
+    starts = iter([_CLOSE_START, "Wed Sep  3 07:00:00 2026"])
+    monkeypatch.setattr(terminal, "pid_start", lambda _pid: next(starts, "later"))
+    notes = _refusals(monkeypatch)
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    closed: list[str] = []
+    monkeypatch.setattr("command_center.terminal.close_iterm_session", closed.append)
+    monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
+    args = argparse.Namespace(session="s1", iterm="w0t1p0:FRESH", pid=_CLOSE_PID)
+    assert cli.cmd_close_now(args) == 1
+    assert killed == [] and closed == []
+    assert notes and "no longer this session's claude" in notes[0]
+
+
+def test_close_now_refuses_when_no_pid_can_be_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No --pid and no live registry entry: there is nothing to bind, so nothing is closed."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _barrier(True)
+    _no_settle(monkeypatch)
+    monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [])
+    notes = _refusals(monkeypatch)
+    closed: list[str] = []
+    monkeypatch.setattr("command_center.terminal.close_iterm_session", closed.append)
+    monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
+    args = argparse.Namespace(session="s1", iterm="w0t1p0:FRESH", pid=0)
+    assert cli.cmd_close_now(args) == 1
+    assert closed == []
+    assert notes and "no live Claude pid" in notes[0]
 
 
 def test_close_now_sigterms_a_fresh_live_pid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A fresh, matching, alive Claude PID is SIGTERM'd."""
+    """Barrier OFF (the escape hatch): a fresh, matching, alive Claude PID is SIGTERM'd."""
     import signal
 
     from command_center.models import LiveSession
 
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _barrier(False)
     _no_settle(monkeypatch)
     live = LiveSession(pid=4321, session_id="s1", cwd="/repo", alive=True)
     monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [live])
@@ -1326,7 +1481,7 @@ def test_close_now_sigterms_a_fresh_live_pid(
     monkeypatch.setattr(
         "command_center.terminal.close_iterm_session", lambda _x: (_ for _ in ()).throw(OSError)
     )
-    assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="")) == 0
+    assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="", pid=0)) == 0
     assert killed == [(4321, signal.SIGTERM)]
 
 
@@ -1335,6 +1490,7 @@ def test_close_now_no_pid_no_iterm_leaves_stale_tab_alone(
 ) -> None:
     """Stored stale iterm id + no live PID + no --iterm → never close (stale-evidence guard)."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _barrier(False)
     _no_settle(monkeypatch)
     with Store() as store:
         store.ensure("s1", cwd="/repo")
@@ -1343,21 +1499,22 @@ def test_close_now_no_pid_no_iterm_leaves_stale_tab_alone(
     monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
     closed: list[str] = []
     monkeypatch.setattr("command_center.terminal.close_iterm_session", closed.append)
-    assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="")) == 0
+    assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="", pid=0)) == 0
     assert closed == []  # never close on a store-only (stale) id
 
 
 def test_close_now_iterm_flag_closes_even_without_a_pid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A hook-supplied fresh --iterm id closes the tab even when no live PID is found."""
+    """Barrier OFF: a hook-supplied fresh --iterm id closes the tab even with no live PID."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _barrier(False)
     _no_settle(monkeypatch)
     monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [])
     monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
     closed: list[str] = []
     monkeypatch.setattr("command_center.terminal.close_iterm_session", closed.append)
-    assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="w0t1p0:FRESH")) == 0
+    assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="w0t1p0:FRESH", pid=0)) == 0
     assert closed == ["w0t1p0:FRESH"]
 
 
@@ -1368,6 +1525,7 @@ def test_close_now_tmux_kills_only_the_matched_pane(
     import subprocess
 
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _barrier(False)
     _no_settle(monkeypatch)
     monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [])
     # A two-pane window where only %5 hosts this session's claude.
@@ -1385,8 +1543,26 @@ def test_close_now_tmux_kills_only_the_matched_pane(
         "command_center.terminal.close_iterm_session", lambda _x: (_ for _ in ()).throw(OSError)
     )
     # tmux matched first → iTerm must NOT be touched even though --iterm was supplied.
-    assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="w0t1p0:X")) == 0
+    assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="w0t1p0:X", pid=0)) == 0
     assert runs == [["tmux", "kill-pane", "-t", "%5"]]
+
+
+# ---- locks -----------------------------------------------------------------
+def test_locks_marks_a_leased_row_as_committing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A row under the Stop lease is listed even with no live holder — and says why."""
+    from command_center.models import now_ms
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [])  # holder gone
+    with Store() as store:
+        store.ensure("s1", cwd="/repo")
+        store.acquire_file_lock("s1", "/repo/f.py", now_ms(), {"s1"}, 30 * 60 * 1000)
+        store.protect_locks("s1", now_ms() + 90_000)
+    assert cli.cmd_locks(argparse.Namespace()) == 0
+    out = capsys.readouterr().out
+    assert "/repo/f.py" in out and "committing — frees in" in out
 
 
 # ------------------------------ codex-usage ----------------------------------- #

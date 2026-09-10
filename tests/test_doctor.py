@@ -32,6 +32,10 @@ def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Never read this machine's real Automation store: the Terminal section must be −
     # ("unreadable") unless a test points it at a fake TCC.db of its own.
     monkeypatch.setattr(doctor, "_TCC_DB", tmp_path / "no-such-TCC.db")
+    # A machine that really carries a managed-settings file must not flip the Stop-hook
+    # coverage check to "cannot prove coverage" in these tests.
+    monkeypatch.setattr(doctor, "_MANAGED_SETTINGS_DARWIN", tmp_path / "no-managed.json")
+    monkeypatch.setattr(doctor, "_MANAGED_SETTINGS_POSIX", tmp_path / "no-managed.json")
 
 
 def _statuses(section: doctor.Section) -> dict[str, str]:
@@ -211,27 +215,143 @@ def test_daemon_section_na_on_other_platform(monkeypatch: pytest.MonkeyPatch) ->
     assert statuses["daemon service"] == doctor.NA
 
 
-# ------------------------------ Stop-hook order guard ------------------------------ #
+# ------------------------- Stop-hook timeout coverage ------------------------- #
+_CCC_STOP = "/opt/ccc hook stop"
+_CCC_RELEASE = "/opt/ccc hook release-locks"
+
+
 def _stop_settings(*commands: str) -> dict:
     """A settings dict whose Stop event lists *commands*, one per group, in order."""
     return {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": c}]} for c in commands]}}
 
 
-def test_stop_order_ok_when_release_locks_last() -> None:
-    settings = _stop_settings("/my/commit.sh", "/opt/ccc hook stop", "/opt/ccc hook release-locks")
-    assert doctor._stop_order_check(settings).status == doctor.OK
+def _stop_entries(*entries: dict) -> dict:
+    """A settings dict whose Stop event lists *entries* verbatim (timeouts, odd types, …)."""
+    return {"hooks": {"Stop": [{"hooks": [dict(entry)]} for entry in entries]}}
 
 
-def test_stop_order_warns_when_foreign_hook_after_release_locks() -> None:
-    settings = _stop_settings(
-        "/opt/ccc hook stop", "/opt/ccc hook release-locks", "/late/foreign.sh"
+def _barrier_wait(seconds: int) -> None:
+    cfg = config.load_config()
+    cfg.stop_barrier_wait_sec = seconds
+    config.save_config(cfg)
+
+
+def test_stop_timeout_coverage_na_when_release_locks_not_wired() -> None:
+    """Nothing to cover: without ccc's lease hook there is no window to compare against."""
+    assert doctor._stop_hook_timeout_coverage_check({}).status == doctor.NA
+    check = doctor._stop_hook_timeout_coverage_check(_stop_settings("/only/foreign.sh"))
+    assert check.status == doctor.NA and "not wired" in check.detail
+
+
+def test_stop_timeout_coverage_na_on_an_entry_it_cannot_read() -> None:
+    """A non-``command`` (or empty) Stop entry may do anything — never claim coverage."""
+    settings = _stop_entries(
+        {"type": "command", "command": _CCC_RELEASE},
+        {"type": "prompt", "command": "/foreign/thing.sh", "timeout": 5},
     )
-    assert doctor._stop_order_check(settings).status == doctor.FAIL
+    check = doctor._stop_hook_timeout_coverage_check(settings)
+    assert check.status == doctor.NA and "cannot prove coverage" in check.detail
+    empty = _stop_entries(
+        {"type": "command", "command": _CCC_RELEASE}, {"type": "command", "command": ""}
+    )
+    assert doctor._stop_hook_timeout_coverage_check(empty).status == doctor.NA
 
 
-def test_stop_order_na_when_release_locks_not_wired() -> None:
-    assert doctor._stop_order_check({}).status == doctor.NA
-    assert doctor._stop_order_check(_stop_settings("/only/foreign.sh")).status == doctor.NA
+def test_stop_timeout_coverage_na_when_a_plugin_may_add_stop_hooks() -> None:
+    """An enabled plugin registers hooks in a file ccc never reads (measured: openai-codex)."""
+    settings = _stop_settings(_CCC_STOP, _CCC_RELEASE, "/my/commit.sh")
+    settings["enabledPlugins"] = {"codex@openai-codex": True}
+    check = doctor._stop_hook_timeout_coverage_check(settings)
+    assert check.status == doctor.NA
+    assert "1 enabled plugin" in check.detail and "cannot read" in check.detail
+
+
+def test_stop_timeout_coverage_na_when_managed_settings_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A managed-settings file is a scope ccc can neither read nor enumerate."""
+    managed = tmp_path / "managed-settings.json"
+    managed.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(doctor, "_MANAGED_SETTINGS_DARWIN", managed)
+    monkeypatch.setattr(doctor, "_MANAGED_SETTINGS_POSIX", managed)
+    check = doctor._stop_hook_timeout_coverage_check(_stop_settings(_CCC_RELEASE, "/my/commit.sh"))
+    assert check.status == doctor.NA and "managed settings" in check.detail
+
+
+def test_stop_timeout_coverage_fails_even_when_a_scope_is_unreadable() -> None:
+    """A readable 300 s hook is a FAIL whatever else is invisible — NA would hide it.
+
+    An unenumerable plugin scope can only push the true maximum HIGHER; it can never make a
+    hook ccc CAN see safe, so the blocker is appended to the finding instead of replacing it.
+    """
+    settings = _stop_entries(
+        {"type": "command", "command": _CCC_RELEASE},
+        {"type": "command", "command": "/bin/zsh /me/auto-commit-after-turn.sh", "timeout": 300},
+    )
+    settings["enabledPlugins"] = {"codex@openai-codex": True}
+    check = doctor._stop_hook_timeout_coverage_check(settings)
+    assert check.status == doctor.FAIL
+    assert "auto-commit-after-turn.sh" in check.detail and "300s" in check.detail
+    assert "and 1 enabled plugin may add Stop hooks ccc cannot read" in check.detail
+
+
+def test_stop_timeout_coverage_na_still_reports_what_is_measurable() -> None:
+    """An NA that measures nothing is a wasted check: name the longest READABLE timeout."""
+    settings = _stop_entries(
+        {"type": "command", "command": _CCC_RELEASE},
+        {"type": "command", "command": "/my/lint.sh", "timeout": 30},
+    )
+    settings["enabledPlugins"] = {"codex@openai-codex": True}
+    check = doctor._stop_hook_timeout_coverage_check(settings)
+    assert check.status == doctor.NA
+    assert "1 enabled plugin" in check.detail
+    assert "30s" in check.detail and "180s" in check.detail and "lint.sh" in check.detail
+
+
+def test_stop_timeout_coverage_ok_below_the_barrier_and_says_it_is_only_an_upper_bound() -> None:
+    """A declared timeout bounds the hook; it is NOT proof the hook finished — say so."""
+    settings = _stop_entries(
+        {"type": "command", "command": _CCC_RELEASE},
+        {"type": "command", "command": "/my/commit.sh", "timeout": 120},
+        {"type": "command", "command": "/my/lint.sh", "timeout": 30},
+    )
+    check = doctor._stop_hook_timeout_coverage_check(settings)
+    assert check.status == doctor.OK
+    assert "120s" in check.detail and "commit.sh" in check.detail
+    assert "upper bound" in check.detail
+
+
+def test_stop_timeout_coverage_fails_when_a_foreign_hook_outlives_the_lease() -> None:
+    """A 300 s auto-commit against a 180 s lease: the locks free themselves mid-commit."""
+    settings = _stop_entries(
+        {"type": "command", "command": _CCC_RELEASE},
+        {"type": "command", "command": "/bin/zsh /me/auto-commit-after-turn.sh", "timeout": 300},
+    )
+    check = doctor._stop_hook_timeout_coverage_check(settings)
+    assert check.status == doctor.FAIL
+    assert "auto-commit-after-turn.sh" in check.detail
+    assert "300s" in check.detail and "180s" in check.detail
+    assert "stop_barrier_wait_sec" in check.detail
+
+
+def test_stop_timeout_coverage_normalizes_an_omitted_timeout_to_claude_codes_default() -> None:
+    """No `timeout` key means Claude Code's own default (60 s), not "no limit" and not 0."""
+    settings = _stop_entries(
+        {"type": "command", "command": _CCC_RELEASE},
+        {"type": "command", "command": "/my/commit.sh"},
+    )
+    assert doctor.CLAUDE_HOOK_DEFAULT_TIMEOUT_SEC == 60
+    _barrier_wait(30)
+    check = doctor._stop_hook_timeout_coverage_check(settings)
+    assert check.status == doctor.FAIL and "60s" in check.detail and "30s" in check.detail
+    _barrier_wait(180)
+    assert doctor._stop_hook_timeout_coverage_check(settings).status == doctor.OK
+
+
+def test_stop_timeout_coverage_ok_without_any_foreign_stop_hook() -> None:
+    """ccc's own entries are not measured against the window they define."""
+    check = doctor._stop_hook_timeout_coverage_check(_stop_settings(_CCC_STOP, _CCC_RELEASE))
+    assert check.status == doctor.OK and "no foreign Stop hooks" in check.detail
 
 
 def test_exit_code_zero_when_no_failures() -> None:

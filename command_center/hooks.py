@@ -107,6 +107,16 @@ _LOCK_DENY = (
     "finish (or when they run `ccc handoff` there), and your edit will then go through."
 )
 
+# The same denial when the holder's TURN is already over and the lock is under the Stop-time
+# lease (store.protect_locks): the wait is BOUNDED and we can name the deadline, which the
+# live-holder case above cannot.
+_LOCK_DENY_PROTECTED = (
+    "`{path}` is locked by another Claude Code session ({holder}) whose turn has just ended — its "
+    "files are being committed right now, so the lock is deliberately held until that can have "
+    "finished. It frees automatically in about {secs} s, and your edit will then go through: "
+    "edit a DIFFERENT file meanwhile, or retry this one after that. You're queued for it."
+)
+
 _HANDOFF_NUDGE = (
     "Another Claude Code session is waiting to edit {files}. If you are DONE with {it} for this "
     "turn, release {it} now so they can start — this commits, pushes, then unlocks:\n{cmds}\n"
@@ -506,8 +516,10 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> int:
     Fail-open by construction: returns 0 (no decision → the edit proceeds) when the file is
     free / already ours / reclaimable, when locking is disabled or no file path is present,
     and — because ``dispatch`` swallows exceptions — on any error. The single non-proceed
-    outcome is an explicit *deny* when the file is held by another **live** session (and any
-    configured ``file_lock_wait_sec`` poll grace has elapsed).
+    outcome is an explicit *deny* when the file is held by another **live** session, or held
+    under the Stop-time lease of a session whose turn just ended (and any configured
+    ``file_lock_wait_sec`` poll grace has elapsed). The leased case names its deadline: that
+    wait is bounded by ``stop_barrier_wait_sec``, the live-holder one is not.
     """
     cfg = config.load_config()
     if not cfg.file_lock_enabled:
@@ -529,7 +541,18 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> int:
             holder = store.acquire_file_lock(sid, path, now_ms(), _live_ids(), ttl_ms)
             if holder is None:
                 return 0
-    _emit_pre_tool_deny(_LOCK_DENY.format(path=path, holder=short_id(holder)))
+        # Read inside this block (no second connection): a leased lock frees at a KNOWN
+        # time, so that denial names the wait instead of "shortly".
+        protected_until = store.protection_deadline(path)
+    remaining_ms = protected_until - now_ms()
+    if remaining_ms > 0:
+        _emit_pre_tool_deny(
+            _LOCK_DENY_PROTECTED.format(
+                path=path, holder=short_id(holder), secs=max(1, round(remaining_ms / 1000))
+            )
+        )
+    else:
+        _emit_pre_tool_deny(_LOCK_DENY.format(path=path, holder=short_id(holder)))
     return 0
 
 
@@ -621,34 +644,47 @@ def handle_stop_failure(payload: dict[str, Any]) -> int:
 
 
 def handle_release_locks(payload: dict[str, Any]) -> int:
-    """Release all of the session's file locks — the Stop floor.
+    """Lease the session's file locks past the end of its turn — the Stop floor.
 
-    Wired as the final Stop hook, *after* the auto-commit, so the session's files are already
-    committed + pushed before their locks drop. A parked / idle session therefore holds none.
+    Claude Code runs every hook of one event in PARALLEL, so registration order proves
+    nothing and this hook cannot know whether a foreign Stop hook (an auto-commit that may
+    run for minutes) is done with the session's files. It therefore does NOT delete the lock
+    rows: it stamps them with ``protected_until = now + stop_barrier_wait_sec``
+    (:meth:`Store.protect_locks`). A stamped row is unacquirable by any peer until the stamp
+    expires, and it expires by itself — the guarantee rests on a timestamp in SQLite, not on
+    any process surviving, finishing or being observed. The session's own pending waits are
+    still cleared, and its next edit of a file clears that file's lease (a new turn). With
+    ``stop_barrier_enabled`` off, the locks are released immediately as they used to be.
 
     A ``mark-done --close`` may also have armed a one-shot close-after-turn request: claim it
-    atomically (at most one caller ever wins) and, on success, spawn the detached closer.
-    Running last means the SIGTERM + pane/tab close happen only after auto-commit committed
-    this turn's work. Kept fast and never-raising (dispatch swallows too, but we mirror the
-    defensive neighbours).
+    atomically (at most one caller ever wins) and, on success, spawn the detached closer. The
+    lease is what protects the files if that kill lands mid-commit. Kept fast and
+    never-raising — no waiting, no process probing, one UPDATE (dispatch swallows too, but we
+    mirror the defensive neighbours).
     """
     sid = _session_id(payload)
     if sid:
+        cfg = config.load_config()
         with Store() as store:
-            store.release_all_file_locks(sid)
+            if cfg.stop_barrier_enabled:
+                store.protect_locks(sid, now_ms() + cfg.stop_barrier_wait_sec * 1000)
+            else:
+                store.release_all_file_locks(sid)
             kind, claim = store.claim_after_turn(sid, now_ms(), CLOSE_REQUEST_TTL_MS)
             if kind == "close":
                 from . import spawn  # lazy, like _maybe_grade_after_turn
 
-                spawn.spawn_ccc(
-                    [
-                        "close-now",
-                        "--session",
-                        sid,
-                        "--iterm",
-                        os.environ.get("ITERM_SESSION_ID", ""),
-                    ]
-                )
+                args = [
+                    "close-now",
+                    "--session",
+                    sid,
+                    "--iterm",
+                    os.environ.get("ITERM_SESSION_ID", ""),
+                ]
+                pid = os.environ.get("CLAUDE_PID", "").strip()
+                if pid.isdigit():
+                    args += ["--pid", pid]
+                spawn.spawn_ccc(args)
             elif kind == "switch" and claim is not None:
                 # `ccc switch-account`: the relauncher terminates this Claude once its Stop
                 # chain is over, waits for the shell to come back and types the resume into
@@ -756,7 +792,9 @@ def handle_session_end(payload: dict[str, Any]) -> int:
     if not sid:
         return 0
     with Store() as store:
-        store.release_all_file_locks(sid)  # never leave a closed session holding a file
+        # A still-leased file is deliberately KEPT (it frees itself when the lease expires):
+        # the process is gone, but a Stop-chain commit of its files may not be.
+        store.release_unprotected_file_locks(sid, now_ms())
         session, _ = ensure_current_session(store, sid, payload.get("cwd", ""))
         store.reset_subagents(sid)  # the process is going: no subagent of it survives
         fields: dict[str, Any] = {"last_response_at": now_ms(), "needs_summary": True}

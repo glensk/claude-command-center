@@ -155,19 +155,39 @@ def _ccc_hook_arg(command: str) -> str | None:
     return None
 
 
+def hook_command_name(command: str) -> str:
+    """A short, human name for a hook *command* — what a report or a refusal can print.
+
+    The basename of the LAST path-looking word, which for the common wrapper shapes
+    (``/bin/zsh /…/run-stop-hook.sh``, ``node /…/hook.mjs``) names the hook rather than its
+    interpreter; argv[0]'s basename when no word looks like a path, and the stripped
+    command itself when there is no word at all.
+    """
+    words = command.split()
+    if not words:
+        return command.strip()
+    paths = [word for word in words if "/" in word]
+    return (paths[-1] if paths else words[0]).rsplit("/", 1)[-1]
+
+
 def _is_ccc_hook_command(command: str) -> bool:
     return _ccc_hook_arg(command) is not None
 
 
-def hook_entries(settings: dict, event: str | None = None) -> list[tuple[str, str | None, str]]:
-    """Every hook entry in *settings* as ``(event key, matcher or None, command)``.
+def hook_entry_details(
+    settings: dict, event: str | None = None
+) -> list[tuple[str, str | None, str, int | None, str]]:
+    """Every hook entry as ``(event key, matcher or None, command, timeout, type)``.
 
-    Wiring order, ccc's entries and foreign ones alike; with *event* set, only that
-    settings-event key. Tolerates any malformed shape a hand-edited settings.json can
-    hold; the single walk every reader here and in doctor goes through — the triple is
-    exactly :data:`HOOK_SPEC`'s shape, so a wiring can be compared against the spec.
+    The SINGLE walk of the wiring — :func:`hook_entries` is the 3-tuple view of it, so
+    there is still exactly one traversal to keep tolerant of the malformed shapes a
+    hand-edited settings.json can hold. ``timeout`` is the entry's declared seconds, or
+    ``None`` when it declares none (Claude Code then applies its own default — see
+    ``doctor.CLAUDE_HOOK_DEFAULT_TIMEOUT_SEC``); ``type`` is the entry's ``"type"`` string
+    (``""`` when absent), which tells an evaluable ``command`` entry from one whose
+    behaviour ccc cannot read.
     """
-    entries: list[tuple[str, str | None, str]] = []
+    entries: list[tuple[str, str | None, str, int | None, str]] = []
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
         return entries
@@ -180,16 +200,47 @@ def hook_entries(settings: dict, event: str | None = None) -> list[tuple[str, st
             raw_matcher = group.get("matcher")
             matcher = raw_matcher if isinstance(raw_matcher, str) and raw_matcher else None
             for entry in group.get("hooks", []) or []:
-                if isinstance(entry, dict):
-                    entries.append((str(key), matcher, str(entry.get("command", ""))))
+                if not isinstance(entry, dict):
+                    continue
+                raw_timeout = entry.get("timeout")
+                timeout = (
+                    int(raw_timeout)
+                    if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool)
+                    else None
+                )
+                entries.append(
+                    (
+                        str(key),
+                        matcher,
+                        str(entry.get("command", "")),
+                        timeout,
+                        str(entry.get("type", "") or ""),
+                    )
+                )
     return entries
+
+
+def hook_entries(settings: dict, event: str | None = None) -> list[tuple[str, str | None, str]]:
+    """Every hook entry in *settings* as ``(event key, matcher or None, command)``.
+
+    Wiring order, ccc's entries and foreign ones alike; with *event* set, only that
+    settings-event key. Tolerates any malformed shape a hand-edited settings.json can
+    hold; the view of :func:`hook_entry_details` (the one walk) every reader here and in
+    doctor goes through — the triple is exactly :data:`HOOK_SPEC`'s shape, so a wiring can
+    be compared against the spec.
+    """
+    return [
+        (key, matcher, command)
+        for key, matcher, command, _timeout, _type in hook_entry_details(settings, event)
+    ]
 
 
 def hook_commands(settings: dict, event: str | None = None) -> list[str]:
     """Every hook command in *settings* — ccc's and foreign — in wiring order.
 
-    With *event* set, only that settings-event key's commands (doctor's Stop-order guard
-    needs them in order).
+    With *event* set, only that settings-event key's commands. Callers that also need an
+    entry's declared timeout or type (doctor's Stop-hook timeout coverage) read
+    :func:`hook_entry_details` instead.
     """
     return [command for _event, _matcher, command in hook_entries(settings, event)]
 

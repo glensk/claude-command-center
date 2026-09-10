@@ -307,7 +307,8 @@ So, whenever you add or change anything that renders into a row:
 - [docs/reference.md](docs/reference.md) — the full feature reference (TUI keys, peek/jump,
   future-job files, mirrors, locks, daemon, resume-halted, AIM scoring/drift/DONE internals).
 - [docs/hooks.md](docs/hooks.md) — what each installed hook does, the status line, the
-  Stop-hook ordering contract.
+  Stop-hook lock lease (same-event hooks run in parallel, so the lease — not a wiring
+  order — is what keeps a peer off a file that is still being committed).
 - [docs/obsidian.md](docs/obsidian.md) — the Obsidian integration: dashboards, job-file
   buttons, the phone-friendly `launch:` toggle, troubleshooting.
 - [docs/codex.md](docs/codex.md) — delegating implementation to OpenAI Codex.

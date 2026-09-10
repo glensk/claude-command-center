@@ -22,10 +22,13 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 # The wiring ccc owns, in the order it is appended to each event's hook list — the
 # SINGLE source for both the installer and the recognizer. Each entry is
-# ``(settings-event-key, matcher-or-None, ccc-hook-arg)``. Order matters for ``Stop``:
-# ``stop`` then ``release-locks`` are appended LAST so release-locks runs after any
-# foreign Stop hooks (e.g. a user's commit hook) — files are committed before their
-# locks release.
+# ``(settings-event-key, matcher-or-None, ccc-hook-arg)``. ``stop`` then ``release-locks``
+# are still appended LAST on ``Stop``, but that order is COSMETIC: Claude Code runs every
+# hook of one event in PARALLEL, so no registration position makes release-locks run after
+# a foreign commit hook. What keeps a peer off a file that is still being committed is the
+# Stop LEASE (``Store.protect_locks``: release-locks stamps the locks instead of dropping
+# them) plus the fail-closed drain wait in ``ccc close-now`` / ``ccc switch-now``, which
+# refuse to kill a Claude whose Stop chain they cannot see finish.
 HOOK_SPEC: tuple[tuple[str, str | None, str], ...] = (
     ("SessionStart", None, "session-start"),
     ("UserPromptSubmit", None, "user-prompt"),

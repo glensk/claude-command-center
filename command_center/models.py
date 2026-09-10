@@ -184,6 +184,10 @@ class FileLock:
     session_id: str
     acquired_at: int  # epoch ms when first taken this turn
     refreshed_at: int  # epoch ms of the last edit; the TTL is measured from here
+    # Epoch ms until which this lock stays reserved for its holder even after its turn
+    # ended (the Stop lease — see Store.protect_locks); 0 = not protected. LAST on
+    # purpose, so existing positional construction keeps working.
+    protected_until: int = 0
 
 
 @dataclass

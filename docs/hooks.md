@@ -30,8 +30,8 @@ own the wiring: delete the forwarder, don't wrap it.
 | **UserPromptSubmit** | nags to set an AIM if missing; nudges to sharpen a vague AIM / re-align sub-goals / tick finished items |
 | **PreToolUse** (`Edit\|Write\|MultiEdit\|NotebookEdit`) | acquires the cross-session file lock on the target file (or denies + queues) |
 | **PostToolUse**     | forwards the session's live `TodoWrite`/Task list into ccc; nudges the lock holder to hand off when a peer waits |
-| **Stop**            | end-of-turn: spawns the detached progress grader / AIM-met assessment (when enabled); the commit + `release-locks` floor |
-| **release-locks**   | drops every file lock the session holds (wired *after* any commit step — see below) |
+| **Stop**            | end-of-turn: spawns the detached progress grader / AIM-met assessment (when enabled) |
+| **release-locks**   | LEASES every file lock the session holds past the end of the turn (`stop_barrier_wait_sec`) instead of dropping it — see below |
 | **SessionEnd**      | final reconcile so the row parks cleanly                                          |
 | **PreCompact**      | preserves state across a context compaction                                       |
 | **SubagentStart**   | counts in-process subagents so `switch-account` refuses while one runs            |
@@ -43,17 +43,60 @@ Headless `claude -p` runs never create rows: the hooks bail when
 real session inherits that session's AIM and cwd; without the guard every such run would
 leak a duplicate row.
 
-## The Stop-hook ordering contract
+## The Stop-hook lock lease
 
-The `release-locks` hook must run **after** anything that commits the turn's work, so a
-waiting session never starts on uncommitted changes. `ccc install-hooks` places its
-`release-locks` entry **last** in the `Stop` chain for exactly this reason.
+**Claude Code runs every hook of one event in parallel.** Where a hook sits in the `Stop`
+list therefore guarantees nothing: ccc's `release-locks` entry cannot be "ordered after"
+your auto-commit, and an auto-commit that runs for two minutes is still writing the
+session's files long after the turn ended. (ccc still appends its two `Stop` entries last —
+that is cosmetic, and the installer tests only assert the wiring, not an ordering effect.)
 
-**If you have your own commit automation** (an auto-commit-on-Stop hook of your own), make
-sure it is registered *before* ccc's `release-locks` entry in `settings.json`. The
-invariant is: *commit the files → then release the locks*. `ccc handoff <file>` is the one
-release path that commits first itself (commit → push → release), so it is always safe;
-the automatic Stop-time release relies on your commit step running earlier in the chain.
+What holds the invariant *commit the files → then release the locks* is a **lease in the
+store**, not a running process:
+
+- **The turn ends → the locks are stamped, not dropped.** `release-locks` sets
+  `protected_until = now + stop_barrier_wait_sec` (default 180 s) on every lock the session
+  holds. Nothing has to survive, finish or be observed for that to hold — it is a timestamp
+  in SQLite, and it expires by itself.
+- **A stamped lock denies every peer**, whatever the holder's liveness or the ordinary
+  `file_lock_ttl_sec`; that refusal says the holder's files are being committed right now and
+  names the seconds until the lock frees itself, so the waiting session knows the wait is
+  bounded and why. `ccc locks` shows the same state (`committing — frees in N s`).
+- **The holder's own next edit clears the stamp** — a new edit is a new turn.
+- **`ccc handoff <file>` is the way to hand a file over IMMEDIATELY** without waiting the
+  lease out: it commits (path-scoped) → pushes → releases that one file, in that order, so
+  the waiter never starts on uncommitted work. `ccc lock-release [--all]` deletes leased
+  rows too — by design: it is the explicit "I know what I am doing" escape hatch.
+- **The price is honest and bounded:** a contended file can stay denied for up to
+  `stop_barrier_wait_sec` after a turn instead of milliseconds. Lower it, or set
+  `stop_barrier_enabled = false` to go back to the immediate release.
+- **Do not set `stop_barrier_wait_sec = 0` to opt out.** The clamp accepts it, but at 0 the
+  lease is empty AND the drain wait can never confirm anything (a single clean scan is not a
+  proof), so `close-now` refuses **every** close and `switch-now` every relaunch. The way to
+  opt out completely is `stop_barrier_enabled = false`.
+
+**If you have your own commit automation** (an auto-commit-on-Stop hook), you no longer
+have to register it anywhere in particular. Check instead that its declared `timeout` fits
+inside `stop_barrier_wait_sec` — `ccc doctor`'s *Stop-hook timeout coverage* check does
+exactly that comparison (and says so when it cannot: an entry it cannot read, an enabled
+plugin, or a managed-settings file may add `Stop` hooks ccc never sees).
+
+**The two destructive paths wait, and refuse when they cannot tell.** `ccc close-now`
+(`mark-done --close`) and `ccc switch-now` (`switch-account`) must kill a Claude process,
+so they first watch its process tree until the Stop chain looks drained — two consecutive
+clean scans `stop_barrier_settle_sec` apart, bounded by `stop_barrier_wait_sec`. A timeout
+with hooks still running, an unreadable `ps`, or a pid whose identity changed leaves the
+process **and** its tab alive (logged to `events.log`, plus a desktop notification). That
+observation is best effort by construction — hooks contributed by **plugins** or by a
+managed-settings file appear in no file ccc can read, and are only caught by a `hook`
+substring over-match — which is exactly why the *lease*, not the wait, carries the
+guarantee: even a kill that lands mid-commit cannot hand a half-written file to a peer.
+
+**One documented exception: `ON DELETE CASCADE`.** `file_locks.session_id` references
+`sessions(session_id)` with `ON DELETE CASCADE`, so deleting a session row (`Store.delete`
+/ `delete_many` — pruning, `ccc rm`) erases its leased locks without consulting
+`protected_until`. That is deliberate: removing a session is an explicit operator action,
+not an automatic expiry.
 
 ## The status line
 
