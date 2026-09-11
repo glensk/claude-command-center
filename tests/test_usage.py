@@ -2358,7 +2358,7 @@ def test_read_codex_live_refuses_a_snapshot_from_another_home(tmp_path: Path) ->
 
 
 def test_render_codex_usage_blocked_banner_marks_live_figures() -> None:
-    """Live+pinned needs no banner at all; the rollout path keeps its caveat."""
+    """A pinned 100% row IS the banner: live draws bare bars, rollout keeps only its caveat."""
     windows = {
         "five_hour": usage.Window(used_percentage=100.0, resets_at=_LIVE_NOW + 600),
         "seven_day": usage.Window(used_percentage=23.0, resets_at=_LIVE_NOW + 5 * 86400),
@@ -2400,9 +2400,29 @@ def test_render_codex_usage_blocked_banner_marks_live_figures() -> None:
         blocked_reason=reason,
         blocked_at=_LIVE_NOW,
     )
+    # Rollout-sourced + pinned: the two red lines would repeat the 100% row too, so only
+    # the grey caveat (the 100% is ccc's pin, the other bar is a stale reading) survives.
     plain = usage.render_codex_usage(rollout, now=_LIVE_NOW).plain
-    assert "100% = the limit that fired; other figures are 2m old" in plain
-    assert "live figures" not in plain
+    assert plain.splitlines() == [
+        "100% = the limit that fired; other figures are 2m old",
+        "Session: Resets in 10m        100%",
+        "Week: Resets in 5d 0h 0m       23%",
+    ]
+
+    # Rollout-sourced with nothing pinned (both resets already passed, so no live
+    # exhausted window): nothing else names the block, so the red banner stays.
+    expired = usage.Usage(
+        captured_at=_LIVE_NOW - 120,
+        five_hour=usage.Window(used_percentage=100.0, resets_at=_LIVE_NOW - 1),
+        seven_day=usage.Window(used_percentage=23.0, resets_at=_LIVE_NOW - 1),
+        blocked_reason=reason,
+        blocked_at=_LIVE_NOW,
+    )
+    plain = usage.render_codex_usage(expired, now=_LIVE_NOW).plain
+    assert plain.startswith(
+        "⛔ usage limit reached\n100% = the limit that fired; other figures are 2m old\n"
+    )
+    assert "access returns" not in plain  # no future reset to promise
 
 
 def test_render_codex_usage_blocked_banner_uses_the_short_wording() -> None:
@@ -2413,12 +2433,12 @@ def test_render_codex_usage_blocked_banner_uses_the_short_wording() -> None:
     (``BLOCKED — included usage limit reached (no credit overflow)``, 61 chars) stretched
     the Codex box past 60 columns and stole that width from the job-details pane.
 
-    Rollout-sourced (``live=False``), since a live pinned snapshot renders no banner —
-    its 100% bar already carries the refusal.
+    Nothing pinned (99%, no window at 100%), since a pinned snapshot renders no red
+    banner — its 100% bar already carries the refusal.
     """
     snap = usage.Usage(
         captured_at=_LIVE_NOW - 120,
-        five_hour=usage.Window(used_percentage=100.0, resets_at=_LIVE_NOW + 600),
+        five_hour=usage.Window(used_percentage=99.0, resets_at=_LIVE_NOW + 600),
         seven_day=usage.Window(used_percentage=23.0, resets_at=_LIVE_NOW + 5 * 86400),
         blocked_reason="included usage limit reached (no credit overflow)",
         blocked_at=_LIVE_NOW,

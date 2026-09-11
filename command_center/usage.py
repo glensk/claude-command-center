@@ -2122,14 +2122,15 @@ def render_work_usage(usage: Usage | None, now: int | None = None) -> Text:
 def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
     """Render the two-bar OpenAI Codex usage card (green bars) as Rich ``Text``.
 
-    A refusal normally prefixes the bars with a red banner — but a **live** snapshot
-    whose exhausted window is already pinned at 100% needs none: that row reads
+    A refusal normally prefixes the bars with a red banner — but a snapshot whose
+    exhausted window is already pinned at 100% needs none: that row reads
     ``Session: Resets in 19m … 100%``, which is both the refusal and when it lifts, so
-    the banner only repeated it (``⛔ usage limit reached`` / ``access returns in 19m`` /
-    ``live figures, 0m old``) at the cost of three of the card's lines. The banner stays
-    wherever the bars do NOT carry the block: rollout-sourced figures (those bars are the
-    last SUCCESSFUL call's and read as headroom, hence the ``100% = the limit that fired``
-    caveat) and any snapshot with no live exhausted window to pin (see
+    the banner only repeated it (``⛔ usage limit reached`` / ``access returns in 19m``)
+    at the cost of two of the card's lines. A live pinned snapshot draws the bare bars; a
+    rollout-sourced one keeps just the grey ``100% = the limit that fired; other figures
+    are <age> old`` caveat, because there the 100% is ccc's pin and the other bar is the
+    last SUCCESSFUL call's reading. The red banner stays only where the bars do NOT carry
+    the block: no window data at all, or no live exhausted window to pin (see
     :func:`codex_exhausted_window`).
 
     A window that has not opened yet (0% used, reset a full window length past the
@@ -2139,8 +2140,22 @@ def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
     """
     now = int(time.time()) if now is None else now
     if usage is not None and usage.blocked:
-        if usage.live and not usage.is_empty() and codex_exhausted_window(usage, now) is not None:
-            return _render_card(
+        pinned = not usage.is_empty() and codex_exhausted_window(usage, now) is not None
+        age = _format_age(now - usage.captured_at) if usage.captured_at else "?"
+        # Live figures need no caveat: the endpoint reported the block AND the windows in
+        # one answer, so the bars below ARE the state that fired. A rollout-sourced
+        # snapshot instead carries the last SUCCESSFUL call's numbers, with only the
+        # window ccc pinned reading 100% — say which is which.
+        note = (
+            f"live figures, {age} old"
+            if usage.live
+            else f"100% = the limit that fired; other figures are {age} old"
+        )
+        if pinned:
+            # The 100% row already says "limit reached" and when it lifts; only the
+            # rollout caveat has something to add.
+            banner = Text() if usage.live else Text(note + "\n", style="grey50")
+            return banner + _render_card(
                 usage,
                 now,
                 fill_color=_CODEX_FILL,
@@ -2162,16 +2177,6 @@ def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
         ]
         if resets:
             banner += Text(f"access returns {format_reset(min(resets), now)}\n", style="bold red")
-        age = _format_age(now - usage.captured_at) if usage.captured_at else "?"
-        # Live figures need no caveat: the endpoint reported the block AND the windows in
-        # one answer, so the bars below ARE the state that fired. A rollout-sourced
-        # snapshot instead carries the last SUCCESSFUL call's numbers, with only the
-        # window ccc pinned reading 100% — say which is which.
-        note = (
-            f"live figures, {age} old"
-            if usage.live
-            else f"100% = the limit that fired; other figures are {age} old"
-        )
         banner += Text(note + "\n", style="grey50")
         return banner + _render_card(
             usage,
