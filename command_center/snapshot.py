@@ -398,13 +398,42 @@ def parse_procargs2(raw: bytes) -> list[str]:
     return args
 
 
-def procargs(pid: int) -> list[str] | None:
-    """The exact ``argv`` of *pid* via ``sysctl(KERN_PROCARGS2)``; ``None`` when unknown.
+def parse_procargs2_full(raw: bytes) -> tuple[str, list[str], dict[str, str]]:
+    """Decode a ``KERN_PROCARGS2`` blob into ``(executable, argv, environ)``.
 
-    macOS-only (the MIB does not exist elsewhere) and best-effort: a vanished process, a
-    process owned by another user, or a non-Darwin platform all yield ``None``, which the
-    classifier reads as "record it as a shell + note instead of a command".
+    The same layout :func:`parse_procargs2` reads, continued past ``argv``: the
+    remaining NUL-separated strings are the process's environment AT EXEC TIME as
+    ``KEY=value`` (a shell's later ``export``s are invisible here — callers wanting a
+    launch's own pins compare the child against the parent, never the parent against
+    itself). A repeated key keeps its first value, as ``execve`` semantics do.
     """
+    if len(raw) < 5:
+        return "", [], {}
+    argc = int.from_bytes(raw[:4], "little", signed=False)
+    if argc <= 0 or argc > 4096:
+        return "", [], {}
+    body = raw[4:]
+    end = body.find(b"\0")
+    if end < 0:
+        return "", [], {}
+    exe = body[:end].decode("utf-8", errors="replace")
+    pos = end + 1
+    while pos < len(body) and body[pos] == 0:  # padding between exec_path and argv[0]
+        pos += 1
+    parts = body[pos:].split(b"\0")
+    args = [part.decode("utf-8", errors="replace") for part in parts[:argc]]
+    env: dict[str, str] = {}
+    for part in parts[argc:]:
+        key, sep, value = part.partition(b"=")
+        if sep and key:
+            env.setdefault(
+                key.decode("utf-8", errors="replace"), value.decode("utf-8", errors="replace")
+            )
+    return exe, args, env
+
+
+def _procargs2_raw(pid: int) -> bytes | None:
+    """The raw ``KERN_PROCARGS2`` buffer of *pid*, or ``None`` when it cannot be read."""
     if sys.platform != "darwin" or pid <= 0:
         return None
     try:
@@ -423,10 +452,44 @@ def procargs(pid: int) -> list[str] | None:
         mib3 = (ctypes.c_int * 3)(_CTL_KERN, _KERN_PROCARGS2, pid)
         if libc.sysctl(mib3, 3, buf, ctypes.byref(size), None, 0) != 0:
             return None
-        args = parse_procargs2(buf.raw[: size.value])
+        return buf.raw[: size.value]
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return None
+
+
+def procargs(pid: int) -> list[str] | None:
+    """The exact ``argv`` of *pid* via ``sysctl(KERN_PROCARGS2)``; ``None`` when unknown.
+
+    macOS-only (the MIB does not exist elsewhere) and best-effort: a vanished process, a
+    process owned by another user, or a non-Darwin platform all yield ``None``, which the
+    classifier reads as "record it as a shell + note instead of a command".
+    """
+    raw = _procargs2_raw(pid)
+    if raw is None:
+        return None
+    try:
+        args = parse_procargs2(raw)
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return None
     return args or None
+
+
+def procargs_full(pid: int) -> tuple[str, list[str], dict[str, str]] | None:
+    """``(executable, argv, environ)`` of *pid* via ``KERN_PROCARGS2``; ``None`` when unknown.
+
+    The relaunch path of ``ccc codex-switch`` rebuilds a live codex command from this —
+    exact argv (a multi-line prompt is ONE element here, unsplittable in ``ps`` output)
+    and the launch's own environment pins. Same platform and failure contract as
+    :func:`procargs`.
+    """
+    raw = _procargs2_raw(pid)
+    if raw is None:
+        return None
+    try:
+        exe, args, env = parse_procargs2_full(raw)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return None
+    return (exe, args, env) if args else None
 
 
 # --------------------------------------------------------------------------- #

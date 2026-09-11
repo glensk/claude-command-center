@@ -165,6 +165,23 @@ It flags any action still billing the OpenAI Codex seat, which is reserved for
 `/codex-debate` (`short_aim_backend = "codex"` used to spend ~17.6k Codex tokens per ten-word
 label). See the multi-account section of [docs/reference.md](docs/reference.md).
 
+## The Codex seat switch (`codex_switch.py`)
+
+`command_center/codex_switch.py` is the Codex twin of `switch-account -N`: a live Codex TUI
+thread moves to another `CODEX_HOME` in the same tab, zero tokens, via a `UserPromptSubmit`
+hook that pipes the payload into `ccc codex-switch`. Invariants (debated with Codex, 19
+objections, all accepted — see `docs/reference.md`): the rollout is the hook's
+`transcript_path` (never rediscovered by glob) and its `session_meta` must name the thread;
+the process is the OUTERMOST exact-name `codex` ancestor in the foreground of its tty; argv
+and environ come from `snapshot.procargs_full` (`KERN_PROCARGS2`), the options from a
+COMPLETE allow-list (unknown → refuse, `--remote` → refuse, `-p` → per-home profile file
+must match); the launch is a 0600 record executed by `ccc codex-switch-exec <token>` — no
+value is ever typed into a shell; the TUI is quit with `/quit` only (no SIGTERM); the
+rollout is PREFIX-MERGED (the target's own bytes kept, only the new tail's `rate_limits`
+nulled — ccc's per-seat readers and Codex's byte-offset history projection both depend on
+that; divergence is set aside and refused); a failure after the source exited relaunches
+the SOURCE seat. Tests: `tests/test_codex_switch.py`.
+
 ## The codex launch policy (do not regress)
 
 `command_center/codex_launch.py` is the ONE place a `codex exec` command line is built, and

@@ -170,7 +170,7 @@ same tab after the turn (the conversation continues via `claude --resume`, and w
 `-p` the relaunched session submits a first prompt — `continue` by default — so it
 keeps working on the new seat instead of parking idle; `-K` makes that conditional on
 the session's own state, submitting it only when its work was really interrupted, so a
-switch leaves an idle session idle — see docs/reference.md). For automations that just changed ccc's own code or config (an
+switch leaves an idle session idle — see docs/reference.md). The same move exists for the OpenAI Codex TUI: with several ChatGPT logins configured as `CODEX_HOME`s, typing `/switch [seat]` (leading space) inside any live Codex thread relaunches it under another seat in the same tab with zero tokens (`ccc codex-switch`, driven by a `UserPromptSubmit` hook). For automations that just changed ccc's own code or config (an
 editable install), `ccc restart-tui` bounces the running TUI in its **own** terminal tab
 so the new code loads — no manual keystroke; it exits 0 once the TUI is back, 1 if none
 is running.

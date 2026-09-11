@@ -950,8 +950,8 @@ def send_text_to_session(iterm_session_id: str, text: str) -> bool:
         return False
 
 
-def type_into_iterm_session(iterm_session_id: str, text: str) -> bool:
-    """Type *text* + Return into an EXISTING iTerm session located by ``$ITERM_SESSION_ID``.
+def type_into_iterm_session(iterm_session_id: str, text: str, *, newline: bool = True) -> bool:
+    """Type *text* (+ Return by default) into an EXISTING iTerm session by ``$ITERM_SESSION_ID``.
 
     The same-tab relaunch path of ``ccc switch-now``: once the session's Claude process
     has exited its tab runs only the shell, so AppleScript ``write text`` (which submits
@@ -960,18 +960,26 @@ def type_into_iterm_session(iterm_session_id: str, text: str) -> bool:
     second: the Python-API :func:`send_text_to_session`. ``False`` when neither
     delivered. Callers MUST have confirmed the process is gone — text typed while Claude
     still owns the tty lands in its composer, not in the shell.
+
+    ``newline=False`` types the text WITHOUT the trailing Return (AppleScript ``write text
+    … newline NO``; no Python-API fallback). ``text=""`` with the default sends a bare
+    Return. The pair exists for the Codex TUI, whose paste-burst heuristic (≥ 3 chars
+    within 8 ms each, ``paste_burst.rs``) treats a Return arriving within 120 ms of a
+    burst as a newline INSIDE the paste, not as submit — so ``ccc codex-switch-now``
+    types ``/quit`` first and the Return separately, a beat later.
     """
     uuid = (iterm_session_id or "").split(":")[-1].strip()
-    if not uuid or not text:
+    if not uuid or (not text and not newline):
         return False
     escaped = _as_quote(text)
+    suffix = "" if newline else " newline NO"
     script = f'''
     tell application "iTerm2"
         repeat with aWindow in windows
             repeat with aTab in tabs of aWindow
                 repeat with aSession in sessions of aTab
                     if id of aSession is "{uuid}" then
-                        tell aSession to write text "{escaped}"
+                        tell aSession to write text "{escaped}"{suffix}
                         return "ok"
                     end if
                 end repeat
@@ -983,6 +991,8 @@ def type_into_iterm_session(iterm_session_id: str, text: str) -> bool:
     out = _osascript(script)
     if out is not None and out.strip() == "ok":
         return True
+    if not newline or not text:
+        return False
     return send_text_to_session(iterm_session_id, text)
 
 
@@ -1343,24 +1353,30 @@ def tty_ready_for_input(tty: str, table: dict[int, Any]) -> bool:
     return True
 
 
-def tmux_send_keys(pane_id: str, text: str) -> bool:
-    """Type *text* + Enter into tmux pane *pane_id* (the tmux twin of the iTerm typer)."""
+def tmux_send_keys(pane_id: str, text: str, *, newline: bool = True) -> bool:
+    """Type *text* (+ Enter by default) into tmux pane *pane_id* (the iTerm typer's twin).
+
+    ``newline=False`` sends the text only; ``text=""`` sends a bare Enter — the same pair
+    :func:`type_into_iterm_session` offers, for the same Codex paste-burst reason.
+    """
     tmux = shutil.which("tmux")
-    if tmux is None or not pane_id or not text:
+    if tmux is None or not pane_id or (not text and not newline):
         return False
     try:
-        subprocess.run(
-            [tmux, "send-keys", "-t", pane_id, "-l", text],
-            capture_output=True,
-            timeout=5,
-            check=True,
-        )
-        subprocess.run(
-            [tmux, "send-keys", "-t", pane_id, "Enter"],
-            capture_output=True,
-            timeout=5,
-            check=True,
-        )
+        if text:
+            subprocess.run(
+                [tmux, "send-keys", "-t", pane_id, "-l", text],
+                capture_output=True,
+                timeout=5,
+                check=True,
+            )
+        if newline:
+            subprocess.run(
+                [tmux, "send-keys", "-t", pane_id, "Enter"],
+                capture_output=True,
+                timeout=5,
+                check=True,
+            )
         return True
     except (subprocess.SubprocessError, OSError):
         return False

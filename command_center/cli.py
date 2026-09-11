@@ -2075,6 +2075,27 @@ def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     return 0
 
 
+def cmd_codex_switch(args: argparse.Namespace) -> int:
+    """``ccc codex-switch`` — the Codex ``/switch`` hook side (see :mod:`codex_switch`)."""
+    from . import codex_switch
+
+    return codex_switch.run_switch(args)
+
+
+def cmd_codex_switch_now(args: argparse.Namespace) -> int:
+    """Internal: the detached Codex relauncher (see :mod:`codex_switch`)."""
+    from . import codex_switch
+
+    return codex_switch.run_switch_now(args)
+
+
+def cmd_codex_switch_exec(args: argparse.Namespace) -> int:
+    """The Codex seat-switch trampoline (see :mod:`codex_switch`)."""
+    from . import codex_switch
+
+    return codex_switch.run_switch_exec(args)
+
+
 def cmd_keep(args: argparse.Namespace) -> int:
     return _set_field(args, "keep", not args.off)
 
@@ -5111,6 +5132,71 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "-H", "--halt-id", default="", help="with --auto: the halt record this recovery owns"
     )
     p_switchnow.set_defaults(func=cmd_switch_now)
+
+    p_cswitch = sub.add_parser(
+        "codex-switch",
+        help="Codex `/switch`: move the LIVE Codex thread this hook runs in to another seat "
+        "(CODEX_HOME) in the same tab — reads the UserPromptSubmit JSON on stdin, prints the "
+        "block decision (zero model tokens); spawns codex-switch-now",
+    )
+    p_cswitch.add_argument(
+        "-t",
+        "--target",
+        default="",
+        help="seat label / alias / e-mail (default: next seat with headroom)",
+    )
+    p_cswitch.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="print the plan as the block reason, relaunch nothing",
+    )
+    p_cswitch.add_argument(
+        "-p",
+        "--pid",
+        type=int,
+        default=0,
+        help="start the codex-process search at this pid (testing)",
+    )
+    p_cswitch.add_argument(
+        "-i",
+        "--input",
+        default="",
+        help="read the hook JSON from this file instead of stdin (testing)",
+    )
+    p_cswitch.set_defaults(func=cmd_codex_switch)
+
+    p_cswitchnow = sub.add_parser(
+        "codex-switch-now",
+        help="internal: type /quit into the Codex tab, wait for the process to exit, port the "
+        "rollout to the target CODEX_HOME and type the trampoline line (spawned by codex-switch)",
+    )
+    p_cswitchnow.add_argument("-T", "--token", default="", help="the launch record's token")
+    p_cswitchnow.add_argument("-p", "--pid", type=int, default=0, help="the codex TUI pid to quit")
+    p_cswitchnow.add_argument(
+        "-H",
+        "--hook-pid",
+        type=int,
+        default=0,
+        help="the hook process whose exit marks the block landed",
+    )
+    p_cswitchnow.add_argument("-i", "--iterm", default="", help="the tab's $ITERM_SESSION_ID")
+    p_cswitchnow.add_argument("-t", "--tmux-pane", default="", help="the pane's $TMUX_PANE")
+    p_cswitchnow.set_defaults(func=cmd_codex_switch_now)
+
+    p_cswitchexec = sub.add_parser(
+        "codex-switch-exec",
+        help="the trampoline a switched Codex tab runs: exec `codex … resume <thread>` under "
+        "the seat a codex-switch launch record names (replaces this process)",
+    )
+    p_cswitchexec.add_argument("token", help="the launch record token (app_home/codex-switch/)")
+    p_cswitchexec.add_argument(
+        "-S",
+        "--source",
+        action="store_true",
+        help="relaunch the SOURCE seat instead (the fall-back)",
+    )
+    p_cswitchexec.set_defaults(func=cmd_codex_switch_exec)
 
     p_onlimit = sub.add_parser(
         "switch-on-limit",

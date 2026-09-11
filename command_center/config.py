@@ -169,6 +169,10 @@ DEFAULTS: dict[str, object] = {
     # Anything else falls back to ``fill`` with one stderr note. Set it with
     # ``codex-in-claude policy fill|order`` (or ``ai set codex-policy``).
     "codex_seat_policy": "fill",
+    # Extra names `/switch <seat>` (ccc codex-switch) accepts for a seat, one
+    # ``"alias=label"`` per entry, e.g. ``["work=default", "gl=private"]``. The labels
+    # themselves and the login e-mails are always accepted; aliases are case-insensitive.
+    "codex_seat_aliases": [],
     # Multi-account Claude Code. ``claude_accounts`` maps labels to config dirs, one
     # ``"label=path"`` entry per line (list[str] so save_config round-trips it). Empty
     # (the default) ⇒ a single ``{"private": claude_home()}`` account, i.e. today's
@@ -792,6 +796,7 @@ class Config:
     codex_homes_extra: list[str] = field(default_factory=list)  # "label=path" per extra login
     codex_seat_order: list[str] = field(default_factory=list)  # seat labels, "" = canonical order
     codex_seat_policy: str = "fill"  # "fill" (resets-soonest first) | "order" (strict)
+    codex_seat_aliases: list[str] = field(default_factory=list)  # "alias=label" for /switch
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
     subscription_ends: list[str] = field(default_factory=list)  # "card=YYYY-MM-DD|auto"
