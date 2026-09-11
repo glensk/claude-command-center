@@ -160,6 +160,18 @@ _WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 # ``primary``). Anything of another length is ignored rather than guessed at.
 _WHAM_FIVE_HOUR_SEC = 5 * 3600
 _WHAM_SEVEN_DAY_SEC = 7 * 86400
+# A 0%-used Codex window is NOT an open window: ``wham/usage`` (and the rollout
+# ``rate_limits`` block) then report ``reset_after_seconds == limit_window_seconds`` —
+# ``reset_at`` is just fetch time + window length and moves forward on every refresh
+# (seen 2026-09-10 on the team and de 5h windows, and on both seats' 7d windows in the
+# 09-08 rollouts, tp#226). Embossed as ``Resets in 4h 58m`` it read as two idle seats
+# resetting in lock-step. A window whose reset sits at least the window length minus
+# this slack past its capture is therefore rendered ``idle`` instead (see
+# :func:`_window_idle`); the slack absorbs the endpoint's own clock skew (18002 s seen
+# for an 18000 s window).
+_IDLE_WINDOW_SLACK_SEC = 120
+# The two Codex rows' window lengths, in ``_render_card``'s ``(session, week)`` order.
+_CODEX_IDLE_WINDOW_SEC = (_WHAM_FIVE_HOUR_SEC, _WHAM_SEVEN_DAY_SEC)
 # JSON-RPC ids for the ``codex app-server`` fallback (see _fetch_codex_usage_appserver).
 _APPSERVER_INIT_ID = 1
 _APPSERVER_LIMITS_ID = 2
@@ -1930,6 +1942,21 @@ def _bar_row(
     return row
 
 
+def _window_idle(win: Window | None, captured_at: int, window_sec: int) -> bool:
+    """True when *win* has not opened yet: 0% used and its reset a full window away.
+
+    "A full window away" = ``resets_at - captured_at >= window_sec -
+    _IDLE_WINDOW_SLACK_SEC``, measured from the snapshot's OWN capture time (not the
+    render clock), so the verdict is stable across the TUI's refreshes. Such a window has
+    no reset of its own — its allowance never expires until first use.
+    """
+    return (
+        win is not None
+        and win.used_percentage == 0
+        and win.resets_at - captured_at >= window_sec - _IDLE_WINDOW_SLACK_SEC
+    )
+
+
 def _section(  # pylint: disable=too-many-arguments
     prefix: str,
     win: Window | None,
@@ -1974,6 +2001,7 @@ def _render_card(  # pylint: disable=too-many-arguments
     label_color: str,
     fill_for_pct: Callable[[float], str] | None = None,
     staleness: tuple[int, int] | None = None,
+    idle_window_sec: tuple[int, int] | None = None,
 ) -> Text:
     """The two-bar card body (session + week), shared by both providers.
 
@@ -1993,6 +2021,13 @@ def _render_card(  # pylint: disable=too-many-arguments
     each row drops its bar for a bare ``?%`` once ``now - usage.captured_at`` exceeds
     its own threshold (see :func:`_section`). ``None`` (Codex/Copilot) keeps today's
     behaviour — a bar is always drawn from whatever figure the cache holds.
+
+    *idle_window_sec*, when given, is ``(session_window_sec, week_window_sec)``: a row
+    whose window has not opened yet (0% used, reset a full window length past
+    ``usage.captured_at`` — see :func:`_window_idle`) is embossed ``Session: idle`` /
+    ``Week: idle · opens on first use`` over its 0% bar instead of the drifting
+    ``Resets in …`` placeholder the Codex endpoint reports for it (tp#226). ``None``
+    (the Claude cards) keeps the reset label on every row.
     """
 
     def _fill(win: Window | None) -> str:
@@ -2003,6 +2038,13 @@ def _render_card(  # pylint: disable=too-many-arguments
     age = now - usage.captured_at
     session_stale = staleness is not None and age > staleness[0]
     week_stale = staleness is not None and age > staleness[1]
+    session_label: str | None = None
+    week_label: str | None = None
+    if idle_window_sec is not None:
+        if _window_idle(usage.five_hour, usage.captured_at, idle_window_sec[0]):
+            session_label = "Session: idle"
+        if _window_idle(usage.seven_day, usage.captured_at, idle_window_sec[1]):
+            week_label = "Week: idle · opens on first use"
 
     text = Text()
     text.append_text(
@@ -2012,13 +2054,20 @@ def _render_card(  # pylint: disable=too-many-arguments
             now,
             _fill(usage.five_hour),
             label_color,
+            label=session_label,
             stale=session_stale,
         )
     )
     # No blank line between the windows — keeps the card tight.
     text.append_text(
         _section(
-            "Week: ", usage.seven_day, now, _fill(usage.seven_day), label_color, stale=week_stale
+            "Week: ",
+            usage.seven_day,
+            now,
+            _fill(usage.seven_day),
+            label_color,
+            label=week_label,
+            stale=week_stale,
         )
     )
     if usage.fable_week is not None:
@@ -2082,11 +2131,22 @@ def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
     last SUCCESSFUL call's and read as headroom, hence the ``100% = the limit that fired``
     caveat) and any snapshot with no live exhausted window to pin (see
     :func:`codex_exhausted_window`).
+
+    A window that has not opened yet (0% used, reset a full window length past the
+    capture — the endpoint's placeholder, see :data:`_IDLE_WINDOW_SLACK_SEC`) is embossed
+    ``Session: idle`` / ``Week: idle · opens on first use`` instead of a ``Resets in …``
+    that would creep forward on every refresh.
     """
     now = int(time.time()) if now is None else now
     if usage is not None and usage.blocked:
         if usage.live and not usage.is_empty() and codex_exhausted_window(usage, now) is not None:
-            return _render_card(usage, now, fill_color=_CODEX_FILL, label_color=_CODEX_FILL)
+            return _render_card(
+                usage,
+                now,
+                fill_color=_CODEX_FILL,
+                label_color=_CODEX_FILL,
+                idle_window_sec=_CODEX_IDLE_WINDOW_SEC,
+            )
         # The bars below are the last SUCCESSFUL call's figures and would read as healthy
         # headroom, so the refusal is stated first, in red, with the age of the numbers.
         # Card-sized wording (short_refusal_label), and no "BLOCKED —" prefix: the red ⛔
@@ -2113,10 +2173,22 @@ def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
             else f"100% = the limit that fired; other figures are {age} old"
         )
         banner += Text(note + "\n", style="grey50")
-        return banner + _render_card(usage, now, fill_color=_CODEX_FILL, label_color=_CODEX_FILL)
+        return banner + _render_card(
+            usage,
+            now,
+            fill_color=_CODEX_FILL,
+            label_color=_CODEX_FILL,
+            idle_window_sec=_CODEX_IDLE_WINDOW_SEC,
+        )
     if usage is None or usage.is_empty():
         return Text("—\n(run Codex to populate)", style="grey50")
-    return _render_card(usage, now, fill_color=_CODEX_FILL, label_color=_CODEX_FILL)
+    return _render_card(
+        usage,
+        now,
+        fill_color=_CODEX_FILL,
+        label_color=_CODEX_FILL,
+        idle_window_sec=_CODEX_IDLE_WINDOW_SEC,
+    )
 
 
 # --- GitHub Copilot month-to-date usage ----------------------------------------

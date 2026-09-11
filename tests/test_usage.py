@@ -781,6 +781,69 @@ def test_render_codex_usage_empty_placeholder() -> None:
     assert "run Codex" in plain
 
 
+def test_render_codex_usage_idle_window_reads_idle_not_a_drifting_reset() -> None:
+    """tp#226: at 0% the endpoint reports ``reset_at = fetch time + window length`` (no
+    window is open), which embossed as ``Resets in 4h 58m`` creeping forward on every
+    refresh. Such a row reads ``idle`` — and the verdict keys on the snapshot's own
+    capture time, so it does not flip as the render clock advances."""
+    snap = usage.Usage(
+        captured_at=_NOW,
+        five_hour=usage.Window(0.0, _NOW + usage._WHAM_FIVE_HOUR_SEC + 2),  # 18002 s seen
+        seven_day=usage.Window(0.0, _NOW + usage._WHAM_SEVEN_DAY_SEC),
+    )
+    for now in (_NOW, _NOW + 3600, _NOW + 4 * 3600):
+        plain = usage.render_codex_usage(snap, now=now).plain
+        assert "Session: idle" in plain
+        assert "Week: idle · opens on first use" in plain
+        assert "Resets" not in plain
+        for line in plain.splitlines():
+            assert line.endswith("0%") and len(line) == usage._CARD_INNER_WIDTH
+    # The two rows are judged independently: a used week keeps its real reset.
+    mixed = usage.Usage(
+        captured_at=_NOW,
+        five_hour=usage.Window(0.0, _NOW + usage._WHAM_FIVE_HOUR_SEC),
+        seven_day=usage.Window(16.0, _NOW + 447156),
+    )
+    plain = usage.render_codex_usage(mixed, now=_NOW).plain
+    assert "Session: idle" in plain
+    assert "Week: Resets in 5d 4h 12m" in plain and "16%" in plain
+
+
+def test_render_codex_usage_idle_needs_both_zero_and_a_full_window() -> None:
+    """A 0% row whose reset is nearer than a full window IS an open window (a window
+    that just rolled over): it keeps ``Resets in …``. So does any used window whose
+    reset happens to sit a full window away, and the Claude card keeps its reset label
+    on every row — the idle rule is the Codex card's alone."""
+    rolled = usage.Usage(
+        captured_at=_NOW,
+        five_hour=usage.Window(0.0, _NOW + usage._WHAM_FIVE_HOUR_SEC - 600),
+        seven_day=usage.Window(0.0, _NOW + usage._WHAM_SEVEN_DAY_SEC - 600),
+    )
+    plain = usage.render_codex_usage(rolled, now=_NOW).plain
+    assert "Session: Resets in 4h 50m" in plain
+    assert "Week: Resets in 6d 23h 50m" in plain
+    assert "idle" not in plain
+    # Inside the slack the window still counts as unopened.
+    edge = usage.Usage(
+        captured_at=_NOW,
+        five_hour=usage.Window(0.0, _NOW + usage._WHAM_FIVE_HOUR_SEC - 60),
+        seven_day=usage.Window(1.0, _NOW + usage._WHAM_SEVEN_DAY_SEC),
+    )
+    plain = usage.render_codex_usage(edge, now=_NOW).plain
+    assert "Session: idle" in plain
+    assert "Week: Resets in 7d 0h 0m" in plain and "1%" in plain
+    # Claude cards: same shape, unchanged rendering.
+    claude = usage.Usage(
+        captured_at=_NOW,
+        five_hour=usage.Window(0.0, _NOW + usage._WHAM_FIVE_HOUR_SEC),
+        seven_day=usage.Window(0.0, _NOW + usage._WHAM_SEVEN_DAY_SEC),
+    )
+    plain = usage.render_usage(claude, now=_NOW).plain
+    assert "Session: Resets in 5h 0m" in plain
+    assert "Week: Resets in 7d 0h 0m" in plain
+    assert "idle" not in plain
+
+
 # A realistic per-user enhanced-billing usage payload (verified shape): the current
 # month carries Copilot "AI Credits" line-items (net 0 => covered by the subscription).
 _COPILOT_API = {
