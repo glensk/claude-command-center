@@ -3177,17 +3177,18 @@ class CommandCenterApp(App[None]):
         jumpstate.clear_request()
 
     def _session_for_uuid(self, uuid: str) -> str | None:
-        """The tracked session id whose iTerm tab UUID is *uuid*, or None (from the store)."""
+        """The tracked session id that owns iTerm tab *uuid*, or None (from the store).
+
+        Several rows can share a tab (a relaunch in the same tab); the live/most recent
+        one wins — see :meth:`Store.session_for_tab_uuid`.
+        """
         if (store := self.store) is None:
             return None
         try:
-            for session in store.list_sessions():
-                isid = session.iterm_session_id
-                if isid and isid.split(":")[-1] == uuid:
-                    return session.session_id
+            session = store.session_for_tab_uuid(uuid)
         except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             return None
-        return None
+        return session.session_id if session else None
 
     async def _handle_jump_toggle(self) -> None:
         """Run the whole f+j toggle in-process (the fast path — see jump / iterm_api).

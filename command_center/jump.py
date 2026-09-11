@@ -97,16 +97,17 @@ def find_ccc_tty() -> str | None:
 
 
 def _session_for_uuid(uuid: str) -> str | None:
-    """The tracked session id whose iTerm tab UUID is *uuid*, or None."""
+    """The tracked session id that owns iTerm tab *uuid*, or None.
+
+    Several rows can share a tab (a relaunch in the same tab); the live/most recent
+    one wins — see :meth:`Store.session_for_tab_uuid`.
+    """
     try:
         with Store() as store:
-            for session in store.list_sessions():
-                isid = session.iterm_session_id
-                if isid and isid.split(":")[-1] == uuid:
-                    return session.session_id
+            session = store.session_for_tab_uuid(uuid)
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return None
-    return None
+    return session.session_id if session else None
 
 
 def _resume_selected() -> int:

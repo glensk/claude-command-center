@@ -692,6 +692,32 @@ class Store:  # pylint: disable=too-many-public-methods
         columns = _session_columns(rows[0])
         return [_row_to_session(r, columns) for r in rows]
 
+    def session_for_tab_uuid(self, uuid: str) -> Session | None:
+        """The session that currently owns the iTerm tab whose UUID is *uuid*, or None.
+
+        A tab outlives its sessions: a relaunch in the same tab (a resume, an
+        account switch, a driver starting the next run after the previous one hit its
+        limit) leaves several rows carrying the same ``iterm_session_id``. The one the
+        user is looking at is the live one — so a not-done row beats a done one, then
+        the most recently active wins (``last_response_at``, then ``updated_at``).
+        Naive first-match returned the OLDEST row (SQL insertion order), which sent
+        ``f+j`` and peek to the dead session. Matching is case-insensitive on the
+        UUID tail (``w0t1p0:UUID`` → ``UUID``); archived rows are included so a tab
+        whose only owner is archived still resolves.
+        """
+        want = uuid.split(":")[-1].strip().upper()
+        if not want:
+            return None
+        matches = [
+            s
+            for s in self.list_sessions(include_archived=True)
+            if s.iterm_session_id and s.iterm_session_id.split(":")[-1].strip().upper() == want
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda s: (s.done, s.archived, -s.last_response_at, -s.updated_at))
+        return matches[0]
+
     def delete(self, session_id: str) -> None:
         """Remove a session, its sub-goals (FK cascade) and its transcript-scan row.
 

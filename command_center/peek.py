@@ -191,16 +191,8 @@ def session_prompts(adapter: ClaudeAdapter, session: Session) -> list[str]:
 
 
 def _session_for_uuid(store: Store, uuid: str) -> Session | None:
-    """The tracked session whose tab UUID matches, most-recently-active first."""
-    matches = [
-        session
-        for session in store.list_sessions(include_archived=True)
-        if _uuid(session.iterm_session_id) == uuid
-    ]
-    if not matches:
-        return None
-    matches.sort(key=lambda s: (s.last_response_at, s.updated_at), reverse=True)
-    return matches[0]
+    """The tracked session whose tab UUID matches (see :meth:`Store.session_for_tab_uuid`)."""
+    return store.session_for_tab_uuid(uuid)
 
 
 def _leaf(cwd: str) -> str:

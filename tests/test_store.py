@@ -99,6 +99,46 @@ def test_archived_excluded(tmp_path: Path) -> None:
     assert len(store.list_sessions(include_archived=True)) == 2
 
 
+def test_session_for_tab_uuid_live_row_beats_done_row(tmp_path: Path) -> None:
+    """A reused tab: the done session that responded LAST still loses to the live one.
+
+    Regression: f+j from a tab whose previous session exited (out of credits) and a
+    new one was launched in the same tab landed on the dead row — first SQL match
+    (insertion order) won, and the dead row was the older one.
+    """
+    store = _store(tmp_path)
+    store.ensure("dead", cwd="/Users/x/repo")
+    store.update_fields(
+        "dead", iterm_session_id="w1t13p0:TAB-1", done=True, last_response_at=900, updated_at=950
+    )
+    store.ensure("fresh", cwd="/Users/x/repo")  # relaunched in the same tab, no reply yet
+    store.update_fields("fresh", iterm_session_id="w1t13p0:TAB-1", last_response_at=0)
+    chosen = store.session_for_tab_uuid("TAB-1")
+    assert chosen is not None and chosen.session_id == "fresh"
+    assert store.session_for_tab_uuid("w9t9p9:tab-1") is not None  # tail + case-insensitive
+    assert store.session_for_tab_uuid("TAB-NOPE") is None
+    assert store.session_for_tab_uuid("") is None
+
+
+def test_session_for_tab_uuid_most_recent_live_wins(tmp_path: Path) -> None:
+    """Two live rows on one tab → the one that answered most recently."""
+    store = _store(tmp_path)
+    store.ensure("old", cwd="/Users/x/repo")
+    store.update_fields("old", iterm_session_id="w0t1p0:TAB-2", last_response_at=100)
+    store.ensure("new", cwd="/Users/x/repo")
+    store.update_fields("new", iterm_session_id="w0t1p0:TAB-2", last_response_at=200)
+    store.ensure("gone", cwd="/Users/x/repo")  # archived: only wins when nothing else owns the tab
+    store.update_fields(
+        "gone", iterm_session_id="w0t1p0:TAB-2", last_response_at=999, archived=True
+    )
+    chosen = store.session_for_tab_uuid("TAB-2")
+    assert chosen is not None and chosen.session_id == "new"
+    store.ensure("only", cwd="/Users/x/repo")
+    store.update_fields("only", iterm_session_id="w0t1p0:TAB-3", archived=True)
+    chosen = store.session_for_tab_uuid("TAB-3")
+    assert chosen is not None and chosen.session_id == "only"
+
+
 _UUID_A = "ad2096c4-0000-4000-8000-000000000001"
 _UUID_B = "ad2096c4-0000-4000-8000-000000000002"  # shares A's 8-char display prefix
 _UUID_C = "be317d55-0000-4000-8000-000000000003"

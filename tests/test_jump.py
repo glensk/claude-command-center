@@ -152,6 +152,24 @@ def test_run_in_session_tab_requests_then_focuses(monkeypatch: pytest.MonkeyPatc
     assert calls["resume"] == 0
 
 
+def test_session_tab_reused_by_two_sessions_picks_live_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Slow path, real store: a tab holding a done row AND a live row selects the live one."""
+    from command_center.store import Store
+
+    db = tmp_path / "state.db"
+    with Store(db) as store:
+        store.ensure("dead", cwd="/Users/x/repo")
+        store.update_fields("dead", iterm_session_id="w1t13p0:UUID-S", done=True)
+        store.ensure("live", cwd="/Users/x/repo")
+        store.update_fields("live", iterm_session_id="w1t13p0:UUID-S")
+    monkeypatch.setattr(jump, "Store", lambda: Store(db))
+    calls = _wire(monkeypatch, frontmost=True, current=("UUID-S", "/dev/ttys042"))
+    assert jump.run(_args()) == 0
+    assert calls["request"] == "live"
+
+
 def test_no_toggle_skips_context(monkeypatch: pytest.MonkeyPatch) -> None:
     """--no-toggle → always just focus ccc, even in the ccc tab."""
     calls = _wire(monkeypatch, frontmost=True, current=("UUID-X", "/dev/ttys001"))
