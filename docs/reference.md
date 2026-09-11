@@ -965,10 +965,13 @@ one script, **`codex-in-claude.py`** (on `PATH`; it's this repo's folder, added 
 `.zshrc` — the skill/command call it by bare name, so the repo can move):
 
 ```commands
-codex-in-claude.py models                              # list models (* = configured)
+codex-in-claude.py models                              # list models (* = configured) + short names
 codex-in-claude.py set-model gpt-5.5 --for delegate-review   # or --for debate / --for all
+codex-in-claude.py set-model astra --for debate        # short names (sol, astra, …) resolve to slugs
+codex-in-claude.py alias [<name> <slug>] [-d <name>]   # list / define / delete short names
 codex-in-claude.py set-effort high                     # low|medium|high|xhigh|default (model's own)
 codex-in-claude.py get-model --for debate
+codex-in-claude.py get-model astra                     # the slug a name means (exit 3 = unknown)
 ```
 
 `delegate` runs are **supervised**: `codex exec` lives in its own process group (killed whole

@@ -42,7 +42,10 @@ move):
 codex-in-claude.py models                                    # list models (* = configured)
 codex-in-claude.py pick [--for debate]                       # interactive numbered picker
 codex-in-claude.py set-model gpt-5.6-sol --for all           # or --for debate / delegate-review
+codex-in-claude.py set-model astra --for debate              # short names resolve to the slug
 codex-in-claude.py get-model --for debate
+codex-in-claude.py get-model astra                           # what a name means (exit 3 = unknown)
+codex-in-claude.py alias [<name> <slug>] [-d <name>]         # list / define / delete short names
 codex-in-claude.py set-effort high                           # low|medium|high|xhigh|default
 codex-in-claude.py sync-skills [--check]                     # re-stamp the model into the help
 codex-in-claude.py usage [--json]                            # Codex 5h + weekly quota
@@ -72,6 +75,18 @@ seat with no fallback at all.
 
 `--for all` is a real reset: it moves `default` **and** clears the per-command pins, which
 would otherwise shadow it. A bare `set-model <slug>` (no `--for`) only moves `default`.
+
+**Short names.** Every model argument — `set-model`, `get-model NAME`, `delegate -m`,
+`run -m`, and through the last one `codex-review.py -m`, i.e. `/codex-debate <name>` —
+accepts a short name as well as a slug. The catalog's own codenames are built in (`sol` →
+`gpt-5.6-sol`, `astra` → `gpt-6-astra`, `terra`, `luna`: the trailing alphabetic segment
+of a VISIBLE slug, dropped when two visible slugs share it; hidden models are reachable by
+slug only), and the config's `aliases` map — written by `alias <name> <slug>` — wins over
+them. Names are stored resolved (the config holds slugs, never names), an unknown name
+exits `3` listing the slugs and short names, and `codex-in-claude.py models` prints the
+current short-name table. `/codex-debate astra` runs ONE debate on GPT-6 Astra without
+touching the standing `debate` default (`sol`); `/codex-model astra debate` changes the
+default itself.
 
 ## Seat policy: fill (default) or order — next attempt and runtime fallback
 

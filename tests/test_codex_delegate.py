@@ -166,6 +166,115 @@ def test_valid_slug_and_effort(cic: ModuleType) -> None:
     assert cic.effort_of("gpt-5.5") == "xhigh"
 
 
+# --------------------------- short model names (aliases) --------------------------- #
+def test_codename_is_the_trailing_alphabetic_segment(cic: ModuleType) -> None:
+    assert cic.codename_of("gpt-5.6-sol") == "sol"
+    assert cic.codename_of("gpt-6-astra") == "astra"
+    assert cic.codename_of("gpt-5.5") is None  # version-only slug: no codename
+    assert cic.codename_of("sol") is None  # no dash at all
+    assert cic.codename_of("gpt-5.6-Sol") == "sol"  # lowercased
+
+
+def test_builtin_aliases_skip_hidden_and_ambiguous(
+    cic: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only VISIBLE models get a built-in name; a shared codename names nobody."""
+    catalog = [
+        {"slug": "gpt-5.6-sol", "visibility": "list"},
+        {"slug": "gpt-6-astra", "visibility": "list"},
+        {"slug": "gpt-6-astra-preview", "visibility": "hide"},  # hidden: no name
+        {"slug": "gpt-7-nova", "visibility": "list"},
+        {"slug": "gpt-8-nova", "visibility": "list"},  # 'nova' is ambiguous: dropped
+        {"slug": "gpt-5.5", "visibility": "list"},
+    ]
+    monkeypatch.setattr(
+        cic,
+        "list_models",
+        lambda **kw: [m for m in catalog if kw.get("include_hidden") or m["visibility"] == "list"],
+    )
+    assert cic.builtin_aliases() == {"sol": "gpt-5.6-sol", "astra": "gpt-6-astra"}
+    assert cic.resolve_alias("nova") is None
+    assert cic.resolve_alias("gpt-7-nova") == "gpt-7-nova"  # the full slug still works
+    assert cic.resolve_alias("gpt-6-astra-preview") == "gpt-6-astra-preview"  # hidden by slug
+
+
+def test_resolve_alias_prefers_slug_then_config_then_codename(cic: ModuleType) -> None:
+    assert cic.resolve_alias("gpt-5.5") == "gpt-5.5"
+    assert cic.resolve_alias("sol") == "gpt-5.6-sol"
+    assert cic.resolve_alias(" SOL ") == "gpt-5.6-sol"  # case/space-insensitive
+    assert cic.resolve_alias("astra") is None  # not in _FAKE_CATALOG
+    cic.save_config({"aliases": {"Astra": "gpt-5.5", "sol": "gpt-5.4"}})
+    assert cic.resolve_alias("astra") == "gpt-5.5"  # config defines it
+    assert cic.resolve_alias("sol") == "gpt-5.4"  # config wins over the codename
+    assert cic.config_aliases() == {"astra": "gpt-5.5", "sol": "gpt-5.4"}
+
+
+def test_load_config_tolerates_a_bad_aliases_value(cic: ModuleType) -> None:
+    cic.save_config({"aliases": "gpt-5.5"})  # not a map
+    assert cic.load_config()["aliases"] == {}
+    assert cic.resolve_alias("sol") == "gpt-5.6-sol"
+
+
+def test_set_model_accepts_a_short_name(cic: ModuleType) -> None:
+    assert cic.cmd_set_model(argparse.Namespace(slug="sol", for_command="debate")) == cic.EX_OK
+    assert cic.resolve_model("debate") == "gpt-5.6-sol"  # stored as the SLUG, never the name
+    assert (
+        cic.cmd_set_model(argparse.Namespace(slug="astra", for_command="debate"))
+        == cic.EX_INVALID_MODEL
+    )
+    assert cic.resolve_model("debate") == "gpt-5.6-sol"  # unchanged on refusal
+
+
+def test_get_model_resolves_a_name(cic: ModuleType, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cic.cmd_get_model(argparse.Namespace(name="sol", for_command=None)) == cic.EX_OK
+    assert capsys.readouterr().out.strip() == "gpt-5.6-sol"
+    assert cic.cmd_get_model(argparse.Namespace(name="gpt-5.4", for_command=None)) == cic.EX_OK
+    assert capsys.readouterr().out.strip() == "gpt-5.4"
+    assert (
+        cic.cmd_get_model(argparse.Namespace(name="astra", for_command=None))
+        == cic.EX_INVALID_MODEL
+    )
+    err = capsys.readouterr().err
+    assert "Unknown model 'astra'" in err and "sol=gpt-5.6-sol" in err
+    # without a name it is the old contract: the resolution for --for
+    cic.save_config({"default": "gpt-5.4"})
+    assert cic.cmd_get_model(argparse.Namespace(name=None, for_command="debate")) == cic.EX_OK
+    assert capsys.readouterr().out.strip() == "gpt-5.4"
+
+
+def test_alias_define_list_delete(cic: ModuleType, capsys: pytest.CaptureFixture[str]) -> None:
+    ns = lambda **kw: argparse.Namespace(  # noqa: E731
+        name=kw.get("name"), slug=kw.get("slug"), delete=kw.get("delete", False)
+    )
+    assert cic.cmd_alias(ns(name="Astra", slug="gpt-5.5")) == cic.EX_OK
+    assert cic.load_config()["aliases"] == {"astra": "gpt-5.5"}
+    assert cic.cmd_alias(ns(name="a2", slug="astra")) == cic.EX_OK  # via another name
+    assert cic.load_config()["aliases"]["a2"] == "gpt-5.5"
+    assert cic.cmd_alias(ns(name="bad", slug="gpt-9")) == cic.EX_INVALID_MODEL
+    assert cic.cmd_alias(ns(name="gpt-5.4", slug="gpt-5.5")) == cic.EX_USAGE  # a slug is no name
+    capsys.readouterr()
+    assert cic.cmd_alias(ns()) == cic.EX_OK
+    out = capsys.readouterr().out
+    assert "astra            -> gpt-5.5  (config)" in out
+    assert "sol              -> gpt-5.6-sol  (built-in)" in out
+    assert cic.cmd_alias(ns(name="astra")) == cic.EX_OK
+    assert capsys.readouterr().out.strip() == "gpt-5.5"
+    assert cic.cmd_alias(ns(name="astra", delete=True)) == cic.EX_OK
+    assert "astra" not in cic.load_config()["aliases"]
+    assert cic.cmd_alias(ns(name="sol", delete=True)) == cic.EX_USAGE  # built-in: not deletable
+    assert cic.cmd_alias(ns(name=None, delete=True)) == cic.EX_USAGE
+    assert cic.cmd_alias(ns(name="nope")) == cic.EX_INVALID_MODEL
+
+
+def test_models_lists_the_short_names(cic: ModuleType, capsys: pytest.CaptureFixture[str]) -> None:
+    cic.save_config({"aliases": {"astra": "gpt-5.5"}})
+    assert cic.cmd_models(argparse.Namespace(refresh=False, include_hidden=False)) == cic.EX_OK
+    out = capsys.readouterr().out
+    assert "short names" in out
+    assert "astra            -> gpt-5.5  (config)" in out
+    assert "sol              -> gpt-5.6-sol\n" in out
+
+
 # --------------------------- quota parsing / headroom --------------------------- #
 _HEADROOM_NOW = 2_000_000_000
 _HEADROOM_FIXTURES = Path(__file__).parent / "fixtures" / "codex_headroom"

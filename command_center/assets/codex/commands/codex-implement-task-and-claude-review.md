@@ -18,7 +18,7 @@ Do this:
      read-only lockout stays). Without it, Codex stays read-only and returns a patch you apply.
    - `--no-takeover` → if Codex fails after 3 rounds, report the failures instead of
      implementing it yourself.
-   - an optional **model slug** (e.g. `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`) — if present, it
+   - an optional **model slug or short name** (e.g. `gpt-5.5`, `sol`, `astra`) — if present, it
      overrides the configured model for this run (`codex-in-claude delegate -m <slug>`). See
      choices with `codex-in-claude models`. Everything left after the flags/model is the `<task>`.
 

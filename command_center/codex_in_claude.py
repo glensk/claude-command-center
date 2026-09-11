@@ -9,6 +9,7 @@ command (``/codex-implement-task-and-claude-review`` and ``/codex-debate``):
 * ``models``      — list the Codex models available on this login.
 * ``get-model``   — print the model resolved for a given command.
 * ``set-model``   — set the model for a command (or the global default).
+* ``alias``       — list/define/delete short model names (``astra`` -> ``gpt-6-astra``).
 * ``pick``        — interactive numbered picker for the model (terminal only).
 * ``sync-skills`` — stamp the resolved model into the ``description:`` frontmatter of the
                     codex skills/commands, so Claude Code's ``/codex…`` help shows it.
@@ -28,9 +29,16 @@ Model source: ``codex debug models`` (``--refresh``), else the offline cache
 Config (JSON, atomic writes)::
 
     ~/.config/codex-in-claude/config.json        # override via $CODEX_IN_CLAUDE_CONFIG
-    {"default": "gpt-5.6-sol", "delegate-review": null, "debate": null}
+    {"default": "gpt-5.6-sol", "delegate-review": null, "debate": null,
+     "aliases": {"astra": "gpt-6-astra"}}
 
 Resolution order for a command: per-command value -> ``default`` -> ``gpt-5.6-sol``.
+
+Every place that takes a model (``set-model``, ``get-model NAME``, ``delegate -m``,
+``run -m`` — and through it ``codex-review.py -m``, i.e. ``/codex-debate <name>``) accepts
+a SHORT NAME as well as a slug: the catalog's own codenames are built in (``sol`` ->
+``gpt-5.6-sol``, ``astra`` -> ``gpt-6-astra``: the trailing alphabetic segment of a slug,
+dropped when two slugs share it) and the config's ``aliases`` map wins over them.
 
 ``set-model`` / ``set-effort`` / ``pick`` also re-stamp the ``[codex <model> effort=<e>]``
 marker into the codex skill/command descriptions (see ``sync-skills``), so the model in
@@ -958,13 +966,14 @@ def load_config() -> dict:
     :func:`pinned_codex_home`); ``codex-review.py`` reads the same two keys.
     """
     path = config_path()
-    base = {
+    base: dict[str, Any] = {
         "default": DEFAULT_MODEL,
         "delegate-review": None,
         "debate": None,
         "effort": "xhigh",
         "codex_home": None,
         "codex_home_until": None,
+        "aliases": {},
     }
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -972,6 +981,8 @@ def load_config() -> dict:
             base.update(data)
     except (OSError, ValueError):
         pass
+    if not isinstance(base.get("aliases"), dict):
+        base["aliases"] = {}
     return base
 
 
@@ -1180,6 +1191,75 @@ def valid_slug(slug: str) -> bool:
     return any(m.get("slug") == slug for m in list_models(refresh=False, include_hidden=True))
 
 
+def codename_of(slug: str) -> str | None:
+    """The catalog codename of *slug*: ``gpt-5.6-sol`` -> ``sol``, ``gpt-5.5`` -> None.
+
+    The trailing ``-<word>`` segment when it is purely alphabetic; a version-only slug
+    has none.
+    """
+    head, sep, tail = slug.rpartition("-")
+    if not sep or not head or not tail.isalpha():
+        return None
+    return tail.lower()
+
+
+def builtin_aliases() -> dict[str, str]:
+    """Codename -> slug for every VISIBLE catalog model, ambiguous codenames dropped.
+
+    Two visible slugs sharing a codename would make the short name a guess, so neither
+    gets it — the full slug still works. Hidden models (``codex-auto-review``,
+    ``gpt-reserve``) get no built-in name: they are reachable by slug or a config alias.
+    """
+    seen: dict[str, str | None] = {}
+    for model in list_models(refresh=False, include_hidden=False):
+        slug = str(model.get("slug") or "")
+        name = codename_of(slug)
+        if not name:
+            continue
+        seen[name] = None if name in seen and seen[name] != slug else slug
+    return {name: slug for name, slug in seen.items() if slug}
+
+
+def config_aliases() -> dict[str, str]:
+    """The user-defined ``aliases`` map (``codex-in-claude alias NAME SLUG``), keys lowercased."""
+    raw = load_config().get("aliases") or {}
+    return {
+        str(name).lower(): str(slug)
+        for name, slug in raw.items()
+        if isinstance(name, str) and isinstance(slug, str) and name and slug
+    }
+
+
+def model_aliases() -> dict[str, str]:
+    """Every short name that resolves: built-in codenames, overlaid by the config map."""
+    merged = builtin_aliases()
+    merged.update(config_aliases())
+    return merged
+
+
+def resolve_alias(name: str) -> str | None:
+    """Turn a model NAME (slug or short name) into a catalog slug, or None if unknown."""
+    if valid_slug(name):
+        return name
+    return model_aliases().get(name.strip().lower())
+
+
+def _model_arg(name: str) -> str | None:
+    """Resolve a user-supplied model name; on failure print the known names and return None."""
+    slug = resolve_alias(name)
+    if slug:
+        return slug
+    known = ", ".join(str(m.get("slug")) for m in list_models(refresh=False, include_hidden=False))
+    short = ", ".join(f"{alias}={slug}" for alias, slug in sorted(model_aliases().items()))
+    print(
+        f"Unknown model '{name}'. Known (visible): {known or '(none)'}\n"
+        f"Short names: {short or '(none)'}\n"
+        "Use --include-hidden via `models -H` to see hidden ones.",
+        file=sys.stderr,
+    )
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Subcommands
 # --------------------------------------------------------------------------- #
@@ -1206,19 +1286,106 @@ def cmd_models(args: argparse.Namespace) -> int:
         desc = str(m.get("description") or "")
         print(f" {star} {slug:<{width}}  effort={eff:<7}{hide}  {desc}")
     print()
+    user_defined = config_aliases()
+    aliases = model_aliases()
+    if aliases:
+        print("short names (any model argument accepts them):")
+        for alias, slug in sorted(aliases.items()):
+            tag = "  (config)" if user_defined.get(alias) == slug else ""
+            print(f"    {alias:<16} -> {slug}{tag}")
+        print()
     print("per-command:")
     for cmd in COMMANDS:
         print(f"    {cmd:<16} -> {resolve_model(cmd)}")
     print(f"    {'effort':<16} -> {resolve_effort() or 'default (each model own)'}")
     print(f"\nconfig: {local_link(config_path())}")
-    print("change: codex-in-claude.py pick   |   set-model <slug> [--for debate|delegate-review]")
+    print(
+        "change: codex-in-claude.py pick   |   set-model <slug|name> [--for debate|delegate-review]"
+        "   |   alias <name> <slug>"
+    )
     return EX_OK
 
 
 def cmd_get_model(args: argparse.Namespace) -> int:
-    """Print the resolved model for a command (or the global default)."""
+    """Print the resolved model for a command (or the global default).
+
+    With a NAME (``get-model astra``): print the slug that short name or slug resolves
+    to — exit 3 when it is unknown — so a caller can validate a model argument before
+    spending a round on it.
+    """
+    name = getattr(args, "name", None)
+    if name:
+        slug = _model_arg(name)
+        if not slug:
+            return EX_INVALID_MODEL
+        print(slug)
+        return EX_OK
     print(resolve_model(args.for_command))
     return EX_OK
+
+
+def _alias_delete(name: str) -> int:
+    """``alias -d NAME``: drop a config alias (built-in codenames are not deletable)."""
+    if not name:
+        print("alias -d needs the NAME to delete.", file=sys.stderr)
+        return EX_USAGE
+    cfg = load_config()
+    if name not in cfg["aliases"]:
+        hint = ""
+        if name in builtin_aliases():
+            hint = " (a built-in codename; only config aliases can be deleted)"
+        print(f"No config alias '{name}'{hint}.", file=sys.stderr)
+        return EX_USAGE
+    del cfg["aliases"][name]
+    save_config(cfg)
+    print(f"deleted alias {name}")
+    return EX_OK
+
+
+def _alias_define(name: str, slug: str) -> int:
+    """``alias NAME SLUG``: record NAME -> SLUG in the config (SLUG may itself be a name)."""
+    target = _model_arg(slug)
+    if not target:
+        return EX_INVALID_MODEL
+    if valid_slug(name):
+        print(f"'{name}' is a model slug itself and cannot be an alias.", file=sys.stderr)
+        return EX_USAGE
+    cfg = load_config()
+    cfg["aliases"][name] = target
+    path = save_config(cfg)
+    print(f"alias {name} -> {target}\nconfig: {path}")
+    return EX_OK
+
+
+def _alias_list() -> int:
+    """``alias`` with no arguments: every short name, tagged built-in or config."""
+    user_defined = config_aliases()
+    aliases = model_aliases()
+    if not aliases:
+        print("(no short names: empty catalog and no config aliases)")
+        return EX_OK
+    for alias, target in sorted(aliases.items()):
+        tag = "  (config)" if user_defined.get(alias) == target else "  (built-in)"
+        print(f"  {alias:<16} -> {target}{tag}")
+    return EX_OK
+
+
+def cmd_alias(args: argparse.Namespace) -> int:
+    """List, define, resolve or delete short model names (config ``aliases``)."""
+    name = (getattr(args, "name", None) or "").strip().lower()
+    slug = getattr(args, "slug", None)
+    if getattr(args, "delete", False):
+        return _alias_delete(name)
+    if name and slug:
+        return _alias_define(name, slug)
+    if name:
+        resolved = resolve_alias(name)
+        if not resolved:
+            print(f"'{name}' is not defined.", file=sys.stderr)
+            return EX_INVALID_MODEL
+        print(resolved)
+        return EX_OK
+    return _alias_list()
 
 
 def _report_sync(rows: list[tuple[str, Path, str]], *, verbose: bool = False) -> None:
@@ -1313,16 +1480,8 @@ def cmd_pick(args: argparse.Namespace) -> int:
 
 def cmd_set_model(args: argparse.Namespace) -> int:
     """Set the model for a command (or the global default with --for all/omitted)."""
-    slug = args.slug
-    if not valid_slug(slug):
-        known = ", ".join(
-            str(m.get("slug")) for m in list_models(refresh=False, include_hidden=False)
-        )
-        print(
-            f"Unknown model '{slug}'. Known (visible): {known or '(none)'}\n"
-            "Use --include-hidden via `models -H` to see hidden ones.",
-            file=sys.stderr,
-        )
+    slug = _model_arg(args.slug)
+    if not slug:
         return EX_INVALID_MODEL
     cfg = load_config()
     target = args.for_command
@@ -3991,10 +4150,12 @@ def cmd_delegate(args: argparse.Namespace) -> int:  # pylint: disable=too-many-r
     if not args.prompt.strip():
         print("ERROR: empty prompt.", file=sys.stderr)
         return EX_USAGE
-    model = args.model or resolve_model("delegate-review")
-    if args.model and not valid_slug(args.model):
-        print(f"ERROR: unknown model '{args.model}'.", file=sys.stderr)
-        return EX_INVALID_MODEL
+    model = resolve_model("delegate-review")
+    if args.model:
+        resolved = _model_arg(args.model)
+        if not resolved:
+            return EX_INVALID_MODEL
+        model = resolved
     effort = args.effort or resolve_effort()  # None -> let codex use the model's default
     shown_effort = effort or effort_of(model)
     # The guaranteed first line — captured/printed by us, never Claude preamble.
@@ -4168,10 +4329,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             "ERROR: empty prompt (pass PROMPT, or `-` with the prompt on stdin).", file=sys.stderr
         )
         return EX_USAGE
-    model = args.model or resolve_model(args.purpose or None)
-    if args.model and not valid_slug(args.model):
-        print(f"ERROR: unknown model '{args.model}'.", file=sys.stderr)
-        return EX_INVALID_MODEL
+    model = resolve_model(args.purpose or None)
+    if args.model:
+        resolved = _model_arg(args.model)
+        if not resolved:
+            return EX_INVALID_MODEL
+        model = resolved
     effort = args.effort or resolve_effort()
     shown_effort = effort or effort_of(model)
     as_json = bool(getattr(args, "json", False))
@@ -4374,19 +4537,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_models.set_defaults(func=cmd_models)
 
-    p_get = sub.add_parser("get-model", help="print the model resolved for a command")
+    p_get = sub.add_parser(
+        "get-model", help="print the model resolved for a command, or the slug a NAME means"
+    )
+    p_get.add_argument(
+        "name",
+        nargs="?",
+        default=None,
+        help="a slug or short name to resolve (astra -> gpt-6-astra); exit 3 = unknown",
+    )
     p_get.add_argument(
         "-f",
         "--for",
         dest="for_command",
         choices=COMMANDS,
         default=None,
-        help="command (default: global)",
+        help="command (default: global); ignored when NAME is given",
     )
     p_get.set_defaults(func=cmd_get_model)
 
+    p_alias = sub.add_parser(
+        "alias",
+        help="list/define/delete short model names (alias astra gpt-6-astra)",
+        description=(
+            "No arguments: list every short name (the catalog codenames are built in). "
+            "NAME alone: print what it resolves to. NAME SLUG: define it in the config "
+            "(wins over the built-in codename). -d NAME: delete a config alias."
+        ),
+    )
+    p_alias.add_argument("name", nargs="?", default=None, help="the short name, e.g. astra")
+    p_alias.add_argument("slug", nargs="?", default=None, help="the model slug it stands for")
+    p_alias.add_argument("-d", "--delete", action="store_true", help="delete the config alias NAME")
+    p_alias.set_defaults(func=cmd_alias)
+
     p_set = sub.add_parser("set-model", help="set the model for a command (or global default)")
-    p_set.add_argument("slug", help="model slug, e.g. gpt-5.6-sol")
+    p_set.add_argument("slug", help="model slug or short name, e.g. gpt-5.6-sol or astra")
     p_set.add_argument(
         "-f",
         "--for",
@@ -4458,7 +4643,10 @@ def build_parser() -> argparse.ArgumentParser:
         "-f", "--feedback", default=None, help="Claude's review feedback for a revision round"
     )
     p_del.add_argument(
-        "-m", "--model", default=None, help="override model (else resolved from config)"
+        "-m",
+        "--model",
+        default=None,
+        help="override model — slug or short name (else resolved from config)",
     )
     p_del.add_argument(
         "-p",
@@ -4584,7 +4772,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "-C", "--cwd", default=None, help="repo dir codex reads (codex -C); refused for $HOME"
     )
-    p_run.add_argument("-m", "--model", default=None, help="override the resolved model")
+    p_run.add_argument(
+        "-m", "--model", default=None, help="override the resolved model (slug or short name)"
+    )
     p_run.add_argument(
         "-e", "--effort", choices=EFFORTS, default=None, help="override the reasoning effort"
     )

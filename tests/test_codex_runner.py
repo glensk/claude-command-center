@@ -415,6 +415,22 @@ def test_argv_rebuilt_per_seat_mcp_and_profile(three_seats: SeatFixture) -> None
         assert "--skip-git-repo-check" in argv  # the fixture workdir is not a repo
 
 
+def test_run_accepts_a_short_model_name(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`run -m sol` (what `/codex-debate sol` sends) launches the SLUG and reports it."""
+    three_seats.scenarios(private={"scenario": "ok", "reply": "hi"})
+    assert cic.cmd_run(_run_ns(three_seats, model="SOL")) == cic.EX_OK
+    envelope = _envelope(capsys)
+    assert envelope["model"] == _MODEL
+    (call,) = three_seats.calls()
+    assert call["argv"][call["argv"].index("-m") + 1] == _MODEL
+    # an unknown name is refused before any seat is tried
+    assert cic.cmd_run(_run_ns(three_seats, model="astra")) == cic.EX_INVALID_MODEL
+    assert len(three_seats.calls()) == 1
+    assert "Unknown model 'astra'" in capsys.readouterr().err
+
+
 def test_argv_fresh_output_file_per_attempt(three_seats: SeatFixture) -> None:
     """Each attempt gets its OWN -o file, and none survives the call."""
     three_seats.scenarios(private="refuse_quota", de={"scenario": "ok", "reply": "de"})
