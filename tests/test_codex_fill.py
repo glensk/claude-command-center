@@ -861,27 +861,36 @@ def test_the_policy_key_round_trips_through_save_config(three_seats: SeatFixture
 
 
 def test_pin_active_follows_the_policy_and_the_registry(
-    three_seats: SeatFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    three_seats: SeatFixture, tmp_path: Path
 ) -> None:
+    """The policy/order overrides live in a NESTED MonkeyPatch context.
+
+    ``monkeypatch.undo()`` on the function-scoped fixture would also undo the
+    ``three_seats`` env isolation (``$CODEX_IN_CLAUDE_CONFIG``, ``Path.home``) — and the
+    ``save_config`` calls after it then wrote a pytest temp path into the developer's
+    REAL ``~/.config/codex-in-claude/config.json`` (2026-09-10).
+    """
+    assert cic.config_path() == three_seats.cic_config
     cic.save_config({"codex_home": str(three_seats.seats["de"]), "codex_home_until": None})
     assert cic.pin_active() is True  # fill + an order + a registered pin
-    monkeypatch.setattr(config, "codex_seat_policy", lambda: "order")
-    assert cic.pin_active() is False  # order + an explicit order
-    monkeypatch.setattr(config, "codex_seat_order", lambda: [])
-    assert cic.pin_active() is True
-    monkeypatch.undo()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(config, "codex_seat_policy", lambda: "order")
+        assert cic.pin_active() is False  # order + an explicit order
+        mp.setattr(config, "codex_seat_order", lambda: [])
+        assert cic.pin_active() is True
 
     stray = tmp_path / "stray"
     stray.mkdir()
     cic.save_config({"codex_home": str(stray), "codex_home_until": None})
     assert cic.pin_active() is False  # unregistered under BOTH policies
-    monkeypatch.setattr(config, "codex_seat_policy", lambda: "order")
-    monkeypatch.setattr(config, "codex_seat_order", lambda: [])
-    assert cic.pin_active() is False
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(config, "codex_seat_policy", lambda: "order")
+        mp.setattr(config, "codex_seat_order", lambda: [])
+        assert cic.pin_active() is False
 
-    monkeypatch.undo()
     cic.save_config({"codex_home": str(three_seats.seats["de"]), "codex_home_until": "2000-01-01"})
     assert cic.pin_active() is False  # expired
+    assert cic.config_path() == three_seats.cic_config  # every write above stayed in tmp
 
 
 def test_the_quota_footer_names_the_policy(
