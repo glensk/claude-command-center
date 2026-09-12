@@ -6146,7 +6146,8 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def _dispatch(argv: list[str] | None) -> int:
+    """Parse *argv* and run the selected command (everything ``main`` guards)."""
     # Normalise argv FIRST: the same list decides the parser mode and is parsed, so an
     # explicit argv and a real command line take exactly the same path.
     argv = sys.argv[1:] if argv is None else list(argv)
@@ -6158,3 +6159,39 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_tui(args) if sys.stdout.isatty() else cmd_ls(args)
     func = args.func
     return int(func(args))
+
+
+# `ccc ls | head -3`: the reader closes the pipe while we are still writing. Python's
+# default SIGPIPE disposition (ignored, so the write raises BrokenPipeError) is left
+# alone on purpose — ccc also writes to *subprocess* stdin pipes that catch that very
+# exception (`usage._appserver_exchange`, `codex_in_claude`), and a global
+# `signal(SIGPIPE, SIG_DFL)` would kill ccc outright there instead. The dead stdout is
+# therefore handled once, here at the entry point.
+_EXIT_SIGPIPE = 141  # what a shell reports for a SIGPIPE-killed process (128 + 13)
+
+
+def _quiet_broken_pipe() -> int:
+    """Swallow a reader that closed our stdout early, and report it like SIGPIPE would.
+
+    stdout is re-pointed at ``/dev/null`` first: without that, the interpreter's shutdown
+    flush hits the dead fd a second time and prints
+    ``Exception ignored in: <_io.TextIOWrapper …> BrokenPipeError`` after we returned.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+    except (OSError, ValueError):  # pragma: no cover - stdout already unusable
+        pass
+    return _EXIT_SIGPIPE
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        code = _dispatch(argv)
+        # Flush HERE, inside the guard: output short enough to still sit in the block
+        # buffer would otherwise die in the shutdown flush, where nothing can catch it.
+        sys.stdout.flush()
+        return code
+    except BrokenPipeError:
+        return _quiet_broken_pipe()
