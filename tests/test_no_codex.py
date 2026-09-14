@@ -127,7 +127,13 @@ def test_session_launch_env_prefix_exports_the_flag() -> None:
 
 
 def test_session_apply_to_environ_sets_the_flag(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("CCC_NO_CODEX", raising=False)
+    # ``setenv`` first so monkeypatch RECORDS the variable's absence: a bare
+    # ``delenv(raising=False)`` on a missing name records nothing, and the ``"1"`` the code
+    # under test writes into ``os.environ`` then outlived this test — every later test in
+    # the same process saw ``CCC_NO_CODEX=1`` (four ``test_codex_launch.py`` failures when
+    # the two files run together).
+    monkeypatch.setenv("CCC_NO_CODEX", "")
+    monkeypatch.delenv("CCC_NO_CODEX")
     accounts.session_apply_to_environ(Session(session_id="s"))
     assert "CCC_NO_CODEX" not in os.environ
     accounts.session_apply_to_environ(Session(session_id="s", no_codex=True))
