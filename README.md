@@ -102,7 +102,7 @@ and some are macOS-first (they drive iTerm2 / Karabiner). Honest table:
 | Auto-resume halted            | resumes rate-limit-halted sessions once the limit resets (machine must stay on)              | `claude-session-continue`                                          | `resume_halted`                      |
 | Rate-limit failover           | a halted session relaunches itself on an account that still has quota, same tab              | a second account in `claude_accounts`                              | `auto_switch_on_limit`               |
 | Cross-session file locks      | serializes edits when several sessions share one checkout                                    | Claude Code hooks                                                  | `file_lock_enabled` (default on)     |
-| Codex delegation              | hand implementation to OpenAI Codex; Claude only verifies. Every Codex call bills the ChatGPT login whose weekly allowance resets soonest (`codex_seat_policy = "fill"`; `codex-in-claude policy order` restores the strict `codex-in-claude order`) and falls through at run time when one is held, exhausted or refusing | `codex` CLI                                                        | `-j codex` jobs / slash command      |
+| Codex delegation              | hand implementation to OpenAI Codex; Claude only verifies. Every Codex call bills the ChatGPT login whose weekly allowance resets soonest (`codex_seat_policy = "fill"`; `codex-in-claude policy order` restores the strict `codex-in-claude order`) and falls through at run time when one is held, exhausted or refusing. A login SHARED with a colleague on alternating weeks goes on a weekly rota (`codex-in-claude rota set <seat> -s <monday> alice bob`) and leaves the ranking for their week | `codex` CLI                                                        | `-j codex` jobs / slash command      |
 | Copilot usage card            | month-to-date GitHub Copilot spend in the TUI                                                | `gh` CLI + a Copilot seat                                          | `copilot_usage`                      |
 | Peek + jump *(macOS)*         | float a panel of a tab's prompts/AIM; one-key toggle to/from `ccc`                           | macOS + iTerm2 + Karabiner                                         | Karabiner chords                     |
 
@@ -194,7 +194,10 @@ each prompt render), so the block is built solely for `-h`/`--help`.
 In the TUI, the `t` leader chord expands/collapses the usage cards: `t1`…`t8` for the
 Claude/Codex/Copilot subscription cards (`t5` is a second Codex card for a second
 ChatGPT login, shown once `codex_home_private` points at another `CODEX_HOME`; and more
-via `codex_homes_extra`, one `"label=path"` entry per further login → cards `t6`…`t8`),
+via `codex_homes_extra`, one `"label=path"` entry per further login → cards `t6`…`t8`;
+a login you SHARE with a colleague on alternating weeks also takes a `codex_seat_rota`
+entry, which blocks it for every Codex consumer during their week — see
+[docs/codex.md](docs/codex.md) § "Sharing a seat on a weekly rota"),
 and `to`/`ta` for two optional cards fed by an
 *external* homelab "overseer" alert-triage daemon (incidents awaiting you + recent
 automatic activity) — off until you set `nixos_overseer_dir` in `config.toml`. A

@@ -169,6 +169,26 @@ DEFAULTS: dict[str, object] = {
     # Anything else falls back to ``fill`` with one stderr note. Set it with
     # ``codex-in-claude policy fill|order`` (or ``ai set codex-policy``).
     "codex_seat_policy": "fill",
+    # A seat SHARED with a colleague on alternating weeks: one
+    # ``"label=YYYY-MM-DD@IANA_ZONE:name,name[,name…]"`` entry per seat, e.g.
+    # ``["default=2026-09-14@Europe/Zurich:alice,bob"]``. The date is the MONDAY of the
+    # week the FIRST name holds the seat; the names take turns week by week in that
+    # order, forever, forwards and backwards from it. Weeks are ``[Monday 00:00, next
+    # Monday 00:00)`` IN THAT ZONE (never the process's local zone — travel, or another
+    # consumer's ``TZ``, must not move the boundary), so the zone is REQUIRED.
+    #
+    # During somebody else's week the seat is a BLOCKED quota row (``blocked_by="rota"``)
+    # for every Codex consumer — the ranking, the pin, the probe, `headroom`, `-Q`, a
+    # registered ``$CODEX_HOME``, a journal resume — overridable only by a human
+    # ``/switch <seat>!`` or by editing this key. An entry ccc cannot read, or one whose
+    # names do not contain ``codex_seat_rota_me``, blocks that seat too: failing OPEN
+    # would bill a colleague's week. Set it with ``codex-in-claude rota set``.
+    "codex_seat_rota": [],
+    # WHICH of those names is this machine's operator. Any syntactically valid name
+    # (``^[a-z0-9][a-z0-9_-]*$``); membership is decided PER SEAT, so a rota whose names
+    # do not list this one is never ours. Empty (the default) is fine while no seat is on
+    # a rota, and fail-closed the moment one is. Set it with ``codex-in-claude rota me``.
+    "codex_seat_rota_me": "",
     # Extra names `/switch <seat>` (ccc codex-switch) accepts for a seat, one
     # ``"alias=label"`` per entry, e.g. ``["work=default", "gl=private"]``. The labels
     # themselves and the login e-mails are always accepted; aliases are case-insensitive.
@@ -477,6 +497,34 @@ def codex_seat_policy() -> str:
             file=sys.stderr,
         )
     return "fill"
+
+
+def codex_seat_rota() -> list[str]:
+    """The configured seat-rota entries, raw — stripped, deduped, strings only.
+
+    One ``"label=YYYY-MM-DD@IANA_ZONE:name,name[,…]"`` per SHARED seat. Deliberately
+    unvalidated here, exactly like :func:`codex_seat_order`:
+    :func:`command_center.seat_rota.parse_codex_seat_rota` owns the grammar and REPORTS
+    every problem, and :mod:`command_center.quota` turns a problem naming a configured
+    seat into a blocked row. Raising here would take every Codex consumer on the machine
+    offline over one typo.
+    """
+    seen: list[str] = []
+    for raw in load_config().codex_seat_rota:
+        entry = str(raw).strip()
+        if entry and entry not in seen:
+            seen.append(entry)
+    return seen
+
+
+def codex_seat_rota_me() -> str:
+    """WHICH rota name this machine's operator is (``""`` when unset).
+
+    Never normalized beyond stripping: a name that does not match the rota's own spelling
+    must fail CLOSED (the seat blocks) rather than be quietly lower-cased into somebody
+    else's week.
+    """
+    return str(load_config().codex_seat_rota_me or "").strip()
 
 
 def unknown_config_keys() -> list[str]:
@@ -796,6 +844,9 @@ class Config:
     codex_homes_extra: list[str] = field(default_factory=list)  # "label=path" per extra login
     codex_seat_order: list[str] = field(default_factory=list)  # seat labels, "" = canonical order
     codex_seat_policy: str = "fill"  # "fill" (resets-soonest first) | "order" (strict)
+    # "label=YYYY-MM-DD@IANA_ZONE:name,name[,…]" per SHARED seat + this machine's operator
+    codex_seat_rota: list[str] = field(default_factory=list)
+    codex_seat_rota_me: str = ""
     codex_seat_aliases: list[str] = field(default_factory=list)  # "alias=label" for /switch
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link

@@ -251,7 +251,8 @@ class Plan:
     source: Seat
     target: Seat
     codex_pid: int
-    target_note: str = ""  # e.g. "forced past ccc's hold" for an explicit `<seat>!`
+    # e.g. "forced past ccc's seat oracle on 'default' (rota: 14.9.–20.9. used by alice)"
+    target_note: str = ""
     env_names: tuple[str, ...] = field(default_factory=tuple)  # names only — never values
 
 
@@ -381,6 +382,38 @@ def ranked_labels() -> tuple[list[str], str]:
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return [], f"seat oracle unavailable: {exc}"
     return [candidate.label for candidate in ranked], ""
+
+
+def seat_blocker(label: str) -> str:
+    """Why the oracle refuses seat *label*, in its own words (``""`` when it does not).
+
+    ``rota: 14.9.–20.9. used by alice`` / ``hold: team seat reserved`` / ``seven_day
+    window at 100%``. The forced-switch note used to say "forced past ccc's hold" for
+    every refusal, which was wrong the moment a second kind of block existed: a user who
+    forces past a ROTA is taking a colleague's week, not ignoring a hold, and the note is
+    the only place that distinction is recorded.
+
+    Best effort: any failure reads as "no reason we can name", because a missing
+    explanation must never turn a switch the user explicitly forced into a refusal.
+    """
+    try:
+        from . import quota  # pylint: disable=import-outside-toplevel
+
+        now = int(time.time())
+        rows = quota._codex_quotas(now, quota.read_cooldowns(now))  # noqa: SLF001
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return ""
+    for row in rows:
+        if row.account != label or row.state != quota.BLOCKED:
+            continue
+        blocker = str(row.blocked_by or row.source or "blocked")
+        reason = str(row.reason or "")
+        if not reason:
+            return blocker
+        # The rota writes its week INTO the reason, so prefixing again would read
+        # "rota: rota: …".
+        return reason if reason.startswith(f"{blocker}:") else f"{blocker}: {reason}"
+    return ""
 
 
 def next_seat(current: Seat, all_seats: list[Seat], ranked: list[str]) -> Seat:
@@ -943,7 +976,10 @@ def plan_switch(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
                     + (f" ({why})" if why else " (see `codex-in-claude order`)")
                     + f" — `/switch {target_token}!` forces it"
                 )
-            note = f"forced past ccc's hold on {target.label!r}"
+            blocker = seat_blocker(target.label)
+            note = f"forced past ccc's seat oracle on {target.label!r}" + (
+                f" ({blocker})" if blocker else ""
+            )
     else:
         if not ranked and why:
             raise SwitchError(f"{why} — name the seat explicitly: /switch <seat>!")

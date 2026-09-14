@@ -133,7 +133,7 @@ from typing import TYPE_CHECKING, Any, TextIO
 from . import codex_launch
 
 if TYPE_CHECKING:  # pragma: no cover - runtime import is local: quota imports THIS module
-    from . import quota
+    from . import quota, seat_rota
 
 DEFAULT_MODEL = "gpt-5.6-sol"  # newest/best per the Codex catalog
 COMMANDS = ("delegate-review", "debate")  # codex-related commands this manager governs
@@ -1750,7 +1750,9 @@ def _seat_table_lines(now: int | None = None) -> list[str]:
             blocker = str(row.get("blocked_by") or "")
             reason = str(row.get("reason") or "")
             unblocks = int(row.get("resets_at") or 0)
-            detail = f"{blocker + ': ' if blocker else ''}{reason}".strip()
+            # A fail-closed rota reason already starts with "rota:" — never "rota: rota:".
+            already = bool(blocker) and reason.startswith(f"{blocker}:")
+            detail = (reason if already else f"{blocker + ': ' if blocker else ''}{reason}").strip()
             if unblocks > now_ts:
                 detail += f" (unblocks {_format_reset(unblocks, now_ts)})"
             detail = detail or windows
@@ -1765,6 +1767,13 @@ def _seat_table_lines(now: int | None = None) -> list[str]:
             line += f"  {row['email']}"
         if row.get("rank_reason"):
             line += f"  ·  {row['rank_reason']}"
+        rota = row.get("rota") or {}
+        if rota.get("mine") and rota.get("label"):
+            # OUR week on a shared seat. Deliberately not via ``note``, which renders with
+            # a ⚠ — whose week it is is a fact about the seat, not a warning about it.
+            # (The other person's week already shows as ``rota: <week> used by <name>``
+            # in the blocked branch above.)
+            line += f"  ·  rota: {rota['label']}"
         if row.get("attempt_rank") == 1:
             line += "  ← next attempt"
         if row.get("note"):
@@ -1894,6 +1903,237 @@ def cmd_policy(args: argparse.Namespace) -> int:
         print(json.dumps({"schema_version": 1, "policy": policy}))
         return EX_OK
     print(_POLICY_BLURB.get(policy, _POLICY_BLURB["fill"]))
+    return EX_OK
+
+
+# --------------------------------------------------------------------------- #
+# `rota` — the weekly schedule of a SHARED seat (config.toml `codex_seat_rota`)
+# --------------------------------------------------------------------------- #
+def _rota_write_guard() -> str:
+    """The refusal text when ``config.toml`` holds keys ccc does not know, else ``""``.
+
+    ``save_config`` re-emits ONLY the keys ccc knows, so rewriting a file that carries a
+    hand-added one would delete it. Same guard as ``order`` / ``policy``.
+    """
+    from . import config  # pylint: disable=import-outside-toplevel
+
+    stray = config.unknown_config_keys()
+    if not stray:
+        return ""
+    return (
+        f"refusing to rewrite config.toml: unknown keys {', '.join(stray)} would be "
+        "dropped — remove them or edit codex_seat_rota by hand"
+    )
+
+
+def _rota_entry_label(entry: str) -> str:
+    """The seat an entry names, read from the raw text alone (parse errors included).
+
+    Rewrites go through THIS, never through the parsed specs: an entry ccc cannot parse
+    must survive a ``rota set`` of another seat instead of being silently dropped.
+    """
+    return entry.partition("=")[0].strip()
+
+
+def _rota_line(label: str, state: seat_rota.RotaState, me: str) -> str:
+    """One seat's rota as a line: whose week it is, and when it changes hands."""
+    holder = f"{state.label}{' (you)' if state.mine else ''}"
+    if state.mine:
+        tail = (
+            f"{state.next_holder} from {state.next_other_label}"
+            if state.next_other_at
+            else "yours from here on"
+        )
+    elif state.next_mine_at:
+        tail = f"yours from {state.next_mine_label}"
+    else:
+        tail = f"never yours — codex_seat_rota_me is {me!r}"
+    return f"{label:<10} {holder}  ·  {tail}"
+
+
+def _rota_states(
+    now: int,
+) -> tuple[dict[str, seat_rota.RotaState], list[seat_rota.RotaError], str]:
+    """``(state per CONFIGURED seat on a rota, errors, me)`` — the whole read side."""
+    from . import config, quota, seat_rota  # pylint: disable=import-outside-toplevel
+
+    homes = quota._canonical_codex_homes()  # noqa: SLF001
+    specs, _parse_errors = quota._rota_specs()  # noqa: SLF001
+    me = config.codex_seat_rota_me()
+    states = {
+        label: seat_rota.rota_state(spec, me, now)
+        for label, spec in specs.items()
+        if label in homes
+    }
+    return states, quota.rota_errors(homes), me
+
+
+def cmd_rota(args: argparse.Namespace) -> int:
+    """``rota [show|set LABEL|clear LABEL|me NAME]`` — a seat SHARED on alternating weeks.
+
+    A rota turns "this login is my colleague's this week" into a computed block: during
+    somebody else's week the seat leaves the ranking for every Codex consumer, and it
+    comes back on Monday 00:00 in the entry's own zone without anybody re-arming
+    anything. It is ABSOLUTE for automation — the pin, the probe, ``headroom``, ``-Q``, a
+    registered ``$CODEX_HOME``, a journal resume — and overridable only by a human
+    ``/switch <seat>!`` or by editing the config.
+
+    The verbs are disjoint on purpose (debate O12): ``show`` reads, ``set`` writes one
+    seat's schedule, ``clear`` drops it, ``me`` says which name this machine is. Every
+    write goes through the same unknown-key guard as ``order``/``policy``, and every verb
+    keeps working while another entry is unreadable — a broken rota must not lock the
+    operator out of the command that repairs it.
+    """
+    verb = str(getattr(args, "verb", "") or "show")
+    if verb == "set":
+        return _cmd_rota_set(args)
+    if verb == "clear":
+        return _cmd_rota_clear(args)
+    if verb == "me":
+        return _cmd_rota_me(args)
+    return _cmd_rota_show(args)
+
+
+def _cmd_rota_show(args: argparse.Namespace) -> int:
+    """``rota`` / ``rota show [-j]`` — who holds which seat this week, and who is next."""
+    from . import quota  # pylint: disable=import-outside-toplevel
+
+    now = int(time.time())
+    states, errors, me = _rota_states(now)
+    if getattr(args, "json", False):
+        specs, _errs = quota._rota_specs()  # noqa: SLF001
+        print(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "me": me,
+                    "seats": {
+                        label: {
+                            key: value
+                            for key, value in quota._rota_payload(  # noqa: SLF001
+                                specs[label], state, me
+                            ).items()
+                            if key != "me"  # ``me`` is one machine-wide fact, not per seat
+                        }
+                        for label, state in states.items()
+                    },
+                    "errors": [
+                        {"entry": err.entry, "label": err.label, "error": err.error}
+                        for err in errors
+                    ],
+                }
+            )
+        )
+        return EX_OK
+    if not states and not errors:
+        print("no seat on a rota")
+        return EX_OK
+    print(f"me: {me or '(unset — `codex-in-claude rota me <name>`)'}")
+    for label, state in states.items():
+        print(_rota_line(label, state, me))
+    for err in errors:
+        print(f"error: {err.entry!r} — {err.error}")
+    return EX_OK
+
+
+def _cmd_rota_set(args: argparse.Namespace) -> int:
+    """``rota set LABEL -s MONDAY [-z ZONE] NAME NAME…`` — write one seat's schedule.
+
+    Two things the entry grammar cannot know are checked here — that LABEL really is a
+    configured seat, and which zone to default to — and then the entry is handed to
+    :func:`command_center.seat_rota.parse_codex_seat_rota`, whose refusal IS the message.
+    One grammar, one set of sentences: a date that is not a Monday is refused with the
+    Monday of that week, an unknown zone with its own name, a single name with "a rota
+    needs at least two names". Never persist an entry ccc cannot read back.
+    """
+    from . import config, quota, seat_rota  # pylint: disable=import-outside-toplevel
+
+    label = str(getattr(args, "label", "") or "").strip()
+    homes = quota._canonical_codex_homes()  # noqa: SLF001
+    if label not in homes:
+        print(f"error: unknown seat label {label!r} — known: {', '.join(homes)}", file=sys.stderr)
+        return EX_USAGE
+    # An unnamed zone is the machine's own — but only when it can be named honestly. A
+    # rota anchored in the wrong zone changes hands on the wrong day, so guessing is
+    # worse than refusing.
+    zone = str(getattr(args, "tz", "") or "").strip() or seat_rota.local_zone_name()
+    if not zone:
+        print(
+            "error: this machine's time zone could not be determined — pass -z Europe/Zurich",
+            file=sys.stderr,
+        )
+        return EX_USAGE
+    names = [str(name).strip() for name in (getattr(args, "names", None) or [])]
+    start = str(getattr(args, "start", "") or "").strip()
+    entry = f"{label}={start}@{zone}:{','.join(names)}"
+    specs, problems = seat_rota.parse_codex_seat_rota([entry])
+    if problems or label not in specs:
+        error = problems[0].error if problems else "could not be read back"
+        print(f"error: {error}", file=sys.stderr)
+        return EX_USAGE
+    guard = _rota_write_guard()
+    if guard:
+        print(guard, file=sys.stderr)
+        return EX_USAGE
+    cfg = config.load_config()
+    cfg.codex_seat_rota = [
+        line for line in config.codex_seat_rota() if _rota_entry_label(line) != label
+    ] + [entry]
+    config.save_config(cfg)
+    me = config.codex_seat_rota_me()
+    print(_rota_line(label, seat_rota.rota_state(specs[label], me, int(time.time())), me))
+    if me not in names:
+        # Fail-closed is the right default and a nasty surprise when it is silent: say so
+        # here, where the operator is already holding the fix.
+        print(
+            f"warning: codex_seat_rota_me {me!r} is not one of {','.join(names)} — this seat "
+            "stays BLOCKED until you run: codex-in-claude rota me <name>",
+            file=sys.stderr,
+        )
+    return EX_OK
+
+
+def _cmd_rota_clear(args: argparse.Namespace) -> int:
+    """``rota clear LABEL`` — drop that seat's entry (the seat is ours again, always)."""
+    from . import config  # pylint: disable=import-outside-toplevel
+
+    label = str(getattr(args, "label", "") or "").strip()
+    entries = config.codex_seat_rota()
+    remaining = [line for line in entries if _rota_entry_label(line) != label]
+    if len(remaining) == len(entries):
+        known = ", ".join(_rota_entry_label(line) for line in entries) or "(none)"
+        print(f"error: no rota entry for {label!r} — configured: {known}", file=sys.stderr)
+        return EX_USAGE
+    guard = _rota_write_guard()
+    if guard:
+        print(guard, file=sys.stderr)
+        return EX_USAGE
+    cfg = config.load_config()
+    cfg.codex_seat_rota = remaining
+    config.save_config(cfg)
+    print(f"rota cleared: {label} is no longer shared")
+    return EX_OK
+
+
+def _cmd_rota_me(args: argparse.Namespace) -> int:
+    """``rota me NAME`` — which rota name THIS machine's operator is."""
+    from . import config, seat_rota  # pylint: disable=import-outside-toplevel
+
+    name = str(getattr(args, "name", "") or "").strip()
+    if not seat_rota.valid_name(name):  # the ONE definition of a rota name
+        print(f"error: {name!r} is not a rota name ([a-z0-9][a-z0-9_-]*)", file=sys.stderr)
+        return EX_USAGE
+    guard = _rota_write_guard()
+    if guard:
+        print(guard, file=sys.stderr)
+        return EX_USAGE
+    cfg = config.load_config()
+    cfg.codex_seat_rota_me = name
+    config.save_config(cfg)
+    print(f"rota me: {name}")
+    states, _errors, me = _rota_states(int(time.time()))
+    for label, state in states.items():
+        print(_rota_line(label, state, me))
     return EX_OK
 
 
@@ -3389,7 +3629,8 @@ class RunAttempt:
     home: str
     elapsed_s: float
     # "ok" | "refused:<kind>" | "failed" | "timeout" | "stalled" | "network" | "slept" |
-    # "startup_timeout" | "skipped:exhausted" | "skipped:unmeasured" (write run, no weekly
+    # "startup_timeout" | "skipped:rota" (somebody else's week — not waivable by -Q) |
+    # "skipped:exhausted" | "skipped:unmeasured" (write run, no weekly
     # reading) | "skipped:below-floor" (-F/--min-remaining) | "skipped:reserve" /
     # "skipped:unknown" (-H/--headroom)
     outcome: str
@@ -3460,7 +3701,13 @@ def _thread_id_of(events: list[dict]) -> str:
 
 
 def seat_status_report(now: int | None = None) -> tuple[list[str], int | None]:
-    """``(one line per seat, earliest reset)`` — why nothing is eligible right now."""
+    """``(one line per seat, earliest reset)`` — why nothing is eligible right now.
+
+    A ROTA block names itself (``rota: 14.9.–20.9. used by alice``): its reason is the
+    week and the holder, which without the prefix reads like a quota figure. This is the
+    only evidence a caller gets when an explicit ``$CODEX_HOME`` or a journal resume ends
+    in ``all_seats_unavailable``, so it must say what kind of block it is.
+    """
     now_ts = int(time.time()) if now is None else int(now)
     try:
         from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
@@ -3473,7 +3720,10 @@ def seat_status_report(now: int | None = None) -> tuple[list[str], int | None]:
     for row in rows:
         bits: list[str] = []
         if row.get("reason"):
-            bits.append(str(row["reason"]))
+            reason = str(row["reason"])
+            if row.get("blocked_by") == "rota" and not reason.startswith("rota:"):
+                reason = f"rota: {reason}"  # a fail-closed reason already says it
+            bits.append(reason)
         resets_at = int(row.get("resets_at") or 0)
         if resets_at > now_ts:
             resets.append(resets_at)
@@ -3697,6 +3947,21 @@ def _claim_probe(cand: SeatCandidate) -> bool:
         return False  # cannot claim ⇒ do not probe; the ranking has other seats
 
 
+def _rota_configured() -> bool:
+    """True when ANY seat is on a ``codex_seat_rota`` (so a row must always be built).
+
+    Cheap (a memoized config read) and fail-safe in the direction that costs least: on
+    any doubt it answers False, which only means ``-Q`` keeps its old shortcut on a
+    machine with no rota at all.
+    """
+    from . import config  # pylint: disable=import-outside-toplevel
+
+    try:
+        return bool(config.codex_seat_rota())
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return False
+
+
 def _skip_reason(  # pylint: disable=too-many-return-statements  # one per skip outcome
     cand: SeatCandidate,
     *,
@@ -3708,11 +3973,17 @@ def _skip_reason(  # pylint: disable=too-many-return-statements  # one per skip 
     """The ``RunAttempt.outcome`` for a seat that must NOT be launched, or ``""``.
 
     Every check reads ONE quota row (plan D5, debate O4), so the preflight cannot
-    contradict the ranking that produced the candidate. Order matters: proven-exhausted
-    first (the cheapest and most certain), then the write-mode rules, then the optional
-    headroom gate.
+    contradict the ranking that produced the candidate. Order matters: the seat ROTA
+    first (a policy prohibition, not a quota fact), then proven-exhausted (the cheapest
+    and most certain), then the write-mode rules, then the optional headroom gate.
+
+    ``-Q``/``ignore_quota`` waives a QUOTA verdict — "try it even at 100 %, I accept the
+    refusal". It deliberately does not waive a rota: the seat belongs to somebody else
+    this week, and no amount of accepting a refusal makes billing their week ours
+    (debate O7). So whenever a rota is configured the row is built even under ``-Q``,
+    and ``skipped:rota`` outranks it. A human override exists — ``/switch <seat>!``.
     """
-    if ignore_quota and not (write or min_remaining_pct or headroom):
+    if ignore_quota and not (write or min_remaining_pct or headroom or _rota_configured()):
         return ""  # nothing left to check — do not pay for a quota row
     from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
 
@@ -3721,6 +3992,8 @@ def _skip_reason(  # pylint: disable=too-many-return-statements  # one per skip 
         row = _candidate_row(cand, now)
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return ""  # a row we cannot build proves nothing — fail open, as everywhere else
+    if row.block_scope == "rota":
+        return "skipped:rota"
     if not ignore_quota and row.state == quota.BLOCKED:
         return "skipped:exhausted"
     if write and min_remaining_pct > 0 and quota._measured_week(row) is None:  # noqa: SLF001
@@ -3799,8 +4072,10 @@ def run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,
       second seat to move to, so a filter could only turn a runnable resume into a
       refusal. The documented trade-off is a possible ``SEAT-REFUSED-MIDRUN`` review
       (plan D5).
-    * **Four skip reasons, all evaluated from the seat's QUOTA ROW** (plan D5, debate
-      O4), before any process: ``skipped:exhausted`` (the row is BLOCKED — a window at
+    * **Five skip reasons, all evaluated from the seat's QUOTA ROW** (plan D5, debate
+      O4), before any process: ``skipped:rota`` (a ``codex_seat_rota`` says this week
+      belongs to somebody else — a POLICY block ``-Q`` cannot waive),
+      ``skipped:exhausted`` (the row is BLOCKED — a window at
       100 %, a live refusal or a hold), ``skipped:unmeasured`` (a WRITE run with a floor
       refuses a seat whose weekly window is unknown — the floor cannot be checked there;
       ``min_remaining_pct == 0`` waives both), ``skipped:below-floor``
@@ -4522,6 +4797,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  codex-in-claude.py delegate --write -C . 'add retry to fetch()'\n"
             "  codex-in-claude order private de default    # seat order (+ clears the pin)\n"
             "  codex-in-claude policy fill                 # rank by weekly reset, not order\n"
+            "  codex-in-claude rota set default -s 2026-09-14 alice bob   # share a seat weekly\n"
             "  codex-in-claude run -j -C . 'reply OK'      # machine entry point (-j envelope)\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4929,6 +5205,67 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_policy.add_argument("-j", "--json", action="store_true", help="machine-readable: {policy}")
     p_policy.set_defaults(func=cmd_policy)
+
+    p_rota = sub.add_parser(
+        "rota",
+        help="show/set the weekly rota of a SHARED seat (whose week is it?)",
+        description=(
+            "A seat shared with a colleague on alternating weeks (ccc config.toml "
+            "`codex_seat_rota`): `label=YYYY-MM-DD@IANA_ZONE:name,name`, where the date is "
+            "the MONDAY of the FIRST name's week and the names take turns from there, "
+            "forever. During somebody else's week the seat is BLOCKED for every Codex "
+            "consumer — the ranking, the pin, headroom, -Q, an explicit $CODEX_HOME, a "
+            "resume — and only a human `/switch <seat>!` overrides it. An entry ccc cannot "
+            "read, or one whose names do not include `rota me`, blocks that seat too "
+            "(failing open would bill a colleague's week). No verb = show."
+        ),
+    )
+    # ``-j`` lives on BOTH ``rota`` and ``rota show`` so either spelling works; the
+    # subparser's default is SUPPRESS, or its False would overwrite ``rota -j show``.
+    p_rota.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help="machine-readable: {schema_version, me, seats, errors}",
+    )
+    # No ``verb`` default: argparse's subparsers dest is None when no verb is given,
+    # and ``cmd_rota`` reads that as ``show`` (a bare ``rota`` is a report).
+    p_rota.set_defaults(func=cmd_rota)
+    rota_verbs = p_rota.add_subparsers(dest="verb")
+    p_rota_show = rota_verbs.add_parser("show", help="who holds each shared seat this week")
+    p_rota_show.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="machine-readable: {schema_version, me, seats, errors}",
+    )
+    p_rota_show.set_defaults(func=cmd_rota)
+    p_rota_set = rota_verbs.add_parser(
+        "set", help="set one seat's rota: the first name's Monday, then the names"
+    )
+    p_rota_set.add_argument("label", help="the seat label (default / private / an extra)")
+    p_rota_set.add_argument("names", nargs="+", help="the names taking turns, in turn order")
+    p_rota_set.add_argument(
+        "-s",
+        "--start",
+        required=True,
+        metavar="YYYY-MM-DD",
+        help="the MONDAY of the week the FIRST name holds the seat",
+    )
+    p_rota_set.add_argument(
+        "-z",
+        "--tz",
+        metavar="ZONE",
+        help="IANA zone the weeks are measured in (default: this machine's)",
+    )
+    p_rota_set.set_defaults(func=cmd_rota)
+    p_rota_clear = rota_verbs.add_parser("clear", help="drop a seat's rota (it is ours again)")
+    p_rota_clear.add_argument("label", help="the seat label to un-share")
+    p_rota_clear.set_defaults(func=cmd_rota)
+    p_rota_me = rota_verbs.add_parser("me", help="which rota name THIS machine's operator is")
+    p_rota_me.add_argument("name", help="one of the names in the rota entries")
+    p_rota_me.set_defaults(func=cmd_rota)
 
     p_runs = sub.add_parser(
         "runs", help="list in-flight delegate runs (elapsed/idle/last output, one line each)"

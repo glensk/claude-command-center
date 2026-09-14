@@ -182,8 +182,22 @@ change the verdict: a `free` plan (`plan free — entitlement unproven`) and a
 `subscription_ends` date that has passed. A refusal stapled from a rollout file **expires**
 once its exhausted window's reset has passed (or after 5 h when no window is known), so a
 week-old refusal can no longer hold a paid seat out of the ladder for good; the row then
-falls back to its windows and is remeasurable. `ccc quota` shows the whole ladder, tagged
-with the policy that ranked it:
+falls back to its windows and is remeasurable.
+
+**A recorded refusal yields to a newer healthy reading** (2026-09-14). The seat's own usage
+is read BEFORE the cooldown store, and an `observed` entry whose `scope` is exactly `quota`
+is superseded when that reading is newer than the refusal, carries no block of its own, is
+well-formed and folds to `available`. The row then reports what the seat says today and its
+`note` names what it overrode (`refusal 3d old superseded by a reading 2h old`). Until this,
+`ai routing` printed `blocked observed-rejection: codex exec refused: quota… (unblocks in
+18h 13m)` for three days while ccc's own usage card for the same login read `Session: idle
+0% · Week: idle`. The narrowings are deliberate: an administrative `hold` is never
+superseded (it is policy, not a measurement), `auth`/`entitlement`/scope-less blocks say
+things a usage reading cannot refute, and stale, absent or malformed windows are `unknown`,
+which is a measurement failure rather than evidence. Readers never write, so the entry stays
+in `cooldowns.json` until its own deadline — and one healthy measurement buys AT MOST one
+new attempt, because the runner records its next refusal with an `observed_at` newer than
+that measurement. `ccc quota` shows the whole ladder, tagged with the policy that ranked it:
 
 ```
 codex seats [fill]: 1 private ✅ → 2 de ✅ → 3 default ⛔ (hold)     next attempt: codex:private
@@ -193,6 +207,76 @@ codex seats [fill]: 1 private ✅ → 2 de ✅ → 3 default ⛔ (hold)     next
 `ccc quota -j` carries the same, machine-readable: a top-level `codex_seat_policy`, and
 per `codex_seat_order` row the additive `cohort`, `measured`, `probe`, `rank_reason` and
 `malformed`. `codex_pin` appears whenever the pin actually governs.
+
+### Sharing a seat on a weekly rota
+
+One ChatGPT login often belongs to two people on alternating weeks. An administrative hold
+(`ccc quota -m codex -H -U …`) reserves it exactly once — somebody has to re-arm it every
+Monday, and the week nobody does is the week ccc bills a colleague's seat. `codex_seat_rota`
+turns that into a COMPUTED block: during the other person's week the seat is simply not a
+candidate, and on Monday 00:00 it comes back by itself.
+
+```toml
+codex_seat_rota    = ["default=2026-09-14@Europe/Zurich:alice,bob"]
+codex_seat_rota_me = "bob"
+```
+
+An entry is `label=YYYY-MM-DD@IANA_ZONE:name,name[,name…]`. The date is the **Monday** of the
+week the FIRST name holds the seat, and the names take turns week by week in that order,
+forever — forwards AND backwards from that Monday, so a rota set in March still answers for
+last week. The zone is **required**: weeks are the aware intervals `[Monday 00:00, next
+Monday 00:00)` in THAT zone, never the process's, because a laptop that travels (or another
+consumer running under a different `TZ`) must not move the day a seat changes hands. Names
+match `^[a-z0-9][a-z0-9_-]*$`, at least two, no duplicates. `codex_seat_rota_me` says which
+of them this machine is; membership is decided PER SEAT, so a rota that does not list you is
+never yours.
+
+```commands
+codex-in-claude rota                                    # whose week is it, and who is next
+codex-in-claude rota me bob                             # which name THIS machine is
+codex-in-claude rota set default -s 2026-09-14 alice bob   # -z defaults to this machine's zone
+codex-in-claude rota set default -s 2026-09-14 -z Europe/Zurich alice bob
+codex-in-claude rota clear default                      # the seat is ours again, always
+codex-in-claude rota show -j                            # {schema_version, me, seats, errors}
+```
+
+```
+me: bob
+default    14.9.–20.9. used by alice  ·  yours from Mon 21.9.
+```
+
+**What the block does and does not override.** It is ABSOLUTE for automation: the ranking
+under `fill` and `order`, the account pin, the daily probe, `headroom`, `-Q/--ignore-quota`,
+an explicit **registered** `$CODEX_HOME` and a journal resume all refuse the seat
+(`skipped:rota`; with nothing else eligible the runner starts no process and reports
+`all_seats_unavailable`, naming the rota). `-Q` deliberately does not waive it: that flag
+accepts a REFUSAL, and no amount of accepting refusals makes billing somebody else's week
+ours. The only overrides are a human `/switch <seat>!` — whose note then records what it
+overrode, `forced past ccc's seat oracle on 'default' (rota: 14.9.–20.9. used by alice)` —
+and editing the config. Documented exception: an UNREGISTERED explicit `$CODEX_HOME` has no
+label, so no rota can name it.
+
+**Unusable rota ⇒ the seat is BLOCKED, not free.** An entry naming a configured seat that
+ccc cannot read (bad date, not a Monday, missing/unknown zone, fewer than two names, a
+duplicate, a bad name) blocks that seat with `reason = "rota: invalid entry (<why>)"`, and so
+does a valid entry whose names do not contain `codex_seat_rota_me` (`"rota:
+codex_seat_rota_me 'carol' is not one of alice,bob"`). Failing open would resolve "we cannot
+tell whose week it is" to "ours", which is the one answer that costs a colleague their week.
+An entry naming no configured seat is reported and ignored — there is no seat to block. Every
+parse problem appears in `ccc quota -j` as `codex_seat_rota_errors: [{entry, label, error}]`
+and once on stderr, and `codex-in-claude rota` lists them; every `rota` verb keeps working
+while one entry is unreadable, so a broken rota never locks you out of the command that
+repairs it.
+
+**In the payloads.** `ccc quota -j` carries a `rota` object per `codex_seat_order` row
+(`null` for a seat on no rota): `holder`, `mine`, `me`, `names`, `anchor`, `tz`,
+`week_start`, `week_end_exclusive`, `label` (`14.9.–20.9. used by alice`), `next_mine_at` /
+`next_mine_label`, `next_holder`, `next_other_at` / `next_other_label`, and — while the seat
+is somebody else's — `underlying` (`state`, `blocked_by`, `reason`, `resets_at`,
+`resets_label`), the verdict the rota wrapper replaced. The two `*_label` fields are rendered
+in the ENTRY's zone so no consumer re-interprets an epoch in its own and prints a Sunday.
+`resets_at` on a rota-blocked row is `max(our next Monday, the underlying block's own reset)`:
+a hold that outlasts our next week is not promised away.
 
 ### The offload gate is asked of the whole seat pool
 

@@ -63,13 +63,14 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 # rules documented above, and splitting them would put the rules a reader must hold in
 # their head in three places. It crossed 1000 lines with the `fill` seat policy (tp#212).
 import json
+import sys
 import time
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from . import config, usage
+from . import config, seat_rota, usage
 
 # Schema version of the ``snapshot()`` payload / ``ccc quota --json`` contract. Consumers
 # (notably the ``ai.py`` commit-message ladder) MUST refuse a version they do not know
@@ -94,6 +95,13 @@ from . import config, usage
 # ``measured``, ``probe``, ``rank_reason`` and ``malformed``. ``codex_pin`` now follows
 # ``codex_in_claude.pin_active()``, which under the ``fill`` policy is true even with an
 # explicit order configured.
+#
+# v2 stayed v2 once more on 2026-09-14 (the seat rota), same reason — everything it adds
+# is ADDITIVE: per ``codex_seat_order`` row a ``rota`` object (``None`` when that seat is
+# on no rota), the same object on the seat's ``providers`` entry, and a top-level
+# ``codex_seat_rota_errors`` when an entry could not be read. A v2 consumer that ignores
+# them still reads the row correctly: a seat blocked by the rota is a BLOCKED row with
+# ``blocked_by="rota"``, which every existing consumer already renders as "skip it".
 SCHEMA_VERSION = 2
 
 # Provider states. Only BLOCKED may remove a rung from a ladder; UNKNOWN deliberately
@@ -226,6 +234,11 @@ class ProviderQuota:
     # determined. Routing IGNORES it (fail-open: an unmeasurable seat stays runnable);
     # :func:`codex_in_claude.seat_headroom` fails closed on it (plan D4).
     malformed: bool = False
+    # Codex seats on a ``codex_seat_rota``: whose week it is, when it is ours again, and
+    # — while it is somebody else's — the ``underlying`` verdict this wrapper replaced.
+    # Empty for every seat that is on no rota (and dropped from the JSON by
+    # :func:`_provider_dict`), so a machine without one sees exactly today's payload.
+    rota: dict[str, Any] = field(default_factory=dict)
 
 
 def _cooldowns_path() -> Path:
@@ -526,6 +539,56 @@ def _verdict_from_windows(
     return AVAILABLE, "", "", 0, any(w.risky for w in fresh)
 
 
+def observed_block_superseded(
+    entry: dict,
+    snap: usage.Usage | None,
+    windows: Iterable[WindowState],
+    now: int,  # pylint: disable=unused-argument  # see the note below
+) -> bool:
+    """True when *entry*'s recorded refusal is disproved by a NEWER healthy reading.
+
+    The bug this ends (2026-09-14): ``record_seat_refusal`` writes a cooldown entry whose
+    ``blocked_until`` is the exhausted window's reset, and :func:`_codex_seat_quota`
+    consulted the store FIRST — so the entry stood until its own deadline no matter what
+    the seat's own usage said afterwards. A refusal observed on 09-11 therefore still
+    reported ``unblocks in 18h`` on 09-14 while the seat's live reading said 0 % / 0 %
+    with an empty ``blocked_reason``.
+
+    Every condition is a deliberate narrowing:
+
+    * never a ``hold`` — an administrative reservation is policy, and no measurement may
+      lift it (the same rule :func:`record_block` and :func:`clear_block` already follow);
+    * the scope must be EXACTLY ``"quota"`` — the only scope a rate-limit refusal writes.
+      ``auth`` / ``entitlement`` blocks say something a usage reading cannot refute, and
+      an operator's scope-less ``ccc quota -m`` stands until its own deadline;
+    * the reading must EXIST, be well-formed and be newer than the refusal, and it must
+      not itself carry a refusal (:attr:`usage.Usage.blocked`) — ``read_codex_usage``
+      staples a rollout refusal newer than the reading, so refusal → success → refusal
+      still resolves to blocked;
+    * and its governing windows must fold to AVAILABLE. Stale-only, absent or malformed
+      windows are UNKNOWN, and UNKNOWN is a measurement failure, not evidence.
+
+    *now* is the instant the *windows* were resolved against; it is the caller's business
+    (it decides freshness while BUILDING them, which is why this predicate needs no clock
+    of its own) and stays in the signature so the four inputs of one verdict travel
+    together.
+
+    Pure: readers never write. The superseded entry stays in ``cooldowns.json`` until its
+    own ``blocked_until``, so two processes can disagree about nothing — and the runner's
+    next refusal, recorded with a NEWER ``observed_at`` than this reading, excludes the
+    seat again (one healthy measurement buys at most one attempt).
+    """
+    if entry.get("kind") == KIND_HOLD:
+        return False
+    if entry.get("scope") != "quota":
+        return False
+    if snap is None or snap.malformed or snap.blocked:
+        return False
+    if snap.captured_at <= int(entry.get("observed_at", 0) or 0):
+        return False
+    return _verdict_from_windows(windows)[0] == AVAILABLE
+
+
 def _cooldown_quota(pid: str, kind: str, entry: dict) -> ProviderQuota:
     """Build a BLOCKED provider straight from a cooldown entry (rejection or hold)."""
     is_hold = entry.get("kind") == KIND_HOLD
@@ -676,23 +739,75 @@ def _codex_seat_note(label: str, live: usage.Usage | None, today: str = "") -> s
     return " · ".join(parts)
 
 
-def _codex_seat_quota(  # pylint: disable=too-many-return-statements
+def _codex_windows(snap: usage.Usage, now: int) -> dict[str, WindowState]:
+    """*snap*'s two Codex windows, resolved to states (absent ones simply missing)."""
+    windows: dict[str, WindowState] = {}
+    for name, win, stale_after in (
+        ("five_hour", snap.five_hour, _SESSION_STALE_AFTER_SEC),
+        ("seven_day", snap.seven_day, _WEEK_STALE_AFTER_SEC),
+    ):
+        state = _window_state(name, win, snap.captured_at, now, stale_after)
+        if state is not None:
+            windows[name] = state
+    return windows
+
+
+def _seat_evidence(home: Path, now: int) -> tuple[usage.Usage | None, dict[str, WindowState], Any]:
+    """``(snapshot, windows, live cache)`` for *home* — the seat's own evidence, read once.
+
+    Read BEFORE the cooldown store is consulted (2026-09-14): a recorded refusal may be
+    superseded by a newer healthy reading, and the only way to know is to have the reading
+    in hand first. Never raises — a bad cache is a missing measurement, not a failed row.
+    """
+    try:
+        live = usage.read_codex_live(home)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        live = None  # advisory only; a bad cache never fails the row
+    try:
+        snap = usage.read_codex_usage(now, home)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        snap = None
+    return snap, (_codex_windows(snap, now) if snap is not None else {}), live
+
+
+def _codex_seat_quota(
     pid: str, label: str, home: Path, now: int, cooldowns: dict[str, dict]
 ) -> ProviderQuota:
-    """Resolve ONE Codex/ChatGPT seat from its cached window snapshot."""
+    """Resolve ONE Codex/ChatGPT seat: its own evidence, its cooldowns, then its rota."""
+    return _apply_rota(_codex_seat_row(pid, label, home, now, cooldowns), label, now)
+
+
+def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-locals
+    pid: str, label: str, home: Path, now: int, cooldowns: dict[str, dict]
+) -> ProviderQuota:
+    """The ORDINARY row for one seat — windows, refusals and the cooldown store.
+
+    Order matters and is the 2026-09-14 fix: the seat's own usage is read FIRST, and a
+    recorded ``quota`` refusal only stands while :func:`observed_block_superseded` says a
+    newer healthy reading has not disproved it. The store used to be consulted before any
+    measurement, which made an entry final until its own deadline — a refusal from Friday
+    kept a seat out of the ladder all weekend while its live reading said 0 %.
+
+    A seat we could not measure at all (no ``auth.json``, no snapshot) keeps its cooldown:
+    a missing reading can never supersede anything.
+    """
     email = ""
     try:
         email = usage.codex_account_email(home) or ""
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         email = ""  # identity is display metadata, never a reason to fail the row
-    if pid in cooldowns:
-        quota = _cooldown_quota(pid, "codex", cooldowns[pid])
+    has_auth = (home.expanduser() / "auth.json").is_file()
+    snap, windows, live = _seat_evidence(home, now) if has_auth else (None, {}, None)
+    entry = cooldowns.get(pid)
+    superseded = entry is not None and observed_block_superseded(entry, snap, windows.values(), now)
+    if entry is not None and not superseded:
+        quota = _cooldown_quota(pid, "codex", entry)
         quota.account, quota.email = label, email
         return quota
     # No auth.json = no login here (or a keyring store this reader cannot see). UNKNOWN,
     # never BLOCKED: "we could not measure it" must not delete a rung — the run-time
     # refusal classifier is what turns a real auth failure into a block.
-    if not (home.expanduser() / "auth.json").is_file():
+    if not has_auth:
         return ProviderQuota(
             id=pid,
             kind="codex",
@@ -702,13 +817,8 @@ def _codex_seat_quota(  # pylint: disable=too-many-return-statements
             account=label,
             email=email,
         )
-    try:
-        live = usage.read_codex_live(home)
-    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-        live = None  # advisory only; a bad cache never fails the row
     note = _codex_seat_note(label, live)
     free_plan = live is not None and (live.plan_type or "").strip().lower() == "free"
-    snap = usage.read_codex_usage(now, home)
     if snap is None:
         return ProviderQuota(
             id=pid,
@@ -721,14 +831,19 @@ def _codex_seat_quota(  # pylint: disable=too-many-return-statements
             risky=free_plan,
             note=note,
         )
-    windows: dict[str, WindowState] = {}
-    for name, win, stale_after in (
-        ("five_hour", snap.five_hour, _SESSION_STALE_AFTER_SEC),
-        ("seven_day", snap.seven_day, _WEEK_STALE_AFTER_SEC),
-    ):
-        state = _window_state(name, win, snap.captured_at, now, stale_after)
-        if state is not None:
-            windows[name] = state
+    if superseded and entry is not None:
+        # Say WHY the row disagrees with a cooldown entry a reader can still see in
+        # cooldowns.json: the refusal is older than the measurement that disproved it.
+        refusal_age = _compact_duration(now - int(entry.get("observed_at", 0) or 0))
+        reading_age = _compact_duration(now - snap.captured_at)
+        note = " · ".join(
+            part
+            for part in (
+                note,
+                f"refusal {refusal_age} old superseded by a reading {reading_age} old",
+            )
+            if part
+        )
     if snap.blocked:
         # Codex is refusing calls. ``read_codex_usage`` has already pinned the window
         # that filled to 100%, so name it as the blocker and carry its reset — that is
@@ -783,6 +898,190 @@ def _codex_seat_quota(  # pylint: disable=too-many-return-statements
         note=note,
         malformed=snap.malformed,
     )
+
+
+# ── the weekly seat rota: a COMPUTED policy block, not a quota fact ─────────────────
+# A seat shared with a colleague on alternating weeks cannot be reserved with a hold:
+# somebody would have to re-arm it every Monday, and the week nobody does is the week we
+# bill their seat. So the block is derived from ``codex_seat_rota`` + the clock on every
+# resolution. Parse problems are reported ONCE per process (the rota is re-resolved
+# several times per run), mirroring ``config.codex_seat_policy``'s fallback note.
+_ROTA_WARNED = False
+
+
+def _rota_specs() -> tuple[dict[str, seat_rota.RotaSpec], list[seat_rota.RotaError]]:
+    """The configured rota, parsed. Never raises: a failed read is "no rota, one error"."""
+    try:
+        return seat_rota.parse_codex_seat_rota(config.codex_seat_rota())
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return {}, [seat_rota.RotaError(entry="", label="", error=f"unreadable: {exc}")]
+
+
+def rota_errors(homes: dict[str, Path]) -> list[seat_rota.RotaError]:
+    """Every unusable rota entry, a valid one naming no configured seat included.
+
+    The second kind is reported and IGNORED (there is no seat to block), which is the one
+    rota problem that is not fail-closed: a rota for a login this machine does not have
+    can only be a leftover or a config shared between machines.
+    """
+    specs, errors = _rota_specs()
+    raw = config.codex_seat_rota()
+    for label in specs:
+        if label in homes:
+            continue
+        entry = next((line for line in raw if line.partition("=")[0].strip() == label), label)
+        errors.append(
+            seat_rota.RotaError(
+                entry=entry, label=label, error="no Codex seat with this label is configured"
+            )
+        )
+    return errors
+
+
+def _warn_rota_errors(errors: list[seat_rota.RotaError]) -> None:
+    """Print each unusable entry once per process (never per resolution)."""
+    global _ROTA_WARNED  # pylint: disable=global-statement
+    if not errors or _ROTA_WARNED:
+        return
+    _ROTA_WARNED = True
+    for err in errors:
+        print(f"⚠️  codex_seat_rota {err.entry!r}: {err.error}", file=sys.stderr)
+
+
+def _rota_payload(
+    spec: seat_rota.RotaSpec | None, state: seat_rota.RotaState | None, me: str
+) -> dict[str, Any]:
+    """The ``rota`` object a row carries — every key always present, empty when unknown.
+
+    The two ``*_label`` fields are PRE-RENDERED in the rota's own zone on purpose: every
+    consumer (``ai routing``, the ``order`` table, a script) renders in its own process
+    under its own ``TZ``, and a bare epoch re-interpreted locally prints a Sunday to
+    anybody east of the entry's zone.
+    """
+    if spec is None or state is None:
+        return {
+            "holder": "",
+            "mine": False,
+            "me": me,
+            "names": [],
+            "anchor": "",
+            "tz": "",
+            "week_start": "",
+            "week_end_exclusive": "",
+            "label": "",
+            "next_mine_at": 0,
+            "next_mine_label": "",
+            "next_holder": "",
+            "next_other_at": 0,
+            "next_other_label": "",
+        }
+    return {
+        "holder": state.holder,
+        "mine": state.mine,
+        "me": me,
+        "names": list(spec.names),
+        "anchor": spec.anchor.isoformat(),
+        "tz": spec.zone,
+        "week_start": state.week_start.isoformat(),
+        "week_end_exclusive": state.week_end_exclusive.isoformat(),
+        "label": state.label,
+        "next_mine_at": state.next_mine_at,
+        "next_mine_label": state.next_mine_label,
+        "next_holder": state.next_holder,
+        "next_other_at": state.next_other_at,
+        "next_other_label": state.next_other_label,
+    }
+
+
+def _rota_blocked(
+    row: ProviderQuota, reason: str, payload: dict[str, Any], now: int
+) -> ProviderQuota:
+    """*row* wrapped in the rota's block, carrying the verdict it replaced.
+
+    ``resets_at`` is ``max(next own Monday, the underlying block's own reset)`` (debate
+    O10): a hold or an exhausted window that outlasts our next week is NOT promised away
+    by the rota — the seat comes back when BOTH are over. The underlying verdict survives
+    inside ``rota.underlying`` so a consumer can say "rota until Mon 21.9., then the hold
+    until 23.9." instead of pretending the rota is the only reason.
+    """
+    underlying_resets = row.resets_at if row.state == BLOCKED else 0
+    rota = {
+        **payload,
+        "underlying": {
+            "state": row.state,
+            "blocked_by": row.blocked_by,
+            "reason": row.reason,
+            "resets_at": row.resets_at,
+            "resets_label": seat_rota.day_label(row.resets_at, str(payload.get("tz") or "")),
+        },
+    }
+    return replace(
+        row,
+        state=BLOCKED,
+        reason=reason,
+        source="rota",
+        blocked_by="rota",
+        block_scope="rota",
+        resets_at=max(int(payload.get("next_mine_at") or 0), underlying_resets),
+        captured_at=now,
+        rota=rota,
+    )
+
+
+def _apply_rota(  # pylint: disable=too-many-return-statements  # one per rota outcome
+    row: ProviderQuota, label: str, now: int
+) -> ProviderQuota:
+    """Apply this seat's rota to its ordinary *row* — ours, somebody else's, or unusable.
+
+    FAIL CLOSED (debate O5): an entry naming a configured seat that ccc cannot read, or
+    one whose names do not contain ``codex_seat_rota_me``, BLOCKS that seat. The
+    alternative — ignoring the broken entry — resolves "we do not know whose week it is"
+    to "ours", which is exactly the week we must not bill.
+
+    A row with no provider id is an UNREGISTERED explicit ``$CODEX_HOME``: it has no
+    label a rota could name (``_seat_candidate_for`` calls it ``explicit``), so it is
+    deliberately exempt — the documented escape hatch.
+    """
+    if not row.id:
+        return row
+    specs, errors = _rota_specs()
+    spec = specs.get(label)
+    if spec is None:
+        broken = next((err for err in errors if err.label == label), None)
+        if broken is None:
+            return row  # this seat is on no rota at all — today's behaviour, unchanged
+        me = config.codex_seat_rota_me()
+        return _rota_blocked(
+            row, f"rota: invalid entry ({broken.error})", _rota_payload(None, None, me), now
+        )
+    me = config.codex_seat_rota_me()
+    known = seat_rota.valid_name(me) and me in spec.names
+    # The schedule itself is fine even when ``me`` is not on it, so the holder and the
+    # week ARE known; only "is it ours?" is not — and that question may never default to
+    # yes. Resolving with ``me=""`` keeps the row informative while blocking it.
+    state = _rota_state(spec, me if known else "", now)
+    if state is None:
+        # ``snapshot()`` never raises (module docstring), and an unresolvable rota is
+        # still a rota: block rather than let the exception fail the seat open.
+        return _rota_blocked(row, "rota: unresolvable entry", _rota_payload(None, None, me), now)
+    payload = _rota_payload(spec, state, me)
+    if not known:
+        names = ",".join(spec.names)
+        return _rota_blocked(
+            row, f"rota: codex_seat_rota_me {me!r} is not one of {names}", payload, now
+        )
+    if state.mine:
+        row.rota = payload
+        return row
+    return _rota_blocked(row, state.label, payload, now)
+
+
+def _rota_state(spec: seat_rota.RotaSpec, me: str, now: int) -> seat_rota.RotaState | None:
+    """:func:`seat_rota.rota_state`, or ``None`` when the clock cannot be placed in the zone."""
+    try:
+        return seat_rota.rota_state(spec, me, now)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return None
 
 
 def _codex_quotas(now: int, cooldowns: dict[str, dict]) -> list[ProviderQuota]:
@@ -1295,6 +1594,13 @@ def snapshot(
     }
     if unknown_labels:
         result["codex_seat_order_unknown"] = unknown_labels
+    # Rota entries ccc could not use. Reported in the payload AND once on stderr: an
+    # entry naming a configured seat has already BLOCKED it (fail closed), so the
+    # operator must be able to see why without reading the JSON.
+    rota_problems = rota_errors(homes)
+    if rota_problems:
+        result["codex_seat_rota_errors"] = [asdict(err) for err in rota_problems]
+        _warn_rota_errors(rota_problems)
     # Only an ACTIVE pin is reported: a pin that governs nothing (an explicit order under
     # the ``order`` policy, an unregistered path) advertised here would have every
     # consumer render a lie. Under ``fill`` a registered pin DOES govern, so it appears
@@ -1353,6 +1659,9 @@ def _seat_order_rows(
                 "probe": rank.probe if rank is not None else False,
                 "rank_reason": rank.reason if rank is not None else "",
                 "malformed": row.malformed,
+                # ``None`` for a seat on no rota, so a consumer can test the key itself
+                # instead of an empty-object convention (plan B, 2026-09-14).
+                "rota": row.rota or None,
             }
         )
     return out
@@ -1397,6 +1706,9 @@ def _rehydrate(raw: dict[str, Any]) -> ProviderQuota:
         block_scope=raw.get("block_scope", ""),
         note=raw.get("note", ""),
         malformed=bool(raw.get("malformed", False)),
+        # Without this a round-tripped row lost its rota, so ``ccc quota -p codex`` (which
+        # goes through the serialized form) would report a rota block with no rota (O11).
+        rota=dict(raw.get("rota") or {}),
     )
 
 
@@ -1407,8 +1719,6 @@ def main(argv: list[str] | None = None) -> int:
     ``--provider`` exit codes (0 available / 1 blocked / 2 unknown) are the contract other
     tools depend on, and a second renderer here would drift from it.
     """
-    import sys
-
     from .cli import main as _cli_main
 
     return _cli_main(["quota", *(sys.argv[1:] if argv is None else argv)])

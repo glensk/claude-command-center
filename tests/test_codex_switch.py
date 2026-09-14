@@ -13,6 +13,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -878,3 +879,85 @@ def test_run_switch_now_refuses_an_unbound_pid(
         )
         == 1
     )
+
+
+# --------------------------------------------------------------------------- #
+# the weekly seat rota (codex_seat_rota): the oracle's verdict, and the override
+# --------------------------------------------------------------------------- #
+def _configure_rota(tmp_path: Path, entry: str, me: str = "bob") -> None:
+    """Register the three fixture seats with ccc AND put one of them on a rota.
+
+    Written into the real ``config.toml`` (under the autouse tmp ``CLAUDE_HOME``) so
+    these two tests run against the REAL seat oracle rather than a patched ranking —
+    the whole point is that ``/switch`` inherits the rota without knowing about it.
+    """
+    from command_center import config as _config
+
+    home = _config.app_home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text(
+        f'codex_home_private = "{tmp_path / ".codex-private"}"\n'
+        f'codex_homes_extra = ["de={tmp_path / ".codex-de"}"]\n'
+        f'codex_seat_rota = ["{entry}"]\n'
+        f'codex_seat_rota_me = "{me}"\n',
+        encoding="utf-8",
+    )
+    _config.invalidate_config_cache()
+
+
+def _rota_entry(label: str, names: str) -> str:
+    """A rota entry whose CURRENT week belongs to the first name (live clock, any day)."""
+    import datetime as _dt
+    import zoneinfo as _zi
+
+    today = _dt.datetime.now(_zi.ZoneInfo("Europe/Zurich")).date()
+    monday = today - _dt.timedelta(days=today.weekday())
+    return f"{label}={monday.isoformat()}@Europe/Zurich:{names}"
+
+
+def test_plan_switch_skips_a_seat_on_somebody_elses_week(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The automatic pick never lands on a seat whose week belongs to a colleague."""
+    real_ranked = cs.ranked_labels
+    _prepare(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(cs, "ranked_labels", real_ranked)  # the REAL oracle decides
+    _configure_rota(tmp_path, _rota_entry("private", "alice,bob"))
+    assert cs.ranked_labels()[0] == ["default", "de"]  # private is off-week
+    plan = cs.plan_switch(_hook(tmp_path), "", start_pid=500, table=_table())
+    assert plan.target.label == "de"
+    assert plan.target_note == ""
+
+
+def test_forced_switch_note_names_the_rota_not_a_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`<seat>!` stays the human override — and records WHICH block it overrode."""
+    real_ranked = cs.ranked_labels
+    _prepare(tmp_path, monkeypatch, [])
+    monkeypatch.setattr(cs, "ranked_labels", real_ranked)
+    _configure_rota(tmp_path, _rota_entry("private", "alice,bob"))
+    with pytest.raises(cs.SwitchError, match="not available per ccc's seat oracle"):
+        cs.plan_switch(_hook(tmp_path), "gl", start_pid=500, table=_table())
+    plan = cs.plan_switch(_hook(tmp_path), "gl", force=True, start_pid=500, table=_table())
+    assert plan.target.label == "private"
+    assert plan.target_note.startswith("forced past ccc's seat oracle on 'private' (rota: ")
+    assert " used by alice)" in plan.target_note
+
+
+def test_seat_blocker_reads_the_rows_own_words(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hold keeps saying "hold", an unblocked seat says nothing — no rota wording leak."""
+    from command_center import quota
+
+    _prepare(tmp_path, monkeypatch, [])
+    _configure_rota(tmp_path, _rota_entry("private", "alice,bob"))
+    quota.record_block(
+        "codex:de",
+        blocked_until=int(time.time()) + 3600,
+        kind=quota.KIND_HOLD,
+        reason="de reserved",
+    )
+    assert cs.seat_blocker("de") == "hold: de reserved"
+    assert cs.seat_blocker("default") == ""  # eligible → no reason to name

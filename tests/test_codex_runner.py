@@ -1315,6 +1315,36 @@ def test_runs_skips_ended_and_prunes_old_ended(
     assert not stale.exists(), "a final record past the retention window must be pruned"
 
 
+# ── a superseded refusal buys exactly one attempt ─────────────────────────────────
+def test_one_newer_measurement_buys_at_most_one_attempt(three_seats: SeatFixture) -> None:
+    """A stale refusal yields to a newer healthy reading — once, not for free forever.
+
+    The seat is tried again because its own measurement disproved the recorded refusal
+    (2026-09-14); when it refuses AGAIN, that refusal is recorded with an ``observed_at``
+    newer than the measurement, so the next ranking excludes it once more. Without the
+    second half, a seat with a stale live cache would be re-attempted on every run.
+    """
+    now = int(time.time())
+    three_seats.measure()  # every seat healthy: no probe promotion, configured order rules
+    quota.record_block(
+        "codex:private",
+        blocked_until=now + 18 * 3600,
+        observed_at=now - 86400,
+        reason="codex exec refused: quota — usage limit reached",
+        scope="quota",
+        source="codex-exec",
+    )
+    assert [cand.label for cand in cic.codex_homes_in_order()] == ["private", "de", "default"]
+
+    three_seats.scenarios(private="refuse_quota", de={"scenario": "ok", "reply": "de"})
+    assert cic.cmd_run(_run_ns(three_seats, json=False)) == cic.EX_OK
+    assert three_seats.call_homes() == ["private", "de"]  # the superseded seat WAS tried
+
+    entry = quota.read_cooldowns()["codex:private"]
+    assert entry["observed_at"] >= now  # the fresh refusal outdates the measurement
+    assert "private" not in [cand.label for cand in cic.codex_homes_in_order()]
+
+
 # ── end to end, through the real executable ───────────────────────────────────────
 @pytest.mark.slow
 def test_e2e_run_cli_with_real_executable(tmp_path: Path) -> None:

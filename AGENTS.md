@@ -221,7 +221,12 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
    within 12 h of each other are one cohort, filled equally by 5 % usage bucket then by the
    `codex-seat-attempts.json` ledger — while `order` is the strict `codex_seat_order`. The
    account pin leads under `fill` but only enrolled paths may be pinned; under `order` an
-   explicit order disarms it. See [docs/codex.md](docs/codex.md) § "Seat policy".
+   explicit order disarms it. A seat SHARED on alternating weeks (`codex_seat_rota`) is a
+   COMPUTED block for the weeks that are somebody else's — absolute for automation (`-Q`, a
+   registered `$CODEX_HOME` and a journal resume included, outcome `skipped:rota`), fail-closed
+   when the entry is unreadable or does not name `codex_seat_rota_me`, and overridable only by
+   a human `/switch <seat>!`. See [docs/codex.md](docs/codex.md) §§ "Seat policy" and
+   "Sharing a seat on a weekly rota".
 5. **Per-seat argv, always rebuilt.** `permission_args(write, codex_home=cand.home)` and
    `mcp_disable_args(cand.home)` are recomputed for each attempt with a fresh `-o` file — the
    first seat's profile or MCP flags must never leak onto the second.

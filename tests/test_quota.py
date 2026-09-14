@@ -505,3 +505,191 @@ def test_snapshot_has_one_row_per_codex_seat(
     assert ids == ["codex", "codex:private"]
     assert snap["version"] == quota.SCHEMA_VERSION
     assert "best_codex_account" in snap
+
+
+# ── a newer healthy reading supersedes a recorded refusal ────────────────────────
+# The 2026-09-14 bug: `record_seat_refusal` wrote `codex:private = {scope: quota,
+# observed_at: 09-11, blocked_until: 09-15}` and `_codex_seat_quota` consulted the
+# cooldown store FIRST, so the entry stood until its own deadline while the seat's own
+# live reading said 0 % / 0 % with an empty blocked_reason. Three days of a healthy paid
+# seat were reported as "blocked (unblocks in 18h)".
+
+
+def _quota_entry(observed_at: int, **over: object) -> dict:
+    """A cooldown entry shaped exactly as ``record_seat_refusal`` writes a quota refusal."""
+    entry = {
+        "blocked_until": NOW + 18 * 3600,
+        "observed_at": observed_at,
+        "reason": "codex exec refused: quota — usage limit reached",
+        "status": 0,
+        "scope": "quota",
+        "source": "codex-exec",
+        "kind": quota.KIND_OBSERVED,
+    }
+    entry.update(over)
+    return entry
+
+
+def _healthy(captured_at: int, five: float = 0.0, seven: float = 0.0, **over: object):
+    """A live Codex snapshot with two fresh, non-exhausted windows."""
+    return usage.Usage(
+        captured_at=captured_at,
+        five_hour=usage.Window(used_percentage=five, resets_at=NOW + 3600),
+        seven_day=usage.Window(used_percentage=seven, resets_at=NOW + 5 * 86400),
+        live=True,
+        **over,  # type: ignore[arg-type]
+    )
+
+
+def _superseded(entry: dict, snap: usage.Usage | None, now: int = NOW) -> bool:
+    """The predicate under test, with the windows built exactly as the resolver does."""
+    windows = quota._codex_windows(snap, now) if snap is not None else {}  # noqa: SLF001
+    return quota.observed_block_superseded(entry, snap, windows.values(), now)
+
+
+def test_newer_healthy_reading_supersedes_a_quota_refusal() -> None:
+    assert _superseded(_quota_entry(NOW - 3 * 86400), _healthy(NOW - 600)) is True
+
+
+def test_a_reading_older_than_the_refusal_supersedes_nothing() -> None:
+    """Order of evidence, not its existence: the refusal came AFTER this measurement."""
+    assert _superseded(_quota_entry(NOW - 600), _healthy(NOW - 3 * 86400)) is False
+    # Equal timestamps prove nothing either — strictly newer is the rule.
+    assert _superseded(_quota_entry(NOW - 600), _healthy(NOW - 600)) is False
+
+
+def test_a_newer_reading_that_is_itself_blocked_or_full_does_not_supersede() -> None:
+    old = _quota_entry(NOW - 3 * 86400)
+    # `read_codex_usage` staples a rollout refusal newer than the reading, so a stapled
+    # snapshot is the "refusal → success → refusal" case: still blocked.
+    stapled = _healthy(NOW - 600, blocked_reason="included usage limit reached", blocked_at=NOW)
+    assert _superseded(old, stapled) is False
+    assert _superseded(old, _healthy(NOW - 600, seven=100.0)) is False  # a full window
+    assert _superseded(old, _healthy(NOW - 600, malformed=True)) is False
+
+
+def test_stale_or_absent_windows_never_supersede() -> None:
+    """UNKNOWN is a measurement failure, not evidence — it may not lift a block."""
+    old = _quota_entry(NOW - 3 * 86400)
+    stale = usage.Usage(
+        captured_at=NOW - 600,
+        five_hour=usage.Window(used_percentage=0.0, resets_at=NOW - 60),  # reset passed
+        seven_day=usage.Window(used_percentage=0.0, resets_at=NOW - 60),
+    )
+    assert _superseded(old, stale) is False
+    windowless = usage.Usage(captured_at=NOW - 600, five_hour=None, seven_day=None)
+    assert _superseded(old, windowless) is False
+    assert _superseded(old, None) is False
+
+
+def test_holds_and_non_quota_scopes_are_never_superseded() -> None:
+    """A hold is policy, and auth/entitlement say what no usage reading can refute."""
+    healthy = _healthy(NOW - 600)
+    hold = _quota_entry(NOW - 3 * 86400, kind=quota.KIND_HOLD, scope="hold")
+    assert _superseded(hold, healthy) is False
+    for scope in ("auth", "entitlement", "", "quota-ish"):
+        assert _superseded(_quota_entry(NOW - 3 * 86400, scope=scope), healthy) is (
+            scope == "quota"
+        )
+
+
+def test_superseded_row_is_available_names_the_refusal_and_keeps_the_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole fix, end to end: the row goes AVAILABLE and the store is untouched."""
+    home = tmp_path / "seat"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "auth.json").write_text("{}", encoding="utf-8")
+    quota.record_block(
+        "codex:private",
+        blocked_until=NOW + 18 * 3600,
+        observed_at=NOW - 3 * 86400,
+        reason="codex exec refused: quota — usage limit reached",
+        scope="quota",
+        source="codex-exec",
+    )
+    monkeypatch.setattr(usage, "read_codex_live", lambda _h: None)
+    monkeypatch.setattr(usage, "read_codex_usage", lambda _n, _h: _healthy(NOW - 7200))
+    cooldowns = quota.read_cooldowns(NOW)
+    row = quota._codex_seat_quota("codex:private", "private", home, NOW, cooldowns)  # noqa: SLF001
+    assert row.state == quota.AVAILABLE
+    assert row.note == "refusal 3d old superseded by a reading 2h old"
+    # Readers never write: the entry stays until its own deadline, for every other
+    # process AND for `ccc quota -c`.
+    assert "codex:private" in quota.read_cooldowns(NOW)
+
+
+def test_an_unmeasurable_seat_keeps_its_recorded_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No auth.json and no snapshot are missing readings — they supersede nothing."""
+    entry = {"codex:private": _quota_entry(NOW - 3 * 86400)}
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    row = quota._codex_seat_quota("codex:private", "private", bare, NOW, entry)  # noqa: SLF001
+    assert (row.state, row.blocked_by) == (quota.BLOCKED, "observed-rejection")
+    home = tmp_path / "seat"
+    home.mkdir()
+    (home / "auth.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(usage, "read_codex_live", lambda _h: None)
+    monkeypatch.setattr(usage, "read_codex_usage", lambda _n, _h: None)
+    row = quota._codex_seat_quota("codex:private", "private", home, NOW, entry)  # noqa: SLF001
+    assert (row.state, row.blocked_by) == (quota.BLOCKED, "observed-rejection")
+
+
+def _write_rollout(home: Path, name: str, event: dict) -> None:
+    """One rollout file carrying one ``rate_limits`` event (the real on-disk shape)."""
+    day = home / "sessions" / "2026" / "09" / "11"
+    day.mkdir(parents=True, exist_ok=True)
+    (day / f"rollout-2026-09-11T09-00-00-{name}.jsonl").write_text(
+        json.dumps({"type": "session_meta", "payload": {}}) + "\n" + json.dumps(event) + "\n",
+        encoding="utf-8",
+    )
+    usage._codex_cache.clear()  # noqa: SLF001
+
+
+def _token_count(captured_at: int, reached: str | None = None) -> dict:
+    """A ``token_count`` event with two healthy windows (or a refusal, with *reached*)."""
+    return {
+        "type": "event_msg",
+        "timestamp": captured_at,
+        "payload": {
+            "type": "token_count",
+            "rate_limits": {
+                "primary": {"used_percent": 10.0, "window_minutes": 300, "resets_at": NOW + 3600},
+                "secondary": {
+                    "used_percent": 20.0,
+                    "window_minutes": 10080,
+                    "resets_at": NOW + 5 * 86400,
+                },
+                "rate_limit_reached_type": reached,
+            },
+        },
+    }
+
+
+def test_rollout_evidence_supersedes_only_when_it_is_newer_and_healthy(tmp_path: Path) -> None:
+    """A ``token_count`` block exists only because Codex SERVED a turn on that seat.
+
+    So a healthy rollout event newer than the refusal is a success after it — but a
+    refusal event newer still (refusal → success → refusal) blocks again, because
+    ``read_codex_usage`` staples that one on.
+    """
+    home = tmp_path / "seat"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "auth.json").write_text("{}", encoding="utf-8")
+    entry = {"codex:private": _quota_entry(NOW - 3600)}
+
+    _write_rollout(home, "served", _token_count(NOW - 1800))  # T+1: a served turn
+    row = quota._codex_seat_quota("codex:private", "private", home, NOW, entry)  # noqa: SLF001
+    assert row.state == quota.AVAILABLE
+    assert "superseded" in row.note
+
+    _write_rollout(home, "served", _token_count(NOW - 7200))  # T−1: older than the refusal
+    row = quota._codex_seat_quota("codex:private", "private", home, NOW, entry)  # noqa: SLF001
+    assert (row.state, row.blocked_by) == (quota.BLOCKED, "observed-rejection")
+
+    _write_rollout(home, "served", _token_count(NOW - 1800))
+    _write_rollout(home, "refused", _token_count(NOW - 900, "usage_limit_reached"))  # T+2
+    row = quota._codex_seat_quota("codex:private", "private", home, NOW, entry)  # noqa: SLF001
+    assert row.state == quota.BLOCKED

@@ -208,6 +208,8 @@ def test_snapshot_carries_the_ranked_seat_order_and_next_attempt(
         "probe",
         "rank_reason",
         "malformed",
+        # additive since 2026-09-14 — the seat rota (None when the seat is on none)
+        "rota",
     }
     assert snap["codex_seat_policy"] == "fill"
     assert rows[0]["state"] == quota.BLOCKED
