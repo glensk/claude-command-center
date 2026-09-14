@@ -73,6 +73,7 @@ from .. import (
     jumpstate,
     launchd,
     nixos_overseer,
+    quota,
     repos,
     resume,
     routing,
@@ -162,6 +163,14 @@ _CARD_TOGGLE_KEYS: dict[str, str] = {
     "toggle_card_copilot": "usage_card_copilot",
     "toggle_card_nixos_overseer_supervised": "card_nixos_overseer_supervised",
     "toggle_card_nixos_overseer_tier_a": "card_nixos_overseer_tier_a",
+}
+
+# The two FIXED Codex cards (`t3`/`t5`) → the Codex SEAT label they show, which is the
+# name a ``codex_seat_rota`` entry uses. The `t6`…`t8` cards are their own seat label
+# already (``codex_homes_extra`` is "label=path"), so they need no table.
+_CODEX_CARD_SEATS: dict[str, str] = {
+    "toggle_card_codex": "default",
+    "toggle_card_codex_private": "private",
 }
 
 # Cells a card's top border spends on everything that is not the title itself:
@@ -1472,7 +1481,10 @@ _HELP_TOPICS: dict[str, str] = {
         "  Collapsed keeps the card's titled top border (which names its own chord) and\n"
         "  drops the rest of the box. Unlike td/tf (view-local), these PERSIST to\n"
         "  config.toml. t2 on a machine with no `work` account says so instead of\n"
-        "  toggling an empty box.\n\n"
+        "  toggling an empty box. A Codex card whose seat is somebody else's this\n"
+        "  codex_seat_rota week collapses by itself (title marked \u26d4) and its chord\n"
+        "  opens it for THIS view only — the persisted gate is left alone and decides\n"
+        "  again when the seat is ours (off: usage_card_codex_rota_collapse=false).\n\n"
         "[b]Config keys[/b] (~/.claude/command-center/config.toml)\n"
         "  usage_refresh_sec                  card re-read / render cadence (5.0)\n"
         "  copilot_usage_refresh_sec          idle Copilot gh-fetch throttle (900)\n"
@@ -1489,6 +1501,8 @@ _HELP_TOPICS: dict[str, str] = {
         "                                     ...] -> cards t6..t8\n"
         "  usage_card_codex_extra_collapsed   labels of those cards to collapse\n"
         "  usage_card_private/_work/_codex/_codex_private/_copilot   the t1..t5 toggles\n"
+        "  usage_card_codex_rota_collapse     collapse a Codex card for the week its\n"
+        "                                     seat is somebody else's (on)\n"
         "  card_nixos_overseer_supervised/_tier_a     the to / ta toggles\n"
         "  claude_accounts                    ['private=~/.claude', 'work=~/.claude-work']\n"
         "  claude_account_emails    identity hard-link, e.g. ['work=you@company.com'] —\n"
@@ -2138,6 +2152,11 @@ class CommandCenterApp(App[None]):
         # installed here by _apply_rows — mutated on the UI thread ONLY. Empty until the
         # first full build lands, so the cards paint their placeholder for ~1 s.
         self._codex_usage: dict[str, usage.Usage | None] = {}
+        # Codex SEAT labels whose card this VIEW wants open although the weekly rota has
+        # handed the seat to somebody else (see _codex_card_expanded). View-local on
+        # purpose: the persisted usage_card_codex* gates keep meaning "my preference for
+        # a week the seat is mine", so nothing has to be written back when it comes back.
+        self._rota_card_override: set[str] = set()
         # Set by the fast poll when `ccc restart-tui` asks us to restart: run() re-execs
         # the process in place (same tab) once the app has exited and the terminal restored.
         self.restart_requested = False
@@ -2685,12 +2704,16 @@ class CommandCenterApp(App[None]):
         # work card — not even a collapsed title line — so that one is gated on `visible`
         # and disappears entirely. Parsed from the already-loaded Config: no file read.
         _set_card_expanded(work_panel, self.cfg.usage_card_work, visible=self._has_work_account())
-        _set_card_expanded(codex_panel, self.cfg.usage_card_codex)
+        # …and a Codex card whose seat is somebody else's this rota week collapses
+        # regardless of its own gate (which stays untouched — see _codex_card_expanded).
+        _set_card_expanded(
+            codex_panel, self._codex_card_expanded("default", self.cfg.usage_card_codex)
+        )
         # …and, like the work card, the second Codex card disappears outright (title line
         # included) on a machine with no codex_home_private — there is nothing to show.
         _set_card_expanded(
             codex_private_panel,
-            self.cfg.usage_card_codex_private,
+            self._codex_card_expanded("private", self.cfg.usage_card_codex_private),
             visible=self._has_codex_private(),
         )
         # The extra Codex cards invert the gate: a label LISTED in
@@ -2699,7 +2722,8 @@ class CommandCenterApp(App[None]):
         # configured, so `visible` is never in question here.
         collapsed = set(self.cfg.usage_card_codex_extra_collapsed)
         for label, extra_panel in extra_panels.items():
-            _set_card_expanded(extra_panel, label not in collapsed, visible=True)
+            expanded = self._codex_card_expanded(label, label not in collapsed)
+            _set_card_expanded(extra_panel, expanded, visible=True)
         _set_card_expanded(copilot_panel, self.cfg.usage_card_copilot)
         _set_card_expanded(nixos_supervised_panel, self.cfg.card_nixos_overseer_supervised)
         _set_card_expanded(nixos_tier_a_panel, self.cfg.card_nixos_overseer_tier_a)
@@ -4237,6 +4261,12 @@ class CommandCenterApp(App[None]):
             return "on" if idlenotify.is_enabled() else "silent"
         card_key = _CARD_TOGGLE_KEYS.get(action or "")
         if card_key is not None:
+            # A Codex card in somebody else's rota week answers for the rota, not for its
+            # (untouched, and this week unconsulted) gate.
+            seat = _CODEX_CARD_SEATS.get(action or "")
+            if seat is not None and self._rota_collapses(seat) is not None:
+                shown = seat in self._rota_card_override
+                return "shown (rota week)" if shown else "collapsed (rota week)"
             # Off is "collapsed", not "hidden": the card's titled border-top line stays.
             return "expanded" if getattr(self.cfg, card_key) else "collapsed"
         return None
@@ -4357,6 +4387,90 @@ class CommandCenterApp(App[None]):
         """
         return config.parse_subscription_ends(self.cfg.subscription_ends)
 
+    # ── the weekly Codex seat rota, as the usage cards see it ───────────────────────
+    # A login shared on a ``codex_seat_rota`` is BLOCKED for the whole of somebody else's
+    # week: every Codex consumer skips it and `ai routing` prints it ⛔. Its card would
+    # spend that week showing bars for a seat nothing may spend, so it collapses to its
+    # title line — which then carries the ⛔ and is still the line naming the chord that
+    # reopens it. Deliberately NOT a config write: see _codex_card_expanded.
+
+    def _rota_verdict(self, seat: str) -> quota.RotaVerdict | None:
+        """This Codex seat's rota verdict, or ``None`` when it is on no rota at all.
+
+        :func:`quota.rota_verdict` is config plus arithmetic — no home is read, no
+        provider evidence consulted — so it is cheap enough for the render tick, and it
+        is the SAME verdict the seat ranking applies (fail-closed rules included). It is
+        non-raising by construction; the guard is this tick's standing rule that a usage
+        card may never take the app down.
+        """
+        try:
+            return quota.rota_verdict(seat)
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            return None
+
+    def _rota_blocks(self, seat: str) -> quota.RotaVerdict | None:
+        """The verdict when this seat is NOT ours this week, else ``None``."""
+        verdict = self._rota_verdict(seat)
+        return verdict if verdict is not None and verdict.blocked else None
+
+    def _rota_collapses(self, seat: str) -> quota.RotaVerdict | None:
+        """The verdict that COLLAPSES this seat's card right now, else ``None``.
+
+        ``usage_card_codex_rota_collapse = false`` opts out of the behaviour (rota weeks
+        then render like any other week); the ⛔ in the title does not depend on it,
+        because that marker is information rather than behaviour.
+        """
+        if not self.cfg.usage_card_codex_rota_collapse:
+            return None
+        return self._rota_blocks(seat)
+
+    def _codex_card_expanded(self, seat: str, gate: bool) -> bool:
+        """Is this Codex card expanded — its own persisted *gate*, or the rota's rule?
+
+        While the rota blocks the seat the persisted gate is deliberately not consulted:
+        the card is collapsed unless THIS view asked for it (the card's chord sets that,
+        see :meth:`_toggle_rota_card`), and the untouched gate decides again the moment
+        the seat is ours. A week off therefore costs no config write and cannot flip a
+        preference the operator set for their own weeks.
+        """
+        if self._rota_collapses(seat) is not None:
+            return seat in self._rota_card_override
+        return gate
+
+    def _toggle_rota_card(self, seat: str, label: str, *, announce: bool = True) -> None:
+        """Show/hide a rota-blocked Codex card for THIS view — the card's own chord.
+
+        Flips :attr:`_rota_card_override` instead of the persisted gate, so the chord
+        still visibly toggles the card during a colleague's week without editing the
+        preference that applies to ours.
+        """
+        verdict = self._rota_blocks(seat)
+        reason = verdict.reason if verdict is not None else "rota"
+        if seat in self._rota_card_override:
+            self._rota_card_override.discard(seat)
+            shown = False
+        else:
+            self._rota_card_override.add(seat)
+            shown = True
+        self._update_usage()
+
+        def undo_rota_card(seat: str = seat, label: str = label) -> str | None:
+            self._toggle_rota_card(seat, label, announce=False)
+            state = "shown" if seat in self._rota_card_override else "collapsed"
+            return f"{label} card {state} again."
+
+        self._push_undo(f"{label} card rota override", undo_rota_card)
+        if announce:
+            state = "shown for this view" if shown else "collapsed again"
+            self.notify(f"{label} card {state} — {reason}.")
+
+    def _rota_toggle_handled(self, seat: str, label: str) -> bool:
+        """True when the card's chord went to the rota override instead of the gate."""
+        if self._rota_collapses(seat) is None:
+            return False
+        self._toggle_rota_card(seat, label)
+        return True
+
     def _set_claude_card_titles(self) -> None:
         """(Re)build both Claude cards' border titles.
 
@@ -4394,30 +4508,35 @@ class CommandCenterApp(App[None]):
         chord-less title.
         """
         ends = self._subscription_ends()
-        cards: list[tuple[str, Path | None, str, str]] = [
+        cards: list[tuple[str, Path | None, str, str, str]] = [
             (
                 "#usage-codex",
                 config.codex_home(),
                 commands.by_action("toggle_card_codex").key,
                 "codex",
+                "default",
             ),
             (
                 "#usage-codex-private",
                 self._codex_private_home(),
                 commands.by_action("toggle_card_codex_private").key,
                 "codex_private",
+                "private",
             ),
         ]
         for index, (label, extra_home) in enumerate(self._codex_homes_extra().items()):
             chord = _EXTRA_CODEX_CHORDS[index] if index < len(_EXTRA_CODEX_CHORDS) else ""
-            cards.append((f"#usage-codex-x-{label}", extra_home, chord, f"codex_{label}"))
-        for card_id, home, chord, card in cards:
+            cards.append((f"#usage-codex-x-{label}", extra_home, chord, f"codex_{label}", label))
+        for card_id, home, chord, card, seat in cards:
             try:
                 panel = self.query_one(card_id, Static)
             except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
                 continue
+            # A seat the rota has handed to somebody else is marked ⛔ whether the card is
+            # collapsed or open: collapsed, this line is all that is left to say why.
+            mark = usage.CODEX_BLOCKED_MARK if self._rota_blocks(seat) is not None else ""
             panel.border_title = usage.codex_card_title(
-                home, chord, usage.subscription_suffix(card, ends, home)
+                home, chord, usage.subscription_suffix(card, ends, home), mark=mark
             )
 
     def _toggle_usage_card(
@@ -4476,7 +4595,13 @@ class CommandCenterApp(App[None]):
         self._toggle_usage_card("usage_card_work", "Claude (work)")
 
     def action_toggle_card_codex(self) -> None:
-        """Expand/collapse the Codex usage card — the `t3` chord."""
+        """Expand/collapse the Codex usage card — the `t3` chord.
+
+        During a rota week that is somebody else's the chord opens/closes the card for
+        THIS view only, leaving the persisted gate (my preference for my own weeks) alone.
+        """
+        if self._rota_toggle_handled("default", "Codex"):
+            return
         self._toggle_usage_card("usage_card_codex", "Codex")
 
     def action_toggle_card_codex_private(self) -> None:
@@ -4497,9 +4622,13 @@ class CommandCenterApp(App[None]):
                 markup=False,
             )
             return
+        if self._rota_toggle_handled("private", "Codex (second login)"):
+            return
         self._toggle_usage_card("usage_card_codex_private", "Codex (second login)")
 
-    def _toggle_codex_extra_card(self, index: int, *, announce: bool = True) -> None:
+    def _toggle_codex_extra_card(
+        self, index: int, *, announce: bool = True, rota_aware: bool = True
+    ) -> None:
         """Expand/collapse the *index*-th (1-based) ``codex_homes_extra`` card, and persist.
 
         Same reload-modify-save contract as :meth:`_toggle_usage_card` — ``self.cfg`` is
@@ -4521,6 +4650,11 @@ class CommandCenterApp(App[None]):
             )
             return
         label = labels[index - 1]
+        # In somebody else's rota week the chord drives the view-local override instead
+        # (see _toggle_rota_card); *rota_aware* is off only when UNDOING a gate toggle,
+        # which by construction was made in a week the seat was ours.
+        if rota_aware and self._rota_toggle_handled(label, f"Codex {label}"):
+            return
         cfg = config.load_config()
         collapsed = [name for name in cfg.usage_card_codex_extra_collapsed if name != label]
         now_collapsed = len(collapsed) == len(cfg.usage_card_codex_extra_collapsed)
@@ -4536,7 +4670,7 @@ class CommandCenterApp(App[None]):
         self._update_usage()
 
         def undo_codex_extra(index: int = index, label: str = label) -> str | None:
-            self._toggle_codex_extra_card(index, announce=False)
+            self._toggle_codex_extra_card(index, announce=False, rota_aware=False)
             state = (
                 "collapsed" if label in self.cfg.usage_card_codex_extra_collapsed else "expanded"
             )

@@ -542,7 +542,11 @@ COMMANDS: list[Command] = [
             "Expand or collapse the Codex usage card — the green-bordered 5h/weekly "
             "bars read from Codex's newest session rollout. Type t then 3. Expanded by "
             "default; the chord collapses it to its titled top border alone (and again "
-            "expands it), persisted to ccc's config."
+            "expands it), persisted to ccc's config. "
+            "A card whose seat is somebody else's this codex_seat_rota week is "
+            "collapsed already and its title marked \u26d4 — the seat is blocked for "
+            "every Codex consumer; the chord then opens it for THIS view only, "
+            "leaving the persisted gate (your preference for your own weeks) alone."
         ),
         action="toggle_card_codex",
         chord=("t", "3"),
@@ -577,7 +581,11 @@ COMMANDS: list[Command] = [
             "(and again expands it), persisted to ccc's config. Each Codex card names its "
             "own account in the title, so two logins are never confused. With no "
             "codex_home_private configured the card is absent entirely, and the chord "
-            "explains that instead of toggling."
+            "explains that instead of toggling. "
+            "A card whose seat is somebody else's this codex_seat_rota week is "
+            "collapsed already and its title marked \u26d4 — the seat is blocked for "
+            "every Codex consumer; the chord then opens it for THIS view only, "
+            "leaving the persisted gate (your preference for your own weeks) alone."
         ),
         action="toggle_card_codex_private",
         chord=("t", "5"),

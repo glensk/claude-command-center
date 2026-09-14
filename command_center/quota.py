@@ -1028,15 +1028,94 @@ def _rota_blocked(
     )
 
 
-def _apply_rota(  # pylint: disable=too-many-return-statements  # one per rota outcome
-    row: ProviderQuota, label: str, now: int
-) -> ProviderQuota:
-    """Apply this seat's rota to its ordinary *row* — ours, somebody else's, or unusable.
+@dataclass(frozen=True)
+class RotaVerdict:
+    """Whose week ONE seat is in, decided from ``codex_seat_rota`` plus the clock alone.
+
+    The verdict half of :func:`_apply_rota`, lifted out so a consumer that has no
+    :class:`ProviderQuota` to wrap can ask the same question and get the same answer —
+    the TUI's usage cards collapse a seat that is not ours this week, and a second
+    implementation of the fail-closed rules below would be a second chance to get them
+    wrong. Config + arithmetic only: no home is read, no provider evidence consulted, so
+    it is cheap enough for a render tick.
+    """
+
+    label: str  # the Codex seat label the verdict is about
+    blocked: bool  # True ⇒ this seat is unusable this week
+    reason: str  # why, in the words the quota row carries ("" when not blocked)
+    holder: str  # whose week it is ("" when the rota could not be read at all)
+    mine: bool  # … and whether that is us
+    payload: dict[str, Any]  # the ``rota`` object a row/JSON consumer carries
+
+
+def rota_verdict(  # pylint: disable=too-many-return-statements  # one per rota outcome
+    label: str, now: int | None = None
+) -> RotaVerdict | None:
+    """The rota's verdict for seat *label*, or ``None`` when it is on no rota at all.
 
     FAIL CLOSED (debate O5): an entry naming a configured seat that ccc cannot read, or
     one whose names do not contain ``codex_seat_rota_me``, BLOCKS that seat. The
     alternative — ignoring the broken entry — resolves "we do not know whose week it is"
     to "ours", which is exactly the week we must not bill.
+    """
+    now = int(time.time()) if now is None else now
+    specs, errors = _rota_specs()
+    spec = specs.get(label)
+    me = config.codex_seat_rota_me()
+    if spec is None:
+        broken = next((err for err in errors if err.label == label), None)
+        if broken is None:
+            return None  # this seat is on no rota at all — today's behaviour, unchanged
+        return RotaVerdict(
+            label=label,
+            blocked=True,
+            reason=f"rota: invalid entry ({broken.error})",
+            holder="",
+            mine=False,
+            payload=_rota_payload(None, None, me),
+        )
+    known = seat_rota.valid_name(me) and me in spec.names
+    # The schedule itself is fine even when ``me`` is not on it, so the holder and the
+    # week ARE known; only "is it ours?" is not — and that question may never default to
+    # yes. Resolving with ``me=""`` keeps the verdict informative while blocking it.
+    state = _rota_state(spec, me if known else "", now)
+    if state is None:
+        # ``snapshot()`` never raises (module docstring), and an unresolvable rota is
+        # still a rota: block rather than let the exception fail the seat open.
+        return RotaVerdict(
+            label=label,
+            blocked=True,
+            reason="rota: unresolvable entry",
+            holder="",
+            mine=False,
+            payload=_rota_payload(None, None, me),
+        )
+    payload = _rota_payload(spec, state, me)
+    if not known:
+        names = ",".join(spec.names)
+        return RotaVerdict(
+            label=label,
+            blocked=True,
+            reason=f"rota: codex_seat_rota_me {me!r} is not one of {names}",
+            holder=state.holder,
+            mine=False,
+            payload=payload,
+        )
+    return RotaVerdict(
+        label=label,
+        blocked=not state.mine,
+        reason="" if state.mine else state.label,
+        holder=state.holder,
+        mine=state.mine,
+        payload=payload,
+    )
+
+
+def _apply_rota(row: ProviderQuota, label: str, now: int) -> ProviderQuota:
+    """Apply this seat's rota to its ordinary *row* — ours, somebody else's, or unusable.
+
+    The verdict itself is :func:`rota_verdict` (which owns the fail-closed rules); this
+    function only wraps *row* in it.
 
     A row with no provider id is an UNREGISTERED explicit ``$CODEX_HOME``: it has no
     label a rota could name (``_seat_candidate_for`` calls it ``explicit``), so it is
@@ -1044,36 +1123,13 @@ def _apply_rota(  # pylint: disable=too-many-return-statements  # one per rota o
     """
     if not row.id:
         return row
-    specs, errors = _rota_specs()
-    spec = specs.get(label)
-    if spec is None:
-        broken = next((err for err in errors if err.label == label), None)
-        if broken is None:
-            return row  # this seat is on no rota at all — today's behaviour, unchanged
-        me = config.codex_seat_rota_me()
-        return _rota_blocked(
-            row, f"rota: invalid entry ({broken.error})", _rota_payload(None, None, me), now
-        )
-    me = config.codex_seat_rota_me()
-    known = seat_rota.valid_name(me) and me in spec.names
-    # The schedule itself is fine even when ``me`` is not on it, so the holder and the
-    # week ARE known; only "is it ours?" is not — and that question may never default to
-    # yes. Resolving with ``me=""`` keeps the row informative while blocking it.
-    state = _rota_state(spec, me if known else "", now)
-    if state is None:
-        # ``snapshot()`` never raises (module docstring), and an unresolvable rota is
-        # still a rota: block rather than let the exception fail the seat open.
-        return _rota_blocked(row, "rota: unresolvable entry", _rota_payload(None, None, me), now)
-    payload = _rota_payload(spec, state, me)
-    if not known:
-        names = ",".join(spec.names)
-        return _rota_blocked(
-            row, f"rota: codex_seat_rota_me {me!r} is not one of {names}", payload, now
-        )
-    if state.mine:
-        row.rota = payload
+    verdict = rota_verdict(label, now)
+    if verdict is None:
         return row
-    return _rota_blocked(row, state.label, payload, now)
+    if verdict.blocked:
+        return _rota_blocked(row, verdict.reason, verdict.payload, now)
+    row.rota = verdict.payload
+    return row
 
 
 def _rota_state(spec: seat_rota.RotaSpec, me: str, now: int) -> seat_rota.RotaState | None:

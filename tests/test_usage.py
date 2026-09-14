@@ -1859,6 +1859,24 @@ def test_codex_card_title_squeezes_the_local_part_only_on_overflow(tmp_path: Pat
     assert usage.codex_card_title(None, "t5", " -> 18.9") == "t5:Codex -> 18.9"
 
 
+def test_codex_card_title_marks_a_seat_that_is_not_ours_this_week(tmp_path: Path) -> None:
+    """The ⛔ leads like the chord, and is paid for out of the title BUDGET.
+
+    A card the weekly seat rota has collapsed is this line and nothing else, so the
+    marker has to be on it — and it must not widen the card: the two cells it costs push
+    a borderline address into the local-part squeeze instead.
+    """
+    home = tmp_path / "codex"
+    _write_codex_auth(home, email="openai.account@datascience.ch")
+    assert usage.codex_card_title(home, "t3") == "t3:Codex openai…@datascience.ch"
+    marked = usage.codex_card_title(home, "t3", mark=usage.CODEX_BLOCKED_MARK)
+    assert marked == "t3:⛔Codex op.ac@datascience.ch"
+    assert usage.cell_len(marked) <= usage._CARD_TITLE_BUDGET  # no wider than unmarked
+    # No account at all, and no chord: the marker still leads what is left of the title.
+    assert usage.codex_card_title(None, "t5", mark=usage.CODEX_BLOCKED_MARK) == "t5:⛔Codex"
+    assert usage.codex_card_title(None, "", mark=usage.CODEX_BLOCKED_MARK) == "⛔Codex"
+
+
 def test_next_anniversary_derives_the_monthly_billing_day() -> None:
     """The renewal day is the created day-of-month, at or after today, clamped short months."""
     created = "2025-09-18T09:53:15.392387Z"

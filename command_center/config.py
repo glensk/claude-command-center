@@ -227,6 +227,13 @@ DEFAULTS: dict[str, object] = {
     # the booleans above (which are True = expanded) because the extra cards are dynamic:
     # an unlisted label is expanded, so a newly added login needs no second key.
     "usage_card_codex_extra_collapsed": [],
+    # A Codex card whose seat is somebody else's this ``codex_seat_rota`` week collapses
+    # by itself, whatever its own gate above says — the seat is BLOCKED for every Codex
+    # consumer, so its bars are a week of noise. The gates above are left untouched, so
+    # the card comes back to YOUR preference the Monday the seat is ours again; the
+    # card's own chord still opens it for the current view. False = render rota weeks
+    # exactly like any other.
+    "usage_card_codex_rota_collapse": True,
     "usage_card_copilot": True,  # EXPAND the Copilot card (copilot_usage gates the FETCH)
     # External homelab "overseer" alert-triage daemon (a SEPARATE project — unrelated to
     # ccc's own future-job plumbing). Its incidents feed two read-only TUI cards. Empty
@@ -858,6 +865,9 @@ class Config:
     usage_card_codex_private: bool = True  # render gate for the second Codex card
     # Labels of the codex_homes_extra cards that are COLLAPSED (unlisted = expanded).
     usage_card_codex_extra_collapsed: list[str] = field(default_factory=list)
+    # Collapse a Codex card for the week its seat belongs to somebody else (no config
+    # write: the card's own gate is left alone and takes over again when the week flips).
+    usage_card_codex_rota_collapse: bool = True
     usage_card_copilot: bool = True  # render gate (copilot_usage stays the fetch gate)
     nixos_overseer_dir: str = ""  # external overseer root ("" = feature off)
     card_nixos_overseer_supervised: bool = True

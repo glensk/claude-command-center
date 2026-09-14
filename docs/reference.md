@@ -1786,6 +1786,20 @@ box (that card is absent entirely, title line included — as is the `t5` card w
 `codex_home_private` and a `t6`…`t8` card with no `codex_homes_extra` entry at that
 position; those are the only cards that ever disappear outright).
 
+**A Codex card whose seat is somebody else's this week collapses by itself.** A login
+shared on a `codex_seat_rota` (docs/codex.md § "Sharing a seat on a weekly rota") is
+BLOCKED for every Codex consumer during the other person's week, so its card folds to its
+titled top border and that title takes a ⛔ (`t3:⛔Codex op.ac@example.org` — the marker
+is paid for out of the same 32-cell budget, so a borderline address squeezes its local
+part rather than the card widening). The persisted `usage_card_codex*` gate is neither
+read nor written for that week: it keeps meaning "my preference for a week the seat is
+mine" and takes over again at the handover, so the card comes back by itself. The card's
+chord still toggles it — view-locally, leaving `config.toml` alone — and the `t` menu
+reports `collapsed (rota week)` / `shown (rota week)` instead of expanded/collapsed.
+`usage_card_codex_rota_collapse = false` turns the collapsing off; the ⛔ is independent
+of it (a fact, not a behaviour). Only the rota does this — a seat blocked by quota or a
+hold keeps its card, because its bars are exactly what you want to look at then.
+
 **The two nixos-overseer cards** read incidents from an *external* homelab
 "overseer" alert-triage daemon (a separate project — nothing to do with ccc's own
 future jobs) and are OFF until you point `nixos_overseer_dir` at that daemon's

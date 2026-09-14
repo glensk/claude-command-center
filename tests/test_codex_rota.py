@@ -274,6 +274,33 @@ def test_a_seat_on_no_rota_is_untouched(three_seats: SeatFixture) -> None:
     assert _row_for(three_seats, "default").rota == {}
 
 
+# ── the verdict alone: the same answer for a consumer with no row to wrap ────────
+def test_the_verdict_answers_blocked_ours_and_no_rota(three_seats: SeatFixture) -> None:
+    """``quota.rota_verdict`` is what the TUI's usage cards ask — same rules, no row."""
+    _write_rota(three_seats, _entry("private", "alice,bob"), _entry("de", "bob,alice"))
+    blocked = quota.rota_verdict("private")
+    assert blocked is not None and blocked.blocked is True
+    assert blocked.reason == blocked.payload["label"] and " used by alice" in blocked.reason
+    assert (blocked.holder, blocked.mine) == ("alice", False)
+    ours = quota.rota_verdict("de")
+    assert ours is not None and (ours.blocked, ours.holder, ours.mine, ours.reason) == (
+        False,
+        "bob",
+        True,
+        "",
+    )
+    assert quota.rota_verdict("default") is None  # on no rota at all
+
+
+def test_the_verdict_and_the_row_never_disagree(three_seats: SeatFixture) -> None:
+    """One implementation of the fail-closed rules, asked two ways."""
+    _write_rota(three_seats, "private=2026-09-15@Europe/Zurich:alice,bob")  # a Tuesday
+    verdict = quota.rota_verdict("private")
+    assert verdict is not None and verdict.blocked is True
+    assert verdict.reason.startswith("rota: invalid entry (") and "not a Monday" in verdict.reason
+    assert _row_for(three_seats, "private").reason == verdict.reason
+
+
 # ── fail closed: an unusable rota BLOCKS the seat it names ───────────────────────
 def test_an_invalid_entry_blocks_the_seat_it_names(three_seats: SeatFixture) -> None:
     _write_rota(three_seats, "private=2026-09-15@Europe/Zurich:alice,bob")  # a Tuesday

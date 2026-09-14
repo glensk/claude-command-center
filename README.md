@@ -196,7 +196,10 @@ Claude/Codex/Copilot subscription cards (`t5` is a second Codex card for a secon
 ChatGPT login, shown once `codex_home_private` points at another `CODEX_HOME`; and more
 via `codex_homes_extra`, one `"label=path"` entry per further login → cards `t6`…`t8`;
 a login you SHARE with a colleague on alternating weeks also takes a `codex_seat_rota`
-entry, which blocks it for every Codex consumer during their week — see
+entry, which blocks it for every Codex consumer during their week — and folds its card
+away for that week, titled `t3:⛔Codex …`, since its bars are a week of numbers nothing
+may spend; the chord still opens it for the current view, nothing is written to
+`config.toml`, and `usage_card_codex_rota_collapse = false` opts out. See
 [docs/codex.md](docs/codex.md) § "Sharing a seat on a weekly rota"),
 and `to`/`ta` for two optional cards fed by an
 *external* homelab "overseer" alert-triage daemon (incidents awaiting you + recent

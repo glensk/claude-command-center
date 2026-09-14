@@ -256,6 +256,17 @@ overrode, `forced past ccc's seat oracle on 'default' (rota: 14.9.–20.9. used 
 and editing the config. Documented exception: an UNREGISTERED explicit `$CODEX_HOME` has no
 label, so no rota can name it.
 
+**In the TUI the seat's card folds away for that week.** A blocked seat's usage card
+would spend the week showing bars nothing may spend, so it collapses to its own title
+line and that line carries the block: `╭─ t3:⛔Codex op.ac@example.org ─╮`. Nothing is
+persisted — the card's `usage_card_codex` / `usage_card_codex_private` /
+`usage_card_codex_extra_collapsed` gate is left exactly as you set it and decides again
+the Monday the seat is ours, which is also why the week costs no config write. The card's
+own chord (`t3`/`t5`/`t6`…`t8`) still opens it for the CURRENT view when you want to look,
+and closes it again; the `t` menu names that state (`collapsed (rota week)`). Set
+`usage_card_codex_rota_collapse = false` to render rota weeks like any other — the ⛔ in
+the title stays either way, because it reports a fact rather than a behaviour.
+
 **Unusable rota ⇒ the seat is BLOCKED, not free.** An entry naming a configured seat that
 ccc cannot read (bad date, not a Monday, missing/unknown zone, fewer than two names, a
 duplicate, a bad name) blocks that seat with `reason = "rota: invalid entry (<why>)"`, and so

@@ -7,9 +7,10 @@ import json
 import os
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 from rich.text import Text
@@ -2577,6 +2578,152 @@ def test_card_toggle_collapses_to_its_title_line(
             await pilot.pause()
             assert codex.has_class("card-collapsed") is False
             assert codex.outer_size.height == expanded_height
+
+    asyncio.run(scenario())
+
+
+# ── the weekly Codex seat rota, as the `t3` card sees it ─────────────────────────
+_ZURICH = "Europe/Zurich"
+
+
+def _rota_toml(names: str, *, me: str = "albert", extra: str = "") -> str:
+    """A config.toml putting the `default` Codex seat on a rota anchored to THIS week.
+
+    The anchor is the CURRENT week's Monday, so the FIRST name holds the seat right now
+    whatever day the suite runs: ``"andrei,albert"`` is somebody else's week and
+    ``"albert,andrei"`` is ours. ``codex_usage = false`` keeps the card off the network.
+    """
+    today = datetime.now(ZoneInfo(_ZURICH)).date()
+    monday = today - timedelta(days=today.weekday())
+    return (
+        f'codex_seat_rota = ["default={monday.isoformat()}@{_ZURICH}:{names}"]\n'
+        f'codex_seat_rota_me = "{me}"\n'
+        "codex_usage = false\n" + extra
+    )
+
+
+def _write_config(tmp_path: Path, body: str) -> None:
+    (tmp_path / "command-center").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "command-center" / "config.toml").write_text(body, encoding="utf-8")
+
+
+def test_codex_card_collapses_for_somebody_elses_rota_week(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A seat the rota has handed to a colleague spends that week collapsed, marked ⛔.
+
+    The seat is BLOCKED for every Codex consumer while it is not ours, so its bars are a
+    week of numbers nothing may act on. Nothing is persisted: the card's own gate still
+    reads True and takes over again the Monday the seat comes back.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _write_config(tmp_path, _rota_toml("andrei,albert"))
+    from command_center import config
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            codex = app.query_one("#usage-codex")
+            assert codex.display is True  # collapsed is not hidden
+            assert codex.has_class("card-collapsed") is True
+            assert codex.outer_size.height == 1
+            assert str(codex.border_title) == f"t3:{usage.CODEX_BLOCKED_MARK}Codex"
+            # …and the gate that decides OUR weeks was neither read nor written.
+            assert app.cfg.usage_card_codex is True
+            assert config.load_config().usage_card_codex is True
+
+    asyncio.run(scenario())
+
+
+def test_t3_opens_a_rota_blocked_card_for_this_view_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """During a colleague's week `t3` still toggles the card — without touching config.
+
+    The chord drives a view-local override instead of the persisted gate, so looking at
+    the numbers once cannot silently rewrite the preference that applies to our own weeks.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _write_config(tmp_path, _rota_toml("andrei,albert"))
+    from command_center import config
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            codex = app.query_one("#usage-codex")
+            assert codex.has_class("card-collapsed") is True
+
+            await pilot.press("t")
+            await pilot.press("3")
+            await pilot.pause()
+            assert codex.has_class("card-collapsed") is False  # shown for this view
+            assert config.load_config().usage_card_codex is True  # nothing written
+
+            await pilot.press("t")
+            await pilot.press("3")
+            await pilot.pause()
+            assert codex.has_class("card-collapsed") is True
+            assert config.load_config().usage_card_codex is True
+
+    asyncio.run(scenario())
+
+
+def test_our_own_rota_week_renders_the_codex_card_normally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Our week is an ordinary week: no collapse, no ⛔, and `t3` persists as always."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _write_config(tmp_path, _rota_toml("albert,andrei"))
+    from command_center import config
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            codex = app.query_one("#usage-codex")
+            assert codex.has_class("card-collapsed") is False
+            assert str(codex.border_title) == "t3:Codex"
+
+            await pilot.press("t")
+            await pilot.press("3")
+            await pilot.pause()
+            assert config.load_config().usage_card_codex is False
+
+    asyncio.run(scenario())
+
+
+def test_rota_collapse_switched_off_keeps_the_card_but_still_marks_the_seat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`usage_card_codex_rota_collapse = false` opts out of the BEHAVIOUR, not the fact.
+
+    The ⛔ stays — it says the seat is somebody else's, which is true whether or not the
+    card folds away — and the chord is back to flipping the persisted gate.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _write_config(
+        tmp_path, _rota_toml("andrei,albert", extra="usage_card_codex_rota_collapse = false\n")
+    )
+    from command_center import config
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            codex = app.query_one("#usage-codex")
+            assert codex.has_class("card-collapsed") is False
+            assert str(codex.border_title) == f"t3:{usage.CODEX_BLOCKED_MARK}Codex"
+
+            await pilot.press("t")
+            await pilot.press("3")
+            await pilot.pause()
+            assert config.load_config().usage_card_codex is False  # the ordinary path
 
     asyncio.run(scenario())
 

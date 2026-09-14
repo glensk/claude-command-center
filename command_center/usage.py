@@ -1300,8 +1300,21 @@ def abbrev_email(email: str, *, squeeze_local: bool = False) -> str:
 _CARD_TITLE_BUDGET = 32
 
 
-def codex_card_title(home: Path | None, chord: str, suffix: str = "") -> str:
+# Marker a Codex card's title carries while its seat is somebody else's on a
+# ``codex_seat_rota`` week: the seat is BLOCKED for every Codex consumer, and the card is
+# collapsed to this one line, so the line has to say why. Two cells, and it is counted
+# against _CARD_TITLE_BUDGET like everything else — an address that no longer fits
+# squeezes its local part rather than widening the card.
+CODEX_BLOCKED_MARK = "⛔"
+
+
+def codex_card_title(home: Path | None, chord: str, suffix: str = "", *, mark: str = "") -> str:
     """Border title for a Codex card: ``t3:Codex first…@example.org``.
+
+    *mark* is an optional state glyph placed between the chord and the product name
+    (``t3:⛔Codex op.ac@example.org``) — today only :data:`CODEX_BLOCKED_MARK`, for a seat
+    the weekly rota has handed to somebody else. It leads, like the chord, because a
+    collapsed card is this line and nothing else.
 
     Naming the account is what keeps two Codex cards apart, so the vendor prefix gives
     way to the address: ``OpenAI Codex <account>`` overflowed the card's 34-column title
@@ -1322,6 +1335,7 @@ def codex_card_title(home: Path | None, chord: str, suffix: str = "") -> str:
     advertise, and a naked colon would read as a broken title.
     """
     prefix = f"{chord}:" if chord else ""
+    prefix = f"{prefix}{mark}"
     email = codex_account_email(home) if home is not None else None
     if not email:
         return f"{prefix}Codex{suffix}"
