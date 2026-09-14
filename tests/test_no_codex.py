@@ -148,7 +148,12 @@ def flagged_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
     """A flagged, resumable session row in the default store + a transcript on disk."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.delenv("CCC_NO_CODEX", raising=False)
+    # ``setenv`` before ``delenv`` so the absence is RECORDED and restored: the exec-path
+    # tests below write ``CCC_NO_CODEX=1`` straight into ``os.environ`` before the stubbed
+    # exec, and a bare ``delenv(raising=False)`` on a missing name leaves that "1" in the
+    # process for every later test (``test_codex_launch.py`` then saw Codex disabled).
+    monkeypatch.setenv("CCC_NO_CODEX", "")
+    monkeypatch.delenv("CCC_NO_CODEX")
     repo = tmp_path / "repo"
     repo.mkdir()
     with Store() as store:
