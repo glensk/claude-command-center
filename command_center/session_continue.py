@@ -42,6 +42,8 @@ import sys
 import time as time_mod
 from datetime import datetime, timedelta
 
+from . import brokenpipe
+
 DEFAULT_PROMPT = "Continue where you left off."
 LAST_SESSION_KEYWORDS = ("last", "latest", "continue")
 AUTO_KEYWORDS = ("auto",)
@@ -477,9 +479,14 @@ def _main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-bra
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Console entry point: run :func:`_main`, mapping Ctrl-C to exit code 130."""
+    """Console entry point: run :func:`_main`, mapping Ctrl-C to exit code 130.
+
+    :func:`~command_center.brokenpipe.guard` sits inside the Ctrl-C handler so that a
+    reader closing our stdout early (`claude-session-continue --help | head -1`) exits
+    quietly instead of leaving a BrokenPipeError to the interpreter's shutdown flush.
+    """
     try:
-        return _main(argv)
+        return brokenpipe.guard(lambda: _main(argv))
     except KeyboardInterrupt:
         print("\nAborted.", file=sys.stderr)
         return 130

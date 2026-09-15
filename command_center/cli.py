@@ -49,7 +49,7 @@ import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from . import __version__, config, hookspec
+from . import __version__, brokenpipe, config, hookspec
 from .adapters import ClaudeAdapter
 from .models import (
     DEFAULT_LLM,
@@ -6161,37 +6161,8 @@ def _dispatch(argv: list[str] | None) -> int:
     return int(func(args))
 
 
-# `ccc ls | head -3`: the reader closes the pipe while we are still writing. Python's
-# default SIGPIPE disposition (ignored, so the write raises BrokenPipeError) is left
-# alone on purpose — ccc also writes to *subprocess* stdin pipes that catch that very
-# exception (`usage._appserver_exchange`, `codex_in_claude`), and a global
-# `signal(SIGPIPE, SIG_DFL)` would kill ccc outright there instead. The dead stdout is
-# therefore handled once, here at the entry point.
-_EXIT_SIGPIPE = 141  # what a shell reports for a SIGPIPE-killed process (128 + 13)
-
-
-def _quiet_broken_pipe() -> int:
-    """Swallow a reader that closed our stdout early, and report it like SIGPIPE would.
-
-    stdout is re-pointed at ``/dev/null`` first: without that, the interpreter's shutdown
-    flush hits the dead fd a second time and prints
-    ``Exception ignored in: <_io.TextIOWrapper …> BrokenPipeError`` after we returned.
-    """
-    try:
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, sys.stdout.fileno())
-        os.close(devnull)
-    except (OSError, ValueError):  # pragma: no cover - stdout already unusable
-        pass
-    return _EXIT_SIGPIPE
-
-
+# `ccc ls | head -3`: a reader that closes the pipe early is swallowed once, here at the
+# entry point, by the guard every console script in this package shares — see
+# :mod:`command_center.brokenpipe` for why SIGPIPE is deliberately left ignored.
 def main(argv: list[str] | None = None) -> int:
-    try:
-        code = _dispatch(argv)
-        # Flush HERE, inside the guard: output short enough to still sit in the block
-        # buffer would otherwise die in the shutdown flush, where nothing can catch it.
-        sys.stdout.flush()
-        return code
-    except BrokenPipeError:
-        return _quiet_broken_pipe()
+    return brokenpipe.guard(lambda: _dispatch(argv))

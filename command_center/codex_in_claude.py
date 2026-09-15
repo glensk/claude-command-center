@@ -130,7 +130,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
-from . import codex_launch
+from . import brokenpipe, codex_launch
 
 if TYPE_CHECKING:  # pragma: no cover - runtime import is local: quota imports THIS module
     from . import quota, seat_rota
@@ -5297,10 +5297,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def _dispatch(argv: list[str] | None) -> int:
     """Parse args and dispatch to the chosen subcommand; returns its exit code."""
     args = build_parser().parse_args(argv)
     return int(args.func(args))
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Console entry point: :func:`_dispatch` behind the shared broken-pipe guard.
+
+    `codex-in-claude rota | head -1` and `codex-in-claude --help | head -1` must exit
+    quietly like any other Unix filter — see :mod:`command_center.brokenpipe`.
+    """
+    return brokenpipe.guard(lambda: _dispatch(argv))
 
 
 if __name__ == "__main__":

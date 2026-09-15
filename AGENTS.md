@@ -380,7 +380,13 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
   report with every thread's Python stack, terminal restore, capped in-place re-exec;
   `views/tui.py` beats it from the fast poll and starts it only on a real tty.
 - **Packaging** — the wheel ships three console entry points (`ccc`, `codex-in-claude`,
-  `claude-session-continue`) and the `command_center/assets/` package data.
+  `claude-session-continue`) and the `command_center/assets/` package data. Every one of
+  those `main()`s runs behind `brokenpipe.guard` so a reader that closes our stdout
+  (`ccc ls | head -3`, `codex-in-claude --help | head -1`) exits 141 silently instead of
+  tracebacking; the guard flushes in a `finally` because argparse's `--help` leaves by
+  `SystemExit`, past any success-path-only flush. SIGPIPE stays ignored on purpose — these
+  CLIs also write to subprocess stdin pipes whose own handlers catch `BrokenPipeError`.
+  A fourth entry point must go through the same guard (`tests/test_brokenpipe.py`).
 
 ## Private/local notes
 
