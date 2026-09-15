@@ -1290,6 +1290,32 @@ def test_heartbeat_progress_at_ignores_trouble_and_sleep(
     assert final["ended"] and final["child_state"] == "gone"
 
 
+def test_final_heartbeat_folds_in_progress_that_arrived_at_exit(
+    three_seats: SeatFixture, tmp_path: Path
+) -> None:
+    """The retained record dates the last REAL progress line, not the last tick.
+
+    Output produced while ``proc.wait`` is returning only reaches the buffers once the
+    reader threads join, so a run whose whole answer arrives in one burst at exit would
+    otherwise be filed with a ``progress_at`` from before its silent stretch — and the
+    statusline would report a healthy finish as minutes idle.
+    """
+    heartbeat = tmp_path / "hb-late.json"
+    seen, raised = _collect_heartbeats(
+        three_seats, heartbeat, "late_progress", timeout=0, idle_timeout=30
+    )
+    assert raised is None, raised
+    final = json.loads(heartbeat.read_text(encoding="utf-8"))
+    assert final["ended"] and final["child_state"] == "gone"
+    silent = [snap for snap in seen if not snap.get("ended")]
+    assert silent, "no periodic heartbeat was written during the silent stretch"
+    assert final["progress_at"] >= final["started"] + 5, (
+        "the final record predates the burst that arrived at exit: "
+        f"progress_at={final['progress_at']} started={final['started']}"
+    )
+    assert final["progress_at"] >= max(snap["progress_at"] for snap in silent)
+
+
 def test_runs_skips_ended_and_prunes_old_ended(
     three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

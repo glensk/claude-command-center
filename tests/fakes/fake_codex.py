@@ -400,6 +400,28 @@ def main() -> int:  # pylint: disable=too-many-branches,too-many-return-statemen
         time.sleep(40)
         return 0
 
+    if scenario == "late_progress":
+        print(
+            json.dumps(
+                {"type": "thread.started", "thread_id": "01a06cfb-0000-7000-8000-000000000008"}
+            )
+        )
+        print(json.dumps({"type": "turn.started"}), flush=True)
+        time.sleep(6)
+        # The whole answer lands in ONE burst and the process exits at once, so these
+        # lines only reach the supervisor's buffers when its reader threads join --
+        # after ``proc.wait`` returned, where no periodic tick can have seen them.
+        print(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"id": "item_0", "type": "agent_message", "text": reply},
+                }
+            )
+        )
+        print(json.dumps({"type": "turn.completed"}), flush=True)
+        return 0
+
     if scenario == "trouble_then_ok":
         print(
             json.dumps(

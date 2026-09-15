@@ -999,7 +999,9 @@ in the user's dotfiles, tp#221): `schema_version` 1, `writer`, `tool` (`codex`),
 `child_pid` + `child_proc_start` (the `codex exec` process), `child_state`, `account` (the seat
 label), `model`, `model_source`, `effort`, `interval_s`, `started`, `updated`, `next_due`,
 `progress_at` (wall clock of the last PROGRESS line — reconnect chatter and a suspended
-machine never move it), `idle_s`, `lines`, `last_line`, plus the runner's own `runner_pid`,
+machine never move it; every snapshot dates a new line the moment it is observed, the final
+one included, so a run whose whole answer arrives in the burst at exit is not filed as idle),
+`idle_s`, `lines`, `last_line`, plus the runner's own `runner_pid`,
 `codex_pgid`, `elapsed_s`, `slept_s`, `trouble`, `caffeinate_pid`. On exit the file is NOT
 removed: one final record with `ended` and `child_state: gone` stays for 10 minutes so a
 reader that saw the run alive can tell normal completion from a crash; `runs` skips those

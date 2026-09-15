@@ -729,6 +729,7 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
     # trouble chatter and a suspended machine never move it (the reader trusts it).
     started_epoch = int(time.time())
     progress_at = started_epoch
+    stamped_progress = 0  # progress lines already dated; `seen_progress` drives the watchdog
     identity: HeartbeatIdentity | None = None
     if heartbeat_path is not None:
         identity = HeartbeatIdentity(
@@ -738,6 +739,21 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
             child_proc_start=_lstart_of(proc.pid),
         )
         _prune_ended_heartbeats(heartbeat_path.parent)
+
+    def stamp_progress(snap: _HealthSnapshot) -> None:
+        """Date a new PROGRESS line the moment it is OBSERVED, and only once.
+
+        Every snapshot stamps -- the two in the loop and the final one taken after the
+        reader threads join -- because a run can exit in the gap between any two of them
+        and would otherwise inherit an older stamp. ``seen_progress`` cannot do this job:
+        it belongs to the sleep-aware idle accounting at the foot of the loop, which is a
+        tick behind, so a run that finished inside that tick was filed as never having
+        made progress at all.
+        """
+        nonlocal progress_at, stamped_progress
+        if snap.progress != stamped_progress:
+            stamped_progress = snap.progress
+            progress_at = int(time.time())
 
     def heartbeat_extra(snap: _HealthSnapshot, *, ended: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -755,8 +771,7 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
     try:
         while True:
             snap = health.snapshot()
-            if snap.progress != seen_progress:
-                progress_at = int(time.time())
+            stamp_progress(snap)
             if heartbeat_path is not None and tick % HEARTBEAT_INTERVAL_S == 0:
                 _write_heartbeat(
                     heartbeat_path,
@@ -789,6 +804,7 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
             awake_gap = min(gap, TICK_CAP_S)
             awake_elapsed += awake_gap
             snap = health.snapshot()
+            stamp_progress(snap)
             if snap.progress != seen_progress:
                 seen_progress, awake_idle, slept_since_progress = snap.progress, 0.0, False
             else:
@@ -823,6 +839,12 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
         if heartbeat_path is not None:
             # The retained final record: a reader that saw this run alive can tell a
             # normal exit (``ended`` set) from a crash (file stale, pid gone, no ``ended``).
+            # Output that arrived while ``proc.wait`` was returning only reaches the
+            # buffers once the reader threads join, so the last PROGRESS line can be
+            # newer than every tick saw: fold it in before the record is frozen, or the
+            # retained ``progress_at`` understates the run's real finish.
+            final_snap = health.snapshot()
+            stamp_progress(final_snap)
             _write_heartbeat(
                 heartbeat_path,
                 heartbeat_meta or {},
@@ -831,7 +853,7 @@ def _exec_codex(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
                 out_buf,
                 err_buf,
                 codex_pgid,
-                extra=heartbeat_extra(health.snapshot(), ended=True),
+                extra=heartbeat_extra(final_snap, ended=True),
                 identity=identity,
             )
             with contextlib.suppress(OSError):
