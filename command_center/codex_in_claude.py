@@ -1703,7 +1703,11 @@ def cmd_home(  # pylint: disable=too-many-branches,too-many-return-statements,to
     if getattr(args, "json", False):
         # The machine contract external drivers (codex-review.py) consume instead of
         # re-implementing pin/hold resolution — ONE selector, everywhere. ``candidates``
-        # is the ATTEMPT order: its first entry is always ``home``.
+        # is the ATTEMPT order: its first entry is always ``home``. ``homes`` is the
+        # whole REGISTRY (label → CODEX_HOME, env-independent), blocked and exhausted
+        # seats included: a consumer that lets its user name a seat (`tp open N -e
+        # codex -s de`) resolves the label here and re-asks with ``$CODEX_HOME`` set,
+        # instead of re-implementing ``codex_home_private``/``codex_homes_extra``.
         print(
             json.dumps(
                 {
@@ -1715,6 +1719,7 @@ def cmd_home(  # pylint: disable=too-many-branches,too-many-return-statements,to
                     "until": str(cfg.get("codex_home_until") or ""),
                     "order": order,
                     "candidates": _candidate_dicts(candidates),
+                    "homes": {label: str(home) for label, home in canonical_codex_homes().items()},
                     "pin_active": pin_active(cfg),
                     "policy": policy,
                 }
@@ -5184,7 +5189,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-j",
         "--json",
         action="store_true",
-        help="machine-readable selection: {home, source, label, email, until}",
+        help="machine-readable selection: {home, source, label, email, until, homes}",
     )
     p_home.set_defaults(func=cmd_home)
 

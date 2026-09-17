@@ -408,6 +408,31 @@ def test_home_json_carries_order_candidates_and_pin_state(
     assert payload["source"] == "codex_seat_order"
 
 
+def test_home_json_carries_the_whole_registry_as_homes(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`home -j` names EVERY registered seat in `homes` (label → CODEX_HOME), the
+    ones the ranker left out of `candidates` included — a consumer that lets its
+    user name a seat (`tp open N -e codex -s de`) resolves the label here and
+    re-asks with `$CODEX_HOME` set, instead of re-reading ccc's config."""
+    three_seats.scenarios(de="refuse_quota")
+    assert cic.cmd_home(argparse.Namespace(path=None, until=None, clear=False, json=True)) == (
+        cic.EX_OK
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["homes"] == {label: str(home) for label, home in three_seats.seats.items()}
+    # …and an explicit $CODEX_HOME at one of those paths is honoured, label resolved.
+    monkeypatch.setenv("CODEX_HOME", payload["homes"]["de"])
+    assert cic.cmd_home(argparse.Namespace(path=None, until=None, clear=False, json=True)) == (
+        cic.EX_OK
+    )
+    pinned = json.loads(capsys.readouterr().out)
+    assert pinned["source"] == "env $CODEX_HOME"
+    assert pinned["label"] == "de"
+    assert pinned["home"] == payload["homes"]["de"]
+    assert pinned["homes"] == payload["homes"]
+
+
 def test_home_json_under_fill_lets_the_registered_pin_govern(
     three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
