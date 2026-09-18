@@ -65,7 +65,8 @@ environment still overrides it. Create the second login once with
 The pin must point at a home **ccc knows** — `~/.codex`, `codex_home_private`, or an entry
 of `codex_homes_extra`. A path outside those maps to no seat label, so the selector treats
 the pin as absent and ignores it; add the login to `codex_homes_extra` first
-(`codex_homes_extra = ["de=~/.codex-de"]`) and it gains its own `codex:de` quota row.
+(`codex_homes_extra = ["de=~/.codex-de"]`) and it gains its own quota row — id
+`codex:de`, shown as `codex-de`, which is also the shell alias that opens it.
 
 Since 2026-09-04 the pin is the WEAKEST selector: it applies only while no explicit
 **seat order** is configured (see the next section). With an order set, `home <path>`
@@ -200,7 +201,7 @@ new attempt, because the runner records its next refusal with an `observed_at` n
 that measurement. `ccc quota` shows the whole ladder, tagged with the policy that ranked it:
 
 ```
-codex seats [fill]: 1 private ✅ → 2 de ✅ → 3 default ⛔ (hold)     next attempt: codex:private
+codex seats [fill]: 1 private ✅ → 2 de ✅ → 3 default ⛔ (hold)     next attempt: codex-priv
                     ⚠ private: renewal date 2026-09-30 passed · change: codex-in-claude order <label…>
 ```
 

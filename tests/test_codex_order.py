@@ -230,7 +230,41 @@ def test_quota_footer_names_the_ladder_and_the_next_attempt(
     assert cli.main(["quota"]) == 0
     out = capsys.readouterr().out
     assert "codex seats [fill]: 1 private ⛔ (hold) → 2 de ❔ → 3 default ❔" in out
-    assert "next attempt: codex:de" in out
+    # The footer names the seat the way the rows above do (the provider id's display
+    # spelling), not the wire id — see quota.display_id.
+    assert "next attempt: codex-de" in out
+    _ = three_seats
+
+
+def test_quota_report_names_seats_the_way_a_shell_does(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every row is the command that opens that seat — no wire id reaches a human.
+
+    The report used to print `codex` / `codex:private` / `claude:work`, which a reader
+    had to translate into `codex-work` / `codex-priv` / `cwork` before they could act on
+    a blocked row.
+    """
+    assert cli.main(["quota"]) == 0
+    out = capsys.readouterr().out
+    for shown in ("codex-work", "codex-priv", "codex-de"):
+        assert shown in out, out
+    assert "codex:private" not in out and " codex " not in out, out
+
+
+def test_quota_flags_take_either_spelling(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A name copied off the report must address the same provider the wire id does."""
+    assert cli.main(["quota", "-p", "codex-priv"]) == cli.main(["quota", "-p", "codex:private"])
+    shown = capsys.readouterr().out
+    assert shown.count("codex-priv:") == 2, shown
+    quota.record_block("codex:de", blocked_until=int(time.time()) + 900, reason="probe")
+    assert cli.main(["quota", "-p", "codex-de"]) == quota.EXIT_BLOCKED
+    capsys.readouterr()
+    assert cli.main(["quota", "-c", "codex-de"]) == 0
+    assert "codex-de cleared" in capsys.readouterr().out
+    assert cli.main(["quota", "-p", "codex:de"]) != quota.EXIT_BLOCKED
     _ = three_seats
 
 

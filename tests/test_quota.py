@@ -693,3 +693,54 @@ def test_rollout_evidence_supersedes_only_when_it_is_newer_and_healthy(tmp_path:
     _write_rollout(home, "refused", _token_count(NOW - 900, "usage_limit_reached"))  # T+2
     row = quota._codex_seat_quota("codex:private", "private", home, NOW, entry)  # noqa: SLF001
     assert row.state == quota.BLOCKED
+
+
+# ── human names ──────────────────────────────────────────────────────────────────
+#
+# The ids are the wire format (the cooldown store's keys, `ai.py`'s `_ORACLE_IDS`) and
+# must not move. What a person reads is a separate vocabulary — the one they type at a
+# shell — and the two are joined by `display_id`/`canonical_id`. The round-trip is the
+# invariant: if it ever stops holding, `ccc quota -c <name-from-the-report>` clears the
+# wrong provider, or nothing at all.
+
+
+@pytest.mark.parametrize(
+    ("pid", "shown"),
+    [
+        ("copilot", "copilot"),
+        ("gemini", "gemini"),
+        ("codex", "codex-work"),
+        ("codex:private", "codex-priv"),
+        ("codex:de", "codex-de"),
+        ("claude:work", "claude-work"),
+        ("claude:private", "claude-priv"),
+    ],
+)
+def test_display_name_round_trips_to_its_wire_id(pid: str, shown: str) -> None:
+    assert quota.display_id(pid) == shown
+    assert quota.canonical_id(shown) == pid
+    assert quota.canonical_id(pid) == pid, "a wire id must pass through untouched"
+
+
+def test_seat_command_only_where_the_name_is_not_the_command() -> None:
+    """Codex seats are named after their own aliases; the Claude ones are not."""
+    assert quota.seat_command("claude:work") == "cwork"
+    assert quota.seat_command("claude:private") == "cpriv"
+    assert quota.seat_command("codex:de") == ""
+    assert quota.seat_command("copilot") == ""
+
+
+def test_an_extra_codex_label_keeps_its_own_spelling() -> None:
+    """Only `default`/`private` are re-spelled; a `codex_homes_extra` label is its own."""
+    assert quota.display_id("codex:de-2") == "codex-de-2"
+    assert quota.canonical_id("codex-de-2") == "codex:de-2"
+
+
+def test_snapshot_rows_carry_the_display_name_and_the_command() -> None:
+    """Additive v2 fields: a consumer renders a report without re-deriving the rules."""
+    snap = quota.snapshot(now=NOW)
+    rows = {row["id"]: row for row in snap["providers"]}
+    assert snap["version"] == quota.SCHEMA_VERSION
+    for pid, row in rows.items():
+        assert row["display"] == quota.display_id(pid)
+        assert row.get("command", "") == quota.seat_command(pid)

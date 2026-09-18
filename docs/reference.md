@@ -2190,19 +2190,37 @@ already-refused request.
 ```commands
 ccc quota                       # human table: provider · state · data age · unblocks · windows
 ccc quota -j                    # versioned JSON contract (for scripts), schema v2
-ccc quota -p codex:private      # one provider; exit 0=available 1=blocked 2=unknown
+ccc quota -p codex-priv         # one provider; exit 0=available 1=blocked 2=unknown
 ccc quota -b                    # best CLAUDE account label only
 ccc quota -M claude-opus-4-6    # scope Claude windows to the model you will call
 ccc quota -r                    # force a live re-fetch (the ONLY networked path)
 ccc quota -m copilot -u 272848 -R "429 quota exceeded"   # record an authoritative block
-ccc quota -m codex -H -U 2026-09-07T00:00 -R "team seat reserved"  # administrative HOLD
+ccc quota -m codex-work -H -U 2026-09-07T00:00 -R "team seat reserved"  # administrative HOLD
 ccc quota -c copilot            # clear a block (also the only way to lift a hold)
-ccc quota -c claude:private -O  # observed-only clear: lifts a rejection, never a hold
+ccc quota -c claude-priv -O     # observed-only clear: lifts a rejection, never a hold
 ```
 
-Every Codex seat appears as its own row — `codex` (the canonical team seat, `~/.codex`,
-env-independent), `codex:private` (`codex_home_private`) and one `codex:<label>` per
-`codex_homes_extra` login — each with the account e-mail from its `auth.json` as identity
+### Two vocabularies: what you read and what machines key on
+
+The report names every seat **the way you open it** — `claude-work (cwork)`,
+`claude-priv (cpriv)`, `codex-work`, `codex-priv`, `codex-de` — so a blocked row already
+tells you the command for the seat to use instead. The JSON contract keeps the ids it
+always had (`claude:work`, `codex`, `codex:private`): they key the cooldown store and
+every consumer's provider map, and renaming them would orphan recorded blocks. The two
+are joined by `quota.display_id` / `quota.canonical_id` (exact inverses, pinned by a
+round-trip test), and **`-p`, `-m` and `-c` accept either spelling**, so a name copied off
+the report always addresses the right provider. Since 2026-09-18 each `-j` provider row
+also carries `display` (the human name) and, for a seat that has one, `command` (the shell
+alias) — additive, schema still v2 — so a consumer renders a report without re-deriving
+the rules. `ccc quota -b` is unchanged: it prints the bare Claude account LABEL (`work`),
+which is what shell wrappers feed to `CLAUDE_CONFIG_DIR` logic. The `codex seats …` footer
+keeps naming SEAT LABELS (`default`/`private`/`de`) in its ranked ladder, because those are
+the tokens `ccc set codex-order` takes; only its `next attempt` is a provider id and is
+spelled like the rows.
+
+Every Codex seat appears as its own row — `codex-work` (the canonical team seat,
+`~/.codex`, env-independent; id `codex`), `codex-priv` (`codex_home_private`) and one
+`codex-<label>` per `codex_homes_extra` login — each with the account e-mail from its `auth.json` as identity
 proof and its own rollout-refusal attribution. A seat whose path is already listed is
 deduped away, so one billable identity is never counted twice. A seat on a `codex_seat_rota`
 is BLOCKED for the weeks that belong to somebody else (`blocked_by="rota"`, the row carrying

@@ -3432,8 +3432,9 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
         else:
             blocked_until = now + max(0, args.retry_after)
         kind = quota.KIND_HOLD if args.hold else quota.KIND_OBSERVED
+        marked = quota.canonical_id(args.mark)
         entry = quota.record_block(
-            args.mark,
+            marked,
             blocked_until=blocked_until,
             reason=args.reason
             or ("administrative hold" if args.hold else "provider rejected the request"),
@@ -3442,20 +3443,22 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
             kind=kind,
             scope=args.scope,
         )
+        shown = quota.display_id(marked)
         if entry.get("kind") == quota.KIND_HOLD and kind != quota.KIND_HOLD:
-            print(f"quota: {args.mark} has an unexpired HOLD — observed mark not applied")
+            print(f"quota: {shown} has an unexpired HOLD — observed mark not applied")
             return 0
         until = usage.format_reset(int(entry["blocked_until"]), now)
         word = "held" if entry.get("kind") == quota.KIND_HOLD else "blocked"
-        print(f"quota: {args.mark} {word}, unblocks {until}")
+        print(f"quota: {shown} {word}, unblocks {until}")
         return 0
 
     if args.clear:
-        cleared = quota.clear_block(args.clear, observed_only=args.observed_only)
+        target = quota.canonical_id(args.clear)
+        cleared = quota.clear_block(target, observed_only=args.observed_only)
         outcome = "cleared" if cleared else "not blocked"
         if not cleared and args.observed_only:
             outcome = "not cleared (no observed block; holds need a plain -c)"
-        print(f"quota: {args.clear} {outcome}")
+        print(f"quota: {quota.display_id(target)} {outcome}")
         return 0
 
     if args.refresh:
@@ -3470,13 +3473,16 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
     snap = quota.snapshot(model=args.model, now=now)
 
     if args.provider:
-        match = next((p for p in snap["providers"] if p["id"] == args.provider), None)
+        # Either spelling: the report prints `claude-work`, the JSON contract still says
+        # `claude:work`, and a user must be able to paste back whichever they are looking at.
+        wanted = quota.canonical_id(args.provider)
+        match = next((p for p in snap["providers"] if p["id"] == wanted), None)
         if match is None:
             print(f"quota: unknown provider '{args.provider}'", file=sys.stderr)
             return quota.EXIT_UNKNOWN
         if not args.json:
             reason = f" — {match['reason']}" if match.get("reason") else ""
-            print(f"{match['id']}: {match['state']}{reason}")
+            print(f"{quota.display_id(match['id'])}: {match['state']}{reason}")
         else:
             print(json.dumps(match, indent=2))
         return {
@@ -3492,7 +3498,19 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
         print(json.dumps(snap, indent=2))
         return 0
 
-    print(f"  {'provider':<16} {'state':<10} {'data age':<12} {'unblocks':<16} windows")
+    # Width from the widest NAME actually printed: the seat aliases (`claude-work
+    # (cwork)`) made a fixed 16 overflow into the state column, and hard-coding the new
+    # maximum would do the same the next time a seat label grows.
+    # Read from the snapshot's own `display`/`command` fields rather than re-deriving
+    # them: the report is then a consumer of the same contract every external caller
+    # reads, so a naming change cannot land in one and not the other.
+    names = {
+        prov["id"]: str(prov.get("display") or prov["id"])
+        + (f" ({prov['command']})" if prov.get("command") else "")
+        for prov in snap["providers"]
+    }
+    width = max([len("provider"), *(len(n) for n in names.values())])
+    print(f"  {'provider':<{width + 2}} {'state':<10} {'data age':<12} {'unblocks':<16} windows")
     for prov in snap["providers"]:
         state = prov["state"]
         unblocks = (
@@ -3522,9 +3540,16 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
             detail = f"{prov['reason']} ({wins})"
         if prov.get("email"):
             detail = f"{detail}  [{prov['email']}]" if detail else f"[{prov['email']}]"
-        print(f"  {mark} {prov['id']:<14} {state:<10} {age:<12} {unblocks:<16} {detail}")
+        # The name carries the seat's own shell command when that is not the name
+        # itself, so the row answers "and how do I open a session there?" in place.
+        print(
+            f"  {mark} {names[prov['id']]:<{width}} {state:<10} {age:<12} {unblocks:<16} {detail}"
+        )
     if snap["best_claude_account"]:
-        print(f"best Claude account (spends what resets soonest): {snap['best_claude_account']}")
+        best = names.get(snap["best_claude_account"]) or quota.display_id(
+            snap["best_claude_account"]
+        )
+        print(f"best Claude account (spends what resets soonest): {best}")
     _print_codex_seat_footer(snap, now)
     return 0
 
@@ -3541,7 +3566,7 @@ def _print_codex_seat_footer(snap: dict[str, Any], now: int) -> None:
     D9): under ``fill`` the next attempt is the seat whose weekly allowance resets
     soonest, so the configured order alone no longer explains it.
     """
-    from . import usage  # pylint: disable=import-outside-toplevel
+    from . import quota, usage  # pylint: disable=import-outside-toplevel
 
     rows = snap.get("codex_seat_order") or []
     ladder = " → ".join(
@@ -3554,7 +3579,12 @@ def _print_codex_seat_footer(snap: dict[str, Any], now: int) -> None:
         )
         for row in rows
     )
-    next_attempt = str(snap.get("codex_next_attempt") or snap.get("best_codex_account") or "")
+    # The ranked ladder above shows SEAT LABELS (`default`/`private`/`de`) on purpose —
+    # they are the tokens `ccc set codex-order` demands. `next_attempt` is a provider id,
+    # so it is spelled the way the rows above spell it.
+    next_attempt = quota.display_id(
+        str(snap.get("codex_next_attempt") or snap.get("best_codex_account") or "")
+    )
     if next_attempt:
         tail = f"next attempt: {next_attempt}"
     else:
@@ -5576,6 +5606,12 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_quota = sub.add_parser(
         "quota",
         help="fast cache-first quota oracle: which provider/account still has tokens",
+        description=(
+            "Rows are named the way you would open a session on that seat — "
+            "claude-work (cwork), claude-priv (cpriv), codex-work, codex-priv, codex-de. "
+            "-p/-m/-c take either that name or the JSON contract's id (claude:work, "
+            "codex, codex:private); the -j payload keeps the ids unchanged."
+        ),
     )
     p_quota.add_argument(
         "-j", "--json", action="store_true", help="emit the versioned JSON contract"
@@ -5584,7 +5620,8 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "-p",
         "--provider",
         metavar="ID",
-        help="report ONE provider; exit 0=available 1=blocked 2=unknown/disabled",
+        help="report ONE provider (claude-work or claude:work); "
+        "exit 0=available 1=blocked 2=unknown/disabled",
     )
     p_quota.add_argument(
         "-b",
@@ -5606,7 +5643,10 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         help="re-fetch live usage first (the ONLY networked path)",
     )
     p_quota.add_argument(
-        "-m", "--mark", metavar="ID", help="record an authoritative block for a provider"
+        "-m",
+        "--mark",
+        metavar="ID",
+        help="record an authoritative block for a provider (either spelling)",
     )
     p_quota.add_argument(
         "-u",
@@ -5637,7 +5677,9 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         help="block scope tag for -m (e.g. 'auth' = entitlement/login failure; "
         "consumers may treat auth-scoped blocks as not worth a last-resort retry)",
     )
-    p_quota.add_argument("-c", "--clear", metavar="ID", help="drop a provider's block")
+    p_quota.add_argument(
+        "-c", "--clear", metavar="ID", help="drop a provider's block (either spelling)"
+    )
     p_quota.add_argument(
         "-O",
         "--observed-only",

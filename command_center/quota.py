@@ -96,6 +96,12 @@ from . import config, seat_rota, usage
 # ``codex_in_claude.pin_active()``, which under the ``fill`` policy is true even with an
 # explicit order configured.
 #
+# v2 stayed v2 on 2026-09-18, same reason — the rename is ADDITIVE: each provider row
+# gains ``display`` (the human spelling: ``claude:work`` → ``claude-work``, ``codex`` →
+# ``codex-work``) and, for a seat with one, ``command`` (the shell alias that opens it:
+# ``cwork``/``cpriv``). ``id`` is untouched and stays the key for the cooldown store and
+# every consumer's provider map; a consumer that ignores the new fields is unaffected.
+#
 # v2 stayed v2 once more on 2026-09-14 (the seat rota), same reason — everything it adds
 # is ADDITIVE: per ``codex_seat_order`` row a ``rota`` object (``None`` when that seat is
 # on no rota), the same object on the seat's ``providers`` entry, and a top-level
@@ -204,6 +210,72 @@ class WindowState:
     def risky(self) -> bool:
         """Advisory: at/over routing's 90 % risk threshold, but not necessarily blocked."""
         return not self.stale and self.used_pct >= _RISKY_PCT
+
+
+# ── Human-facing names ───────────────────────────────────────────────────────
+#
+# The ids above are this module's WIRE format and never change: consumers pin them
+# (``ai.py``'s ``_ORACLE_IDS``), the cooldown store is keyed by them, and renaming them
+# would orphan every recorded block. What a HUMAN reads is a different thing: the seats
+# are opened from a shell as ``cwork``, ``codex-de``, ``codex-priv``, so a report that
+# says ``claude:work`` / ``codex`` / ``codex:private`` makes the reader translate every
+# row back into a command before they can act on it — and ``codex`` (the canonical team
+# seat) does not even hint that it is the work login.
+#
+# :func:`display_id` is that translation (``<kind>-<seat>``, seat spelled the way the
+# shell spells it), :func:`canonical_id` its exact inverse, and every id-taking flag
+# (``-p``/``-m``/``-c``) accepts EITHER spelling — so nothing that already works breaks
+# and nothing a human reads has to be translated. Round-trip is a test invariant.
+_DISPLAY_SEAT = {"default": "work", "private": "priv"}
+# The inverse, per kind: Codex's canonical team seat is labelled ``default`` while the
+# work Claude seat really is labelled ``work``, so ``work`` un-maps differently per kind.
+_CANONICAL_SEAT: dict[str, dict[str, str]] = {
+    "claude": {"priv": "private"},
+    "codex": {"work": "default", "priv": "private"},
+}
+
+
+def display_id(pid: str) -> str:
+    """Wire id → the name a human reads: ``claude:work`` → ``claude-work``,
+    ``codex`` → ``codex-work``, ``codex:private`` → ``codex-priv``.
+
+    Single-seat providers (``copilot``, ``gemini``) have no seat to name and pass through.
+    """
+    kind, _sep, seat = pid.partition(":")
+    if kind == "codex" and not seat:
+        seat = "default"  # the canonical team seat's implicit label
+    if not seat:
+        return pid
+    return f"{kind}-{_DISPLAY_SEAT.get(seat, seat)}"
+
+
+def canonical_id(name: str) -> str:
+    """The inverse of :func:`display_id`; anything already canonical passes through.
+
+    Lets ``ccc quota -c claude-work`` and ``ccc quota -c claude:work`` mean the same
+    thing, so a user can copy the name straight off the report.
+    """
+    kind, sep, seat = name.partition("-")
+    if not sep or kind not in _CANONICAL_SEAT:
+        return name
+    seat = _CANONICAL_SEAT[kind].get(seat, seat)
+    if kind == "codex" and seat == "default":
+        return "codex"
+    return f"{kind}:{seat}"
+
+
+def seat_command(pid: str) -> str:
+    """The shell command that opens a session on this seat, when it is not the
+    display name itself — ``claude:work`` → ``cwork``, ``claude:private`` → ``cpriv``.
+
+    The Codex seats are named after their own commands (``codex-de`` IS the alias), so
+    they return "" rather than repeating themselves. The commands themselves live in the
+    user's shell configuration; this is only the naming convention they follow.
+    """
+    kind, _sep, seat = pid.partition(":")
+    if kind != "claude" or not seat:
+        return ""
+    return "c" + _DISPLAY_SEAT.get(seat, seat)
 
 
 @dataclass
@@ -1727,6 +1799,13 @@ def _provider_dict(quota: ProviderQuota) -> dict[str, Any]:
     """Serialize one provider, dropping empty optional fields to keep the JSON readable."""
     data = asdict(quota)
     data["windows"] = {name: asdict(win) for name, win in quota.windows.items()}
+    # ADDITIVE (2026-09-18, v2 stays v2): the human spelling of ``id`` and the shell
+    # command that opens that seat, so a consumer rendering a report for a person does
+    # not have to re-derive this module's naming rules and drift from them. ``id`` is
+    # unchanged and remains the key for everything machine-facing.
+    data["display"] = display_id(quota.id)
+    if command := seat_command(quota.id):
+        data["command"] = command
     return {
         k: v for k, v in data.items() if v not in ("", 0, None, {}) or k in ("state", "id", "kind")
     }
