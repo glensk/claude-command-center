@@ -2319,6 +2319,21 @@ Claude accounts expose a Fable-model-scoped weekly window alongside the plain on
 account at 100 % on `fable_week` is **not** out of tokens for an Opus request — pass
 `-M <model>` (or `model=` to `quota.snapshot`) so only the governing windows are consulted.
 
+### A blocked row still carries what the meter measured
+
+The cooldown store decides the **verdict** — that is its whole job — but not what the row
+knows. Every resolver measures FIRST and passes its windows into the blocked row, so a
+seat rejected by an observed 429 still reports the meter beside it. Before this, `ccc
+quota` drew empty `0 %` bars for an account whose weekly window the TUI card next to it
+showed at 100 %, and a JSON consumer reading a blocked row could not see the figures at
+all. The verdict fields are untouched: `blocked_by` stays `observed-rejection` / `hold`
+and `resets_at` stays the entry's deadline, because a rejection is not a meter reading.
+
+The same separation runs through Copilot: its credit window is now built from whatever
+snapshot exists — including one whose denominator is a configured guess, or a stale one —
+while the rule that only a *live-entitlement* denominator may establish exhaustion is
+unchanged. Showing a figure and letting it decide are two different things.
+
 ### The cooldown store
 
 `cooldowns.json` records authoritative rejections — HTTP status, quota marker, scope,

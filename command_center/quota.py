@@ -733,8 +733,18 @@ def observed_block_superseded(
     return _verdict_from_windows(windows)[0] == AVAILABLE
 
 
-def _cooldown_quota(pid: str, kind: str, entry: dict) -> ProviderQuota:
-    """Build a BLOCKED provider straight from a cooldown entry (rejection or hold)."""
+def _cooldown_quota(
+    pid: str, kind: str, entry: dict, windows: dict[str, WindowState] | None = None
+) -> ProviderQuota:
+    """Build a BLOCKED provider straight from a cooldown entry (rejection or hold).
+
+    *windows* are the provider's MEASURED windows, when the caller has them. They do not
+    enter the verdict — that is the entry's, which is the whole point of the store — but
+    they are still the truth about the provider's meter, and a row that drops them lies by
+    omission: ``ccc quota`` drew empty 0 % bars for a seat whose weekly window the TUI card
+    beside it showed at 100 %, and a JSON consumer reading a blocked row could not see the
+    meter at all. Every caller that has a snapshot now measures FIRST and passes it here.
+    """
     is_hold = entry.get("kind") == KIND_HOLD
     return ProviderQuota(
         id=pid,
@@ -745,6 +755,7 @@ def _cooldown_quota(pid: str, kind: str, entry: dict) -> ProviderQuota:
             or ("administrative hold" if is_hold else "provider rejected the request")
         ),
         source="hold" if is_hold else "cooldown",
+        windows=dict(windows or {}),
         blocked_by="hold" if is_hold else "observed-rejection",
         resets_at=int(entry.get("blocked_until", 0) or 0),
         captured_at=int(entry.get("observed_at", 0) or 0),
@@ -753,25 +764,8 @@ def _cooldown_quota(pid: str, kind: str, entry: dict) -> ProviderQuota:
     )
 
 
-def _claude_quota(account: str, model: str, now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
-    """Resolve one Claude account against the windows that govern *model*."""
-    pid = f"claude:{account}"
-    config_dir = str(config.claude_config_dirs().get(account, ""))
-    if pid in cooldowns:
-        quota = _cooldown_quota(pid, "claude", cooldowns[pid])
-        quota.account, quota.config_dir = account, config_dir
-        return quota
-    snap = usage.read_usage(account)
-    if snap is None:
-        return ProviderQuota(
-            id=pid,
-            kind="claude",
-            state=UNKNOWN,
-            reason="no usage snapshot",
-            source="windows",
-            account=account,
-            config_dir=config_dir,
-        )
+def _claude_windows(snap: usage.Usage, now: int) -> dict[str, WindowState]:
+    """One Claude snapshot's windows, each aged against the evidence that produced it."""
     windows: dict[str, WindowState] = {}
     for name, win, stale_after, evidence_at in (
         ("five_hour", snap.five_hour, _SESSION_STALE_AFTER_SEC, None),
@@ -784,6 +778,32 @@ def _claude_quota(account: str, model: str, now: int, cooldowns: dict[str, dict]
         state = _window_state(name, win, snap.captured_at, now, stale_after, evidence_at)
         if state is not None:
             windows[name] = state
+    return windows
+
+
+def _claude_quota(account: str, model: str, now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
+    """Resolve one Claude account against the windows that govern *model*."""
+    pid = f"claude:{account}"
+    config_dir = str(config.claude_config_dirs().get(account, ""))
+    # Measured BEFORE the cooldown store is consulted, so a blocked row still carries the
+    # account's real windows (see :func:`_cooldown_quota`). The verdict order is unchanged
+    # — an entry still outranks the meter — only the evidence travels with it now.
+    snap = usage.read_usage(account)
+    windows = _claude_windows(snap, now) if snap is not None else {}
+    if pid in cooldowns:
+        quota = _cooldown_quota(pid, "claude", cooldowns[pid], windows)
+        quota.account, quota.config_dir = account, config_dir
+        return quota
+    if snap is None:
+        return ProviderQuota(
+            id=pid,
+            kind="claude",
+            state=UNKNOWN,
+            reason="no usage snapshot",
+            source="windows",
+            account=account,
+            config_dir=config_dir,
+        )
     governing = _windows_for_model(windows, model)
     verdict, reason, blocked_by, resets_at, risky = _verdict_from_windows(governing)
     quota = ProviderQuota(
@@ -945,7 +965,7 @@ def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-loca
     entry = cooldowns.get(pid)
     superseded = entry is not None and observed_block_superseded(entry, snap, windows.values(), now)
     if entry is not None and not superseded:
-        quota = _cooldown_quota(pid, "codex", entry)
+        quota = _cooldown_quota(pid, "codex", entry, windows)
         quota.account, quota.email = label, email
         return quota
     # No auth.json = no login here (or a keyring store this reader cannot see). UNKNOWN,
@@ -1653,23 +1673,50 @@ def select_codex_account(
     return candidates[0].id if candidates else ""
 
 
+def _copilot_window(snap: usage.CopilotUsage | None) -> dict[str, WindowState]:
+    """Copilot's credit meter as a window — measurement only, no verdict.
+
+    Built from whatever snapshot exists, INCLUDING one whose denominator is a configured
+    guess or whose figures are stale, because this is what the seat's meter says and it is
+    what the TUI card draws. Whether that reading may establish exhaustion is a separate
+    question, answered by :func:`_copilot_quota` alone.
+    """
+    if snap is None:
+        return {}
+    used = snap.credits_used or snap.quantity
+    quota = max(1, snap.credit_quota)
+    return {
+        "credits": WindowState(
+            name="credits",
+            used_pct=used / quota * 100.0,
+            resets_at=int(snap.premium_reset_at),
+            evidence_at=snap.captured_at,
+        )
+    }
+
+
 def _copilot_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
     """Resolve the GitHub Copilot seat.
 
     Precedence, strictest evidence first:
 
-    1. An unexpired observed 429 → ``blocked``. The seat's own rejection outranks any
+    1. An unexpired observed 429 -> ``blocked``. The seat's own rejection outranks any
        billing snapshot, which lags by up to a day.
     2. A FRESH snapshot whose denominator came from the live seat entitlement
-       (``quota_source == "api"``) → ``blocked`` or ``available`` by the meter.
-    3. Anything else — a *guessed* ``copilot_credit_quota`` denominator, a stale
-       snapshot, or no snapshot → ``unknown``. A guessed denominator can never establish
+       (``quota_source == "api"``) -> ``blocked`` or ``available`` by the meter.
+    3. Anything else - a *guessed* ``copilot_credit_quota`` denominator, a stale
+       snapshot, or no snapshot -> ``unknown``. A guessed denominator can never establish
        exhaustion: the configured default has been observed to be 2x the real entitlement,
        which would report a dead seat as half-full.
+
+    Every one of those outcomes carries the meter's window when there is one
+    (:func:`_copilot_window`). Only rule 2 lets it decide anything; the rest merely show
+    it, so the row and the card can never disagree about what was measured.
     """
-    if "copilot" in cooldowns:
-        return _cooldown_quota("copilot", "copilot", cooldowns["copilot"])
     snap = usage.read_copilot_usage()
+    windows = _copilot_window(snap)
+    if "copilot" in cooldowns:
+        return _cooldown_quota("copilot", "copilot", cooldowns["copilot"], windows)
     if snap is None:
         return ProviderQuota(
             id="copilot", kind="copilot", state=UNKNOWN, reason="no usage snapshot", source="meter"
@@ -1681,6 +1728,7 @@ def _copilot_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
             state=UNKNOWN,
             reason="denominator is a configured guess, not the seat entitlement",
             source="meter",
+            windows=windows,
             captured_at=snap.captured_at,
         )
     if snap.captured_at + _COPILOT_STALE_AFTER_SEC < now:
@@ -1690,20 +1738,20 @@ def _copilot_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
             state=UNKNOWN,
             reason="meter snapshot stale",
             source="meter",
+            windows=windows,
             captured_at=snap.captured_at,
         )
-    used = snap.credits_used or snap.quantity
-    quota = max(1, snap.credit_quota)
-    pct = used / quota * 100.0
-    window = WindowState(name="credits", used_pct=pct, resets_at=int(snap.premium_reset_at))
+    window = windows["credits"]
     if window.exhausted:
+        used = snap.credits_used or snap.quantity
+        quota = max(1, snap.credit_quota)
         return ProviderQuota(
             id="copilot",
             kind="copilot",
             state=BLOCKED,
-            reason=f"AI credits {used:.0f}/{quota} ({pct:.0f}%)",
+            reason=f"AI credits {used:.0f}/{quota} ({window.used_pct:.0f}%)",
             source="meter",
-            windows={"credits": window},
+            windows=windows,
             blocked_by="credits",
             resets_at=int(snap.premium_reset_at),
             captured_at=snap.captured_at,
@@ -1714,10 +1762,29 @@ def _copilot_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
         kind="copilot",
         state=AVAILABLE,
         source="meter",
-        windows={"credits": window},
+        windows=windows,
         captured_at=snap.captured_at,
         risky=window.risky,
     )
+
+
+def _agy_windows(snap: usage.AgyUsage | None, now: int) -> dict[str, WindowState]:
+    """One Antigravity snapshot's buckets as windows (measurement only, no verdict)."""
+    if snap is None:
+        return {}
+    windows: dict[str, WindowState] = {}
+    for bucket in snap.buckets:
+        name = _AGY_WINDOW_NAMES.get(bucket.id, bucket.id.replace("-", "_"))
+        win = _window_state(
+            name,
+            usage.Window(used_percentage=bucket.used_percentage, resets_at=bucket.resets_at),
+            snap.captured_at,
+            now,
+            _AGY_STALE_AFTER_SEC,
+        )
+        if win is not None:
+            windows[name] = win
+    return windows
 
 
 def _agy_quota(now: int, cooldowns: dict[str, dict], model: str = "") -> ProviderQuota:
@@ -1735,9 +1802,10 @@ def _agy_quota(now: int, cooldowns: dict[str, dict], model: str = "") -> Provide
     family the ``agy`` rung actually spends (its default model is a Gemini Flash), so it
     is the honest default rather than a guess averaged over both.
     """
-    if "agy" in cooldowns:
-        return _cooldown_quota("agy", "agy", cooldowns["agy"])
     snap = usage.read_agy_usage()
+    windows = _agy_windows(snap, now)
+    if "agy" in cooldowns:
+        return _cooldown_quota("agy", "agy", cooldowns["agy"], windows)
     if snap is None:
         off = not config.load_config().agy_usage
         return ProviderQuota(
@@ -1747,18 +1815,6 @@ def _agy_quota(now: int, cooldowns: dict[str, dict], model: str = "") -> Provide
             reason="no usage snapshot" + (" (agy_usage is off)" if off else ""),
             source="meter",
         )
-    windows: dict[str, WindowState] = {}
-    for bucket in snap.buckets:
-        name = _AGY_WINDOW_NAMES.get(bucket.id, bucket.id.replace("-", "_"))
-        win = _window_state(
-            name,
-            usage.Window(used_percentage=bucket.used_percentage, resets_at=bucket.resets_at),
-            snap.captured_at,
-            now,
-            _AGY_STALE_AFTER_SEC,
-        )
-        if win is not None:
-            windows[name] = win
     governing = _agy_windows_for_model(windows, model)
     state, reason, blocked_by, resets_at, risky = _verdict_from_windows(governing)
     return ProviderQuota(

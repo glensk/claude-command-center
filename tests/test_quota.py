@@ -988,3 +988,95 @@ def test_quota_report_no_bars_flag_restores_the_plain_columns(
     assert "█" not in out and "░" not in out
     # With no bars drawn, every window is back in the textual column.
     assert "geminiweek 40%" in out
+
+
+# ── a blocked row still carries what the meter measured ──────────────────────
+#
+# The cooldown store decides the VERDICT — that is its whole job. It must not decide what
+# the row knows: `ccc quota` drew empty 0% bars for a seat whose weekly window the TUI
+# card beside it showed at 100%, because every cooldown path returned before reading the
+# snapshot. A row and a card must never disagree about what was measured.
+
+
+def test_blocked_claude_row_still_reports_its_windows() -> None:
+    usage.write_usage(
+        {
+            "five_hour": {"used_percentage": 12, "resets_at": NOW + 3600},
+            "seven_day": {"used_percentage": 100, "resets_at": NOW + 86400},
+        },
+        account="private",
+        now=NOW,
+    )
+    quota.record_block(
+        "claude:private", blocked_until=NOW + 7200, reason="rate-limit halt", observed_at=NOW
+    )
+    row = quota._claude_quota("private", "", NOW, quota.read_cooldowns(NOW))
+    assert row.state == quota.BLOCKED
+    assert row.source == "cooldown"  # the verdict is still the entry's
+    assert row.reason == "rate-limit halt"
+    # …and the meter travels with it.
+    assert row.windows["seven_day"].used_pct == 100.0
+    assert row.windows["five_hour"].used_pct == 12.0
+    # The BLOCKING signal stays the rejection, not a window — a cooldown is not a meter
+    # reading and its reset is the entry's deadline.
+    assert row.blocked_by == "observed-rejection"
+    assert row.resets_at == NOW + 7200
+
+
+def test_blocked_copilot_row_still_reports_its_credit_window() -> None:
+    usage._write_copilot_usage(
+        usage.CopilotUsage(
+            captured_at=NOW,
+            year=2026,
+            month=9,
+            sku="AI Credits",
+            unit="AI credits",
+            quantity=1500.0,
+            gross=0.0,
+            net=0.0,
+            credit_quota=1500,
+            credits_used=1500.0,
+            premium_reset_at=NOW + 86400,
+            quota_source="api",
+        )
+    )
+    quota.record_block("copilot", blocked_until=NOW + 7200, reason="429", observed_at=NOW)
+    row = quota._copilot_quota(NOW, quota.read_cooldowns(NOW))
+    assert row.state == quota.BLOCKED
+    assert row.windows["credits"].used_pct == 100.0
+
+
+def test_a_guessed_denominator_is_shown_but_never_blocks() -> None:
+    """The safety rule is about the VERDICT, not about hiding the figure.
+
+    A configured `copilot_credit_quota` has been observed at 2x the real entitlement, so
+    it may not establish exhaustion — but the card draws it, so the row must show it too.
+    """
+    usage._write_copilot_usage(
+        usage.CopilotUsage(
+            captured_at=NOW,
+            year=2026,
+            month=9,
+            sku="AI Credits",
+            unit="AI credits",
+            quantity=1500.0,
+            gross=0.0,
+            net=0.0,
+            credit_quota=1500,
+            credits_used=1500.0,
+            premium_reset_at=NOW + 86400,
+            quota_source="config",
+        )
+    )
+    row = quota._copilot_quota(NOW, {})
+    assert row.state == quota.UNKNOWN
+    assert row.windows["credits"].used_pct == 100.0
+
+
+def test_blocked_agy_row_still_reports_its_buckets() -> None:
+    _agy_snapshot(gemini_pct=100.0, third_party_pct=7.0)
+    quota.record_block("agy", blocked_until=NOW + 3600, reason="refused", observed_at=NOW)
+    row = quota._agy_quota(NOW, quota.read_cooldowns(NOW))
+    assert row.state == quota.BLOCKED
+    assert row.windows["gemini_week"].used_pct == 100.0
+    assert row.windows["claudegpt_week"].used_pct == 7.0
