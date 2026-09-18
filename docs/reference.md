@@ -2234,20 +2234,38 @@ selector. The `data age` column shows how old each row's governing evidence is
 
 ### The two usage bars
 
-Every row draws the same **session** and **week** bars the TUI usage cards draw — same
-green ≤65 % / orange ≤85 % / red thresholds, same track colour, one palette
-(`usage.ansi_bar`, next to the cards' own `usage._bar`). Each provider fills those two
-slots from its own windows (`quota.BAR_SLOTS`): Claude and Codex from `five_hour` /
-`seven_day`, Copilot's monthly `credits` into the week slot (it is the recurring allowance
-that decides whether the seat answers; the row's `unblocks` carries the real reset), and
-Antigravity's `gemini_week` — it has no session window, so that slot reads `—` rather than
-an empty bar claiming a measured 0 %.
+Every row draws a **session** and a **week** bar, with the percentage embossed inside the
+bar the way the TUI cards emboss their reset time — that is what lets two bar columns sit
+beside the text ones instead of needing a number column after each (`usage.ansi_bar`, next
+to the cards' own `usage._bar`).
+
+Each provider fills the two slots from its own windows (`quota.BAR_SLOTS`): Claude and
+Codex from `five_hour` / `seven_day`, Antigravity from `gemini_week`. A provider whose kind
+is in `quota.BAR_SPAN_KINDS` has **one** allowance rather than two and gets a single bar
+across both columns — that is Copilot, whose budget is a month; squeezing a month into the
+"week" cell and leaving "session" blank would describe a provider with two horizons when it
+has one. A slot with no window of its own draws an empty bar reading `0%`, not a dash: both
+say "nothing measured here", but the bar keeps the column's shape.
+
+**The fill scale is the oracle's, not the cards'.** The cards go orange at 66 % and red at
+86 % — an at-a-glance health light. Here a colour that disagrees with the verdict in the
+next column is a bug: a seat at 97 % is `available`, so painting it the same red as an
+exhausted one says "stop" about a rung the table says to use. So `usage.cli_fill_for_pct`
+is green below `quota._RISKY_PCT` (90 %), orange while risky, and **red only once the
+window is actually full** (100 %). A test pins the two thresholds to quota's own.
 
 A window drawn as a bar is **not** repeated in the textual `windows` column, so each figure
 appears once; what has no slot (`fable_week`, Antigravity's second bucket) still shows
 there. A stale figure keeps its bar but loses its colour — it is the last thing measured,
-not a live reading. Colour is emitted only on a TTY without `NO_COLOR`; `-B/--no-bars`
-drops the two columns entirely and restores the plain `windows` listing.
+not a live reading. The `state` column is painted too: green for `available`, red for
+`blocked`/`disabled`, and deliberately unpainted for `unknown`, which is the fail-open
+state — colouring it like a block would advertise the exact conclusion the oracle refuses
+to draw from a measurement failure.
+
+Header and rows are built from the same widths (the mark cell padded to a known
+`_MARK_WIDTH`, then the name padded to the measured column), so the headings cannot drift
+off their columns. Colour is emitted only on a TTY without `NO_COLOR`; `-B/--no-bars` drops
+the bar columns entirely and restores the plain `windows` listing.
 
 ### Google Antigravity (`agy`)
 

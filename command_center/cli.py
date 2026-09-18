@@ -3389,10 +3389,34 @@ def cmd_job_account(args: argparse.Namespace) -> int:
 
 _QUOTA_MARK = {"available": "✅", "blocked": "⛔", "unknown": "❔", "disabled": "🚫"}
 
-# One usage bar in the `ccc quota` report: 10 glyphs, a space, a right-aligned percentage
-# ("100%" is the widest) — 15 visible columns, whatever escape sequences the colour adds.
-_BAR_GLYPHS = 10
-_BAR_CELL_WIDTH = _BAR_GLYPHS + 5
+# One usage bar in the `ccc quota` report. The percentage is EMBOSSED inside the bar (the
+# cards' own trick) rather than printed after it, which is what lets two bar columns fit
+# beside the text ones. A cell is therefore exactly `_BAR_CELL_WIDTH` terminal columns,
+# whatever escape sequences the colour adds — so padding is by the known width, never by
+# `len()`.
+_BAR_CELL_WIDTH = 13
+# The two cells plus the space between them: what a SPANNING bar (one allowance, not two
+# — see `quota.BAR_SPAN`) occupies.
+_BAR_SPAN_WIDTH = _BAR_CELL_WIDTH * 2 + 1
+
+# The `state` column, painted so the row's verdict is readable before it is read: a rung
+# to use is green, one to skip is red. `unknown` is deliberately neither — it is the
+# fail-open state, and colouring it like a block would advertise the exact conclusion the
+# oracle refuses to draw from a measurement failure.
+_QUOTA_STATE_COLOR = {"available": "\033[32m", "blocked": "\033[31m", "disabled": "\033[31m"}
+
+# Terminal columns reserved for the ✅/⛔/❔/🚫 mark. The glyphs are double-width emoji,
+# but `_QUOTA_MARK` falls back to a single space for a state it does not know, so the
+# cell is PADDED to this width rather than assumed to be it — otherwise one unrecognised
+# state shifts that row alone.
+_MARK_WIDTH = 2
+
+
+def _pad_cells(text: str, width: int) -> str:
+    """*text* padded with spaces to *width* TERMINAL columns (not characters)."""
+    from rich.cells import cell_len  # pylint: disable=import-outside-toplevel
+
+    return text + " " * max(0, width - cell_len(text))
 
 
 def _quota_age(prov: dict[str, Any], now: int) -> str:
@@ -3410,34 +3434,48 @@ def _quota_age(prov: dict[str, Any], now: int) -> str:
     return f"marked {age}" if prov.get("source") in ("cooldown", "hold") else age
 
 
-def _quota_bar_cells(windows: dict[str, Any], *, color: bool) -> tuple[str, set[str]]:
+def _quota_bar_cells(prov: dict[str, Any], *, color: bool) -> tuple[str, set[str]]:
     """The row's session + week bar cells, and the names of the windows they drew.
 
     Each slot of :data:`quota.BAR_SLOTS` is filled by the first window the provider
-    actually has, so one renderer serves every provider — Claude's ``fivehour`` /
-    ``sevenday``, Copilot's ``credits``, Antigravity's ``gemini_week``. A slot with no
-    window prints ``—``: an empty bar would claim a measured 0 %.
+    actually has, so one renderer serves every provider — Claude's and Codex's
+    ``five_hour`` / ``seven_day``, Antigravity's ``gemini_week``.
+
+    A provider whose KIND is in :data:`quota.BAR_SPAN_KINDS` has one allowance rather
+    than two and gets a single bar across both columns. That is Copilot, whose budget is
+    a month: squeezing a month into the "week" cell and leaving "session" blank would
+    describe a provider with two horizons when it has one.
+
+    A slot with no window of its own draws an EMPTY bar reading ``0%`` rather than a dash.
+    Both say "nothing measured here", but the bar keeps the column's shape, so the eye
+    reads down a row of bars instead of down a row of holes.
 
     The returned name set is what the caller must NOT repeat in the textual ``windows``
-    column. Padding is done here because the ANSI escapes make ``len()`` useless for it.
+    column.
     """
     from . import quota, usage  # pylint: disable=import-outside-toplevel
+
+    windows = prov.get("windows") or {}
+
+    def _cell(name: str, width: int) -> str:
+        if not name:
+            return usage.ansi_bar(0.0, width=width, color=color)
+        pct = float(windows[name].get("used_pct", 0) or 0)
+        # A stale figure keeps its bar but loses its colour: it is the last thing we
+        # measured, not a live reading, and a green bar would assert more than we know.
+        return usage.ansi_bar(pct, width=width, color=color and not windows[name].get("stale"))
+
+    if str(prov.get("kind", "")) in quota.BAR_SPAN_KINDS:
+        span = next((n for n in quota.BAR_SPAN_WINDOWS if n in windows), "")
+        return _cell(span, _BAR_SPAN_WIDTH) + " ", {span} if span else set()
 
     out: list[str] = []
     drawn: set[str] = set()
     for _slot, candidates in quota.BAR_SLOTS:
         name = next((n for n in candidates if n in windows), "")
-        if not name:
-            out.append("—".ljust(_BAR_CELL_WIDTH))
-            continue
-        drawn.add(name)
-        pct = float(windows[name].get("used_pct", 0) or 0)
-        # A stale figure keeps its bar but loses its colour: it is the last thing we
-        # measured, not a live reading, and a green bar would assert more than we know.
-        glyphs = usage.ansi_bar(
-            pct, width=_BAR_GLYPHS, color=color and not windows[name].get("stale")
-        )
-        out.append(f"{glyphs} {pct:>3.0f}%")
+        if name:
+            drawn.add(name)
+        out.append(_cell(name, _BAR_CELL_WIDTH))
     return " ".join(out) + " ", drawn
 
 
@@ -3571,9 +3609,14 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
     # alone. Computed here so the ages are formatted once and reused by the loop.
     ages = {prov["id"]: _quota_age(prov, now) for prov in snap["providers"]}
     age_w = max([len("data age"), *(len(a) for a in ages.values())])
+    colorable = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     bars = not args.no_bars
-    color = bars and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-    head = f"  {'provider':<{width + 2}} {'state':<10} {'data age':<{age_w}} "
+    color = bars and colorable
+    # The header is built from the SAME pieces as a row — a blank mark cell, then the
+    # name padded to `width` — so the two cannot drift. Spelling the header's first
+    # column as `width + 2` while the rows spent `cell_len(mark) + 1 + width` on it is
+    # exactly how it came to sit one column to the left of everything below it.
+    head = f"  {'':<{_MARK_WIDTH}} {'provider':<{width}} {'state':<10} {'data age':<{age_w}} "
     if bars:
         head += f"{'session':<{_BAR_CELL_WIDTH}} {'week':<{_BAR_CELL_WIDTH}} "
     print(head + f"{'unblocks':<16} windows")
@@ -3585,7 +3628,7 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
             else ("—" if state != quota.AVAILABLE else "")
         )
         windows = prov.get("windows") or {}
-        cells, drawn = _quota_bar_cells(windows, color=color) if bars else ("", set())
+        cells, drawn = _quota_bar_cells(prov, color=color) if bars else ("", set())
         # Only the windows NO bar shows (fable_week, Antigravity's second bucket, a
         # provider whose window has no slot): a row must state each figure once.
         wins = " ".join(
@@ -3593,7 +3636,7 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
             for name, win in windows.items()
             if name not in drawn
         )
-        mark = _QUOTA_MARK.get(state, " ")
+        mark = _pad_cells(_QUOTA_MARK.get(state, " "), _MARK_WIDTH)
         detail = wins or prov.get("reason", "")
         # A non-available provider that also has windows used to show ONLY the windows,
         # hiding why it is blocked — and a refusal's windows read as healthy headroom.
@@ -3605,8 +3648,11 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
             detail = f"{detail}  [{prov['email']}]" if detail else f"[{prov['email']}]"
         # The name carries the seat's own shell command when that is not the name
         # itself, so the row answers "and how do I open a session there?" in place.
+        shown_state = f"{state:<10}"
+        if colorable and state in _QUOTA_STATE_COLOR:
+            shown_state = f"{_QUOTA_STATE_COLOR[state]}{shown_state}\033[0m"
         print(
-            f"  {mark} {names[prov['id']]:<{width}} {state:<10} {ages[prov['id']]:<{age_w}} "
+            f"  {mark} {names[prov['id']]:<{width}} {shown_state} {ages[prov['id']]:<{age_w}} "
             f"{cells}{unblocks:<16} {detail}".rstrip()
         )
     if snap["best_claude_account"]:

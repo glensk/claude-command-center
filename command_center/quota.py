@@ -168,21 +168,34 @@ _AGY_WINDOW_NAMES = {"gemini-weekly": "gemini_week", "3p-weekly": "claudegpt_wee
 #
 # Two consequences worth stating, because they are choices and not accidents:
 #
-# * Copilot's monthly `credits` window fills the WEEK slot. It is a month, not a week,
-#   but it is the recurring allowance that decides whether the seat answers, and the
-#   alternative — a fourth column used by exactly one provider — costs more than the
-#   imprecision. The row's `unblocks` column carries the real reset.
+# * Copilot's monthly `credits` window is not in either slot — it SPANS them, see
+#   :data:`BAR_SPAN` below.
 # * Antigravity has two weekly buckets and no session window; `gemini_week` is listed
 #   first for the same reason :func:`_agy_quota` scopes to it by default — it is the
 #   family the `agy` rung spends.
+#
+# A slot a provider has no window for draws an EMPTY bar reading `0%`, not a dash: both
+# say "nothing measured here", but the bar keeps the column's shape so the eye reads down
+# a row of bars instead of down a row of holes.
 #
 # Windows drawn as a bar are omitted from the report's textual `windows` column, so a row
 # states each figure once. Anything with no slot here (`fable_week`, Antigravity's second
 # bucket) still shows there, which is what keeps this map from hiding data.
 BAR_SLOTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("session", ("five_hour",)),
-    ("week", ("seven_day", "credits", "gemini_week", "claudegpt_week")),
+    ("week", ("seven_day", "gemini_week", "claudegpt_week")),
 )
+# Provider KINDS that have one allowance rather than a session/week pair, and are drawn
+# as a single bar across BOTH columns, filled by the first of `BAR_SPAN_WINDOWS` they
+# carry. Copilot's credit budget is a month: filing it under "week" and leaving "session"
+# blank would describe a provider with two horizons when it has one. The row's `unblocks`
+# column still carries the real reset date.
+#
+# Keyed on the KIND, not on which windows happen to be present, so a copilot row with no
+# figures at all (blocked by an observed 429 before any meter was read) still draws its
+# one empty bar instead of briefly turning into a two-window provider.
+BAR_SPAN_KINDS: tuple[str, ...] = ("copilot",)
+BAR_SPAN_WINDOWS: tuple[str, ...] = ("credits",)
 
 # The Fable weekly figure is only as fresh as the last successful OAuth fetch
 # (``oauth_fetched_at``): statusline writes refresh ``captured_at`` while PRESERVING a

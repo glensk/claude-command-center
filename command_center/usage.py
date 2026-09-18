@@ -1897,18 +1897,30 @@ def _fill_for_pct(pct: float) -> str:
 
 # ── The same bar, for a plain terminal ───────────────────────────────────────
 #
-# The card bars above are Rich ``Text`` (background-filled cells with the reset time
-# embossed over them) and only render inside the TUI. ``ccc quota``'s report is plain
-# ``print()``, so it needs the bar as a STRING — but it must be the *same* bar: same
-# green/orange/red thresholds, same track colour, one palette. Hence this renderer sits
-# here, next to :func:`_bar`, and reuses :func:`_fill_for_pct` rather than restating the
-# thresholds at the call site.
+# The card bars above are Rich ``Text`` and only render inside the TUI. ``ccc quota``'s
+# report is plain ``print()``, so it needs the bar as a STRING — but it must be the *same*
+# bar: background-filled cells with the figure embossed over them, one palette, one track
+# colour. Hence this renderer sits here, next to :func:`_bar`.
 #
-# Foreground glyphs, not background cells: a report is piped, redirected and pasted far
-# more often than a TUI is, and ``████░░░░░░`` still reads as a bar with every escape
-# stripped, where a row of background-coloured spaces collapses into blanks.
+# It keeps a colourless fallback the cards have no need for. A report is piped, redirected
+# and pasted far more often than a TUI is, and ``█████░░░░40%`` still reads as a bar with
+# every escape stripped, where a row of background-coloured spaces collapses into blanks.
 _BAR_FILL_GLYPH = "\u2588"  # █ used
 _BAR_TRACK_GLYPH = "\u2591"  # ░ remaining
+
+# The report's fill scale, and it is NOT the cards' (:func:`_fill_for_pct`, green ≤65 /
+# orange ≤85 / red). A card is an at-a-glance health light where "getting warm" earns a
+# colour early; the report is the oracle's own table, and there a colour that disagrees
+# with the verdict beside it is a bug — a seat at 97 % is `available`, so painting it the
+# same red as an exhausted one says "stop" about a rung the very next column says to use.
+# So the bar is painted in the oracle's vocabulary instead: green below the routing RISK
+# threshold, orange while risky, red only once the window is actually FULL (quota's
+# ``_RISKY_PCT`` / ``_EXHAUSTED_PCT`` — restated rather than imported, because ``quota``
+# imports this module and not the other way round; a test pins them equal).
+_CLI_RISKY_PCT = 90.0
+_CLI_FULL_PCT = 100.0
+# Wide enough for an embossed "100%" plus a readable stretch of bar on both sides.
+_CLI_BAR_WIDTH = 13
 
 
 def _hex_rgb(color: str) -> tuple[int, int, int]:
@@ -1917,32 +1929,65 @@ def _hex_rgb(color: str) -> tuple[int, int, int]:
     return int(raw[0:2], 16), int(raw[2:4], 16), int(raw[4:6], 16)
 
 
-def ansi_bar(pct: float, *, width: int = 10, color: bool = True) -> str:
-    """A *width*-glyph usage bar for a plain terminal, coloured like the TUI cards.
+def cli_fill_for_pct(pct: float) -> str:
+    """The report's fill: green until risky, orange while risky, red only when full."""
+    if pct >= _CLI_FULL_PCT:
+        return _FILL_RED
+    if pct >= _CLI_RISKY_PCT:
+        return _FILL_ORANGE
+    return _FILL_GREEN
 
-    *pct* is the percentage USED (the cards' convention) and is clamped to 0–100; the
-    fill colour comes from :func:`_fill_for_pct`, so a bar here and a bar on a card
-    agree on what "healthy" looks like. *color* False emits the glyphs bare — for a
-    pipe, for ``NO_COLOR``, and for tests, which then assert on the shape alone.
 
-    Returns only the bar: the caller owns the percentage text and the column padding,
-    because the escape sequences make ``len()`` useless for alignment.
+def ansi_bar(
+    pct: float,
+    *,
+    width: int = _CLI_BAR_WIDTH,
+    color: bool = True,
+    label: str | None = None,
+) -> str:
+    """A *width*-cell usage bar with its percentage embossed, for a plain terminal.
+
+    *pct* is the percentage USED (the cards' convention) and is clamped to 0–100. The
+    figure rides INSIDE the bar, right-aligned, exactly as the cards emboss their reset
+    time — that is what buys the report its two bar columns without a separate number
+    column after each one. Pass *label* to emboss something else (``""`` for a bare bar).
+
+    Colour mode paints every cell's background (fill or track) and the embossed glyphs
+    on top — dark over the bright fill, light over the dark track. Colourless mode falls
+    back to ``█``/``░`` runs with the label overwriting its cells, so a piped report still
+    shows both the proportion and the number.
+
+    Returns just the bar: it is exactly *width* terminal columns wide, but the escapes
+    make ``len()`` useless, so the caller pads by the known width, never by measuring.
     """
     pct = max(0.0, min(100.0, pct))
     filled = round(pct / 100 * width)
-    bar = _BAR_FILL_GLYPH * filled + _BAR_TRACK_GLYPH * (width - filled)
+    text = f"{pct:.0f}%" if label is None else label
+    text = text[:width]
+    start = width - len(text)  # right-aligned: the digits line up down the column
     if not color:
-        return bar
-    # An empty run gets NO colour code: a full or empty bar would otherwise carry a
-    # dangling escape that says nothing and shows up in every golden-output test.
-    parts = []
-    if filled:
-        fr, fg, fb = _hex_rgb(_fill_for_pct(pct))
-        parts.append(f"\033[38;2;{fr};{fg};{fb}m{_BAR_FILL_GLYPH * filled}")
-    if width - filled:
-        tr, tg, tb = _hex_rgb(_TRACK_COLOR)
-        parts.append(f"\033[38;2;{tr};{tg};{tb}m{_BAR_TRACK_GLYPH * (width - filled)}")
-    return "".join(parts) + "\033[0m"
+        cells = [_BAR_FILL_GLYPH if i < filled else _BAR_TRACK_GLYPH for i in range(width)]
+        cells[start:] = list(text)
+        return "".join(cells)
+    fill_rgb = _hex_rgb(cli_fill_for_pct(pct))
+    track_rgb = _hex_rgb(_TRACK_COLOR)
+    overlay = _hex_rgb(_OVERLAY_ON_FILL)
+    on_track = _hex_rgb(_PCT_STYLE)
+    out: list[str] = []
+    current = ""  # last SGR emitted — a bar is at most four runs, not `width` of them
+    for i in range(width):
+        br, bg, bb = fill_rgb if i < filled else track_rgb
+        if i < start:
+            sgr, glyph = f"\033[48;2;{br};{bg};{bb}m", " "
+        else:
+            fr, fg, fb = overlay if i < filled else on_track
+            sgr = f"\033[1;38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m"
+            glyph = text[i - start]
+        if sgr != current:
+            out.append(sgr)
+            current = sgr
+        out.append(glyph)
+    return "".join(out) + "\033[0m"
 
 
 def _bar(

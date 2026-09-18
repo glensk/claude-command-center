@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -850,11 +851,14 @@ def test_bar_slots_name_only_windows_providers_really_have() -> None:
     """
     slots = dict(quota.BAR_SLOTS)
     assert slots["session"] == ("five_hour",)
+    known = {*slots["session"], *slots["week"], *quota.BAR_SPAN_WINDOWS, "fable_week"}
     _agy_snapshot(gemini_pct=5.0, third_party_pct=5.0)
     snap = quota.snapshot(now=NOW)
     for prov in snap["providers"]:
         for name in prov.get("windows") or {}:
-            assert name in {*slots["session"], *slots["week"], "fable_week"}, name
+            assert name in known, name
+    # A spanning KIND must not also claim a session/week slot — it would draw twice.
+    assert not set(quota.BAR_SPAN_WINDOWS) & {*slots["session"], *slots["week"]}
 
 
 # ── the report's usage bars ──────────────────────────────────────────────────
@@ -885,7 +889,7 @@ def _quota_args(**over: str | bool | None) -> argparse.Namespace:
 def test_quota_report_draws_a_session_and_week_bar(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every row gets both bars; a provider with no such window prints `—`, not 0 %."""
+    """Every row gets both bars, with the percentage embossed inside them."""
     from command_center import cli
 
     _agy_snapshot(gemini_pct=40.0, third_party_pct=0.0)
@@ -893,15 +897,82 @@ def test_quota_report_draws_a_session_and_week_bar(
     assert cli.cmd_quota(_quota_args()) == 0
     out = capsys.readouterr().out
     assert "session" in out and "week" in out
-    agy_row = next(
-        line for line in out.splitlines() if line.lstrip().startswith(("✅ agy", "❔ agy"))
-    )
-    # Antigravity: no session window (—), a 40 % weekly bar drawn from `gemini_week`.
-    assert "—" in agy_row
-    assert "████░░░░░░  40%" in agy_row
+    agy_row = next(line for line in out.splitlines() if " agy " in line)
+    # Antigravity has no session window: an EMPTY bar reading 0%, never a dash, so the
+    # column keeps its shape.
+    assert "░░░░░░░░░░░0%" in agy_row
+    assert "—" not in agy_row
+    assert "█████░░░░░40%" in agy_row  # the weekly bucket, figure embossed
     # The bar's window is NOT repeated in the textual column; the one with no bar is.
     assert "geminiweek" not in agy_row
     assert "claudegptweek 0%" in agy_row
+
+
+def test_quota_report_gives_copilot_one_bar_across_both_columns(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Copilot's budget is one month-long allowance, not a session/week pair.
+
+    Squeezing it into the week cell and leaving session blank would describe a provider
+    with two horizons; the row is drawn with one bar spanning both instead — and it still
+    spans when the seat is blocked before any meter was read.
+    """
+    from command_center import cli
+
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    assert cli.cmd_quota(_quota_args()) == 0
+    row = next(line for line in capsys.readouterr().out.splitlines() if " copilot " in line)
+    # ONE run of bar glyphs, the width of both cells plus the space between them —
+    # a two-cell row would show two runs separated by a space.
+    assert "░" * (cli._BAR_SPAN_WIDTH - 2) + "0%" in row
+    assert len(re.findall(r"[░█]+", row)) == 1, row
+
+
+def test_quota_report_header_lines_up_with_its_rows(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The header and the rows are built from the same widths, so columns cannot drift.
+
+    Regression: the header spent `width + 2` columns on the provider name while each row
+    spent `cell_len(mark) + 1 + width`, so every column sat one place to the left of its
+    heading.
+    """
+    from rich.cells import cell_len
+
+    from command_center import cli
+
+    _agy_snapshot(gemini_pct=40.0, third_party_pct=0.0)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    assert cli.cmd_quota(_quota_args()) == 0
+    lines = capsys.readouterr().out.splitlines()
+    header = lines[0]
+    rows = [ln for ln in lines[1:] if ln.startswith("  ")]
+    assert rows, lines
+
+    def at_column(text: str, col: int) -> str:
+        """The character occupying display column *col* — rows carry double-width marks,
+        so a character index is not a column index."""
+        seen = 0
+        for ch in text:
+            if seen == col:
+                return ch
+            seen += cell_len(ch)
+        return ""
+
+    for label in ("state", "data age", "session", "week", "unblocks"):
+        col = cell_len(header[: header.index(label)])
+        for row in rows:
+            # The copilot row draws ONE bar across session+week by design, so it is the
+            # one row that legitimately has no field boundary at the `week` heading.
+            if label == "week" and " copilot " in row:
+                continue
+            # A heading sits at the first column of its field, so the column before it is
+            # the separator space on every row.
+            assert at_column(row, col - 1) == " ", (label, row)
+            # …and the field itself is non-empty wherever it is always populated
+            # (`unblocks` is blank on an available provider, by design).
+            if label != "unblocks":
+                assert at_column(row, col) != " ", (label, row)
 
 
 def test_quota_report_no_bars_flag_restores_the_plain_columns(
@@ -914,6 +985,6 @@ def test_quota_report_no_bars_flag_restores_the_plain_columns(
     assert cli.cmd_quota(_quota_args(no_bars=True)) == 0
     out = capsys.readouterr().out
     assert "session" not in out.splitlines()[0]
-    assert "█" not in out
+    assert "█" not in out and "░" not in out
     # With no bars drawn, every window is back in the textual column.
     assert "geminiweek 40%" in out

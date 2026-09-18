@@ -6,6 +6,7 @@ import base64
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -16,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from rich.cells import cell_len
 
 from command_center import cli, config, usage
 
@@ -2628,19 +2630,62 @@ def test_agy_usage_fetch_writes_the_cache(monkeypatch: pytest.MonkeyPatch) -> No
 # ── the plain-terminal bar (`ccc quota`) ─────────────────────────────────────
 
 
-def test_ansi_bar_shape_and_thresholds() -> None:
-    """Glyph count follows the percentage; the colour follows the CARD thresholds."""
-    assert usage.ansi_bar(0, width=10, color=False) == "░" * 10
-    assert usage.ansi_bar(100, width=10, color=False) == "█" * 10
-    assert usage.ansi_bar(40, width=10, color=False) == "█" * 4 + "░" * 6
+def _plain(text: str) -> str:
+    """Strip SGR escapes — the only escape shape :func:`usage.ansi_bar` emits."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+def test_ansi_bar_embosses_the_percentage_and_stays_exactly_width() -> None:
+    """The figure rides INSIDE the bar — that is what buys the report two bar columns."""
+    assert usage.ansi_bar(0, width=13, color=False) == "░" * 11 + "0%"
+    assert usage.ansi_bar(40, width=13, color=False) == "█" * 5 + "░" * 5 + "40%"
+    assert usage.ansi_bar(100, width=13, color=False) == "█" * 9 + "100%"
     # Out-of-range input is clamped, not rendered as an over-long bar.
-    assert usage.ansi_bar(140, width=10, color=False) == "█" * 10
-    assert usage.ansi_bar(-5, width=10, color=False) == "░" * 10
-    # One palette: the bar's fill is exactly what a card at that percentage would use.
-    for pct, expect in (
-        (10.0, usage._FILL_GREEN),
-        (75.0, usage._FILL_ORANGE),
-        (99.0, usage._FILL_RED),
-    ):
-        r, g, b = usage._hex_rgb(expect)
-        assert f"38;2;{r};{g};{b}m" in usage.ansi_bar(pct, width=10)
+    assert usage.ansi_bar(140, width=13, color=False) == "█" * 9 + "100%"
+    assert usage.ansi_bar(-5, width=13, color=False) == "░" * 11 + "0%"
+    # `label` overrides the figure; "" is a bare bar.
+    assert usage.ansi_bar(50, width=10, color=False, label="") == "█" * 5 + "░" * 5
+
+
+def test_ansi_bar_is_exactly_width_columns_painted_or_not() -> None:
+    """The caller pads by the constant, so a bar that is not `width` misaligns the table."""
+    for pct in (0, 7, 50, 99.6, 100):
+        assert cell_len(usage.ansi_bar(pct, width=13, color=False)) == 13, pct
+        assert cell_len(_plain(usage.ansi_bar(pct, width=13))) == 13, pct
+
+
+def test_ansi_bar_paints_fill_track_and_emboss() -> None:
+    """Both backgrounds appear, and stripping the colour leaves the embossed figure."""
+    painted = usage.ansi_bar(40, width=13)
+    for color in (usage.cli_fill_for_pct(40), usage._TRACK_COLOR):
+        r, g, b = usage._hex_rgb(color)
+        assert f"48;2;{r};{g};{b}m" in painted
+    assert _plain(painted) == " " * 10 + "40%"
+    # A full bar has no track run at all, and vice versa — no dangling empty escape.
+    assert _plain(usage.ansi_bar(100, width=13)) == " " * 9 + "100%"
+
+
+def test_cli_fill_is_red_only_when_the_window_is_actually_full() -> None:
+    """The report's scale is the ORACLE's, not the cards'.
+
+    A seat at 97 % is `available`; painting it the same red as an exhausted one would
+    tell the reader to stop using a rung the very next column tells them to use. So:
+    green below the risk threshold, orange while risky, red only at 100 %.
+    """
+    assert usage.cli_fill_for_pct(0) == usage._FILL_GREEN
+    assert usage.cli_fill_for_pct(89.9) == usage._FILL_GREEN
+    assert usage.cli_fill_for_pct(90) == usage._FILL_ORANGE
+    assert usage.cli_fill_for_pct(97) == usage._FILL_ORANGE
+    assert usage.cli_fill_for_pct(99.9) == usage._FILL_ORANGE
+    assert usage.cli_fill_for_pct(100) == usage._FILL_RED
+    # …and the CARDS keep their own, earlier scale: this must not have moved them.
+    assert usage._fill_for_pct(70) == usage._FILL_ORANGE
+    assert usage._fill_for_pct(97) == usage._FILL_RED
+
+
+def test_cli_fill_thresholds_match_the_oracles_own() -> None:
+    """The bar is painted in quota's vocabulary; restating them must not let them drift."""
+    from command_center import quota
+
+    assert usage._CLI_RISKY_PCT == quota._RISKY_PCT
+    assert usage._CLI_FULL_PCT == quota._EXHAUSTED_PCT
