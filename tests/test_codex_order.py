@@ -229,7 +229,9 @@ def test_quota_footer_names_the_ladder_and_the_next_attempt(
     )
     assert cli.main(["quota"]) == 0
     out = capsys.readouterr().out
-    assert "codex seats [fill]: 1 private ⛔ (hold) → 2 de ❔ → 3 default ❔" in out
+    # Seats are named the way the PROVIDER COLUMN names them, not by their config token:
+    # one report, one vocabulary. The tokens appear in the change hint below instead.
+    assert "codex seats [fill]: 1 codex-priv ⛔ (hold) → 2 codex-de ❔ → 3 codex-work ❔" in out
     # The footer names the seat the way the rows above do (the provider id's display
     # spelling), not the wire id — see quota.display_id.
     assert "next attempt: codex-de" in out
@@ -290,15 +292,16 @@ def test_quota_footer_honours_the_pin_under_fill_and_flags_it_under_order(
     monkeypatch.setattr(config, "subscription_end_map", lambda: {"codex_private": "2020-01-31"})
     assert cli.main(["quota"]) == 0
     out = capsys.readouterr().out
-    assert "pin: de until ∞" in out  # fill: the order is a tiebreak, the pin governs
-    assert "⚠ private: renewal date 2020-01-31 passed" in out
-    assert "change: codex-in-claude order <label…>" in out
+    assert "pin: codex-de until ∞" in out  # fill: the order is a tiebreak, the pin governs
+    assert "⚠ codex-priv: renewal date 2020-01-31 passed" in out
+    # …and the hint that follows still spells the `ccc set codex-order` tokens.
+    assert "change: codex-in-claude order private de default" in out
 
     monkeypatch.setattr(config, "codex_seat_policy", lambda: "order")
     assert cli.main(["quota"]) == 0
     out = capsys.readouterr().out
     assert "codex seats [order]:" in out
-    assert "pin: de (ignored: explicit order set)" in out
+    assert "pin: codex-de (ignored: explicit order set)" in out
 
 
 # ── the `order` CLI ───────────────────────────────────────────────────────────────

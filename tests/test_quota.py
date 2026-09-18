@@ -193,16 +193,6 @@ def test_observed_429_outranks_a_healthy_meter(monkeypatch: pytest.MonkeyPatch) 
     assert (result.state, result.source) == (quota.BLOCKED, "cooldown")
 
 
-# ── gemini is a capability state ─────────────────────────────────────────────────
-
-
-def test_gemini_is_disabled_not_blocked() -> None:
-    """A retired tier has no reset to wait for, so ``blocked`` would be a lie."""
-    result = quota._gemini_quota({})
-    assert result.state == quota.DISABLED
-    assert result.resets_at == 0
-
-
 # ── cooldown store: expiry, ordering, concurrency ────────────────────────────────
 
 
@@ -274,7 +264,7 @@ def test_snapshot_is_versioned_and_json_serializable(monkeypatch: pytest.MonkeyP
     json.dumps(snap)  # must round-trip for the `-j` contract
     # No cross-provider "best": ranking providers is a cost decision, not a quota fact.
     assert "best" not in snap
-    assert {p["id"] for p in snap["providers"]} >= {"copilot", "codex", "gemini"}
+    assert {p["id"] for p in snap["providers"]} >= {"copilot", "codex", "agy"}
 
 
 def test_snapshot_ranks_usable_claude_accounts_by_urgency(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -909,15 +899,20 @@ def test_quota_report_draws_a_session_and_week_bar(
     # Antigravity meters ONE weekly allowance per row and no session at all, so each row
     # draws a single spanning bar rather than leaving a permanently empty session cell.
     agy_row = next(line for line in out.splitlines() if " agy " in line)
-    assert len(re.findall(r"[░█]+", agy_row)) == 1, agy_row
+    # One bar: the glyph runs are split only by the embossed `weekly` label, never by the
+    # gap between two cells, so the whole width is a single allowance.
+    assert "weekly" in agy_row
+    assert re.sub(r"[░█]+", "#", agy_row).count("#") <= 2, agy_row
     assert "40%" in agy_row  # its weekly bucket, figure embossed inside the bar
     # The bar's window is NOT repeated in the textual column, and the OTHER allowance is
     # a row of its own now, so nothing trails the bars at all.
     assert "geminiweek" not in agy_row
     assert "claudegptweek" not in agy_row
     gpt_row = next(line for line in out.splitlines() if " agy-gpt " in line)
-    assert len(re.findall(r"[░█]+", gpt_row)) == 1, gpt_row
-    assert "░" * (cli._BAR_SPAN_WIDTH - 2) + "0%" in gpt_row
+    assert "weekly" in gpt_row
+    # An untouched bucket: track glyphs the full span, broken only by its own label.
+    bar = "".join(re.findall(r"[░█]+|weekly", gpt_row))
+    assert bar == "░" * 9 + "weekly" + "░" * 10, bar
 
 
 def test_quota_report_gives_copilot_one_bar_across_both_columns(

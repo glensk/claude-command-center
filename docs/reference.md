@@ -2247,6 +2247,14 @@ across both columns — that is Copilot, whose budget is a month; squeezing a mo
 has one. A slot with no window of its own draws an empty bar reading `0%`, not a dash: both
 say "nothing measured here", but the bar keeps the column's shape.
 
+**Each bar names its own period.** A percentage is a fraction of an unnamed thing until it
+does: the spanning bars carry `monthly` (Copilot) or `weekly` (Antigravity) centred in
+them, and the two-column rows take the words from their headings instead. When a window is
+actually FULL the bar takes the whole width, turns red, and states the reset inside itself
+— `weekly: resets 2d 18h   100%` — because a row at 100 % has nothing left to compare
+against, so the shape says only "full" and the reset is the one thing still worth the
+space. The `unblocks` column then drops that same reset rather than printing it twice.
+
 **The fill scale is the oracle's, not the cards'.** The cards go orange at 66 % and red at
 86 % — an at-a-glance health light. Here a colour that disagrees with the verdict in the
 next column is a bug: a seat at 97 % is `available`, so painting it the same red as an
@@ -2261,6 +2269,12 @@ not a live reading. The `state` column is painted too: green for `available`, re
 `blocked`/`disabled`, and deliberately unpainted for `unknown`, which is the fail-open
 state — colouring it like a block would advertise the exact conclusion the oracle refuses
 to draw from a measurement failure.
+
+The provider name is painted in the **same accent as its TUI usage card** — gold for the
+private Claude seat, blue for the work one, green Codex, violet Copilot, olive
+Antigravity — and `ai routing` paints its rungs from the same values, so one provider reads
+as one colour across all three surfaces. The `state` column is painted too: green for
+`available`, red for `blocked`/`disabled`, and deliberately unpainted for `unknown`.
 
 Header and rows are built from the same widths (the mark cell padded to a known
 `_MARK_WIDTH`, then the name padded to the measured column), so the headings cannot drift
@@ -2327,6 +2341,11 @@ Two things the table settles:
 The per-call column assumes this harness's ~20 k-token system prompt and a one-word
 answer; a real session with a long context costs proportionally more. The **% per 1k
 tokens** column is the transferable one.
+
+The table is also kept as a runnable script, `agy-consts.py`, beside `ai.py` in whichever
+toolbox owns your ladder — run it for the same figures with their measurement date
+attached, `-a` to also list models Antigravity has added since (unpriced rather than
+guessed), `-j` for JSON.
 
 ### Four states, and why the distinction matters
 

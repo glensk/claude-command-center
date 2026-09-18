@@ -130,6 +130,12 @@ _LABEL_STYLE = "bold #d7d7e6"
 _RESET_STYLE = "grey58"
 _CLAUDE_ACCENT = "#ffaf00"  # private Claude card's gold border — its reset-label colour
 _CLAUDE_WORK_ACCENT = "#6cb6ff"  # work Claude card's blue border/reset colour (same product)
+# Antigravity has no usage card, but `ccc quota` names its two rungs and `ai routing`
+# paints the same rungs, so the accents live here with the rest of the palette. Olive-lime
+# is the colour agy's OWN /usage panel draws its bars in; the second budget warms it
+# towards amber, near enough to read as the same product and far enough from Codex green.
+_AGY_ACCENT = "#a6be3a"
+_AGY_GPT_ACCENT = "#c9a93e"
 # Reset text is embossed onto the bar: over the bright filled portion it is drawn dark,
 # over the dark track it takes the card's accent colour (so it both matches the box and
 # stays legible). The bar's fill/track colours remain as each glyph's background, so usage
@@ -1907,6 +1913,13 @@ def _fill_for_pct(pct: float) -> str:
 # every escape stripped, where a row of background-coloured spaces collapses into blanks.
 _BAR_FILL_GLYPH = "\u2588"  # █ used
 _BAR_TRACK_GLYPH = "\u2591"  # ░ remaining
+# Padding inside an embossed label — the cells the caller left EMPTY, as opposed to the
+# real spaces between its words. Colourless bars need the distinction: padding falls back
+# to the bar glyph (so the proportion still reads), a real space stays a space (so
+# `weekly: resets 2d 18h` does not come out as `weekly:█resets█2d█18h`). Callers compose
+# labels with :func:`cli._emboss`, which uses this; a plain string still works and is
+# treated as all-real, which is what a bare percentage wants.
+BAR_PAD = "\u0000"
 
 # The report's fill scale, and it is NOT the cards' (:func:`_fill_for_pct`, green ≤65 /
 # orange ≤85 / red). A card is an at-a-glance health light where "getting warm" earns a
@@ -1966,8 +1979,13 @@ def ansi_bar(
     text = text[:width]
     start = width - len(text)  # right-aligned: the digits line up down the column
     if not color:
+        # A label SPACE falls back to the bar glyph (the cards' trick): without colour the
+        # glyphs are all a reader has to go on, so a full-width label would otherwise erase
+        # the bar and leave a percentage floating in whitespace.
         cells = [_BAR_FILL_GLYPH if i < filled else _BAR_TRACK_GLYPH for i in range(width)]
-        cells[start:] = list(text)
+        for offset, glyph in enumerate(text):
+            if glyph != BAR_PAD:
+                cells[start + offset] = glyph
         return "".join(cells)
     fill_rgb = _hex_rgb(cli_fill_for_pct(pct))
     track_rgb = _hex_rgb(_TRACK_COLOR)
@@ -1977,12 +1995,12 @@ def ansi_bar(
     current = ""  # last SGR emitted — a bar is at most four runs, not `width` of them
     for i in range(width):
         br, bg, bb = fill_rgb if i < filled else track_rgb
-        if i < start:
+        glyph = text[i - start] if i >= start else BAR_PAD
+        if glyph == BAR_PAD:
             sgr, glyph = f"\033[48;2;{br};{bg};{bb}m", " "
         else:
             fr, fg, fb = overlay if i < filled else on_track
             sgr = f"\033[1;38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m"
-            glyph = text[i - start]
         if sgr != current:
             out.append(sgr)
             current = sgr

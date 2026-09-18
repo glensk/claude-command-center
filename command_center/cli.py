@@ -3412,6 +3412,32 @@ _QUOTA_STATE_COLOR = {"available": "\033[32m", "blocked": "\033[31m", "disabled"
 _MARK_WIDTH = 2
 
 
+def _quota_name_color(prov: dict[str, Any]) -> str:
+    """The provider name's colour — the SAME accent its TUI usage card is drawn in.
+
+    A reader who has the cards open should not have to re-learn which row is which: gold
+    is the private Claude seat on both, blue the work one, green Codex, violet Copilot.
+    `ai routing` paints its rungs from the same values, so one provider reads one colour
+    across all three surfaces. A kind with no card (none today) simply goes unpainted.
+    """
+    from . import usage  # pylint: disable=import-outside-toplevel
+
+    kind, pid = str(prov.get("kind", "")), str(prov.get("id", ""))
+    if kind == "claude":
+        work = str(prov.get("account", "")) == "work"
+        return usage._CLAUDE_WORK_ACCENT if work else usage._CLAUDE_ACCENT  # noqa: SLF001
+    return {
+        "codex": usage._CODEX_FILL,  # noqa: SLF001
+        "copilot": usage._COPILOT_FILL,  # noqa: SLF001
+    }.get(kind) or (
+        usage._AGY_GPT_ACCENT  # noqa: SLF001
+        if pid == "agy:gpt"
+        else usage._AGY_ACCENT  # noqa: SLF001
+        if kind == "agy"
+        else ""
+    )
+
+
 def _pad_cells(text: str, width: int) -> str:
     """*text* padded with spaces to *width* TERMINAL columns (not characters)."""
     from rich.cells import cell_len  # pylint: disable=import-outside-toplevel
@@ -3434,49 +3460,136 @@ def _quota_age(prov: dict[str, Any], now: int) -> str:
     return f"marked {age}" if prov.get("source") in ("cooldown", "hold") else age
 
 
-def _quota_bar_cells(prov: dict[str, Any], *, color: bool) -> tuple[str, set[str]]:
-    """The row's session + week bar cells, and the names of the windows they drew.
+def _emboss(width: int, *, right: str = "", center: str = "", left: str = "") -> str:
+    """Lay *left* / *center* / *right* out across exactly *width* columns.
 
-    Each slot of :data:`quota.BAR_SLOTS` is filled by the first window the provider
-    actually has, so one renderer serves every provider — Claude's and Codex's
-    ``five_hour`` / ``seven_day``, Antigravity's ``gemini_week``.
+    The bar renderer takes one already-laid-out string, so the composition happens here:
+    *right* is flush to the end, *left* to the start, and *center* is centred in whatever
+    is left between them — dropped entirely if it would not fit rather than colliding
+    with either. The result is exactly *width* characters, which is what lets the caller
+    pad by a constant.
+    """
+    # One column of breathing room between the left text and the right one: without it a
+    # long reset label runs straight into the percentage ("…12d 10h100%").
+    from . import usage  # pylint: disable=import-outside-toplevel
 
-    A provider whose KIND is in :data:`quota.BAR_SPAN_KINDS` has one allowance rather
-    than two and gets a single bar across both columns. That is Copilot, whose budget is
-    a month: squeezing a month into the "week" cell and leaving "session" blank would
-    describe a provider with two horizons when it has one.
+    right = right[:width]
+    left = left[: max(0, width - len(right) - (1 if right and left else 0))]
+    # Padding is `usage.BAR_PAD`, not a space: a colourless bar draws its glyph through
+    # the padding and leaves the label's own spaces alone.
+    row = list(left + usage.BAR_PAD * (width - len(left) - len(right)) + right)
+    free_start, free_end = len(left), width - len(right)
+    if center and len(center) <= free_end - free_start:
+        at = free_start + (free_end - free_start - len(center)) // 2
+        row[at : at + len(center)] = list(center)
+    return "".join(row)
+
+
+def _quota_bar_cells(prov: dict[str, Any], now: int, *, color: bool) -> tuple[str, set[str], int]:
+    """The row's bar cells, the windows they drew, and the reset they already state.
+
+    Three shapes, most specific first:
+
+    1. **An EXHAUSTED window** (fresh, at 100 %) takes the whole width as one red bar
+       embossed ``weekly: resets 1d 2h`` — the period that is gone, and when it comes
+       back. A row at 100 % has nothing left to compare against, so splitting it into two
+       bars spends the width on a shape that says only "full"; the reset is the one thing
+       the reader still needs, so it moves INTO the bar and out of the `unblocks` column
+       (the third return value tells the caller which reset it took, so the column can
+       drop the duplicate).
+    2. **A single-allowance provider** (:data:`quota.BAR_SPAN_KINDS`) spans both columns,
+       centred on the period it renews over — `monthly` for Copilot's credit budget,
+       `weekly` for Antigravity's. Without that word a percentage is a fraction of an
+       unnamed thing.
+    3. **Everything else** fills the session and week slots of :data:`quota.BAR_SLOTS`,
+       each labelled with its own period, so one renderer serves every provider.
 
     A slot with no window of its own draws an EMPTY bar reading ``0%`` rather than a dash.
     Both say "nothing measured here", but the bar keeps the column's shape, so the eye
     reads down a row of bars instead of down a row of holes.
-
-    The returned name set is what the caller must NOT repeat in the textual ``windows``
-    column.
     """
     from . import quota, usage  # pylint: disable=import-outside-toplevel
 
     windows = prov.get("windows") or {}
 
-    def _cell(name: str, width: int) -> str:
+    def _reset_label(name: str, win: dict[str, Any], budget: int) -> str:
+        """``weekly: resets 2d 18h``, shortened until it fits *budget* columns.
+
+        The bar is 27 columns wide and the percentage owns four, so the phrase has a hard
+        ceiling and ``monthly`` + a two-digit day count already exceeds it. Rather than
+        truncate mid-word — which is how "12d 10h" became "12d 10" — the candidates give
+        up detail in order: the unit, then the verb, then everything but the period.
+        """
+        horizon = quota.BAR_HORIZON.get(name, "")
+        span = int(win.get("resets_at", 0) or 0) - now
+        if not horizon:
+            return ""
+        if span <= 0:
+            return horizon
+        full = usage._format_age(span)  # noqa: SLF001  # "12d 10h" / "1h 9m" / "45m"
+        coarse = full.split(" ", 1)[0]  # "12d"
+        for candidate in (
+            f"{horizon}: resets {full}",
+            f"{horizon}: resets {coarse}",
+            f"{horizon} {coarse}",
+            horizon,
+        ):
+            if len(candidate) <= budget:
+                return candidate
+        return horizon[:budget]
+
+    def _cell(name: str, width: int, *, center: str = "", left: str = "") -> str:
         if not name:
-            return usage.ansi_bar(0.0, width=width, color=color)
-        pct = float(windows[name].get("used_pct", 0) or 0)
+            return usage.ansi_bar(0.0, width=width, color=color, label=_emboss(width, right="0%"))
+        win = windows[name]
+        pct = float(win.get("used_pct", 0) or 0)
         # A stale figure keeps its bar but loses its colour: it is the last thing we
         # measured, not a live reading, and a green bar would assert more than we know.
-        return usage.ansi_bar(pct, width=width, color=color and not windows[name].get("stale"))
+        return usage.ansi_bar(
+            pct,
+            width=width,
+            color=color and not win.get("stale"),
+            label=_emboss(width, right=f"{pct:.0f}%", center=center, left=left),
+        )
 
+    # 1. an exhausted window owns the whole row
+    full = next(
+        (
+            name
+            for name, win in windows.items()
+            if name in quota.BAR_HORIZON
+            and not win.get("stale")
+            and float(win.get("used_pct", 0) or 0) >= 100.0
+        ),
+        "",
+    )
+    if full:
+        # The percentage owns four columns plus the separating space the emboss inserts.
+        budget = _BAR_SPAN_WIDTH - len("100%") - 1
+        cell = _cell(full, _BAR_SPAN_WIDTH, left=_reset_label(full, windows[full], budget))
+        return cell + " ", {full}, int(windows[full].get("resets_at", 0) or 0)
+
+    # 2. one allowance, one bar across both columns
     if str(prov.get("kind", "")) in quota.BAR_SPAN_KINDS:
         span = next((n for n in quota.BAR_SPAN_WINDOWS if n in windows), "")
-        return _cell(span, _BAR_SPAN_WIDTH) + " ", {span} if span else set()
+        horizon = quota.BAR_HORIZON.get(span, "")
+        return (
+            _cell(span, _BAR_SPAN_WIDTH, center=horizon) + " ",
+            {span} if span else set(),
+            0,
+        )
 
+    # 3. the ordinary session + week pair
     out: list[str] = []
     drawn: set[str] = set()
     for _slot, candidates in quota.BAR_SLOTS:
         name = next((n for n in candidates if n in windows), "")
         if name:
             drawn.add(name)
+        # No period label here: these two columns have HEADINGS saying `session` and
+        # `week`. Only a spanning bar, which sits under both, has to name its own.
         out.append(_cell(name, _BAR_CELL_WIDTH))
-    return " ".join(out) + " ", drawn
+    return " ".join(out) + " ", drawn, 0
 
 
 def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branches
@@ -3628,7 +3741,13 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
             else ("—" if state != quota.AVAILABLE else "")
         )
         windows = prov.get("windows") or {}
-        cells, drawn = _quota_bar_cells(prov, color=color) if bars else ("", set())
+        cells, drawn, shown_reset = (
+            _quota_bar_cells(prov, now, color=color) if bars else ("", set(), 0)
+        )
+        # The exhausted-window bar already states this row's reset; printing it again in
+        # `unblocks` would say the same thing twice on the widest row in the table.
+        if shown_reset and shown_reset == int(prov.get("resets_at", 0) or 0):
+            unblocks = ""
         # Only the windows NO bar shows (fable_week, Antigravity's second bucket, a
         # provider whose window has no slot): a row must state each figure once.
         wins = " ".join(
@@ -3651,8 +3770,14 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
         shown_state = f"{state:<10}"
         if colorable and state in _QUOTA_STATE_COLOR:
             shown_state = f"{_QUOTA_STATE_COLOR[state]}{shown_state}\033[0m"
+        shown_name = f"{names[prov['id']]:<{width}}"
+        if colorable and (accent := _quota_name_color(prov)):
+            from . import usage  # pylint: disable=import-outside-toplevel
+
+            r, g, b = usage._hex_rgb(accent)  # noqa: SLF001
+            shown_name = f"\033[38;2;{r};{g};{b}m{shown_name}\033[0m"
         print(
-            f"  {mark} {names[prov['id']]:<{width}} {shown_state} {ages[prov['id']]:<{age_w}} "
+            f"  {mark} {shown_name} {shown_state} {ages[prov['id']]:<{age_w}} "
             f"{cells}{unblocks:<16} {detail}".rstrip()
         )
     if snap["best_claude_account"]:
@@ -3679,8 +3804,13 @@ def _print_codex_seat_footer(snap: dict[str, Any], now: int) -> None:
     from . import quota, usage  # pylint: disable=import-outside-toplevel
 
     rows = snap.get("codex_seat_order") or []
+
+    def _seat_name(row: dict[str, Any]) -> str:
+        """The name the PROVIDER COLUMN uses (`codex-priv`), not the config token."""
+        return quota.display_id(str(row.get("id") or "")) or str(row.get("label", "?"))
+
     ladder = " → ".join(
-        f"{row.get('configured_rank', '?')} {row.get('label', '?')} "
+        f"{row.get('configured_rank', '?')} {_seat_name(row)} "
         f"{_QUOTA_MARK.get(str(row.get('state')), ' ')}"
         + (
             f" ({row['blocked_by']})"
@@ -3689,9 +3819,11 @@ def _print_codex_seat_footer(snap: dict[str, Any], now: int) -> None:
         )
         for row in rows
     )
-    # The ranked ladder above shows SEAT LABELS (`default`/`private`/`de`) on purpose —
-    # they are the tokens `ccc set codex-order` demands. `next_attempt` is a provider id,
-    # so it is spelled the way the rows above spell it.
+    # Every seat in this block is named the way the table above names it (`codex-priv`,
+    # not `private`): one report, one vocabulary, so a line here can be read without
+    # translating it back into a row. The seat LABELS are a different thing — they are the
+    # tokens `ccc set codex-order` takes — so the change hint below spells them out rather
+    # than leaving the reader to guess that `codex-priv` is configured as `private`.
     next_attempt = quota.display_id(
         str(snap.get("codex_next_attempt") or snap.get("best_codex_account") or "")
     )
@@ -3705,23 +3837,28 @@ def _print_codex_seat_footer(snap: dict[str, Any], now: int) -> None:
         tail = f"next attempt: none eligible{when}"
     policy = str(snap.get("codex_seat_policy") or "fill")
     print(f"codex seats [{policy}]: {ladder or '(none configured)'}     {tail}")
-    notes = [f"{row['label']}: {row['note']}" for row in rows if row.get("note")]
+    notes = [f"{_seat_name(row)}: {row['note']}" for row in rows if row.get("note")]
+    order_tokens = " ".join(str(row.get("label", "")) for row in rows if row.get("label"))
     if notes:
         print(
             " " * len(f"codex seats [{policy}]: ")
             + "⚠ "
             + " · ".join(notes)
-            + " · change: codex-in-claude order <label…>"
+            + f" · change: codex-in-claude order {order_tokens}"
         )
     pin = snap.get("codex_pin") or {}
     if pin:
-        print(f"pin: {pin['account']} until {pin.get('until') or '∞'}")
+        # `codex_pin.account` is a seat LABEL; the rows carry the id, so the pin reads in
+        # the same vocabulary as every other line in this block.
+        pinned = next((r for r in rows if r.get("label") == pin["account"]), None)
+        shown_pin = _seat_name(pinned) if pinned else str(pin["account"])
+        print(f"pin: {shown_pin} until {pin.get('until') or '∞'}")
     else:
         # No ``codex_pin`` while a row IS flagged pinned means the pin exists but an
         # explicit order overrules it — say so, or the user keeps re-setting a dead knob.
         ignored = next((row for row in rows if row.get("pinned")), None)
         if ignored is not None:
-            print(f"pin: {ignored['label']} (ignored: explicit order set)")
+            print(f"pin: {_seat_name(ignored)} (ignored: explicit order set)")
 
 
 def cmd_resume_halted(args: argparse.Namespace) -> int:

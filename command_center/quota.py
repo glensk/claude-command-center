@@ -20,8 +20,10 @@ Four states, and the distinction between them is the whole design:
 * ``unknown``   — no data, stale data, or a *guessed* denominator. Never treated as blocked:
   refusing to try a provider because we failed to measure it is how a working rung gets
   silently deleted. Callers **fail open** on ``unknown``.
-* ``disabled``  — a capability fact, not a quota fact (e.g. the Gemini CLI's individual tier
-  was retired). It cannot be "waited out", so it is never given a reset time.
+* ``disabled``  — a capability fact, not a quota fact: a rung that cannot succeed at any
+  hour of any day. It cannot be "waited out", so it is never given a reset time. No
+  provider reports it today (the retired Gemini CLI row that did was dropped); the state
+  remains for the next capability that is off rather than merely empty.
 
 **Windows are never collapsed into one percentage.** A provider can sit at 100 % on its
 5-hour window and 49 % on its weekly one; a single ``used_pct`` would render that as
@@ -115,6 +117,12 @@ from . import config, seat_rota, usage
 # rather than one with two windows: each is blocked only by its own bucket. A consumer
 # that looks its own provider ids up by name never sees them; one that iterates every row
 # reads them with the same field set as any other.
+# v2 stayed v2 on 2026-09-18 when the ``gemini`` row was REMOVED. That is a subtraction,
+# not a rename, and the only honest way to read it: the Gemini CLI's individual tier was
+# retired, so the row could never be anything but ``disabled`` — a permanent "skip me"
+# occupying a line in every report and a key in every consumer's provider map. A consumer
+# that looks it up now finds nothing, which is the same instruction (do not use it) with
+# none of the noise. Restoring it is one entry in ``providers`` if the tier returns.
 SCHEMA_VERSION = 2
 
 # Provider states. Only BLOCKED may remove a rung from a ladder; UNKNOWN deliberately
@@ -214,6 +222,18 @@ BAR_SLOTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # bar instead of briefly turning into a two-window provider.
 BAR_SPAN_KINDS: tuple[str, ...] = ("copilot", "agy")
 BAR_SPAN_WINDOWS: tuple[str, ...] = ("credits", "gemini_week", "claudegpt_week")
+
+# The word a window's bar is labelled with: WHAT PERIOD this allowance renews on. A bar
+# without it is a percentage of an unnamed thing — "56 %" reads very differently against a
+# month than against five hours. Every window that can fill a bar has an entry, and a name
+# with none is simply left unlabelled rather than guessed at.
+BAR_HORIZON: dict[str, str] = {
+    "five_hour": "session",
+    "seven_day": "weekly",
+    "gemini_week": "weekly",
+    "claudegpt_week": "weekly",
+    "credits": "monthly",
+}
 
 # The Fable weekly figure is only as fresh as the last successful OAuth fetch
 # (``oauth_fetched_at``): statusline writes refresh ``captured_at`` while PRESERVING a
@@ -1839,25 +1859,6 @@ def _agy_quotas(now: int, cooldowns: dict[str, dict]) -> list[ProviderQuota]:
     return rows
 
 
-def _gemini_quota(cooldowns: dict[str, dict]) -> ProviderQuota:
-    """The Gemini CLI rung — a capability state, not a quota one.
-
-    The individual Gemini Code Assist tier this CLI authenticated against was retired
-    (``IneligibleTierError``), so the rung cannot succeed at any hour of any day. That is
-    ``disabled``, deliberately NOT ``blocked``: a block implies "retry after the reset",
-    and there is no reset to wait for. Re-enable by configuration if the tier returns.
-    """
-    if "gemini" in cooldowns:
-        return _cooldown_quota("gemini", "gemini", cooldowns["gemini"])
-    return ProviderQuota(
-        id="gemini",
-        kind="gemini",
-        state=DISABLED,
-        reason="Gemini Code Assist individual tier retired (IneligibleTierError)",
-        source="config",
-    )
-
-
 def snapshot(
     *, model: str = "", now: int | None = None, accounts: list[str] | None = None
 ) -> dict[str, Any]:
@@ -1890,7 +1891,6 @@ def snapshot(
         *codex_rows,
         *claude,
         *_agy_quotas(now, cooldowns),
-        _gemini_quota(cooldowns),
     ]
     best = next((q.id for q in claude if q.state == AVAILABLE), "")
     result: dict[str, Any] = {
