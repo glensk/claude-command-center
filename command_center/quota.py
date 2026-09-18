@@ -185,11 +185,10 @@ _AGY_WINDOW_NAMES = {bucket: window for _pid, bucket, window in _AGY_ROWS}
 #
 # Two consequences worth stating, because they are choices and not accidents:
 #
-# * Copilot's monthly `credits` window is not in either slot — it SPANS them, see
-#   :data:`BAR_SPAN_KINDS` below.
-# * Both Antigravity window names are listed, and each of its two rows carries exactly
-#   one of them (see :data:`_AGY_ROWS`) — so `agy` fills the week slot from
-#   `gemini_week` and `agy-gpt` from `claudegpt_week`. Neither has a session window.
+# Only the providers that really have TWO horizons are in these slots: the Claude and
+# Codex seats, which meter a 5-hour session window alongside a weekly one. Copilot and
+# both Antigravity rungs have a single allowance each and SPAN both columns instead —
+# see :data:`BAR_SPAN_KINDS`.
 #
 # A slot a provider has no window for draws an EMPTY bar reading `0%`, not a dash: both
 # say "nothing measured here", but the bar keeps the column's shape so the eye reads down
@@ -200,19 +199,21 @@ _AGY_WINDOW_NAMES = {bucket: window for _pid, bucket, window in _AGY_ROWS}
 # which is what keeps this map from hiding data.
 BAR_SLOTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("session", ("five_hour",)),
-    ("week", ("seven_day", "gemini_week", "claudegpt_week")),
+    ("week", ("seven_day",)),
 )
 # Provider KINDS that have one allowance rather than a session/week pair, and are drawn
 # as a single bar across BOTH columns, filled by the first of `BAR_SPAN_WINDOWS` they
-# carry. Copilot's credit budget is a month: filing it under "week" and leaving "session"
-# blank would describe a provider with two horizons when it has one. The row's `unblocks`
-# column still carries the real reset date.
+# carry. Copilot's credit budget is a month and Antigravity's two buckets are weeks;
+# neither meters a session at all, so filing them under "week" and leaving "session"
+# permanently empty described providers with two horizons when they have one — and cost
+# every such row half its bar to say nothing. The row's `unblocks` column still carries
+# the real reset date.
 #
-# Keyed on the KIND, not on which windows happen to be present, so a copilot row with no
-# figures at all (blocked by an observed 429 before any meter was read) still draws its
-# one empty bar instead of briefly turning into a two-window provider.
-BAR_SPAN_KINDS: tuple[str, ...] = ("copilot",)
-BAR_SPAN_WINDOWS: tuple[str, ...] = ("credits",)
+# Keyed on the KIND, not on which windows happen to be present, so a row with no figures
+# at all (blocked by an observed 429 before any meter was read) still draws its one empty
+# bar instead of briefly turning into a two-window provider.
+BAR_SPAN_KINDS: tuple[str, ...] = ("copilot", "agy")
+BAR_SPAN_WINDOWS: tuple[str, ...] = ("credits", "gemini_week", "claudegpt_week")
 
 # The Fable weekly figure is only as fresh as the last successful OAuth fetch
 # (``oauth_fetched_at``): statusline writes refresh ``captured_at`` while PRESERVING a

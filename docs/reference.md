@@ -2293,13 +2293,40 @@ refreshes it on `agy_usage_refresh_sec` (900 s idle / 300 s while a job works), 
 (`AGY_BIN` overrides `$PATH`). A missing binary, a timeout or an unparseable answer leaves
 the previous cache standing and the rows age out to `unknown` — never to `blocked`.
 
-**Cost differs by two orders of magnitude inside the Claude/GPT bucket**, measured
-2026-09-18 with one trivial call each: `gpt-oss-120b-medium` 0.08 % of the week
-(~1280 calls), `claude-sonnet-4-6` 4.1 % (~24), `claude-opus-4-6-thinking` 6.8 % (~15).
-For scale, `gemini-3.8-flash-low` costs 0.58 % of the *Gemini* week (~170). That gap is why
-`ai.py`'s `agy-gpt` rung defaults to `gpt-oss-120b-medium` while the interactive `agy-gpt`
-shell alias opens on `claude-sonnet-4-6` — a trailing `--model` overrides either, since the
-CLI takes the last one.
+#### What a model costs
+
+**Antigravity publishes no per-model multiplier.** Its own `/usage` text says only that
+"quota is consumed proportionally to the cost of the tokens", and Google's plan
+announcements say the Flash and Pro models share one limit "drawn down as per API
+pricing". The CLI receives the figure — its protobufs carry a `QuotaCostMetric` with a
+`GetCost` — but never surfaces it, and nothing in the binary holds a table. So the numbers
+below were **measured**, one identical trivial prompt per model, 2026-09-18 on this
+account, by reading `/usage` before and after:
+
+| model | bucket | % of week / call | % per 1k tokens | trivial calls/week |
+| :------------------------- | :------ | ---: | -----: | ---: |
+| `gpt-oss-120b-medium`      | 3p      | 0.078 | 0.0045 | ~1280 |
+| `gemini-3.8-flash-low`     | gemini  | 0.584 | 0.0301 |  ~171 |
+| `gemini-3.8-flash-medium`  | gemini  | 0.646 | 0.0326 |  ~155 |
+| `gemini-3.8-flash-high`    | gemini  | 0.656 | 0.0330 |  ~152 |
+| `gemini-3.6-flash-low`     | gemini  | 0.716 | 0.0336 |  ~140 |
+| `gemini-3.1-pro-low`       | gemini  | 1.709 | 0.0856 |   ~59 |
+| `claude-sonnet-4-6`        | 3p      | 4.089 | ~0.19  |   ~24 |
+| `claude-opus-4-6-thinking` | 3p      | 6.824 | ~0.31  |   ~15 |
+
+Two things the table settles:
+
+- **The `-low` / `-medium` / `-high` suffix is reasoning effort, not a price tier.** Across
+  the three 3.8-Flash variants the per-token rate barely moves (0.0301 → 0.0330); what
+  grows is the token count, from 0 thinking tokens at `low` to 491 at `high`. Paying for
+  effort means paying for more tokens at the same rate.
+- **The model family is the real lever.** `gemini-3.1-pro-low` costs 2.8x a 3.8-Flash per
+  token, and `gpt-oss-120b-medium` is another ~7x cheaper again — which is exactly why the
+  message ladder leads with it.
+
+The per-call column assumes this harness's ~20 k-token system prompt and a one-word
+answer; a real session with a long context costs proportionally more. The **% per 1k
+tokens** column is the transferable one.
 
 ### Four states, and why the distinction matters
 

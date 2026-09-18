@@ -906,17 +906,18 @@ def test_quota_report_draws_a_session_and_week_bar(
     assert cli.cmd_quota(_quota_args()) == 0
     out = capsys.readouterr().out
     assert "session" in out and "week" in out
+    # Antigravity meters ONE weekly allowance per row and no session at all, so each row
+    # draws a single spanning bar rather than leaving a permanently empty session cell.
     agy_row = next(line for line in out.splitlines() if " agy " in line)
-    # Antigravity has no session window: an EMPTY bar reading 0%, never a dash, so the
-    # column keeps its shape.
-    assert "░░░░░░░░░░░0%" in agy_row
-    assert "█████░░░░░40%" in agy_row  # its weekly bucket, figure embossed
+    assert len(re.findall(r"[░█]+", agy_row)) == 1, agy_row
+    assert "40%" in agy_row  # its weekly bucket, figure embossed inside the bar
     # The bar's window is NOT repeated in the textual column, and the OTHER allowance is
     # a row of its own now, so nothing trails the bars at all.
     assert "geminiweek" not in agy_row
     assert "claudegptweek" not in agy_row
     gpt_row = next(line for line in out.splitlines() if " agy-gpt " in line)
-    assert "░░░░░░░░░░░0%" in gpt_row
+    assert len(re.findall(r"[░█]+", gpt_row)) == 1, gpt_row
+    assert "░" * (cli._BAR_SPAN_WIDTH - 2) + "0%" in gpt_row
 
 
 def test_quota_report_gives_copilot_one_bar_across_both_columns(
@@ -976,9 +977,9 @@ def test_quota_report_header_lines_up_with_its_rows(
     for label in ("state", "data age", "session", "week", "unblocks"):
         col = cell_len(header[: header.index(label)])
         for row in rows:
-            # The copilot row draws ONE bar across session+week by design, so it is the
-            # one row that legitimately has no field boundary at the `week` heading.
-            if label == "week" and " copilot " in row:
+            # A single-allowance provider draws ONE bar across session+week by design,
+            # so those rows legitimately have no field boundary at the `week` heading.
+            if label == "week" and any(name in row for name in (" copilot ", " agy ", " agy-gpt ")):
                 continue
             # A heading sits at the first column of its field, so the column before it is
             # the separator space on every row.
