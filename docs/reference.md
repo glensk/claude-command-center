@@ -2267,24 +2267,39 @@ Header and rows are built from the same widths (the mark cell padded to a known
 off their columns. Colour is emitted only on a TTY without `NO_COLOR`; `-B/--no-bars` drops
 the bar columns entirely and restores the plain `windows` listing.
 
-### Google Antigravity (`agy`)
+### Google Antigravity — two rungs, `agy` and `agy-gpt`
 
-The `agy` row is metered by the Antigravity CLI's own `/usage` command
+One account, **two independent weekly allowances**, and which one a call spends is decided
+by nothing but `--model`:
+
+| row | bucket | models | spent by |
+| :-------- | :-------------- | :---------------------------------- | :---------------------- |
+| `agy`     | `gemini_week`   | Gemini Flash, Gemini Pro            | `agy` (the CLI default) |
+| `agy-gpt` | `claudegpt_week`| Claude Opus, Claude Sonnet, GPT-OSS | `agy-gpt` (shell alias) |
+
+They are **two rows, not one provider with two windows**, because the budgets are
+exhausted independently: each is blocked only by its own bucket, a refusal is recorded
+against the bucket that refused, and an empty Claude/GPT week cannot take the Gemini rung
+down with it. Neither has a session window, so each fills only the report's week slot. The
+wire ids follow the seat convention — `agy` and `agy:gpt`, spelled `agy` / `agy-gpt` for
+humans, joined by `display_id` / `canonical_id` like every other seat.
+
+Both come from the same cached meter: the CLI's own `/usage` command
 (`agy -p /usage --output-format json`), which costs **nothing** — it answers from the
 account's quota service, `num_turns: 0`, `total_tokens: 0` — so it is cheap enough to poll.
 Off by default (`agy_usage`, an INERT key like `copilot_usage`); turn it on and the daemon
 refreshes it on `agy_usage_refresh_sec` (900 s idle / 300 s while a job works), `ccc quota
--r` forces it, and `ccc doctor` resolves the binary through the `agy` entry in
-`external_deps.py` (`AGY_BIN` overrides `$PATH`). A missing binary, a timeout or an
-unparseable answer leaves the previous cache standing and the row ages out to `unknown` —
-never to `blocked`.
+-r` forces it, and the binary is resolved through the `agy` entry in `external_deps.py`
+(`AGY_BIN` overrides `$PATH`). A missing binary, a timeout or an unparseable answer leaves
+the previous cache standing and the rows age out to `unknown` — never to `blocked`.
 
-Antigravity meters **two independent weekly allowances**, one per model family:
-`gemini_week` (Gemini Flash/Pro) and `claudegpt_week` (Claude Opus/Sonnet, GPT-OSS). The
-verdict is therefore model-scoped like the Claude rows': `-M claude-sonnet-4-6` consults
-the third-party bucket, anything else — including no model at all — consults the Gemini
-one, which is the family `ai.py`'s `agy` rung actually spends. Both are always reported.
-Collapsing them would let an exhausted Claude-family bucket delete a working Gemini rung.
+**Cost differs by two orders of magnitude inside the Claude/GPT bucket**, measured
+2026-09-18 with one trivial call each: `gpt-oss-120b-medium` 0.08 % of the week
+(~1280 calls), `claude-sonnet-4-6` 4.1 % (~24), `claude-opus-4-6-thinking` 6.8 % (~15).
+For scale, `gemini-3.8-flash-low` costs 0.58 % of the *Gemini* week (~170). That gap is why
+`ai.py`'s `agy-gpt` rung defaults to `gpt-oss-120b-medium` while the interactive `agy-gpt`
+shell alias opens on `claude-sonnet-4-6` — a trailing `--model` overrides either, since the
+CLI takes the last one.
 
 ### Four states, and why the distinction matters
 

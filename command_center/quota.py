@@ -108,11 +108,13 @@ from . import config, seat_rota, usage
 # ``codex_seat_rota_errors`` when an entry could not be read. A v2 consumer that ignores
 # them still reads the row correctly: a seat blocked by the rota is a BLOCKED row with
 # ``blocked_by="rota"``, which every existing consumer already renders as "skip it".
-# v2 stayed v2 on 2026-09-18 for the Antigravity rung too, same reason — it is a NEW
-# ROW, not a changed one: ``providers`` gains an ``agy`` entry (kind ``agy``, windows
-# ``gemini_week`` / ``claudegpt_week``, both weekly — Antigravity has no session window).
-# A consumer that looks its own provider ids up by name never sees it; one that iterates
-# every row reads it with the same field set as any other.
+# v2 stayed v2 on 2026-09-18 for the Antigravity rungs too, same reason — they are NEW
+# ROWS, not changed ones: ``providers`` gains ``agy`` (window ``gemini_week``) and
+# ``agy:gpt`` (window ``claudegpt_week``), both kind ``agy``, both weekly-only —
+# Antigravity has no session window. The two allowances are independent, hence two rows
+# rather than one with two windows: each is blocked only by its own bucket. A consumer
+# that looks its own provider ids up by name never sees them; one that iterates every row
+# reads them with the same field set as any other.
 SCHEMA_VERSION = 2
 
 # Provider states. Only BLOCKED may remove a rung from a ladder; UNKNOWN deliberately
@@ -150,14 +152,29 @@ _AGY_STALE_AFTER_SEC = 24 * 3600
 # Fable-week-exhausted account as out of tokens for an Opus request.
 _FABLE_MODEL_HINTS = ("fable",)
 
-# Antigravity serves two model families out of two SEPARATE weekly allowances. A model
-# name carrying one of these hints is served from the `3p-weekly` bucket; everything
-# else (and an unnamed model) from `gemini-weekly`. See :func:`_agy_quota`.
-_AGY_THIRD_PARTY_HINTS = ("claude", "sonnet", "opus", "gpt", "oss")
+# Antigravity serves two model families out of two SEPARATE weekly allowances, so it is
+# TWO rungs, not one provider with a model-scoped verdict. Each row owns one bucket:
+#
+#   agy      gemini-weekly  Gemini Flash / Pro          — what plain `agy` spends
+#   agy-gpt  3p-weekly      Claude Opus/Sonnet, GPT-OSS — what `agy-gpt` spends
+#
+# One row per allowance is what a reader can act on: the report shows each bar beside the
+# command that spends it, a refusal is recorded against the bucket that refused, and an
+# exhausted Claude/GPT week cannot take the Gemini rung down with it. The previous shape —
+# one `agy` row carrying both windows, the verdict scoped by guessing the family from the
+# model name — could only ever answer for one of them at a time.
+#
+# The ids follow the seat convention (`codex:private` → `codex-priv`): the wire id is
+# ``agy:gpt``, the human name ``agy-gpt``, and `display_id`/`canonical_id` join them.
+_AGY_ROWS: tuple[tuple[str, str, str], ...] = (
+    # (provider id, bucket id in the /usage payload, window name in the contract)
+    ("agy", "gemini-weekly", "gemini_week"),
+    ("agy:gpt", "3p-weekly", "claudegpt_week"),
+)
 # Bucket id → the window name the report and the JSON contract show. An id with no entry
-# keeps its own spelling (dashes to underscores), so a third group Google adds appears
-# instead of vanishing.
-_AGY_WINDOW_NAMES = {"gemini-weekly": "gemini_week", "3p-weekly": "claudegpt_week"}
+# keeps its own spelling (dashes to underscores), so a third group Google adds still
+# appears — on the `agy` row, until it is given a row of its own here.
+_AGY_WINDOW_NAMES = {bucket: window for _pid, bucket, window in _AGY_ROWS}
 
 # ── The report's two bars ────────────────────────────────────────────────────
 #
@@ -169,18 +186,18 @@ _AGY_WINDOW_NAMES = {"gemini-weekly": "gemini_week", "3p-weekly": "claudegpt_wee
 # Two consequences worth stating, because they are choices and not accidents:
 #
 # * Copilot's monthly `credits` window is not in either slot — it SPANS them, see
-#   :data:`BAR_SPAN` below.
-# * Antigravity has two weekly buckets and no session window; `gemini_week` is listed
-#   first for the same reason :func:`_agy_quota` scopes to it by default — it is the
-#   family the `agy` rung spends.
+#   :data:`BAR_SPAN_KINDS` below.
+# * Both Antigravity window names are listed, and each of its two rows carries exactly
+#   one of them (see :data:`_AGY_ROWS`) — so `agy` fills the week slot from
+#   `gemini_week` and `agy-gpt` from `claudegpt_week`. Neither has a session window.
 #
 # A slot a provider has no window for draws an EMPTY bar reading `0%`, not a dash: both
 # say "nothing measured here", but the bar keeps the column's shape so the eye reads down
 # a row of bars instead of down a row of holes.
 #
 # Windows drawn as a bar are omitted from the report's textual `windows` column, so a row
-# states each figure once. Anything with no slot here (`fable_week`, Antigravity's second
-# bucket) still shows there, which is what keeps this map from hiding data.
+# states each figure once. Anything with no slot here (`fable_week`) still shows there,
+# which is what keeps this map from hiding data.
 BAR_SLOTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("session", ("five_hour",)),
     ("week", ("seven_day", "gemini_week", "claudegpt_week")),
@@ -288,6 +305,10 @@ _DISPLAY_SEAT = {"default": "work", "private": "priv"}
 _CANONICAL_SEAT: dict[str, dict[str, str]] = {
     "claude": {"priv": "private"},
     "codex": {"work": "default", "priv": "private"},
+    # Antigravity's second rung is a model-family "seat" (`agy:gpt` → `agy-gpt`); no
+    # spelling differs between the two forms, so the map is empty and only its PRESENCE
+    # matters — that is what makes `canonical_id` split the name at all.
+    "agy": {},
 }
 
 
@@ -637,22 +658,6 @@ def _windows_for_model(windows: dict[str, WindowState], model: str) -> list[Wind
     """
     wants_fable = any(hint in model.lower() for hint in _FABLE_MODEL_HINTS)
     return [win for name, win in windows.items() if name != "fable_week" or wants_fable]
-
-
-def _agy_windows_for_model(windows: dict[str, WindowState], model: str) -> list[WindowState]:
-    """The Antigravity window that governs *model* — see :func:`_agy_quota`.
-
-    Falls back to every window when the expected one is absent (an older cache, a payload
-    whose groups changed), so a renamed bucket degrades to "judge on what we have"
-    rather than to "no window data".
-    """
-    wanted = (
-        "claudegpt_week"
-        if any(hint in model.lower() for hint in _AGY_THIRD_PARTY_HINTS)
-        else "gemini_week"
-    )
-    win = windows.get(wanted)
-    return [win] if win is not None else list(windows.values())
 
 
 def _verdict_from_windows(
@@ -1768,67 +1773,69 @@ def _copilot_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
     )
 
 
-def _agy_windows(snap: usage.AgyUsage | None, now: int) -> dict[str, WindowState]:
-    """One Antigravity snapshot's buckets as windows (measurement only, no verdict)."""
+def _agy_window(snap: usage.AgyUsage | None, bucket_id: str, now: int) -> dict[str, WindowState]:
+    """One Antigravity bucket as a window (measurement only, no verdict)."""
     if snap is None:
         return {}
-    windows: dict[str, WindowState] = {}
-    for bucket in snap.buckets:
-        name = _AGY_WINDOW_NAMES.get(bucket.id, bucket.id.replace("-", "_"))
-        win = _window_state(
-            name,
-            usage.Window(used_percentage=bucket.used_percentage, resets_at=bucket.resets_at),
-            snap.captured_at,
-            now,
-            _AGY_STALE_AFTER_SEC,
-        )
-        if win is not None:
-            windows[name] = win
-    return windows
+    bucket = snap.bucket(bucket_id)
+    if bucket is None:
+        return {}
+    name = _AGY_WINDOW_NAMES.get(bucket.id, bucket.id.replace("-", "_"))
+    win = _window_state(
+        name,
+        usage.Window(used_percentage=bucket.used_percentage, resets_at=bucket.resets_at),
+        snap.captured_at,
+        now,
+        _AGY_STALE_AFTER_SEC,
+    )
+    return {name: win} if win is not None else {}
 
 
-def _agy_quota(now: int, cooldowns: dict[str, dict], model: str = "") -> ProviderQuota:
-    """Resolve the Google Antigravity (``agy``) rung from its own ``/usage`` meter.
+def _agy_quotas(now: int, cooldowns: dict[str, dict]) -> list[ProviderQuota]:
+    """One row per Antigravity weekly allowance — see :data:`_AGY_ROWS`.
 
-    Antigravity has **no session window**: both of its buckets are weekly, one per model
-    family — ``gemini-weekly`` (Gemini Flash/Pro) and ``3p-weekly`` (Claude Opus/Sonnet,
-    GPT-OSS). They are independent allowances, which is exactly why the verdict is
-    MODEL-SCOPED like the Claude rows' (:func:`_windows_for_model`): a 100 % ``3p-weekly``
-    says nothing about a Gemini call, and blocking the rung on it would delete a working
-    provider. Both windows are always reported; only the governing one decides.
-
-    With no model named — the empty string ``ai.py`` passes when it asks the oracle about
-    a ladder whose Claude rung set the scope — the **Gemini** window governs. That is the
-    family the ``agy`` rung actually spends (its default model is a Gemini Flash), so it
-    is the honest default rather than a guess averaged over both.
+    Both rows come from the SAME cached ``/usage`` snapshot (one account, one meter), but
+    each carries only its own bucket and is blocked only by its own. That is the whole
+    reason they are two rows: the allowances are independent, so a spent Claude/GPT week
+    must not remove the Gemini rung, and a refusal from one must not be recorded against
+    the other.
     """
     snap = usage.read_agy_usage()
-    windows = _agy_windows(snap, now)
-    if "agy" in cooldowns:
-        return _cooldown_quota("agy", "agy", cooldowns["agy"], windows)
-    if snap is None:
-        off = not config.load_config().agy_usage
-        return ProviderQuota(
-            id="agy",
-            kind="agy",
-            state=UNKNOWN,
-            reason="no usage snapshot" + (" (agy_usage is off)" if off else ""),
-            source="meter",
+    off = snap is None and not config.load_config().agy_usage
+    rows: list[ProviderQuota] = []
+    for pid, bucket_id, _name in _AGY_ROWS:
+        windows = _agy_window(snap, bucket_id, now)
+        if pid in cooldowns:
+            rows.append(_cooldown_quota(pid, "agy", cooldowns[pid], windows))
+            continue
+        if not windows:
+            rows.append(
+                ProviderQuota(
+                    id=pid,
+                    kind="agy",
+                    state=UNKNOWN,
+                    reason="no usage snapshot" + (" (agy_usage is off)" if off else ""),
+                    source="meter",
+                    captured_at=snap.captured_at if snap is not None else 0,
+                )
+            )
+            continue
+        state, reason, blocked_by, resets_at, risky = _verdict_from_windows(windows.values())
+        rows.append(
+            ProviderQuota(
+                id=pid,
+                kind="agy",
+                state=state,
+                reason=reason,
+                source="meter",
+                windows=windows,
+                blocked_by=blocked_by,
+                resets_at=resets_at,
+                captured_at=snap.captured_at if snap is not None else 0,
+                risky=risky,
+            )
         )
-    governing = _agy_windows_for_model(windows, model)
-    state, reason, blocked_by, resets_at, risky = _verdict_from_windows(governing)
-    return ProviderQuota(
-        id="agy",
-        kind="agy",
-        state=state,
-        reason=reason,
-        source="meter",
-        windows=windows,
-        blocked_by=blocked_by,
-        resets_at=resets_at,
-        captured_at=snap.captured_at,
-        risky=risky,
-    )
+    return rows
 
 
 def _gemini_quota(cooldowns: dict[str, dict]) -> ProviderQuota:
@@ -1881,7 +1888,7 @@ def snapshot(
         _copilot_quota(now, cooldowns),
         *codex_rows,
         *claude,
-        _agy_quota(now, cooldowns, model),
+        *_agy_quotas(now, cooldowns),
         _gemini_quota(cooldowns),
     ]
     best = next((q.id for q in claude if q.state == AVAILABLE), "")

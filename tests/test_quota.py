@@ -779,66 +779,75 @@ def _agy_snapshot(gemini_pct: float, third_party_pct: float, captured_at: int = 
     )
 
 
+def _agy_rows(now: int = NOW, cooldowns: dict | None = None) -> dict[str, quota.ProviderQuota]:
+    return {row.id: row for row in quota._agy_quotas(now, cooldowns or {})}
+
+
 def test_agy_without_a_snapshot_is_unknown_not_blocked() -> None:
-    """No meter is a measurement failure — the rung stays runnable (fail-open)."""
-    row = quota._agy_quota(NOW, {})
-    assert row.id == "agy"
-    assert row.state == quota.UNKNOWN
-    assert "no usage snapshot" in row.reason
+    """No meter is a measurement failure — both rungs stay runnable (fail-open)."""
+    rows = _agy_rows()
+    assert set(rows) == {"agy", "agy:gpt"}
+    for row in rows.values():
+        assert row.state == quota.UNKNOWN
+        assert "no usage snapshot" in row.reason
 
 
-def test_agy_reports_both_weekly_buckets_and_no_session_window() -> None:
+def test_each_agy_row_owns_exactly_one_weekly_bucket() -> None:
+    """One account, two INDEPENDENT allowances — so two rows, one window each."""
     _agy_snapshot(gemini_pct=12.0, third_party_pct=3.0)
-    row = quota._agy_quota(NOW, {})
-    assert row.state == quota.AVAILABLE
-    assert set(row.windows) == {"gemini_week", "claudegpt_week"}
-    assert "five_hour" not in row.windows  # Antigravity has no session window at all
-    assert row.windows["gemini_week"].used_pct == 12.0
+    rows = _agy_rows()
+    assert list(rows["agy"].windows) == ["gemini_week"]
+    assert list(rows["agy:gpt"].windows) == ["claudegpt_week"]
+    assert rows["agy"].windows["gemini_week"].used_pct == 12.0
+    assert rows["agy:gpt"].windows["claudegpt_week"].used_pct == 3.0
+    # Neither has a session window at all.
+    assert all("five_hour" not in row.windows for row in rows.values())
+    assert all(row.state == quota.AVAILABLE for row in rows.values())
 
 
-def test_agy_third_party_exhaustion_does_not_block_a_gemini_call() -> None:
-    """The two allowances are independent; collapsing them would delete a working rung."""
+def test_an_exhausted_bucket_blocks_only_its_own_rung() -> None:
+    """The failure this split exists to prevent: one dead week deleting the other rung."""
     _agy_snapshot(gemini_pct=10.0, third_party_pct=100.0)
-    assert quota._agy_quota(NOW, {}, "gemini-3.8-flash-low").state == quota.AVAILABLE
-    # …and with no model named, the Gemini bucket governs — the family the rung spends.
-    assert quota._agy_quota(NOW, {}, "").state == quota.AVAILABLE
-    # Naming a Claude/GPT model DOES pick up the exhausted bucket.
-    blocked = quota._agy_quota(NOW, {}, "claude-sonnet-4-6")
-    assert blocked.state == quota.BLOCKED
-    assert blocked.blocked_by == "claudegpt_week"
+    rows = _agy_rows()
+    assert rows["agy"].state == quota.AVAILABLE
+    assert rows["agy:gpt"].state == quota.BLOCKED
+    assert rows["agy:gpt"].blocked_by == "claudegpt_week"
 
-
-def test_agy_gemini_exhaustion_blocks_the_default_scope() -> None:
     _agy_snapshot(gemini_pct=100.0, third_party_pct=0.0)
-    row = quota._agy_quota(NOW, {}, "")
-    assert row.state == quota.BLOCKED
-    assert row.blocked_by == "gemini_week"
-    assert row.resets_at == NOW + 4 * 86400  # the BLOCKING bucket's reset
+    rows = _agy_rows()
+    assert rows["agy"].state == quota.BLOCKED
+    assert rows["agy"].blocked_by == "gemini_week"
+    assert rows["agy"].resets_at == NOW + 4 * 86400  # the BLOCKING bucket's reset
+    assert rows["agy:gpt"].state == quota.AVAILABLE
 
 
 def test_agy_stale_snapshot_is_unknown() -> None:
     """A day-old reading of 100 % proves nothing about today's allowance."""
     _agy_snapshot(gemini_pct=100.0, third_party_pct=100.0, captured_at=NOW - 2 * 86400)
-    assert quota._agy_quota(NOW, {}, "").state == quota.UNKNOWN
+    assert all(row.state == quota.UNKNOWN for row in _agy_rows().values())
 
 
-def test_agy_cooldown_outranks_the_meter() -> None:
-    """An observed refusal is stricter evidence than any cached percentage."""
+def test_a_cooldown_blocks_only_the_row_it_names() -> None:
+    """An observed refusal is stricter evidence than the meter — for ITS bucket alone."""
     _agy_snapshot(gemini_pct=1.0, third_party_pct=1.0)
-    quota.record_block("agy", blocked_until=NOW + 3600, reason="agy refused", observed_at=NOW)
-    row = quota._agy_quota(NOW, quota.read_cooldowns(NOW))
-    assert row.state == quota.BLOCKED
-    assert row.source == "cooldown"
+    quota.record_block("agy:gpt", blocked_until=NOW + 3600, reason="agy refused", observed_at=NOW)
+    rows = _agy_rows(cooldowns=quota.read_cooldowns(NOW))
+    assert rows["agy:gpt"].state == quota.BLOCKED
+    assert rows["agy:gpt"].source == "cooldown"
+    # …and the blocked row still carries the meter it was measured with.
+    assert rows["agy:gpt"].windows["claudegpt_week"].used_pct == 1.0
+    assert rows["agy"].state == quota.AVAILABLE
 
 
-def test_agy_appears_in_the_snapshot_contract() -> None:
+def test_both_agy_rows_appear_in_the_snapshot_contract() -> None:
     _agy_snapshot(gemini_pct=5.0, third_party_pct=5.0)
     snap = quota.snapshot(now=NOW)
-    row = next(p for p in snap["providers"] if p["id"] == "agy")
-    assert row["kind"] == "agy"
-    assert set(row["windows"]) == {"gemini_week", "claudegpt_week"}
-    # `agy` has no seat, so it reads the same in both spellings — the round-trip every
-    # id-taking flag relies on.
+    rows = {p["id"]: p for p in snap["providers"] if p["kind"] == "agy"}
+    assert set(rows) == {"agy", "agy:gpt"}
+    assert rows["agy:gpt"]["display"] == "agy-gpt"
+    # Both spellings address the same row — the round-trip every id-taking flag needs.
+    assert quota.display_id("agy:gpt") == "agy-gpt"
+    assert quota.canonical_id("agy-gpt") == "agy:gpt"
     assert quota.display_id("agy") == "agy"
     assert quota.canonical_id("agy") == "agy"
 
@@ -901,11 +910,13 @@ def test_quota_report_draws_a_session_and_week_bar(
     # Antigravity has no session window: an EMPTY bar reading 0%, never a dash, so the
     # column keeps its shape.
     assert "░░░░░░░░░░░0%" in agy_row
-    assert "—" not in agy_row
-    assert "█████░░░░░40%" in agy_row  # the weekly bucket, figure embossed
-    # The bar's window is NOT repeated in the textual column; the one with no bar is.
+    assert "█████░░░░░40%" in agy_row  # its weekly bucket, figure embossed
+    # The bar's window is NOT repeated in the textual column, and the OTHER allowance is
+    # a row of its own now, so nothing trails the bars at all.
     assert "geminiweek" not in agy_row
-    assert "claudegptweek 0%" in agy_row
+    assert "claudegptweek" not in agy_row
+    gpt_row = next(line for line in out.splitlines() if " agy-gpt " in line)
+    assert "░░░░░░░░░░░0%" in gpt_row
 
 
 def test_quota_report_gives_copilot_one_bar_across_both_columns(
@@ -950,14 +961,17 @@ def test_quota_report_header_lines_up_with_its_rows(
     assert rows, lines
 
     def at_column(text: str, col: int) -> str:
-        """The character occupying display column *col* — rows carry double-width marks,
-        so a character index is not a column index."""
+        """The character occupying display column *col*.
+
+        Rows carry double-width marks, so a character index is not a column index. Rows
+        are right-stripped, so a column past the end reads as the blank it would be.
+        """
         seen = 0
         for ch in text:
             if seen == col:
                 return ch
             seen += cell_len(ch)
-        return ""
+        return " "
 
     for label in ("state", "data age", "session", "week", "unblocks"):
         col = cell_len(header[: header.index(label)])
@@ -1071,12 +1085,3 @@ def test_a_guessed_denominator_is_shown_but_never_blocks() -> None:
     row = quota._copilot_quota(NOW, {})
     assert row.state == quota.UNKNOWN
     assert row.windows["credits"].used_pct == 100.0
-
-
-def test_blocked_agy_row_still_reports_its_buckets() -> None:
-    _agy_snapshot(gemini_pct=100.0, third_party_pct=7.0)
-    quota.record_block("agy", blocked_until=NOW + 3600, reason="refused", observed_at=NOW)
-    row = quota._agy_quota(NOW, quota.read_cooldowns(NOW))
-    assert row.state == quota.BLOCKED
-    assert row.windows["gemini_week"].used_pct == 100.0
-    assert row.windows["claudegpt_week"].used_pct == 7.0
