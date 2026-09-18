@@ -35,6 +35,7 @@ _EXPECTED_INERT_KEYS = {
     "copilot_usage",
     "claude_usage",
     "codex_usage",
+    "agy_usage",
     "resume_halted",
     "auto_switch_on_limit",
     "reap",

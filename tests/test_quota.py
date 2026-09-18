@@ -13,7 +13,9 @@ The behaviours worth guarding here are the ones whose failure is SILENT and expe
 
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -744,3 +746,174 @@ def test_snapshot_rows_carry_the_display_name_and_the_command() -> None:
     for pid, row in rows.items():
         assert row["display"] == quota.display_id(pid)
         assert row.get("command", "") == quota.seat_command(pid)
+
+
+# ── Google Antigravity (`agy`) ────────────────────────────────────────────────
+
+
+def _agy_snapshot(gemini_pct: float, third_party_pct: float, captured_at: int = NOW) -> None:
+    """Write an Antigravity cache with both weekly buckets at the given USED percentages."""
+    usage._write_agy_usage(
+        usage.AgyUsage(
+            captured_at=captured_at,
+            buckets=[
+                usage.AgyBucket(
+                    id="gemini-weekly",
+                    group="Gemini Models",
+                    label="Weekly Limit Remaining",
+                    window="weekly",
+                    used_percentage=gemini_pct,
+                    resets_at=NOW + 4 * 86400,
+                ),
+                usage.AgyBucket(
+                    id="3p-weekly",
+                    group="Claude and GPT models",
+                    label="Weekly Limit Remaining",
+                    window="weekly",
+                    used_percentage=third_party_pct,
+                    resets_at=NOW + 5 * 86400,
+                ),
+            ],
+        )
+    )
+
+
+def test_agy_without_a_snapshot_is_unknown_not_blocked() -> None:
+    """No meter is a measurement failure — the rung stays runnable (fail-open)."""
+    row = quota._agy_quota(NOW, {})
+    assert row.id == "agy"
+    assert row.state == quota.UNKNOWN
+    assert "no usage snapshot" in row.reason
+
+
+def test_agy_reports_both_weekly_buckets_and_no_session_window() -> None:
+    _agy_snapshot(gemini_pct=12.0, third_party_pct=3.0)
+    row = quota._agy_quota(NOW, {})
+    assert row.state == quota.AVAILABLE
+    assert set(row.windows) == {"gemini_week", "claudegpt_week"}
+    assert "five_hour" not in row.windows  # Antigravity has no session window at all
+    assert row.windows["gemini_week"].used_pct == 12.0
+
+
+def test_agy_third_party_exhaustion_does_not_block_a_gemini_call() -> None:
+    """The two allowances are independent; collapsing them would delete a working rung."""
+    _agy_snapshot(gemini_pct=10.0, third_party_pct=100.0)
+    assert quota._agy_quota(NOW, {}, "gemini-3.8-flash-low").state == quota.AVAILABLE
+    # …and with no model named, the Gemini bucket governs — the family the rung spends.
+    assert quota._agy_quota(NOW, {}, "").state == quota.AVAILABLE
+    # Naming a Claude/GPT model DOES pick up the exhausted bucket.
+    blocked = quota._agy_quota(NOW, {}, "claude-sonnet-4-6")
+    assert blocked.state == quota.BLOCKED
+    assert blocked.blocked_by == "claudegpt_week"
+
+
+def test_agy_gemini_exhaustion_blocks_the_default_scope() -> None:
+    _agy_snapshot(gemini_pct=100.0, third_party_pct=0.0)
+    row = quota._agy_quota(NOW, {}, "")
+    assert row.state == quota.BLOCKED
+    assert row.blocked_by == "gemini_week"
+    assert row.resets_at == NOW + 4 * 86400  # the BLOCKING bucket's reset
+
+
+def test_agy_stale_snapshot_is_unknown() -> None:
+    """A day-old reading of 100 % proves nothing about today's allowance."""
+    _agy_snapshot(gemini_pct=100.0, third_party_pct=100.0, captured_at=NOW - 2 * 86400)
+    assert quota._agy_quota(NOW, {}, "").state == quota.UNKNOWN
+
+
+def test_agy_cooldown_outranks_the_meter() -> None:
+    """An observed refusal is stricter evidence than any cached percentage."""
+    _agy_snapshot(gemini_pct=1.0, third_party_pct=1.0)
+    quota.record_block("agy", blocked_until=NOW + 3600, reason="agy refused", observed_at=NOW)
+    row = quota._agy_quota(NOW, quota.read_cooldowns(NOW))
+    assert row.state == quota.BLOCKED
+    assert row.source == "cooldown"
+
+
+def test_agy_appears_in_the_snapshot_contract() -> None:
+    _agy_snapshot(gemini_pct=5.0, third_party_pct=5.0)
+    snap = quota.snapshot(now=NOW)
+    row = next(p for p in snap["providers"] if p["id"] == "agy")
+    assert row["kind"] == "agy"
+    assert set(row["windows"]) == {"gemini_week", "claudegpt_week"}
+    # `agy` has no seat, so it reads the same in both spellings — the round-trip every
+    # id-taking flag relies on.
+    assert quota.display_id("agy") == "agy"
+    assert quota.canonical_id("agy") == "agy"
+
+
+def test_bar_slots_name_only_windows_providers_really_have() -> None:
+    """The report's two bars are fed from real window names, not aspirational ones.
+
+    A typo here is silent: every row would simply print `—` where its bar belongs, which
+    is exactly what happened the first time these were spelled `fivehour`/`sevenday`.
+    """
+    slots = dict(quota.BAR_SLOTS)
+    assert slots["session"] == ("five_hour",)
+    _agy_snapshot(gemini_pct=5.0, third_party_pct=5.0)
+    snap = quota.snapshot(now=NOW)
+    for prov in snap["providers"]:
+        for name in prov.get("windows") or {}:
+            assert name in {*slots["session"], *slots["week"], "fable_week"}, name
+
+
+# ── the report's usage bars ──────────────────────────────────────────────────
+
+
+def _quota_args(**over: str | bool | None) -> argparse.Namespace:
+    """A `ccc quota` Namespace with every flag at its default, then *over* applied."""
+    base = dict(
+        json=False,
+        provider=None,
+        best=False,
+        model="",
+        refresh=False,
+        mark=None,
+        retry_after=None,
+        until=None,
+        hold=False,
+        reason="",
+        scope="",
+        clear=None,
+        observed_only=False,
+        no_bars=False,
+    )
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+def test_quota_report_draws_a_session_and_week_bar(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every row gets both bars; a provider with no such window prints `—`, not 0 %."""
+    from command_center import cli
+
+    _agy_snapshot(gemini_pct=40.0, third_party_pct=0.0)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    assert cli.cmd_quota(_quota_args()) == 0
+    out = capsys.readouterr().out
+    assert "session" in out and "week" in out
+    agy_row = next(
+        line for line in out.splitlines() if line.lstrip().startswith(("✅ agy", "❔ agy"))
+    )
+    # Antigravity: no session window (—), a 40 % weekly bar drawn from `gemini_week`.
+    assert "—" in agy_row
+    assert "████░░░░░░  40%" in agy_row
+    # The bar's window is NOT repeated in the textual column; the one with no bar is.
+    assert "geminiweek" not in agy_row
+    assert "claudegptweek 0%" in agy_row
+
+
+def test_quota_report_no_bars_flag_restores_the_plain_columns(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center import cli
+
+    _agy_snapshot(gemini_pct=40.0, third_party_pct=0.0)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    assert cli.cmd_quota(_quota_args(no_bars=True)) == 0
+    out = capsys.readouterr().out
+    assert "session" not in out.splitlines()[0]
+    assert "█" not in out
+    # With no bars drawn, every window is back in the textual column.
+    assert "geminiweek 40%" in out

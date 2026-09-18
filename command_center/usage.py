@@ -1895,6 +1895,56 @@ def _fill_for_pct(pct: float) -> str:
     return _FILL_RED
 
 
+# ── The same bar, for a plain terminal ───────────────────────────────────────
+#
+# The card bars above are Rich ``Text`` (background-filled cells with the reset time
+# embossed over them) and only render inside the TUI. ``ccc quota``'s report is plain
+# ``print()``, so it needs the bar as a STRING — but it must be the *same* bar: same
+# green/orange/red thresholds, same track colour, one palette. Hence this renderer sits
+# here, next to :func:`_bar`, and reuses :func:`_fill_for_pct` rather than restating the
+# thresholds at the call site.
+#
+# Foreground glyphs, not background cells: a report is piped, redirected and pasted far
+# more often than a TUI is, and ``████░░░░░░`` still reads as a bar with every escape
+# stripped, where a row of background-coloured spaces collapses into blanks.
+_BAR_FILL_GLYPH = "\u2588"  # █ used
+_BAR_TRACK_GLYPH = "\u2591"  # ░ remaining
+
+
+def _hex_rgb(color: str) -> tuple[int, int, int]:
+    """``"#3fb950"`` → ``(63, 185, 80)``. The card palette is hex; ANSI wants ints."""
+    raw = color.lstrip("#")
+    return int(raw[0:2], 16), int(raw[2:4], 16), int(raw[4:6], 16)
+
+
+def ansi_bar(pct: float, *, width: int = 10, color: bool = True) -> str:
+    """A *width*-glyph usage bar for a plain terminal, coloured like the TUI cards.
+
+    *pct* is the percentage USED (the cards' convention) and is clamped to 0–100; the
+    fill colour comes from :func:`_fill_for_pct`, so a bar here and a bar on a card
+    agree on what "healthy" looks like. *color* False emits the glyphs bare — for a
+    pipe, for ``NO_COLOR``, and for tests, which then assert on the shape alone.
+
+    Returns only the bar: the caller owns the percentage text and the column padding,
+    because the escape sequences make ``len()`` useless for alignment.
+    """
+    pct = max(0.0, min(100.0, pct))
+    filled = round(pct / 100 * width)
+    bar = _BAR_FILL_GLYPH * filled + _BAR_TRACK_GLYPH * (width - filled)
+    if not color:
+        return bar
+    # An empty run gets NO colour code: a full or empty bar would otherwise carry a
+    # dangling escape that says nothing and shows up in every golden-output test.
+    parts = []
+    if filled:
+        fr, fg, fb = _hex_rgb(_fill_for_pct(pct))
+        parts.append(f"\033[38;2;{fr};{fg};{fb}m{_BAR_FILL_GLYPH * filled}")
+    if width - filled:
+        tr, tg, tb = _hex_rgb(_TRACK_COLOR)
+        parts.append(f"\033[38;2;{tr};{tg};{tb}m{_BAR_TRACK_GLYPH * (width - filled)}")
+    return "".join(parts) + "\033[0m"
+
+
 def _bar(
     pct: float,
     fill_color: str = _FILL_COLOR,
@@ -2574,3 +2624,226 @@ def render_copilot_usage(usage: CopilotUsage | None, now: int | None = None) -> 
     text.append_text(_bar_row(pct, _COPILOT_FILL, label=label, label_color=_COPILOT_FILL))
     text.rstrip()
     return text
+
+
+# ── Google Antigravity (`agy`) ───────────────────────────────────────────────
+#
+# The Antigravity CLI meters itself through its own `/usage` slash command, which in
+# print mode answers pure JSON and — verified 2026-09-18 — costs NOTHING: the reply
+# carries `num_turns: 0` and `total_tokens: 0`, because the command is served by the CLI
+# from the account's quota service, not by a model turn. That is what makes it cheap
+# enough to poll on the daemon's schedule.
+#
+# The payload is `command.data.groups[].buckets[]`, one bucket per rate-limit window:
+#
+#     {"id": "gemini-weekly", "name": "Weekly Limit Remaining", "window": "weekly",
+#      "remaining_fraction": 0.994, "reset_time": "2026-09-25T10:07:15Z"}
+#
+# Two groups today — `gemini-weekly` (Gemini Flash/Pro) and `3p-weekly` (Claude Opus /
+# Sonnet, GPT-OSS) — but the shape is a LIST and is read as one: a third group appearing
+# must show up as a third bucket, not be silently dropped by a hard-coded pair of fields.
+#
+# **`remaining_fraction`, not a used fraction.** Everything else in this module counts
+# what has been SPENT (`used_percentage`), so the conversion happens once, here, at the
+# parse boundary — a bar drawn from a remaining fraction would read 100 % healthy on a
+# dead account.
+_AGY_USAGE_ARGS = ("-p", "/usage", "--output-format", "json")
+_AGY_TIMEOUT_SEC = 30.0
+
+
+@dataclass
+class AgyBucket:
+    """One Antigravity rate-limit window, converted to this module's conventions."""
+
+    id: str  # "gemini-weekly" / "3p-weekly" — the payload's own bucket id
+    group: str  # "Gemini Models" / "Claude and GPT models"
+    label: str  # "Weekly Limit Remaining"
+    window: str  # "weekly"
+    used_percentage: float  # 100 - remaining_fraction*100
+    resets_at: int  # Unix epoch from the payload's ISO `reset_time`
+
+
+@dataclass
+class AgyUsage:
+    """A captured snapshot of every Antigravity quota bucket."""
+
+    captured_at: int  # Unix epoch seconds when ccc fetched it
+    buckets: list[AgyBucket]
+
+    def bucket(self, bucket_id: str) -> AgyBucket | None:
+        """The bucket with *bucket_id*, or ``None`` when the payload had none."""
+        return next((b for b in self.buckets if b.id == bucket_id), None)
+
+
+def _agy_usage_path() -> Path:
+    return config.app_home() / "agy_usage.json"
+
+
+def _agy_exe() -> str | None:
+    """Resolve the ``agy`` binary, or ``None`` — a missing CLI is a degrade, not an error.
+
+    Goes through the repo's external-dependency registry (``AGY_BIN`` override → ``$PATH``)
+    with ``resolve``, not ``require``: this fetcher is best-effort behind an opt-in switch,
+    so an absent Antigravity install must leave the last cache standing and say nothing,
+    exactly as a missing ``gh`` does for the Copilot card.
+    """
+    # pylint: disable=import-outside-toplevel  # capability-scoped: nothing in the
+    # registry may be imported or probed at module load (the extdeps convention).
+    from extdeps import resolve
+
+    from .external_deps import EXTERNAL_DEPS
+
+    return resolve(EXTERNAL_DEPS["agy"])
+
+
+def _parse_agy_usage(data: object, now: int) -> AgyUsage | None:
+    """``agy -p /usage --output-format json`` → :class:`AgyUsage`, or ``None``.
+
+    ``None`` means "this payload tells us nothing" — a non-SUCCESS status, no groups, or
+    not one parseable bucket. Individual malformed buckets are skipped rather than failing
+    the whole snapshot: one unreadable group must not blind the report to the other.
+    """
+    if not isinstance(data, dict):
+        return None
+    if str(data.get("status", "")) not in ("", "SUCCESS"):
+        return None
+    command = data.get("command")
+    payload = command.get("data") if isinstance(command, dict) else None
+    groups = payload.get("groups") if isinstance(payload, dict) else None
+    if not isinstance(groups, list):
+        return None
+    buckets: list[AgyBucket] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        name = str(group.get("name", ""))
+        for raw in group.get("buckets") or []:
+            if not isinstance(raw, dict):
+                continue
+            remaining = raw.get("remaining_fraction")
+            if not isinstance(remaining, (int, float)):
+                continue
+            buckets.append(
+                AgyBucket(
+                    id=str(raw.get("id", "")),
+                    group=name,
+                    label=str(raw.get("name", "")),
+                    window=str(raw.get("window", "")),
+                    # Clamped: the service has no reason to report outside 0–1, but a
+                    # negative "remaining" would otherwise render as a >100 % bar.
+                    used_percentage=100.0 - max(0.0, min(1.0, float(remaining))) * 100.0,
+                    resets_at=_iso_to_epoch(raw.get("reset_time")),
+                )
+            )
+    if not buckets:
+        return None
+    return AgyUsage(captured_at=now, buckets=buckets)
+
+
+def _write_agy_usage(snap: AgyUsage) -> None:
+    payload = {
+        "captured_at": snap.captured_at,
+        "buckets": [
+            {
+                "id": b.id,
+                "group": b.group,
+                "label": b.label,
+                "window": b.window,
+                "used_percentage": b.used_percentage,
+                "resets_at": b.resets_at,
+            }
+            for b in snap.buckets
+        ],
+    }
+    path = _agy_usage_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _flock(path.with_name(path.name + ".lock")):
+            _atomic_write_json(path, payload)
+    except OSError:
+        pass
+
+
+def fetch_agy_usage(now: int | None = None) -> AgyUsage | None:
+    """Ask the Antigravity CLI for its own quota and cache the answer.
+
+    The ONE networked path for this provider (the CLI does the call). Best-effort in
+    every failure mode — no binary, a timeout, a non-zero exit, unparseable JSON — and
+    each one returns ``None`` with the previous cache untouched, because a provider we
+    briefly could not measure must degrade to ``unknown``, never to "blocked".
+
+    Runs in a temporary directory: ``agy`` treats its working directory as a workspace,
+    and metering the account has no business touching the repo the caller happens to
+    stand in.
+    """
+    now = int(time.time()) if now is None else now
+    exe = _agy_exe()
+    if not exe:
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix="ccc-agy-") as sandbox:
+            result = subprocess.run(  # noqa: S603
+                [exe, *_AGY_USAGE_ARGS],
+                capture_output=True,
+                text=True,
+                timeout=_AGY_TIMEOUT_SEC,
+                check=False,
+                cwd=sandbox,
+            )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    snap = _parse_agy_usage(data, now)
+    if snap is None:
+        return None
+    _write_agy_usage(snap)
+    return snap
+
+
+def read_agy_usage() -> AgyUsage | None:
+    """Load the last cached Antigravity snapshot, or ``None`` if absent/unreadable."""
+    data = _load_json_dict(_agy_usage_path())
+    if data is None:
+        return None
+    raw_buckets = data.get("buckets")
+    if not isinstance(raw_buckets, list):
+        return None
+    try:
+        buckets = [
+            AgyBucket(
+                id=str(b.get("id", "")),
+                group=str(b.get("group", "")),
+                label=str(b.get("label", "")),
+                window=str(b.get("window", "")),
+                used_percentage=float(b.get("used_percentage", 0) or 0),
+                resets_at=int(b.get("resets_at", 0) or 0),
+            )
+            for b in raw_buckets
+            if isinstance(b, dict)
+        ]
+        captured_at = int(data.get("captured_at", 0) or 0)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not buckets:
+        return None
+    return AgyUsage(captured_at=captured_at, buckets=buckets)
+
+
+def agy_usage_stale(refresh_sec: float, now: int | None = None) -> bool:
+    """True if the cache is missing or older than ``refresh_sec`` (drives the refresh).
+
+    Mirrors :func:`copilot_usage_stale`, mtime-based for the same reason: the file's age
+    is what "how long since we last had a reading" means, and it survives a snapshot
+    whose ``captured_at`` a future format change might move.
+    """
+    now = int(time.time()) if now is None else now
+    try:
+        mtime = _agy_usage_path().stat().st_mtime
+    except OSError:
+        return True
+    return (now - int(mtime)) >= refresh_sec

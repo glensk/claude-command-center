@@ -3389,6 +3389,57 @@ def cmd_job_account(args: argparse.Namespace) -> int:
 
 _QUOTA_MARK = {"available": "✅", "blocked": "⛔", "unknown": "❔", "disabled": "🚫"}
 
+# One usage bar in the `ccc quota` report: 10 glyphs, a space, a right-aligned percentage
+# ("100%" is the widest) — 15 visible columns, whatever escape sequences the colour adds.
+_BAR_GLYPHS = 10
+_BAR_CELL_WIDTH = _BAR_GLYPHS + 5
+
+
+def _quota_age(prov: dict[str, Any], now: int) -> str:
+    """How old the evidence behind this row's verdict is.
+
+    Cooldown/hold rows are labelled as the age of the MARK, not of quota data — a hold
+    recorded yesterday says nothing about yesterday's usage figures.
+    """
+    from . import usage  # pylint: disable=import-outside-toplevel
+
+    captured = int(prov.get("captured_at", 0) or 0)
+    if not captured:
+        return "—"
+    age = usage._format_age(max(0, now - captured))  # noqa: SLF001
+    return f"marked {age}" if prov.get("source") in ("cooldown", "hold") else age
+
+
+def _quota_bar_cells(windows: dict[str, Any], *, color: bool) -> tuple[str, set[str]]:
+    """The row's session + week bar cells, and the names of the windows they drew.
+
+    Each slot of :data:`quota.BAR_SLOTS` is filled by the first window the provider
+    actually has, so one renderer serves every provider — Claude's ``fivehour`` /
+    ``sevenday``, Copilot's ``credits``, Antigravity's ``gemini_week``. A slot with no
+    window prints ``—``: an empty bar would claim a measured 0 %.
+
+    The returned name set is what the caller must NOT repeat in the textual ``windows``
+    column. Padding is done here because the ANSI escapes make ``len()`` useless for it.
+    """
+    from . import quota, usage  # pylint: disable=import-outside-toplevel
+
+    out: list[str] = []
+    drawn: set[str] = set()
+    for _slot, candidates in quota.BAR_SLOTS:
+        name = next((n for n in candidates if n in windows), "")
+        if not name:
+            out.append("—".ljust(_BAR_CELL_WIDTH))
+            continue
+        drawn.add(name)
+        pct = float(windows[name].get("used_pct", 0) or 0)
+        # A stale figure keeps its bar but loses its colour: it is the last thing we
+        # measured, not a live reading, and a green bar would assert more than we know.
+        glyphs = usage.ansi_bar(
+            pct, width=_BAR_GLYPHS, color=color and not windows[name].get("stale")
+        )
+        out.append(f"{glyphs} {pct:>3.0f}%")
+    return " ".join(out) + " ", drawn
+
 
 def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branches
     """Fast, cache-first quota oracle — which provider/account still has tokens.
@@ -3466,9 +3517,14 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
             usage.fetch_claude_usage(label, now)
         usage.fetch_copilot_usage(now)
         # Opt-in (a network call per Codex login), so gated exactly like the daemon's pass.
-        if config.load_config().codex_usage:
+        live_cfg = config.load_config()
+        if live_cfg.codex_usage:
             for home in config.codex_homes().values():
                 usage.fetch_codex_usage(home, now)
+        # Same gate for Antigravity: `agy -p /usage` spends no tokens but does spawn the
+        # CLI, so it runs only where the daemon's pass would run it.
+        if live_cfg.agy_usage:
+            usage.fetch_agy_usage(now)
 
     snap = quota.snapshot(model=args.model, now=now)
 
@@ -3510,7 +3566,17 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
         for prov in snap["providers"]
     }
     width = max([len("provider"), *(len(n) for n in names.values())])
-    print(f"  {'provider':<{width + 2}} {'state':<10} {'data age':<12} {'unblocks':<16} windows")
+    # Both variable-width columns are measured, never guessed: a `marked 20h 20m` age is
+    # 14 characters and used to push every column behind it out of alignment on that row
+    # alone. Computed here so the ages are formatted once and reused by the loop.
+    ages = {prov["id"]: _quota_age(prov, now) for prov in snap["providers"]}
+    age_w = max([len("data age"), *(len(a) for a in ages.values())])
+    bars = not args.no_bars
+    color = bars and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    head = f"  {'provider':<{width + 2}} {'state':<10} {'data age':<{age_w}} "
+    if bars:
+        head += f"{'session':<{_BAR_CELL_WIDTH}} {'week':<{_BAR_CELL_WIDTH}} "
+    print(head + f"{'unblocks':<16} windows")
     for prov in snap["providers"]:
         state = prov["state"]
         unblocks = (
@@ -3518,19 +3584,14 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
             if prov.get("resets_at")
             else ("—" if state != quota.AVAILABLE else "")
         )
-        # How old the evidence behind this verdict is. Cooldown/hold rows are labelled
-        # as the age of the MARK, not of quota data — a hold recorded yesterday says
-        # nothing about yesterday's usage figures.
-        captured = int(prov.get("captured_at", 0) or 0)
-        if not captured:
-            age = "—"
-        elif prov.get("source") in ("cooldown", "hold"):
-            age = f"marked {usage._format_age(max(0, now - captured))}"  # noqa: SLF001
-        else:
-            age = usage._format_age(max(0, now - captured))  # noqa: SLF001
+        windows = prov.get("windows") or {}
+        cells, drawn = _quota_bar_cells(windows, color=color) if bars else ("", set())
+        # Only the windows NO bar shows (fable_week, Antigravity's second bucket, a
+        # provider whose window has no slot): a row must state each figure once.
         wins = " ".join(
             f"{name.replace('_', '')} {win['used_pct']:.0f}%{'(stale)' if win.get('stale') else ''}"
-            for name, win in (prov.get("windows") or {}).items()
+            for name, win in windows.items()
+            if name not in drawn
         )
         mark = _QUOTA_MARK.get(state, " ")
         detail = wins or prov.get("reason", "")
@@ -3538,12 +3599,15 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
         # hiding why it is blocked — and a refusal's windows read as healthy headroom.
         if wins and state != quota.AVAILABLE and prov.get("reason"):
             detail = f"{prov['reason']} ({wins})"
+        elif not wins and state != quota.AVAILABLE and prov.get("reason"):
+            detail = prov["reason"]
         if prov.get("email"):
             detail = f"{detail}  [{prov['email']}]" if detail else f"[{prov['email']}]"
         # The name carries the seat's own shell command when that is not the name
         # itself, so the row answers "and how do I open a session there?" in place.
         print(
-            f"  {mark} {names[prov['id']]:<{width}} {state:<10} {age:<12} {unblocks:<16} {detail}"
+            f"  {mark} {names[prov['id']]:<{width}} {state:<10} {ages[prov['id']]:<{age_w}} "
+            f"{cells}{unblocks:<16} {detail}".rstrip()
         )
     if snap["best_claude_account"]:
         best = names.get(snap["best_claude_account"]) or quota.display_id(
@@ -5679,6 +5743,13 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     )
     p_quota.add_argument(
         "-c", "--clear", metavar="ID", help="drop a provider's block (either spelling)"
+    )
+    p_quota.add_argument(
+        "-B",
+        "--no-bars",
+        action="store_true",
+        help="plain report: no session/week usage bars (bars are colourless off a TTY "
+        "or under NO_COLOR anyway)",
     )
     p_quota.add_argument(
         "-O",

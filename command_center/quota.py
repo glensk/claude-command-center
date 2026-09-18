@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Fast, cache-first quota oracle — "which provider still has tokens, and until when?"
 
-Every LLM-calling tool in this toolbox walks a *fallback ladder* of providers (GitHub
-Copilot seat → Codex/ChatGPT seat → Claude subscription). Left alone, each rung learns it
-is exhausted only by ATTEMPTING it and failing, which is exactly the failure this module
+Every LLM-calling tool in this toolbox walks a *fallback ladder* of providers (Google
+Antigravity → GitHub Copilot seat → Codex/ChatGPT seat → Claude subscription). Left alone,
+each rung learns it is exhausted only by ATTEMPTING it and failing, which is the failure this module
 exists to end: a Copilot seat that is hard-429 for three days still cost ``ai.py push`` a
 300-second doomed retry on every single commit.
 
@@ -108,6 +108,11 @@ from . import config, seat_rota, usage
 # ``codex_seat_rota_errors`` when an entry could not be read. A v2 consumer that ignores
 # them still reads the row correctly: a seat blocked by the rota is a BLOCKED row with
 # ``blocked_by="rota"``, which every existing consumer already renders as "skip it".
+# v2 stayed v2 on 2026-09-18 for the Antigravity rung too, same reason — it is a NEW
+# ROW, not a changed one: ``providers`` gains an ``agy`` entry (kind ``agy``, windows
+# ``gemini_week`` / ``claudegpt_week``, both weekly — Antigravity has no session window).
+# A consumer that looks its own provider ids up by name never sees it; one that iterates
+# every row reads it with the same field set as any other.
 SCHEMA_VERSION = 2
 
 # Provider states. Only BLOCKED may remove a rung from a ladder; UNKNOWN deliberately
@@ -135,11 +140,49 @@ _SESSION_STALE_AFTER_SEC = 5 * 3600
 _WEEK_STALE_AFTER_SEC = 7 * 86400
 # The Copilot billing snapshot lags by up to a day; past this it cannot establish anything.
 _COPILOT_STALE_AFTER_SEC = 24 * 3600
+# Same 24 h reasoning for the Antigravity meter: its windows are weekly, so the FIGURE
+# ages slowly, but a reading older than a day was taken before a day's worth of calls
+# could have been made and must not establish exhaustion on its own.
+_AGY_STALE_AFTER_SEC = 24 * 3600
 
 # Models whose usage is governed by the Fable-scoped weekly window. Any other model
 # ignores ``fable_week`` entirely — the bug this mapping exists to prevent is treating a
 # Fable-week-exhausted account as out of tokens for an Opus request.
 _FABLE_MODEL_HINTS = ("fable",)
+
+# Antigravity serves two model families out of two SEPARATE weekly allowances. A model
+# name carrying one of these hints is served from the `3p-weekly` bucket; everything
+# else (and an unnamed model) from `gemini-weekly`. See :func:`_agy_quota`.
+_AGY_THIRD_PARTY_HINTS = ("claude", "sonnet", "opus", "gpt", "oss")
+# Bucket id → the window name the report and the JSON contract show. An id with no entry
+# keeps its own spelling (dashes to underscores), so a third group Google adds appears
+# instead of vanishing.
+_AGY_WINDOW_NAMES = {"gemini-weekly": "gemini_week", "3p-weekly": "claudegpt_week"}
+
+# ── The report's two bars ────────────────────────────────────────────────────
+#
+# `ccc quota`'s text report draws the SAME two bars the TUI usage cards draw — a session
+# bar and a weekly one — for every row, whatever the provider. Each provider names its
+# windows differently, so this is the map from "the slot a bar occupies" to "the window
+# names that may fill it", most specific first; the FIRST window a row actually has wins.
+#
+# Two consequences worth stating, because they are choices and not accidents:
+#
+# * Copilot's monthly `credits` window fills the WEEK slot. It is a month, not a week,
+#   but it is the recurring allowance that decides whether the seat answers, and the
+#   alternative — a fourth column used by exactly one provider — costs more than the
+#   imprecision. The row's `unblocks` column carries the real reset.
+# * Antigravity has two weekly buckets and no session window; `gemini_week` is listed
+#   first for the same reason :func:`_agy_quota` scopes to it by default — it is the
+#   family the `agy` rung spends.
+#
+# Windows drawn as a bar are omitted from the report's textual `windows` column, so a row
+# states each figure once. Anything with no slot here (`fable_week`, Antigravity's second
+# bucket) still shows there, which is what keeps this map from hiding data.
+BAR_SLOTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("session", ("five_hour",)),
+    ("week", ("seven_day", "credits", "gemini_week", "claudegpt_week")),
+)
 
 # The Fable weekly figure is only as fresh as the last successful OAuth fetch
 # (``oauth_fetched_at``): statusline writes refresh ``captured_at`` while PRESERVING a
@@ -282,8 +325,8 @@ def seat_command(pid: str) -> str:
 class ProviderQuota:
     """One provider (or one Claude account) resolved to a state, with its evidence."""
 
-    id: str  # "copilot" | "codex[:private]" | "gemini" | "claude:<account>"
-    kind: str  # "copilot" | "codex" | "gemini" | "claude"
+    id: str  # "copilot" | "codex[:private]" | "gemini" | "agy" | "claude:<account>"
+    kind: str  # "copilot" | "codex" | "gemini" | "agy" | "claude"
     state: str  # AVAILABLE | BLOCKED | UNKNOWN | DISABLED
     reason: str = ""  # human explanation, always set for non-available states
     source: str = ""  # where the verdict came from: "cooldown" | "meter" | "windows" | "config"
@@ -581,6 +624,22 @@ def _windows_for_model(windows: dict[str, WindowState], model: str) -> list[Wind
     """
     wants_fable = any(hint in model.lower() for hint in _FABLE_MODEL_HINTS)
     return [win for name, win in windows.items() if name != "fable_week" or wants_fable]
+
+
+def _agy_windows_for_model(windows: dict[str, WindowState], model: str) -> list[WindowState]:
+    """The Antigravity window that governs *model* — see :func:`_agy_quota`.
+
+    Falls back to every window when the expected one is absent (an older cache, a payload
+    whose groups changed), so a renamed bucket degrades to "judge on what we have"
+    rather than to "no window data".
+    """
+    wanted = (
+        "claudegpt_week"
+        if any(hint in model.lower() for hint in _AGY_THIRD_PARTY_HINTS)
+        else "gemini_week"
+    )
+    win = windows.get(wanted)
+    return [win] if win is not None else list(windows.values())
 
 
 def _verdict_from_windows(
@@ -1648,6 +1707,61 @@ def _copilot_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
     )
 
 
+def _agy_quota(now: int, cooldowns: dict[str, dict], model: str = "") -> ProviderQuota:
+    """Resolve the Google Antigravity (``agy``) rung from its own ``/usage`` meter.
+
+    Antigravity has **no session window**: both of its buckets are weekly, one per model
+    family — ``gemini-weekly`` (Gemini Flash/Pro) and ``3p-weekly`` (Claude Opus/Sonnet,
+    GPT-OSS). They are independent allowances, which is exactly why the verdict is
+    MODEL-SCOPED like the Claude rows' (:func:`_windows_for_model`): a 100 % ``3p-weekly``
+    says nothing about a Gemini call, and blocking the rung on it would delete a working
+    provider. Both windows are always reported; only the governing one decides.
+
+    With no model named — the empty string ``ai.py`` passes when it asks the oracle about
+    a ladder whose Claude rung set the scope — the **Gemini** window governs. That is the
+    family the ``agy`` rung actually spends (its default model is a Gemini Flash), so it
+    is the honest default rather than a guess averaged over both.
+    """
+    if "agy" in cooldowns:
+        return _cooldown_quota("agy", "agy", cooldowns["agy"])
+    snap = usage.read_agy_usage()
+    if snap is None:
+        off = not config.load_config().agy_usage
+        return ProviderQuota(
+            id="agy",
+            kind="agy",
+            state=UNKNOWN,
+            reason="no usage snapshot" + (" (agy_usage is off)" if off else ""),
+            source="meter",
+        )
+    windows: dict[str, WindowState] = {}
+    for bucket in snap.buckets:
+        name = _AGY_WINDOW_NAMES.get(bucket.id, bucket.id.replace("-", "_"))
+        win = _window_state(
+            name,
+            usage.Window(used_percentage=bucket.used_percentage, resets_at=bucket.resets_at),
+            snap.captured_at,
+            now,
+            _AGY_STALE_AFTER_SEC,
+        )
+        if win is not None:
+            windows[name] = win
+    governing = _agy_windows_for_model(windows, model)
+    state, reason, blocked_by, resets_at, risky = _verdict_from_windows(governing)
+    return ProviderQuota(
+        id="agy",
+        kind="agy",
+        state=state,
+        reason=reason,
+        source="meter",
+        windows=windows,
+        blocked_by=blocked_by,
+        resets_at=resets_at,
+        captured_at=snap.captured_at,
+        risky=risky,
+    )
+
+
 def _gemini_quota(cooldowns: dict[str, dict]) -> ProviderQuota:
     """The Gemini CLI rung — a capability state, not a quota one.
 
@@ -1698,6 +1812,7 @@ def snapshot(
         _copilot_quota(now, cooldowns),
         *codex_rows,
         *claude,
+        _agy_quota(now, cooldowns, model),
         _gemini_quota(cooldowns),
     ]
     best = next((q.id for q in claude if q.state == AVAILABLE), "")

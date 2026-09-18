@@ -2188,7 +2188,8 @@ paid a doomed retry — 300 s of it, because the same-seat OpenCode fallback re-
 already-refused request.
 
 ```commands
-ccc quota                       # human table: provider · state · data age · unblocks · windows
+ccc quota                       # human table: provider · state · age · session+week bars · unblocks
+ccc quota -B                    # the same table without the bars (plain columns)
 ccc quota -j                    # versioned JSON contract (for scripts), schema v2
 ccc quota -p codex-priv         # one provider; exit 0=available 1=blocked 2=unknown
 ccc quota -b                    # best CLAUDE account label only
@@ -2230,6 +2231,42 @@ team-first otherwise); `codex-in-claude`'s `_codex_home()`, `codex-review.py` (v
 `codex-in-claude.py home -j`) and ccc's own `llm.run_codex` all follow that one
 selector. The `data age` column shows how old each row's governing evidence is
 (`marked <age>` for cooldown/hold rows — the age of the mark, not of quota data).
+
+### The two usage bars
+
+Every row draws the same **session** and **week** bars the TUI usage cards draw — same
+green ≤65 % / orange ≤85 % / red thresholds, same track colour, one palette
+(`usage.ansi_bar`, next to the cards' own `usage._bar`). Each provider fills those two
+slots from its own windows (`quota.BAR_SLOTS`): Claude and Codex from `five_hour` /
+`seven_day`, Copilot's monthly `credits` into the week slot (it is the recurring allowance
+that decides whether the seat answers; the row's `unblocks` carries the real reset), and
+Antigravity's `gemini_week` — it has no session window, so that slot reads `—` rather than
+an empty bar claiming a measured 0 %.
+
+A window drawn as a bar is **not** repeated in the textual `windows` column, so each figure
+appears once; what has no slot (`fable_week`, Antigravity's second bucket) still shows
+there. A stale figure keeps its bar but loses its colour — it is the last thing measured,
+not a live reading. Colour is emitted only on a TTY without `NO_COLOR`; `-B/--no-bars`
+drops the two columns entirely and restores the plain `windows` listing.
+
+### Google Antigravity (`agy`)
+
+The `agy` row is metered by the Antigravity CLI's own `/usage` command
+(`agy -p /usage --output-format json`), which costs **nothing** — it answers from the
+account's quota service, `num_turns: 0`, `total_tokens: 0` — so it is cheap enough to poll.
+Off by default (`agy_usage`, an INERT key like `copilot_usage`); turn it on and the daemon
+refreshes it on `agy_usage_refresh_sec` (900 s idle / 300 s while a job works), `ccc quota
+-r` forces it, and `ccc doctor` resolves the binary through the `agy` entry in
+`external_deps.py` (`AGY_BIN` overrides `$PATH`). A missing binary, a timeout or an
+unparseable answer leaves the previous cache standing and the row ages out to `unknown` —
+never to `blocked`.
+
+Antigravity meters **two independent weekly allowances**, one per model family:
+`gemini_week` (Gemini Flash/Pro) and `claudegpt_week` (Claude Opus/Sonnet, GPT-OSS). The
+verdict is therefore model-scoped like the Claude rows': `-M claude-sonnet-4-6` consults
+the third-party bucket, anything else — including no model at all — consults the Gemini
+one, which is the family `ai.py`'s `agy` rung actually spends. Both are always reported.
+Collapsing them would let an exhausted Claude-family bucket delete a working Gemini rung.
 
 ### Four states, and why the distinction matters
 

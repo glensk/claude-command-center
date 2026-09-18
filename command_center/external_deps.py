@@ -49,4 +49,19 @@ EXTERNAL_DEPS: dict[str, Dep] = {
             "opt-out that writes mirrors without a scrubber."
         ),
     ),
+    # Google's Antigravity CLI. ccc calls it for ONE thing: `agy -p /usage
+    # --output-format json`, the account's own quota meter (zero tokens — the CLI answers
+    # from the quota service, not from a model turn). Resolved with `resolve`, not
+    # `require`: the fetcher behind `agy_usage` is best-effort, and a machine with no
+    # Antigravity install must simply report the provider as `unknown`.
+    "agy": Dep(
+        name="agy",
+        command="agy",
+        env="AGY_BIN",
+        install_hint=(
+            "Install Google's Antigravity CLI (`agy`) and put it on $PATH, or set AGY_BIN "
+            "to its absolute path. Needed only while `agy_usage = true`; with it off, ccc "
+            "never looks for the binary."
+        ),
+    ),
 }

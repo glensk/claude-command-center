@@ -86,6 +86,7 @@ UNMAPPED_INERT: tuple[str, ...] = (
     "verify_subgoals_llm",
     "claude_usage",
     "codex_usage",
+    "agy_usage",
     "auto_switch_on_limit",
 )
 

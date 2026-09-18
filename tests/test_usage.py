@@ -2492,3 +2492,155 @@ def test_refusal_attribution_is_per_home(tmp_path: Path, monkeypatch: pytest.Mon
     snap_b = usage.read_codex_usage(now=_NOW, home=home_b)
     assert snap_a is not None and snap_a.blocked
     assert snap_b is not None and not snap_b.blocked
+
+
+# ── Google Antigravity (`agy`) ────────────────────────────────────────────────
+
+# The live `agy -p /usage --output-format json` shape, captured 2026-09-18. Note
+# `remaining_fraction`: every other meter in this module counts what was SPENT, so the
+# conversion at the parse boundary is the thing these tests exist to pin.
+_AGY_USAGE_JSON = {
+    "conversation_id": "",
+    "status": "SUCCESS",
+    "response": "Gemini Models\tWeekly Limit Remaining\t99%\t2026-09-25T10:07:15Z\n",
+    "num_turns": 0,
+    "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    "command": {
+        "name": "usage",
+        "data": {
+            "description": "Within each group, models share a weekly limit.",
+            "groups": [
+                {
+                    "name": "Gemini Models",
+                    "description": "Models within this group: Gemini Flash, Gemini Pro",
+                    "buckets": [
+                        {
+                            "id": "gemini-weekly",
+                            "name": "Weekly Limit Remaining",
+                            "window": "weekly",
+                            "remaining_fraction": 0.994162380695343,
+                            "reset_time": "2026-09-25T10:07:15Z",
+                        }
+                    ],
+                },
+                {
+                    "name": "Claude and GPT models",
+                    "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+                    "buckets": [
+                        {
+                            "id": "3p-weekly",
+                            "name": "Weekly Limit Remaining",
+                            "window": "weekly",
+                            "remaining_fraction": 1,
+                            "reset_time": "2026-09-25T10:07:35Z",
+                        }
+                    ],
+                },
+            ],
+        },
+    },
+}
+
+
+def test_agy_usage_parses_remaining_fraction_as_used() -> None:
+    """`remaining_fraction` 0.994 is 0.58 % USED — the inversion must happen once, here."""
+    snap = usage._parse_agy_usage(_AGY_USAGE_JSON, _NOW)
+    assert snap is not None
+    gemini = snap.bucket("gemini-weekly")
+    third_party = snap.bucket("3p-weekly")
+    assert gemini is not None and third_party is not None
+    assert gemini.used_percentage == pytest.approx(0.5837619, abs=1e-4)
+    assert third_party.used_percentage == pytest.approx(0.0)
+    assert gemini.group == "Gemini Models"
+    assert gemini.resets_at == int(datetime(2026, 9, 25, 10, 7, 15, tzinfo=UTC).timestamp())
+
+
+def test_agy_usage_rejects_unusable_payloads() -> None:
+    """Anything that cannot yield a bucket is None — never a zero-usage snapshot."""
+    assert usage._parse_agy_usage({"status": "ERROR", "command": {}}, _NOW) is None
+    assert usage._parse_agy_usage({"status": "SUCCESS"}, _NOW) is None
+    assert usage._parse_agy_usage("not a dict", _NOW) is None
+    # A group whose bucket carries no numeric remaining_fraction is skipped, and a
+    # payload of nothing BUT such groups yields no snapshot at all.
+    empty = {"status": "SUCCESS", "command": {"data": {"groups": [{"buckets": [{}]}]}}}
+    assert usage._parse_agy_usage(empty, _NOW) is None
+
+
+def test_agy_usage_roundtrip_and_staleness(monkeypatch: pytest.MonkeyPatch) -> None:
+    snap = usage._parse_agy_usage(_AGY_USAGE_JSON, _NOW)
+    assert snap is not None
+    usage._write_agy_usage(snap)
+    back = usage.read_agy_usage()
+    assert back is not None
+    assert [b.id for b in back.buckets] == ["gemini-weekly", "3p-weekly"]
+    back_bucket = back.bucket("gemini-weekly")
+    snap_bucket = snap.bucket("gemini-weekly")
+    assert back_bucket is not None
+    assert snap_bucket is not None
+    assert back_bucket.used_percentage == pytest.approx(snap_bucket.used_percentage)
+    assert usage.agy_usage_stale(900, now=int(time.time())) is False
+    assert usage.agy_usage_stale(900, now=int(time.time()) + 1000) is True
+
+
+def test_agy_usage_fetch_failures_leave_the_cache_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No binary / bad exit / unparseable output → None, and nothing is written.
+
+    The whole point: a provider we briefly could not measure must degrade to ``unknown``,
+    which the oracle reaches by finding no FRESH snapshot — writing a bogus one instead
+    would let a measurement failure masquerade as data.
+    """
+    monkeypatch.setattr(usage, "_agy_exe", lambda: None)
+    assert usage.fetch_agy_usage(_NOW) is None
+    assert usage.read_agy_usage() is None
+
+    monkeypatch.setattr(usage, "_agy_exe", lambda: "/bin/echo")
+    monkeypatch.setattr(
+        usage.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", "boom"),
+    )
+    assert usage.fetch_agy_usage(_NOW) is None
+    assert usage.read_agy_usage() is None
+
+    monkeypatch.setattr(
+        usage.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "not json", ""),
+    )
+    assert usage.fetch_agy_usage(_NOW) is None
+    assert usage.read_agy_usage() is None
+
+
+def test_agy_usage_fetch_writes_the_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(usage, "_agy_exe", lambda: "/bin/echo")
+    monkeypatch.setattr(
+        usage.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, json.dumps(_AGY_USAGE_JSON), ""),
+    )
+    snap = usage.fetch_agy_usage(_NOW)
+    assert snap is not None
+    assert usage.read_agy_usage() is not None
+
+
+# ── the plain-terminal bar (`ccc quota`) ─────────────────────────────────────
+
+
+def test_ansi_bar_shape_and_thresholds() -> None:
+    """Glyph count follows the percentage; the colour follows the CARD thresholds."""
+    assert usage.ansi_bar(0, width=10, color=False) == "░" * 10
+    assert usage.ansi_bar(100, width=10, color=False) == "█" * 10
+    assert usage.ansi_bar(40, width=10, color=False) == "█" * 4 + "░" * 6
+    # Out-of-range input is clamped, not rendered as an over-long bar.
+    assert usage.ansi_bar(140, width=10, color=False) == "█" * 10
+    assert usage.ansi_bar(-5, width=10, color=False) == "░" * 10
+    # One palette: the bar's fill is exactly what a card at that percentage would use.
+    for pct, expect in (
+        (10.0, usage._FILL_GREEN),
+        (75.0, usage._FILL_ORANGE),
+        (99.0, usage._FILL_RED),
+    ):
+        r, g, b = usage._hex_rgb(expect)
+        assert f"38;2;{r};{g};{b}m" in usage.ansi_bar(pct, width=10)

@@ -66,6 +66,7 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
     copilot_refreshed: bool = False  # routine; deliberately excluded from is_empty()
     claude_refreshed: bool = False  # routine Claude /usage OAuth fetch; excluded from is_empty()
     codex_refreshed: bool = False  # routine live Codex usage fetch; excluded from is_empty()
+    agy_refreshed: bool = False  # routine Antigravity `/usage` fetch; excluded from is_empty()
     resume_spawned: bool = False  # spawned the resume-halted watcher; excluded from is_empty()
     limit_switched: list[str] = field(default_factory=list)  # sessions moved off a capped seat
     temps_swept: int = 0  # orphaned usage temp files reclaimed; excluded from is_empty()
@@ -264,6 +265,10 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
         # Same for each configured CODEX_HOME's live ChatGPT usage endpoint, so the Codex
         # cards do not go stale between Codex turns (throttled per home).
         _refresh_codex_usage(store, cfg, report, dry_run)
+
+        # And the Antigravity account's own weekly meter, so `ccc quota` can rank the
+        # `agy` rung without every consumer paying for a CLI spawn of its own.
+        _refresh_agy_usage(store, cfg, report, dry_run)
 
         # Dispatch armed parked-prompt jobs whose fire time has passed (see park.py).
         _fire_reset_jobs(store, cfg, report, dry_run)
@@ -490,6 +495,31 @@ def _refresh_codex_usage(
         if usage.codex_usage_stale(home, throttle):
             if usage.fetch_codex_usage(home) is not None:
                 report.codex_refreshed = True
+
+
+def _refresh_agy_usage(
+    store: Store, cfg: config.Config, report: DaemonReport, dry_run: bool
+) -> None:
+    """Refresh the cached Google Antigravity quota when it is stale.
+
+    Mirrors :func:`_refresh_copilot_usage` exactly — gated on ``agy_usage``, throttled by
+    ``agy_usage_refresh_sec`` (or the shorter ``agy_usage_refresh_active_sec`` while any
+    job works), mtime-keyed (:func:`usage.agy_usage_stale`). The fetch spends no tokens;
+    what the throttle guards is the ~3 s ``agy`` process spawn. Best-effort: no binary,
+    a timeout or an unparseable answer simply leaves the previous cache standing, which
+    the oracle then ages out into ``unknown`` on its own.
+    """
+    from . import usage
+
+    if not cfg.agy_usage or dry_run:
+        return
+    active = usage.has_active_work(s.status for s in store.list_sessions())
+    throttle = usage.adaptive_interval(
+        cfg.agy_usage_refresh_sec, cfg.agy_usage_refresh_active_sec, active=active
+    )
+    if not usage.agy_usage_stale(throttle):
+        return
+    report.agy_refreshed = usage.fetch_agy_usage() is not None
 
 
 def _fire_reset_jobs(store: Store, cfg: config.Config, report: DaemonReport, dry_run: bool) -> None:

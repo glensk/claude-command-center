@@ -110,6 +110,16 @@ DEFAULTS: dict[str, object] = {
     # chosen budget: 1,900 credits/user/mo, the documented Copilot Business
     # per-user baseline. Set it to whatever your seat is actually allotted.
     "copilot_credit_quota": 1900,
+    # Google Antigravity quota: run the CLI's own `/usage` command (`agy -p /usage
+    # --output-format json`) and cache what it reports, so `ccc quota` can rank the agy
+    # rung the same way it ranks Copilot and the Claude seats. The call spends NO tokens
+    # (`num_turns: 0`) — the cost it guards is the ~3 s process spawn, hence the throttle.
+    # It feeds the `ccc quota` report only; there is no agy usage CARD.
+    "agy_usage": False,  # run `agy -p /usage` to meter the Antigravity account (INERT: off)
+    "agy_usage_refresh_sec": 900,  # min sec between idle agy `/usage` runs
+    # While any job is WORKING/SNOOZED the throttle drops to this shorter "active"
+    # interval; 0 or >= idle disables the speed-up (same contract as the Copilot pair).
+    "agy_usage_refresh_active_sec": 300,  # active-work agy `/usage` throttle (~1/3 of idle)
     # Claude /usage OAuth fetch: keep each account's usage card in step with `claude`'s
     # own /usage (incl. any weekly model-scoped window the status line never carries) by
     # fetching the OAuth usage endpoint out-of-band (reads the CLI's keychain token).
@@ -366,6 +376,7 @@ INERT_DEFAULT_KEYS: tuple[str, ...] = (
     "copilot_usage",  # no `gh` billing calls
     "claude_usage",  # no keychain read / Claude OAuth /usage fetch
     "codex_usage",  # no Codex auth.json read / chatgpt.com usage fetch
+    "agy_usage",  # no `agy` process spawn / Antigravity quota fetch
     "resume_halted",  # no resume watcher / continue-script spawns
     "auto_switch_on_limit",  # no automatic account failover on a rate-limit halt
     "reap",  # never auto-close a stranger's sessions un-asked
@@ -841,6 +852,9 @@ class Config:
     # This guess is used solely when that endpoint is unreachable; 1,900 is the
     # documented Copilot Business per-user baseline.
     copilot_credit_quota: int = 1900
+    agy_usage: bool = False  # run `agy -p /usage` to meter the Antigravity account (INERT: off)
+    agy_usage_refresh_sec: int = 900
+    agy_usage_refresh_active_sec: int = 300
     claude_usage: bool = False  # fetch the Claude /usage OAuth endpoint (INERT: off)
     claude_usage_refresh_sec: int = 600
     claude_usage_refresh_active_sec: int = 200
