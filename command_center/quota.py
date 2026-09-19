@@ -129,8 +129,8 @@ from . import config, seat_rota, usage
 # ``opriv``. Both are normally ``unknown``: Zen publishes no meter of any kind, and the
 # one measurable quantity — what THIS machine spent, read from opencode's own sqlite
 # store — is a spend figure, not an allowance. The priv row therefore carries a
-# ``monthly`` window ONLY when the user has named a cap (``opencode_budget_usd``), and
-# reaching that cap blocks it as LOCAL POLICY (``blocked_by="budget"``), not as provider
+# ``wallet`` window ONLY when the user has named the top-up (``opencode_credit_usd``), and
+# an empty wallet blocks it as LOCAL POLICY (``blocked_by="wallet"``), not as provider
 # exhaustion. A consumer that iterates rows reads them with the usual field set; one
 # that looks providers up by name never sees them.
 # v2 stayed v2 on 2026-09-20 for the Muse Code rung, same reason — ONE NEW ROW: ``providers``
