@@ -1398,17 +1398,32 @@ def fire_attached_in_new_tab(session_id: str) -> bool:
 
 
 def _iterm(command: str) -> bool:
+    """Open an iTerm2 tab (AppleScript) and type *command* into it; False when that failed.
+
+    The created session is PINNED before it is written to (tp#312, 2026-09-19): the old
+    script created the tab and then addressed ``current session of current window``, a
+    focus-relative specifier iTerm2 resolves at write time — a window or tab that gained
+    focus in the millisecond between the two Apple events received the typed command
+    instead (reproduced for the sibling defect tp#302 in ``tp_launch.new_tab``: a 1.2 s
+    focus switch put the marker in the wrong tab). ``set newSession to current session of
+    (create tab …)`` freezes the answer as ``session id "UUID" of tab N of window id W``:
+    the session component is id-keyed, so a tab index that shifts afterwards can only make
+    the write FAIL (-1728 → osascript exit 1 → False → the caller's next launcher rung),
+    never deliver the command to somebody else's tab.
+    """
     # command is already shell-quoted; _as_quote escapes it for the AppleScript "..."
     # literal too, so a cwd/path containing a double-quote can't break out.
     escaped = _as_quote(command)
     script = f'''
     tell application "iTerm2"
         if (count of windows) = 0 then
-            create window with default profile
+            set newSession to current session of (create window with default profile)
         else
-            tell current window to create tab with default profile
+            tell current window
+                set newSession to current session of (create tab with default profile)
+            end tell
         end if
-        tell current session of current window to write text "{escaped}"
+        tell newSession to write text "{escaped}"
         activate
     end tell
     '''

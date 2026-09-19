@@ -288,3 +288,42 @@ def test_probe_launch_prints_only_a_framed_marker(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(config, "load_config", lambda: _cfg("tmux"))
     monkeypatch.setattr(terminal.subprocess, "run", _RunRecorder())
     assert terminal.probe_launch()[1] == terminal.LAUNCHER_TMUX
+
+
+# ------------- the AppleScript tab is pinned, not focus-relative (tp#312) ------------- #
+def test_iterm_writes_to_the_session_it_created_not_the_focused_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tab/window that gains focus between `create tab` and `write text` must not get the line."""
+    scripts: list[str] = []
+
+    def fake_osascript(script: str, _timeout: float = 10) -> str | None:
+        scripts.append(script)
+        return ""
+
+    monkeypatch.setattr(terminal, "_osascript", fake_osascript)
+    assert terminal._iterm("cd '/tmp/re po' && claude") is True
+    script = scripts[0]
+    assert "set newSession to current session of (create window with default profile)" in script
+    assert "set newSession to current session of (create tab with default profile)" in script
+    assert "tell newSession to write text \"cd '/tmp/re po' && claude\"" in script
+    # iTerm2 resolves these at write time — no launch may address a session that way.
+    for phrase in ("current session of current window", "current session of current tab"):
+        assert phrase not in script
+    # The pin is taken before anything is typed, and only then written to.
+    assert script.index("create tab with default profile") < script.index("write text")
+    # A session that vanished anyway fails loudly (osascript exit 1) → the next launcher rung.
+    monkeypatch.setattr(terminal, "_osascript", lambda _s, _timeout=10: None)
+    assert terminal._iterm("echo x") is False
+
+
+def test_iterm_pinned_write_keeps_the_applescript_escaping(monkeypatch: pytest.MonkeyPatch) -> None:
+    scripts: list[str] = []
+
+    def mock_osascript(s: str, _timeout: int = 10) -> str:
+        scripts.append(s)
+        return ""
+
+    monkeypatch.setattr(terminal, "_osascript", mock_osascript)
+    assert terminal._iterm('echo "a\\b"') is True
+    assert r'tell newSession to write text "echo \"a\\b\""' in scripts[0]
