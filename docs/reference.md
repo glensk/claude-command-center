@@ -47,7 +47,7 @@ flags. Grouped by what they do:
 - `ccc new-prompt [-r cat/repo] [-o]` — a prefilled capture file for a future job.
 - `ccc jobs` — list registered future jobs (drafts).
 - `ccc job-account` — per-account usage urgency + which account a new job will bill to (the `job_account` policy).
-- `ccc quota` — cache-first quota oracle: which provider/account still has tokens, and when each blocked one unblocks.
+- `ccc quota` — cache-first quota oracle: which provider/account still has tokens, when each allowance renews, and when each blocked one unblocks.
 - `ccc start-job <id>` / `ccc open-job <id>|--file` — launch a saved job (in place / in a new tab, safe from Obsidian). Prefer `open-job` from scripts and agents: `start-job` execs in place and refuses without a TTY (it opens a tab instead) — see "Terminal guard" below.
 - `ccc done-job` · `ccc delete-job` · `ccc restore-job` · `ccc unlaunch` — the lifecycle: done-without-running / trash / restore / back-to-draft.
 
@@ -2188,7 +2188,7 @@ paid a doomed retry — 300 s of it, because the same-seat OpenCode fallback re-
 already-refused request.
 
 ```commands
-ccc quota                       # human table: provider · state · age · session+week bars · unblocks
+ccc quota                       # human table: provider · state · age · session+week bars · renew
 ccc quota -B                    # the same table without the bars (plain columns)
 ccc quota -j                    # versioned JSON contract (for scripts), schema v2
 ccc quota -p codex-priv         # one provider; exit 0=available 1=blocked 2=unknown
@@ -2232,6 +2232,63 @@ team-first otherwise); `codex-in-claude`'s `_codex_home()`, `codex-review.py` (v
 selector. The `data age` column shows how old each row's governing evidence is
 (`marked <age>` for cooldown/hold rows — the age of the mark, not of quota data).
 
+### The OpenCode Zen rows — `opencode-free (ofree)` and `opencode-priv (opriv)`
+
+Two rungs for one binary: `ofree` runs a free Zen model and costs nothing, `opriv` runs
+whatever `opencode` itself is configured to use and costs money. Both rows are normally
+**`unknown`, and that is the finding, not a gap**: Zen publishes no meter of any kind —
+`/zen/v1/usage`, `/billing`, `/account`, `/me`, `/credits` and `/limits` all 404, the docs
+state no rate limits for either tier, and the prepaid balance is behind an interactive
+console login. `available` in this oracle means headroom PROVEN by fresh authoritative
+data, and "the provider publishes nothing" proves neither capacity nor that the key still
+authenticates. `unknown` fails open, so nothing is lost — the row simply stops claiming
+what was never measured.
+
+What *is* measurable is what **this machine** spent, which opencode records per assistant
+message in its own store (`~/.local/share/opencode/opencode.db`, or `$CCC_OPENCODE_DB`).
+Per message, not per session: `session.cost` is a running total stamped with the session's
+LAST model and LAST activity, so resuming an old conversation would move its whole history
+into this month and file it under whatever model spoke last. The sum matches what
+`opencode stats` prints, to the cent.
+
+That figure is **spend, not an allowance**, so it becomes a bar only once you supply the
+missing half — `opencode_budget_usd`, your own monthly cap (default `0.0` = off; Zen's own
+`$5 → $20` is wallet auto-reload, not a monthly allowance, so there is no honest default
+to pick). With a cap set, the paid row draws one `monthly` bar that renews at 00:00 on the
+1st, and reaching the cap BLOCKS it with `blocked_by="budget"` and a reason that says in
+words whose rule it is: Zen itself would still serve the request. The free row never gets
+a window at all — free replies cost nothing, so a percentage of them is a fraction of
+nothing; its reply count is prose.
+
+Reading the store costs one indexed scan (23 ms warm, 0.2 s cold on a 380 MB store), so
+the result is cached in `opencode_usage.json` and re-read only when that file ages past
+`opencode_usage_refresh_sec` (900) — or when it describes a month that has ended. Every
+failure mode — no file, a lock, a migration, a payload whose shape changed, an unknown
+table — resolves to `unknown` with the reason stated, never to a confident `$0.00`.
+
+These rows are **visibility only**: they add no rung to `ai.py`'s ladder, no
+`_ORACLE_IDS` entry and no TUI usage card. `ccc quota -m opencode-free -u 600` still works
+— a recorded refusal is the one thing that can block the free tier.
+
+### `renew` — by when must I spend this?
+
+The field after the bars answers the question a percentage cannot: **when does this
+allowance come back, and therefore by when is it use-it-or-lose-it?** `renew 2d 12h`,
+coloured by how soon — red under a day, orange under two, green beyond. Every row has it,
+and a row with no renewing allowance says `—` rather than guessing.
+
+It states the row's **longest** horizon (`_RENEW_WINDOWS`: credits, monthly, seven_day,
+and Antigravity's two weeks) and deliberately never the 5-hour session window, which
+renews several times a day and is not something anyone plans around.
+
+It **replaced** the old `unblocks` field rather than joining it — the table is two columns
+narrower than before. That is possible because the two were usually the same fact: a
+window that blocks by being full unblocks exactly when it renews. What is left over is
+kept: a deadline more than an hour from the renewal (a recorded 429, an administrative
+hold, a rota week) is stated in the detail column as `unblocks in 15m`, and a SECOND
+allowance on the same row (`fable_week` beside `seven_day`) carries its own `(renew 5d 2h)`
+beside its percentage, because one field cannot speak for two deadlines.
+
 ### The two usage bars
 
 Every row draws a **session** and a **week** bar, with the percentage embossed inside the
@@ -2245,15 +2302,18 @@ is in `quota.BAR_SPAN_KINDS` has **one** allowance rather than two and gets a si
 across both columns — that is Copilot, whose budget is a month; squeezing a month into the
 "week" cell and leaving "session" blank would describe a provider with two horizons when it
 has one. A slot with no window of its own draws an empty bar reading `0%`, not a dash: both
-say "nothing measured here", but the bar keeps the column's shape.
+say "nothing measured here", but the bar keeps the column's shape. The one exception is a
+kind that declares itself UNMETERED (`quota.BAR_SPAN_EMPTY` — the OpenCode rows): there the
+bar is centred on `unmetered` and drops the percentage, because `0%` would claim a
+measurement that was never possible, which is the opposite of "nothing is published".
 
 **Each bar names its own period.** A percentage is a fraction of an unnamed thing until it
 does: the spanning bars carry `monthly` (Copilot) or `weekly` (Antigravity) centred in
 them, and the two-column rows take the words from their headings instead. When a window is
-actually FULL the bar takes the whole width, turns red, and states the reset inside itself
-— `weekly: resets 2d 18h   100%` — because a row at 100 % has nothing left to compare
-against, so the shape says only "full" and the reset is the one thing still worth the
-space. The `unblocks` column then drops that same reset rather than printing it twice.
+actually FULL the bar takes the whole width and turns red, because a row at 100 % has
+nothing left to compare against and the shape then says only "full". It no longer states
+its own reset: the `renew` field below does that for every row, and a deadline printed in
+two places on the widest row in the table is one place too many.
 
 **The fill scale is the oracle's, not the cards'.** The cards go orange at 66 % and red at
 86 % — an at-a-glance health light. Here a colour that disagrees with the verdict in the

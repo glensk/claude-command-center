@@ -3405,6 +3405,26 @@ _BAR_SPAN_WIDTH = _BAR_CELL_WIDTH * 2 + 1
 # oracle refuses to draw from a measurement failure.
 _QUOTA_STATE_COLOR = {"available": "\033[32m", "blocked": "\033[31m", "disabled": "\033[31m"}
 
+# Windows whose RENEWAL the report states, longest horizon first. `five_hour` is
+# deliberately absent: a session window renews several times a day and nobody plans
+# around it, while a weekly or monthly allowance is use-it-or-lose-it — which is the
+# whole question this field answers ("by when must I spend this?").
+_RENEW_WINDOWS = ("credits", "monthly", "seven_day", "gemini_week", "claudegpt_week")
+# Terminal columns for the renew field. It REPLACES the old 16-column `unblocks` field
+# rather than joining it — the table was already 97 columns wide at COLUMNS=80, so a
+# fourteenth column that says `renew 12d 10h` and absorbs the unblock case makes the
+# report two columns narrower than it was, not fifteen wider.
+_RENEW_WIDTH = 14
+# How soon is soon: under a day is red (spend it today or lose it), under two days
+# orange, anything further green. 208 is the 256-colour orange the usage bars use.
+_RENEW_URGENCY: tuple[tuple[int, str], ...] = ((86400, "\033[31m"), (2 * 86400, "\033[38;5;208m"))
+_RENEW_CALM = "\033[32m"
+# Two reset instants this close are the same EVENT told twice — a 429's retry deadline
+# and the window it was hit on land a few seconds apart, and a weekly window at 100 %
+# unblocks exactly when it renews. Used both to suppress a duplicate `unblocks` note and
+# to decide whether a second window's renewal is worth stating.
+_SAME_RESET_SEC = 3600
+
 # Terminal columns reserved for the ✅/⛔/❔/🚫 mark. The glyphs are double-width emoji,
 # but `_QUOTA_MARK` falls back to a single space for a state it does not know, so the
 # cell is PADDED to this width rather than assumed to be it — otherwise one unrecognised
@@ -3485,22 +3505,23 @@ def _emboss(width: int, *, right: str = "", center: str = "", left: str = "") ->
     return "".join(row)
 
 
-def _quota_bar_cells(prov: dict[str, Any], now: int, *, color: bool) -> tuple[str, set[str], int]:
-    """The row's bar cells, the windows they drew, and the reset they already state.
+def _quota_bar_cells(prov: dict[str, Any], *, color: bool) -> tuple[str, set[str]]:
+    """The row's bar cells and the windows they drew.
 
     Three shapes, most specific first:
 
     1. **An EXHAUSTED window** (fresh, at 100 %) takes the whole width as one red bar
-       embossed ``weekly: resets 1d 2h`` — the period that is gone, and when it comes
-       back. A row at 100 % has nothing left to compare against, so splitting it into two
-       bars spends the width on a shape that says only "full"; the reset is the one thing
-       the reader still needs, so it moves INTO the bar and out of the `unblocks` column
-       (the third return value tells the caller which reset it took, so the column can
-       drop the duplicate).
+       centred on the period that is gone. A row at 100 % has nothing left to compare
+       against, so splitting it into two bars spends the width on a shape that says only
+       "full". It no longer embosses its own reset: the renew field states every row's
+       reset, and a deadline printed in two places on the widest row in the table is one
+       place too many.
     2. **A single-allowance provider** (:data:`quota.BAR_SPAN_KINDS`) spans both columns,
        centred on the period it renews over — `monthly` for Copilot's credit budget,
        `weekly` for Antigravity's. Without that word a percentage is a fraction of an
-       unnamed thing.
+       unnamed thing; where there is no window at all (OpenCode Zen publishes no meter)
+       the word comes from :data:`quota.BAR_SPAN_EMPTY` and the percentage is dropped,
+       because `0%` would claim a measurement nobody made.
     3. **Everything else** fills the session and week slots of :data:`quota.BAR_SLOTS`,
        each labelled with its own period, so one renderer serves every provider.
 
@@ -3512,35 +3533,16 @@ def _quota_bar_cells(prov: dict[str, Any], now: int, *, color: bool) -> tuple[st
 
     windows = prov.get("windows") or {}
 
-    def _reset_label(name: str, win: dict[str, Any], budget: int) -> str:
-        """``weekly: resets 2d 18h``, shortened until it fits *budget* columns.
-
-        The bar is 27 columns wide and the percentage owns four, so the phrase has a hard
-        ceiling and ``monthly`` + a two-digit day count already exceeds it. Rather than
-        truncate mid-word — which is how "12d 10h" became "12d 10" — the candidates give
-        up detail in order: the unit, then the verb, then everything but the period.
-        """
-        horizon = quota.BAR_HORIZON.get(name, "")
-        span = int(win.get("resets_at", 0) or 0) - now
-        if not horizon:
-            return ""
-        if span <= 0:
-            return horizon
-        full = usage._format_age(span)  # noqa: SLF001  # "12d 10h" / "1h 9m" / "45m"
-        coarse = full.split(" ", 1)[0]  # "12d"
-        for candidate in (
-            f"{horizon}: resets {full}",
-            f"{horizon}: resets {coarse}",
-            f"{horizon} {coarse}",
-            horizon,
-        ):
-            if len(candidate) <= budget:
-                return candidate
-        return horizon[:budget]
-
-    def _cell(name: str, width: int, *, center: str = "", left: str = "") -> str:
+    def _cell(
+        name: str, width: int, *, center: str = "", left: str = "", blank: bool = False
+    ) -> str:
         if not name:
-            return usage.ansi_bar(0.0, width=width, color=color, label=_emboss(width, right="0%"))
+            return usage.ansi_bar(
+                0.0,
+                width=width,
+                color=color,
+                label=_emboss(width, right="" if blank else "0%", center=center),
+            )
         win = windows[name]
         pct = float(win.get("used_pct", 0) or 0)
         # A stale figure keeps its bar but loses its colour: it is the last thing we
@@ -3564,19 +3566,27 @@ def _quota_bar_cells(prov: dict[str, Any], now: int, *, color: bool) -> tuple[st
         "",
     )
     if full:
-        # The percentage owns four columns plus the separating space the emboss inserts.
-        budget = _BAR_SPAN_WIDTH - len("100%") - 1
-        cell = _cell(full, _BAR_SPAN_WIDTH, left=_reset_label(full, windows[full], budget))
-        return cell + " ", {full}, int(windows[full].get("resets_at", 0) or 0)
+        cell = _cell(full, _BAR_SPAN_WIDTH, center=quota.BAR_HORIZON.get(full, ""))
+        return cell + " ", {full}
 
     # 2. one allowance, one bar across both columns
-    if str(prov.get("kind", "")) in quota.BAR_SPAN_KINDS:
+    kind = str(prov.get("kind", ""))
+    if kind in quota.BAR_SPAN_KINDS:
         span = next((n for n in quota.BAR_SPAN_WINDOWS if n in windows), "")
-        horizon = quota.BAR_HORIZON.get(span, "")
+        horizon = quota.BAR_HORIZON.get(span, "") or quota.BAR_SPAN_EMPTY.get(kind, "")
+        # `0%` is dropped ONLY for a kind that declares itself unmetered. A provider
+        # that HAS a meter we simply have not read yet (Copilot before its first billing
+        # snapshot) keeps the `0%`: there, zero is a missing measurement of a real
+        # quantity, which is a different statement from "there is nothing to measure".
         return (
-            _cell(span, _BAR_SPAN_WIDTH, center=horizon) + " ",
+            _cell(
+                span,
+                _BAR_SPAN_WIDTH,
+                center=horizon,
+                blank=not span and kind in quota.BAR_SPAN_EMPTY,
+            )
+            + " ",
             {span} if span else set(),
-            0,
         )
 
     # 3. the ordinary session + week pair
@@ -3589,7 +3599,47 @@ def _quota_bar_cells(prov: dict[str, Any], now: int, *, color: bool) -> tuple[st
         # No period label here: these two columns have HEADINGS saying `session` and
         # `week`. Only a spanning bar, which sits under both, has to name its own.
         out.append(_cell(name, _BAR_CELL_WIDTH))
-    return " ".join(out) + " ", drawn, 0
+    return " ".join(out) + " ", drawn
+
+
+def _window_renew(win: dict[str, Any], primary_at: int, now: int) -> str:
+    """`` (renew 5d 2h)`` for a window the renew field does not speak for, else ``""``.
+
+    A row states one renewal in its own field; a SECOND allowance on the same row
+    (`fable_week` beside `seven_day`) has its own deadline, and without this it would be
+    the only percentage in the report with no date attached. "Materially different" is an
+    hour, so a window that merely rounds differently stays quiet.
+    """
+    from . import usage  # pylint: disable=import-outside-toplevel
+
+    at = int(win.get("resets_at", 0) or 0)
+    if at <= now or abs(at - primary_at) <= _SAME_RESET_SEC:
+        return ""
+    return f" (renew {usage._format_age(at - now)})"  # noqa: SLF001
+
+
+def _quota_renew(prov: dict[str, Any], now: int) -> tuple[str, int, str]:
+    """``("renew 2d 12h", <the instant>, <colour>)`` for this row's primary renewal.
+
+    One field per row, from the LONGEST horizon it has (:data:`_RENEW_WINDOWS`) — the
+    allowance that is use-it-or-lose-it. A row with no such window (an unmetered rung, a
+    seat blocked before anything was measured) renews at no knowable time and says so
+    with a dash rather than a guess.
+
+    A window whose reset has already passed is not a renewal in the future; it is a stale
+    reading, and reporting `renew 0m` from one would invite the reader to wait for an
+    event that happened yesterday.
+    """
+    from . import usage  # pylint: disable=import-outside-toplevel
+
+    windows = prov.get("windows") or {}
+    name = next((n for n in _RENEW_WINDOWS if n in windows), "")
+    at = int((windows.get(name) or {}).get("resets_at", 0) or 0) if name else 0
+    if at <= now:
+        return "—", 0, ""
+    span = at - now
+    color = next((c for limit, c in _RENEW_URGENCY if span < limit), _RENEW_CALM)
+    return f"renew {usage._format_age(span)}", at, color  # noqa: SLF001
 
 
 def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branches
@@ -3732,37 +3782,49 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
     head = f"  {'':<{_MARK_WIDTH}} {'provider':<{width}} {'state':<10} {'data age':<{age_w}} "
     if bars:
         head += f"{'session':<{_BAR_CELL_WIDTH}} {'week':<{_BAR_CELL_WIDTH}} "
-    print(head + f"{'unblocks':<16} windows")
+    print(head + f"{'renew':<{_RENEW_WIDTH}} windows")
     for prov in snap["providers"]:
         state = prov["state"]
-        unblocks = (
-            usage.format_reset(prov["resets_at"], now)
-            if prov.get("resets_at")
-            else ("—" if state != quota.AVAILABLE else "")
-        )
         windows = prov.get("windows") or {}
-        cells, drawn, shown_reset = (
-            _quota_bar_cells(prov, now, color=color) if bars else ("", set(), 0)
+        cells, drawn = _quota_bar_cells(prov, color=color) if bars else ("", set())
+        renew, renew_at, renew_color = _quota_renew(prov, now)
+        # An unblock deadline the renew field does NOT already state — a cooldown, a hold,
+        # a rota week. When it IS the same instant (a weekly window at 100 % unblocks when
+        # it renews) the renew field has said it, and saying it twice on the widest row in
+        # the table only costs the reader a comparison to discover they are equal.
+        blocked_at = int(prov.get("resets_at", 0) or 0)
+        unblock_note = (
+            f"unblocks {usage.format_reset(blocked_at, now)}"
+            if blocked_at and abs(blocked_at - renew_at) > _SAME_RESET_SEC
+            else ""
         )
-        # The exhausted-window bar already states this row's reset; printing it again in
-        # `unblocks` would say the same thing twice on the widest row in the table.
-        if shown_reset and shown_reset == int(prov.get("resets_at", 0) or 0):
-            unblocks = ""
         # Only the windows NO bar shows (fable_week, Antigravity's second bucket, a
-        # provider whose window has no slot): a row must state each figure once.
+        # provider whose window has no slot): a row must state each figure once. Such a
+        # window carries its OWN renewal when that differs from the row's primary one —
+        # `fable_week` is a second allowance with a second deadline, and the single renew
+        # field cannot speak for both.
         wins = " ".join(
-            f"{name.replace('_', '')} {win['used_pct']:.0f}%{'(stale)' if win.get('stale') else ''}"
+            f"{name.replace('_', '')} {win['used_pct']:.0f}%"
+            f"{'(stale)' if win.get('stale') else ''}"
+            f"{_window_renew(win, renew_at, now)}"
             for name, win in windows.items()
             if name not in drawn
         )
         mark = _pad_cells(_QUOTA_MARK.get(state, " "), _MARK_WIDTH)
-        detail = wins or prov.get("reason", "")
+        # Whitespace-normalised, not used raw: a reason is free text recorded by whoever
+        # observed the refusal (`ccc quota -m`, a rollout staple, a transcript scan), and
+        # one that arrived with a trailing newline split its row in two — visible only in
+        # `-B`, where the reason is the last thing on the line.
+        reason = " ".join(str(prov.get("reason") or "").split())
+        detail = wins or reason
         # A non-available provider that also has windows used to show ONLY the windows,
         # hiding why it is blocked — and a refusal's windows read as healthy headroom.
-        if wins and state != quota.AVAILABLE and prov.get("reason"):
-            detail = f"{prov['reason']} ({wins})"
-        elif not wins and state != quota.AVAILABLE and prov.get("reason"):
-            detail = prov["reason"]
+        if wins and state != quota.AVAILABLE and reason:
+            detail = f"{reason} ({wins})"
+        elif not wins and state != quota.AVAILABLE and reason:
+            detail = reason
+        if unblock_note:
+            detail = f"{unblock_note} · {detail}" if detail else unblock_note
         if prov.get("email"):
             detail = f"{detail}  [{prov['email']}]" if detail else f"[{prov['email']}]"
         # The name carries the seat's own shell command when that is not the name
@@ -3776,9 +3838,12 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
 
             r, g, b = usage._hex_rgb(accent)  # noqa: SLF001
             shown_name = f"\033[38;2;{r};{g};{b}m{shown_name}\033[0m"
+        shown_renew = f"{renew:<{_RENEW_WIDTH}}"
+        if colorable and renew_color:
+            shown_renew = f"{renew_color}{shown_renew}\033[0m"
         print(
             f"  {mark} {shown_name} {shown_state} {ages[prov['id']]:<{age_w}} "
-            f"{cells}{unblocks:<16} {detail}".rstrip()
+            f"{cells}{shown_renew} {detail}".rstrip()
         )
     if snap["best_claude_account"]:
         best = names.get(snap["best_claude_account"]) or quota.display_id(

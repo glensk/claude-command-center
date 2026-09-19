@@ -120,6 +120,16 @@ DEFAULTS: dict[str, object] = {
     # While any job is WORKING/SNOOZED the throttle drops to this shorter "active"
     # interval; 0 or >= idle disables the speed-up (same contract as the Copilot pair).
     "agy_usage_refresh_active_sec": 300,  # active-work agy `/usage` throttle (~1/3 of idle)
+    # OpenCode Zen: it publishes NO quota or balance API (every /zen/v1 usage endpoint
+    # 404s and the docs state no limits), so the only measurable thing is what THIS
+    # machine spent — read from opencode's own sqlite session store. That is a spend
+    # figure, not an allowance, so it gets a denominator only if you name one:
+    # `opencode_budget_usd` is YOUR monthly cap, 0 = no cap and no bar. A cap that is
+    # reached blocks the `opencode-priv` rung as LOCAL POLICY (Zen would still serve it),
+    # which is exactly why it cannot have a made-up default — Zen's own $5 -> $20 is
+    # wallet auto-reload, not a monthly allowance.
+    "opencode_budget_usd": 0.0,  # monthly USD cap for the opencode-priv rung (0 = off)
+    "opencode_usage_refresh_sec": 900,  # min sec between sqlite re-reads of opencode spend
     # Claude /usage OAuth fetch: keep each account's usage card in step with `claude`'s
     # own /usage (incl. any weekly model-scoped window the status line never carries) by
     # fetching the OAuth usage endpoint out-of-band (reads the CLI's keychain token).
@@ -855,6 +865,12 @@ class Config:
     agy_usage: bool = False  # run `agy -p /usage` to meter the Antigravity account (INERT: off)
     agy_usage_refresh_sec: int = 900
     agy_usage_refresh_active_sec: int = 300
+    # Your own monthly spending cap for OpenCode Zen, in USD. 0 = no cap: the
+    # `opencode-priv` row then reports spend as text and stays `unknown`, because a
+    # figure with no denominator cannot prove headroom. See DEFAULTS for why there is
+    # no plausible-looking default here.
+    opencode_budget_usd: float = 0.0
+    opencode_usage_refresh_sec: int = 900
     claude_usage: bool = False  # fetch the Claude /usage OAuth endpoint (INERT: off)
     claude_usage_refresh_sec: int = 600
     claude_usage_refresh_active_sec: int = 200

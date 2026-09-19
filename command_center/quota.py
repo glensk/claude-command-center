@@ -123,6 +123,16 @@ from . import config, seat_rota, usage
 # occupying a line in every report and a key in every consumer's provider map. A consumer
 # that looks it up now finds nothing, which is the same instruction (do not use it) with
 # none of the noise. Restoring it is one entry in ``providers`` if the tier returns.
+# v2 stayed v2 on 2026-09-19 for the OpenCode Zen rungs, same reason as the Antigravity
+# pair — they are NEW ROWS: ``providers`` gains ``opencode:free`` and ``opencode:priv``,
+# both kind ``opencode``, whose ``command`` fields are the shell aliases ``ofree`` and
+# ``opriv``. Both are normally ``unknown``: Zen publishes no meter of any kind, and the
+# one measurable quantity — what THIS machine spent, read from opencode's own sqlite
+# store — is a spend figure, not an allowance. The priv row therefore carries a
+# ``monthly`` window ONLY when the user has named a cap (``opencode_budget_usd``), and
+# reaching that cap blocks it as LOCAL POLICY (``blocked_by="budget"``), not as provider
+# exhaustion. A consumer that iterates rows reads them with the usual field set; one
+# that looks providers up by name never sees them.
 SCHEMA_VERSION = 2
 
 # Provider states. Only BLOCKED may remove a rung from a ladder; UNKNOWN deliberately
@@ -184,6 +194,24 @@ _AGY_ROWS: tuple[tuple[str, str, str], ...] = (
 # appears — on the `agy` row, until it is given a row of its own here.
 _AGY_WINDOW_NAMES = {bucket: window for _pid, bucket, window in _AGY_ROWS}
 
+# OpenCode Zen is two rungs for the same reason Antigravity is: one command spends
+# money and the other does not, and nothing about them is shared but the binary.
+#
+#   opencode-free  ofree   a free Zen model      — costs nothing, has no published meter
+#   opencode-priv  opriv   opencode's own default — costs money, has no published balance
+#
+# Zen answers 404 on every usage/billing endpoint and documents no rate limits, so
+# NEITHER row can prove headroom and both stay ``unknown`` unless something authoritative
+# says otherwise: a recorded refusal, or the user's own spending cap.
+_OPENCODE_ROWS: tuple[tuple[str, str], ...] = (
+    # (provider id, seat label)
+    ("opencode:free", "free"),
+    ("opencode:priv", "priv"),
+)
+# The spend reading is local and cheap, but a figure from yesterday was taken before a
+# day of calls could have been made — same 24 h reasoning as Copilot and Antigravity.
+_OPENCODE_STALE_AFTER_SEC = 24 * 3600
+
 # ── The report's two bars ────────────────────────────────────────────────────
 #
 # `ccc quota`'s text report draws the SAME two bars the TUI usage cards draw — a session
@@ -220,8 +248,13 @@ BAR_SLOTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # Keyed on the KIND, not on which windows happen to be present, so a row with no figures
 # at all (blocked by an observed 429 before any meter was read) still draws its one empty
 # bar instead of briefly turning into a two-window provider.
-BAR_SPAN_KINDS: tuple[str, ...] = ("copilot", "agy")
-BAR_SPAN_WINDOWS: tuple[str, ...] = ("credits", "gemini_week", "claudegpt_week")
+BAR_SPAN_KINDS: tuple[str, ...] = ("copilot", "agy", "opencode")
+BAR_SPAN_WINDOWS: tuple[str, ...] = ("credits", "gemini_week", "claudegpt_week", "monthly")
+# What a SPANNING bar says when the provider has no window to draw at all. Without it
+# such a row shows an empty bar embossed `0%`, which reads as "nothing spent" when the
+# truth is "nothing is measured" — the opposite claim, and the one that would send a
+# reader to a rung believing it was proven idle.
+BAR_SPAN_EMPTY: dict[str, str] = {"opencode": "unmetered"}
 
 # The word a window's bar is labelled with: WHAT PERIOD this allowance renews on. A bar
 # without it is a percentage of an unnamed thing — "56 %" reads very differently against a
@@ -229,6 +262,7 @@ BAR_SPAN_WINDOWS: tuple[str, ...] = ("credits", "gemini_week", "claudegpt_week")
 # with none is simply left unlabelled rather than guessed at.
 BAR_HORIZON: dict[str, str] = {
     "five_hour": "session",
+    "monthly": "monthly",
     "seven_day": "weekly",
     "gemini_week": "weekly",
     "claudegpt_week": "weekly",
@@ -330,7 +364,16 @@ _CANONICAL_SEAT: dict[str, dict[str, str]] = {
     # spelling differs between the two forms, so the map is empty and only its PRESENCE
     # matters — that is what makes `canonical_id` split the name at all.
     "agy": {},
+    # OpenCode's seats spell the same in both forms (`opencode:free` <-> `opencode-free`);
+    # only the PRESENCE of the kind matters, and that is what makes `canonical_id` split
+    # the name at all.
+    "opencode": {},
 }
+
+# The shell command that opens a rung, where the name does not already say it. Claude's
+# seats follow a rule (`claude:work` -> `cwork`); OpenCode's are two fixed aliases, and
+# a rule invented to cover two cases would just be a lookup table with extra steps.
+_SEAT_COMMANDS = {"opencode:free": "ofree", "opencode:priv": "opriv"}
 
 
 def display_id(pid: str) -> str:
@@ -370,6 +413,8 @@ def seat_command(pid: str) -> str:
     they return "" rather than repeating themselves. The commands themselves live in the
     user's shell configuration; this is only the naming convention they follow.
     """
+    if fixed := _SEAT_COMMANDS.get(pid):
+        return fixed
     kind, _sep, seat = pid.partition(":")
     if kind != "claude" or not seat:
         return ""
@@ -1859,6 +1904,120 @@ def _agy_quotas(now: int, cooldowns: dict[str, dict]) -> list[ProviderQuota]:
     return rows
 
 
+def _opencode_money(amount: float) -> str:
+    """``$0.24`` — a spend figure, always two decimals, always with its currency."""
+    return f"${amount:,.2f}"
+
+
+def _opencode_quotas(now: int, cooldowns: dict[str, dict]) -> list[ProviderQuota]:
+    """The two OpenCode Zen rungs — see :data:`_OPENCODE_ROWS`.
+
+    Both rows are ``unknown`` unless something authoritative says otherwise, and that is
+    the whole design rather than a gap in it. Zen publishes no meter: every usage,
+    billing and balance endpoint 404s, the docs state no rate limits for either tier, and
+    the prepaid balance sits behind an interactive console login. ``available`` in this
+    module means "headroom PROVEN by fresh authoritative data", and "the provider
+    publishes nothing" proves neither capacity nor even that the key still authenticates.
+    ``unknown`` fails open, so no rung is lost — the row simply stops claiming what was
+    never measured.
+
+    What CAN be measured is what this machine spent, which opencode records per assistant
+    message (:func:`usage.read_opencode_usage`). That is a spend figure, not an allowance,
+    so it becomes a bar only once the user supplies the missing half — ``opencode_budget_usd``,
+    their own monthly cap. Reaching that cap BLOCKS the paid rung, and the reason says in
+    words that it is local policy: Zen itself would still serve the request.
+
+    The free row never gets a window at all. Free replies cost nothing, so a percentage
+    of anything would be invented; its spend counter is prose, not a denominator.
+    """
+    snap = usage.read_opencode_usage(now)
+    budget = float(config.load_config().opencode_budget_usd)
+    stale = snap is not None and (snap.captured_at + _OPENCODE_STALE_AFTER_SEC) < now
+    rows: list[ProviderQuota] = []
+    for pid, seat in _OPENCODE_ROWS:
+        free_tier = seat == "free"
+        windows: dict[str, WindowState] = {}
+        if snap is not None and not free_tier and budget > 0:
+            windows["monthly"] = WindowState(
+                name="monthly",
+                used_pct=min(100.0, snap.paid_usd / budget * 100.0),
+                resets_at=snap.month_end,
+                stale=stale,
+                evidence_at=snap.captured_at,
+            )
+        if pid in cooldowns:
+            rows.append(_cooldown_quota(pid, "opencode", cooldowns[pid], windows))
+            continue
+        captured = snap.captured_at if snap is not None else 0
+        if snap is None:
+            rows.append(
+                ProviderQuota(
+                    id=pid,
+                    kind="opencode",
+                    state=UNKNOWN,
+                    reason="opencode store unreadable (missing, locked or migrated)",
+                    source="meter",
+                    account=seat,
+                )
+            )
+            continue
+        if free_tier:
+            rows.append(
+                ProviderQuota(
+                    id=pid,
+                    kind="opencode",
+                    state=UNKNOWN,
+                    reason=(
+                        f"free tier — no published meter "
+                        f"({snap.free_messages} free replies this month)"
+                    ),
+                    source="meter",
+                    captured_at=captured,
+                    account=seat,
+                )
+            )
+            continue
+        spent = _opencode_money(snap.paid_usd)
+        if budget <= 0:
+            rows.append(
+                ProviderQuota(
+                    id=pid,
+                    kind="opencode",
+                    state=UNKNOWN,
+                    reason=(
+                        f"{spent} spent this month — Zen publishes no balance; "
+                        f"set opencode_budget_usd for a bar"
+                    ),
+                    source="meter",
+                    captured_at=captured,
+                    account=seat,
+                )
+            )
+            continue
+        window = windows["monthly"]
+        of_cap = f"{spent} of {_opencode_money(budget)} local monthly cap"
+        rows.append(
+            ProviderQuota(
+                id=pid,
+                kind="opencode",
+                state=BLOCKED if window.exhausted else UNKNOWN,
+                reason=(
+                    f"local monthly cap reached: {of_cap} (Zen itself would still serve)"
+                    if window.exhausted
+                    else f"{of_cap} — a cap is not a balance, Zen publishes none"
+                ),
+                source="meter",
+                windows=windows,
+                blocked_by="budget" if window.exhausted else "",
+                resets_at=snap.month_end if window.exhausted else 0,
+                captured_at=captured,
+                risky=window.risky,
+                account=seat,
+            )
+        )
+    return rows
+
+
 def snapshot(
     *, model: str = "", now: int | None = None, accounts: list[str] | None = None
 ) -> dict[str, Any]:
@@ -1891,6 +2050,7 @@ def snapshot(
         *codex_rows,
         *claude,
         *_agy_quotas(now, cooldowns),
+        *_opencode_quotas(now, cooldowns),
     ]
     best = next((q.id for q in claude if q.state == AVAILABLE), "")
     result: dict[str, Any] = {

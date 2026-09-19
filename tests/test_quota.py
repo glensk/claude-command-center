@@ -18,6 +18,7 @@ import json
 import re
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -969,20 +970,21 @@ def test_quota_report_header_lines_up_with_its_rows(
             seen += cell_len(ch)
         return " "
 
-    for label in ("state", "data age", "session", "week", "unblocks"):
+    spanning = (" copilot ", " agy ", " agy-gpt ", " opencode-free ", " opencode-priv ")
+    for label in ("state", "data age", "session", "week", "renew"):
         col = cell_len(header[: header.index(label)])
         for row in rows:
             # A single-allowance provider draws ONE bar across session+week by design,
             # so those rows legitimately have no field boundary at the `week` heading.
-            if label == "week" and any(name in row for name in (" copilot ", " agy ", " agy-gpt ")):
+            if label == "week" and any(name in row for name in spanning):
                 continue
             # A heading sits at the first column of its field, so the column before it is
             # the separator space on every row.
             assert at_column(row, col - 1) == " ", (label, row)
-            # …and the field itself is non-empty wherever it is always populated
-            # (`unblocks` is blank on an available provider, by design).
-            if label != "unblocks":
-                assert at_column(row, col) != " ", (label, row)
+            # …and the field itself is non-empty on EVERY row: `renew` states a dash when
+            # a row has no renewing allowance, so no column here is ever legitimately
+            # blank (the old `unblocks` field was, which is what hid drift in it).
+            assert at_column(row, col) != " ", (label, row)
 
 
 def test_quota_report_no_bars_flag_restores_the_plain_columns(
@@ -1081,3 +1083,389 @@ def test_a_guessed_denominator_is_shown_but_never_blocks() -> None:
     row = quota._copilot_quota(NOW, {})
     assert row.state == quota.UNKNOWN
     assert row.windows["credits"].used_pct == 100.0
+
+
+# ── OpenCode Zen (`ofree` / `opriv`) ─────────────────────────────────────────
+#
+# The behaviour worth guarding: Zen publishes NO meter, so neither row may ever claim
+# proven headroom, and the one number we do have (local spend) may only block when the
+# USER supplied the denominator. A default budget appearing here would silently remove a
+# working rung the provider would still have served.
+
+
+def _opencode_db(path: Path, messages: list[dict], table: str = "message") -> None:
+    """Write a miniature opencode store: one row per *messages* entry, ms timestamps."""
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    con.execute(
+        f"create table {table} (id text primary key, session_id text, "  # noqa: S608
+        "time_created integer, time_updated integer, data text)"
+    )
+    for index, message in enumerate(messages):
+        con.execute(
+            f"insert into {table} values (?,?,?,?,?)",  # noqa: S608
+            (
+                f"m{index}",
+                "s1",
+                int(message.pop("at", NOW)) * 1000,
+                int(NOW) * 1000,
+                json.dumps(message),
+            ),
+        )
+    con.commit()
+    con.close()
+
+
+def _zen(cost: float, model: str = "glm-5.3-flash", at: int = NOW) -> dict:
+    return {
+        "role": "assistant",
+        "providerID": "opencode",
+        "modelID": model,
+        "cost": cost,
+        "at": at,
+    }
+
+
+def _opencode_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, messages: list[dict], **kw: str
+) -> Path:
+    path = tmp_path / "opencode.db"
+    _opencode_db(path, messages, **kw)
+    monkeypatch.setenv(usage._OPENCODE_DB_ENV, str(path))
+    return path
+
+
+def _opencode_rows(now: int = NOW, cooldowns: dict | None = None) -> dict[str, quota.ProviderQuota]:
+    return {row.id: row for row in quota._opencode_quotas(now, cooldowns or {})}
+
+
+def _budget(monkeypatch: pytest.MonkeyPatch, usd: float) -> None:
+    """Pin `opencode_budget_usd` without writing the user's config file."""
+    from command_center import config
+
+    live = config.load_config()
+    monkeypatch.setattr(config, "load_config", lambda: replace(live, opencode_budget_usd=usd))
+
+
+def test_opencode_ids_round_trip_and_name_their_shell_commands() -> None:
+    """A user must be able to paste either spelling back, and see how to open the rung."""
+    for pid, shown, command in (
+        ("opencode:free", "opencode-free", "ofree"),
+        ("opencode:priv", "opencode-priv", "opriv"),
+    ):
+        assert quota.display_id(pid) == shown
+        assert quota.canonical_id(shown) == pid
+        assert quota.canonical_id(pid) == pid  # already canonical passes through
+        assert quota.seat_command(pid) == command
+
+
+def test_opencode_without_a_store_is_unknown_not_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store we cannot read is a measurement failure — both rungs stay runnable."""
+    monkeypatch.setenv(usage._OPENCODE_DB_ENV, str(tmp_path / "absent.db"))
+    rows = _opencode_rows()
+    assert set(rows) == {"opencode:free", "opencode:priv"}
+    for row in rows.values():
+        assert row.state == quota.UNKNOWN
+        assert "unreadable" in row.reason
+        assert row.windows == {}
+
+
+def test_neither_row_is_ever_available(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`available` means headroom PROVEN. Zen publishes nothing, so it is never earned."""
+    _opencode_store(tmp_path, monkeypatch, [_zen(0.10), _zen(0.0, "muse-spark-1.3-free")])
+    _budget(monkeypatch, 20.0)
+    rows = _opencode_rows()
+    assert [row.state for row in rows.values()] == [quota.UNKNOWN, quota.UNKNOWN]
+
+
+def test_the_free_row_never_gets_a_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Free replies cost nothing, so any percentage would be a fraction of nothing."""
+    _opencode_store(
+        tmp_path,
+        monkeypatch,
+        [_zen(0.0, "muse-spark-1.3-free"), _zen(0.0, "muse-spark-1.3-free")],
+    )
+    _budget(monkeypatch, 20.0)
+    free = _opencode_rows()["opencode:free"]
+    assert free.windows == {}
+    assert "2 free replies" in free.reason
+
+
+def test_spend_without_a_budget_is_prose_not_a_bar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No cap configured: the figure is reported, and it can block nothing."""
+    _opencode_store(tmp_path, monkeypatch, [_zen(3.5), _zen(1.5)])
+    _budget(monkeypatch, 0.0)
+    priv = _opencode_rows()["opencode:priv"]
+    assert priv.windows == {}
+    assert priv.state == quota.UNKNOWN
+    assert "$5.00 spent this month" in priv.reason
+
+
+@pytest.mark.parametrize(
+    ("spent", "state", "pct"),
+    [(5.0, quota.UNKNOWN, 25.0), (19.99, quota.UNKNOWN, 99.95), (20.0, quota.BLOCKED, 100.0)],
+)
+def test_an_explicit_budget_is_the_only_thing_that_can_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spent: float, state: str, pct: float
+) -> None:
+    """Below / just under / at the cap — and the block says whose rule it is."""
+    _opencode_store(tmp_path, monkeypatch, [_zen(spent)])
+    _budget(monkeypatch, 20.0)
+    priv = _opencode_rows()["opencode:priv"]
+    assert priv.state == state
+    assert priv.windows["monthly"].used_pct == pytest.approx(pct)
+    assert priv.windows["monthly"].resets_at == usage.opencode_month_bounds(NOW)[1]
+    if state == quota.BLOCKED:
+        assert priv.blocked_by == "budget"
+        assert "Zen itself would still serve" in priv.reason
+        assert priv.resets_at == usage.opencode_month_bounds(NOW)[1]
+
+
+def test_spend_is_summed_per_message_not_per_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session that ends on a free model still owes what its paid messages cost.
+
+    `session.cost` would attribute the whole session to its LAST model and its LAST
+    activity — so one resumed conversation could move months of spend into this month.
+    """
+    _opencode_store(
+        tmp_path,
+        monkeypatch,
+        [
+            _zen(2.0, "gpt-5.4"),
+            _zen(0.0, "muse-spark-1.3-free"),
+            {"role": "user", "content": "hi", "at": NOW},
+            _zen(1.0, "claude-opus-5", at=NOW - 40 * 86400),  # last month: excluded
+            {"role": "assistant", "providerID": "github-copilot", "cost": 9.0, "at": NOW},
+        ],
+    )
+    _budget(monkeypatch, 20.0)
+    snap = usage.fetch_opencode_usage(NOW)
+    assert snap is not None
+    assert snap.paid_usd == pytest.approx(2.0)  # not 3.0 (last month), not 11.0 (copilot)
+    assert snap.paid_messages == 1
+    assert snap.free_messages == 1
+
+
+def test_an_unrecognised_payload_is_unknown_not_zero_spend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a schema migration, summing a field that is gone would report $0.00 surely."""
+    _opencode_store(tmp_path, monkeypatch, [{"kind": "assistant", "price": 4.0, "at": NOW}])
+    assert usage.fetch_opencode_usage(NOW) is None
+    _budget(monkeypatch, 20.0)
+    assert _opencode_rows()["opencode:priv"].state == quota.UNKNOWN
+
+
+def test_a_table_rename_is_followed_not_reported_as_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store has migrated before; the reader picks the table that has the rows."""
+    path = tmp_path / "opencode.db"
+    _opencode_db(path, [], table="message")  # the old, now-empty table
+    _opencode_db(path, [_zen(7.0)], table="session_message")
+    monkeypatch.setenv(usage._OPENCODE_DB_ENV, str(path))
+    snap = usage.fetch_opencode_usage(NOW)
+    assert snap is not None and snap.paid_usd == pytest.approx(7.0)
+
+
+def test_a_store_with_no_known_table_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    path = tmp_path / "opencode.db"
+    sqlite3.connect(path).execute("create table something_else (id text)")
+    monkeypatch.setenv(usage._OPENCODE_DB_ENV, str(path))
+    assert usage.fetch_opencode_usage(NOW) is None
+
+
+def test_a_cooldown_blocks_the_opencode_row_it_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ccc quota -m opencode-free -u 600` is the only way the free rung goes down."""
+    _opencode_store(tmp_path, monkeypatch, [_zen(1.0)])
+    _budget(monkeypatch, 20.0)
+    quota.record_block(
+        "opencode:free", blocked_until=NOW + 600, reason="zen refused", observed_at=NOW
+    )
+    rows = _opencode_rows(cooldowns=quota.read_cooldowns(NOW))
+    assert rows["opencode:free"].state == quota.BLOCKED
+    assert rows["opencode:free"].source == "cooldown"
+    assert rows["opencode:priv"].state == quota.UNKNOWN  # untouched
+
+
+def test_a_stale_reading_cannot_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A figure older than a day was taken before a day of spending could have happened.
+
+    The reader itself refreshes on a TTL, so the aged snapshot is injected: what is under
+    test is the VERDICT rule, that an over-cap figure nobody re-measured today may show
+    its bar but may not remove the rung.
+    """
+    start, end = usage.opencode_month_bounds(NOW)
+    aged = usage.OpencodeUsage(
+        captured_at=NOW - 2 * 86400,
+        month_start=start,
+        month_end=end,
+        paid_usd=50.0,
+        paid_messages=1,
+        free_messages=0,
+    )
+    monkeypatch.setattr(usage, "read_opencode_usage", lambda *_a, **_k: aged)
+    _budget(monkeypatch, 20.0)
+    priv = _opencode_rows()["opencode:priv"]
+    assert priv.windows["monthly"].used_pct == 100.0
+    assert priv.windows["monthly"].stale is True
+    assert priv.state == quota.UNKNOWN
+
+
+def test_month_bounds_are_local_midnights_and_a_stale_month_is_re_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cached figure from LAST month answers a question nobody asked."""
+    from datetime import datetime
+
+    start, end = usage.opencode_month_bounds(NOW)
+    assert datetime.fromtimestamp(start).day == 1
+    assert datetime.fromtimestamp(start).hour == 0
+    assert datetime.fromtimestamp(end).day == 1
+    assert end > NOW >= start
+
+    _opencode_store(tmp_path, monkeypatch, [_zen(4.0)])
+    usage.fetch_opencode_usage(NOW)
+    # A month later the cache is younger than the TTL but describes a window that ended.
+    later = end + 86400
+    snap = usage.read_opencode_usage(later, refresh_sec=10**9)
+    assert snap is not None
+    assert snap.month_start == usage.opencode_month_bounds(later)[0]
+    assert snap.paid_usd == pytest.approx(0.0)  # the old month's spend is not this month's
+
+
+# ── the report's renew field ─────────────────────────────────────────────────
+#
+# One field per row answering "by when must I spend this?". It REPLACED the old
+# `unblocks` field rather than joining it, so the deadline of a blocked row and the
+# renewal of its allowance can no longer be printed as two separate facts when they are
+# the same instant — which is the case for every window that blocks by being full.
+
+
+def _renew_of(prov: dict, now: int = NOW) -> tuple[str, int, str]:
+    from command_center import cli
+
+    return cli._quota_renew(prov, now)
+
+
+def _window(name: str, resets_in: int, pct: float = 10.0) -> dict:
+    return {"windows": {name: {"used_pct": pct, "resets_at": NOW + resets_in}}}
+
+
+@pytest.mark.parametrize(
+    ("resets_in", "color"),
+    [
+        (3600, "\033[31m"),  # under a day: red, spend it today
+        (86400 - 1, "\033[31m"),
+        (86400, "\033[38;5;208m"),  # exactly a day is no longer "today"
+        (2 * 86400 - 1, "\033[38;5;208m"),
+        (2 * 86400, "\033[32m"),  # exactly two days is calm
+        (9 * 86400, "\033[32m"),
+    ],
+)
+def test_renew_urgency_boundaries(resets_in: int, color: str) -> None:
+    """The colour boundaries are AT 24 h and 48 h, not near them."""
+    text, at, shown = _renew_of(_window("seven_day", resets_in))
+    assert shown == color
+    assert at == NOW + resets_in
+    assert text.startswith("renew ")
+
+
+def test_renew_ignores_the_session_window() -> None:
+    """A 5-hour window renews all day; it is not the allowance you plan around."""
+    assert _renew_of(_window("five_hour", 3600)) == ("—", 0, "")
+
+
+def test_renew_prefers_the_longest_horizon() -> None:
+    """A row with both states its WEEKLY renewal, never its session one."""
+    prov = {
+        "windows": {
+            "five_hour": {"used_pct": 0.0, "resets_at": NOW + 600},
+            "seven_day": {"used_pct": 0.0, "resets_at": NOW + 3 * 86400},
+        }
+    }
+    text, at, _color = _renew_of(prov)
+    assert (text, at) == ("renew 3d 0h", NOW + 3 * 86400)
+
+
+def test_a_past_reset_is_a_dash_not_a_countdown_to_yesterday() -> None:
+    """A stale window's reset already happened; `renew 0m` would invite a pointless wait."""
+    assert _renew_of(_window("seven_day", -3600)) == ("—", 0, "")
+
+
+def test_a_second_allowance_states_its_own_renewal() -> None:
+    """`fable_week` is a second deadline; the single renew field cannot speak for it."""
+    from command_center import cli
+
+    same = {"used_pct": 13.0, "resets_at": NOW + 3 * 86400}
+    assert cli._window_renew(same, NOW + 3 * 86400, NOW) == ""  # same event, stays quiet
+    assert cli._window_renew(same, NOW + 3 * 86400 + 600, NOW) == ""  # within the hour
+    assert cli._window_renew(same, NOW + 6 * 86400, NOW) == " (renew 3d 0h)"
+
+
+def test_the_report_states_a_renewal_for_every_row(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every row carries the field — a dash where there is nothing to renew."""
+    from command_center import cli
+
+    _agy_snapshot(gemini_pct=40.0, third_party_pct=0.0)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    assert cli.cmd_quota(_quota_args()) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "renew" in lines[0] and "unblocks" not in lines[0]
+    rows = [ln for ln in lines[1:] if ln.startswith("  ")]
+    assert rows
+    for row in rows:
+        assert "renew " in row or "—" in row, row
+    # Its weekly bucket, stated as a span. The fixture's clock is not the report's, so
+    # the SHAPE is what matters: a field that always says "—" would pass a laxer check.
+    agy_row = next(ln for ln in rows if " agy " in ln)
+    assert re.search(r"renew \d+d \d+h", agy_row), agy_row
+
+
+def test_a_full_window_states_its_reset_once(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exhausted bar no longer embosses a reset the renew field already prints."""
+    from command_center import cli
+
+    _agy_snapshot(gemini_pct=100.0, third_party_pct=0.0)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    assert cli.cmd_quota(_quota_args()) == 0
+    row = next(
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("  ⛔ agy ")
+    )
+    assert "resets" not in row  # the bar's old embossed label is gone
+    assert row.count("renew") == 1
+    assert "unblocks" not in row  # the block and the renewal are the same instant
+
+
+def test_a_deadline_the_renewal_does_not_cover_is_still_stated(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cooldown that expires before the window renews is a SECOND fact — keep it."""
+    from command_center import cli
+
+    _agy_snapshot(gemini_pct=1.0, third_party_pct=1.0)
+    quota.record_block("agy", blocked_until=int(time.time()) + 900, reason="429", observed_at=0)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    assert cli.cmd_quota(_quota_args()) == 0
+    row = next(
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("  ⛔ agy ")
+    )
+    assert "unblocks in 15m" in row
+    assert "renew" in row

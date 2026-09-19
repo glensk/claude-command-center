@@ -55,13 +55,14 @@ import json
 import os
 import select
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
 
@@ -2907,6 +2908,262 @@ def agy_usage_stale(refresh_sec: float, now: int | None = None) -> bool:
     now = int(time.time()) if now is None else now
     try:
         mtime = _agy_usage_path().stat().st_mtime
+    except OSError:
+        return True
+    return (now - int(mtime)) >= refresh_sec
+
+
+# ── OpenCode Zen (`ofree` / `opriv`) ─────────────────────────────────────────
+#
+# Zen publishes NO meter. Every plausible endpoint — `/zen/v1/usage`, `/billing`,
+# `/account`, `/me`, `/credits`, `/limits` — answers 404 with the marketing page, the
+# docs state no rate limits for either tier, and the prepaid balance lives behind an
+# interactive console login. So there is exactly one measurable quantity: **what this
+# machine spent**, which opencode records itself.
+#
+# It records it per ASSISTANT MESSAGE, in `opencode.db`:
+#
+#     {"role": "assistant", "cost": 0.01716885, "modelID": "gemini-3.7-flash",
+#      "providerID": "opencode", "tokens": {...}, "time": {...}}
+#
+# Per message, not per session, and that is not a detail: `session.cost` is a running
+# total stamped with the session's LAST activity and LAST model, so resuming a March
+# session in September would move its whole history into September's figure and file it
+# under whatever model spoke last. Summing messages avoids both. The all-time sum of
+# this field matches what `opencode stats` itself prints, to the cent, which is how we
+# know it is the same number opencode reports.
+#
+# What comes out is SPEND, never an allowance: a denominator exists only if the user
+# names one (`opencode_budget_usd`). See :func:`quota._opencode_quotas`.
+_OPENCODE_DB_ENV = "CCC_OPENCODE_DB"  # test/override hook for the store's location
+# Message tables opencode is known to keep its conversation in. Both exist in the
+# current schema (`message` holds the rows; `session_message` is present and empty), so
+# the reader picks whichever actually has the newest row instead of pinning one name and
+# silently reporting $0.00 after the next migration.
+_OPENCODE_MESSAGE_TABLES = ("message", "session_message")
+_OPENCODE_SQLITE_TIMEOUT_SEC = 0.5  # busy timeout: a locked store must degrade, not hang
+# Below this, a `time_created` is seconds rather than milliseconds. 1e11 s is year 5138
+# and 1e11 ms is 1973, so nothing real sits near the boundary.
+_OPENCODE_MS_FLOOR = 1e11
+
+
+@dataclass
+class OpencodeUsage:
+    """What this machine spent on OpenCode Zen in the current calendar month."""
+
+    captured_at: int  # Unix epoch seconds when ccc read the store
+    month_start: int  # Unix epoch of 00:00 local on the 1st (the window's start)
+    month_end: int  # Unix epoch of 00:00 local on the 1st of next month (its renewal)
+    paid_usd: float  # summed cost of this month's PAID Zen messages
+    paid_messages: int
+    free_messages: int  # Zen messages that cost nothing (the free tier)
+
+
+def _opencode_db_path() -> Path:
+    """Where opencode keeps its store — ``$CCC_OPENCODE_DB`` wins, then XDG, then ~."""
+    if override := os.environ.get(_OPENCODE_DB_ENV, "").strip():
+        return Path(override).expanduser()
+    base = os.environ.get("XDG_DATA_HOME", "").strip()
+    root = Path(base).expanduser() if base else Path.home() / ".local" / "share"
+    return root / "opencode" / "opencode.db"
+
+
+def _opencode_usage_path() -> Path:
+    return config.app_home() / "opencode_usage.json"
+
+
+def opencode_month_bounds(now: int) -> tuple[int, int]:
+    """``(start, end)`` of *now*'s calendar month in LOCAL time, as epoch seconds.
+
+    Local, because a monthly spend budget is a human month, not a UTC one. Built from
+    naive local datetimes so both ends land on real local midnights across a DST change.
+    """
+    moment = datetime.fromtimestamp(now)
+    start = datetime(moment.year, moment.month, 1)
+    end = datetime(moment.year + (moment.month == 12), moment.month % 12 + 1, 1)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+def _opencode_live_table(con: sqlite3.Connection) -> str | None:
+    """The message table this store writes to, or ``None`` for an unknown schema.
+
+    A schema probe rather than a hard-coded name (the store has migrated before, and
+    `session_message` already exists beside `message`): a candidate must be present and
+    carry the two columns this reader needs, and a NON-EMPTY candidate beats an empty
+    one — which is the whole live/legacy distinction here, since opencode does not keep
+    two populated message tables at once.
+
+    Emptiness is probed with ``limit 1``, never ``max(time_created)``: that column has no
+    index of its own, so asking for its maximum SCANS the table — which was most of the
+    0.4 s this reader used to cost, spent on choosing between two names.
+    """
+    present = {
+        str(row[0]) for row in con.execute("select name from sqlite_master where type='table'")
+    }
+    fallback: str | None = None
+    for name in _OPENCODE_MESSAGE_TABLES:
+        if name not in present:
+            continue
+        columns = {str(row[1]) for row in con.execute(f"pragma table_info('{name}')")}
+        if not {"data", "time_created"} <= columns:
+            continue
+        if con.execute(f"select 1 from {name} limit 1").fetchone():  # noqa: S608
+            return name
+        fallback = fallback or name
+    # Every candidate is empty: still a readable store with zero spend this month, not
+    # an unsupported schema.
+    return fallback
+
+
+def _opencode_sum(con: sqlite3.Connection, table: str, floor: int) -> tuple[float, int, int] | None:
+    """``(paid USD, paid messages, free messages)`` since *floor*, or ``None``.
+
+    ``None`` means the rows were readable but UNRECOGNISABLE — a payload that no longer
+    carries a `role` at all. Summing a field a migration removed would report $0.00 with
+    total confidence, which is the one answer worse than admitting we do not know.
+    """
+    paid = free = rows = shaped = 0
+    paid_usd = 0.0
+    for (blob,) in con.execute(
+        f"select data from {table} where time_created >= ?",  # noqa: S608
+        (floor,),
+    ):
+        rows += 1
+        try:
+            data = json.loads(blob)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(data, dict) or "role" not in data:
+            continue
+        # Counted before the provider filter: it is the evidence that this payload is
+        # still a shape we know how to read.
+        shaped += 1
+        if data.get("providerID") != "opencode" or data.get("role") != "assistant":
+            continue
+        try:
+            cost = float(data.get("cost") or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        # Positive cost IS the definition of paid: the `-free` suffix is a naming
+        # convention Zen rotates, and a model that billed nothing billed nothing.
+        if cost > 0:
+            paid += 1
+            paid_usd += cost
+        else:
+            free += 1
+    return None if rows and not shaped else (paid_usd, paid, free)
+
+
+def fetch_opencode_usage(now: int | None = None) -> OpencodeUsage | None:
+    """Read this month's Zen spend out of opencode's store and cache it.
+
+    Read-only in every sense the store can express (`mode=ro` URI, `query_only`, a busy
+    timeout), and it NEVER raises: a missing file, a lock, a migration mid-flight or
+    malformed JSON all return ``None`` and leave the previous cache alone, because a
+    provider we briefly could not measure must degrade to ``unknown``, never to blocked.
+    """
+    now = int(time.time()) if now is None else now
+    path = _opencode_db_path()
+    if not path.is_file():
+        return None
+    start, end = opencode_month_bounds(now)
+    try:
+        con = sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True, timeout=_OPENCODE_SQLITE_TIMEOUT_SEC
+        )
+    except sqlite3.Error:
+        return None
+    try:
+        con.execute("pragma query_only=1")
+        table = _opencode_live_table(con)
+        if table is None:
+            return None
+        # The column has been milliseconds for as long as ccc has read it, but a unit
+        # change would silently select EVERY row (or none), so the bound is scaled to
+        # what the data actually is — one row read by rowid, not a max() scan.
+        sample = con.execute(
+            f"select time_created from {table} order by rowid desc limit 1"  # noqa: S608
+        ).fetchone()
+        newest = int((sample or (0,))[0] or 0)
+        floor = int(start * 1000) if newest >= _OPENCODE_MS_FLOOR else start
+        totals = _opencode_sum(con, table, floor)
+        if totals is None:  # rows we could read but not recognise — see the helper
+            return None
+        paid_usd, paid, free = totals
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+    finally:
+        con.close()
+    snap = OpencodeUsage(
+        captured_at=now,
+        month_start=start,
+        month_end=end,
+        paid_usd=round(paid_usd, 6),
+        paid_messages=paid,
+        free_messages=free,
+    )
+    _write_opencode_usage(snap)
+    return snap
+
+
+def _write_opencode_usage(snap: OpencodeUsage) -> None:
+    path = _opencode_usage_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _flock(path.with_name(path.name + ".lock")):
+            _atomic_write_json(path, asdict(snap))
+    except OSError:
+        pass
+
+
+def _load_opencode_cache() -> OpencodeUsage | None:
+    data = _load_json_dict(_opencode_usage_path())
+    if data is None:
+        return None
+    try:
+        return OpencodeUsage(
+            captured_at=int(data.get("captured_at", 0) or 0),
+            month_start=int(data.get("month_start", 0) or 0),
+            month_end=int(data.get("month_end", 0) or 0),
+            paid_usd=float(data.get("paid_usd", 0) or 0),
+            paid_messages=int(data.get("paid_messages", 0) or 0),
+            free_messages=int(data.get("free_messages", 0) or 0),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def read_opencode_usage(
+    now: int | None = None, refresh_sec: float | None = None
+) -> OpencodeUsage | None:
+    """This month's Zen spend, from cache, re-reading the store when that has aged out.
+
+    Unlike every other provider here the source is a LOCAL file, so the refresh needs no
+    daemon and no opt-in switch: it costs one indexed sqlite scan (23 ms on a 380 MB
+    store, against the oracle's ~70 ms budget), and the cache keeps even that off the
+    common path. A cached snapshot from LAST month is always re-read, whatever the TTL
+    says — its window has ended, so its figures answer a question nobody asked.
+    """
+    now = int(time.time()) if now is None else now
+    if refresh_sec is None:
+        refresh_sec = float(config.load_config().opencode_usage_refresh_sec)
+    cached = _load_opencode_cache()
+    month_start, _end = opencode_month_bounds(now)
+    fresh = (
+        cached is not None
+        and cached.month_start == month_start
+        and not opencode_usage_stale(refresh_sec, now)
+    )
+    if fresh:
+        return cached
+    return fetch_opencode_usage(now) or cached
+
+
+def opencode_usage_stale(refresh_sec: float, now: int | None = None) -> bool:
+    """True if the spend cache is missing or older than ``refresh_sec`` (mtime-based)."""
+    now = int(time.time()) if now is None else now
+    try:
+        mtime = _opencode_usage_path().stat().st_mtime
     except OSError:
         return True
     return (now - int(mtime)) >= refresh_sec
