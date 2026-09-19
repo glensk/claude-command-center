@@ -3409,7 +3409,7 @@ _QUOTA_STATE_COLOR = {"available": "\033[32m", "blocked": "\033[31m", "disabled"
 # deliberately absent: a session window renews several times a day and nobody plans
 # around it, while a weekly or monthly allowance is use-it-or-lose-it — which is the
 # whole question this field answers ("by when must I spend this?").
-_RENEW_WINDOWS = ("credits", "monthly", "seven_day", "gemini_week", "claudegpt_week")
+_RENEW_WINDOWS = ("credits", "seven_day", "gemini_week", "claudegpt_week")
 # Terminal columns for the renew field. It REPLACES the old 16-column `unblocks` field
 # rather than joining it — the table was already 97 columns wide at COLUMNS=80, so a
 # fourteenth column that says `renew 12d 10h` and absorbs the unblock case makes the
@@ -3623,26 +3623,52 @@ def _quota_renew(prov: dict[str, Any], now: int) -> tuple[str, int, str]:
 
     One field per row, from the LONGEST horizon it has (:data:`_RENEW_WINDOWS`) — the
     allowance that is use-it-or-lose-it. A row with no such window (an unmetered rung, a
-    seat blocked before anything was measured) renews at no knowable time and says so
-    with a dash rather than a guess.
+    prepaid wallet, a seat blocked before anything was measured) renews at no knowable
+    time and says so with a dash rather than a guess.
 
     A window whose reset has already passed is not a renewal in the future; it is a stale
     reading, and reporting `renew 0m` from one would invite the reader to wait for an
     event that happened yesterday.
+
+    **The colour marks an opportunity, not a countdown.** Red and orange mean "there is
+    allowance here that expires soon, spend it"; a row with nothing left to spend gets
+    the same date in plain text, because urgency about a quota you have already used is
+    noise — waiting is all you can do, and the figure is good news, not a warning. So the
+    colour is dropped for a BLOCKED row and for a window past :data:`quota._RISKY_PCT`
+    (the same 90 % this module already calls "nearly spent"); everything below that keeps
+    the red / orange / green scale.
     """
-    from . import usage  # pylint: disable=import-outside-toplevel
+    from . import quota, usage  # pylint: disable=import-outside-toplevel
 
     windows = prov.get("windows") or {}
     name = next((n for n in _RENEW_WINDOWS if n in windows), "")
-    at = int((windows.get(name) or {}).get("resets_at", 0) or 0) if name else 0
+    window = windows.get(name) or {} if name else {}
+    at = int(window.get("resets_at", 0) or 0)
+    # No renewing window, but the row is held until a known instant (a recorded 429, a
+    # hold, a rota week): that deadline IS when this rung comes back, which is the
+    # question the field asks. Falling back to it is what lets an unmetered rung — the
+    # free tier, whose refusal carries a deadline only a human can read off the TUI —
+    # state a real countdown instead of a dash.
+    if at <= now:
+        at = int(prov.get("resets_at", 0) or 0)
     if at <= now:
         return "—", 0, ""
     span = at - now
-    color = next((c for limit, c in _RENEW_URGENCY if span < limit), _RENEW_CALM)
+    worth_spending = (
+        prov.get("state") != quota.BLOCKED
+        and float(window.get("used_pct", 0) or 0) < quota._RISKY_PCT  # noqa: SLF001
+    )
+    color = (
+        next((c for limit, c in _RENEW_URGENCY if span < limit), _RENEW_CALM)
+        if worth_spending
+        else ""
+    )
     return f"renew {usage._format_age(span)}", at, color  # noqa: SLF001
 
 
-def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branches
+def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
+    args: argparse.Namespace,
+) -> int:
     """Fast, cache-first quota oracle — which provider/account still has tokens.
 
     Reads only the snapshots ccc already maintains (~70 ms, no network) so any agent or
@@ -3712,6 +3738,42 @@ def cmd_quota(args: argparse.Namespace) -> int:  # pylint: disable=too-many-bran
             outcome = "not cleared (no observed block; holds need a plain -c)"
         print(f"quota: {quota.display_id(target)} {outcome}")
         return 0
+
+    if args.credit is not None:
+        if args.credit < 0:
+            print("quota: -C/--credit takes a balance in USD, not a negative", file=sys.stderr)
+            return 2
+        # Deliberately NOT named `snap`: that name belongs to the quota snapshot below,
+        # and a shadow here typed the whole rest of the function as a usage record.
+        recorded = usage.record_opencode_credit(args.credit, now)
+        wallet = config.load_config().opencode_credit_usd
+        shown = f"${args.credit:,.2f}"
+        tail = f" of ${wallet:,.2f}" if wallet > 0 else " (set opencode_credit_usd for a bar)"
+        spent = recorded.paid_usd_since_credit if recorded is not None else 0.0
+        print(f"quota: opencode-priv balance recorded as {shown}{tail}")
+        if spent:
+            print(f"       ${spent:,.2f} already spent here since that instant")
+        return 0
+
+    if args.probe:
+        ok, detail = usage.probe_opencode_free()
+        # An inconclusive probe records NOTHING: overwriting a real verdict with "we
+        # could not tell" would turn a slow network into a blocked rung.
+        if ok is not None:
+            usage.record_opencode_probe(ok, detail, now)
+        if ok is None:
+            print(f"quota: opencode-free inconclusive — {detail}")
+            return quota.EXIT_UNKNOWN
+        if ok:
+            print("quota: opencode-free served a request — the free tier is up")
+            return quota.EXIT_AVAILABLE
+        print(f"quota: opencode-free refused — {detail}")
+        print(
+            "       Zen states no reset time anywhere a script can read; the opencode TUI "
+            'shows one\n       ("retrying in 9h 53m"). Record it with: '
+            "ccc quota -m opencode-free -u <seconds>"
+        )
+        return quota.EXIT_BLOCKED
 
     if args.refresh:
         for label in config.claude_config_dirs():
@@ -6004,6 +6066,21 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "--observed-only",
         action="store_true",
         help="with -c: clear only an observed block, never a hold (the success-path mode)",
+    )
+    p_quota.add_argument(
+        "-C",
+        "--credit",
+        type=float,
+        metavar="USD",
+        help="record the OpenCode Zen balance you just read in the console; the row then "
+        "nets this machine's spend off it (Zen exposes no balance API)",
+    )
+    p_quota.add_argument(
+        "-P",
+        "--probe",
+        action="store_true",
+        help="ask the OpenCode free tier for one reply and record whether it was served "
+        "(the only meter it has; takes seconds, never runs on its own)",
     )
     p_quota.set_defaults(func=cmd_quota)
 

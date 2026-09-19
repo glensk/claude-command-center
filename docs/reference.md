@@ -2199,6 +2199,8 @@ ccc quota -m copilot -u 272848 -R "429 quota exceeded"   # record an authoritati
 ccc quota -m codex-work -H -U 2026-09-07T00:00 -R "team seat reserved"  # administrative HOLD
 ccc quota -c copilot            # clear a block (also the only way to lift a hold)
 ccc quota -c claude-priv -O     # observed-only clear: lifts a rejection, never a hold
+ccc quota -C 15                 # record the OpenCode Zen balance you read in the console
+ccc quota -P                    # ask the OpenCode free tier for one reply (its only meter)
 ```
 
 ### Two vocabularies: what you read and what machines key on
@@ -2234,52 +2236,98 @@ selector. The `data age` column shows how old each row's governing evidence is
 
 ### The OpenCode Zen rows — `opencode-free (ofree)` and `opencode-priv (opriv)`
 
-Two rungs for one binary: `ofree` runs a free Zen model and costs nothing, `opriv` runs
-whatever `opencode` itself is configured to use and costs money. Both rows are normally
-**`unknown`, and that is the finding, not a gap**: Zen publishes no meter of any kind —
-`/zen/v1/usage`, `/billing`, `/account`, `/me`, `/credits` and `/limits` all 404, the docs
-state no rate limits for either tier, and the prepaid balance is behind an interactive
-console login. `available` in this oracle means headroom PROVEN by fresh authoritative
-data, and "the provider publishes nothing" proves neither capacity nor that the key still
-authenticates. `unknown` fails open, so nothing is lost — the row simply stops claiming
-what was never measured.
+Two rungs for one binary, sharing nothing but the executable: `ofree` runs a free Zen
+model and costs nothing, `opriv` runs whatever `opencode` itself is configured to use and
+spends a prepaid wallet.
 
-What *is* measurable is what **this machine** spent, which opencode records per assistant
-message in its own store (`~/.local/share/opencode/opencode.db`, or `$CCC_OPENCODE_DB`).
-Per message, not per session: `session.cost` is a running total stamped with the session's
-LAST model and LAST activity, so resuming an old conversation would move its whole history
-into this month and file it under whatever model spoke last. The sum matches what
-`opencode stats` prints, to the cent.
+**Zen publishes no meter, and that is researched rather than assumed** (2026-09-19):
+`/zen/v1/{usage,billing,account,me,credits,limits}` all 404, `/zen/go/v1/usage` exists but
+answers `403 EntitlementError: OpenCode Go subscription required` to a pay-as-you-go key,
+the docs state no rate limits for either tier, and upstream has four open requests for a
+balance endpoint (anomalyco/opencode#10447, #10448, #16017, #44189). The prepaid balance
+lives in the web console behind an interactive login. The only balance signal an API key
+ever sees is the `Insufficient balance` error you get at $0.
 
-That figure is **spend, not an allowance**, so it becomes a bar only once you supply the
-missing half — `opencode_budget_usd`, your own monthly cap (default `0.0` = off; Zen's own
-`$5 → $20` is wallet auto-reload, not a monthly allowance, so there is no honest default
-to pick). With a cap set, the paid row draws one `monthly` bar that renews at 00:00 on the
-1st, and reaching the cap BLOCKS it with `blocked_by="budget"` and a reason that says in
-words whose rule it is: Zen itself would still serve the request. The free row never gets
-a window at all — free replies cost nothing, so a percentage of them is a fraction of
-nothing; its reply count is prose.
+So each row is metered by the only evidence that exists for it.
 
-Reading the store costs one indexed scan (23 ms warm, 0.2 s cold on a 380 MB store), so
-the result is cached in `opencode_usage.json` and re-read only when that file ages past
-`opencode_usage_refresh_sec` (900) — or when it describes a month that has ended. Every
-failure mode — no file, a lock, a migration, a payload whose shape changed, an unknown
-table — resolves to `unknown` with the reason stated, never to a confident `$0.00`.
+**`opencode-priv` — a wallet, not a period.** It is reconstructed from two halves: the
+balance **you** read off the console and record with `ccc quota -C 15`, minus what this
+machine has spent since that instant. Spend comes from opencode's own store
+(`~/.local/share/opencode/opencode.db`, or `$CCC_OPENCODE_DB`), summed **per assistant
+message** — never `session.cost`, which is a running total stamped with the session's LAST
+model and LAST activity, so resuming an old conversation would move its whole history into
+today and file it under whatever model spoke last. The all-time sum matches `opencode
+stats` to the cent.
 
-These rows are **visibility only**: they add no rung to `ai.py`'s ladder, no
-`_ORACLE_IDS` entry and no TUI usage card. `ccc quota -m opencode-free -u 600` still works
-— a recorded refusal is the one thing that can block the free tier.
+```
+❔ opencode-priv (opriv) unknown  0m  ███████░balance░░░░░░░░░25% —   ≈$15.00 of $20.00 left
+                                                                     — $15.00 read 14m ago
+                                                                     − $0.00 spent here since
+```
+
+Both halves are stated because the second is a **lower bound**: spend from another machine
+is invisible here, and on the store this was built against it accounted for roughly half
+the real burn. That is exactly why the anchor exists — the row starts from a number a human
+read and only infers the delta. With no anchor it falls back to all-time local spend
+against the top-up and says `≤` instead of `≈`. `opencode_credit_usd` is the top-up size
+(the bar's denominator, `0` = no bar); there is no honest default, because Zen's own
+`$5 → $20` is wallet auto-reload, not an allowance.
+
+The row **has no renewal** — a wallet refills when money is added, never on a clock — so
+its window is named `wallet`, is absent from `_RENEW_WINDOWS`, and the renew field shows
+`—`. It stays `unknown` until the wallet is provably empty: headroom reconstructed from a
+human reading plus an incomplete delta cannot *prove* anything, and `available` would be a
+guess wearing a verdict's clothes. An empty wallet is a real block (`blocked_by="wallet"`).
+
+**`opencode-free` — ask it.** The free tier has no meter either, but it can be
+interrogated: `ccc quota -P` sends one free request and records whether Zen served it. A
+success is the one thing in this oracle that makes an unmetered rung `available` — it is
+not an inference, it is the provider doing the thing. A refusal is `blocked` in the
+provider's own words.
+
+The probe **streams** the CLI's output and stops at the first decisive line, because a
+spent tier does not fail fast: `opencode run` enters its own retry schedule and sits there
+(the answer arrives in ~4 s, but the process keeps going for minutes). It runs in a stable
+scratch directory under the app home — opencode initialises its working directory as a
+project, and in a fresh temp directory that init swallowed the whole timeout. A verdict
+governs for `opencode_probe_ttl_sec` (1 h) and then ages to `unknown`: the free tier turns
+over faster than a day.
+
+**The refusal carries no reset a script can read.** The opencode TUI renders one
+(`Free usage exceeded, subscribe to Go [retrying in 9h 53m attempt #1]`) but nothing
+writes it to stdout, the logs or the store, and the HTTP API refuses free models outright
+(`403 FreeTierError: free tier can only be used from within OpenCode`). Rather than invent
+a plausible number, the row says so — and a countdown you read off the TUI is recorded the
+same way any other observed deadline is:
+
+```commands
+ccc quota -P                                    # is the free tier up right now?
+ccc quota -m opencode-free -u 35580 -R "free usage exceeded (TUI: 9h 53m)"
+ccc quota -C 15                                 # the balance you just read in the console
+```
+
+These rows are **visibility only**: no rung in `ai.py`'s ladder, no `_ORACLE_IDS` entry, no
+TUI usage card.
 
 ### `renew` — by when must I spend this?
 
 The field after the bars answers the question a percentage cannot: **when does this
-allowance come back, and therefore by when is it use-it-or-lose-it?** `renew 2d 12h`,
-coloured by how soon — red under a day, orange under two, green beyond. Every row has it,
-and a row with no renewing allowance says `—` rather than guessing.
+allowance come back, and therefore by when is it use-it-or-lose-it?** `renew 2d 12h`.
+Every row has it, and a row with nothing to renew says `—` rather than guessing.
 
-It states the row's **longest** horizon (`_RENEW_WINDOWS`: credits, monthly, seven_day,
-and Antigravity's two weeks) and deliberately never the 5-hour session window, which
-renews several times a day and is not something anyone plans around.
+It states the row's **longest** horizon (`_RENEW_WINDOWS`: credits, seven_day and
+Antigravity's two weeks) and deliberately never the 5-hour session window, which renews
+several times a day and is not something anyone plans around. A row with no renewing
+window but a known deadline — a recorded 429, a hold, a rota week, the free tier's
+refusal — shows that instead, because it is the same question: when does this rung come
+back?
+
+**The colour marks an opportunity, not a countdown.** Red under a day, orange under two,
+green beyond — but only where there is allowance left to lose. A `blocked` row, or one
+past `quota._RISKY_PCT` (90 %, this module's own "nearly spent" line), keeps the same date
+in plain text. Shouting about a quota you have already used is noise: waiting is all you
+can do with it, and the colour is needed by the rows that really do have something about
+to expire.
 
 It **replaced** the old `unblocks` field rather than joining it — the table is two columns
 narrower than before. That is possible because the two were usually the same fact: a
@@ -2303,9 +2351,10 @@ across both columns — that is Copilot, whose budget is a month; squeezing a mo
 "week" cell and leaving "session" blank would describe a provider with two horizons when it
 has one. A slot with no window of its own draws an empty bar reading `0%`, not a dash: both
 say "nothing measured here", but the bar keeps the column's shape. The one exception is a
-kind that declares itself UNMETERED (`quota.BAR_SPAN_EMPTY` — the OpenCode rows): there the
-bar is centred on `unmetered` and drops the percentage, because `0%` would claim a
-measurement that was never possible, which is the opposite of "nothing is published".
+kind that declares itself UNMETERED (`quota.BAR_SPAN_EMPTY` — an OpenCode row with nothing
+measured): there the bar is centred on `unmetered` and drops the percentage, because `0%`
+would claim a measurement that was never possible, which is the opposite of "nothing is
+published".
 
 **Each bar names its own period.** A percentage is a fraction of an unnamed thing until it
 does: the spanning bars carry `monthly` (Copilot) or `weekly` (Antigravity) centred in

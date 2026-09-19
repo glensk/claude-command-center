@@ -249,7 +249,7 @@ BAR_SLOTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # at all (blocked by an observed 429 before any meter was read) still draws its one empty
 # bar instead of briefly turning into a two-window provider.
 BAR_SPAN_KINDS: tuple[str, ...] = ("copilot", "agy", "opencode")
-BAR_SPAN_WINDOWS: tuple[str, ...] = ("credits", "gemini_week", "claudegpt_week", "monthly")
+BAR_SPAN_WINDOWS: tuple[str, ...] = ("credits", "gemini_week", "claudegpt_week", "wallet")
 # What a SPANNING bar says when the provider has no window to draw at all. Without it
 # such a row shows an empty bar embossed `0%`, which reads as "nothing spent" when the
 # truth is "nothing is measured" — the opposite claim, and the one that would send a
@@ -262,7 +262,10 @@ BAR_SPAN_EMPTY: dict[str, str] = {"opencode": "unmetered"}
 # with none is simply left unlabelled rather than guessed at.
 BAR_HORIZON: dict[str, str] = {
     "five_hour": "session",
-    "monthly": "monthly",
+    # Not a period: a prepaid wallet renews when money is added, never on a clock. The
+    # word still belongs in the bar, because "37 %" of an unnamed thing is unreadable —
+    # it just names a POT rather than a horizon.
+    "wallet": "balance",
     "seven_day": "weekly",
     "gemini_week": "weekly",
     "claudegpt_week": "weekly",
@@ -1909,112 +1912,183 @@ def _opencode_money(amount: float) -> str:
     return f"${amount:,.2f}"
 
 
+def _opencode_free_row(pid: str, snap: usage.OpencodeUsage | None, now: int) -> ProviderQuota:
+    """The free rung, whose only evidence is whether Zen last SERVED a request.
+
+    Zen publishes no meter for the free tier — the docs state no limits at all — so the
+    honest question is not "how much is left" but "does it answer right now", and one
+    free request answers it outright. A fresh success is the only thing in this module
+    that can make an unmetered rung ``available``: it is not an inference, it is the
+    provider doing the thing.
+
+    A refusal is ``blocked`` with NO reset: the deadline exists (the TUI renders
+    "Free usage exceeded … retrying in 9h 53m") but the CLI never writes it anywhere a
+    script can read, so the row states the refusal and leaves the clock to a human
+    (`ccc quota -m opencode-free -u <sec>` records what the TUI showed). Inventing a
+    plausible-looking reset would be the one thing worse than admitting there is none.
+
+    An old verdict is ``unknown``, not sticky: the free tier can flip within the hour.
+    """
+    ttl = float(config.load_config().opencode_probe_ttl_sec)
+    probe = snap.probe if snap is not None else None
+    replies = f"{snap.free_messages} replies here all-time" if snap is not None else ""
+    if probe is None:
+        return ProviderQuota(
+            id=pid,
+            kind="opencode",
+            state=UNKNOWN,
+            reason=f"free tier — no published meter; ask it with `ccc quota -P` ({replies})"
+            if replies
+            else "free tier — no published meter; ask it with `ccc quota -P`",
+            source="meter",
+            captured_at=snap.captured_at if snap is not None else 0,
+            account="free",
+        )
+    age = usage._format_age(max(0, now - probe.at))  # noqa: SLF001
+    if (probe.at + ttl) < now:
+        return ProviderQuota(
+            id=pid,
+            kind="opencode",
+            state=UNKNOWN,
+            reason=(
+                f"last probe {age} ago: {'served' if probe.ok else 'refused'} — "
+                f"stale, the free tier turns over faster than that"
+            ),
+            source="probe",
+            captured_at=probe.at,
+            account="free",
+        )
+    if probe.ok:
+        return ProviderQuota(
+            id=pid,
+            kind="opencode",
+            state=AVAILABLE,
+            reason="",
+            source="probe",
+            captured_at=probe.at,
+            account="free",
+            note=f"served a free request {age} ago",
+        )
+    return ProviderQuota(
+        id=pid,
+        kind="opencode",
+        state=BLOCKED,
+        reason=(
+            f"{probe.detail or 'free tier refused'} (probed {age} ago) — Zen states no "
+            f"reset; record the TUI's countdown with `ccc quota -m opencode-free -u SEC`"
+        ),
+        source="probe",
+        blocked_by="free-tier",
+        captured_at=probe.at,
+        account="free",
+        risky=True,
+    )
+
+
+def _opencode_priv_row(pid: str, snap: usage.OpencodeUsage | None, now: int) -> ProviderQuota:
+    """The paid rung: a PREPAID WALLET, which is why it has no renewal at all.
+
+    Zen bills pay-as-you-go against a balance you top up, and publishes no way to read
+    that balance with an API key (four upstream requests open for one; `/zen/go/v1/usage`
+    is Go-subscription only). So the figure is assembled from an anchor and a delta:
+    the balance the user last read off the console (``ccc quota -C``) minus what this
+    machine has spent since. Both halves are stated in the row, because the second is a
+    LOWER BOUND — spend from another machine is invisible here, and on the store this was
+    built against it accounted for about half the real burn.
+
+    With no anchor the row falls back to all-time local spend against the top-up, which
+    is a floor on what has been used and is labelled as one. With no ``opencode_credit_usd``
+    at all there is no denominator and therefore no bar — only the spend, as prose.
+
+    The state stays ``unknown`` until the wallet is provably empty: a balance
+    reconstructed from a human reading plus an incomplete delta cannot prove headroom,
+    and saying ``available`` from it would be a guess wearing a verdict's clothes.
+    """
+    wallet = float(config.load_config().opencode_credit_usd)
+    if snap is None:
+        return ProviderQuota(
+            id=pid,
+            kind="opencode",
+            state=UNKNOWN,
+            reason="opencode store unreadable (missing, locked or migrated)",
+            source="meter",
+            account="priv",
+        )
+    spent_total = _opencode_money(snap.paid_usd_total)
+    if wallet <= 0:
+        return ProviderQuota(
+            id=pid,
+            kind="opencode",
+            state=UNKNOWN,
+            reason=(
+                f"{spent_total} spent here all-time — Zen publishes no balance; "
+                f"set opencode_credit_usd and record yours with `ccc quota -C <usd>`"
+            ),
+            source="meter",
+            captured_at=snap.captured_at,
+            account="priv",
+        )
+    if snap.credit is not None:
+        left = snap.credit.usd - snap.paid_usd_since_credit
+        read_age = usage._format_age(max(0, now - snap.credit.at))  # noqa: SLF001
+        detail = (
+            f"≈{_opencode_money(left)} of {_opencode_money(wallet)} left — "
+            f"{_opencode_money(snap.credit.usd)} read {read_age} ago "
+            f"− {_opencode_money(snap.paid_usd_since_credit)} spent here since "
+            f"(this machine only)"
+        )
+    else:
+        left = wallet - snap.paid_usd_total
+        detail = (
+            f"≤{_opencode_money(left)} of {_opencode_money(wallet)} left — "
+            f"{spent_total} spent here all-time, a LOWER bound; "
+            f"anchor it with `ccc quota -C <usd>` from the console"
+        )
+    used_pct = max(0.0, min(100.0, (wallet - left) / wallet * 100.0))
+    # `wallet`, not `credits`: Copilot's `credits` window renews monthly and the renew
+    # field speaks for it. This one renews when money is added and never on a clock, so
+    # it must not be mistaken for a period — see `_RENEW_WINDOWS`, which omits it.
+    window = WindowState(
+        name="wallet",
+        used_pct=used_pct,
+        resets_at=0,
+        stale=(snap.captured_at + _OPENCODE_STALE_AFTER_SEC) < now,
+        evidence_at=snap.captured_at,
+    )
+    empty = left <= 0 and not window.stale
+    return ProviderQuota(
+        id=pid,
+        kind="opencode",
+        state=BLOCKED if empty else UNKNOWN,
+        reason=(f"wallet empty: {detail}" if empty else detail),
+        source="meter",
+        windows={"wallet": window},
+        blocked_by="wallet" if empty else "",
+        captured_at=snap.captured_at,
+        risky=used_pct >= _RISKY_PCT,
+        account="priv",
+    )
+
+
 def _opencode_quotas(now: int, cooldowns: dict[str, dict]) -> list[ProviderQuota]:
     """The two OpenCode Zen rungs — see :data:`_OPENCODE_ROWS`.
 
-    Both rows are ``unknown`` unless something authoritative says otherwise, and that is
-    the whole design rather than a gap in it. Zen publishes no meter: every usage,
-    billing and balance endpoint 404s, the docs state no rate limits for either tier, and
-    the prepaid balance sits behind an interactive console login. ``available`` in this
-    module means "headroom PROVEN by fresh authoritative data", and "the provider
-    publishes nothing" proves neither capacity nor even that the key still authenticates.
-    ``unknown`` fails open, so no rung is lost — the row simply stops claiming what was
-    never measured.
-
-    What CAN be measured is what this machine spent, which opencode records per assistant
-    message (:func:`usage.read_opencode_usage`). That is a spend figure, not an allowance,
-    so it becomes a bar only once the user supplies the missing half — ``opencode_budget_usd``,
-    their own monthly cap. Reaching that cap BLOCKS the paid rung, and the reason says in
-    words that it is local policy: Zen itself would still serve the request.
-
-    The free row never gets a window at all. Free replies cost nothing, so a percentage
-    of anything would be invented; its spend counter is prose, not a denominator.
+    One binary, two rungs, nothing shared: `ofree` spends no money and is metered only by
+    asking it, `opriv` spends a prepaid wallet no API will report. A recorded cooldown
+    outranks both readings — it is the only place a real deadline can come from.
     """
     snap = usage.read_opencode_usage(now)
-    budget = float(config.load_config().opencode_budget_usd)
-    stale = snap is not None and (snap.captured_at + _OPENCODE_STALE_AFTER_SEC) < now
     rows: list[ProviderQuota] = []
     for pid, seat in _OPENCODE_ROWS:
-        free_tier = seat == "free"
-        windows: dict[str, WindowState] = {}
-        if snap is not None and not free_tier and budget > 0:
-            windows["monthly"] = WindowState(
-                name="monthly",
-                used_pct=min(100.0, snap.paid_usd / budget * 100.0),
-                resets_at=snap.month_end,
-                stale=stale,
-                evidence_at=snap.captured_at,
-            )
-        if pid in cooldowns:
-            rows.append(_cooldown_quota(pid, "opencode", cooldowns[pid], windows))
-            continue
-        captured = snap.captured_at if snap is not None else 0
-        if snap is None:
-            rows.append(
-                ProviderQuota(
-                    id=pid,
-                    kind="opencode",
-                    state=UNKNOWN,
-                    reason="opencode store unreadable (missing, locked or migrated)",
-                    source="meter",
-                    account=seat,
-                )
-            )
-            continue
-        if free_tier:
-            rows.append(
-                ProviderQuota(
-                    id=pid,
-                    kind="opencode",
-                    state=UNKNOWN,
-                    reason=(
-                        f"free tier — no published meter "
-                        f"({snap.free_messages} free replies this month)"
-                    ),
-                    source="meter",
-                    captured_at=captured,
-                    account=seat,
-                )
-            )
-            continue
-        spent = _opencode_money(snap.paid_usd)
-        if budget <= 0:
-            rows.append(
-                ProviderQuota(
-                    id=pid,
-                    kind="opencode",
-                    state=UNKNOWN,
-                    reason=(
-                        f"{spent} spent this month — Zen publishes no balance; "
-                        f"set opencode_budget_usd for a bar"
-                    ),
-                    source="meter",
-                    captured_at=captured,
-                    account=seat,
-                )
-            )
-            continue
-        window = windows["monthly"]
-        of_cap = f"{spent} of {_opencode_money(budget)} local monthly cap"
-        rows.append(
-            ProviderQuota(
-                id=pid,
-                kind="opencode",
-                state=BLOCKED if window.exhausted else UNKNOWN,
-                reason=(
-                    f"local monthly cap reached: {of_cap} (Zen itself would still serve)"
-                    if window.exhausted
-                    else f"{of_cap} — a cap is not a balance, Zen publishes none"
-                ),
-                source="meter",
-                windows=windows,
-                blocked_by="budget" if window.exhausted else "",
-                resets_at=snap.month_end if window.exhausted else 0,
-                captured_at=captured,
-                risky=window.risky,
-                account=seat,
-            )
+        row = (
+            _opencode_free_row(pid, snap, now)
+            if seat == "free"
+            else _opencode_priv_row(pid, snap, now)
         )
+        if pid in cooldowns:
+            row = _cooldown_quota(pid, "opencode", cooldowns[pid], row.windows)
+            row.account = seat
+        rows.append(row)
     return rows
 
 

@@ -881,6 +881,8 @@ def _quota_args(**over: str | bool | None) -> argparse.Namespace:
         clear=None,
         observed_only=False,
         no_bars=False,
+        credit=None,
+        probe=False,
     )
     base.update(over)
     return argparse.Namespace(**base)
@@ -1087,10 +1089,11 @@ def test_a_guessed_denominator_is_shown_but_never_blocks() -> None:
 
 # ── OpenCode Zen (`ofree` / `opriv`) ─────────────────────────────────────────
 #
-# The behaviour worth guarding: Zen publishes NO meter, so neither row may ever claim
-# proven headroom, and the one number we do have (local spend) may only block when the
-# USER supplied the denominator. A default budget appearing here would silently remove a
-# working rung the provider would still have served.
+# The behaviour worth guarding: Zen publishes NO meter (researched, not assumed — every
+# usage/billing endpoint 404s and the Go one is 403 without a subscription), so neither
+# row may claim proven headroom from a measurement nobody could take. The paid rung is a
+# prepaid WALLET reconstructed from a human's console reading plus this machine's spend,
+# and it never renews. The free rung's only meter is asking it.
 
 
 def _opencode_db(path: Path, messages: list[dict], table: str = "message") -> None:
@@ -1140,12 +1143,13 @@ def _opencode_rows(now: int = NOW, cooldowns: dict | None = None) -> dict[str, q
     return {row.id: row for row in quota._opencode_quotas(now, cooldowns or {})}
 
 
-def _budget(monkeypatch: pytest.MonkeyPatch, usd: float) -> None:
-    """Pin `opencode_budget_usd` without writing the user's config file."""
+def _wallet(monkeypatch: pytest.MonkeyPatch, usd: float, **over: object) -> None:
+    """Pin the wallet size (and any other knob) without writing the user's config file."""
     from command_center import config
 
     live = config.load_config()
-    monkeypatch.setattr(config, "load_config", lambda: replace(live, opencode_budget_usd=usd))
+    pinned = replace(live, opencode_credit_usd=usd, **over)  # type: ignore[arg-type]
+    monkeypatch.setattr(config, "load_config", lambda: pinned)
 
 
 def test_opencode_ids_round_trip_and_name_their_shell_commands() -> None:
@@ -1169,61 +1173,73 @@ def test_opencode_without_a_store_is_unknown_not_blocked(
     assert set(rows) == {"opencode:free", "opencode:priv"}
     for row in rows.values():
         assert row.state == quota.UNKNOWN
-        assert "unreadable" in row.reason
         assert row.windows == {}
 
 
-def test_neither_row_is_ever_available(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """`available` means headroom PROVEN. Zen publishes nothing, so it is never earned."""
-    _opencode_store(tmp_path, monkeypatch, [_zen(0.10), _zen(0.0, "muse-spark-1.3-free")])
-    _budget(monkeypatch, 20.0)
-    rows = _opencode_rows()
-    assert [row.state for row in rows.values()] == [quota.UNKNOWN, quota.UNKNOWN]
-
-
-def test_the_free_row_never_gets_a_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Free replies cost nothing, so any percentage would be a fraction of nothing."""
-    _opencode_store(
-        tmp_path,
-        monkeypatch,
-        [_zen(0.0, "muse-spark-1.3-free"), _zen(0.0, "muse-spark-1.3-free")],
-    )
-    _budget(monkeypatch, 20.0)
-    free = _opencode_rows()["opencode:free"]
-    assert free.windows == {}
-    assert "2 free replies" in free.reason
-
-
-def test_spend_without_a_budget_is_prose_not_a_bar(
+def test_the_wallet_is_an_anchor_plus_a_delta(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No cap configured: the figure is reported, and it can block nothing."""
+    """$20 loaded, $15 read off the console, $2 spent here since → $13 left, 35 % used."""
+    _opencode_store(tmp_path, monkeypatch, [_zen(5.0, at=NOW - 86400), _zen(2.0, at=NOW + 60)])
+    _wallet(monkeypatch, 20.0)
+    usage.record_opencode_credit(15.0, NOW)
+    priv = _opencode_rows(now=NOW + 120)["opencode:priv"]
+    assert priv.windows["wallet"].used_pct == pytest.approx(35.0)  # (20 - 13) / 20
+    assert "≈$13.00 of $20.00 left" in priv.reason
+    assert "$2.00 spent here since" in priv.reason
+    # Spend from BEFORE the reading is already inside the number the human read.
+    assert "$5.00" not in priv.reason
+
+
+def test_a_wallet_does_not_renew(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """It refills when money is added, never on a clock — so it has no reset instant."""
+    from command_center import cli
+
+    _opencode_store(tmp_path, monkeypatch, [_zen(1.0)])
+    _wallet(monkeypatch, 20.0)
+    usage.record_opencode_credit(15.0, NOW)
+    priv = _opencode_rows()["opencode:priv"]
+    assert priv.windows["wallet"].resets_at == 0
+    assert "wallet" not in cli._RENEW_WINDOWS
+    assert cli._quota_renew(quota._provider_dict(priv), NOW) == ("—", 0, "")
+
+
+def test_without_an_anchor_the_row_states_a_lower_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Local spend cannot see other machines, so it can only floor what has been used."""
+    _opencode_store(tmp_path, monkeypatch, [_zen(3.0), _zen(1.0)])
+    _wallet(monkeypatch, 20.0)
+    priv = _opencode_rows()["opencode:priv"]
+    assert "≤$16.00 of $20.00 left" in priv.reason
+    assert "LOWER bound" in priv.reason
+    assert priv.windows["wallet"].used_pct == pytest.approx(20.0)
+
+
+def test_no_wallet_configured_means_no_bar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A spend figure with no denominator is prose, not a percentage."""
     _opencode_store(tmp_path, monkeypatch, [_zen(3.5), _zen(1.5)])
-    _budget(monkeypatch, 0.0)
+    _wallet(monkeypatch, 0.0)
     priv = _opencode_rows()["opencode:priv"]
     assert priv.windows == {}
     assert priv.state == quota.UNKNOWN
-    assert "$5.00 spent this month" in priv.reason
+    assert "$5.00 spent here all-time" in priv.reason
 
 
-@pytest.mark.parametrize(
-    ("spent", "state", "pct"),
-    [(5.0, quota.UNKNOWN, 25.0), (19.99, quota.UNKNOWN, 99.95), (20.0, quota.BLOCKED, 100.0)],
-)
-def test_an_explicit_budget_is_the_only_thing_that_can_block(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spent: float, state: str, pct: float
+def test_only_an_empty_wallet_blocks_the_paid_rung(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Below / just under / at the cap — and the block says whose rule it is."""
-    _opencode_store(tmp_path, monkeypatch, [_zen(spent)])
-    _budget(monkeypatch, 20.0)
-    priv = _opencode_rows()["opencode:priv"]
-    assert priv.state == state
-    assert priv.windows["monthly"].used_pct == pytest.approx(pct)
-    assert priv.windows["monthly"].resets_at == usage.opencode_month_bounds(NOW)[1]
-    if state == quota.BLOCKED:
-        assert priv.blocked_by == "budget"
-        assert "Zen itself would still serve" in priv.reason
-        assert priv.resets_at == usage.opencode_month_bounds(NOW)[1]
+    """Reconstructed headroom cannot prove availability; an empty wallet does prove a block."""
+    _opencode_store(tmp_path, monkeypatch, [_zen(4.0, at=NOW + 60)])
+    _wallet(monkeypatch, 20.0)
+    usage.record_opencode_credit(10.0, NOW)
+    assert _opencode_rows(now=NOW + 120)["opencode:priv"].state == quota.UNKNOWN
+
+    usage.record_opencode_credit(3.0, NOW)  # …and now the delta exceeds what was left
+    empty = _opencode_rows(now=NOW + 120)["opencode:priv"]
+    assert empty.state == quota.BLOCKED
+    assert empty.blocked_by == "wallet"
+    assert "wallet empty" in empty.reason
 
 
 def test_spend_is_summed_per_message_not_per_session(
@@ -1232,7 +1248,7 @@ def test_spend_is_summed_per_message_not_per_session(
     """A session that ends on a free model still owes what its paid messages cost.
 
     `session.cost` would attribute the whole session to its LAST model and its LAST
-    activity — so one resumed conversation could move months of spend into this month.
+    activity — so one resumed conversation could move months of spend into today.
     """
     _opencode_store(
         tmp_path,
@@ -1241,15 +1257,12 @@ def test_spend_is_summed_per_message_not_per_session(
             _zen(2.0, "gpt-5.4"),
             _zen(0.0, "muse-spark-1.3-free"),
             {"role": "user", "content": "hi", "at": NOW},
-            _zen(1.0, "claude-opus-5", at=NOW - 40 * 86400),  # last month: excluded
             {"role": "assistant", "providerID": "github-copilot", "cost": 9.0, "at": NOW},
         ],
     )
-    _budget(monkeypatch, 20.0)
     snap = usage.fetch_opencode_usage(NOW)
     assert snap is not None
-    assert snap.paid_usd == pytest.approx(2.0)  # not 3.0 (last month), not 11.0 (copilot)
-    assert snap.paid_messages == 1
+    assert snap.paid_usd_total == pytest.approx(2.0)  # not 11.0 — copilot is not Zen
     assert snap.free_messages == 1
 
 
@@ -1259,7 +1272,7 @@ def test_an_unrecognised_payload_is_unknown_not_zero_spend(
     """After a schema migration, summing a field that is gone would report $0.00 surely."""
     _opencode_store(tmp_path, monkeypatch, [{"kind": "assistant", "price": 4.0, "at": NOW}])
     assert usage.fetch_opencode_usage(NOW) is None
-    _budget(monkeypatch, 20.0)
+    _wallet(monkeypatch, 20.0)
     assert _opencode_rows()["opencode:priv"].state == quota.UNKNOWN
 
 
@@ -1272,7 +1285,7 @@ def test_a_table_rename_is_followed_not_reported_as_zero(
     _opencode_db(path, [_zen(7.0)], table="session_message")
     monkeypatch.setenv(usage._OPENCODE_DB_ENV, str(path))
     snap = usage.fetch_opencode_usage(NOW)
-    assert snap is not None and snap.paid_usd == pytest.approx(7.0)
+    assert snap is not None and snap.paid_usd_total == pytest.approx(7.0)
 
 
 def test_a_store_with_no_known_table_is_unknown(
@@ -1286,65 +1299,93 @@ def test_a_store_with_no_known_table_is_unknown(
     assert usage.fetch_opencode_usage(NOW) is None
 
 
-def test_a_cooldown_blocks_the_opencode_row_it_names(
+def test_the_free_row_is_whatever_the_last_probe_found(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`ccc quota -m opencode-free -u 600` is the only way the free rung goes down."""
+    """A served request is the ONE thing that can prove an unmetered rung is up."""
+    _opencode_store(tmp_path, monkeypatch, [_zen(0.0, "muse-spark-1.3-free")])
+    _wallet(monkeypatch, 20.0)
+
+    free = _opencode_rows()["opencode:free"]
+    assert free.state == quota.UNKNOWN and "ccc quota -P" in free.reason
+
+    usage.record_opencode_probe(True, "", NOW)
+    served = _opencode_rows()["opencode:free"]
+    assert served.state == quota.AVAILABLE
+    assert served.windows == {}  # proof of service is not a percentage
+
+    usage.record_opencode_probe(False, "Rate limit exceeded. Please try again later.", NOW)
+    refused = _opencode_rows()["opencode:free"]
+    assert refused.state == quota.BLOCKED
+    assert refused.blocked_by == "free-tier"
+    assert "Rate limit exceeded" in refused.reason
+    # No invented deadline: Zen states none, and the row says where a real one comes from.
+    assert refused.resets_at == 0
+    assert "ccc quota -m opencode-free" in refused.reason
+
+
+def test_a_stale_probe_decides_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The free tier turns over within hours; yesterday's answer is not today's."""
+    _opencode_store(tmp_path, monkeypatch, [_zen(0.0)])
+    _wallet(monkeypatch, 20.0, opencode_probe_ttl_sec=3600)
+    usage.record_opencode_probe(False, "Rate limit exceeded", NOW - 2 * 3600)
+    free = _opencode_rows()["opencode:free"]
+    assert free.state == quota.UNKNOWN
+    assert "stale" in free.reason
+
+
+def test_a_cooldown_outranks_both_opencode_readings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ccc quota -m opencode-free -U …` is how the TUI's countdown gets into the table."""
     _opencode_store(tmp_path, monkeypatch, [_zen(1.0)])
-    _budget(monkeypatch, 20.0)
+    _wallet(monkeypatch, 20.0)
+    usage.record_opencode_probe(True, "", NOW)  # …the probe says the tier is up
     quota.record_block(
-        "opencode:free", blocked_until=NOW + 600, reason="zen refused", observed_at=NOW
+        "opencode:free", blocked_until=NOW + 9 * 3600, reason="free usage exceeded", observed_at=NOW
     )
     rows = _opencode_rows(cooldowns=quota.read_cooldowns(NOW))
     assert rows["opencode:free"].state == quota.BLOCKED
     assert rows["opencode:free"].source == "cooldown"
+    assert rows["opencode:free"].resets_at == NOW + 9 * 3600
+    assert rows["opencode:free"].account == "free"  # the seat label survives the override
     assert rows["opencode:priv"].state == quota.UNKNOWN  # untouched
 
 
-def test_a_stale_reading_cannot_block(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A figure older than a day was taken before a day of spending could have happened.
-
-    The reader itself refreshes on a TTL, so the aged snapshot is injected: what is under
-    test is the VERDICT rule, that an over-cap figure nobody re-measured today may show
-    its bar but may not remove the rung.
-    """
-    start, end = usage.opencode_month_bounds(NOW)
+def test_a_stale_wallet_reading_cannot_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A day-old reading of an empty wallet was taken before today's top-up could land."""
     aged = usage.OpencodeUsage(
         captured_at=NOW - 2 * 86400,
-        month_start=start,
-        month_end=end,
-        paid_usd=50.0,
-        paid_messages=1,
+        paid_usd_total=50.0,
+        paid_usd_since_credit=50.0,
         free_messages=0,
+        credit=usage.OpencodeCredit(usd=1.0, at=NOW - 3 * 86400),
     )
     monkeypatch.setattr(usage, "read_opencode_usage", lambda *_a, **_k: aged)
-    _budget(monkeypatch, 20.0)
+    _wallet(monkeypatch, 20.0)
     priv = _opencode_rows()["opencode:priv"]
-    assert priv.windows["monthly"].used_pct == 100.0
-    assert priv.windows["monthly"].stale is True
+    assert priv.windows["wallet"].stale is True
     assert priv.state == quota.UNKNOWN
 
 
-def test_month_bounds_are_local_midnights_and_a_stale_month_is_re_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A cached figure from LAST month answers a question nobody asked."""
-    from datetime import datetime
+@pytest.mark.parametrize(
+    ("chunk", "expected"),
+    [
+        ('level=ERROR error.error="AI_APICallError: Rate limit exceeded. Try later."', False),
+        ("Free usage exceeded, subscribe to Go", False),
+        ("\x1b[0m\n> build · muse-spark-1.3-contributor-free\n", None),
+        ("timestamp=2026-09-19T14:20:20.764Z level=INFO message=started", None),
+        ("hallo", True),
+    ],
+)
+def test_the_probe_reads_a_verdict_out_of_the_cli_stream(chunk: str, expected: bool | None) -> None:
+    """Served, refused, or not yet decisive — the three answers, off partial output.
 
-    start, end = usage.opencode_month_bounds(NOW)
-    assert datetime.fromtimestamp(start).day == 1
-    assert datetime.fromtimestamp(start).hour == 0
-    assert datetime.fromtimestamp(end).day == 1
-    assert end > NOW >= start
-
-    _opencode_store(tmp_path, monkeypatch, [_zen(4.0)])
-    usage.fetch_opencode_usage(NOW)
-    # A month later the cache is younger than the TTL but describes a window that ended.
-    later = end + 86400
-    snap = usage.read_opencode_usage(later, refresh_sec=10**9)
-    assert snap is not None
-    assert snap.month_start == usage.opencode_month_bounds(later)[0]
-    assert snap.paid_usd == pytest.approx(0.0)  # the old month's spend is not this month's
+    The probe streams because a spent tier makes `opencode run` retry rather than fail:
+    it must decide on the first line that says something, not on the exit code.
+    """
+    verdict = usage._opencode_probe_verdict(chunk)
+    assert (verdict[0] if verdict else None) is expected
 
 
 # ── the report's renew field ─────────────────────────────────────────────────
@@ -1382,6 +1423,37 @@ def test_renew_urgency_boundaries(resets_in: int, color: str) -> None:
     assert shown == color
     assert at == NOW + resets_in
     assert text.startswith("renew ")
+
+
+def test_a_used_up_quota_keeps_the_date_but_loses_the_colour() -> None:
+    """Red means "spend this". A quota you have already spent has nothing to spend.
+
+    The date still matters — it is when the rung comes back — but colouring it would
+    shout about the one thing the reader cannot act on, and would drown out the rows that
+    really do have allowance about to expire.
+    """
+    full = {
+        "state": "blocked",
+        "windows": {"seven_day": {"used_pct": 100.0, "resets_at": NOW + 3600}},
+    }
+    text, at, color = _renew_of(full)
+    assert (text, at) == ("renew 1h 0m", NOW + 3600)
+    assert color == ""
+    # …and the same row while merely NEARLY spent: past quota's own "risky" line there
+    # is too little left to be worth a warning.
+    nearly = {"windows": {"seven_day": {"used_pct": 95.0, "resets_at": NOW + 3600}}}
+    assert _renew_of(nearly)[2] == ""
+    assert _renew_of({"windows": {"seven_day": {"used_pct": 89.0, "resets_at": NOW + 3600}}})[
+        2
+    ] == ("\033[31m")
+
+
+def test_a_blocked_row_states_when_it_comes_back_even_with_no_window() -> None:
+    """The free tier's refusal carries a deadline but no meter — the field still shows it."""
+    held = {"state": "blocked", "resets_at": NOW + 9 * 3600, "windows": {}}
+    text, at, color = _renew_of(held)
+    assert (text, at) == ("renew 9h 0m", NOW + 9 * 3600)
+    assert color == ""
 
 
 def test_renew_ignores_the_session_window() -> None:

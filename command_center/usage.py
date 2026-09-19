@@ -53,6 +53,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import select
 import shutil
 import sqlite3
@@ -2915,31 +2916,38 @@ def agy_usage_stale(refresh_sec: float, now: int | None = None) -> bool:
 
 # ── OpenCode Zen (`ofree` / `opriv`) ─────────────────────────────────────────
 #
-# Zen publishes NO meter. Every plausible endpoint — `/zen/v1/usage`, `/billing`,
-# `/account`, `/me`, `/credits`, `/limits` — answers 404 with the marketing page, the
-# docs state no rate limits for either tier, and the prepaid balance lives behind an
-# interactive console login. So there is exactly one measurable quantity: **what this
-# machine spent**, which opencode records itself.
+# Zen publishes NO meter, and that is a researched finding rather than a gap we did not
+# look for (2026-09-19): `/zen/v1/{usage,billing,account,me,credits,limits}` all 404,
+# `/zen/go/v1/usage` exists but answers `403 EntitlementError: OpenCode Go subscription
+# required` for a pay-as-you-go key, and upstream has four open requests for a balance
+# endpoint (anomalyco/opencode#10447, #10448, #16017, #44189). The prepaid balance lives
+# in the web console behind an interactive login; the only balance signal an API key can
+# see is the "Insufficient balance" error you get at $0.
 #
-# It records it per ASSISTANT MESSAGE, in `opencode.db`:
+# So the wallet figure has to come from two halves:
+#
+#   1. an ANCHOR the user reads off the console and records (`ccc quota -C 15`), and
+#   2. what this machine has spent SINCE that anchor, which opencode records itself.
+#
+# Half 2 comes from `opencode.db`, per ASSISTANT MESSAGE:
 #
 #     {"role": "assistant", "cost": 0.01716885, "modelID": "gemini-3.7-flash",
 #      "providerID": "opencode", "tokens": {...}, "time": {...}}
 #
-# Per message, not per session, and that is not a detail: `session.cost` is a running
-# total stamped with the session's LAST activity and LAST model, so resuming a March
-# session in September would move its whole history into September's figure and file it
-# under whatever model spoke last. Summing messages avoids both. The all-time sum of
-# this field matches what `opencode stats` itself prints, to the cent, which is how we
-# know it is the same number opencode reports.
+# Per message, not per session: `session.cost` is a running total stamped with the
+# session's LAST model and LAST activity, so resuming a March session in September would
+# move its whole history into September and file it under whatever model spoke last. The
+# all-time sum of this field matches what `opencode stats` prints, to the cent.
 #
-# What comes out is SPEND, never an allowance: a denominator exists only if the user
-# names one (`opencode_budget_usd`). See :func:`quota._opencode_quotas`.
+# The figure is still only THIS MACHINE's spend, which is a lower bound on the wallet's
+# real burn — measured against a console reading it accounted for about half of it.
+# That is exactly why the anchor exists: the row is honest about starting from a number a
+# human read, and only the delta since then is inferred.
 _OPENCODE_DB_ENV = "CCC_OPENCODE_DB"  # test/override hook for the store's location
 # Message tables opencode is known to keep its conversation in. Both exist in the
 # current schema (`message` holds the rows; `session_message` is present and empty), so
-# the reader picks whichever actually has the newest row instead of pinning one name and
-# silently reporting $0.00 after the next migration.
+# the reader picks whichever actually has rows instead of pinning one name and silently
+# reporting $0.00 after the next migration.
 _OPENCODE_MESSAGE_TABLES = ("message", "session_message")
 _OPENCODE_SQLITE_TIMEOUT_SEC = 0.5  # busy timeout: a locked store must degrade, not hang
 # Below this, a `time_created` is seconds rather than milliseconds. 1e11 s is year 5138
@@ -2948,15 +2956,32 @@ _OPENCODE_MS_FLOOR = 1e11
 
 
 @dataclass
+class OpencodeCredit:
+    """A wallet balance a HUMAN read off the console, and when they read it."""
+
+    usd: float
+    at: int  # Unix epoch seconds
+
+
+@dataclass
+class OpencodeProbe:
+    """The outcome of one free-tier request: did Zen serve it, and what did it say?"""
+
+    at: int  # Unix epoch seconds
+    ok: bool
+    detail: str  # the provider's own words when it refused
+
+
+@dataclass
 class OpencodeUsage:
-    """What this machine spent on OpenCode Zen in the current calendar month."""
+    """What this machine spent on OpenCode Zen, plus what the user told us about the wallet."""
 
     captured_at: int  # Unix epoch seconds when ccc read the store
-    month_start: int  # Unix epoch of 00:00 local on the 1st (the window's start)
-    month_end: int  # Unix epoch of 00:00 local on the 1st of next month (its renewal)
-    paid_usd: float  # summed cost of this month's PAID Zen messages
-    paid_messages: int
-    free_messages: int  # Zen messages that cost nothing (the free tier)
+    paid_usd_total: float  # all-time PAID Zen spend recorded on this machine
+    paid_usd_since_credit: float  # …of which is newer than the credit anchor
+    free_messages: int  # free-tier replies recorded on this machine (all time)
+    credit: OpencodeCredit | None = None
+    probe: OpencodeProbe | None = None
 
 
 def _opencode_db_path() -> Path:
@@ -2970,18 +2995,6 @@ def _opencode_db_path() -> Path:
 
 def _opencode_usage_path() -> Path:
     return config.app_home() / "opencode_usage.json"
-
-
-def opencode_month_bounds(now: int) -> tuple[int, int]:
-    """``(start, end)`` of *now*'s calendar month in LOCAL time, as epoch seconds.
-
-    Local, because a monthly spend budget is a human month, not a UTC one. Built from
-    naive local datetimes so both ends land on real local midnights across a DST change.
-    """
-    moment = datetime.fromtimestamp(now)
-    start = datetime(moment.year, moment.month, 1)
-    end = datetime(moment.year + (moment.month == 12), moment.month % 12 + 1, 1)
-    return int(start.timestamp()), int(end.timestamp())
 
 
 def _opencode_live_table(con: sqlite3.Connection) -> str | None:
@@ -3010,24 +3023,27 @@ def _opencode_live_table(con: sqlite3.Connection) -> str | None:
         if con.execute(f"select 1 from {name} limit 1").fetchone():  # noqa: S608
             return name
         fallback = fallback or name
-    # Every candidate is empty: still a readable store with zero spend this month, not
-    # an unsupported schema.
+    # Every candidate is empty: still a readable store with zero spend, not an
+    # unsupported schema.
     return fallback
 
 
-def _opencode_sum(con: sqlite3.Connection, table: str, floor: int) -> tuple[float, int, int] | None:
-    """``(paid USD, paid messages, free messages)`` since *floor*, or ``None``.
+def _opencode_spend(
+    con: sqlite3.Connection, table: str, since_ms: int | None
+) -> tuple[float, float, int] | None:
+    """``(all-time paid USD, paid USD since *since_ms*, free replies)``, or ``None``.
 
     ``None`` means the rows were readable but UNRECOGNISABLE — a payload that no longer
     carries a `role` at all. Summing a field a migration removed would report $0.00 with
     total confidence, which is the one answer worse than admitting we do not know.
+
+    One pass for both totals: the wallet needs the delta since the anchor, and a row with
+    no anchor yet still needs a lower bound, and scanning the table twice for that would
+    double the only cost this reader has.
     """
-    paid = free = rows = shaped = 0
-    paid_usd = 0.0
-    for (blob,) in con.execute(
-        f"select data from {table} where time_created >= ?",  # noqa: S608
-        (floor,),
-    ):
+    total = since = 0.0
+    free = rows = shaped = 0
+    for stamp, blob in con.execute(f"select time_created, data from {table}"):  # noqa: S608
         rows += 1
         try:
             data = json.loads(blob)
@@ -3046,16 +3062,17 @@ def _opencode_sum(con: sqlite3.Connection, table: str, floor: int) -> tuple[floa
             cost = 0.0
         # Positive cost IS the definition of paid: the `-free` suffix is a naming
         # convention Zen rotates, and a model that billed nothing billed nothing.
-        if cost > 0:
-            paid += 1
-            paid_usd += cost
-        else:
+        if cost <= 0:
             free += 1
-    return None if rows and not shaped else (paid_usd, paid, free)
+            continue
+        total += cost
+        if since_ms is not None and int(stamp or 0) >= since_ms:
+            since += cost
+    return None if rows and not shaped else (total, since, free)
 
 
 def fetch_opencode_usage(now: int | None = None) -> OpencodeUsage | None:
-    """Read this month's Zen spend out of opencode's store and cache it.
+    """Re-read this machine's Zen spend and refresh the cache, keeping anchor and probe.
 
     Read-only in every sense the store can express (`mode=ro` URI, `query_only`, a busy
     timeout), and it NEVER raises: a missing file, a lock, a migration mid-flight or
@@ -3063,10 +3080,12 @@ def fetch_opencode_usage(now: int | None = None) -> OpencodeUsage | None:
     provider we briefly could not measure must degrade to ``unknown``, never to blocked.
     """
     now = int(time.time()) if now is None else now
+    kept = _load_opencode_cache()
+    credit = kept.credit if kept else None
+    probe = kept.probe if kept else None
     path = _opencode_db_path()
     if not path.is_file():
         return None
-    start, end = opencode_month_bounds(now)
     try:
         con = sqlite3.connect(
             f"file:{path}?mode=ro", uri=True, timeout=_OPENCODE_SQLITE_TIMEOUT_SEC
@@ -3079,28 +3098,30 @@ def fetch_opencode_usage(now: int | None = None) -> OpencodeUsage | None:
         if table is None:
             return None
         # The column has been milliseconds for as long as ccc has read it, but a unit
-        # change would silently select EVERY row (or none), so the bound is scaled to
+        # change would silently select EVERY row (or none), so the anchor is scaled to
         # what the data actually is — one row read by rowid, not a max() scan.
         sample = con.execute(
             f"select time_created from {table} order by rowid desc limit 1"  # noqa: S608
         ).fetchone()
         newest = int((sample or (0,))[0] or 0)
-        floor = int(start * 1000) if newest >= _OPENCODE_MS_FLOOR else start
-        totals = _opencode_sum(con, table, floor)
+        since_ms = None
+        if credit is not None:
+            since_ms = credit.at * 1000 if newest >= _OPENCODE_MS_FLOOR else credit.at
+        totals = _opencode_spend(con, table, since_ms)
         if totals is None:  # rows we could read but not recognise — see the helper
             return None
-        paid_usd, paid, free = totals
     except (sqlite3.Error, OSError, ValueError):
         return None
     finally:
         con.close()
+    total, since, free = totals
     snap = OpencodeUsage(
         captured_at=now,
-        month_start=start,
-        month_end=end,
-        paid_usd=round(paid_usd, 6),
-        paid_messages=paid,
+        paid_usd_total=round(total, 6),
+        paid_usd_since_credit=round(since, 6),
         free_messages=free,
+        credit=credit,
+        probe=probe,
     )
     _write_opencode_usage(snap)
     return snap
@@ -3121,40 +3142,47 @@ def _load_opencode_cache() -> OpencodeUsage | None:
     if data is None:
         return None
     try:
+        raw_credit = data.get("credit")
+        raw_probe = data.get("probe")
         return OpencodeUsage(
             captured_at=int(data.get("captured_at", 0) or 0),
-            month_start=int(data.get("month_start", 0) or 0),
-            month_end=int(data.get("month_end", 0) or 0),
-            paid_usd=float(data.get("paid_usd", 0) or 0),
-            paid_messages=int(data.get("paid_messages", 0) or 0),
+            paid_usd_total=float(data.get("paid_usd_total", 0) or 0),
+            paid_usd_since_credit=float(data.get("paid_usd_since_credit", 0) or 0),
             free_messages=int(data.get("free_messages", 0) or 0),
+            credit=(
+                OpencodeCredit(usd=float(raw_credit["usd"]), at=int(raw_credit["at"]))
+                if isinstance(raw_credit, dict)
+                else None
+            ),
+            probe=(
+                OpencodeProbe(
+                    at=int(raw_probe["at"]),
+                    ok=bool(raw_probe["ok"]),
+                    detail=str(raw_probe.get("detail", "")),
+                )
+                if isinstance(raw_probe, dict)
+                else None
+            ),
         )
-    except (AttributeError, TypeError, ValueError):
+    except (AttributeError, KeyError, TypeError, ValueError):
         return None
 
 
 def read_opencode_usage(
     now: int | None = None, refresh_sec: float | None = None
 ) -> OpencodeUsage | None:
-    """This month's Zen spend, from cache, re-reading the store when that has aged out.
+    """This machine's Zen spend, from cache, re-reading the store when that has aged out.
 
     Unlike every other provider here the source is a LOCAL file, so the refresh needs no
-    daemon and no opt-in switch: it costs one indexed sqlite scan (23 ms on a 380 MB
-    store, against the oracle's ~70 ms budget), and the cache keeps even that off the
-    common path. A cached snapshot from LAST month is always re-read, whatever the TTL
-    says — its window has ended, so its figures answer a question nobody asked.
+    daemon and no opt-in switch: it costs one sqlite scan (22 ms warm, 0.2 s cold on a
+    380 MB store, against the oracle's ~70 ms budget), and the cache keeps even that off
+    the common path.
     """
     now = int(time.time()) if now is None else now
     if refresh_sec is None:
         refresh_sec = float(config.load_config().opencode_usage_refresh_sec)
     cached = _load_opencode_cache()
-    month_start, _end = opencode_month_bounds(now)
-    fresh = (
-        cached is not None
-        and cached.month_start == month_start
-        and not opencode_usage_stale(refresh_sec, now)
-    )
-    if fresh:
+    if cached is not None and not opencode_usage_stale(refresh_sec, now):
         return cached
     return fetch_opencode_usage(now) or cached
 
@@ -3167,3 +3195,170 @@ def opencode_usage_stale(refresh_sec: float, now: int | None = None) -> bool:
     except OSError:
         return True
     return (now - int(mtime)) >= refresh_sec
+
+
+def record_opencode_credit(usd: float, now: int | None = None) -> OpencodeUsage | None:
+    """Anchor the wallet at *usd*, as read off the console, and re-measure from there.
+
+    The anchor is a MEASUREMENT (a human read a number at a moment), not a setting, so it
+    lives in the snapshot beside the spend it will be netted against — not in config.toml,
+    where it would look like a preference and would be stale the moment money is spent.
+    """
+    now = int(time.time()) if now is None else now
+    kept = _load_opencode_cache()
+    snap = OpencodeUsage(
+        captured_at=now,
+        paid_usd_total=kept.paid_usd_total if kept else 0.0,
+        paid_usd_since_credit=0.0,  # nothing has been spent since a reading taken now
+        free_messages=kept.free_messages if kept else 0,
+        credit=OpencodeCredit(usd=float(usd), at=now),
+        probe=kept.probe if kept else None,
+    )
+    _write_opencode_usage(snap)
+    # Re-read so the delta is measured against the store rather than assumed to be zero
+    # (messages written in the same second as the anchor are still counted).
+    return fetch_opencode_usage(now) or snap
+
+
+def record_opencode_probe(
+    ok: bool, detail: str = "", now: int | None = None
+) -> OpencodeUsage | None:
+    """Store the outcome of one free-tier request."""
+    now = int(time.time()) if now is None else now
+    kept = _load_opencode_cache()
+    snap = OpencodeUsage(
+        captured_at=kept.captured_at if kept else now,
+        paid_usd_total=kept.paid_usd_total if kept else 0.0,
+        paid_usd_since_credit=kept.paid_usd_since_credit if kept else 0.0,
+        free_messages=kept.free_messages if kept else 0,
+        credit=kept.credit if kept else None,
+        probe=OpencodeProbe(at=now, ok=ok, detail=detail),
+    )
+    _write_opencode_usage(snap)
+    return snap
+
+
+# What the CLI says when Zen turned the free request down. Matched case-insensitively
+# against the whole run, because the wording differs by path — `opencode run` logs
+# "Rate limit exceeded. Please try again later." while the TUI shows "Free usage
+# exceeded, subscribe to Go".
+_OPENCODE_REFUSAL_MARKERS = ("rate limit exceeded", "free usage exceeded", "429")
+
+
+def probe_opencode_free(model: str = "", timeout: float | None = None) -> tuple[bool | None, str]:
+    """Ask the free tier for one word. ``(True|False|None, detail)``.
+
+    ``True`` = Zen served it (headroom PROVEN — the one thing that lets the free row say
+    `available` at all). ``False`` = it refused, in the provider's own words.
+    ``None`` = inconclusive: no binary, or nothing decisive before *timeout*.
+
+    **The output is streamed and the probe stops at the first decisive line**, because
+    waiting for the process is not an option: when the tier is spent `opencode run` does
+    not fail fast, it enters its own retry schedule and sits there (measured: the first
+    refusal was logged 1.5 min in, and the process was still going at 90 s). Reading as it
+    goes turns "served" into a two-second answer and keeps the refusal case bounded by the
+    timeout rather than by opencode's backoff.
+
+    A timeout still reports ``None``, never "blocked": a slow answer is not a refusal.
+
+    This costs one FREE request and one CLI start, so it is never on the report's path —
+    only `ccc quota -P` runs it.
+    """
+    live = config.load_config()
+    model = model or live.opencode_free_model
+    timeout = float(live.opencode_probe_timeout_sec) if timeout is None else timeout
+    exe = shutil.which("opencode")
+    if not exe:
+        return None, "opencode is not on PATH"
+    argv = [
+        exe,
+        "run",
+        "-m",
+        f"opencode/{model}",
+        "--print-logs",
+        "--log-level",
+        "ERROR",
+        "reply with the single word hallo",
+    ]
+    # A STABLE scratch directory, not a fresh temp one. opencode treats its working
+    # directory as a project and initialises it on first use; in a brand-new directory
+    # that init ran before the request and swallowed the whole timeout, while the same
+    # probe in a warm directory had its answer in 5 s. It must also not be the repo the
+    # caller happens to stand in — metering the tier is nobody's project.
+    sandbox = config.app_home() / "opencode-probe"
+    try:
+        sandbox.mkdir(parents=True, exist_ok=True)
+        return _read_opencode_probe(argv, str(sandbox), timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"could not run opencode ({exc})"
+
+
+def _read_opencode_probe(argv: list[str], cwd: str, timeout: float) -> tuple[bool | None, str]:
+    """Run *argv* and answer from the first decisive line, then kill it."""
+    deadline = time.monotonic() + timeout
+    proc = subprocess.Popen(  # noqa: S603
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=cwd,
+        start_new_session=True,
+    )
+    verdict: tuple[bool | None, str] = (None, f"nothing decisive within {timeout:.0f}s")
+    try:
+        assert proc.stdout is not None
+        os.set_blocking(proc.stdout.fileno(), False)
+        pending = ""
+        while time.monotonic() < deadline:
+            ready, _w, _x = select.select([proc.stdout], [], [], 0.5)
+            if not ready:
+                if proc.poll() is not None:
+                    break
+                continue
+            chunk = proc.stdout.read()
+            if not chunk:
+                if proc.poll() is not None:
+                    break
+                continue
+            pending += chunk
+            lines, _sep, pending = pending.rpartition("\n")
+            decided = _opencode_probe_verdict(lines)
+            if decided is not None:
+                verdict = decided
+                break
+        else:
+            verdict = (None, f"no answer within {timeout:.0f}s (the CLI retries when spent)")
+        if (decided := _opencode_probe_verdict(pending)) is not None:
+            verdict = decided
+    finally:
+        proc.kill()
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            proc.wait(timeout=5)
+    return verdict
+
+
+# What the CLI says when Zen turned the free request down. Matched case-insensitively,
+# because the wording differs by path — `opencode run` logs "Rate limit exceeded. Please
+# try again later." while the TUI shows "Free usage exceeded, subscribe to Go".
+_OPENCODE_REFUSAL_MARKERS = ("rate limit exceeded", "free usage exceeded", "429")
+# Noise a run prints before it says anything: the model header and the log lines
+# themselves. Everything else on stdout is the model actually answering.
+_OPENCODE_PROBE_NOISE = ("timestamp=", "> build", "level=")
+
+
+def _opencode_probe_verdict(text: str) -> tuple[bool, str] | None:
+    """Read a chunk of probe output: refused, served, or not yet decisive (``None``)."""
+    lowered = text.lower()
+    if any(marker in lowered for marker in _OPENCODE_REFUSAL_MARKERS):
+        return False, _opencode_refusal_text(text)
+    for line in text.splitlines():
+        clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line).strip()
+        if clean and not any(noise in clean for noise in _OPENCODE_PROBE_NOISE):
+            return True, clean[:120]
+    return None
+
+
+def _opencode_refusal_text(blob: str) -> str:
+    """The provider's own refusal sentence out of a CLI run, trimmed for one table cell."""
+    match = re.search(r"(?:AI_APICallError:\s*)?([^\"\n]*(?:limit|exceeded)[^\"\n]*)", blob, re.I)
+    return (match.group(1).strip() if match else "refused")[:120]

@@ -121,15 +121,26 @@ DEFAULTS: dict[str, object] = {
     # interval; 0 or >= idle disables the speed-up (same contract as the Copilot pair).
     "agy_usage_refresh_active_sec": 300,  # active-work agy `/usage` throttle (~1/3 of idle)
     # OpenCode Zen: it publishes NO quota or balance API (every /zen/v1 usage endpoint
-    # 404s and the docs state no limits), so the only measurable thing is what THIS
-    # machine spent — read from opencode's own sqlite session store. That is a spend
-    # figure, not an allowance, so it gets a denominator only if you name one:
-    # `opencode_budget_usd` is YOUR monthly cap, 0 = no cap and no bar. A cap that is
-    # reached blocks the `opencode-priv` rung as LOCAL POLICY (Zen would still serve it),
-    # which is exactly why it cannot have a made-up default — Zen's own $5 -> $20 is
-    # wallet auto-reload, not a monthly allowance.
-    "opencode_budget_usd": 0.0,  # monthly USD cap for the opencode-priv rung (0 = off)
+    # 404s, /zen/go/v1/usage is 403 without a Go subscription, and upstream has four open
+    # requests for a balance endpoint), so the wallet is reconstructed from two halves:
+    # the balance YOU read off the console (`ccc quota -C 15`, stored as a measurement in
+    # opencode_usage.json) and what this machine has spent since, read from opencode's own
+    # sqlite store. `opencode_credit_usd` is the full top-up — the bar's denominator, and
+    # the only part that is a preference. 0 = no bar; there is no honest default, since
+    # Zen's own $5 -> $20 is wallet auto-reload, not an allowance.
+    "opencode_credit_usd": 0.0,  # what a full Zen top-up is worth, in USD (0 = no bar)
     "opencode_usage_refresh_sec": 900,  # min sec between sqlite re-reads of opencode spend
+    # The free tier has no meter either, but it CAN be asked: one free request either is
+    # served or is refused. `ccc quota -P` does that; these two govern it. The timeout is
+    # load-bearing — a spent free tier makes `opencode run` enter its own retry schedule
+    # and sit there for minutes rather than failing fast.
+    "opencode_free_model": "muse-spark-1.3-contributor-free",  # what -P asks (Zen rotates these)
+    # 150 s, not 30: when the tier is spent the CLI hangs on its first attempt for
+    # ~90 s before it logs anything, so a shorter cap reports "inconclusive" every
+    # single time it matters. A SERVED request still answers in seconds — the probe
+    # streams the output and stops at the first decisive line.
+    "opencode_probe_timeout_sec": 150,  # cap on one -P probe
+    "opencode_probe_ttl_sec": 3600,  # how long a probe's verdict governs the free row
     # Claude /usage OAuth fetch: keep each account's usage card in step with `claude`'s
     # own /usage (incl. any weekly model-scoped window the status line never carries) by
     # fetching the OAuth usage endpoint out-of-band (reads the CLI's keychain token).
@@ -865,12 +876,15 @@ class Config:
     agy_usage: bool = False  # run `agy -p /usage` to meter the Antigravity account (INERT: off)
     agy_usage_refresh_sec: int = 900
     agy_usage_refresh_active_sec: int = 300
-    # Your own monthly spending cap for OpenCode Zen, in USD. 0 = no cap: the
-    # `opencode-priv` row then reports spend as text and stays `unknown`, because a
-    # figure with no denominator cannot prove headroom. See DEFAULTS for why there is
-    # no plausible-looking default here.
-    opencode_budget_usd: float = 0.0
+    # What a full OpenCode Zen top-up is worth, in USD — the denominator of the wallet
+    # bar. 0 = no bar: the `opencode-priv` row then reports spend as text, because a
+    # figure with no denominator cannot prove headroom. The BALANCE itself is not here;
+    # it is a measurement you record with `ccc quota -C`. See DEFAULTS.
+    opencode_credit_usd: float = 0.0
     opencode_usage_refresh_sec: int = 900
+    opencode_free_model: str = "muse-spark-1.3-contributor-free"
+    opencode_probe_timeout_sec: int = 150
+    opencode_probe_ttl_sec: int = 3600
     claude_usage: bool = False  # fetch the Claude /usage OAuth endpoint (INERT: off)
     claude_usage_refresh_sec: int = 600
     claude_usage_refresh_active_sec: int = 200
