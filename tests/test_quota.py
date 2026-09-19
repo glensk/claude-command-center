@@ -752,6 +752,7 @@ def test_snapshot_rows_carry_the_accent_the_report_paints_them_in() -> None:
     assert quota.seat_color("copilot", "copilot") == usage._COPILOT_FILL  # noqa: SLF001
     assert quota.seat_color("agy", "agy") == usage._AGY_ACCENT  # noqa: SLF001
     assert quota.seat_color("agy:gpt", "agy") == usage._AGY_GPT_ACCENT  # noqa: SLF001
+    assert quota.seat_color("muse", "muse") == usage._MUSE_ACCENT  # noqa: SLF001
     assert quota.seat_color("gemini", "gemini") == ""
     # Every published row carries it, and the table reads the field, never a copy.
     snap = quota.snapshot(now=NOW)
@@ -997,7 +998,7 @@ def test_quota_report_header_lines_up_with_its_rows(
             seen += cell_len(ch)
         return " "
 
-    spanning = (" copilot ", " agy ", " agy-gpt ", " opencode-free ", " opencode-priv ")
+    spanning = (" copilot ", " agy ", " agy-gpt ", " opencode-free ", " opencode-priv ", " muse ")
     for label in ("state", "data age", "session", "week", "renew"):
         col = cell_len(header[: header.index(label)])
         for row in rows:
@@ -1566,3 +1567,353 @@ def test_a_deadline_the_renewal_does_not_cover_is_still_stated(
     )
     assert "unblocks in 15m" in row
     assert "renew" in row
+
+
+# ── Muse Code (`muse`) ──────────────────────────────────────────────────────────
+#
+# One rung whose meter is muse's OWN: every model step's token counts in its session
+# logs, priced at the provider catalog muse caches beside them, summed over every log on
+# this machine (hidden child sessions included) against `muse_budget_usd`.
+
+_MUSE_CATALOG = {
+    "schema_version": 1,
+    "provider_id": "meta",
+    "rows": [
+        {
+            "model_id": "muse-spark-1.3-contributor",
+            "cost": {"input": "0.10", "output": "0.20", "cached": "0.002", "currency": "USD"},
+        },
+        {
+            "model_id": "muse-spark-1.3",
+            "cost": {"input": "1.25", "output": "4.25", "cached": "0.15", "currency": "USD"},
+        },
+    ],
+}
+
+
+def _muse_step(inp: int, cached: int, out: int, model: str = "muse-spark-1.3-contributor") -> str:
+    """One `model_completed` record, as muse 1.3.0 writes it (trimmed to what matters)."""
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "record_type": "event",
+            "payload_type": "runtime.session",
+            "payload": {
+                "kind": "run",
+                "event": {
+                    "kind": "model_completed",
+                    "usage": {
+                        "input_tokens": inp,
+                        "output_tokens": out,
+                        "cached_tokens": cached,
+                        "cache_read_tokens": cached,
+                        "cache_write_tokens": 0,
+                        "reasoning_tokens": out // 3,
+                    },
+                    "duration_ms": 3298,
+                    "model": model,
+                },
+            },
+        }
+    )
+
+
+# Records a log is mostly made of, none of which is a step: an instruction dump that
+# MENTIONS the marker, a status record, and a compaction frame quoting a step.
+_MUSE_NOISE = [
+    json.dumps(
+        {
+            "payload_type": "runtime.session",
+            "payload": {
+                "kind": "run",
+                "event": {
+                    "kind": "model_request_configured",
+                    "base_instructions": 'never emit a "model_completed" event yourself ' * 40,
+                },
+            },
+        }
+    ),
+    json.dumps({"payload_type": "session.end", "payload": {"kind": "session_end"}}),
+    json.dumps(
+        {
+            "retained_frame": 1,
+            "children": [{"payload": {"event": {"kind": "model_completed", "usage": {}}}}],
+        }
+    ),
+    "not json at all {",
+]
+
+
+def _muse_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    logs: dict[str, list[str]],
+    *,
+    catalog: dict | None = _MUSE_CATALOG,
+) -> Path:
+    """A miniature muse data dir: *logs* maps a session-relative path to its step lines."""
+    data = tmp_path / "muse-data"
+    for rel, lines in logs.items():
+        path = data / "sessions" / rel / "session.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join([*_MUSE_NOISE, *lines]) + "\n", encoding="utf-8")
+    if catalog is not None:
+        (data / "model-catalog").mkdir(parents=True, exist_ok=True)
+        (data / "model-catalog" / "6d657461.json").write_text(json.dumps(catalog))
+    monkeypatch.setenv(usage._MUSE_DATA_ENV, str(data))
+    return data
+
+
+def _budget(monkeypatch: pytest.MonkeyPatch, usd: float, **over: object) -> None:
+    from command_center import config
+
+    live = config.load_config()
+    pinned = replace(live, muse_budget_usd=usd, **over)  # type: ignore[arg-type]
+    monkeypatch.setattr(config, "load_config", lambda: pinned)
+
+
+def _muse_row(now: int = NOW, cooldowns: dict | None = None) -> quota.ProviderQuota:
+    return quota._muse_quota(now, cooldowns or {})
+
+
+def test_muse_is_a_single_seat_named_after_its_own_command() -> None:
+    """No seat, no alias: `muse` IS the command, so the row carries no `command`."""
+    assert quota.display_id("muse") == "muse"
+    assert quota.canonical_id("muse") == "muse"
+    assert quota.seat_command("muse") == ""
+    assert quota.seat_color("muse", "muse") == usage._MUSE_ACCENT  # noqa: SLF001
+    assert "muse" in quota.BAR_SPAN_KINDS and "budget" in quota.BAR_SPAN_WINDOWS
+    assert quota.BAR_HORIZON["budget"] == "budget"
+
+
+def test_muse_without_a_store_is_unknown_not_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(usage._MUSE_DATA_ENV, str(tmp_path / "absent"))
+    row = _muse_row()
+    assert row.state == quota.UNKNOWN
+    assert not row.windows
+    assert "no muse session logs" in row.reason
+
+
+def test_muse_sums_every_step_at_catalog_prices_cached_as_a_subset_of_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The panel's arithmetic: (input − cached)·p_in + cached·p_cached + output·p_out, over
+    the main log AND the hidden child session muse's own per-session panel omits."""
+    _muse_store(
+        tmp_path,
+        monkeypatch,
+        {
+            "2026/09/20/s1": [_muse_step(30_000, 0, 20), _muse_step(30_000, 29_000, 10)],
+            "2026/09/20/s1/subagent/c1": [_muse_step(3_000, 2_000, 1_000)],
+            "2026/09/20/s2": [],  # a session that never made a model call
+        },
+    )
+    _budget(monkeypatch, 20.0)
+    snap = usage.fetch_muse_usage(NOW)
+    assert snap is not None
+    expected = (
+        (30_000 * 0.10 + 20 * 0.20)
+        + (1_000 * 0.10 + 29_000 * 0.002 + 10 * 0.20)
+        + (1_000 * 0.10 + 2_000 * 0.002 + 1_000 * 0.20)
+    ) / 1_000_000
+    assert snap.est_usd_total == pytest.approx(expected, abs=1e-6)
+    assert (snap.input_tokens, snap.cached_tokens, snap.output_tokens) == (63_000, 31_000, 1_030)
+    assert (snap.steps, snap.sessions) == (3, 3)
+    assert snap.models == ["muse-spark-1.3-contributor"]
+    assert not snap.unpriced
+    row = _muse_row()
+    assert row.state == quota.AVAILABLE
+    assert row.windows["budget"].used_pct == pytest.approx(expected / 20.0 * 100.0)
+    assert row.windows["budget"].resets_at == 0  # nothing renews a budget
+    assert "of $20.00 spent here (est.)" in row.reason
+    assert "63k in / 1k out over 3 steps in 3 sessions" in row.reason
+    assert "muse-spark-1.3-contributor" in row.reason
+
+
+def test_muse_catalog_prices_win_over_the_built_in_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repriced model is repriced here too; a model the catalog lacks keeps the table."""
+    catalog = {
+        "rows": [
+            {"model_id": "muse-spark-1.3-contributor", "cost": {"input": "1", "output": "1"}},
+            {"model_id": "broken", "cost": "free"},  # unreadable row: skipped, not fatal
+        ]
+    }
+    _muse_store(
+        tmp_path,
+        monkeypatch,
+        {
+            "2026/09/20/s1": [
+                _muse_step(1_000_000, 0, 0),
+                _muse_step(0, 0, 1_000_000, "muse-spark-1.3"),
+            ]
+        },
+        catalog=catalog,
+    )
+    snap = usage.fetch_muse_usage(NOW)
+    assert snap is not None
+    # $1 for the repriced million in, $4.25 for the million out at the table's price.
+    assert snap.est_usd_total == pytest.approx(1.0 + 4.25)
+    assert snap.models == ["muse-spark-1.3-contributor", "muse-spark-1.3"]
+
+
+def test_muse_without_any_catalog_still_prices_known_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _muse_store(
+        tmp_path, monkeypatch, {"2026/09/20/s1": [_muse_step(1_000_000, 0, 0)]}, catalog=None
+    )
+    snap = usage.fetch_muse_usage(NOW)
+    assert snap is not None
+    assert snap.est_usd_total == pytest.approx(0.10)
+
+
+def test_muse_names_an_unpriced_model_instead_of_billing_it_as_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _muse_store(
+        tmp_path,
+        monkeypatch,
+        {"2026/09/20/s1": [_muse_step(1_000_000, 0, 0), _muse_step(5, 0, 5, "muse-spark-9")]},
+    )
+    _budget(monkeypatch, 20.0)
+    snap = usage.fetch_muse_usage(NOW)
+    assert snap is not None
+    assert snap.est_usd_total == pytest.approx(0.10)  # the unpriced step is NOT in the sum
+    assert snap.unpriced == {"muse-spark-9": 1}
+    assert snap.steps == 2  # …but its tokens and steps are still counted
+    row = _muse_row()
+    assert "unpriced steps NOT in the sum: 1 of muse-spark-9" in row.reason
+
+
+def test_muse_budget_reached_blocks_as_local_policy_with_no_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _muse_store(tmp_path, monkeypatch, {"2026/09/20/s1": [_muse_step(10_000_000, 0, 0)]})  # $1.00
+    _budget(monkeypatch, 1.0)
+    row = _muse_row()
+    assert row.state == quota.BLOCKED
+    assert row.blocked_by == "budget"
+    assert row.resets_at == 0
+    assert row.reason.startswith("budget reached: $1.00 of $1.00")
+    _budget(monkeypatch, 1.05)  # a hair of headroom: risky, not blocked
+    risky = _muse_row()
+    assert risky.state == quota.AVAILABLE
+    assert risky.risky is True
+
+
+def test_muse_with_no_budget_reports_spend_as_prose_and_no_bar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _muse_store(tmp_path, monkeypatch, {"2026/09/20/s1": [_muse_step(10_000_000, 0, 0)]})
+    _budget(monkeypatch, 0.0)
+    row = _muse_row()
+    assert row.state == quota.UNKNOWN
+    assert not row.windows
+    assert row.reason.startswith("$1.00 spent here (est.)")
+    assert "muse_budget_usd" in row.reason
+
+
+def test_muse_reads_only_the_logs_that_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Append-only logs: an unchanged (size, mtime) is trusted, a grown one is re-read."""
+    data = _muse_store(
+        tmp_path,
+        monkeypatch,
+        {
+            "2026/09/20/s1": [_muse_step(1_000_000, 0, 0)],
+            "2026/09/20/s2": [_muse_step(1_000_000, 0, 0)],
+        },
+    )
+    first = usage.fetch_muse_usage(NOW)
+    assert first is not None and first.est_usd_total == pytest.approx(0.20)
+    reads: list[Path] = []
+    real = usage._muse_read_log  # noqa: SLF001
+
+    def counting(path: Path) -> dict[str, list[int]] | None:
+        reads.append(path)
+        return real(path)
+
+    monkeypatch.setattr(usage, "_muse_read_log", counting)
+    second = usage.fetch_muse_usage(NOW + 1)
+    assert second is not None and second.est_usd_total == pytest.approx(0.20)
+    assert reads == []  # nothing changed, nothing reopened
+    log = data / "sessions" / "2026/09/20/s2" / "session.jsonl"
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(_muse_step(1_000_000, 0, 0) + "\n")
+    import os
+
+    os.utime(log, (NOW + 100, NOW + 100))
+    third = usage.fetch_muse_usage(NOW + 2)
+    assert third is not None and third.est_usd_total == pytest.approx(0.30)
+    assert [p.name for p in reads] == ["session.jsonl"] and reads[0].parent.name == "s2"
+
+
+def test_muse_cache_round_trips_and_serves_reads_within_the_refresh_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _muse_store(tmp_path, monkeypatch, {"2026/09/20/s1": [_muse_step(1_000_000, 500_000, 10)]})
+    fetched = usage.fetch_muse_usage(NOW)
+    assert fetched is not None
+    monkeypatch.setattr(usage, "fetch_muse_usage", lambda *_a, **_k: pytest.fail("re-walked"))
+    cached = usage.read_muse_usage(int(time.time()), refresh_sec=3600)
+    assert cached == fetched
+
+
+def test_a_stale_muse_reading_cannot_prove_headroom(monkeypatch: pytest.MonkeyPatch) -> None:
+    aged = usage.MuseUsage(
+        captured_at=NOW - 2 * 86400,
+        est_usd_total=1.0,
+        input_tokens=1,
+        cached_tokens=0,
+        output_tokens=1,
+        steps=1,
+        sessions=1,
+        models=["muse-spark-1.3-contributor"],
+        unpriced={},
+        logs={},
+    )
+    monkeypatch.setattr(usage, "read_muse_usage", lambda *_a, **_k: aged)
+    _budget(monkeypatch, 20.0)
+    row = _muse_row()
+    assert row.windows["budget"].stale is True
+    assert row.state == quota.UNKNOWN
+    assert row.reason.startswith("stale reading")
+
+
+def test_a_cooldown_outranks_the_muse_meter_but_keeps_its_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _muse_store(tmp_path, monkeypatch, {"2026/09/20/s1": [_muse_step(1_000_000, 0, 0)]})
+    _budget(monkeypatch, 20.0)
+    quota.record_block("muse", blocked_until=NOW + 3600, reason="HTTP 429", observed_at=NOW)
+    row = _muse_row(cooldowns=quota.read_cooldowns(NOW))
+    assert row.state == quota.BLOCKED
+    assert row.source == "cooldown"
+    assert row.resets_at == NOW + 3600
+    assert "budget" in row.windows  # the meter still shows behind the block
+
+
+def test_muse_row_is_in_the_snapshot_and_draws_a_spanning_budget_bar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import cli
+
+    _muse_store(tmp_path, monkeypatch, {"2026/09/20/s1": [_muse_step(50_000_000, 0, 0)]})  # $5
+    _budget(monkeypatch, 20.0)
+    snap = quota.snapshot(now=NOW)
+    row = next(p for p in snap["providers"] if p["id"] == "muse")
+    assert row["display"] == "muse" and "command" not in row
+    assert row["color"] == usage._MUSE_ACCENT  # noqa: SLF001
+    assert row["windows"]["budget"]["used_pct"] == pytest.approx(25.0)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    assert cli.cmd_quota(_quota_args()) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("  ✅ muse "))
+    assert "budget" in line and "25%" in line and " — " in line  # bar word, figure, no renewal
+    assert cli.cmd_quota(_quota_args(no_bars=True)) == 0
+    plain = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("  ✅ muse "))
+    assert "budget 25%" in plain

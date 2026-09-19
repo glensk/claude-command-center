@@ -138,6 +138,10 @@ _CLAUDE_WORK_ACCENT = "#6cb6ff"  # work Claude card's blue border/reset colour (
 # towards amber, near enough to read as the same product and far enough from Codex green.
 _AGY_ACCENT = "#a6be3a"
 _AGY_GPT_ACCENT = "#c9a93e"
+# Muse Code has no card either; `ccc quota` paints its row in the magenta end of Meta
+# AI's gradient — the one hue the palette had left that is neither a blue (the work
+# Claude seat), a green (Codex), a violet (Copilot) nor a yellow-olive (Antigravity).
+_MUSE_ACCENT = "#e0529a"
 # Reset text is embossed onto the bar: over the bright filled portion it is drawn dark,
 # over the dark track it takes the card's accent colour (so it both matches the box and
 # stays legible). The bar's fill/track colours remain as each glyph's background, so usage
@@ -3362,3 +3366,336 @@ def _opencode_refusal_text(blob: str) -> str:
     """The provider's own refusal sentence out of a CLI run, trimmed for one table cell."""
     match = re.search(r"(?:AI_APICallError:\s*)?([^\"\n]*(?:limit|exceeded)[^\"\n]*)", blob, re.I)
     return (match.group(1).strip() if match else "refused")[:120]
+
+
+# ── Muse Code (`muse`) ───────────────────────────────────────────────────────
+#
+# Meta's Muse Code CLI publishes no account meter either, but unlike Zen it WRITES DOWN
+# everything the estimate needs, on this machine, in two places (researched 2026-09-20 on
+# muse 1.3.0):
+#
+#   1. Every model step it makes is a `runtime.session` record in that session's
+#      `session.jsonl` (`$XDG_DATA_HOME/muse/sessions/<yyyy>/<mm>/<dd>/<id>/`) whose
+#      `event.kind == "model_completed"` carries the provider's own token counts and the
+#      model that answered:
+#
+#          {"kind": "model_completed", "model": "muse-spark-1.3-contributor",
+#           "usage": {"input_tokens": 30684, "cached_tokens": 30065, "output_tokens": 25,
+#                     "cache_read_tokens": 30065, "cache_write_tokens": 0,
+#                     "reasoning_tokens": 14}, ...}
+#
+#      `cached_tokens` is a SUBSET of `input_tokens` (the OpenAI shape, and muse's own
+#      `/usage` panel agrees: its `Total` is Input + Output with Cached shown beside them,
+#      not added). Reasoning tokens are a subset of output and are not priced separately.
+#      Hidden child sessions — the memory/skill "reminder" agents muse spawns beside a
+#      turn — log their own steps under `<session>/subagent/<id>/session.jsonl`; muse's
+#      per-session panel leaves them out (`Subagents: none`), the bill does not, so this
+#      reader walks them too and reads a little ABOVE the panels summed.
+#
+#   2. The price list is the provider's, cached verbatim by muse itself in
+#      `model-catalog/*.json` (`rows[].cost = {input, output, cached}` in USD per million
+#      tokens). Muse's `Cost (USD, est.)` is exactly these prices applied to those counts;
+#      `_MUSE_FALLBACK_PRICES` carries the catalog as it stood when this was written, for a
+#      machine whose muse has never fetched one.
+#
+# So the figure is muse's own estimate summed over EVERY session log on this machine,
+# and its limits are the same as that panel's: an estimate at list price, this machine
+# only, and a session run with `--no-session-log` leaves nothing to count.
+#
+# The scan is incremental: a session log is append-only, so a log whose (size, mtime)
+# match the cache is not reopened. What is cached per log is its token tally PER MODEL,
+# never a dollar figure — prices are applied when the row is built, so a catalog update
+# re-prices history without re-reading it.
+_MUSE_DATA_ENV = "CCC_MUSE_DATA"  # test/override hook for muse's data directory
+_MUSE_SESSION_LOG = "session.jsonl"
+# The one record kind that carries billable counts. Lines are tested for this substring
+# before any JSON is parsed: a session log is dominated by ~100 KB instruction records,
+# and decoding those to discard them was most of the cost of reading a log.
+_MUSE_STEP_MARKER = '"model_completed"'
+# USD per million tokens as (input, output, cached), the provider catalog of 2026-09-20.
+# Used ONLY for a model the cached catalog does not name (or when there is no catalog).
+_MUSE_FALLBACK_PRICES: dict[str, tuple[float, float, float]] = {
+    "muse-spark-1.3-contributor": (0.10, 0.20, 0.002),
+    "muse-spark-1.2-contributor": (0.10, 0.20, 0.002),
+    "muse-spark-1.3": (1.25, 4.25, 0.15),
+    "muse-spark-1.2": (1.25, 4.25, 0.15),
+}
+_MUSE_UNKNOWN_MODEL = "?"  # a step record with no model field
+
+
+@dataclass
+class MuseLogTally:
+    """One session log's model steps, per model: ``[input, cached, output, steps]``."""
+
+    size: int
+    mtime: int
+    models: dict[str, list[int]]
+
+
+@dataclass
+class MuseUsage:  # pylint: disable=too-many-instance-attributes  # a record, one field per figure
+    """What this machine spent on Muse Code, at the provider's list prices."""
+
+    captured_at: int  # Unix epoch seconds when ccc last walked the session logs
+    est_usd_total: float  # every priced step on this machine, all time
+    input_tokens: int  # all-time totals over every log (cached is a subset of input)
+    cached_tokens: int
+    output_tokens: int
+    steps: int  # model steps counted (muse's panel calls them Turns)
+    sessions: int  # session logs read, child sessions included
+    models: list[str]  # every model that answered, most-used first
+    unpriced: dict[str, int]  # model → steps that no price list covered (NOT in the sum)
+    logs: dict[str, MuseLogTally]  # per-log tallies, the incremental-scan cache
+
+
+def _muse_data_dir() -> Path:
+    """Where muse keeps its state — ``$CCC_MUSE_DATA`` wins, then XDG, then ~."""
+    if override := os.environ.get(_MUSE_DATA_ENV, "").strip():
+        return Path(override).expanduser()
+    base = os.environ.get("XDG_DATA_HOME", "").strip()
+    root = Path(base).expanduser() if base else Path.home() / ".local" / "share"
+    return root / "muse"
+
+
+def _muse_usage_path() -> Path:
+    return config.app_home() / "muse_usage.json"
+
+
+def _muse_prices(data_dir: Path) -> dict[str, tuple[float, float, float]]:
+    """Model id → (input, output, cached) USD per million tokens.
+
+    Muse's own catalog cache wins row by row; the built-in table fills in a model it does
+    not name. A malformed catalog is simply not a catalog — the fallback still applies,
+    because a price we could not read is not evidence that the tokens were free.
+    """
+    prices = dict(_MUSE_FALLBACK_PRICES)
+    catalog_dir = data_dir / "model-catalog"
+    try:
+        files = sorted(catalog_dir.glob("*.json"))
+    except OSError:
+        return prices
+    for path in files:
+        data = _load_json_dict(path)
+        for row in (data or {}).get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            cost = row.get("cost")
+            model = str(row.get("model_id") or "")
+            if not model or not isinstance(cost, dict):
+                continue
+            try:
+                prices[model] = (
+                    float(cost.get("input", 0) or 0),
+                    float(cost.get("output", 0) or 0),
+                    float(cost.get("cached", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                continue
+    return prices
+
+
+def _muse_step_cost(tally: list[int], price: tuple[float, float, float] | None) -> float | None:
+    """USD for one ``[input, cached, output, steps]`` tally, or ``None`` when unpriced.
+
+    Cached tokens are billed at the cached rate INSTEAD of the input rate — they are a
+    subset of the input count, so they are taken out of it first. Clamped, because a
+    provider bug that reported more cached than input tokens must not produce a refund.
+    """
+    if price is None:
+        return None
+    inp, cached, out, _steps = tally
+    cached = max(0, min(cached, inp))
+    per_in, per_out, per_cached = price
+    return ((inp - cached) * per_in + cached * per_cached + out * per_out) / 1_000_000
+
+
+def _muse_read_log(path: Path) -> dict[str, list[int]] | None:
+    """Tally one session log's model steps per model, or ``None`` if it cannot be read.
+
+    Only lines carrying :data:`_MUSE_STEP_MARKER` are decoded. A line that has the marker
+    but is not a step record (a compaction frame quoting one, a future record type) is
+    skipped by the ``kind`` check, so the marker is a pre-filter and never the verdict.
+    """
+    models: dict[str, list[int]] = {}
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if _MUSE_STEP_MARKER not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                event = (record.get("payload") or {}).get("event") or {}
+                if not isinstance(event, dict) or event.get("kind") != "model_completed":
+                    continue
+                usage = event.get("usage") or {}
+                if not isinstance(usage, dict):
+                    continue
+                tally = models.setdefault(
+                    str(event.get("model") or _MUSE_UNKNOWN_MODEL), [0, 0, 0, 0]
+                )
+                tally[0] += _int_field(usage, "input_tokens")
+                tally[1] += _int_field(usage, "cached_tokens")
+                tally[2] += _int_field(usage, "output_tokens")
+                tally[3] += 1
+    except OSError:
+        return None
+    return models
+
+
+def _muse_session_logs(data_dir: Path) -> list[Path] | None:
+    """Every session log under *data_dir*, child sessions included; ``None`` = no store."""
+    root = data_dir / "sessions"
+    if not root.is_dir():
+        return None
+    try:
+        return sorted(root.rglob(_MUSE_SESSION_LOG))
+    except OSError:
+        return None
+
+
+def _muse_totals(
+    logs: dict[str, MuseLogTally], prices: dict[str, tuple[float, float, float]]
+) -> tuple[float, list[int], list[str], dict[str, int]]:
+    """Fold per-log tallies into ``(usd, [input, cached, output, steps], models, unpriced)``."""
+    by_model: dict[str, list[int]] = {}
+    for entry in logs.values():
+        for model, tally in entry.models.items():
+            total = by_model.setdefault(model, [0, 0, 0, 0])
+            for index, value in enumerate(tally[:4]):
+                total[index] += int(value)
+    usd = 0.0
+    grand = [0, 0, 0, 0]
+    unpriced: dict[str, int] = {}
+    for model, tally in by_model.items():
+        for index, value in enumerate(tally):
+            grand[index] += value
+        cost = _muse_step_cost(tally, prices.get(model))
+        if cost is None:
+            unpriced[model] = tally[3]
+        else:
+            usd += cost
+    models = sorted(by_model, key=lambda name: -by_model[name][3])
+    return usd, grand, models, unpriced
+
+
+def fetch_muse_usage(now: int | None = None) -> MuseUsage | None:
+    """Re-walk muse's session logs and refresh the cache; ``None`` when there is no store.
+
+    Never raises: a missing data directory, an unreadable log or a half-written line all
+    degrade — a log that cannot be read keeps its previous tally when it has one and is
+    otherwise left out — because a provider we briefly could not measure must fall to
+    ``unknown``, never to blocked.
+    """
+    now = int(time.time()) if now is None else now
+    data_dir = _muse_data_dir()
+    paths = _muse_session_logs(data_dir)
+    if paths is None:
+        return None
+    kept = _load_muse_cache()
+    previous = kept.logs if kept is not None else {}
+    logs: dict[str, MuseLogTally] = {}
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        key = str(path.relative_to(data_dir))
+        size, mtime = int(stat.st_size), int(stat.st_mtime)
+        old = previous.get(key)
+        if old is not None and old.size == size and old.mtime == mtime:
+            logs[key] = old
+            continue
+        tallied = _muse_read_log(path)
+        if tallied is None:
+            if old is not None:
+                logs[key] = old
+            continue
+        logs[key] = MuseLogTally(size=size, mtime=mtime, models=tallied)
+    usd, grand, models, unpriced = _muse_totals(logs, _muse_prices(data_dir))
+    snap = MuseUsage(
+        captured_at=now,
+        est_usd_total=round(usd, 6),
+        input_tokens=grand[0],
+        cached_tokens=grand[1],
+        output_tokens=grand[2],
+        steps=grand[3],
+        sessions=len(logs),
+        models=models,
+        unpriced=unpriced,
+        logs=logs,
+    )
+    _write_muse_usage(snap)
+    return snap
+
+
+def _write_muse_usage(snap: MuseUsage) -> None:
+    path = _muse_usage_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _flock(path.with_name(path.name + ".lock")):
+            _atomic_write_json(path, asdict(snap))
+    except OSError:
+        pass
+
+
+def _load_muse_cache() -> MuseUsage | None:
+    data = _load_json_dict(_muse_usage_path())
+    if data is None:
+        return None
+    try:
+        logs = {
+            str(key): MuseLogTally(
+                size=int(entry.get("size", 0) or 0),
+                mtime=int(entry.get("mtime", 0) or 0),
+                models={
+                    str(model): [int(v) for v in tally]
+                    for model, tally in (entry.get("models") or {}).items()
+                },
+            )
+            for key, entry in (data.get("logs") or {}).items()
+            if isinstance(entry, dict)
+        }
+        return MuseUsage(
+            captured_at=_int_field(data, "captured_at"),
+            est_usd_total=float(data.get("est_usd_total", 0) or 0),
+            input_tokens=_int_field(data, "input_tokens"),
+            cached_tokens=_int_field(data, "cached_tokens"),
+            output_tokens=_int_field(data, "output_tokens"),
+            steps=_int_field(data, "steps"),
+            sessions=_int_field(data, "sessions"),
+            models=[str(m) for m in data.get("models") or []],
+            unpriced={str(k): int(v) for k, v in (data.get("unpriced") or {}).items()},
+            logs=logs,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def read_muse_usage(now: int | None = None, refresh_sec: float | None = None) -> MuseUsage | None:
+    """This machine's Muse spend, from cache, re-walking the logs when that has aged out.
+
+    Local files, so — like the OpenCode reader — no daemon and no opt-in switch: a walk
+    costs one ``stat`` per session log plus a read of the logs that grew since last time,
+    and the cache keeps even that off the common path.
+    """
+    now = int(time.time()) if now is None else now
+    if refresh_sec is None:
+        refresh_sec = float(config.load_config().muse_usage_refresh_sec)
+    cached = _load_muse_cache()
+    if cached is not None and not muse_usage_stale(refresh_sec, now):
+        return cached
+    return fetch_muse_usage(now) or cached
+
+
+def muse_usage_stale(refresh_sec: float, now: int | None = None) -> bool:
+    """True if the spend cache is missing or older than ``refresh_sec`` (mtime-based)."""
+    now = int(time.time()) if now is None else now
+    try:
+        mtime = _muse_usage_path().stat().st_mtime
+    except OSError:
+        return True
+    return (now - int(mtime)) >= refresh_sec

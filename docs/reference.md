@@ -2201,6 +2201,7 @@ ccc quota -c copilot            # clear a block (also the only way to lift a hol
 ccc quota -c claude-priv -O     # observed-only clear: lifts a rejection, never a hold
 ccc quota -C 15                 # record the OpenCode Zen balance you read in the console
 ccc quota -P                    # ask the OpenCode free tier for one reply (its only meter)
+ccc quota -p muse               # the Muse Code row: muse's own est. cost against muse_budget_usd
 ```
 
 ### Two vocabularies: what you read and what machines key on
@@ -2313,6 +2314,61 @@ ccc quota -C 15                                 # the balance you just read in t
 These rows are **visibility only**: no rung in `ai.py`'s ladder, no `_ORACLE_IDS` entry, no
 TUI usage card.
 
+### The Muse Code row — `muse`
+
+One rung for Meta's Muse Code CLI (`muse`; the name is the command, so the row carries no
+alias), painted in Meta-magenta (`usage._MUSE_ACCENT`). Muse publishes no account meter,
+but — unlike Zen — it **writes down everything the estimate needs, on this machine**
+(researched 2026-09-20 on muse 1.3.0):
+
+- every model step is a `runtime.session` record in that session's `session.jsonl`
+  (`~/.local/share/muse/sessions/<yyyy>/<mm>/<dd>/<id>/`, or `$CCC_MUSE_DATA`) whose
+  `event.kind == "model_completed"` carries the provider's own token counts and the model
+  that answered (`input_tokens`, `cached_tokens` — a **subset** of input, the OpenAI shape;
+  muse's own `/usage` panel confirms it: `Total` is Input + Output — `output_tokens`,
+  `reasoning_tokens`);
+- the provider's price list is cached verbatim by muse in `model-catalog/*.json`
+  (`rows[].cost = {input, output, cached}`, USD per million tokens; the contributor model
+  `muse-spark-1.3-contributor` is $0.10 / $0.20 / $0.002, the full-price
+  `muse-spark-1.3` $1.25 / $4.25 / $0.15). `usage._MUSE_FALLBACK_PRICES` carries that
+  catalog as of 2026-09-20 for a machine whose muse has never fetched one; the cached
+  catalog wins row by row.
+
+So the row's figure **is muse's own `Cost (USD, est.)`** — `(input − cached)·p_in +
+cached·p_cached + output·p_out` per step — summed over **every** session log on this
+machine and measured against `muse_budget_usd` (default `$20`, `0` = no bar):
+
+```
+✅ muse  available  0m  ░░░░░░░░░budget░░░░░░░░░░0% —  $0.01 of $20.00 spent here (est.) — 98k in / 2k out over 5 steps in 7 sessions · muse-spark-1.3-contributor
+```
+
+Two things the sum does that muse's per-session panel does not: it **includes the hidden
+child sessions** (the memory/skill "reminder" agents muse spawns beside a turn log their
+own steps under `<session>/subagent/<id>/session.jsonl`; the panel says `Subagents: none`,
+the bill does not), and it spans sessions. Its limits are the panel's own: list prices
+(`est.`), this machine only (`here` — a session on another machine or one run with
+`--no-session-log` leaves nothing to count), and a step whose model no price list names
+is counted in tokens and **named in the reason** (`unpriced steps NOT in the sum: …`),
+never priced as free.
+
+The verdict rules differ from the Zen wallet's on purpose. A fresh reading under the cap
+is **`available`**: the meter is the provider's own counts at the provider's own prices,
+complete for this machine, and the only thing the user supplies is the line to measure
+them against — where half the Zen wallet's burn is invisible and it must stay `unknown`.
+Reaching the cap **blocks as local policy** (`blocked_by="budget"`, no reset: nothing
+renews a budget but a bigger number, so the window is named `budget`, is absent from
+`_RENEW_WINDOWS`, and the renew field shows `—`); 90 % is `risky`; a reading older than a
+day is `unknown`. A recorded refusal (`ccc quota -m muse -u …`) outranks the meter and the
+measured bar still rides along behind it.
+
+The walk is **incremental**: session logs are append-only, so a log whose `(size, mtime)`
+match the cache (`muse_usage.json` under the app home) is not reopened, and only lines
+carrying `"model_completed"` are ever JSON-decoded — a log is dominated by ~100 KB
+instruction records. What is cached per log is its token tally **per model**, never a
+dollar figure, so a catalog update re-prices history without re-reading it. Re-walked at
+most every `muse_usage_refresh_sec` (900 s). Like the Zen rows, this one is **visibility
+only**: no ladder rung, no `_ORACLE_IDS` entry, no TUI usage card.
+
 ### `renew` — by when must I spend this?
 
 The field after the bars answers the question a percentage cannot: **when does this
@@ -2351,7 +2407,8 @@ to the cards' own `usage._bar`).
 Each provider fills the two slots from its own windows (`quota.BAR_SLOTS`): Claude and
 Codex from `five_hour` / `seven_day`, Antigravity from `gemini_week`. A provider whose kind
 is in `quota.BAR_SPAN_KINDS` has **one** allowance rather than two and gets a single bar
-across both columns — that is Copilot, whose budget is a month; squeezing a month into the
+across both columns — that is Copilot, whose budget is a month, the Zen wallet (`balance`)
+and Muse Code's spending cap (`budget`); squeezing a month into the
 "week" cell and leaving "session" blank would describe a provider with two horizons when it
 has one. A slot with no window of its own draws an empty bar reading `0%`, not a dash: both
 say "nothing measured here", but the bar keeps the column's shape. The one exception is a

@@ -133,6 +133,13 @@ from . import config, seat_rota, usage
 # reaching that cap blocks it as LOCAL POLICY (``blocked_by="budget"``), not as provider
 # exhaustion. A consumer that iterates rows reads them with the usual field set; one
 # that looks providers up by name never sees them.
+# v2 stayed v2 on 2026-09-20 for the Muse Code rung, same reason — ONE NEW ROW: ``providers``
+# gains ``muse`` (kind ``muse``, no seat, so ``display`` is ``muse`` and there is no
+# ``command``: the name IS the command). Its one window is ``budget`` — muse's own
+# per-step token records priced at the provider's own catalog, summed over every session
+# log on this machine, against ``muse_budget_usd`` — and reaching the cap blocks the row
+# as LOCAL POLICY (``blocked_by="budget"``), like the Zen wallet. With the cap at 0 the
+# row still appears, spend as prose, no bar.
 SCHEMA_VERSION = 2
 
 # Provider states. Only BLOCKED may remove a rung from a ladder; UNKNOWN deliberately
@@ -212,6 +219,15 @@ _OPENCODE_ROWS: tuple[tuple[str, str], ...] = (
 # day of calls could have been made — same 24 h reasoning as Copilot and Antigravity.
 _OPENCODE_STALE_AFTER_SEC = 24 * 3600
 
+# Muse Code is ONE rung: a single login, a single price list, and every step it bills
+# is in its own session logs on this machine. What `ccc quota` follows is the figure
+# muse's `/usage` panel calls `Cost (USD, est.)` — the provider's token counts at the
+# provider's list prices — summed over EVERY session log (hidden child sessions
+# included, which the per-session panel omits) and measured against `muse_budget_usd`.
+# The reading is local and complete for this machine; its 24 h staleness rule is the
+# same as the other spend meters' — a figure older than that predates a day of calls.
+_MUSE_STALE_AFTER_SEC = 24 * 3600
+
 # ── The report's two bars ────────────────────────────────────────────────────
 #
 # `ccc quota`'s text report draws the SAME two bars the TUI usage cards draw — a session
@@ -248,8 +264,8 @@ BAR_SLOTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # Keyed on the KIND, not on which windows happen to be present, so a row with no figures
 # at all (blocked by an observed 429 before any meter was read) still draws its one empty
 # bar instead of briefly turning into a two-window provider.
-BAR_SPAN_KINDS: tuple[str, ...] = ("copilot", "agy", "opencode")
-BAR_SPAN_WINDOWS: tuple[str, ...] = ("credits", "gemini_week", "claudegpt_week", "wallet")
+BAR_SPAN_KINDS: tuple[str, ...] = ("copilot", "agy", "opencode", "muse")
+BAR_SPAN_WINDOWS: tuple[str, ...] = ("credits", "gemini_week", "claudegpt_week", "wallet", "budget")
 # What a SPANNING bar says when the provider has no window to draw at all. Without it
 # such a row shows an empty bar embossed `0%`, which reads as "nothing spent" when the
 # truth is "nothing is measured" — the opposite claim, and the one that would send a
@@ -266,6 +282,9 @@ BAR_HORIZON: dict[str, str] = {
     # word still belongs in the bar, because "37 %" of an unnamed thing is unreadable —
     # it just names a POT rather than a horizon.
     "wallet": "balance",
+    # Also not a period: a spending cap the user named, against which every dollar this
+    # machine's muse sessions cost is counted. Nothing renews it but a bigger number.
+    "budget": "budget",
     "seven_day": "weekly",
     "gemini_week": "weekly",
     "claudegpt_week": "weekly",
@@ -411,7 +430,8 @@ def canonical_id(name: str) -> str:
 def seat_color(pid: str, kind: str, account: str = "") -> str:
     """The hex accent a provider row is painted in — the SAME colour its TUI usage card
     is drawn in: gold for the private Claude seat, blue for the work one, OpenAI-green
-    for Codex, violet for Copilot, the two Antigravity buckets in their own olive pair.
+    for Codex, violet for Copilot, the two Antigravity buckets in their own olive pair,
+    Meta-magenta for Muse Code.
 
     Published on every ``-j`` provider row as ``color`` so that a consumer painting the
     same seat (``ai logs``, ``ai routing``) reads the value from here instead of keeping
@@ -426,6 +446,8 @@ def seat_color(pid: str, kind: str, account: str = "") -> str:
         return usage._COPILOT_FILL  # noqa: SLF001
     if kind == "agy":
         return usage._AGY_GPT_ACCENT if pid == "agy:gpt" else usage._AGY_ACCENT  # noqa: SLF001
+    if kind == "muse":
+        return usage._MUSE_ACCENT  # noqa: SLF001
     return ""
 
 
@@ -449,8 +471,9 @@ def seat_command(pid: str) -> str:
 class ProviderQuota:
     """One provider (or one Claude account) resolved to a state, with its evidence."""
 
-    id: str  # "copilot" | "codex[:private]" | "gemini" | "agy" | "claude:<account>"
-    kind: str  # "copilot" | "codex" | "gemini" | "agy" | "claude"
+    # "copilot" | "codex[:private]" | "agy[:gpt]" | "opencode:<seat>" | "muse" | "claude:<account>"
+    id: str
+    kind: str  # "copilot" | "codex" | "agy" | "opencode" | "muse" | "claude"
     state: str  # AVAILABLE | BLOCKED | UNKNOWN | DISABLED
     reason: str = ""  # human explanation, always set for non-available states
     source: str = ""  # where the verdict came from: "cooldown" | "meter" | "windows" | "config"
@@ -2113,6 +2136,107 @@ def _opencode_quotas(now: int, cooldowns: dict[str, dict]) -> list[ProviderQuota
     return rows
 
 
+def _muse_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
+    """The Muse Code rung: muse's own ``Cost (USD, est.)`` against ``muse_budget_usd``.
+
+    The figure is the one thing in this module that is both LOCAL and COMPLETE for this
+    machine: muse records every model step's token counts itself and caches the
+    provider's price list beside them (see :func:`usage.read_muse_usage`), so the sum is
+    muse's own estimate, not ccc's — over every session log, child sessions included.
+    That is why a fresh reading under the cap is ``available`` here where the Zen wallet
+    (half of whose burn is invisible) stays ``unknown``: the meter is the provider's own
+    counts at the provider's own prices, and the only thing the user supplies is the
+    line to measure them against.
+
+    What it still is NOT: a provider fact. The cap is local policy, so reaching it blocks
+    with ``blocked_by="budget"`` and no reset — nothing renews a budget but a bigger
+    number — and the row says ``est.`` because the prices are list prices, and ``here``
+    because a session on another machine, or one run with ``--no-session-log``, leaves
+    nothing to count. A step whose model no price list names is counted in tokens and
+    NAMED in the reason, never priced as free.
+    """
+    pid, kind = "muse", "muse"
+    row = _muse_measured(pid, kind, now)
+    # A recorded refusal or hold outranks the meter — it is the only place a real
+    # deadline can come from — but the measured window still rides along (see
+    # :func:`_cooldown_quota`), so a blocked row does not draw an empty bar.
+    if pid in cooldowns:
+        return _cooldown_quota(pid, kind, cooldowns[pid], row.windows)
+    return row
+
+
+def _muse_measured(pid: str, kind: str, now: int) -> ProviderQuota:
+    """The Muse row from the meter alone — see :func:`_muse_quota` for the verdict rules."""
+    budget = float(config.load_config().muse_budget_usd)
+    snap = usage.read_muse_usage(now)
+    if snap is None:
+        return ProviderQuota(
+            id=pid,
+            kind=kind,
+            state=UNKNOWN,
+            reason="no muse session logs on this machine (~/.local/share/muse/sessions)",
+            source="meter",
+        )
+    spent = _opencode_money(snap.est_usd_total)
+    tokens = f"{_muse_count(snap.input_tokens)} in / {_muse_count(snap.output_tokens)} out"
+    models = ", ".join(snap.models[:2]) + (" …" if len(snap.models) > 2 else "")
+    tail = f"{tokens} over {snap.steps} steps in {snap.sessions} sessions"
+    if models:
+        tail += f" · {models}"
+    if snap.unpriced:
+        named = ", ".join(f"{count} of {model}" for model, count in snap.unpriced.items())
+        tail += f" · unpriced steps NOT in the sum: {named}"
+    if budget <= 0:
+        return ProviderQuota(
+            id=pid,
+            kind=kind,
+            state=UNKNOWN,
+            reason=f"{spent} spent here (est.) — {tail}; set muse_budget_usd for a bar",
+            source="meter",
+            captured_at=snap.captured_at,
+        )
+    used_pct = max(0.0, min(100.0, snap.est_usd_total / budget * 100.0))
+    window = WindowState(
+        name="budget",
+        used_pct=used_pct,
+        resets_at=0,
+        stale=(snap.captured_at + _MUSE_STALE_AFTER_SEC) < now,
+        evidence_at=snap.captured_at,
+    )
+    detail = f"{spent} of {_opencode_money(budget)} spent here (est.) — {tail}"
+    if window.exhausted:
+        return ProviderQuota(
+            id=pid,
+            kind=kind,
+            state=BLOCKED,
+            reason=f"budget reached: {detail}",
+            source="meter",
+            windows={"budget": window},
+            blocked_by="budget",
+            captured_at=snap.captured_at,
+            risky=True,
+        )
+    return ProviderQuota(
+        id=pid,
+        kind=kind,
+        state=UNKNOWN if window.stale else AVAILABLE,
+        reason=(f"stale reading — {detail}" if window.stale else detail),
+        source="meter",
+        windows={"budget": window},
+        captured_at=snap.captured_at,
+        risky=window.risky,
+    )
+
+
+def _muse_count(tokens: int) -> str:
+    """``61k`` / ``1.2M`` — a token count sized for one table cell."""
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.1f}M"
+    if tokens >= 1_000:
+        return f"{tokens / 1_000:.0f}k"
+    return str(tokens)
+
+
 def snapshot(
     *, model: str = "", now: int | None = None, accounts: list[str] | None = None
 ) -> dict[str, Any]:
@@ -2146,6 +2270,7 @@ def snapshot(
         *claude,
         *_agy_quotas(now, cooldowns),
         *_opencode_quotas(now, cooldowns),
+        _muse_quota(now, cooldowns),
     ]
     best = next((q.id for q in claude if q.state == AVAILABLE), "")
     result: dict[str, Any] = {

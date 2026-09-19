@@ -141,6 +141,14 @@ DEFAULTS: dict[str, object] = {
     # streams the output and stops at the first decisive line.
     "opencode_probe_timeout_sec": 150,  # cap on one -P probe
     "opencode_probe_ttl_sec": 3600,  # how long a probe's verdict governs the free row
+    # Muse Code (Meta's CLI): no account meter, but every model step it makes is written
+    # to its own session logs with the provider's token counts, and the provider's price
+    # list is cached beside them — so `ccc quota` sums muse's own `Cost (USD, est.)` over
+    # every session on this machine. `muse_budget_usd` is what that sum is measured
+    # against: the bar's denominator, and reaching it BLOCKS the row as local policy
+    # (`blocked_by="budget"`). 0 = no bar, spend reported as text only.
+    "muse_budget_usd": 20.0,  # what Muse spend is measured against, in USD (0 = no bar)
+    "muse_usage_refresh_sec": 900,  # min sec between walks of muse's session logs
     # Claude /usage OAuth fetch: keep each account's usage card in step with `claude`'s
     # own /usage (incl. any weekly model-scoped window the status line never carries) by
     # fetching the OAuth usage endpoint out-of-band (reads the CLI's keychain token).
@@ -885,6 +893,10 @@ class Config:
     opencode_free_model: str = "muse-spark-1.3-contributor-free"
     opencode_probe_timeout_sec: int = 150
     opencode_probe_ttl_sec: int = 3600
+    # What Muse Code spend is measured against, in USD — the `budget` bar's denominator
+    # and the local-policy block line. 0 = no bar. See DEFAULTS.
+    muse_budget_usd: float = 20.0
+    muse_usage_refresh_sec: int = 900
     claude_usage: bool = False  # fetch the Claude /usage OAuth endpoint (INERT: off)
     claude_usage_refresh_sec: int = 600
     claude_usage_refresh_active_sec: int = 200

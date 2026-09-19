@@ -3512,8 +3512,10 @@ def _quota_bar_cells(prov: dict[str, Any], *, color: bool) -> tuple[str, set[str
        place too many.
     2. **A single-allowance provider** (:data:`quota.BAR_SPAN_KINDS`) spans both columns,
        centred on the period it renews over — `monthly` for Copilot's credit budget,
-       `weekly` for Antigravity's. Without that word a percentage is a fraction of an
-       unnamed thing; where there is no window at all (OpenCode Zen publishes no meter)
+       `weekly` for Antigravity's — or on the POT it draws from where nothing renews it:
+       `balance` for the Zen wallet, `budget` for Muse Code's spending cap. Without that
+       word a percentage is a fraction of an unnamed thing; where there is no window at
+       all (OpenCode Zen publishes no meter)
        the word comes from :data:`quota.BAR_SPAN_EMPTY` and the percentage is dropped,
        because `0%` would claim a measurement nobody made.
     3. **Everything else** fills the session and week slots of :data:`quota.BAR_SLOTS`,
@@ -3617,8 +3619,8 @@ def _quota_renew(prov: dict[str, Any], now: int) -> tuple[str, int, str]:
 
     One field per row, from the LONGEST horizon it has (:data:`_RENEW_WINDOWS`) — the
     allowance that is use-it-or-lose-it. A row with no such window (an unmetered rung, a
-    prepaid wallet, a seat blocked before anything was measured) renews at no knowable
-    time and says so with a dash rather than a guess.
+    prepaid wallet, a spending cap, a seat blocked before anything was measured) renews at
+    no knowable time and says so with a dash rather than a guess.
 
     A window whose reset has already passed is not a renewal in the future; it is a stale
     reading, and reporting `renew 0m` from one would invite the reader to wait for an
