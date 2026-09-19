@@ -3437,24 +3437,18 @@ def _quota_name_color(prov: dict[str, Any]) -> str:
 
     A reader who has the cards open should not have to re-learn which row is which: gold
     is the private Claude seat on both, blue the work one, green Codex, violet Copilot.
-    `ai routing` paints its rungs from the same values, so one provider reads one colour
-    across all three surfaces. A kind with no card (none today) simply goes unpainted.
+    Read from the row's own ``color`` field (`quota.seat_color`, published on every `-j`
+    row) so this report is a consumer of the same contract `ai logs` / `ai routing`
+    paint from — one provider reads one colour across every surface, and an accent
+    changed in :mod:`usage` cannot land on one of them and not the others. A row without
+    the field (an older snapshot) falls back to the same rule.
     """
-    from . import usage  # pylint: disable=import-outside-toplevel
+    from . import quota  # pylint: disable=import-outside-toplevel
 
-    kind, pid = str(prov.get("kind", "")), str(prov.get("id", ""))
-    if kind == "claude":
-        work = str(prov.get("account", "")) == "work"
-        return usage._CLAUDE_WORK_ACCENT if work else usage._CLAUDE_ACCENT  # noqa: SLF001
-    return {
-        "codex": usage._CODEX_FILL,  # noqa: SLF001
-        "copilot": usage._COPILOT_FILL,  # noqa: SLF001
-    }.get(kind) or (
-        usage._AGY_GPT_ACCENT  # noqa: SLF001
-        if pid == "agy:gpt"
-        else usage._AGY_ACCENT  # noqa: SLF001
-        if kind == "agy"
-        else ""
+    if color := str(prov.get("color") or ""):
+        return color
+    return quota.seat_color(
+        str(prov.get("id", "")), str(prov.get("kind", "")), str(prov.get("account", ""))
     )
 
 

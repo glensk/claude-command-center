@@ -740,6 +740,31 @@ def test_snapshot_rows_carry_the_display_name_and_the_command() -> None:
         assert row.get("command", "") == quota.seat_command(pid)
 
 
+def test_snapshot_rows_carry_the_accent_the_report_paints_them_in() -> None:
+    """Additive `color`: the SAME hex the TUI card and the `ccc quota` table use, so
+    `ai logs` / `ai routing` paint a seat from the row instead of a palette copy."""
+    from command_center import cli, usage
+
+    # The rule itself, per kind (the fixture snapshot holds only some of these seats).
+    assert quota.seat_color("claude:private", "claude", "private") == usage._CLAUDE_ACCENT  # noqa: SLF001
+    assert quota.seat_color("claude:work", "claude", "work") == usage._CLAUDE_WORK_ACCENT  # noqa: SLF001
+    assert quota.seat_color("codex:private", "codex", "private") == usage._CODEX_FILL  # noqa: SLF001
+    assert quota.seat_color("copilot", "copilot") == usage._COPILOT_FILL  # noqa: SLF001
+    assert quota.seat_color("agy", "agy") == usage._AGY_ACCENT  # noqa: SLF001
+    assert quota.seat_color("agy:gpt", "agy") == usage._AGY_GPT_ACCENT  # noqa: SLF001
+    assert quota.seat_color("gemini", "gemini") == ""
+    # Every published row carries it, and the table reads the field, never a copy.
+    snap = quota.snapshot(now=NOW)
+    for row in snap["providers"]:
+        assert row.get("color", "") == quota.seat_color(
+            row["id"], row["kind"], row.get("account", "")
+        )
+        assert cli._quota_name_color(row) == row.get("color", "")  # noqa: SLF001
+    # An older snapshot without the field still resolves through the same rule.
+    legacy = {"id": "claude:work", "kind": "claude", "account": "work"}
+    assert cli._quota_name_color(legacy) == usage._CLAUDE_WORK_ACCENT  # noqa: SLF001
+
+
 # ── Google Antigravity (`agy`) ────────────────────────────────────────────────
 
 

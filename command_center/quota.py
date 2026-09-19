@@ -408,6 +408,27 @@ def canonical_id(name: str) -> str:
     return f"{kind}:{seat}"
 
 
+def seat_color(pid: str, kind: str, account: str = "") -> str:
+    """The hex accent a provider row is painted in — the SAME colour its TUI usage card
+    is drawn in: gold for the private Claude seat, blue for the work one, OpenAI-green
+    for Codex, violet for Copilot, the two Antigravity buckets in their own olive pair.
+
+    Published on every ``-j`` provider row as ``color`` so that a consumer painting the
+    same seat (``ai logs``, ``ai routing``) reads the value from here instead of keeping
+    a copy of the palette: change an accent in :mod:`usage` and every surface follows.
+    "" for a kind with no card (none today), which consumers leave unpainted.
+    """
+    if kind == "claude":
+        return usage._CLAUDE_WORK_ACCENT if account == "work" else usage._CLAUDE_ACCENT  # noqa: SLF001
+    if kind == "codex":
+        return usage._CODEX_FILL  # noqa: SLF001
+    if kind == "copilot":
+        return usage._COPILOT_FILL  # noqa: SLF001
+    if kind == "agy":
+        return usage._AGY_GPT_ACCENT if pid == "agy:gpt" else usage._AGY_ACCENT  # noqa: SLF001
+    return ""
+
+
 def seat_command(pid: str) -> str:
     """The shell command that opens a session on this seat, when it is not the
     display name itself — ``claude:work`` → ``cwork``, ``claude:private`` → ``cpriv``.
@@ -2232,6 +2253,10 @@ def _provider_dict(quota: ProviderQuota) -> dict[str, Any]:
     data["display"] = display_id(quota.id)
     if command := seat_command(quota.id):
         data["command"] = command
+    # ADDITIVE (2026-09-19): the accent the report paints this row in, so `ai logs` /
+    # `ai routing` colour the same seat identically without a second copy of the palette.
+    if color := seat_color(quota.id, quota.kind, quota.account):
+        data["color"] = color
     return {
         k: v for k, v in data.items() if v not in ("", 0, None, {}) or k in ("state", "id", "kind")
     }

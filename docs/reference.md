@@ -2215,7 +2215,11 @@ round-trip test), and **`-p`, `-m` and `-c` accept either spelling**, so a name 
 the report always addresses the right provider. Since 2026-09-18 each `-j` provider row
 also carries `display` (the human name) and, for a seat that has one, `command` (the shell
 alias) — additive, schema still v2 — so a consumer renders a report without re-deriving
-the rules. `ccc quota -b` is unchanged: it prints the bare Claude account LABEL (`work`),
+the rules. Since 2026-09-19 it also carries `color`: the hex accent the table paints the
+row's name in (`quota.seat_color` — the same value as the seat's TUI usage card), so a
+consumer that shows the same seat (`ai logs`, `ai routing`) reads the colour from the row
+instead of keeping a copy of the palette; change an accent in `usage.py` and every surface
+follows. `ccc quota -b` is unchanged: it prints the bare Claude account LABEL (`work`),
 which is what shell wrappers feed to `CLAUDE_CONFIG_DIR` logic. The `codex seats …` footer
 keeps naming SEAT LABELS (`default`/`private`/`de`) in its ranked ladder, because those are
 the tokens `ccc set codex-order` takes; only its `next attempt` is a provider id and is
