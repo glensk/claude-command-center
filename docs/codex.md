@@ -411,6 +411,36 @@ also never promote a probe — an unmeasured seat is a read-only experiment. A `
 binds to exactly one seat, so it gets NO floor and no headroom filter: there is no second
 seat to move to, and the documented trade-off is a possible `SEAT-REFUSED-MIDRUN` review.
 
+### The run ledger — `codex-runs.jsonl`
+
+Every round that goes through the runner (`run`, `delegate`, the short-AIM helper — every
+Codex call in ccc) appends one line per **physical** attempt to
+`~/.claude/command-center/codex-runs.jsonl` once it has returned (`codex_ledger.py`,
+2026-09-21). A skipped seat is not spend and is not written; a refusal IS a round trip the
+seat was asked to bill and is written with its outcome. Each line carries the seat label
+and oracle id, the caller's `-p` purpose, `outcome`/`ok`, wall `ms`, model and effort, the
+prompt size, the `usage` codex reported on `turn.completed` (`tokens_in`/`tokens_out`),
+the working directory, the Claude session (`CLAUDE_CODE_SESSION_ID`) and, on the last
+attempt of a failed round, the runner's message — enough to answer *"did this Mac spend
+the shared seat at 10:33, and on what?"*, which before the ledger only file mtimes could,
+because an `--ephemeral` run leaves no rollout and `codex-seat-attempts.json` keeps one
+stamp per seat.
+
+```json
+{"ts":"2026-09-21T10:33:39+02:00","seat":"default","id":"codex","purpose":"checker",
+ "outcome":"ok","ok":true,"ms":6100,"model":"gpt-5.6-sol","effort":"xhigh",
+ "prompt_chars":4321,"write":false,"cwd":"/…/sdsc-automations","session":"",
+ "tokens_in":15175,"tokens_out":5}
+```
+
+Two readers: **`ccc quota`** stamps each Codex row with its `last_run` (`ts`, `age_s`,
+`purpose`, `outcome`, `ok`, `ms`, `runs_24h`) and prints it in the windows column —
+`last run 58m ago · checker · 6s (3 in 24h)`, a failed attempt suffixed with its outcome —
+and publishes the file's path as `codex_runs_log` on `-j`; **`ai logs`** (ai.py)
+reads that path and merges the lines under the seat names it already prints, so
+`ai logs codex-work` lists them next to ai.py's own calls. Append-only and best-effort:
+an unwritable ledger never fails or delays the Codex call it would have described.
+
 ### Progress watchdog and the sleep guard
 
 Why: on 2026-09-07 an unattended debate round hung seven hours — the laptop idle-slept

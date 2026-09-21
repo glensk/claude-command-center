@@ -3459,6 +3459,29 @@ def _pad_cells(text: str, width: int) -> str:
     return text + " " * max(0, width - cell_len(text))
 
 
+def _quota_last_run_note(prov: dict[str, Any]) -> str:
+    """``last run 58m ago · checker · 6s`` from the row's ``last_run`` (Codex seats), or "".
+
+    A failed attempt is marked (``refused:quota``) because it is still a round trip the
+    seat was asked for; a day with more than one attempt says how many (``3 in 24h``).
+    """
+    from . import usage  # pylint: disable=import-outside-toplevel
+
+    run = prov.get("last_run")
+    if not isinstance(run, dict) or not run:
+        return ""
+    parts = [f"last run {usage._format_age(int(run.get('age_s') or 0))} ago"]  # noqa: SLF001
+    if purpose := str(run.get("purpose") or ""):
+        parts.append(purpose)
+    parts.append(f"{int(run.get('ms') or 0) / 1000:.0f}s")
+    if not run.get("ok"):
+        parts.append(str(run.get("outcome") or "failed"))
+    note = " · ".join(parts)
+    if int(run.get("runs_24h") or 0) > 1:
+        note += f" ({run['runs_24h']} in 24h)"
+    return note
+
+
 def _quota_age(prov: dict[str, Any], now: int) -> str:
     """How old the evidence behind this row's verdict is.
 
@@ -3883,6 +3906,11 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
             detail = reason
         if unblock_note:
             detail = f"{unblock_note} · {detail}" if detail else unblock_note
+        # What THIS machine last launched on a Codex seat (the run ledger), so a usage
+        # figure can be read against our own spend: a 2 % window nobody here opened is
+        # another user of the shared login, not a mystery.
+        if last_run := _quota_last_run_note(prov):
+            detail = f"{detail} · {last_run}" if detail else last_run
         if prov.get("email"):
             detail = f"{detail}  [{prov['email']}]" if detail else f"[{prov['email']}]"
         # The name carries the seat's own shell command when that is not the name

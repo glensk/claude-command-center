@@ -72,7 +72,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from . import config, seat_rota, usage
+from . import codex_ledger, config, seat_rota, usage
 
 # Schema version of the ``snapshot()`` payload / ``ccc quota --json`` contract. Consumers
 # (notably the ``ai.py`` commit-message ladder) MUST refuse a version they do not know
@@ -501,6 +501,12 @@ class ProviderQuota:
     # Empty for every seat that is on no rota (and dropped from the JSON by
     # :func:`_provider_dict`), so a machine without one sees exactly today's payload.
     rota: dict[str, Any] = field(default_factory=dict)
+    # Codex seats only (2026-09-21): the seat's newest PHYSICAL attempt from the run
+    # ledger (:mod:`codex_ledger`) — ``{"ts", "age_s", "purpose", "outcome", "ok", "ms",
+    # "runs_24h"}`` — so ``ccc quota`` can say "last run 58m ago · checker · 6s" and a
+    # spike in a shared seat's usage can be checked against what THIS machine launched.
+    # Additive and dropped when empty; never an input to the state.
+    last_run: dict[str, Any] = field(default_factory=dict)
 
 
 def _cooldowns_path() -> Path:
@@ -1435,6 +1441,21 @@ def _codex_quotas(now: int, cooldowns: dict[str, dict]) -> list[ProviderQuota]:
     return rows
 
 
+def _attach_last_runs(rows: list[ProviderQuota], now: int) -> None:
+    """Stamp each Codex row with its newest ledger attempt (``last_run``); no-op without one.
+
+    Read once per snapshot, never fatal: a corrupt or missing ledger leaves the rows as
+    they were — the ledger is evidence for a person, not an input to any verdict.
+    """
+    try:
+        runs = codex_ledger.last_runs(codex_ledger.read_runs(), now)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return
+    for row in rows:
+        if row.id in runs:
+            row.last_run = runs[row.id]
+
+
 def _codex_pin_label(homes: dict[str, Path]) -> str:
     """The label of an ACTIVE codex-in-claude account pin, or ``""``.
 
@@ -2257,6 +2278,7 @@ def snapshot(
 
     homes = _canonical_codex_homes()
     codex_rows = _codex_quotas(now, cooldowns)
+    _attach_last_runs(codex_rows, now)
     pin_label = _codex_pin_label(homes)
     configured = config.codex_seat_order()
     policy = config.codex_seat_policy()
@@ -2290,6 +2312,10 @@ def snapshot(
         # strict "order". Consumers render it so a surprising next attempt is legible.
         "codex_seat_policy": policy,
         "codex_seat_order": _seat_order_rows(codex_rows, order, ranks, pin_label),
+        # ADDITIVE (2026-09-21): where the Codex run ledger lives, so a consumer that
+        # wants the rows themselves (`ai logs`) reads the file ccc writes instead of
+        # guessing its home. Each Codex provider row carries its own `last_run` summary.
+        "codex_runs_log": str(codex_ledger.ledger_path()),
         "providers": [_provider_dict(q) for q in providers],
     }
     if unknown_labels:
@@ -2420,6 +2446,7 @@ def _rehydrate(raw: dict[str, Any]) -> ProviderQuota:
         # Without this a round-tripped row lost its rota, so ``ccc quota -p codex`` (which
         # goes through the serialized form) would report a rota block with no rota (O11).
         rota=dict(raw.get("rota") or {}),
+        last_run=dict(raw.get("last_run") or {}),
     )
 
 

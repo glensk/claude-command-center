@@ -2220,7 +2220,11 @@ the rules. Since 2026-09-19 it also carries `color`: the hex accent the table pa
 row's name in (`quota.seat_color` — the same value as the seat's TUI usage card), so a
 consumer that shows the same seat (`ai logs`, `ai routing`) reads the colour from the row
 instead of keeping a copy of the palette; change an accent in `usage.py` and every surface
-follows. `ccc quota -b` is unchanged: it prints the bare Claude account LABEL (`work`),
+follows. Since 2026-09-21 a Codex row also carries `last_run` — the seat's newest physical
+attempt from the run ledger (`ts`, `age_s`, `purpose`, `outcome`, `ok`, `ms`, `runs_24h`;
+absent for a seat never launched here), which the table prints as `last run 58m ago ·
+checker · 6s` — and the payload's top level carries `codex_runs_log`, the ledger's path
+(`docs/codex.md` § "The run ledger"). `ccc quota -b` is unchanged: it prints the bare Claude account LABEL (`work`),
 which is what shell wrappers feed to `CLAUDE_CONFIG_DIR` logic. The `codex seats …` footer
 keeps naming SEAT LABELS (`default`/`private`/`de`) in its ranked ladder, because those are
 the tokens `ccc set codex-order` takes; only its `next attempt` is a provider id and is

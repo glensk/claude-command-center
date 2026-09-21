@@ -130,7 +130,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
-from . import brokenpipe, codex_launch
+from . import brokenpipe, codex_launch, codex_ledger
 
 if TYPE_CHECKING:  # pragma: no cover - runtime import is local: quota imports THIS module
     from . import quota, seat_rota
@@ -3661,6 +3661,12 @@ class RunAttempt:
     # reading) | "skipped:below-floor" (-F/--min-remaining) | "skipped:reserve" /
     # "skipped:unknown" (-H/--headroom)
     outcome: str
+    # What codex reported on its ``turn.completed`` event (0 when the run never got
+    # there), and when the attempt ENDED — an attempt is recorded after the fact, so the
+    # construction time is its end. Both feed the run ledger (:mod:`codex_ledger`).
+    tokens_in: int = 0
+    tokens_out: int = 0
+    ended_at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -3697,6 +3703,25 @@ def _events_show_side_effects(events: list[dict]) -> bool:
         if itype not in _BENIGN_ITEM_TYPES:
             return True
     return False
+
+
+def _turn_usage(events: list[dict]) -> tuple[int, int]:
+    """``(input_tokens, output_tokens)`` summed over the ``turn.completed`` events, or zeros.
+
+    The stream's ``usage`` block is the only token accounting an ephemeral run leaves
+    behind (no rollout file), so the ledger takes it from here.
+    """
+    tokens_in = tokens_out = 0
+    for event in events:
+        if str(event.get("type") or "") != "turn.completed":
+            continue
+        usage = event.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        with contextlib.suppress(TypeError, ValueError):
+            tokens_in += int(usage.get("input_tokens") or 0)
+            tokens_out += int(usage.get("output_tokens") or 0)
+    return tokens_in, tokens_out
 
 
 def _agent_message_of(events: list[dict]) -> str:
@@ -4051,7 +4076,30 @@ def _no_seat_result(result: RunResult, now: int | None = None) -> RunResult:
     return result
 
 
-def run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,too-many-locals,too-many-return-statements
+def run_with_fallback(**kwargs: Any) -> RunResult:
+    """Run one Codex round, hopping seats on a REFUSAL — the only launcher in ccc.
+
+    The round itself is :func:`_run_with_fallback` (same keyword signature); this
+    entrance only adds the run ledger: every PHYSICAL attempt the round made is
+    appended to ``<app_home>/codex-runs.jsonl`` (:mod:`command_center.codex_ledger`)
+    once the round has returned, whatever its outcome. Best-effort — a ledger that
+    cannot be written never fails or delays the call.
+    """
+    result = _run_with_fallback(**kwargs)
+    workdir = kwargs.get("workdir", "")
+    codex_ledger.record_result(
+        result,
+        purpose=str(kwargs.get("purpose") or ""),
+        model=str(kwargs.get("model") or ""),
+        effort=str(kwargs.get("effort") or ""),
+        prompt_chars=len(str(kwargs.get("prompt") or "")),
+        write=bool(kwargs.get("write", False)),
+        workdir=os.fspath(workdir) if workdir else "",
+    )
+    return result
+
+
+def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,too-many-locals,too-many-return-statements
     *,
     prompt: str,
     build_cmd: BuildCmd,
@@ -4071,7 +4119,7 @@ def run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,
     headroom: bool = False,
     min_remaining_pct: float = 0.0,
 ) -> RunResult:
-    """Run one Codex round, hopping seats on a REFUSAL — the only launcher in ccc.
+    """The seat-hopping round behind :func:`run_with_fallback` (which adds the ledger).
 
     ``delegate``, ``run`` and :func:`command_center.llm.run_codex` all come through
     here, so "which seat, in which order, and what happens when it says no" has one
@@ -4235,13 +4283,16 @@ def run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,
         failure = classify_codex_failure(proc.returncode, events, proc.stderr or "")
         result.proc = proc
         result.session_id = _thread_id_of(events) or (_session_id_of(proc.stderr or "") or "")
+        tokens_in, tokens_out = _turn_usage(events)
 
         if not failure.kind and proc.returncode == 0:
             record_seat_success(cand)
             result.ok = True
             result.reply = reply or _agent_message_of(events)
             result.seat = cand
-            result.attempts.append(RunAttempt(cand.label, str(cand.home), elapsed, "ok"))
+            result.attempts.append(
+                RunAttempt(cand.label, str(cand.home), elapsed, "ok", tokens_in, tokens_out)
+            )
             if persistent and result.session_id:
                 codex_launch.record_launch(
                     result.session_id, workdir, write=write, codex_home=cand.home
@@ -4252,7 +4303,9 @@ def run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,
 
         if not failure.kind:
             # Non-zero exit the seat is not to blame for: report it, keep the seat.
-            result.attempts.append(RunAttempt(cand.label, str(cand.home), elapsed, "failed"))
+            result.attempts.append(
+                RunAttempt(cand.label, str(cand.home), elapsed, "failed", tokens_in, tokens_out)
+            )
             result.seat, result.reply = cand, reply
             result.error_kind = "codex_failed"
             result.error_message = (
@@ -4262,7 +4315,14 @@ def run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,
 
         record_seat_refusal(cand, failure)
         result.attempts.append(
-            RunAttempt(cand.label, str(cand.home), elapsed, f"refused:{failure.kind}")
+            RunAttempt(
+                cand.label,
+                str(cand.home),
+                elapsed,
+                f"refused:{failure.kind}",
+                tokens_in,
+                tokens_out,
+            )
         )
         if write:
             after = _git_status(workdir)

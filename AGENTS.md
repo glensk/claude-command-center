@@ -228,8 +228,12 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
    a human `/switch <seat>!`. The TUI reads the SAME verdict (`quota.rota_verdict`, config +
    clock, no home touched) to fold that seat's usage card away for the week and mark its title
    ⛔ — view-locally, so no `usage_card_*` gate is written and the card returns by itself at
-   the handover. See [docs/codex.md](docs/codex.md) §§ "Seat policy" and
-   "Sharing a seat on a weekly rota".
+   the handover. Every round the runner makes is also written to the **run ledger**
+   `codex-runs.jsonl` (`codex_ledger.py`, one line per physical attempt: seat, purpose,
+   outcome, ms, tokens, cwd, session) — the only durable record of Codex spend from this
+   machine (ephemeral runs leave no rollout); `ccc quota` shows each seat's `last_run` and
+   `ai logs` (ai.py) merges the lines. See [docs/codex.md](docs/codex.md) §§ "Seat
+   policy", "Sharing a seat on a weekly rota" and "The run ledger".
 5. **Per-seat argv, always rebuilt.** `permission_args(write, codex_home=cand.home)` and
    `mcp_disable_args(cand.home)` are recomputed for each attempt with a fresh `-o` file — the
    first seat's profile or MCP flags must never leak onto the second.
