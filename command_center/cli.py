@@ -540,6 +540,57 @@ def cmd_claude_usage(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_record_run(args: argparse.Namespace) -> int:
+    """``ccc record-run`` — append an EXTERNAL caller's LLM turns to the run ledger.
+
+    The ledger (:mod:`command_center.codex_ledger`, ``<app_home>/codex-runs.jsonl``) is
+    written by ccc's own Codex runner for every Codex attempt; this verb is how a caller
+    that spends a seat WITHOUT the runner — the sdsc-automations checker pair, whose Opus
+    half is a direct ``claude -p`` — files its physical attempts next to them, so
+    ``ai logs`` shows both halves of a ticket's review. Input: ONE JSON object or an
+    array of them on stdin (``-``) or in ``-f/--file``, one object per physical attempt
+    (``{"schema_version": 1, "provider": "claude", "seat": "work", "purpose":
+    "checker", "note": "#255", "requested_model": "opus", "model": "claude-opus-5",
+    "outcome": "ok", "ok": true, "ms": 6100, ...}``; the full key list is
+    ``codex_ledger.validate_row``).
+
+    Strict on purpose: the writer never claims a record it did not make. Exit 0 only
+    when EVERY row was written, 2 when the input is malformed (nothing is written — the
+    whole batch is validated first), 1 when the append failed. "Telemetry must not break
+    the caller" is the CALLER's policy: it wraps this call and ignores a non-zero exit.
+    """
+    from pathlib import Path
+
+    from . import codex_ledger
+
+    try:
+        if args.file and args.file != "-":
+            text = Path(args.file).read_text(encoding="utf-8")
+        else:
+            text = sys.stdin.read()
+        raw = json.loads(text)
+    except (OSError, ValueError) as exc:
+        print(f"record-run: unreadable input: {exc}", file=sys.stderr)
+        return 2
+    items = raw if isinstance(raw, list) else [raw]
+    if not items:
+        print("record-run: nothing to record (empty array)", file=sys.stderr)
+        return 2
+    try:
+        rows = [codex_ledger.validate_row(item, f"row {i}") for i, item in enumerate(items, 1)]
+    except ValueError as exc:
+        print(f"record-run: {exc}", file=sys.stderr)
+        return 2
+    try:
+        written = codex_ledger.append_rows(rows)
+    except OSError as exc:
+        print(f"record-run: cannot append to {codex_ledger.ledger_path()}: {exc}", file=sys.stderr)
+        return 1
+    if not args.quiet:
+        print(f"recorded {written} run(s) in {codex_ledger.ledger_path()}")
+    return 0
+
+
 def cmd_codex_usage(args: argparse.Namespace) -> int:
     """Fetch each configured ``CODEX_HOME``'s live Codex usage and cache it; warm the card.
 
@@ -5308,6 +5359,23 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         help="fetch just this CODEX_HOME (default | private; default: all)",
     )
     p_cdu.set_defaults(func=cmd_codex_usage)
+
+    p_rec = sub.add_parser(
+        "record-run",
+        help=(
+            "append an external caller's LLM attempts (JSON object/array on stdin) to the "
+            "run ledger `ai logs` reads; exit 2 = malformed input, 1 = append failed"
+        ),
+    )
+    p_rec.add_argument(
+        "-f",
+        "--file",
+        default="-",
+        metavar="PATH",
+        help="read the JSON from PATH instead of stdin (`-` = stdin, the default)",
+    )
+    p_rec.add_argument("-q", "--quiet", action="store_true", help="no confirmation line on success")
+    p_rec.set_defaults(func=cmd_record_run)
 
     p_drift = sub.add_parser("check-drift", help="internal: impartial sub-goal drift check (LLM)")
     p_drift.add_argument("--session")

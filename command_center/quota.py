@@ -2312,9 +2312,13 @@ def snapshot(
         # strict "order". Consumers render it so a surprising next attempt is legible.
         "codex_seat_policy": policy,
         "codex_seat_order": _seat_order_rows(codex_rows, order, ranks, pin_label),
-        # ADDITIVE (2026-09-21): where the Codex run ledger lives, so a consumer that
-        # wants the rows themselves (`ai logs`) reads the file ccc writes instead of
-        # guessing its home. Each Codex provider row carries its own `last_run` summary.
+        # ADDITIVE (2026-09-21): where the run ledger lives, so a consumer that wants
+        # the rows themselves (`ai logs`) reads the file ccc writes instead of guessing
+        # its home. Each Codex provider row carries its own `last_run` summary. Two keys,
+        # ONE file: `llm_runs_log` is the name since the ledger also took Claude rows
+        # (`ccc record-run`, provider=claude); `codex_runs_log` stays for a reader built
+        # against the first day's contract. A reader takes one, never both.
+        "llm_runs_log": str(codex_ledger.ledger_path()),
         "codex_runs_log": str(codex_ledger.ledger_path()),
         "providers": [_provider_dict(q) for q in providers],
     }

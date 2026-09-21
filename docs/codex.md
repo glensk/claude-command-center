@@ -436,10 +436,42 @@ stamp per seat.
 Two readers: **`ccc quota`** stamps each Codex row with its `last_run` (`ts`, `age_s`,
 `purpose`, `outcome`, `ok`, `ms`, `runs_24h`) and prints it in the windows column —
 `last run 58m ago · checker · 6s (3 in 24h)`, a failed attempt suffixed with its outcome —
-and publishes the file's path as `codex_runs_log` on `-j`; **`ai logs`** (ai.py)
-reads that path and merges the lines under the seat names it already prints, so
-`ai logs codex-work` lists them next to ai.py's own calls. Append-only and best-effort:
-an unwritable ledger never fails or delays the Codex call it would have described.
+and publishes the file's path as `llm_runs_log` on `-j` (plus the first-day alias
+`codex_runs_log`, same path); **`ai logs`** (ai.py) reads that path and merges the lines
+under the seat names it already prints, so `ai logs codex-work` lists them next to ai.py's
+own calls. Append-only and best-effort: an unwritable ledger never fails or delays the
+Codex call it would have described.
+
+`run -N/--note TEXT` puts the caller's context on every attempt of the round (`"note":
+"#255"` — the sdsc-automations checker names the ticket it is judging; whitespace and
+control characters collapsed, 120 chars at most), and `ai logs` prints it in the detail
+column instead of the seat, which the provider column already names.
+
+**Claude rows — `ccc record-run`.** The same file is the ledger for the headless
+`claude -p` turns an external caller wants next to its Codex ones (the checker pair judges
+every ticket command with Opus AND Codex; `ai logs` used to show only the Codex half).
+The caller pipes ONE JSON object or an array of them — one per physical attempt — to
+`ccc record-run` (`-f/--file PATH` instead of stdin, `-q` for no confirmation line):
+
+```json
+{"schema_version": 1, "provider": "claude", "seat": "work", "purpose": "checker",
+ "note": "#255", "requested_model": "opus", "model": "claude-opus-5",
+ "outcome": "ok", "ok": true, "ms": 6100, "llm_ms": 5400, "prompt_chars": 34000,
+ "tokens_in": 12, "tokens_out": 40, "tokens_cache_read": 30000,
+ "cwd": "/…/sdsc-automations"}
+```
+
+`provider` is `codex` | `claude` (a row without the key predates the field and is Codex);
+`seat` is the caller's label (`work` / `private`), `id` defaults to the ccc oracle id
+(`claude:work`); `requested_model` is the alias handed to `--model` (`opus`) and `model`
+the one Claude Code resolved it to; `outcome` is free text with `ok` the verdict
+(`usage-limit`, `timeout`, `error:exit1`, …). The verb is STRICT — it never claims a
+record it did not make: exit 0 only when every row was appended, 2 for malformed input
+(the whole batch is validated first, nothing is written), 1 when the append failed. The
+"telemetry must not break the call" policy is the caller's: it wraps the subprocess with a
+timeout and ignores a non-zero exit. Claude rows never stamp a Codex row's `last_run`, and
+the file keeps its `codex-runs.jsonl` name because a long-lived older runner process may
+still append to it — a rename would split the history.
 
 ### Progress watchdog and the sleep guard
 

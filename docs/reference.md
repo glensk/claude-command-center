@@ -2223,8 +2223,10 @@ instead of keeping a copy of the palette; change an accent in `usage.py` and eve
 follows. Since 2026-09-21 a Codex row also carries `last_run` — the seat's newest physical
 attempt from the run ledger (`ts`, `age_s`, `purpose`, `outcome`, `ok`, `ms`, `runs_24h`;
 absent for a seat never launched here), which the table prints as `last run 58m ago ·
-checker · 6s` — and the payload's top level carries `codex_runs_log`, the ledger's path
-(`docs/codex.md` § "The run ledger"). `ccc quota -b` is unchanged: it prints the bare Claude account LABEL (`work`),
+checker · 6s` — and the payload's top level carries `llm_runs_log` (and its first-day
+alias `codex_runs_log`, the same path; a reader takes one, never both), the ledger's path
+(`docs/codex.md` § "The run ledger"). The ledger also holds the Claude turns an external
+caller files with `ccc record-run` (`provider: claude`); those never stamp a Codex row. `ccc quota -b` is unchanged: it prints the bare Claude account LABEL (`work`),
 which is what shell wrappers feed to `CLAUDE_CONFIG_DIR` logic. The `codex seats …` footer
 keeps naming SEAT LABELS (`default`/`private`/`de`) in its ranked ladder, because those are
 the tokens `ccc set codex-order` takes; only its `next attempt` is a provider id and is

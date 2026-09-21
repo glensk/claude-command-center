@@ -4082,9 +4082,13 @@ def run_with_fallback(**kwargs: Any) -> RunResult:
     The round itself is :func:`_run_with_fallback` (same keyword signature); this
     entrance only adds the run ledger: every PHYSICAL attempt the round made is
     appended to ``<app_home>/codex-runs.jsonl`` (:mod:`command_center.codex_ledger`)
-    once the round has returned, whatever its outcome. Best-effort — a ledger that
-    cannot be written never fails or delays the call.
+    once the round has returned, whatever its outcome, each line carrying the caller's
+    ``note`` (``run -N``). Best-effort — a ledger that cannot be written never fails or
+    delays the call.
     """
+    # ``note`` is ledger-only context (``run -N``): pop it before the round, which does
+    # not know the keyword, so a caller's note can never turn into a TypeError mid-run.
+    note = str(kwargs.pop("note", "") or "")
     result = _run_with_fallback(**kwargs)
     workdir = kwargs.get("workdir", "")
     codex_ledger.record_result(
@@ -4095,6 +4099,7 @@ def run_with_fallback(**kwargs: Any) -> RunResult:
         prompt_chars=len(str(kwargs.get("prompt") or "")),
         write=bool(kwargs.get("write", False)),
         workdir=os.fspath(workdir) if workdir else "",
+        note=note,
     )
     return result
 
@@ -4745,6 +4750,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             total_timeout=wall_timeout,
             idle_timeout=_idle_timeout_for(getattr(args, "idle_timeout", None), wall_timeout),
             purpose=args.purpose or "run",
+            note=getattr(args, "note", "") or "",
             model=model,
             effort=shown_effort,
             heartbeat_meta={
@@ -5163,6 +5169,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--purpose",
         default="run",
         help="cost-instrumentation purpose label (e.g. debate, checker)",
+    )
+    p_run.add_argument(
+        "-N",
+        "--note",
+        default="",
+        metavar="TEXT",
+        help="context note written to the run ledger on every attempt of this call "
+        "(e.g. the ticket: '#255'); shown by `ai logs`",
     )
     p_run.add_argument(
         "-n",

@@ -14,6 +14,7 @@ exactly as in `test_codex_runner.py`.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import time
 from datetime import datetime
@@ -23,7 +24,7 @@ from conftest import SeatFixture
 
 from command_center import codex_in_claude as cic
 from command_center import codex_ledger, quota
-from command_center.cli import _quota_last_run_note
+from command_center.cli import _quota_last_run_note, cmd_record_run
 
 _MODEL = "gpt-5.6-sol"
 
@@ -73,7 +74,7 @@ def test_a_hop_writes_one_line_per_physical_attempt(
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-1234")
     three_seats.scenarios(private="refuse_quota", de={"scenario": "ok", "reply": "de answered"})
     before = time.time()
-    assert cic.cmd_run(_run_ns(three_seats)) == cic.EX_OK
+    assert cic.cmd_run(_run_ns(three_seats, note="  #255\tticket\n")) == cic.EX_OK
     rows = _ledger_rows(three_seats)
     assert [(r["seat"], r["id"], r["outcome"], r["ok"]) for r in rows] == [
         ("private", "codex:private", "refused:quota", False),
@@ -81,6 +82,9 @@ def test_a_hop_writes_one_line_per_physical_attempt(
     ]
     for row in rows:
         assert row["purpose"] == "checker"
+        assert row["provider"] == "codex"
+        # `run -N`: the same sanitized note on EVERY attempt — a hop keeps its context.
+        assert row["note"] == "#255 ticket"
         assert row["model"] == _MODEL and row["effort"] == "low"
         assert row["prompt_chars"] == len("reply OK")
         assert row["write"] is False
@@ -178,6 +182,7 @@ def test_snapshot_carries_last_run_per_codex_seat_and_the_ledger_path(
     assert cic.cmd_run(_run_ns(three_seats, purpose="vet")) == cic.EX_OK
     snap = quota.snapshot(now=int(time.time()))
     assert snap["codex_runs_log"] == str(codex_ledger.ledger_path())
+    assert snap["llm_runs_log"] == snap["codex_runs_log"], "two keys, ONE file (no rename)"
     rows = {prov["id"]: prov for prov in snap["providers"]}
     served = rows["codex:private"]["last_run"]
     assert served["purpose"] == "vet" and served["ok"] is True and served["runs_24h"] == 1
@@ -203,3 +208,121 @@ def test_table_note_reads_as_prose() -> None:
     assert _quota_last_run_note({"last_run": refused}) == (
         "last run 58m ago · checker · 1s · refused:quota"
     )
+
+
+# ── Claude rows (`ccc record-run`) ───────────────────────────────────────────────────
+def _claude_row(**kw: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "schema_version": 1,
+        "provider": "claude",
+        "seat": "work",
+        "purpose": "checker",
+        "note": "#255",
+        "requested_model": "opus",
+        "model": "claude-opus-5",
+        "outcome": "ok",
+        "ok": True,
+        "ms": 6100,
+        "llm_ms": 5400,
+        "prompt_chars": 34000,
+        "tokens_in": 12,
+        "tokens_out": 40,
+        "tokens_cache_read": 30000,
+        "cwd": "/x/sdsc-automations",
+    }
+    row.update(kw)
+    return row
+
+
+def _record(monkeypatch: pytest.MonkeyPatch, payload: object, **ns: object) -> tuple[int, str]:
+    """Run `ccc record-run` with *payload* on stdin; `(exit, stderr)`."""
+    err = io.StringIO()
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    monkeypatch.setattr("sys.stderr", err)
+    base = {"file": "-", "quiet": True}
+    base.update(ns)
+    return cmd_record_run(argparse.Namespace(**base)), err.getvalue()
+
+
+def test_record_run_appends_a_validated_claude_row(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One object or an array; `id` defaults to the ccc oracle id, `note` is sanitized."""
+    code, err = _record(monkeypatch, _claude_row(note=" #255\n(ticket) "))
+    assert (code, err) == (0, "")
+    code, _ = _record(
+        monkeypatch,
+        [_claude_row(seat="private", outcome="usage-limit", ok=False), _claude_row()],
+    )
+    assert code == 0
+    rows = _ledger_rows(three_seats)
+    assert [(r["provider"], r["seat"], r["id"], r["outcome"]) for r in rows] == [
+        ("claude", "work", "claude:work", "ok"),
+        ("claude", "private", "claude:private", "usage-limit"),
+        ("claude", "work", "claude:work", "ok"),
+    ]
+    first = rows[0]
+    assert first["note"] == "#255 (ticket)"
+    assert first["requested_model"] == "opus" and first["model"] == "claude-opus-5"
+    assert first["tokens_cache_read"] == 30000 and first["llm_ms"] == 5400
+    assert "schema_version" not in first, "the version is the input contract, not a column"
+    assert datetime.fromisoformat(first["ts"]).tzinfo is not None
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        ({"provider": "claude"}, "missing 'seat'"),
+        (_claude_row(provider="gemini"), "provider 'gemini'"),
+        (_claude_row(ms="6100"), "'ms' must be int"),
+        (_claude_row(ok=1), "'ok' must be bool"),
+        (_claude_row(ticket="#255"), "unknown key(s) ticket"),
+        (_claude_row(schema_version=2), "schema_version 2"),
+        (_claude_row(ts="yesterday"), "not ISO-8601"),
+        ([], "empty array"),
+        ("not json", "not a JSON object"),
+    ],
+)
+def test_record_run_refuses_malformed_input_and_writes_nothing(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, payload: object, reason: str
+) -> None:
+    """Exit 2 names the offending key; the WHOLE batch is validated before any append."""
+    code, err = _record(monkeypatch, [payload, _claude_row()] if payload != [] else payload)
+    assert code == 2, err
+    assert reason in err
+    assert not _ledger_rows(three_seats), "a malformed batch records nothing"
+
+
+def test_record_run_exits_1_when_the_append_fails(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The writer never lies: an unwritable ledger is a non-zero exit, not a silent 0."""
+    blocker = three_seats.ccc_home / "command-center" / codex_ledger.LEDGER_NAME
+    blocker.parent.mkdir(parents=True, exist_ok=True)
+    blocker.mkdir()
+    code, err = _record(monkeypatch, _claude_row())
+    assert code == 1 and "cannot append" in err
+
+
+def test_claude_rows_never_stamp_a_codex_seat(three_seats: SeatFixture) -> None:
+    """`last_runs` (→ `ccc quota` last_run) is Codex-only; a row without `provider` is a
+    Codex row written before the field existed and still counts."""
+    now = int(datetime.fromisoformat("2026-09-21T11:30:00+02:00").timestamp())
+    legacy = json.loads(_line("2026-09-21T11:00:00+02:00", "codex:de"))
+    assert "provider" not in legacy
+    claude = codex_ledger.validate_row(_claude_row(ts="2026-09-21T11:20:00+02:00"))
+    runs = codex_ledger.last_runs([legacy, claude], now)
+    assert list(runs) == ["codex:de"], "the newer Claude row is the other family's spend"
+    assert runs["codex:de"]["runs_24h"] == 1
+    assert codex_ledger.provider_of(legacy) == "codex"
+    assert codex_ledger.provider_of(claude) == "claude"
+    # The snapshot path: a Claude row on disk leaves every Codex row's last_run alone.
+    codex_ledger.append_rows([claude])
+    snap = quota.snapshot(now=now)
+    assert all("last_run" not in p for p in snap["providers"] if p["id"].startswith("codex"))
+
+
+def test_sanitize_note_collapses_and_caps() -> None:
+    assert codex_ledger.sanitize_note(None) == ""
+    assert codex_ledger.sanitize_note("  #255\t\x00ticket \n ") == "#255 ticket"
+    assert len(codex_ledger.sanitize_note("x" * 500)) == codex_ledger.NOTE_CHARS
