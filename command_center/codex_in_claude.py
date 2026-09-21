@@ -4919,9 +4919,11 @@ def build_parser() -> argparse.ArgumentParser:
         "-f",
         "--for",
         dest="for_command",
-        choices=COMMANDS,
         default=None,
-        help="command (default: global); ignored when NAME is given",
+        metavar="PURPOSE",
+        help="the command or `run -p` purpose to answer for (delegate-review, debate, "
+        "checker, …; default: global) — what `resolve_model` gives that purpose, so a "
+        "purpose with no key of its own prints the global model; ignored when NAME is given",
     )
     p_get.set_defaults(func=cmd_get_model)
 
