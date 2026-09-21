@@ -239,7 +239,7 @@ def _record(monkeypatch: pytest.MonkeyPatch, payload: object, **ns: object) -> t
     err = io.StringIO()
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
     monkeypatch.setattr("sys.stderr", err)
-    base = {"file": "-", "quiet": True}
+    base: dict[str, object] = {"file": None, "source": "-", "quiet": True}
     base.update(ns)
     return cmd_record_run(argparse.Namespace(**base)), err.getvalue()
 
@@ -291,6 +291,21 @@ def test_record_run_refuses_malformed_input_and_writes_nothing(
     assert code == 2, err
     assert reason in err
     assert not _ledger_rows(three_seats), "a malformed batch records nothing"
+
+
+def test_record_run_takes_the_positional_dash_and_a_file(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """`ccc record-run -` (what sdsc-automations runs) and `ccc record-run PATH` both
+    parse through the real argparse — the first live run failed on exactly this."""
+    from command_center.cli import main as ccc_main
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_claude_row())))
+    assert ccc_main(["record-run", "-q", "-"]) == 0
+    payload = tmp_path / "rows.json"
+    payload.write_text(json.dumps([_claude_row(seat="private")]), encoding="utf-8")
+    assert ccc_main(["record-run", "-q", str(payload)]) == 0
+    assert [r["seat"] for r in _ledger_rows(three_seats)] == ["work", "private"]
 
 
 def test_record_run_exits_1_when_the_append_fails(

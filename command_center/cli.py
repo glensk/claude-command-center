@@ -563,9 +563,10 @@ def cmd_record_run(args: argparse.Namespace) -> int:
 
     from . import codex_ledger
 
+    source = args.file or getattr(args, "source", None) or "-"
     try:
-        if args.file and args.file != "-":
-            text = Path(args.file).read_text(encoding="utf-8")
+        if source != "-":
+            text = Path(source).read_text(encoding="utf-8")
         else:
             text = sys.stdin.read()
         raw = json.loads(text)
@@ -5368,11 +5369,18 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         ),
     )
     p_rec.add_argument(
+        "source",
+        nargs="?",
+        default=None,
+        metavar="PATH|-",
+        help="where the JSON comes from: `-` (stdin, the default) or a file path",
+    )
+    p_rec.add_argument(
         "-f",
         "--file",
-        default="-",
+        default=None,
         metavar="PATH",
-        help="read the JSON from PATH instead of stdin (`-` = stdin, the default)",
+        help="read the JSON from PATH (same as the positional; `-` = stdin)",
     )
     p_rec.add_argument("-q", "--quiet", action="store_true", help="no confirmation line on success")
     p_rec.set_defaults(func=cmd_record_run)
