@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -453,6 +454,46 @@ def _header_text(leading: str, word: str, suffix: str = "") -> Text:
 
 def _first_line(text: str | None) -> str:
     return text.splitlines()[0] if text else ""
+
+
+# How long a synchronous `ccc switch-account` may take before the TUI gives up on it: the
+# command reads the live registry, the ps table and the transcript tail, then either arms
+# the switch or spawns the detached relauncher — seconds, never minutes.
+_SWITCH_ACCOUNT_TIMEOUT_S = 60.0
+
+
+def _run_ccc(args: list[str], *, timeout: float = _SWITCH_ACCOUNT_TIMEOUT_S) -> tuple[int, str]:
+    """Run ``ccc <args…>`` to completion and return ``(exit code, its first output line)``.
+
+    The blocking twin of :func:`spawn.spawn_ccc` for a subcommand whose VERDICT the TUI
+    must show (``switch-account`` refuses for a dozen fail-closed reasons, each named on
+    stderr). ``CCC_INTERNAL`` is dropped on purpose: the marker means "a headless helper
+    with no tab to move", which is true of a grader but false of the TUI acting on a real
+    interactive session — ``switch-account`` refuses under it. Never raises: a missing
+    ``ccc``, a timeout or an exec error come back as a non-zero code with the reason.
+    Single seam for tests (never fork a real ``ccc`` in a unit test).
+    """
+    exe = shutil.which("ccc")
+    if not exe:
+        return 127, "ccc is not on PATH"
+    env = {**os.environ, "AI_NO_AUTOCOMMIT": "1"}
+    env.pop("CCC_INTERNAL", None)
+    try:
+        proc = subprocess.run(  # noqa: S603
+            [exe, *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, f"ccc {' '.join(args[:1])} timed out after {timeout:.0f}s"
+    except (OSError, ValueError) as exc:
+        return 1, f"could not run ccc: {exc}"
+    out = (proc.stdout if proc.returncode == 0 else proc.stderr).strip() or proc.stdout.strip()
+    return proc.returncode, _first_line(out)
 
 
 def _with_tags(text: str, base_style: str) -> Text:
@@ -919,10 +960,11 @@ class EditForm(Vertical):
 
     The editable lines are borderless, transparent inputs you type into directly,
     navigated with ``↑/↓`` or ``Tab`` (the focused line is tinted — that tint IS the
-    cursor). The draft-only rows (``/overseer`` ``/executor`` ``/account``
-    ``Scheduled for``) come FIRST, mirroring the read-only head where the models sit
-    on the ``Status:`` line and the scheduled date right under it — while editing,
-    the head drops those readouts so every option renders exactly once. The first
+    cursor). The draft-only rows (``/overseer`` ``/executor`` ``Scheduled for``) and
+    the ``/account`` row (every row kind, multi-account mode only) come FIRST,
+    mirroring the read-only head where the models and the account sit on the
+    ``Status:`` line and the scheduled date right under it — while editing, the head
+    drops those readouts so every option renders exactly once. The first
     AIM (``/aim (1):``) is editable too — rewritten in place, so correcting how the
     original goal was stated never invents a new revision; the importance line is a
     read-only ``Static`` the focus cursor skips. AIM / prompt / sub-goals are
@@ -955,8 +997,9 @@ class EditForm(Vertical):
         with Horizontal(id="edit-executor-row", classes="fieldrow"):
             yield Label("/executor: ", classes="fieldlabel")
             yield Select(model_opts, value=DEFAULT_LLM, allow_blank=False, id="edit-executor")
-        # Draft-only launch (billing) account — shown only in multi-account mode
+        # Launch (billing) account — every row kind, shown only in multi-account mode
         # (action_edit_session gates the row's display on len(claude_config_dirs) > 1).
+        # What a change means depends on the row: see CommandCenterApp._commit_account.
         account_opts = [(label, label) for label in config.claude_config_dirs()] or [
             ("private", "private")
         ]
@@ -3276,17 +3319,20 @@ class CommandCenterApp(App[None]):
                 style="grey62",
             )
         if session.draft and not editing:
-            # A draft's model pair + billing account live on the Status line (their
-            # editable twins are the top rows of the `e` form).
+            # A draft's model pair lives on the Status line (their editable twins are the
+            # top rows of the `e` form).
             over = session.llm_overseer or ""
             ex = session.llm_exec or ""
             text.append("   /overseer: ", style="bold")
             text.append(over or "—", style=_LLM_STYLE.get(over, "white"))
             text.append("  /executor: ", style="bold")
             text.append(ex or "—", style=_LLM_STYLE.get(ex, "white"))
-            if len(config.claude_config_dirs()) > 1:
-                text.append("  /account: ", style="bold")
-                text.append(accounts.account_label(session.config_dir or ""), style="white")
+        if not editing and len(config.claude_config_dirs()) > 1:
+            # The billing account of EVERY row kind (its editable twin is the `e` form's
+            # /account row): the seat a draft launches under, a parked session resumes
+            # under, a live one bills right now.
+            text.append("   /account: ", style="bold")
+            text.append(accounts.account_label(session.config_dir or ""), style="white")
         # Manual override (set via `e` or Enter on the progress column) wins over the
         # sub-goal ratio and is labelled so its origin is never ambiguous.
         head_frac = effective_progress(session.manual_progress, checked, total_subs)
@@ -3899,17 +3945,12 @@ class CommandCenterApp(App[None]):
         Flips a FUTURE job (draft) freely (it never ran); re-stamps a PARKED session only
         when its transcript already lives under the target account (else resume would find
         nothing); refuses a LIVE session (it already bills the account its process runs
-        under); a no-op with a single account configured.
+        under — the `e` form's /account row relaunches it there instead); a no-op with a
+        single account configured.
         """
         if not (sid := self._current) or (store := self.store) is None:
             return
-        dirs = config.claude_config_dirs()
-        if len(dirs) <= 1:
-            self.notify("Only one Claude account is configured — nothing to switch.")
-            return
-        target = dirs.get(label)
-        if target is None:
-            self.notify(f"No Claude account labelled {label!r} is configured.", severity="warning")
+        if (target := self._account_target(label)) is None:
             return
         session = store.get(sid)
         if session is None:
@@ -3921,21 +3962,15 @@ class CommandCenterApp(App[None]):
         if row is not None and row.is_open:
             self.notify(
                 "That session is live — it already bills the account its process runs "
-                "under; close it (c) first to change the account.",
+                "under; relaunch it there via the e form's /account row, or close it (c) "
+                "first.",
                 severity="warning",
             )
             return
-        if not session.draft and not self._transcript_under(session.cwd, sid, target):
-            # A parked/finished session's conversation is account-bound: re-stamping to an
-            # account that holds no transcript would only make resume find nothing.
-            self.notify(
-                f"Can't switch to {label}: this session's conversation isn't stored under "
-                "that account (resuming there would find nothing).",
-                severity="warning",
-            )
+        restamped = self._restamp_account(sid, session, label, target)
+        if restamped is None:
             return
-        prev_dir = session.config_dir
-        store.update_fields(sid, config_dir=str(target))
+        prev_dir: str = restamped
         self.refresh_data()
         self.notify(f"Account set to {label}.")
 
@@ -3954,6 +3989,105 @@ class CommandCenterApp(App[None]):
     def action_account_work(self) -> None:
         """Bill the highlighted row under the work account — the `tw` chord."""
         self._set_account("work")
+
+    def _account_target(self, label: str) -> Path | None:
+        """*label*'s configured config dir, or None after a notify saying why.
+
+        Single-account mode has nothing to switch; an unknown label nothing to switch to.
+        """
+        dirs = config.claude_config_dirs()
+        if len(dirs) <= 1:
+            self.notify("Only one Claude account is configured — nothing to switch.")
+            return None
+        target = dirs.get(label)
+        if target is None:
+            self.notify(f"No Claude account labelled {label!r} is configured.", severity="warning")
+        return target
+
+    def _restamp_account(self, sid: str, session: Session, label: str, target: Path) -> str | None:
+        """Re-stamp a NOT-live row's account to *target*; return the previous config_dir.
+
+        A FUTURE job (draft) flips freely — it never ran. A parked/finished session's
+        conversation is account-bound, so it is re-stamped only when its transcript already
+        lives under *target*: re-stamping to an account that holds no transcript would only
+        make resume find nothing. Returns None (after a warning) when refused.
+        """
+        if (store := self.store) is None:
+            return None
+        if not session.draft and not self._transcript_under(session.cwd, sid, target):
+            self.notify(
+                f"Can't switch to {label}: this session's conversation isn't stored under "
+                "that account (resuming there would find nothing).",
+                severity="warning",
+            )
+            return None
+        prev_dir = session.config_dir
+        store.update_fields(sid, config_dir=str(target))
+        return prev_dir
+
+    def _commit_account(self, sid: str, session: Session, label: str) -> None:
+        """The `e` form's /account row changed to *label* — apply it per row kind.
+
+        FUTURE job / parked / finished: re-stamped in the store (:meth:`_restamp_account`,
+        with its transcript guard). LIVE session: it already bills the account its process
+        runs under, so the change is handed to ``ccc switch-account``, which relaunches the
+        session under the new account in its own tab with the conversation and its state
+        intact (:meth:`_switch_live_account`); the store row follows once the relaunched
+        process registers itself.
+        """
+        if (target := self._account_target(label)) is None:
+            return
+        if session.config_dir and accounts.same_config_dir(str(target), session.config_dir):
+            return  # nothing to change
+        row = self._rows.get(sid)
+        if row is not None and row.is_open:
+            # busy = a turn in flight; waiting = parked on a permission/question prompt,
+            # which is mid-turn as well — both relaunch when the turn ends, not now.
+            busy = bool(row.live and row.live.raw_status in ("busy", "waiting"))
+            self._switch_live_account(sid, session, label, busy=busy)
+            return
+        if self._restamp_account(sid, session, label, target) is not None:
+            self.notify(f"Account set to {label}.")
+
+    def _switch_live_account(self, sid: str, session: Session, label: str, *, busy: bool) -> None:
+        """Relaunch the LIVE session *sid* under the *label* account via ``ccc switch-account``.
+
+        Idle → ``-N``: the detached relauncher terminates Claude in the session's own tab,
+        waits for the shell and types the env-pinned ``claude --resume <id>`` there. Mid-turn
+        → ARMED instead (``-N`` would refuse, or forced, cut the turn off): the session's own
+        Stop hook relaunches it the moment the turn ends. ``-K`` keeps the session's state —
+        interrupted work continues on the new seat, an idle session lands idle. Runs off-loop
+        (the command reads the registry, the ps table and the transcript), and the command's
+        own verdict — it fails closed on a dozen named reasons — is the notification.
+        """
+        argv = ["switch-account", label, "-s", sid, "-K"]
+        if not busy:
+            argv.append("-N")
+        short = colors.short_folder(session.cwd)
+
+        def worker() -> None:
+            code, line = _run_ccc(argv)
+            self.call_from_thread(self._notify_switched, code, line, label, short, busy)
+
+        self.run_worker(
+            worker,
+            thread=True,
+            group="switch-account",
+            description=f"switch account {short} → {label}",
+        )
+
+    def _notify_switched(self, code: int, line: str, label: str, short: str, busy: bool) -> None:
+        # UI thread: the switch-account verdict, then repaint (liveness/account change).
+        if code == 0:
+            when = "when its current turn ends" if busy else "now, in its own tab"
+            self.notify(f"{short}: relaunching under the {label} account {when}.")
+        else:
+            self.notify(
+                f"{short}: account not switched — {line or f'ccc switch-account exit {code}'}",
+                severity="warning",
+                timeout=12,
+            )
+        self.refresh_data()
 
     def action_toggle_subgoal(self) -> None:
         if not (sid := self._current) or (store := self.store) is None:
@@ -5114,9 +5248,11 @@ class CommandCenterApp(App[None]):
             self.query_one(f"#{row_id}", Horizontal).styles.display = (
                 "block" if session.draft else "none"
             )
-        # Account row is draft-only AND only meaningful when >1 account is configured.
+        # Account row: every row kind (draft / parked / finished / live — what a change
+        # means per kind is _commit_account's business), but only meaningful when >1
+        # account is configured.
         self.query_one("#edit-account-row", Horizontal).styles.display = (
-            "block" if session.draft and len(config.claude_config_dirs()) > 1 else "none"
+            "block" if len(config.claude_config_dirs()) > 1 else "none"
         )
         # Fixed start date (draft-only, like the model rows above it).
         self.query_one("#edit-scheduled-row", Horizontal).styles.display = (
@@ -5312,11 +5448,6 @@ class CommandCenterApp(App[None]):
                 self._commit_model(sid, "llm_overseer", "overseer", overseer)
             if isinstance(executor, str) and executor != original.get("executor", ""):
                 self._commit_model(sid, "llm_exec", "executor", executor)
-            account = self.query_one("#edit-account", Select).value
-            if isinstance(account, str) and account != original.get("account", ""):
-                account_dir = accounts.account_config_dir(account)
-                if account_dir:
-                    store.update_fields(sid, config_dir=account_dir)
             # Fixed start date: an ISO date sinks the job into SCHEDULED, blank clears
             # it back to plain FUTURE; anything unparseable is rejected, not saved.
             scheduled = self.query_one("#edit-scheduled", Input).value.strip()
@@ -5329,6 +5460,12 @@ class CommandCenterApp(App[None]):
                     )
                 else:
                     store.update_fields(sid, start_date=scheduled or None)
+        # Billing account (every row kind; the row is hidden — so never changed — in
+        # single-account mode). The Select only holds a configured label; what the change
+        # means depends on the row kind, see _commit_account.
+        account = self.query_one("#edit-account", Select).value
+        if isinstance(account, str) and account != original.get("account", ""):
+            self._commit_account(sid, session, account)
         # Dependency (every session): commit the picker's pending value if it changed.
         # Belt-and-suspenders re-check the cycle guard (the picker already pre-filters).
         pending = self._edit_depends_pending

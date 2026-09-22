@@ -265,8 +265,15 @@ COMMANDS: list[Command] = [
             "(blank = auto; cleared on mark-done) — also settable with Enter on the progress "
             "column. Type to edit, Esc saves all and returns to the "
             "table — clearing the AIM warns first (it is never lost: every AIM stays in "
-            "aim-history). Future jobs also edit the folder/repo via the picker. The same "
-            "fields are also editable directly with a / n / D / b."
+            "aim-history). Future jobs also edit the folder/repo via the picker. With more "
+            "than one Claude account configured the form's top /account row (a private / "
+            "work dropdown) moves ANY row between cpriv and cwork: a future job flips "
+            "freely, a parked or finished session is re-stamped when its transcript is "
+            "visible under the target account (else it warns and keeps the old one), and a "
+            "live session is relaunched under the new account in its own tab via `ccc "
+            "switch-account` — now when idle, at the end of its turn when busy — with its "
+            "conversation and state intact. The same fields are also editable directly "
+            "with a / n / D / b (and the account with tp / tw)."
         ),
         action="edit_session",
         bind="e",

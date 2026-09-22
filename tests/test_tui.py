@@ -2312,6 +2312,158 @@ def test_account_row_hidden_in_single_account_mode(
     asyncio.run(scenario())
 
 
+def _multi_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Two configured Claude accounts: private = *tmp_path*, work = *tmp_path*/work."""
+    work = tmp_path / "work"
+    work.mkdir(exist_ok=True)
+    from command_center import config as _config
+
+    dirs = {"private": tmp_path, "work": work}
+    monkeypatch.setattr(_config, "claude_config_dirs", lambda: dict(dirs))
+    return work
+
+
+async def _edit_account_to(app: Any, pilot: Any, sid: str, label: str) -> None:
+    """Open the `e` form on *sid*, pick *label* in its /account row and save it."""
+    from textual.widgets import Select
+
+    app.cfg.aim_score_on_set = False
+    app._current = sid
+    app.action_edit_session()
+    await pilot.pause()
+    assert app.query_one("#edit-account-row").styles.display == "block"
+    select = app.query_one("#edit-account", Select)
+    assert select.value != label  # seeded with the row's CURRENT account
+    select.value = label
+    await pilot.pause()
+    app.action_exit_edit()  # AIM unchanged → commits without a confirm dialog
+    await pilot.pause()
+
+
+def test_inline_edit_account_restamps_parked_session_with_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `e` form's /account row shows for a PARKED session too and re-stamps it when its
+    transcript is visible under the target account; the Status head names the account."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    work = _multi_account(tmp_path, monkeypatch)
+    cwd = "/Users/x/parked-edit"
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.ensure("parked-edit", cwd=cwd)
+    store.update_fields("parked-edit", config_dir=str(work), aim="keep me")  # last ran under work
+    store.close()
+    # Its transcript is visible under PRIVATE → the switch is allowed.
+    tx = tmp_path / "projects" / cwd.replace("/", "-") / "parked-edit.jsonl"
+    tx.parent.mkdir(parents=True)
+    tx.write_text('{"type":"x"}\n', encoding="utf-8")
+
+    from command_center.models import Status
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert app.store is not None
+            session = app.store.get("parked-edit")
+            assert session is not None
+            # Read-only head: every row kind carries its account in multi-account mode;
+            # while editing the readout yields to the form's /account row.
+            assert (
+                "/account: work"
+                in app._head_text(session, Status.PARKED, 0, 0, editing=False).plain
+            )
+            assert (
+                "/account" not in app._head_text(session, Status.PARKED, 0, 0, editing=True).plain
+            )
+            await _edit_account_to(app, pilot, "parked-edit", "private")
+
+    asyncio.run(scenario())
+
+    store = Store(tmp_path / "command-center" / "state.db")
+    parked = store.get("parked-edit")
+    store.close()
+    assert parked is not None and accounts.same_config_dir(parked.config_dir, str(tmp_path))
+
+
+def test_inline_edit_account_refuses_parked_without_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PARKED session whose transcript is NOT under the target account keeps its account
+    (resuming there would find nothing) — same guard as the tp/tw chords."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _multi_account(tmp_path, monkeypatch)
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.ensure("parked-notx", cwd="/Users/x/parked-notx")
+    store.update_fields("parked-notx", config_dir=str(tmp_path), aim="keep me")  # ran under private
+    store.close()
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await _edit_account_to(app, pilot, "parked-notx", "work")
+
+    asyncio.run(scenario())
+
+    store = Store(tmp_path / "command-center" / "state.db")
+    parked = store.get("parked-notx")
+    store.close()
+    assert parked is not None and accounts.same_config_dir(parked.config_dir, str(tmp_path))
+
+
+@pytest.mark.parametrize(("status", "expect_now"), [("idle", True), ("busy", False)])
+def test_inline_edit_account_live_session_runs_switch_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str, expect_now: bool
+) -> None:
+    """On a LIVE session the /account row hands the change to `ccc switch-account … -K` —
+    `-N` (relaunch now) when idle, armed for the end of the turn when busy — and never
+    re-stamps the store row itself (the relaunched process registers the new account)."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _multi_account(tmp_path, monkeypatch)
+    cwd = "/Users/x/live-edit"
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.ensure("live-edit", cwd=cwd)
+    store.update_fields("live-edit", config_dir=str(tmp_path), aim="keep me", status="idle")
+    store.close()
+    sessions = tmp_path / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    (sessions / f"{os.getpid()}.json").write_text(
+        json.dumps({"pid": os.getpid(), "sessionId": "live-edit", "cwd": cwd, "status": status}),
+        encoding="utf-8",
+    )
+
+    from command_center.views import tui as _tui
+
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], *, timeout: float = 0.0) -> tuple[int, str]:
+        del timeout
+        calls.append(list(args))
+        return 0, "relaunching now: live-edit → the 'work' account in its own tab"
+
+    monkeypatch.setattr(_tui, "_run_ccc", fake_run)
+
+    async def scenario() -> None:
+        app = _tui.CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert app._rows["live-edit"].is_open
+            await _edit_account_to(app, pilot, "live-edit", "work")
+            await settle(pilot)  # the switch runs in a thread worker
+
+    asyncio.run(scenario())
+
+    expected = ["switch-account", "work", "-s", "live-edit", "-K"] + (["-N"] if expect_now else [])
+    assert calls == [expected]
+    store = Store(tmp_path / "command-center" / "state.db")
+    live = store.get("live-edit")
+    store.close()
+    assert live is not None and accounts.same_config_dir(live.config_dir, str(tmp_path))
+
+
 def test_click_draft_next_step_cell_opens_model_editor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

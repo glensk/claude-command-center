@@ -267,7 +267,9 @@ plus the read-only **`Status:` head** as an extra stop (tinted too, scrolls the 
 so the top of the pane is always reachable; it never escapes into the session table. The head
 also **compacts** while editing — its models/account readout, `Scheduled for:` line and
 *Prompt to run* body drop out, since those are exactly the form's editable rows (every option
-shows once). **`↑/↓`** move between the one-line fields
+shows once). In multi-account mode the form's top **`/account`** row (a private / work dropdown)
+moves **any** row — future job, parked or finished session, live session — between the accounts;
+what that means per row kind is under *Home-icon marker* in Multi-account. **`↑/↓`** move between the one-line fields
 (**`/next-step` · `/deadline` · `progress %` · `/block`**); the **AIM**, the **sub-goal checklist**
 and the future-job **prompt to run** are borderless **multi-line** fields that grow to fit
 (**`Tab`** leaves them). **`progress %`** sets a manual bar override (blank = auto from sub-goals;
@@ -687,7 +689,8 @@ draft's **tags/notes column**: any typed `@tags` plus the free-text `start_when`
 `@home · tomorrow evening`, note in blue) — `ccc ls` shows the same as `next:` / `when:`
 detail lines. The draft's configured models stay a colour-coded `overseer ▸ executor`
 readout in the **model** column; in the job-details pane they render **on the `Status:` line
-itself** (`/overseer: … /executor: …`, plus `/account: …` in multi-account mode), and every
+itself** (`/overseer: … /executor: …`; in multi-account mode **every** row's `Status:` line —
+draft, parked, live — also carries `/account: …`), and every
 draft shows a **`Scheduled for:`** line directly under `Status:` — the blue `D.M.YY` date when
 set, a grey `—` when not. While editing (`e`) those readouts drop out of the head (their
 editable rows — `/overseer` `/executor` `/account` `Scheduled for` — are the **top rows of the
@@ -2147,8 +2150,18 @@ filenames); malformed entries are skipped.
   (draft) freely (it never ran); on a **PARKED** session they re-stamp the account **only
   when that session's transcript already lives under the target account** (else they warn
   and leave it unchanged — resuming under an account with no transcript would find
-  nothing); a **LIVE** session cannot be switched (it already bills the account its
-  process runs under).
+  nothing); a **LIVE** session cannot be switched by the chords (it already bills the
+  account its process runs under). The **`e` form's `/account` row** (top of the form, a
+  private / work dropdown) applies the same rules to a future job and a parked or finished
+  session, and goes one step further for a **LIVE** session: it hands the change to
+  `ccc switch-account <label> -s <id> -K`, which relaunches the session under the new
+  account **in its own tab** — `-N` (now) when the session is idle, armed for the end of
+  the turn when it is busy or waiting on a prompt — keeping the conversation and its state
+  (interrupted work continues on the new seat, an idle session lands idle). The command's
+  own fail-closed verdict (transcript not visible to the target, folder not trusted for it,
+  background work in flight, both dirs logged in as the same identity, …) is shown as the
+  notification, and on a refusal nothing changes; the row's account follows once the
+  relaunched process registers itself.
 - **Routing a NEW job (`job_account`).** When a job is created **without** an explicit
   account (no `-A`, no account select), the `job_account` config key decides which
   account it bills to: `""` (default) ⇒ the default account (today's behaviour); a
