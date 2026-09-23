@@ -2,16 +2,21 @@
 
 Exercises the CLI surface ccc's auto-resume relies on (positional id + ``now``,
 ``-w/--wait-only`` + ``--signal-file``, the claude-missing exit code) and the pure
-time / limit-message parsers. Never invokes a real ``claude``.
+time / limit-message parsers, and the probe's run-ledger row (one per probe,
+purpose ``probe-claude-session``). Never invokes a real ``claude``.
 """
 
 from __future__ import annotations
 
+import json
+import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from command_center import accounts, codex_ledger
 from command_center import session_continue as sc
 
 
@@ -115,3 +120,97 @@ def test_parse_limit_message_epoch_and_relative() -> None:
     assert epoch is not None
     rel = sc.parse_limit_message("resets in 2h 7m", now)
     assert rel is not None and rel.hour == 14 and rel.minute == 8  # +2h07m +1m margin
+
+
+# ------------------------------ the probe's ledger row ------------------------------ #
+def _envelope(result: str, *, is_error: bool = False) -> str:
+    return json.dumps(
+        {
+            "result": result,
+            "is_error": is_error,
+            "session_id": "probe-sess",
+            "duration_api_ms": 321,
+            "modelUsage": {"claude-haiku-4-5-20251001": {}},
+            "usage": {"input_tokens": 4, "output_tokens": 2},
+        }
+    )
+
+
+def _fake_probe(monkeypatch: pytest.MonkeyPatch, stdout: str, rc: int = 0) -> list[Any]:
+    seen: list[Any] = []
+
+    def run(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, rc, stdout, "")
+
+    monkeypatch.setattr(sc.subprocess, "run", run)
+    return seen
+
+
+def test_probe_asks_for_json_and_records_one_ok_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    seen = _fake_probe(monkeypatch, _envelope("Hello!"))
+    assert sc.probe_limit() == (False, None)
+    assert seen[0][seen[0].index("--output-format") + 1] == "json"
+    (row,) = codex_ledger.read_runs()
+    assert (row["provider"], row["seat"], row["purpose"]) == (
+        "claude",
+        "private",
+        "probe-claude-session",
+    )
+    assert row["outcome"] == "ok" and row["ok"] is True
+    assert row["model"] == "claude-haiku-4-5-20251001"
+    assert (row["tokens_in"], row["tokens_out"], row["session"]) == (4, 2, "probe-sess")
+
+
+def test_limit_in_json_result_still_parses_and_is_a_quota_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_probe(monkeypatch, _envelope("Claude AI usage limit reached|1749600600", is_error=True))
+    limited, target = sc.probe_limit()
+    assert limited and target is not None
+    (row,) = codex_ledger.read_runs()
+    assert row["outcome"] == "error:quota" and row["ok"] is False
+    assert "limit reached" in row["error_message"]
+
+
+def test_plain_text_output_still_detects_the_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_probe(monkeypatch, "You've hit your session limit - resets 1:10am", rc=1)
+    limited, target = sc.probe_limit()
+    assert limited and target is not None
+    assert codex_ledger.read_runs()[0]["outcome"] == "error:quota"
+
+
+def test_timeout_is_a_row_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    def run(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd, 1)
+
+    monkeypatch.setattr(sc.subprocess, "run", run)
+    assert sc.probe_limit() == (True, None)
+    (row,) = codex_ledger.read_runs()
+    assert row["outcome"] == "error:timeout" and row["ok"] is False
+
+
+def test_probe_row_seat_follows_claude_config_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    work = tmp_path / ".claude-work"
+    work.mkdir()
+    monkeypatch.setattr(
+        accounts.config,
+        "claude_config_dirs",
+        lambda: {"private": tmp_path / ".claude", "work": work},
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(work))
+    _fake_probe(monkeypatch, _envelope("hi"))
+    sc.probe_limit()
+    assert codex_ledger.read_runs()[0]["seat"] == "work"
+
+
+def test_a_broken_ledger_never_breaks_the_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(_rows: list[dict[str, Any]], path: Path | None = None) -> int:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(codex_ledger, "append_rows", boom)
+    _fake_probe(monkeypatch, _envelope("hi"))
+    assert sc.probe_limit() == (False, None)

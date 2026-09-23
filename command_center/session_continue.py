@@ -9,7 +9,8 @@ The reset time can be given explicitly (``1:10am``) or auto-detected: with no ti
 argument the script probes ``claude -p`` for the limit message and parses the reset
 time out of it (fallback: the end of the active 5h block reported by ``ccusage``, an
 hour-floored estimate). After waiting it probes again to verify the limit is really
-gone before resuming, re-waiting if not.
+gone before resuming, re-waiting if not. Every probe — timeouts included — is one row
+in ccc's run ledger (purpose ``probe-claude-session``), so it shows in ``ai logs``.
 
 This module is the ``claude-session-continue`` console entry point AND the engine the
 command center's auto-resume (:mod:`command_center.resume`) shells out to. The CLI
@@ -30,7 +31,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
     _direct_run(__file__)
 
-
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import argparse
 import json
 import os
@@ -41,6 +42,7 @@ import subprocess
 import sys
 import time as time_mod
 from datetime import datetime, timedelta
+from typing import Any
 
 from . import brokenpipe
 
@@ -49,7 +51,11 @@ LAST_SESSION_KEYWORDS = ("last", "latest", "continue")
 AUTO_KEYWORDS = ("auto",)
 NOW_KEYWORDS = ("now", "immediately")
 SAFETY_MARGIN = timedelta(minutes=1)
-PROBE_CMD = ["claude", "--print", "--model", "haiku", "hi"]
+PROBE_MODEL = "haiku"
+PROBE_PROMPT = "hi"
+PROBE_CMD = ["claude", "--print", "--model", PROBE_MODEL, "--output-format", "json", PROBE_PROMPT]
+#: The ledger ``purpose`` of one probe.
+PROBE_PURPOSE = "probe-claude-session"
 PROBE_TIMEOUT_S = 300
 MAX_AUTO_ATTEMPTS = 12
 FALLBACK_WAIT = timedelta(minutes=15)
@@ -226,9 +232,91 @@ def parse_limit_message(output: str, now: datetime) -> datetime | None:
     return None
 
 
+def _json_envelope(stdout: str) -> dict[str, Any] | None:
+    """Claude's ``--output-format json`` result object, or None (plain text / garbage)."""
+    try:
+        parsed = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _usage_int(usage: dict[str, Any], *names: str) -> int | None:
+    for name in names:
+        value = usage.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return None
+
+
+def _envelope_fields(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Served model, session, API time and token counts out of a result envelope."""
+    fields: dict[str, Any] = {}
+    model_usage = envelope.get("modelUsage")
+    if isinstance(model_usage, dict) and model_usage:
+        fields["model"] = str(next(iter(model_usage)))
+    if isinstance(envelope.get("session_id"), str):
+        fields["session"] = envelope["session_id"]
+    if isinstance(envelope.get("duration_api_ms"), (int, float)):
+        fields["llm_ms"] = int(envelope["duration_api_ms"])
+    usage = envelope.get("usage")
+    if isinstance(usage, dict):
+        tokens = {
+            "tokens_in": _usage_int(usage, "input_tokens", "inputTokens"),
+            "tokens_out": _usage_int(usage, "output_tokens", "outputTokens"),
+            "tokens_cache_read": _usage_int(
+                usage, "cache_read_input_tokens", "cacheReadInputTokens"
+            ),
+            "tokens_cache_create": _usage_int(
+                usage, "cache_creation_input_tokens", "cacheCreationInputTokens"
+            ),
+        }
+        fields.update({key: value for key, value in tokens.items() if value is not None})
+    return fields
+
+
+def _record_probe(outcome: str, started: float, **extra: Any) -> bool:
+    """Append ONE ``probe-claude-session`` row to ccc's run ledger; never raises.
+
+    The seat is the account ``CLAUDE_CONFIG_DIR`` bills (unset = the default account).
+    Imported lazily so the resume engine stays importable without the ledger.
+    """
+    try:
+        from . import accounts, codex_ledger  # pylint: disable=import-outside-toplevel
+
+        row: dict[str, Any] = {
+            "provider": "claude",
+            "seat": accounts.account_label(os.environ.get("CLAUDE_CONFIG_DIR", "")),
+            "purpose": PROBE_PURPOSE,
+            "outcome": outcome,
+            "ok": outcome == "ok",
+            "ms": int((time_mod.monotonic() - started) * 1000),
+            "caller": "claude-session-continue",
+            "requested_model": PROBE_MODEL,
+            "prompt_chars": len(PROBE_PROMPT),
+            **extra,
+        }
+        return bool(codex_ledger.append_rows([codex_ledger.validate_row(row)]))
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"⚠️  could not record the probe in the run ledger: {exc}", file=sys.stderr)
+        return False
+
+
+def _probe_outcome(returncode: int, envelope: dict[str, Any] | None, limited: bool) -> str:
+    """The ledger outcome of a completed probe (a hit limit is a quota error)."""
+    if limited:
+        return "error:quota"
+    if returncode != 0:
+        return f"error:exit-{returncode}"
+    if envelope and envelope.get("is_error"):
+        return "error:claude"
+    return "ok"
+
+
 def probe_limit() -> tuple[bool, datetime | None]:
     """Run a cheap 'claude -p' call; return (limited?, reset target or None)."""
     now = datetime.now()
+    started = time_mod.monotonic()
     try:
         proc = subprocess.run(
             PROBE_CMD,
@@ -239,13 +327,24 @@ def probe_limit() -> tuple[bool, datetime | None]:
         )
     except subprocess.TimeoutExpired:
         print("⚠️  probe timed out; assuming limit still active", file=sys.stderr)
+        _record_probe("error:timeout", started, error_message="probe timed out")
         return True, None
 
-    output = (proc.stdout or "") + (proc.stderr or "")
+    envelope = _json_envelope(proc.stdout or "")
+    result = envelope.get("result", "") if envelope else proc.stdout or ""
+    output = str(result) + (proc.stderr or "")
     target = parse_limit_message(output, now)
+    limited = target is not None or bool(
+        re.search(r"(usage|session|rate|hour)\s*limit", output, re.I)
+    )
+    outcome = _probe_outcome(proc.returncode, envelope, limited)
+    extra = _envelope_fields(envelope) if envelope else {}
+    if outcome != "ok" and output.strip():
+        extra["error_message"] = output.strip()[:500]
+    _record_probe(outcome, started, **extra)
     if target is not None:
         return True, target
-    if re.search(r"(usage|session|rate|hour)\s*limit", output, re.I):
+    if limited:
         return True, None  # limited, but reset time not parseable
     if proc.returncode != 0:
         print(

@@ -1455,6 +1455,9 @@ the daemon spawns a singleton watcher (`ccc resume-halted --watch`) that resumes
   its own headless `claude-session-continue.py --wait-only` detector, spawned with that
   account's `CLAUDE_CONFIG_DIR` pinned, so it probes the rate-limit window of the very
   seat it gates. Resumes only fire after **that** account's limit is confirmed clear.
+  Every probe (`claude --print --model haiku --output-format json hi`, timeouts
+  included) appends one run-ledger row (`provider: claude`, seat = that account,
+  `purpose: probe-claude-session`), so the probes show in `ai logs`.
 - **Each session is revived on the account it was started from** — a `work` session
   comes back on `work`, a `private` one on `private` (the stored `config_dir` is
   prefixed onto the resume command). A `work` halt never gates a `private` resume,
