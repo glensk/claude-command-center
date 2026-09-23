@@ -128,6 +128,37 @@ def _guard_real_codex_reads(
     _wrap(_cic, "_codex_rate_snapshot", 0)
 
 
+# Ambient variables a live Claude Code session (or a codex-in-claude run) exports into
+# the shell that runs pytest. ``CLAUDE_HOME`` is excluded: ``_pin_claude_home`` owns it.
+_AMBIENT_ENV_PREFIXES = ("CLAUDE_", "CODEX_IN_CLAUDE_")
+_AMBIENT_ENV_EXACT = frozenset({"CLAUDECODE"})
+_AMBIENT_ENV_KEEP = frozenset({"CLAUDE_HOME"})
+
+
+def _is_ambient_claude_env(key: str) -> bool:
+    if key in _AMBIENT_ENV_KEEP:
+        return False
+    return key in _AMBIENT_ENV_EXACT or key.startswith(_AMBIENT_ENV_PREFIXES)
+
+
+@pytest.fixture(autouse=True)
+def _scrub_ambient_claude_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset every ``CLAUDE_*`` / ``CODEX_IN_CLAUDE_*`` / ``CLAUDECODE`` variable per test.
+
+    The suite is routinely run from inside a Claude Code session, which exports
+    ``CLAUDE_PID``, ``CLAUDE_CODE_SESSION_ID``, ``CLAUDE_SESSION_AIM`` and friends; ccc
+    code reads those (``hooks.py`` resolves the live pid from ``CLAUDE_PID``). tp#225
+    caught a test acting on the real session's pid that way and pinned just that one
+    variable. tp#233 replaces the per-variable whack-a-mole with a prefix scrub, so a
+    variable ccc starts reading tomorrow is isolated too. Tests that need one of these
+    still ``setenv`` it (monkeypatch is last-wins), and subprocesses that copy
+    ``os.environ`` inherit the scrubbed env.
+    """
+    for key in list(os.environ):
+        if _is_ambient_claude_env(key):
+            monkeypatch.delenv(key, raising=False)
+
+
 @pytest.fixture(autouse=True)
 def _pin_claude_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin ``CLAUDE_HOME`` under ``tmp_path`` so NO test can touch the real ``~/.claude``.
