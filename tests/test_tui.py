@@ -14,6 +14,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from rich.text import Text
+from textual.content import Content
+from textual.widget import Widget
 from textual.widgets import Label, ListView, Static
 
 from command_center import accounts, usage
@@ -122,6 +124,16 @@ def _plain(cell: object) -> str:
     return cell.plain if isinstance(cell, Text) else str(cell)
 
 
+def _render_plain(widget: Widget) -> str:
+    """A widget's rendered text: Textual ``Content`` (8.x) or Rich ``Text``, else ``str``.
+
+    ``render()`` is typed as the whole ``RenderResult`` union, so the ``isinstance``
+    narrowing is what lets mypy see ``.plain``.
+    """
+    rendered = widget.render()
+    return rendered.plain if isinstance(rendered, (Text, Content)) else str(rendered)
+
+
 def test_tui_mounts_lists_and_marks_done(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     sid = _seed(tmp_path)
@@ -140,14 +152,12 @@ def test_tui_mounts_lists_and_marks_done(tmp_path: Path, monkeypatch: pytest.Mon
             app.update_detail()
             await pilot.pause()
             head = app.query_one("#detail-head")
-            rendered = head.render()
-            head_text = rendered.plain if hasattr(rendered, "plain") else str(rendered)
+            head_text = _render_plain(head)
             assert "1/2" in head_text  # one of two sub-goals checked (context block)
             # The editable fields live in their own static so edit mode can swap just
             # them in place; the AIM is rendered there, not in the context head.
             fview = app.query_one("#detail-fields-view")
-            frendered = fview.render()
-            fview_text = frendered.plain if hasattr(frendered, "plain") else str(frendered)
+            fview_text = _render_plain(fview)
             assert "ship the thing" in fview_text  # aim shown in the read-only fields block
 
             # Mark done via the action and confirm it persisted.
@@ -1106,8 +1116,7 @@ def test_arrow_keys_wrap_top_and_bottom(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 def _row_text(list_item) -> str:
-    rendered = list_item.query_one(Label).render()
-    return rendered.plain if hasattr(rendered, "plain") else str(rendered)
+    return _render_plain(list_item.query_one(Label))
 
 
 def test_help_scrolls_and_explains_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1217,9 +1226,8 @@ def test_help_lists_wrap_around(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     asyncio.run(scenario())
 
 
-def _row_text_static(static_widget) -> str:
-    rendered = static_widget.render()
-    return rendered.plain if hasattr(rendered, "plain") else str(rendered)
+def _row_text_static(static_widget: Widget) -> str:
+    return _render_plain(static_widget)
 
 
 def test_help_key_renames_are_gold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1342,8 +1350,9 @@ def test_ah_chord_shows_aim_history(tmp_path: Path, monkeypatch: pytest.MonkeyPa
             await pilot.press("h")
             await pilot.pause()
             assert isinstance(app.screen, TopicScreen)
-            rendered = [s.render() for s in app.screen.query_one("#topic").query("Static")]
-            body = " ".join(r.plain if hasattr(r, "plain") else str(r) for r in rendered)
+            body = " ".join(
+                _render_plain(s) for s in app.screen.query_one("#topic").query("Static")
+            )
             assert "first vague aim" in body
             assert "second sharper aim" in body
             assert "current" in body  # the latest revision is marked
@@ -3289,7 +3298,7 @@ def test_nixos_overseer_cards_default_visibility_and_to_ta_toggle(
             assert app.query_one("#usage-nixos-tier-a").display is True
             # The dir is unset, so both render the placeholder (not a crash).
             supervised_static = app.query_one("#usage-nixos-supervised")
-            assert "set nixos_overseer_dir" in supervised_static.render().plain
+            assert "set nixos_overseer_dir" in _render_plain(supervised_static)
 
             # `to` collapses the supervised card; persisted.
             await pilot.press("t")
@@ -3565,6 +3574,7 @@ def test_draft_head_shows_scheduled_for_and_models_on_status_line(
             await pilot.pause()
             head = app.query_one("#detail-head", DetailHead)
             rendered = head.render()  # a textual Content (not rich Text) on Textual 8.x
+            assert isinstance(rendered, Content)
             lines = rendered.plain.splitlines()
             # Status line carries the draft's model pair (account: single-account → hidden).
             assert "/overseer: opus-5" in lines[0]
@@ -3593,16 +3603,14 @@ def test_draft_head_shows_scheduled_for_and_models_on_status_line(
             )
             # The fields block no longer repeats the model rows.
             fview = app.query_one("#detail-fields-view")
-            frendered = fview.render()
-            fplain = frendered.plain if hasattr(frendered, "plain") else str(frendered)
+            fplain = _render_plain(fview)
             assert "/overseer" not in fplain
 
             # A non-draft session shows neither models nor a Scheduled-for line.
             app._current = "plain"
             app.update_detail()
             await pilot.pause()
-            rendered2 = head.render()
-            plain2 = rendered2.plain if hasattr(rendered2, "plain") else str(rendered2)
+            plain2 = _render_plain(head)
             assert "/overseer" not in plain2
             assert "Scheduled for" not in plain2
 
@@ -3721,12 +3729,12 @@ def test_scheduled_for_edit_field_and_deduped_edit_head(
             table.focus()
             await pilot.pause()
             head = app.query_one("#detail-head", DetailHead)
-            assert "Scheduled for: —" in head.render().plain  # unscheduled → placeholder
+            assert "Scheduled for: —" in _render_plain(head)  # unscheduled → placeholder
 
             await pilot.press("e")
             await pilot.pause()
             # Deduped head while editing: each of these renders ONLY as a form row now.
-            eplain = head.render().plain
+            eplain = _render_plain(head)
             assert "/overseer" not in eplain
             assert "Scheduled for" not in eplain
             assert "Prompt to run" not in eplain
@@ -3738,7 +3746,7 @@ def test_scheduled_for_edit_field_and_deduped_edit_head(
             saved = app.store.get("sched-edit")
             assert saved is not None and saved.start_date == "2026-07-20"
             # Full head is back after the edit — the date line and the readout, once.
-            rplain = head.render().plain
+            rplain = _render_plain(head)
             assert "Scheduled for: 20.7.26" in rplain
             assert rplain.count("/overseer") == 1
 

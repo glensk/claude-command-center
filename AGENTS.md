@@ -20,7 +20,7 @@ Python projects use **`uv`** (preferred over Homebrew/system installs):
 uv sync --all-extras          # install deps (incl. dev extras)
 uv run pytest -q              # run the tests (700+; keep them green)
 uv run ruff format . && uv run ruff check .
-uv run mypy command_center
+uv run mypy .                 # whole repo, tests/ included (tp#233)
 uv run pylint command_center/<files>
 ```
 
