@@ -3254,6 +3254,22 @@ def record_opencode_probe(
 _OPENCODE_REFUSAL_MARKERS = ("rate limit exceeded", "free usage exceeded", "429")
 
 
+def opencode_exe() -> str | None:
+    """The OpenCode CLI: ``OPENCODE_BIN`` → ``$PATH`` → its installer's ``~/.opencode/bin``.
+
+    The last step matters for the hourly probe agent: launchd's minimal PATH never
+    contains ``~/.opencode/bin``, so a PATH-only lookup made every probe inconclusive.
+    """
+    override = os.environ.get("OPENCODE_BIN", "").strip()
+    if override:
+        return override if os.access(override, os.X_OK) else None
+    found = shutil.which("opencode")
+    if found:
+        return found
+    default = Path.home() / ".opencode" / "bin" / "opencode"
+    return str(default) if os.access(default, os.X_OK) else None
+
+
 def probe_opencode_free(model: str = "", timeout: float | None = None) -> tuple[bool | None, str]:
     """Ask the free tier for one word. ``(True|False|None, detail)``.
 
@@ -3276,9 +3292,9 @@ def probe_opencode_free(model: str = "", timeout: float | None = None) -> tuple[
     live = config.load_config()
     model = model or live.opencode_free_model
     timeout = float(live.opencode_probe_timeout_sec) if timeout is None else timeout
-    exe = shutil.which("opencode")
+    exe = opencode_exe()
     if not exe:
-        return None, "opencode is not on PATH"
+        return None, "opencode is not on PATH (nor OPENCODE_BIN, nor ~/.opencode/bin)"
     argv = [
         exe,
         "run",

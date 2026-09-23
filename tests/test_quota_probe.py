@@ -254,3 +254,19 @@ def test_installed_agent_schedules_from_the_last_probe(
     assert row["next_probe_at"] == NOW - 600 + 3600
     assert cli._quota_next_probe_note(row, NOW) == "next probe in 50 min"  # noqa: SLF001
     assert quota_probe.next_probe_note(NOW - 1, NOW) == "next probe due"
+
+
+def test_opencode_exe_falls_back_to_the_installer_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """launchd's PATH lacks ~/.opencode/bin — the probe must still find the CLI there."""
+    exe = tmp_path / ".opencode" / "bin" / "opencode"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("#!/bin/sh\n", encoding="utf-8")
+    exe.chmod(0o755)
+    monkeypatch.delenv("OPENCODE_BIN", raising=False)
+    monkeypatch.setattr(usage.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(usage.Path, "home", lambda: tmp_path)
+    assert usage.opencode_exe() == str(exe)
+    monkeypatch.setenv("OPENCODE_BIN", str(tmp_path / "missing"))
+    assert usage.opencode_exe() is None
