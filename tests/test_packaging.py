@@ -86,6 +86,9 @@ def test_wheel_ships_entrypoints_and_assets(installed_wheel: InstalledWheel) -> 
     assert "command_center/assets/obsidian/future.md.tmpl" in names
     assert "command_center/assets/obsidian/plugins.json" in names
     assert "command_center/assets/karabiner/peek-s-p.json" in names
+    # The panel poker template (``ccc panel-server --install`` bakes + copies it).
+    assert "command_center/assets/panel-poke.sh" in names
+    assert "command_center/panelpoke.py" in names
     assert "command_center/codex_in_claude.py" in names
     assert "command_center/session_continue.py" in names
 
@@ -103,6 +106,23 @@ def test_wheel_ships_entrypoints_and_assets(installed_wheel: InstalledWheel) -> 
     probe = _run([str(installed_wheel.python), "-c", code], env=installed_wheel.env)
     assert probe.returncode == 0, probe.stderr
     assert "OK" in probe.stdout
+
+
+def test_wheel_installs_panel_poker(installed_wheel: InstalledWheel, tmp_path: Path) -> None:
+    """The poker template is read via importlib.resources from the NON-editable install."""
+    app_home = tmp_path / "app home's"
+    code = (
+        "import stat, sys\n"
+        "from pathlib import Path\n"
+        "from command_center.panelpoke import install_poker\n"
+        "path = install_poker(Path(sys.argv[1]), '/opt/ccc', {})\n"
+        "assert stat.S_IMODE(path.stat().st_mode) == 0o755\n"
+        "assert 'COLD_CCC=/opt/ccc' in path.read_text()\n"
+        "print(path)\n"
+    )
+    probe = _run([str(installed_wheel.python), "-c", code, str(app_home)], env=installed_wheel.env)
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == str(app_home / "panel-poke.sh")
 
 
 def test_wheel_exposes_codex_in_claude_run_and_order(installed_wheel: InstalledWheel) -> None:
