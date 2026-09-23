@@ -13,7 +13,7 @@ import json
 import os
 import subprocess
 import time
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 
@@ -458,6 +458,154 @@ def test_cost_history_ignores_corrupt_partial_non_debate_and_reset_samples(
     _install_cost_fixture(cic, tmp_path, monkeypatch, "mixed_costs.jsonl")
     assert cic._debate_cost_deltas(300) == [1.5]
     assert cic.headroom_reserve_percent(300) == 35.0
+
+
+def _debate_row(ts: int, before: object, after: object) -> dict[str, object]:
+    return {
+        "ts": ts,
+        "purpose": "debate",
+        "model": "m",
+        "effort": "high",
+        "before": before,
+        "after": after,
+    }
+
+
+def test_cost_history_drops_unmeasured_identical_rows(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#227: an ephemeral run left no rollout, so before == after is not a real 0."""
+    path = tmp_path / "cost-history.jsonl"
+    monkeypatch.setenv("CODEX_IN_CLAUDE_COST_LOG", str(path))
+    now = _HEADROOM_NOW
+    same = {"300": {"used_percent": 10.0, "resets_at": now + 5000}}
+    live_zero = [
+        {**same, "_meta": {"source": "live", "captured_at": now - 50}},
+        {**same, "_meta": {"source": "live", "captured_at": now - 10}},
+    ]
+    rows = [
+        _debate_row(now - 60, same, same),
+        _debate_row(now - 40, *live_zero),
+        _debate_row(now - 20, same, {"300": {"used_percent": 12.0, "resets_at": now + 5000}}),
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    # The identical row is gone; two distinct live readings keep a genuine 0.
+    assert cic._debate_cost_deltas(300, now=now) == [0.0, 2.0]
+
+
+def test_cost_history_drops_rows_whose_before_reading_predates_a_reset(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale 5h window dates the WHOLE reading: its 7d figure is old too (the 47 % row)."""
+    path = tmp_path / "cost-history.jsonl"
+    monkeypatch.setenv("CODEX_IN_CLAUDE_COST_LOG", str(path))
+    now = _HEADROOM_NOW
+    week = now + 400_000
+    stale_before = {
+        "300": {"used_percent": 10.0, "resets_at": now - 138_000},
+        "10080": {"used_percent": 5.0, "resets_at": week},
+    }
+    fresh_after = {
+        "300": {"used_percent": 80.0, "resets_at": now + 100},
+        "10080": {"used_percent": 52.0, "resets_at": week},
+    }
+    fresh_before = {
+        "300": {"used_percent": 70.0, "resets_at": now + 100},
+        "10080": {"used_percent": 50.0, "resets_at": week},
+    }
+    rows = [
+        _debate_row(now - 10, stale_before, fresh_after),
+        _debate_row(now - 5, fresh_before, fresh_after),
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    assert cic._debate_cost_deltas(10080, now=now) == [2.0]
+    assert cic._debate_cost_deltas(300, now=now) == [10.0]
+
+
+def _rollout_reading(home: Path, *, pct: float, captured_at: int, resets_at: int) -> None:
+    day = home / "sessions" / "2033" / "05" / "18"
+    day.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.fromtimestamp(captured_at, UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    (day / "rollout-cost.jsonl").write_text(
+        json.dumps(
+            {
+                "timestamp": stamp,
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": pct,
+                            "resets_at": resets_at,
+                            "window_minutes": 300,
+                        },
+                        "secondary": None,
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _live_reading(home: Path, *, pct: float, captured_at: int, resets_at: int) -> None:
+    from command_center import usage  # pylint: disable=import-outside-toplevel
+
+    usage._write_codex_usage(  # noqa: SLF001
+        home,
+        usage.Usage(
+            captured_at=captured_at,
+            five_hour=usage.Window(used_percentage=pct, resets_at=resets_at),
+            seven_day=None,
+            live=True,
+        ),
+        captured_at,
+    )
+
+
+@pytest.mark.parametrize(
+    ("live_age", "rollout_age", "source", "pct"),
+    [(10, 100, "live", 30.0), (100, 10, "rollout", 20.0), (50, 50, "live", 30.0)],
+)
+def test_cost_snapshot_takes_the_newer_of_live_and_rollout(
+    cic: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_age: int,
+    rollout_age: int,
+    source: str,
+    pct: float,
+) -> None:
+    home = tmp_path / "seat"
+    home.mkdir()
+    now = int(time.time())
+    resets = now + 3600
+    monkeypatch.setattr(cic, "_usage_feedback_on", lambda: True)
+    _rollout_reading(home, pct=20.0, captured_at=now - rollout_age, resets_at=resets)
+    _live_reading(home, pct=30.0, captured_at=now - live_age, resets_at=resets)
+    snapshot = cic.codex_cost_snapshot(home)
+    captured = now - (live_age if source == "live" else rollout_age)
+    assert snapshot == {
+        "300": {"used_percent": pct, "resets_at": resets},
+        "_meta": {"source": source, "captured_at": captured},
+    }
+
+
+def test_cost_snapshot_ignores_the_live_cache_without_codex_usage(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rollout-only operation is unchanged: the live cache is not even consulted."""
+    home = tmp_path / "seat"
+    home.mkdir()
+    now = int(time.time())
+    monkeypatch.setattr(cic, "_usage_feedback_on", lambda: False)
+    _rollout_reading(home, pct=20.0, captured_at=now - 100, resets_at=now + 3600)
+    _live_reading(home, pct=30.0, captured_at=now - 10, resets_at=now + 3600)
+    snapshot = cic.codex_cost_snapshot(home)
+    assert snapshot["300"]["used_percent"] == 20.0
+    assert snapshot["_meta"]["source"] == "rollout"
+    assert cic.codex_cost_snapshot(tmp_path / "empty") == {}
 
 
 def test_cost_history_prunes_rows_older_than_ninety_days_on_write(

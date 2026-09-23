@@ -727,6 +727,62 @@ def test_the_opt_in_refreshes_the_seat_after_every_attempt(
     assert "--ephemeral" in three_seats.calls()[0]["argv"]
 
 
+def _cost_rows(seats: SeatFixture) -> list[dict]:
+    path = seats.home / "cost-history.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_the_cost_row_is_measured_after_the_post_attempt_fetch(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#227: an ephemeral run leaves no rollout; only the live fetch can measure it."""
+    path = three_seats.ccc_home / "command-center" / "config.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("codex_usage = false", "codex_usage = true"),
+        encoding="utf-8",
+    )
+    config.invalidate_config_cache()
+    start = int(time.time())
+    seat = three_seats.seats["private"]
+    _live(seat, five=10.0, week=10.0, now=start, age=60)
+    fetched: list[Path] = []
+
+    def _fetch(home: Path, now: int | None = None, *, timeout: float | None = None) -> None:
+        fetched.append(home)
+        _live(home, five=12.0, week=11.0, now=start, age=-5)  # same windows, newer reading
+
+    monkeypatch.setattr(cic, "_pre_selection_refresh", lambda cands, budget: None)
+    monkeypatch.setattr(usage, "fetch_codex_usage", _fetch)
+    cic.save_config({"codex_home": str(seat), "codex_home_until": None})
+    three_seats.scenarios(private={"scenario": "ok", "reply": "hi"})
+    assert cic.cmd_run(_run_ns(three_seats, purpose="debate")) == cic.EX_OK
+    assert fetched == [seat]  # exactly one fetch for the one attempt
+    (row,) = _cost_rows(three_seats)
+    assert row["before"]["_meta"]["source"] == "live"
+    assert row["after"]["_meta"]["source"] == "live"
+    assert row["after"]["_meta"]["captured_at"] > row["before"]["_meta"]["captured_at"]
+    assert row["after"]["300"]["used_percent"] - row["before"]["300"]["used_percent"] == 2.0
+    assert cic._debate_cost_deltas(300) == [2.0]  # noqa: SLF001
+
+
+def test_without_codex_usage_the_cost_row_stays_rollout_only(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``codex_usage = false``: no fetch, no live read — the row is rollout-sourced."""
+    fetched: list[Path] = []
+    monkeypatch.setattr(
+        usage, "fetch_codex_usage", lambda home, now=None, *, timeout=None: fetched.append(home)
+    )
+    three_seats.measure()
+    _live(three_seats.seats["private"], five=90.0, week=90.0, now=int(time.time()))
+    three_seats.scenarios(private={"scenario": "ok", "reply": "hi"})
+    assert cic.cmd_run(_run_ns(three_seats)) == cic.EX_OK
+    assert fetched == []
+    (row,) = _cost_rows(three_seats)
+    assert row["before"]["_meta"]["source"] == "rollout"
+    assert row["before"]["300"]["used_percent"] == 20.0
+
+
 def test_a_failed_refresh_still_alternates_the_seats(
     three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

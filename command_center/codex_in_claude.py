@@ -2805,24 +2805,66 @@ def codex_cost_history_path() -> Path:
     return config_path().with_name("cost-history.jsonl")
 
 
-def codex_cost_snapshot(home: Path | None = None) -> dict[str, dict[str, float | int]]:
+def codex_cost_snapshot(home: Path | None = None) -> dict[str, dict[str, Any]]:
     """Serializable duration-keyed quota snapshot for cost instrumentation.
 
     This public seam lets an external debate helper capture ``before`` and ``after``
     around its own ``codex exec`` and pass both to :func:`record_codex_run`. Pass the
     *home* the run actually billed: a hop bills two different seats in one call, and
     a before/after pair straddling them would record a nonsense delta.
+
+    The reading is the NEWER of *home*'s rollout event and — with ``codex_usage`` on —
+    its live-usage cache (live wins a tie). An ephemeral run writes no rollout, so a
+    rollout-only snapshot taken after it is the same stale reading as before it: every
+    such row recorded a delta of 0 (tp#227). The runner refreshes the live cache after
+    each attempt and before recording, so ``after`` is a real measurement.
+
+    Besides the duration keys (``"300"``, ``"10080"``, … → ``used_percent`` /
+    ``resets_at``) a non-empty snapshot carries ``"_meta": {"source": "live"|"rollout",
+    "captured_at": <epoch>}``, so a row says where its figures came from and when; two
+    readings of the same source with the same ``captured_at`` are one measurement.
     """
-    snapshot = _codex_rate_snapshot(home)
-    if snapshot is None:
-        return {}
-    return {
-        str(minutes): {
-            "used_percent": window.used_percent,
-            "resets_at": window.resets_at,
+    home = _codex_home() if home is None else home
+    rollout = _codex_rate_snapshot(home)
+    live = _live_cost_reading(home) if _usage_feedback_on() else None
+    if live is not None and (rollout is None or live[0] >= rollout.captured_at):
+        captured_at, source = live[0], "live"
+        windows = live[1]
+    elif rollout is not None:
+        captured_at, source = rollout.captured_at, "rollout"
+        windows = {
+            minutes: (window.used_percent, window.resets_at)
+            for minutes, window in rollout.windows.items()
         }
-        for minutes, window in sorted(snapshot.windows.items())
+    else:
+        return {}
+    snapshot: dict[str, dict[str, Any]] = {
+        str(minutes): {"used_percent": pct, "resets_at": resets}
+        for minutes, (pct, resets) in sorted(windows.items())
     }
+    snapshot["_meta"] = {"source": source, "captured_at": captured_at}
+    return snapshot
+
+
+def _live_cost_reading(home: Path) -> tuple[int, dict[int, tuple[float, int]]] | None:
+    """``(captured_at, {minutes: (used_percent, resets_at)})`` from *home*'s live cache."""
+    from . import usage  # pylint: disable=import-outside-toplevel  # cycle: usage imports us
+
+    try:
+        snap = usage.read_codex_live(home)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return None
+    if snap is None:
+        return None
+    windows = {
+        minutes: (window.used_percentage, window.resets_at)
+        for minutes, window in (
+            (_FIVE_HOUR_MINUTES, snap.five_hour),
+            (_SEVEN_DAY_MINUTES, snap.seven_day),
+        )
+        if window is not None
+    }
+    return (snap.captured_at, windows) if windows else None
 
 
 def _history_row_timestamp(row: object) -> float | None:
@@ -2841,8 +2883,8 @@ def record_codex_run(
     purpose: str,
     model: str,
     effort: str,
-    before: dict[str, dict[str, float | int]],
-    after: dict[str, dict[str, float | int]],
+    before: dict[str, dict[str, Any]],
+    after: dict[str, dict[str, Any]],
     ts: int | None = None,
     path: Path | None = None,
     home: Path | None = None,
@@ -2905,8 +2947,32 @@ def record_codex_run(
         return False
 
 
+def _reading_predates_a_reset(snapshot: dict[str, Any], ts: float) -> bool:
+    """True when a window of cost *snapshot* had already reset by *ts* (a stale reading)."""
+    for name, window in snapshot.items():
+        if name.startswith("_") or not isinstance(window, dict):
+            continue
+        try:
+            if int(window["resets_at"]) <= ts:
+                return True
+        except (KeyError, TypeError, ValueError):
+            continue
+    return False
+
+
 def _debate_cost_deltas(window_minutes: int, *, now: int | None = None) -> list[float]:
-    """Valid debate-run usage deltas for one duration from the retained history."""
+    """Valid debate-run usage deltas for one duration from the retained history.
+
+    A row counts only when it was actually MEASURED (tp#227):
+
+    * ``before == after`` means no new reading was taken between them — an ephemeral
+      run leaves no rollout, so a rollout-only snapshot repeats itself and records a
+      fake 0. A genuine zero from two live fetches still differs in ``_meta``.
+    * a ``before`` reading ANY of whose windows has ``resets_at`` at or before the
+      row's own ``ts`` predates that reset, so the whole reading is old — its other
+      windows included (a 38 h-old 7d 5 % against a fresh 52 % once read as a 47 %
+      debate, though only the 5h window gave the age away).
+    """
     now_ts = int(time.time()) if now is None else now
     try:
         lines = codex_cost_history_path().read_text(encoding="utf-8", errors="replace").splitlines()
@@ -2929,7 +2995,9 @@ def _debate_cost_deltas(window_minutes: int, *, now: int | None = None) -> list[
             continue
         before = row.get("before")
         after = row.get("after")
-        if not isinstance(before, dict) or not isinstance(after, dict):
+        if not isinstance(before, dict) or not isinstance(after, dict) or before == after:
+            continue
+        if _reading_predates_a_reset(before, row_ts):
             continue
         before_window = before.get(key)
         after_window = after.get(key)
@@ -3856,6 +3924,8 @@ def _attempt_codex(  # pylint: disable=too-many-locals
     effort: str,
     heartbeat_meta: dict[str, Any],
     heartbeat_path: Path,
+    total_timeout: int = 0,
+    started: float | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], str, list[str] | None]:
     """ONE supervised ``codex exec`` on *cand*: ``(proc, reply, worktree before)``.
 
@@ -3866,6 +3936,12 @@ def _attempt_codex(  # pylint: disable=too-many-locals
     is overridden explicitly.
 
     Raises whatever :func:`_exec_codex` raises; the cost row is written either way.
+
+    With ``codex_usage`` on, the seat is re-measured (:func:`_post_attempt_refresh`,
+    inside what is left of the call's budget — *total_timeout* seconds from *started*)
+    BEFORE the ``after`` snapshot is taken: an ephemeral run leaves no rollout, so that
+    fetch is the only thing that can make ``after`` differ from ``before`` (tp#227). It
+    is also what lets the NEXT ranking — this call's own hop included — see the cost.
     """
     perm_args = codex_launch.permission_args(write, codex_home=cand.home)
     mcp_args = codex_launch.mcp_disable_args(cand.home)
@@ -3890,6 +3966,14 @@ def _attempt_codex(  # pylint: disable=too-many-locals
                 stdin_text=prompt,
             )
         finally:
+            if _usage_feedback_on():
+                with contextlib.suppress(Exception):
+                    _post_attempt_refresh(
+                        cand,
+                        _budget_left(
+                            total_timeout, time.monotonic() if started is None else started
+                        ),
+                    )
             record_codex_run(
                 purpose=purpose,
                 model=model,
@@ -3917,7 +4001,9 @@ def ephemeral_default() -> bool:
     NOTHING behind that measures the seat it just billed. With ``codex_usage`` OFF the
     rollout file is the only offline measurement there is, so these calls keep it (they
     stay UNJOURNALLED either way — only ``run -P`` journals); with it ON the runner
-    fetches the live figures itself and the session file is pure litter again.
+    fetches the live figures itself — for the next ranking AND for the attempt's
+    ``after`` cost snapshot (:func:`codex_cost_snapshot` reads the live cache) — and the
+    session file is pure litter again.
 
     A config read that fails answers True: leaving no session file is the conservative
     side of this choice.
@@ -4373,6 +4459,8 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
                 effort=effort,
                 heartbeat_meta=heartbeat_meta,
                 heartbeat_path=heartbeat_path,
+                total_timeout=total_timeout,
+                started=started,
             )
         except FileNotFoundError:
             result.attempts.append(
@@ -4390,11 +4478,6 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
                 result, cand, exc, attempt_started, kind=_STALL_KINDS.get(exc.reason, "stalled")
             )
         elapsed = time.monotonic() - attempt_started
-        if _usage_feedback_on():
-            # Re-measure what this attempt actually cost, so the NEXT ranking (this call's
-            # own hop included) is not made on pre-attempt figures. Never fatal.
-            with contextlib.suppress(Exception):
-                _post_attempt_refresh(cand, _budget_left(total_timeout, started))
         events = parse_json_events(proc.stdout or "")
         failure = classify_codex_failure(proc.returncode, events, proc.stderr or "")
         result.proc = proc

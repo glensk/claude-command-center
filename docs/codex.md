@@ -566,6 +566,13 @@ duration, `headroom` reserves `3 × P95` of their measured cost plus a 10% margi
 to 5–60%) instead of the 35% bootstrap. An external debate runner can use the same
 `codex_cost_snapshot()` and `record_codex_run()` Python functions around its `codex exec`.
 
+A snapshot is the newer of the seat's rollout reading and — with `codex_usage` on — its
+live-usage cache, tagged `"_meta": {"source": "live"|"rollout", "captured_at": <epoch>}`.
+With `codex_usage` on, runs are `--ephemeral` (no rollout), so the runner re-fetches the
+seat's live figures after each attempt and only then takes the `after` snapshot. The
+reserve ignores unmeasured rows: `before == after` (no new reading between them) and rows
+whose `before` reading predates one of its own window resets (tp#227).
+
 Configuration lives in `~/.config/codex-in-claude/config.json` (override with
 `$CODEX_IN_CLAUDE_CONFIG`). Resolution is per-command → `default` → the latest Codex model;
 the effort is a single global key. Keep the engine **read-only by default** — `--write` is
