@@ -379,6 +379,7 @@ def _section_daemon() -> Section:
             section.checks.append(
                 Check(FAIL, "launchd agent", "not installed — ccc daemon --install")
             )
+        section.checks.append(_panel_server_check())
         return section
     if sys.platform.startswith("linux"):
         from . import systemdunit  # pylint: disable=import-outside-toplevel
@@ -398,6 +399,25 @@ def _section_daemon() -> Section:
         return section
     section.checks.append(Check(NA, "daemon service", "no launchd/systemd on this platform"))
     return section
+
+
+def _panel_server_check() -> Check:
+    """The optional resident panel server (tp#70): NA when not installed (it is opt-in).
+
+    OK = installed, alive, ``ready``/``busy`` and running the current code; FAIL =
+    installed but dead / not running, ``degraded`` (chords fall back cold), or a stale
+    ``code_stamp`` after an edit to the editable install.
+    """
+    from . import launchd, panelserver  # pylint: disable=import-outside-toplevel
+
+    if not launchd.panel_server_plist_path().exists():
+        return Check(NA, "panel server", "not installed — optional: ccc panel-server --install")
+    verdict, detail = panelserver.status_line()
+    if verdict == "ok":
+        return Check(OK, "panel server", detail)
+    if verdict == "absent":
+        detail = "installed but not running — ccc panel-server --start"
+    return Check(FAIL, "panel server", detail)
 
 
 #: macOS's Automation (TCC) store; the Apple-events grant that gates every AppleScript to iTerm2.

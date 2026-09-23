@@ -83,3 +83,117 @@ def test_daemon_plist_label_derives_from_config(tmp_path: Path) -> None:
     data = plistlib.loads(xml.encode("utf-8"))
     assert data["Label"] == "com.test.ccc"
     assert data["ProgramArguments"] == ["/x/ccc", "daemon"]
+
+
+# ------------------------- resident panel server agent (tp#70 S5a) ------------------------- #
+@pytest.fixture
+def panel_plist(tmp_path: Path) -> dict:
+    xml = launchd.panel_server_plist_content(
+        "/opt/it's ccc/bin/ccc",
+        launchd.panel_server_label(_cfg(tmp_path)),
+        tmp_path / "app home",
+        {"CCC_HOME": "/x/<&>"},
+    )
+    return plistlib.loads(xml.encode("utf-8"))
+
+
+def test_panel_server_label_derives_from_config(tmp_path: Path, panel_plist: dict) -> None:
+    assert launchd.panel_server_label(_cfg(tmp_path)) == "com.test.ccc-panel-server"
+    assert panel_plist["Label"] == "com.test.ccc-panel-server"
+    assert launchd.panel_server_plist_path(_cfg(tmp_path)).name == "com.test.ccc-panel-server.plist"
+
+
+def test_panel_server_plist_shape(tmp_path: Path, panel_plist: dict) -> None:
+    assert panel_plist["ProgramArguments"] == ["/opt/it's ccc/bin/ccc", "panel-server"]
+    assert panel_plist["KeepAlive"] == {"SuccessfulExit": False}
+    assert panel_plist["RunAtLoad"] is True
+    assert panel_plist["LimitLoadToSessionType"] == "Aqua"
+    assert panel_plist["ProcessType"] == "Interactive"
+    env = panel_plist["EnvironmentVariables"]
+    assert env["PATH"] and env["HOME"] and env["CCC_HOME"] == "/x/<&>"  # escaped, round-trips
+    assert panel_plist["StandardOutPath"] == str(tmp_path / "app home" / "panel-server.log")
+    assert panel_plist["StandardErrorPath"] == str(tmp_path / "app home" / "panel-server.err")
+
+
+class _Launchctl:
+    """Records every ``launchctl`` call; ``loaded`` drives ``print``'s exit code."""
+
+    def __init__(self, loaded: bool = False) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        self.loaded = loaded
+
+    def __call__(self, *args: str):  # noqa: ANN204
+        import subprocess
+
+        self.calls.append(args)
+        rc = 0
+        if args[0] == "print":
+            rc = 0 if self.loaded else 113
+        elif args[0] == "bootstrap":
+            self.loaded = True
+        elif args[0] == "bootout":
+            self.loaded = False
+        return subprocess.CompletedProcess(["launchctl", *args], rc, "", "")
+
+
+@pytest.fixture
+def fake_launchctl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Launchctl:
+    fake = _Launchctl()
+    monkeypatch.setattr(launchd, "_launchctl", fake)
+    monkeypatch.setattr(launchd.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(launchd.Path, "home", classmethod(lambda cls: tmp_path / "userhome"))
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))
+    monkeypatch.delenv("CCC_HOME", raising=False)
+    monkeypatch.setattr(launchd.config, "load_config", lambda: _cfg(tmp_path))
+    monkeypatch.setattr(launchd, "_ccc_path", lambda: "/opt/ccc")
+    return fake
+
+
+def test_panel_server_install_writes_plist_poker_and_bootstraps(
+    tmp_path: Path, fake_launchctl: _Launchctl
+) -> None:
+    assert launchd.panel_server_install() == 0
+    plist = launchd.panel_server_plist_path()
+    assert plist.exists()
+    poker = tmp_path / "claude" / "command-center" / "panel-poke.sh"
+    assert poker.exists() and "COLD_CCC=/opt/ccc" in poker.read_text()
+    verbs = [call[0] for call in fake_launchctl.calls]
+    assert "bootstrap" in verbs
+    assert launchd.panel_server_loaded()
+
+
+def test_panel_server_stop_start_uninstall_and_purge(
+    tmp_path: Path, fake_launchctl: _Launchctl
+) -> None:
+    launchd.panel_server_install()
+    assert launchd.panel_server_stop() == 0 and not fake_launchctl.loaded
+    assert launchd.panel_server_start() == 0 and fake_launchctl.loaded
+    poker = tmp_path / "claude" / "command-center" / "panel-poke.sh"
+    assert launchd.panel_server_uninstall() == 0
+    assert not launchd.panel_server_plist_path().exists()
+    assert poker.exists()  # kept: Karabiner may still point at it
+    launchd.panel_server_install()
+    assert launchd.panel_server_uninstall(purge=True) == 0
+    assert not poker.exists()
+
+
+def test_panel_server_start_without_install_fails(fake_launchctl: _Launchctl) -> None:
+    assert launchd.panel_server_start() == 1
+    assert not any(call[0] == "bootstrap" for call in fake_launchctl.calls)
+
+
+def test_daemon_install_never_touches_the_panel_server(
+    tmp_path: Path, fake_launchctl: _Launchctl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opt-in contract: `ccc daemon --install` does not install the panel server."""
+    import subprocess
+
+    monkeypatch.setattr(
+        launchd.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", ""),
+    )
+    monkeypatch.setattr(launchd, "quota_probe_plist", lambda cfg=None: "<plist/>")
+    launchd.install()
+    assert not launchd.panel_server_plist_path().exists()
+    assert not (tmp_path / "claude" / "command-center" / "panel-poke.sh").exists()

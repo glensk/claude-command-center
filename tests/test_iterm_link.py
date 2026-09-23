@@ -91,10 +91,12 @@ def test_second_connection_gets_its_own_app(monkeypatch: pytest.MonkeyPatch) -> 
     """V16: after a drop, the reconnect's app is bound to the NEW connection."""
     _fake_iterm2(monkeypatch, _conn)
     for link in (iterm_api.ItermLink(), _cookie_link()):
-        assert asyncio.run(link.ensure()) is True
+        connect = link.reconnect if isinstance(link, iterm_api.CookieItermLink) else link.ensure
+        assert asyncio.run(connect()) is True
         first = link._app  # pylint: disable=protected-access
         link.drop()
-        assert asyncio.run(link.ensure()) is True
+        connect = link.reconnect if isinstance(link, iterm_api.CookieItermLink) else link.ensure
+        assert asyncio.run(connect()) is True
         second = link._app  # pylint: disable=protected-access
         assert second is not first
         assert second.connection == link._connection  # pylint: disable=protected-access
@@ -103,7 +105,7 @@ def test_second_connection_gets_its_own_app(monkeypatch: pytest.MonkeyPatch) -> 
 def test_cookie_is_in_env_only_during_connect(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _fake_iterm2(monkeypatch, _conn)
     link = _cookie_link()
-    assert asyncio.run(link.ensure()) is True
+    assert asyncio.run(link.reconnect()) is True
     assert state.env_seen == [("c00kie", "k3y")]
     assert not any(name in os.environ for name in iterm_api.AUTH_ENV)
 
@@ -114,7 +116,7 @@ def test_env_removed_after_401_and_package_never_authenticates(
     """A rejected cookie fails the connect — no in-process AppleScript fallback."""
     state = _fake_iterm2(monkeypatch, _conn)
     link = _cookie_link(("stale", "k"))
-    assert asyncio.run(link.ensure()) is False
+    assert asyncio.run(link.reconnect()) is False
     assert state.auth_calls == 0  # the package's own authenticate was replaced
     assert not any(name in os.environ for name in iterm_api.AUTH_ENV)
     assert sys.modules["iterm2.auth"].authenticate.__name__ == "_authenticate"  # restored
@@ -125,7 +127,7 @@ def test_env_removed_after_exception(monkeypatch: pytest.MonkeyPatch) -> None:
         raise OSError("socket gone")
 
     _fake_iterm2(monkeypatch, _boom)
-    assert asyncio.run(_cookie_link().ensure()) is False
+    assert asyncio.run(_cookie_link().reconnect()) is False
     assert not any(name in os.environ for name in iterm_api.AUTH_ENV)
 
 
@@ -140,7 +142,7 @@ def test_env_removed_after_timeout_via_link_thread(monkeypatch: pytest.MonkeyPat
     thread = iterm_api.LinkThread(_cookie_link())
     try:
         start = time.monotonic()
-        assert thread.call(lambda link: link.ensure(), timeout=0.2) is None
+        assert thread.call(lambda link: link.reconnect(), timeout=0.2) is None
         assert time.monotonic() - start < 2.0
         deadline = time.monotonic() + 2.0
         while any(n in os.environ for n in iterm_api.AUTH_ENV) and time.monotonic() < deadline:
@@ -153,8 +155,8 @@ def test_env_removed_after_timeout_via_link_thread(monkeypatch: pytest.MonkeyPat
 def test_no_connect_when_iterm_absent_or_no_cookie(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _fake_iterm2(monkeypatch, _conn)
     absent = iterm_api.CookieItermLink(running=lambda: False, cookie=lambda: ("c", "k"))
-    assert asyncio.run(absent.ensure()) is False
-    assert asyncio.run(_cookie_link(None).ensure()) is False
+    assert asyncio.run(absent.reconnect()) is False
+    assert asyncio.run(_cookie_link(None).reconnect()) is False
     assert state.connects == 0
 
 
@@ -162,7 +164,7 @@ def test_link_thread_returns_results(monkeypatch: pytest.MonkeyPatch) -> None:
     _fake_iterm2(monkeypatch, _conn)
     thread = iterm_api.LinkThread(_cookie_link())
     try:
-        assert thread.call(lambda link: link.ensure(), timeout=2.0) is True
+        assert thread.call(lambda link: link.reconnect(), timeout=2.0) is True
     finally:
         thread.stop()
 
@@ -194,3 +196,12 @@ def test_fetch_cookie_parses_and_bounds(monkeypatch: pytest.MonkeyPatch) -> None
     assert "request cookie and key" in seen["script"]
     monkeypatch.setattr(terminal, "_osascript", lambda *_a, **_k: None)
     assert iterm_api.fetch_cookie() is None
+
+
+def test_cookie_link_ops_never_connect_implicitly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the server's probe reconnects; a resolver's op on a dropped link degrades."""
+    state = _fake_iterm2(monkeypatch, _conn)
+    link = _cookie_link()
+    assert asyncio.run(link.current_session_uuid()) is None
+    assert asyncio.run(link.session_variable("UUID", "path")) is None
+    assert state.connects == 0

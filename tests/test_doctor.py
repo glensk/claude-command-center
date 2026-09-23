@@ -670,3 +670,41 @@ def test_mirror_scrubber_check_states(tmp_path: Path) -> None:
         )
     check = {c.label: c for c in doctor._section_features(cfg).checks}[label]
     assert check.status == doctor.FAIL and "withheld 2" in check.detail
+
+
+# ------------------------------ panel server row (tp#70 S5a) ------------------------------ #
+def _panel_row(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, installed: bool) -> str:
+    from command_center import launchd
+
+    plist = tmp_path / "panel.plist"
+    if installed:
+        plist.write_text("x")
+    monkeypatch.setattr(launchd, "panel_server_plist_path", lambda cfg=None: plist)
+    check = doctor._panel_server_check()  # pylint: disable=protected-access
+    return check.status
+
+
+def test_panel_server_row_states(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import os
+    import subprocess
+    import sys
+
+    from command_center import panelserver as ps
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CCC_HOME", raising=False)
+    p = ps.paths()
+    assert _panel_row(monkeypatch, tmp_path, installed=False) == doctor.NA
+    assert _panel_row(monkeypatch, tmp_path, installed=True) == doctor.FAIL  # no pidfile
+    ps.write_pidfile(p, os.getpid(), "ready", ps.code_stamp())
+    assert _panel_row(monkeypatch, tmp_path, installed=True) == doctor.OK
+    ps.write_pidfile(p, os.getpid(), "busy", ps.code_stamp())
+    assert _panel_row(monkeypatch, tmp_path, installed=True) == doctor.OK
+    ps.write_pidfile(p, os.getpid(), "degraded", ps.code_stamp())
+    assert _panel_row(monkeypatch, tmp_path, installed=True) == doctor.FAIL
+    ps.write_pidfile(p, os.getpid(), "ready", 0)  # stale code stamp
+    assert _panel_row(monkeypatch, tmp_path, installed=True) == doctor.FAIL
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    ps.write_pidfile(p, proc.pid, "ready", ps.code_stamp())  # dead
+    assert _panel_row(monkeypatch, tmp_path, installed=True) == doctor.FAIL

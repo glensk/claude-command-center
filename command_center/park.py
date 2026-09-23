@@ -696,7 +696,11 @@ def grab(  # pylint: disable=too-many-locals,too-many-return-statements,too-many
 
     prompt = capture_panel("resolving target…", initial, poll=_poll)
     if not prompt:
-        return 130  # cancelled — the panel was the whole interaction, stay silent
+        # Cancelled — the panel was the whole interaction, stay silent. The resolver is
+        # still joined: in the resident panel server a cancel must not leave a thread
+        # behind that finishes after the NEXT chord started (tp#70 D5b).
+        worker.join(timeout=RESOLVE_JOIN_SEC)
+        return 130
     worker.join(timeout=RESOLVE_JOIN_SEC)
     size_err = prompt_size_error(prompt)
     if size_err:

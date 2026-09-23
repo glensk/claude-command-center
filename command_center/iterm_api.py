@@ -178,6 +178,12 @@ class ItermLink:
         try:
             session = self._app.get_session_by_id(uuid)
             if session is None:
+                import iterm2  # pylint: disable=import-outside-toplevel
+
+                # A tab opened after the app was fetched — refetch once (as focus_session).
+                self._app = await iterm2.async_get_app(self._connection)
+                session = self._app.get_session_by_id(uuid)
+            if session is None:
                 return None
             value = await session.async_get_variable(name)
         except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
@@ -256,6 +262,20 @@ class CookieItermLink(ItermLink):
         self._running = running
         self._cookie = cookie
 
+    async def ensure(self) -> bool:
+        """Report readiness only — this link NEVER connects as a side effect of an op.
+
+        Reconnects are the server's decision (:meth:`reconnect`, run by its probe while
+        no panel is active), so a resolver thread can never open the cookie window
+        concurrently with a child spawn on another thread (tp#70 D4/R17).
+        """
+        return self.ready
+
+    async def reconnect(self) -> bool:
+        """Drop any old connection and connect afresh (bounded by the caller)."""
+        self._drop()
+        return await super().ensure()
+
     async def _connect(self, iterm2: Any) -> tuple[Any, Any]:
         if not self._running():
             raise ConnectionError("iTerm2 is not running")
@@ -274,7 +294,7 @@ class LinkThread:
     block the caller (the panel server's main thread) for longer than the bound.
     """
 
-    def __init__(self, link: ItermLink | None = None) -> None:
+    def __init__(self, link: CookieItermLink | None = None) -> None:
         self.link = link or CookieItermLink()
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
@@ -283,7 +303,7 @@ class LinkThread:
         self._thread.start()
 
     def call(
-        self, factory: Callable[[ItermLink], Coroutine[Any, Any, _T]], timeout: float
+        self, factory: Callable[[CookieItermLink], Coroutine[Any, Any, _T]], timeout: float
     ) -> _T | None:
         """``factory(link)`` on the link thread, bounded by *timeout*; None on any failure."""
         future = asyncio.run_coroutine_threadsafe(factory(self.link), self._loop)

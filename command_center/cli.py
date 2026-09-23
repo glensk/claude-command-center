@@ -4919,6 +4919,8 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         f"claude_usage={int(report.claude_refreshed)} "
         f"resume={int(report.resume_spawned)} temps_swept={report.temps_swept}"
     )
+    if report.panel_restart:
+        print(f"{prefix}{report.panel_restart}")
     if args.verbose:
         for label, ids in (
             ("reap", report.reaped),
@@ -5094,6 +5096,21 @@ _RESTART_POLL_SEC = 0.1
 _RESTART_TIMEOUT_SEC = 25.0
 
 
+def _panel_server_stale_hint() -> None:
+    """After a TUI restart: say so when the optional panel server runs stale code (D8).
+
+    Only a hint — ``restart-tui``'s exit-code contract is about the TUI alone.
+    """
+    try:
+        from . import panelserver
+
+        verdict, _detail = panelserver.status_line()
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return
+    if verdict == "stale":
+        print("panel server is stale — ccc panel-server --restart")
+
+
 def cmd_restart_tui(args: argparse.Namespace) -> int:
     """Restart the running ccc TUI in its own terminal tab (for automations).
 
@@ -5132,9 +5149,11 @@ def cmd_restart_tui(args: argparse.Namespace) -> int:
         new_pid = current[0]
         if new_pid != old_pid:  # a fresh process registered — unambiguous restart
             print(f"restarted ccc TUI (pid {old_pid} → {new_pid})")
+            _panel_server_stale_hint()
             return 0
         if saw_consumed and saw_gone:  # same pid re-registered after the gap (execv in place)
             print(f"restarted ccc TUI (pid {old_pid} → {new_pid})")
+            _panel_server_stale_hint()
             return 0
     jumpstate.clear_restart()  # stale-request safety: don't let it restart a TUI started later
     print(
@@ -5144,6 +5163,58 @@ def cmd_restart_tui(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     return 1
+
+
+def cmd_panel_server(args: argparse.Namespace) -> int:
+    """``ccc panel-server`` — the resident panel server (see :mod:`panelserver`)."""
+    from . import panelserver
+
+    return panelserver.cmd(args)
+
+
+def _add_panel_server(sub: Any) -> None:
+    """Register ``ccc panel-server`` (tp#70) — the module itself loads only when run."""
+    parser = sub.add_parser(
+        "panel-server",
+        help="optional resident server: q+p / s+p panels in ≤ 0.2 s (macOS, opt-in)",
+        description=(
+            "Keeps one process resident with AppKit loaded and a warm iTerm2 link, so the "
+            "Karabiner q+p (park) and s+p (peek) chords open their panels in ≤ 0.2 s. "
+            "Opt-in: --install writes a LaunchAgent and the chord poker; without it "
+            "nothing changes. Bare `ccc panel-server` runs the server in this process."
+        ),
+        epilog=(
+            "examples:\n"
+            "  ccc panel-server -I        install + start the LaunchAgent and the poker\n"
+            "  ccc panel-server -t        status (launchd + pidfile + state)\n"
+            "  ccc panel-server -x -n 60  latency stats of the last 60 chords\n"
+            "  ccc panel-server -r        restart after a code change\n"
+            "  ccc panel-server -U -P     uninstall and remove the poker too\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("-I", "--install", action="store_true", help="install + start (opt-in)")
+    group.add_argument("-U", "--uninstall", action="store_true", help="stop + remove the agent")
+    group.add_argument("-s", "--start", action="store_true", help="launchctl bootstrap the agent")
+    group.add_argument("-S", "--stop", action="store_true", help="launchctl bootout the agent")
+    group.add_argument("-t", "--status", action="store_true", help="agent + pidfile + state")
+    group.add_argument("-r", "--restart", action="store_true", help="re-exec (after code edits)")
+    group.add_argument("-x", "--stats", action="store_true", help="panel-metrics.jsonl summary")
+    group.add_argument("-k", "--smoke", action="store_true", help="invisible leak smoke test")
+    group.add_argument(
+        "-f", "--foreground", action="store_true", help="run the server here (the default)"
+    )
+    parser.add_argument(
+        "-P", "--purge", action="store_true", help="with --uninstall: also remove the poker"
+    )
+    parser.add_argument(
+        "-n", "--last", type=int, default=None, metavar="N", help="--stats: only the last N rows"
+    )
+    parser.add_argument(
+        "-c", "--cycles", type=int, default=50, metavar="N", help="--smoke: park+peek cycles"
+    )
+    parser.set_defaults(func=cmd_panel_server)
 
 
 def cmd_tab_symbol(args: argparse.Namespace) -> int:
@@ -6643,6 +6714,8 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         help="auto-close the panel after N seconds (0 = wait for a key; for smoke tests)",
     )
     p_peek.set_defaults(func=cmd_peek)
+
+    _add_panel_server(sub)
 
     p_jump = sub.add_parser(
         "jump",

@@ -418,19 +418,45 @@ def events_in_file(path: Path) -> list[SessionEvent]:
     try:
         with path.open(encoding="utf-8") as handle:
             for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(record, dict) or record.get("isSidechain"):
-                    continue
-                _collect_events(record, events, pending)
+                record = parse_transcript_line(line)
+                if record is not None:
+                    collect_record_events(record, events, pending)
     except OSError:
         pass
     return events
+
+
+def parse_transcript_line(line: str) -> object | None:
+    """One transcript JSONL line → its decoded record; ``None`` for a blank/malformed line.
+
+    The per-line half of every full-transcript walk (:func:`events_in_file`,
+    :meth:`ClaudeAdapter.all_user_prompts_in_file` and the incremental one-pass collector
+    in :mod:`command_center.transcript_cache`), so they all skip the same lines.
+    """
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
+def collect_record_events(
+    record: object, events: list[SessionEvent], pending: dict[str, SessionEvent]
+) -> None:
+    """Append one decoded record's events to *events*, pairing tool results via *pending*.
+
+    The per-record half of :func:`events_in_file`: non-dict and sidechain records are
+    skipped, everything else goes through :func:`_collect_events`. *pending* maps a
+    ``tool_use`` id to its still-unpaired tool event and is the ONLY state carried from
+    one record to the next — so feeding records one at a time (the incremental collector)
+    yields exactly the events of a whole-file walk. The ``prompt`` events it emits carry
+    the same text, in the same order, as :func:`_prompt_text` over the same records.
+    """
+    if not isinstance(record, dict) or record.get("isSidechain"):
+        return
+    _collect_events(record, events, pending)
 
 
 def _collect_events(
@@ -965,13 +991,9 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         try:
             with path.open(encoding="utf-8") as handle:
                 for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                    record = parse_transcript_line(line)
+                    if not isinstance(record, dict):
+                        continue  # blank / malformed / non-object: never a prompt
                     text = _prompt_text(record)
                     if text is not None:
                         prompts.append(text)

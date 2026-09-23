@@ -33,6 +33,11 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 import os
 from typing import Any
 
+#: Smoke-test switch honoured by BOTH panels (park here, peek in ``peek.build_panel``):
+#: the window is drawn fully transparent and the app is never activated, so the
+#: panel server's ``--smoke`` cycles never flash a panel or steal the user's focus.
+SMOKE_ENV = "CCC_PANEL_SMOKE"
+
 # PyObjC classes register globally once per process; keep the lazily-defined
 # action target here so a second capture_prompt call never re-declares it.
 _LAZY: dict[str, object] = {}
@@ -98,7 +103,52 @@ def _actions_class() -> object:
     return _LAZY["actions"]
 
 
-def capture_prompt(  # noqa: PLR0915  pylint: disable=no-member,too-many-statements,too-many-locals
+def dark_floating_window(appkit: Any, width: float, height: float, title: str) -> Any:
+    """The shared chrome of BOTH chord panels (park here, peek in ``peek.build_panel``).
+
+    A titled, full-size-content, floating window of *width* × *height* centred on the
+    main screen: transparent hidden title bar (*title* is still set, for the OS),
+    movable by its background, dark appearance, no traffic-light buttons, the panels'
+    near-black background, and NOT released on close (the caller closes it).
+    """
+    # pylint: disable=no-member  # AppKit attrs resolve via PyObjC
+    screen = appkit.NSScreen.mainScreen()
+    frame = screen.frame() if screen is not None else appkit.NSMakeRect(0, 0, 1440, 900)
+    rect = appkit.NSMakeRect(
+        frame.origin.x + (frame.size.width - width) / 2.0,
+        frame.origin.y + (frame.size.height - height) / 2.0,
+        width,
+        height,
+    )
+    style = appkit.NSWindowStyleMaskTitled | appkit.NSWindowStyleMaskFullSizeContentView
+    window = appkit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        rect, style, appkit.NSBackingStoreBuffered, False
+    )
+    window.setTitle_(title)
+    window.setTitlebarAppearsTransparent_(True)
+    window.setTitleVisibility_(appkit.NSWindowTitleHidden)
+    window.setMovableByWindowBackground_(True)
+    window.setLevel_(appkit.NSFloatingWindowLevel)
+    window.setReleasedWhenClosed_(False)
+    # Dark appearance so text, tab strips and scrollers render against the dark panel.
+    dark = appkit.NSAppearance.appearanceNamed_(appkit.NSAppearanceNameDarkAqua)
+    if dark is not None:
+        window.setAppearance_(dark)
+    for button_kind in (
+        appkit.NSWindowCloseButton,
+        appkit.NSWindowMiniaturizeButton,
+        appkit.NSWindowZoomButton,
+    ):
+        handle = window.standardWindowButton_(button_kind)
+        if handle is not None:
+            handle.setHidden_(True)
+    window.setBackgroundColor_(
+        appkit.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.09, 0.09, 0.11, 1.0)
+    )
+    return window
+
+
+def capture_prompt(  # noqa: PLR0915  pylint: disable=no-member,too-many-statements,too-many-locals,too-many-branches
     header: str,
     initial: str = "",
     poll: Any = None,
@@ -134,38 +184,7 @@ def capture_prompt(  # noqa: PLR0915  pylint: disable=no-member,too-many-stateme
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
 
     width, height = 760.0, 460.0
-    screen = AppKit.NSScreen.mainScreen()
-    frame = screen.frame() if screen is not None else AppKit.NSMakeRect(0, 0, 1440, 900)
-    rect = AppKit.NSMakeRect(
-        frame.origin.x + (frame.size.width - width) / 2.0,
-        frame.origin.y + (frame.size.height - height) / 2.0,
-        width,
-        height,
-    )
-    style = AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskFullSizeContentView
-    window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-        rect, style, AppKit.NSBackingStoreBuffered, False
-    )
-    window.setTitle_("ccc park panel")
-    window.setTitlebarAppearsTransparent_(True)
-    window.setTitleVisibility_(AppKit.NSWindowTitleHidden)
-    window.setMovableByWindowBackground_(True)
-    window.setLevel_(AppKit.NSFloatingWindowLevel)
-    window.setReleasedWhenClosed_(False)
-    dark = AppKit.NSAppearance.appearanceNamed_(AppKit.NSAppearanceNameDarkAqua)
-    if dark is not None:
-        window.setAppearance_(dark)
-    for button_kind in (
-        AppKit.NSWindowCloseButton,
-        AppKit.NSWindowMiniaturizeButton,
-        AppKit.NSWindowZoomButton,
-    ):
-        handle = window.standardWindowButton_(button_kind)
-        if handle is not None:
-            handle.setHidden_(True)
-    window.setBackgroundColor_(
-        AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.09, 0.09, 0.11, 1.0)
-    )
+    window = dark_floating_window(AppKit, width, height, "ccc park panel")
 
     content = window.contentView()
     pad = 22.0
@@ -241,7 +260,10 @@ def capture_prompt(  # noqa: PLR0915  pylint: disable=no-member,too-many-stateme
     # set-up must still invalidate both timers, drop the target's refs and close the
     # window — otherwise a resident process leaks a visible panel and a live timer.
     try:
-        app.activateIgnoringOtherApps_(True)
+        if os.environ.get(SMOKE_ENV):  # invisible + never steals focus (smoke runs only)
+            window.setAlphaValue_(0.0)
+        else:
+            app.activateIgnoringOtherApps_(True)
         window.makeKeyAndOrderFront_(None)
         window.makeFirstResponder_(text)
 

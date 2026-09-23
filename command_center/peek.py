@@ -61,12 +61,15 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from . import sessionmd
+from . import sessionmd, transcript_cache
 from .adapters import ClaudeAdapter
 from .models import AimRevision, Session, synthesize_aim_revision
 from .store import Store
+
+if TYPE_CHECKING:  # annotations only
+    from .transcript_cache import TranscriptCache, TranscriptView
 
 # iTerm2's CFBundleIdentifier — the Karabiner condition and this module agree on it.
 _ITERM_BUNDLE_ID = "com.googlecode.iterm2"
@@ -244,9 +247,10 @@ def _ccc_selected_session(store: Store, frontmost: Frontmost) -> Session | None:
 def session_prompts(adapter: ClaudeAdapter, session: Session) -> list[str]:
     """Every human-typed prompt of a tracked *session*, oldest first (cleaned).
 
-    The **single** source the ``ccc peek`` panel and the RUNNING/DONE vault mirrors
-    (:mod:`command_center.mirrors`) both read, so the panel's prompt list and the
-    mirror's ``## Prompts`` section can never diverge. A thin wrapper over
+    What the RUNNING/DONE vault mirrors (:mod:`command_center.mirrors`) read; the
+    ``ccc peek`` panel gets the identical list from its one-pass transcript read
+    (:mod:`command_center.transcript_cache`, parity-tested against this walk), so the
+    panel's prompt list and the mirror's ``## Prompts`` section never diverge. A thin wrapper over
     :meth:`ClaudeAdapter.all_user_prompts` — the filtering/order/truncation live there
     (``<task-notification>`` and other non-human records are dropped; oldest first; no
     truncation).
@@ -313,11 +317,41 @@ class PeekData:  # pylint: disable=too-many-instance-attributes
     cwd: str = ""  # the session's working directory (shown home-collapsed in the header)
     badge: str = ""  # the tab's coloured emoji (💙, 🔵, …), matching iTerm tab + status line
     id_rgb: tuple[int, int, int] | None = None  # session-id background colour (tab colour)
+    # How the transcript-derived fields were obtained: "miss" (a full read — always on
+    # the cold path), "hit" / "append" (the warm path's TranscriptCache), "" when no
+    # transcript was read. Metrics only (D11) — never part of what the panel draws.
+    cache_state: str = ""
 
 
-def _peek_for_session(adapter: ClaudeAdapter, store: Store, session: Session) -> PeekData:
-    """The full :class:`PeekData` of a tracked *session* (prompts + aim + session tab)."""
-    prompts = session_prompts(adapter, session)
+def _transcript_view(path: Path, cache: TranscriptCache | None) -> tuple[TranscriptView, str]:
+    """Prompts + session segments of transcript *path* from ONE pass (cold or cached).
+
+    The cold path (``cache=None``) reads the file afresh and keeps nothing; the warm
+    path answers from *cache*. Both run the same one-pass collector, so they agree.
+    """
+    if cache is None:
+        return transcript_cache.read_view(path), transcript_cache.CACHE_MISS
+    return cache.get(path)
+
+
+def _peek_for_session(
+    adapter: ClaudeAdapter, store: Store, session: Session, *, cache: TranscriptCache | None = None
+) -> PeekData:
+    """The full :class:`PeekData` of a tracked *session* (prompts + aim + session tab).
+
+    Prompts and session segments come from one transcript pass (see
+    :func:`_transcript_view`; same output as :func:`session_prompts` +
+    :func:`sessionmd.segments_for`); the AIM history and header fields are always read
+    fresh — only transcript-derived data is ever cached.
+    """
+    path = adapter.transcript_path(session.cwd, session.session_id)
+    if path is None:
+        prompts: list[str] = []
+        segments = sessionmd.session_segments([])
+        cache_state = ""
+    else:
+        view, cache_state = _transcript_view(path, cache)
+        prompts, segments = list(view.prompts), list(view.segments)
     aim_revisions = store.list_aim_history(session.session_id)
     # Pre-history session (AIM set before tracking began): synthesize one
     # revision from the live session so the aim tab is not empty.
@@ -326,13 +360,14 @@ def _peek_for_session(adapter: ClaudeAdapter, store: Store, session: Session) ->
     return PeekData(
         prompts,
         aim_revisions,
-        sessionmd.segments_for(adapter, session),
+        segments,
         _leaf(session.cwd),
         resolved=True,
         session_id=session.session_id,
         cwd=session.cwd,
         badge=_tab_badge(session.iterm_session_id),
         id_rgb=_id_rgb(session.iterm_session_id, session.cwd),
+        cache_state=cache_state,
     )
 
 
@@ -342,6 +377,7 @@ def resolve_peek(
     session_id: str | None = None,
     *,
     frontmost: Frontmost | None = None,
+    cache: TranscriptCache | None = None,
 ) -> PeekData:
     """Resolve the focused iTerm tab to its prompts + AIM history + full session.
 
@@ -359,7 +395,10 @@ def resolve_peek(
 
     *frontmost* is the focus seam (:class:`Frontmost`) — the AppleScript default unless
     a caller (the resident panel server, a test) supplies a cheaper or fake one. It is
-    the ONLY thing that differs between the warm and the cold path.
+    the ONLY thing that differs between the warm and the cold path — besides *cache*,
+    the resident server's :class:`~command_center.transcript_cache.TranscriptCache`
+    (``None`` = the cold one-pass read; same output either way, only
+    ``PeekData.cache_state`` tells them apart).
     """
     adapter = adapter or ClaudeAdapter()
     front = frontmost or default_frontmost()
@@ -370,18 +409,18 @@ def resolve_peek(
             session = store.get(session_id)
             if session is None:
                 return PeekData(label=f"no tracked session {session_id}")
-            return _peek_for_session(adapter, store, session)
+            return _peek_for_session(adapter, store, session, cache=cache)
 
         session = _ccc_selected_session(store, front)
         if session is not None:
-            return _peek_for_session(adapter, store, session)
+            return _peek_for_session(adapter, store, session, cache=cache)
 
         uuid = front.uuid()
         if uuid is None:
             return PeekData(label="no focused iTerm session")
         session = _session_for_uuid(store, uuid)
         if session is not None:
-            return _peek_for_session(adapter, store, session)
+            return _peek_for_session(adapter, store, session, cache=cache)
 
         # Fallback: the focused tab is not tracked by ccc (yet) — read the newest
         # transcript in its project directory directly (no AIM history for it). We can
@@ -393,17 +432,18 @@ def resolve_peek(
             if project.is_dir():
                 transcripts = sorted(project.glob("*.jsonl"), key=_safe_mtime, reverse=True)
                 for path in transcripts:
-                    prompts = adapter.all_user_prompts_in_file(path)
-                    if prompts:
+                    view, cache_state = _transcript_view(path, cache)
+                    if view.prompts:
                         return PeekData(
-                            prompts,
+                            list(view.prompts),
                             [],
-                            sessionmd.segments_for_path(path),
+                            list(view.segments),
                             _leaf(cwd),
                             resolved=True,
                             session_id=path.stem,
                             cwd=cwd,
                             id_rgb=_id_rgb(None, cwd),
+                            cache_state=cache_state,
                         )
         return PeekData(label="no Claude session tracked for this tab")
     finally:
@@ -568,21 +608,30 @@ class AppRunLoop:  # pylint: disable=no-member  # AppKit attrs resolve via PyObj
 
         app = AppKit.NSApplication.sharedApplication()
         app.stop_(None)
-        # Wake the run loop so stop_ takes effect immediately (it only checks
-        # between events, and a key event monitor that swallows its event would
-        # otherwise leave the loop idle until the next keystroke).
-        nudge = AppKit.NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(  # noqa: E501  # pylint: disable=line-too-long
-            AppKit.NSEventTypeApplicationDefined,
-            AppKit.NSMakePoint(0.0, 0.0),
-            0,
-            0.0,
-            0,
-            None,
-            0,
-            0,
-            0,
-        )
-        app.postEvent_atStart_(nudge, True)
+        wake_run_loop(app)
+
+
+def wake_run_loop(app: Any) -> None:
+    """Post an app-defined event so a pending ``stop_`` / ``stopModal`` takes effect now.
+
+    Both only check between events, and a key monitor that swallows its event (or a
+    timer callback) would otherwise leave the loop idle until the next keystroke.
+    """
+    # pylint: disable=no-member  # AppKit attrs resolve via PyObjC
+    import AppKit  # noqa: PLC0415 (lazy: AppKit must not load for non-GUI commands)
+
+    nudge = AppKit.NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(  # noqa: E501  # pylint: disable=line-too-long
+        AppKit.NSEventTypeApplicationDefined,
+        AppKit.NSMakePoint(0.0, 0.0),
+        0,
+        0.0,
+        0,
+        None,
+        0,
+        0,
+        0,
+    )
+    app.postEvent_atStart_(nudge, True)
 
 
 @dataclass
@@ -724,41 +773,14 @@ def _build_panel(  # noqa: PLR0913,PLR0915  pylint: disable=no-member,too-many-s
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
     driver: PanelLoop = loop or AppRunLoop()
 
-    width, height = 820.0, 600.0
-    screen = AppKit.NSScreen.mainScreen()
-    frame = screen.frame() if screen is not None else AppKit.NSMakeRect(0, 0, 1440, 900)
-    origin_x = frame.origin.x + (frame.size.width - width) / 2.0
-    origin_y = frame.origin.y + (frame.size.height - height) / 2.0
-    rect = AppKit.NSMakeRect(origin_x, origin_y, width, height)
+    from .parkpanel import dark_floating_window  # noqa: PLC0415  # shared panel chrome
 
-    style = AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskFullSizeContentView
-    window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-        rect, style, AppKit.NSBackingStoreBuffered, False
-    )
-    window.setTitlebarAppearsTransparent_(True)
-    window.setTitleVisibility_(AppKit.NSWindowTitleHidden)
-    window.setMovableByWindowBackground_(True)
-    window.setLevel_(AppKit.NSFloatingWindowLevel)
-    window.setReleasedWhenClosed_(False)
+    width, height = 820.0, 600.0
+    window = dark_floating_window(AppKit, width, height, "ccc peek panel")
     # Registered at once so build_panel() can release a half-built panel on failure;
     # the monitor, observers and timer are attached to it the moment they exist.
     panel = PeekPanel(window)
     holder.append(panel)
-    # Dark appearance so the tab strip and the scrollers render against the dark panel.
-    dark = AppKit.NSAppearance.appearanceNamed_(AppKit.NSAppearanceNameDarkAqua)
-    if dark is not None:
-        window.setAppearance_(dark)
-    for button in (
-        AppKit.NSWindowCloseButton,
-        AppKit.NSWindowMiniaturizeButton,
-        AppKit.NSWindowZoomButton,
-    ):
-        handle = window.standardWindowButton_(button)
-        if handle is not None:
-            handle.setHidden_(True)
-    window.setBackgroundColor_(
-        AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.09, 0.09, 0.11, 1.0)
-    )
 
     content = window.contentView()
     pad = 22.0
@@ -771,8 +793,7 @@ def _build_panel(  # noqa: PLR0913,PLR0915  pylint: disable=no-member,too-many-s
     tabs_h = search_y - 12.0 - pad
 
     # ── Title: the panel's own name, so it can be referred to ("the ccc peek panel")
-    # in conversation — set as the (hidden) window title too for the OS.
-    window.setTitle_("ccc peek panel")
+    # in conversation — also the (hidden) window title for the OS (dark_floating_window).
     title = AppKit.NSTextField.alloc().initWithFrame_(
         AppKit.NSMakeRect(pad, title_y, width - 2.0 * pad, 22.0)
     )
@@ -936,8 +957,14 @@ def _build_panel(  # noqa: PLR0913,PLR0915  pylint: disable=no-member,too-many-s
     aim_view = _add_tab("aim", "aim", aim_text)
     content.addSubview_(tabs)
 
+    from .parkpanel import SMOKE_ENV  # noqa: PLC0415  # the shared smoke switch
+
+    smoke = bool(os.environ.get(SMOKE_ENV))
+    if smoke:  # invisible, never activated — the panel server's --smoke cycles
+        window.setAlphaValue_(0.0)
     window.makeKeyAndOrderFront_(None)
-    app.activateIgnoringOtherApps_(True)
+    if not smoke:
+        app.activateIgnoringOtherApps_(True)
 
     def _scroll_to_bottom(text_view) -> None:
         text_view.scrollRangeToVisible_(AppKit.NSMakeRange(text_view.textStorage().length(), 0))
@@ -1188,6 +1215,25 @@ def show_panel(  # noqa: PLR0913  pylint: disable=too-many-arguments
         loop.run(panel)
     finally:
         panel.close()
+
+
+def build_panel_from(
+    inputs: PanelInputs, *, loop: PanelLoop | None = None, timeout: float = 0.0
+) -> PeekPanel:
+    """:func:`build_panel` driven straight from :class:`PanelInputs` (the panel server)."""
+    return build_panel(
+        inputs.prompts_text,
+        inputs.aim_text,
+        inputs.subtitle,
+        session_id=inputs.session_id,
+        cwd=inputs.cwd,
+        badge=inputs.badge,
+        id_rgb=inputs.id_rgb,
+        prompts_segments=inputs.prompts_segments,
+        session_segments=inputs.session_segments,
+        timeout=timeout,
+        loop=loop,
+    )
 
 
 def show_panel_for(inputs: PanelInputs, *, timeout: float = 0.0) -> None:

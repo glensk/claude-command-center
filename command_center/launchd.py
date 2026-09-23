@@ -331,3 +331,140 @@ def uninstall() -> int:
     if not removed:
         print("launchd agent not installed")
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Resident panel server (tp#70) — opt-in, its own agent, never part of install()
+# --------------------------------------------------------------------------- #
+def panel_server_label(cfg: config.Config | None = None) -> str:
+    """Label for the resident panel-server agent (``<launchd_label>-panel-server``)."""
+    return f"{label(cfg)}-panel-server"
+
+
+def panel_server_plist_path(cfg: config.Config | None = None) -> Path:
+    """Where the panel-server plist lives; its presence IS the opt-in (no config key)."""
+    return _plist_path(panel_server_label(cfg))
+
+
+def _override_env() -> dict[str, str]:
+    """CCC_HOME / CLAUDE_HOME overrides of this shell (see :func:`_override_env_xml`)."""
+    return {name: value for name in ("CCC_HOME", "CLAUDE_HOME") if (value := os.environ.get(name))}
+
+
+def panel_server_plist_content(
+    ccc_path: str, agent_label: str, app_home: Path, env: dict[str, str] | None = None
+) -> str:
+    """The panel-server agent plist (``plistlib`` — every value XML-escaped).
+
+    ``KeepAlive = {SuccessfulExit: false}``: a crash or watchdog ``exit 1`` is restarted,
+    a clean exit (SIGTERM, "already running") is not. ``LimitLoadToSessionType Aqua`` —
+    it needs the window server; ``ProcessType Interactive`` — no background throttling.
+    """
+    import plistlib  # pylint: disable=import-outside-toplevel  # only for this agent
+
+    environment = {"PATH": _path_env(), "HOME": str(Path.home()), **(env or {})}
+    payload = {
+        "Label": agent_label,
+        "ProgramArguments": [ccc_path, "panel-server"],
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "LimitLoadToSessionType": "Aqua",
+        "ProcessType": "Interactive",
+        "EnvironmentVariables": environment,
+        "StandardOutPath": str(app_home / "panel-server.log"),
+        "StandardErrorPath": str(app_home / "panel-server.err"),
+    }
+    return plistlib.dumps(payload).decode("utf-8")
+
+
+def _gui_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def _launchctl(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["launchctl", *args], capture_output=True, text=True, check=False)
+
+
+def panel_server_loaded(cfg: config.Config | None = None) -> bool:
+    """True when launchd knows the panel-server agent (``launchctl print`` exit 0)."""
+    if shutil.which("launchctl") is None:
+        return False
+    return _launchctl("print", f"{_gui_domain()}/{panel_server_label(cfg)}").returncode == 0
+
+
+def panel_server_start(cfg: config.Config | None = None) -> int:
+    """``launchctl bootstrap`` the installed agent (no-op message when not installed)."""
+    path = panel_server_plist_path(cfg)
+    if not path.exists():
+        print("panel server not installed — ccc panel-server --install")
+        return 1
+    if panel_server_loaded(cfg):
+        print(f"panel server already loaded ({panel_server_label(cfg)})")
+        return 0
+    result = _launchctl("bootstrap", _gui_domain(), str(path))
+    if result.returncode != 0:
+        print(f"launchctl bootstrap failed:\n{result.stderr.strip()}")
+        return 1
+    print(f"started {panel_server_label(cfg)}")
+    return 0
+
+
+def panel_server_stop(cfg: config.Config | None = None) -> int:
+    """``launchctl bootout`` the agent (KeepAlive cannot bring it back until --start)."""
+    if not panel_server_loaded(cfg):
+        print("panel server not loaded")
+        return 0
+    result = _launchctl("bootout", f"{_gui_domain()}/{panel_server_label(cfg)}")
+    if result.returncode != 0:
+        print(f"launchctl bootout failed:\n{result.stderr.strip()}")
+        return 1
+    print(f"stopped {panel_server_label(cfg)}")
+    return 0
+
+
+def panel_server_install(cfg: config.Config | None = None) -> int:
+    """Opt in: write the plist, install the chord poker, bootstrap the agent.
+
+    The poker (``<app_home>/panel-poke.sh``) is what Karabiner's q+p / s+p rules run
+    once rewired; it falls back to today's cold command by itself whenever the server is
+    not ``ready``/``busy``. Run from the user's own shell: the server's first iTerm probe
+    may raise the one-time Automation (TCC) prompt for its executable.
+    """
+    from . import panelpoke  # pylint: disable=import-outside-toplevel
+
+    cfg = cfg or config.load_config()
+    app = config.app_home()
+    app.mkdir(parents=True, exist_ok=True)
+    env = _override_env()
+    poker = panelpoke.install_poker(app, _ccc_path(), env)
+    print(f"installed chord poker: {poker}")
+    path = panel_server_plist_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        panel_server_plist_content(_ccc_path(), panel_server_label(cfg), app, env),
+        encoding="utf-8",
+    )
+    print(f"wrote {path}")
+    if panel_server_loaded(cfg):
+        _launchctl("bootout", f"{_gui_domain()}/{panel_server_label(cfg)}")
+    rc = panel_server_start(cfg)
+    if rc == 0:
+        print("rewire the Karabiner q+p / s+p rules to the poker (see docs/reference.md)")
+    return rc
+
+
+def panel_server_uninstall(cfg: config.Config | None = None, *, purge: bool = False) -> int:
+    """Boot out and remove the plist; keep the poker (Karabiner may still run it) unless *purge*."""
+    from . import panelpoke  # pylint: disable=import-outside-toplevel
+
+    cfg = cfg or config.load_config()
+    panel_server_stop(cfg)
+    path = panel_server_plist_path(cfg)
+    if path.exists():
+        path.unlink()
+        print(f"removed {path}")
+    else:
+        print("panel server agent not installed")
+    if purge and panelpoke.remove_poker(config.app_home()):
+        print(f"removed {panelpoke.poker_path(config.app_home())}")
+    return 0

@@ -1253,6 +1253,31 @@ def test_restart_tui_with_no_running_tui_exits_1(
     assert "no running ccc TUI" in capsys.readouterr().err
 
 
+def test_restart_tui_exit_code_unchanged_with_stale_panel_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#70 D8: a stale panel server only adds a hint; the TUI contract (exit 0) holds."""
+    import os
+
+    from command_center import cli, jumpstate
+    from command_center import panelserver as ps
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.delenv("CCC_HOME", raising=False)
+    (tmp_path / "command-center").mkdir(parents=True)
+    ps.write_pidfile(ps.paths(), os.getpid(), "ready", 0)  # alive, stale stamp
+    tuis = iter([(111, "w0t0p0:A"), None, (111, "w0t0p0:A")])
+    monkeypatch.setattr(jumpstate, "get_tui", lambda: next(tuis, (111, "w0t0p0:A")))
+    monkeypatch.setattr(jumpstate, "request_restart", lambda: None)
+    monkeypatch.setattr(jumpstate, "peek_restart", lambda: False)
+    monkeypatch.setattr(cli, "_RESTART_POLL_SEC", 0.0)
+
+    assert cli.cmd_restart_tui(argparse.Namespace()) == 0
+    out = capsys.readouterr().out
+    assert "restarted ccc TUI" in out
+    assert "panel server is stale — ccc panel-server --restart" in out
+
+
 # ---- mark-done --close / --quiet -------------------------------------------
 def test_mark_done_close_arms_close_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

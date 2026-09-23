@@ -70,6 +70,7 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
     resume_spawned: bool = False  # spawned the resume-halted watcher; excluded from is_empty()
     limit_switched: list[str] = field(default_factory=list)  # sessions moved off a capped seat
     temps_swept: int = 0  # orphaned usage temp files reclaimed; excluded from is_empty()
+    panel_restart: str = ""  # stale panel server asked to re-exec (tp#70 S5b); routine
 
     def is_empty(self) -> bool:
         return not (
@@ -279,6 +280,9 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
 
         # Auto-resume session-limit-halted sessions: spawn the watcher when work exists.
         _spawn_resume_watcher(cfg, report, dry_run)
+
+        # Self-heal the optional resident panel server after an edit to the editable install.
+        _restart_stale_panel_server(report, dry_run)
 
         if do_summary and cfg.summarize:
             _regenerate_summaries(store, adapter, cfg, report, dry_run)
@@ -669,6 +673,38 @@ def _spawn_resume_watcher(cfg: config.Config, report: DaemonReport, dry_run: boo
     from . import spawn
 
     report.resume_spawned = spawn.spawn_ccc(["resume-halted", "--watch"])
+
+
+def _restart_stale_panel_server(report: DaemonReport, dry_run: bool) -> None:
+    """Ask a live panel server running older code than the tree to re-exec (tp#70 D8/S5b).
+
+    A complete no-op unless the opt-in agent is installed and its pidfile names a live
+    process. The request targets that pid, so a leftover file can never restart a LATER
+    server; the server itself defers the re-exec while a panel is open. ``--dry-run``
+    reports the intent and writes nothing. Never raises.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        from . import launchd, panelserver
+
+        if not launchd.panel_server_plist_path().exists():
+            return
+        p = panelserver.paths()
+        info = panelserver.read_pidfile(p)
+        if info is None or not panelserver.pid_alive(info.pid):
+            return
+        if info.stamp >= panelserver.code_stamp():
+            return
+        if p.restart.exists():
+            return  # already requested, not yet consumed (e.g. a panel is open)
+        if dry_run:
+            report.panel_restart = f"would restart stale panel server pid {info.pid}"
+            return
+        panelserver.request_restart(p, info.pid)
+        report.panel_restart = f"requested restart of stale panel server pid {info.pid}"
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return
 
 
 def _backfill_versions(store: Store, adapter: ClaudeAdapter, dry_run: bool) -> None:
