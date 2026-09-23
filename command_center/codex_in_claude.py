@@ -99,6 +99,9 @@ open. Keeps a fan-out from thrashing CPU/API and from slamming the wall with man
 
 from __future__ import annotations
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
+# pylint: disable=too-many-lines  # one cohesive runner: model catalog, seat hops, heartbeat, CLI
+
 if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
     import os as _os
     import sys as _sys
@@ -223,7 +226,7 @@ def _heartbeat_writer() -> str:
         from importlib.metadata import version  # pylint: disable=import-outside-toplevel
 
         return f"codex-in-claude/{version('claude-command-center')}"
-    except Exception:  # noqa: BLE001  # pragma: no cover - metadata missing in odd installs
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught  # pragma: no cover - metadata missing in odd installs
         return "codex-in-claude/0"
 
 
@@ -881,7 +884,9 @@ def _stderr_tail(text: str, lines: int = 8) -> str:
     return "\n".join(kept[-lines:])
 
 
-def _repo_map(cwd: str | None, explicit: str | None = None, limit: int = 4000) -> str | None:
+def _repo_map(  # pylint: disable=too-many-return-statements  # one early exit per fallback
+    cwd: str | None, explicit: str | None = None, limit: int = 4000
+) -> str | None:
     """A compact orientation map of the repo, injected into the delegate prompt.
 
     Discovery is what burns delegate wall-clock: a run that has to find its way
@@ -5006,7 +5011,7 @@ def _git_status(cwd: codex_launch.Workdir | str | None) -> list[str] | None:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-def build_parser() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-statements  # flat flag table
     """Construct the argument parser (every flag has a short form)."""
     parser = argparse.ArgumentParser(
         prog="codex-in-claude.py",
