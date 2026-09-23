@@ -242,8 +242,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     depends_on        TEXT,
     job_type          TEXT    NOT NULL DEFAULT 'claude',
     no_codex          INTEGER NOT NULL DEFAULT 0,
-    llm_overseer      TEXT    NOT NULL DEFAULT 'fable-5',
-    llm_exec          TEXT    NOT NULL DEFAULT 'fable-5',
+    llm_overseer      TEXT    NOT NULL DEFAULT 'opus-5',
+    llm_exec          TEXT    NOT NULL DEFAULT 'opus-5',
     model             TEXT    NOT NULL DEFAULT '',
     effort            TEXT    NOT NULL DEFAULT '',
     idempotency_key   TEXT,
@@ -508,8 +508,8 @@ class Store:  # pylint: disable=too-many-public-methods
         "job_type": "TEXT NOT NULL DEFAULT 'claude'",
         # Per-session Codex opt-out: CCC_NO_CODEX=1 in every launch/resume env.
         "no_codex": "INTEGER NOT NULL DEFAULT 0",
-        "llm_overseer": "TEXT NOT NULL DEFAULT 'fable-5'",
-        "llm_exec": "TEXT NOT NULL DEFAULT 'fable-5'",
+        "llm_overseer": "TEXT NOT NULL DEFAULT 'opus-5'",
+        "llm_exec": "TEXT NOT NULL DEFAULT 'opus-5'",
         # OBSERVED runtime values (distinct from the llm_overseer/llm_exec job config):
         # the model the session actually ran on + its --effort reasoning level.
         "model": "TEXT NOT NULL DEFAULT ''",
@@ -812,9 +812,10 @@ class Store:  # pylint: disable=too-many-public-methods
             return existing
         ts = now_ms()
         self.conn.execute(
-            "INSERT INTO sessions (session_id, cwd, agent, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (session_id, cwd, agent, ts, ts),
+            "INSERT INTO sessions "
+            "(session_id, cwd, agent, llm_overseer, llm_exec, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (session_id, cwd, agent, DEFAULT_LLM, DEFAULT_LLM, ts, ts),
         )
         self.conn.commit()
         got = self.get(session_id)
@@ -843,9 +844,19 @@ class Store:  # pylint: disable=too-many-public-methods
         try:
             self.conn.execute(
                 "INSERT INTO sessions (session_id, cwd, agent, draft, status, no_codex, "
-                "idempotency_key, created_at, updated_at) "
-                "VALUES (?, ?, 'claude', 1, ?, ?, ?, ?, ?)",
-                (session_id, cwd, Status.PARKED.value, int(bool(no_codex)), key, ts, ts),
+                "llm_overseer, llm_exec, idempotency_key, created_at, updated_at) "
+                "VALUES (?, ?, 'claude', 1, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    cwd,
+                    Status.PARKED.value,
+                    int(bool(no_codex)),
+                    DEFAULT_LLM,
+                    DEFAULT_LLM,
+                    key,
+                    ts,
+                    ts,
+                ),
             )
         except sqlite3.IntegrityError:
             self.conn.rollback()

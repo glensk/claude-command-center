@@ -2018,7 +2018,7 @@ def test_draft_next_step_cell_shows_models_readout(
     """
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     store = Store(tmp_path / "command-center" / "state.db")
-    store.create_draft("job-models", "/Users/x/repo", "Migrate tickets")  # both default fable-5
+    store.create_draft("job-models", "/Users/x/repo", "Migrate tickets")  # both default opus-5
     mixed = "job-mixed"
     store.create_draft(mixed, "/Users/x/repo", "Ship it")
     store.update_fields(mixed, llm_overseer="opus-4.8", llm_exec="sonnet-5")
@@ -2035,9 +2035,9 @@ def test_draft_next_step_cell_shows_models_readout(
             models_row = table.get_row_at(table.get_row_index("job-models"))
             cell = models_row[_MODEL_COL]
             assert isinstance(cell, Text)
-            # Equal overseer/executor: single orange (#ff9f43) name, no arrow.
+            # Equal overseer/executor: single green name, no arrow.
             assert "▸" not in cell.plain
-            assert _styled_fragments(cell, "#ff9f43") == ["fable-5"]
+            assert _styled_fragments(cell, "#2ecc71") == ["opus-5"]
             # The pair moved OUT of the /next-step cell (draft has no next-step → "—").
             next_cell = models_row[_NEXT_COL]
             assert isinstance(next_cell, Text)
@@ -2059,7 +2059,7 @@ def test_inline_edit_models_selects_save_through_commit(
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     draft_sid = "draft-models-edit"
     store = Store(tmp_path / "command-center" / "state.db")
-    store.create_draft(draft_sid, "/Users/x/repo", "Prepare draft")  # both default fable-5
+    store.create_draft(draft_sid, "/Users/x/repo", "Prepare draft")  # both default opus-5
     store.close()
 
     from textual.widgets import Select
@@ -2083,7 +2083,8 @@ def test_inline_edit_models_selects_save_through_commit(
             assert app.query_one("#edit-executor-row").styles.display == "block"
             overseer = app.query_one("#edit-overseer", Select)
             executor = app.query_one("#edit-executor", Select)
-            assert overseer.value == "fable-5"
+            assert overseer.value == "opus-5"
+            assert "fable-5" not in {str(value) for _prompt, value in overseer._options}
 
             # Picking new choices from the dropdowns (invalid input is impossible).
             overseer.value = "opus-4.8"
@@ -3546,7 +3547,7 @@ def test_draft_head_shows_scheduled_for_and_models_on_status_line(
         "/Users/x/repo",
         "run the thing",
         start_date="2099-01-02",
-        llm_overseer="fable-5",
+        llm_overseer="opus-5",
         llm_exec="opus-4.8",
     )
     store.ensure("plain", cwd="/Users/x/repo")
@@ -3566,7 +3567,7 @@ def test_draft_head_shows_scheduled_for_and_models_on_status_line(
             rendered = head.render()  # a textual Content (not rich Text) on Textual 8.x
             lines = rendered.plain.splitlines()
             # Status line carries the draft's model pair (account: single-account → hidden).
-            assert "/overseer: fable-5" in lines[0]
+            assert "/overseer: opus-5" in lines[0]
             assert "/executor: opus-4.8" in lines[0]
             # Scheduled for: directly under Status, above the FUTURE JOB banner, in blue.
             assert lines[1].startswith("Scheduled for: 2.1.99")

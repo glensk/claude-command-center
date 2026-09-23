@@ -42,14 +42,14 @@ tags: [ccc, future-jobs, dashboard]
 	// Mirror of ccc's models.LLM_CHOICES / DEFAULT_LLM — keep in sync when the
 	// choice list changes there. opus-4.8-1m = the 1M-context beta form
 	// (claude-opus-4-8[1m]); plain opus-4.8 is the 200K default.
-	const MODELS = ["fable-5", "opus-4.8", "opus-4.8-1m", "sonnet-5", "haiku-4.5"];
-	const DEFAULT_MODEL = "fable-5";
+	const MODELS = ["opus-5", "opus-4.8", "opus-4.8-1m", "sonnet-5", "haiku-4.5"];
+	const DEFAULT_MODEL = "opus-5";
 	// Per-model accent: text/border colour + a low-alpha background tint so the
 	// select is legible in both light and dark themes (colour carries the signal,
-	// the tint just hints). fable-5 → orange, opus-4.8 → green, opus-4.8-1m → teal,
+	// the tint just hints). opus-5/opus-4.8 → green, opus-4.8-1m → teal,
 	// sonnet-5 → blue, haiku-4.5 → purple.
 	const MODEL_COLORS = {
-		"fable-5": { fg: "#d97706", bg: "rgba(217, 119, 6, 0.12)" },
+		"opus-5": { fg: "#16a34a", bg: "rgba(22, 163, 74, 0.12)" },
 		"opus-4.8": { fg: "#16a34a", bg: "rgba(22, 163, 74, 0.12)" },
 		"opus-4.8-1m": { fg: "#0d9488", bg: "rgba(13, 148, 136, 0.12)" },
 		"sonnet-5": { fg: "#2563eb", bg: "rgba(37, 99, 235, 0.12)" },
@@ -442,9 +442,10 @@ tags: [ccc, future-jobs, dashboard]
 				modelsBox.style.flexDirection = "column";
 				modelsBox.style.gap = "2px";
 
-				// Overseer — writes llm_overseer (missing → fable-5)
+				// Overseer — writes llm_overseer (missing → opus-5)
 				const overLine = stackedLine(modelsBox, "ovr");
-				const overVal = typeof p.llm_overseer === "string" && p.llm_overseer ? p.llm_overseer : DEFAULT_MODEL;
+				const overRaw = typeof p.llm_overseer === "string" ? p.llm_overseer : "";
+				const overVal = MODELS.includes(overRaw) ? overRaw : DEFAULT_MODEL;
 				const overSel = makeSelect(overLine, MODELS, overVal);
 				applyModelColor(overSel); // colour by current value at render
 				overSel.addEventListener("change", () => {
@@ -452,9 +453,10 @@ tags: [ccc, future-jobs, dashboard]
 					writeFm(path, "llm_overseer", overSel.value);
 				});
 
-				// Exec — writes llm_exec (missing → fable-5)
+				// Exec — writes llm_exec (missing/retired → opus-5)
 				const execLine = stackedLine(modelsBox, "exe");
-				const execVal = typeof p.llm_exec === "string" && p.llm_exec ? p.llm_exec : DEFAULT_MODEL;
+				const execRaw = typeof p.llm_exec === "string" ? p.llm_exec : "";
+				const execVal = MODELS.includes(execRaw) ? execRaw : DEFAULT_MODEL;
 				const execSel = makeSelect(execLine, MODELS, execVal);
 				applyModelColor(execSel); // colour by current value at render
 				execSel.addEventListener("change", () => {
@@ -624,7 +626,7 @@ after an explicit `y`.
 
 **Columns:** **▶** (launch — leftmost) · **Task** (the job's AIM text, linked to its note) ·
 **Hash** (the ccc job `id`) · **Status** · **Type** (`job_type`) · **Overseer / Exec** (the
-`llm_overseer` / `llm_exec` models, stacked in one cell — Overseer above Exec, default `fable-5`;
+`llm_overseer` / `llm_exec` models, stacked in one cell — Overseer above Exec, default `opus-5`;
 `opus-4.8` is the 200K form, `opus-4.8-1m` the 1M-context `claude-opus-4-8[1m]`) ·
 **Cat / Repo** (target category above repository, stacked in one cell) · **Start** / **Deadline** /
 **Created**.

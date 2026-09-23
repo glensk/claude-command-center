@@ -59,7 +59,7 @@ _NS = uuid5(NAMESPACE_URL, "https://github.com/glensk/ccc#demo")
 # Full ``claude --model`` ids to embed in fake transcripts (reverse-mapped to short labels
 # by the observed-model reader). Kept local so the demo does not depend on model internals.
 _MODEL_IDS = {
-    "fable-5": "claude-fable-5",
+    "opus-5": "claude-opus-5",
     "opus-4.8": "claude-opus-4-8",
     "opus-4.8-1m": "claude-opus-4-8[1m]",
     "sonnet-5": "claude-sonnet-5",
@@ -95,7 +95,7 @@ class DemoSession:
     next_step: str = ""
     manual_progress: int | None = None
     drift: str = ""  # "" | "low" | "medium" | "high"
-    model: str = "fable-5"
+    model: str = "opus-5"
     effort: str = "xhigh"
     age_min: int = 0  # minutes since last response (parked/done rows)
 
@@ -111,8 +111,8 @@ class DemoDraft:
     short_aim: str
     aim_score: int
     job_type: str = "claude"
-    overseer: str = "fable-5"
-    executor: str = "fable-5"
+    overseer: str = "opus-5"
+    executor: str = "opus-5"
     start_when: str = ""
     start_date: str = ""  # ISO YYYY-MM-DD; set → SCHEDULED bucket
     deadline_days: int | None = None
@@ -139,7 +139,7 @@ def _sessions() -> list[DemoSession]:
             live_status="busy",
             importance=2,
             next_step="finish the 429 Retry-After header path",
-            model="fable-5",
+            model="opus-5",
             effort="xhigh",
         ),
         DemoSession(
@@ -244,7 +244,7 @@ def _sessions() -> list[DemoSession]:
             checked=2,
             manual_progress=80,  # manual override — bar reads 80% regardless of ticks
             importance=3,
-            model="fable-5",
+            model="opus-5",
             effort="high",
             age_min=6 * 60,
         ),
@@ -265,7 +265,7 @@ def _sessions() -> list[DemoSession]:
             checked=5,
             done=True,
             importance=1,
-            model="fable-5",
+            model="opus-5",
             effort="xhigh",
             age_min=8 * 60,
         ),
@@ -305,7 +305,7 @@ def _sessions() -> list[DemoSession]:
             checked=2,
             drift="medium",
             importance=0,
-            model="fable-5",
+            model="opus-5",
             effort="high",
             age_min=2 * 60,
         ),
@@ -324,7 +324,7 @@ def _drafts() -> list[DemoDraft]:
             short_aim="lint TODO without issue link",
             aim_score=79,
             job_type="codex",  # → the OAI badge in the ver column, [codex] in `ccc jobs`
-            overseer="fable-5",
+            overseer="opus-5",
             executor="opus-4.8",
             start_when="next sprint",
         ),
@@ -438,7 +438,7 @@ def _write_live(home: Path, session_id: str, cwd: str, spec: DemoSession) -> Non
     }
     (sessions / f"demo-{session_id[:8]}.json").write_text(json.dumps(registry), encoding="utf-8")
 
-    model_id = _MODEL_IDS.get(spec.model, _MODEL_IDS["fable-5"])
+    model_id = _MODEL_IDS.get(spec.model, _MODEL_IDS["opus-5"])
     records: list[dict] = [
         {
             "type": "user",

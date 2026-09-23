@@ -51,7 +51,7 @@ def test_expand_llm_choice() -> None:
     """
     assert expand_llm_choice("opus-4.8") == "opus-4.8"  # exact
     assert expand_llm_choice("opus-5") == "opus-5"  # exact
-    assert expand_llm_choice("fable") == "fable-5"  # unique prefix
+    assert expand_llm_choice("fable") is None  # retired models cannot be selected
     assert expand_llm_choice("SONNET") == "sonnet-5"  # case-insensitive
     # Bare "opus" prefixes opus-5, opus-4.8 AND opus-4.8-1m, so shortest-wins cannot
     # decide it — LLM_PREFIX_ALIASES pins it to the current Opus generation.
@@ -72,7 +72,7 @@ def test_llm_choice_maps_are_complete() -> None:
     assert set(LLM_MODEL_IDS) == set(LLM_CHOICES)
     assert set(LLM_AGENT_ALIAS) == set(LLM_CHOICES)
     # The delegation aliases must stay within the Agent tool's model enum.
-    assert set(LLM_AGENT_ALIAS.values()) <= {"fable", "opus", "sonnet", "haiku"}
+    assert set(LLM_AGENT_ALIAS.values()) <= {"opus", "sonnet", "haiku"}
 
 
 def test_model_effort_cell() -> None:

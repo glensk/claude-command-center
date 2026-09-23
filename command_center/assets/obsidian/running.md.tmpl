@@ -36,14 +36,16 @@ tags: [ccc, running-jobs, dashboard]
 	const MIRROR_KIND = "running";
 	const CAT_ORDER = ["infra", "llms", "private", "sdsc"];
 	const CCC = "{{CCC_BIN}}";
-	const DEFAULT_MODEL = "fable-5";
+	const DEFAULT_MODEL = "opus-5";
 
 	// Per-model accent — the future dashboard's MODEL_COLORS (text/border colour +
-	// low-alpha tint, legible in light and dark). fable-5 orange, opus-4.8 green,
+	// low-alpha tint, legible in light and dark). Retired Fable observations stay orange,
+	// opus-5/opus-4.8 green,
 	// opus-4.8-1m teal (the 1M-context claude-opus-4-8[1m]), sonnet-5 blue,
 	// haiku-4.5 purple. Mirror of ccc's models.LLM_CHOICES — keep in sync.
 	const MODEL_COLORS = {
 		"fable-5": { fg: "#d97706", bg: "rgba(217, 119, 6, 0.12)" },
+		"opus-5": { fg: "#16a34a", bg: "rgba(22, 163, 74, 0.12)" },
 		"opus-4.8": { fg: "#16a34a", bg: "rgba(22, 163, 74, 0.12)" },
 		"opus-4.8-1m": { fg: "#0d9488", bg: "rgba(13, 148, 136, 0.12)" },
 		"sonnet-5": { fg: "#2563eb", bg: "rgba(37, 99, 235, 0.12)" },
@@ -341,7 +343,7 @@ tags: [ccc, running-jobs, dashboard]
 				modelsBox.style.flexDirection = "column";
 				modelsBox.style.gap = "2px";
 				// ran — the model that ACTUALLY answered, read from the transcript.
-				// Empty / missing key ⇒ a muted em-dash, never a defaulted fable-5 chip.
+				// Empty / missing key ⇒ a muted em-dash, never a defaulted model chip.
 				const ranLine = stackedLine(modelsBox, "ran");
 				const ranVal = typeof p.model === "string" ? p.model.trim() : "";
 				if (ranVal) {

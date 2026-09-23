@@ -199,16 +199,16 @@ def test_llm_models_export_and_import(env: Env) -> None:
     futuresync.run_sync(env.store, env.cfg)  # bootstrap export
     path = _abs(env, sid)
 
-    # Export: the bootstrapped file carries the fable-5 defaults.
+    # Export: the bootstrapped file carries the opus-5 defaults.
     text = path.read_text(encoding="utf-8")
-    assert 'llm_overseer: "fable-5"' in text and 'llm_exec: "fable-5"' in text
+    assert 'llm_overseer: "opus-5"' in text and 'llm_exec: "opus-5"' in text
 
     # Import (file wins): editing llm_exec in the file lands in the DB.
-    path.write_text(text.replace('llm_exec: "fable-5"', 'llm_exec: "sonnet-5"'), encoding="utf-8")
+    path.write_text(text.replace('llm_exec: "opus-5"', 'llm_exec: "sonnet-5"'), encoding="utf-8")
     report = futuresync.run_sync(env.store, env.cfg)
     assert report.imported == [sid]
     assert _session(env, sid).llm_exec == "sonnet-5"
-    assert _session(env, sid).llm_overseer == "fable-5"
+    assert _session(env, sid).llm_overseer == "opus-5"
     # Canonical rewrite makes the next pass a no-op (echo suppression).
     assert futuresync.run_sync(env.store, env.cfg).total() == 0
 
@@ -216,9 +216,9 @@ def test_llm_models_export_and_import(env: Env) -> None:
 def test_db_model_edit_exports_to_file_frontmatter(env: Env) -> None:
     """A DB-side llm_overseer/llm_exec change (as the TUI details pane makes) reaches the file."""
     sid = _new_draft(env, "Ship the thing")
-    futuresync.run_sync(env.store, env.cfg)  # bootstrap export (fable-5 defaults)
+    futuresync.run_sync(env.store, env.cfg)  # bootstrap export (opus-5 defaults)
     path = _abs(env, sid)
-    assert 'llm_overseer: "fable-5"' in path.read_text(encoding="utf-8")
+    assert 'llm_overseer: "opus-5"' in path.read_text(encoding="utf-8")
 
     # Mirror the details-pane save: store.update_fields bumps updated_at → next sync re-exports.
     env.store.update_fields(sid, llm_overseer="opus-4.8", llm_exec="sonnet-5")

@@ -228,6 +228,9 @@ def _start_job_argv(
         llm_overseer=overseer,
         llm_exec=executor,
     )
+    # update_fields deliberately bypasses choice validation, which lets this helper model
+    # a legacy persisted row when a test passes a retired value.
+    store.update_fields("job-x", llm_overseer=overseer, llm_exec=executor)
     store.close()
 
     captured: dict[str, list[str]] = {}
@@ -263,19 +266,19 @@ def test_start_job_argv_default_models_no_delegation(
 def test_start_job_argv_delegates_when_exec_differs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    argv = _start_job_argv(tmp_path, monkeypatch, overseer="fable-5", executor="opus-4.8")
+    argv = _start_job_argv(tmp_path, monkeypatch, overseer="opus-5", executor="sonnet-5")
     assert argv[:7] == [
         "claude",
         "--model",
-        "claude-fable-5",
+        "claude-opus-5",
         "--session-id",
         "job-x",
         "--effort",
         "xhigh",
     ]
     prompt = argv[7]
-    assert prompt.startswith("[orchestration] You are the overseer running as fable-5.")
-    assert "model 'opus'" in prompt  # Agent-tool alias for the executor
+    assert prompt.startswith("[orchestration] You are the overseer running as opus-5.")
+    assert "model 'sonnet'" in prompt  # Agent-tool alias for the executor
     assert prompt.endswith("run it")
 
 
@@ -283,13 +286,29 @@ def test_start_job_argv_codex_keeps_model_but_no_delegation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     argv = _start_job_argv(
-        tmp_path, monkeypatch, overseer="fable-5", executor="opus-4.8", job_type="codex"
+        tmp_path, monkeypatch, overseer="opus-5", executor="opus-4.8", job_type="codex"
     )
     # --model still applies (Claude oversees), but a codex job gets no delegation prefix —
     # instead the job_launch_prefix routes it into /codex-implement-task-and-claude-review.
-    assert argv[:3] == ["claude", "--model", "claude-fable-5"]
+    assert argv[:3] == ["claude", "--model", "claude-opus-5"]
     assert "[orchestration]" not in argv[7]
     assert argv[7].startswith("/codex-implement-task-and-claude-review ")
+
+
+def test_start_job_legacy_fable_row_maps_once_to_opus(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A pre-retirement row never puts Fable in argv/delegation and warns only once."""
+    argv = _start_job_argv(tmp_path, monkeypatch, overseer="fable-5", executor="fable-5")
+    assert argv[:3] == ["claude", "--model", "claude-opus-5"]
+    assert "fable" not in " ".join(argv).lower()
+    assert "[orchestration]" not in argv[-1]
+    notices = [line for line in capsys.readouterr().err.splitlines() if "retired model" in line]
+    assert notices == [
+        "notice: job job-x requested retired model fable-5; launching on opus-5 instead"
+    ]
 
 
 def test_start_job_effort_omitted_when_config_empty(
@@ -1862,4 +1881,6 @@ def test_new_job_offers_and_defaults_to_opus_never_fable() -> None:
     with pytest.raises(SystemExit):
         parser.parse_args(["new-job", "--aim", "x", "-O", "fable-5"])
     assert "fable-5" not in models.NEW_JOB_LLM_CHOICES
-    assert "fable-5" in models.LLM_MODEL_IDS, "parked fable rows must still resolve"
+    assert "fable-5" not in models.LLM_CHOICES
+    assert "fable-5" not in models.LLM_MODEL_IDS
+    assert "fable-5" not in models.LLM_AGENT_ALIAS

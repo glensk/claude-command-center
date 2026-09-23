@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center.models import LiveSession, TranscriptScan
+from command_center.models import DEFAULT_LLM, LiveSession, TranscriptScan
 from command_center.store import AmbiguousJobId, Store, resolve_job_id
 
 
@@ -22,6 +22,7 @@ def test_ensure_and_update(tmp_path: Path) -> None:
     assert session.session_id == "s1"
     assert session.cwd == "/repo"
     assert session.created_at > 0
+    assert (session.llm_overseer, session.llm_exec) == (DEFAULT_LLM, DEFAULT_LLM)
 
     store.update_fields("s1", aim="done when green", deadline="2026-07-01")
     got = store.get("s1")
@@ -59,14 +60,18 @@ def test_create_draft_blank_prompt_stays_null(tmp_path: Path) -> None:
 def test_create_draft_stores_llm_models_and_defaults(tmp_path: Path) -> None:
     store = _store(tmp_path)
     # Explicit valid choices are stored verbatim.
-    s = store.create_draft("jobllm", "/repo", "Do it", llm_overseer="fable-5", llm_exec="sonnet-5")
-    assert s.llm_overseer == "fable-5" and s.llm_exec == "sonnet-5"
-    # Default when omitted is fable-5 on both.
+    s = store.create_draft("jobllm", "/repo", "Do it", llm_overseer="opus-4.8", llm_exec="sonnet-5")
+    assert s.llm_overseer == "opus-4.8" and s.llm_exec == "sonnet-5"
+    # Default when omitted is opus-5 on both.
     d = store.create_draft("jobdef", "/repo", "Do it")
-    assert d.llm_overseer == "fable-5" and d.llm_exec == "fable-5"
-    # A bogus value falls back to the fable-5 default (validated against LLM_CHOICES).
+    assert d.llm_overseer == "opus-5" and d.llm_exec == "opus-5"
+    # A retired or bogus value falls back to the active default.
     b = store.create_draft("jobbad", "/repo", "Do it", llm_overseer="gpt-9", llm_exec="")
-    assert b.llm_overseer == "fable-5" and b.llm_exec == "fable-5"
+    assert b.llm_overseer == "opus-5" and b.llm_exec == "opus-5"
+    retired = store.create_draft(
+        "jobretired", "/repo", "Do it", llm_overseer="fable-5", llm_exec="fable-5"
+    )
+    assert retired.llm_overseer == "opus-5" and retired.llm_exec == "opus-5"
 
 
 def test_clear_draft_promotes_to_real_session(tmp_path: Path) -> None:

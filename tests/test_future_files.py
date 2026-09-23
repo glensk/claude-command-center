@@ -64,8 +64,8 @@ def test_roundtrip_minimal_job() -> None:
         status="draft",  # serialize's default
         repo="",
         job_type="claude",  # serialize's default
-        llm_overseer="fable-5",  # serialize's default
-        llm_exec="fable-5",  # serialize's default
+        llm_overseer="opus-5",  # serialize's default
+        llm_exec="opus-5",  # serialize's default
         start_when="",
         deadline="",
         created="",
@@ -135,17 +135,17 @@ def test_roundtrip_start_when_with_quotes() -> None:
 
 
 # ---- llm_overseer / llm_exec ---------------------------------------------
-def test_serialize_emits_llm_keys_and_default_is_fable() -> None:
-    # Defaults: serialize with no llm args emits both keys as the fable-5 default.
+def test_serialize_emits_llm_keys_and_default_is_opus() -> None:
+    # Defaults: serialize with no llm args emits both keys as the active default.
     text = future_files.serialize(session_id=_UUID, aim="x", repo="home/ccc")
-    assert 'llm_overseer: "fable-5"' in text
-    assert 'llm_exec: "fable-5"' in text
+    assert 'llm_overseer: "opus-5"' in text
+    assert 'llm_exec: "opus-5"' in text
     job = future_files.parse_job_file(text)
-    assert job.llm_overseer == "fable-5" and job.llm_exec == "fable-5"
+    assert job.llm_overseer == "opus-5" and job.llm_exec == "opus-5"
 
 
 def test_missing_llm_keys_parse_to_default() -> None:
-    # A pre-feature file with no llm_* frontmatter keys parses to the fable-5 default.
+    # A pre-feature file with no llm_* frontmatter keys parses to the active default.
     text = (
         "---\n"
         f'session_id: "{_UUID}"\n'
@@ -155,7 +155,7 @@ def test_missing_llm_keys_parse_to_default() -> None:
         "---\n\n## AIM\n\nDo it\n\n## Prompt\n\n"
     )
     job = future_files.parse_job_file(text)
-    assert job.llm_overseer == "fable-5" and job.llm_exec == "fable-5"
+    assert job.llm_overseer == "opus-5" and job.llm_exec == "opus-5"
 
 
 def test_controls_block_lists_model_selects() -> None:
@@ -166,6 +166,7 @@ def test_controls_block_lists_model_selects() -> None:
     llm_opts = ", ".join(f"option({choice})" for choice in models.LLM_CHOICES)
     assert f"inlineSelect({llm_opts}):llm_overseer]" in text
     assert f"inlineSelect({llm_opts}):llm_exec]" in text
+    assert "fable-5" not in llm_opts
 
 
 def test_controls_block_labels_every_select() -> None:
@@ -461,8 +462,8 @@ def test_roundtrip_depends_on() -> None:
         status="ready",
         repo="home/claude-command-center",
         job_type="claude",
-        llm_overseer="fable-5",
-        llm_exec="fable-5",
+        llm_overseer="opus-5",
+        llm_exec="opus-5",
         start_when="",
         deadline="",
         created="2026-07-12",
@@ -498,8 +499,8 @@ def test_validate_depends_on(tmp_path: Path) -> None:
         status="ready",
         repo="home/repo",
         job_type="claude",
-        llm_overseer="fable-5",
-        llm_exec="fable-5",
+        llm_overseer="opus-5",
+        llm_exec="opus-5",
         start_when="",
         deadline="",
         created="",

@@ -68,6 +68,7 @@ from .models import (
     no_codex_conflict,
     now_ms,
     parse_iso_date,
+    resolve_job_llm,
     xterm_rgb,
 )
 from .store import Store
@@ -2885,8 +2886,14 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches
                 store.update_fields(args.session_id, fire_at=0)  # disarm, keep the draft
             print(f"error: job {args.session_id}: {conflict}", file=sys.stderr)
             return 1
-        overseer = session.llm_overseer if session.llm_overseer in LLM_MODEL_IDS else DEFAULT_LLM
-        executor = session.llm_exec if session.llm_exec in LLM_MODEL_IDS else DEFAULT_LLM
+        overseer, retired_overseer = resolve_job_llm(session.llm_overseer)
+        executor, retired_executor = resolve_job_llm(session.llm_exec)
+        if retired_overseer or retired_executor:
+            print(
+                f"notice: job {args.session_id} requested retired model fable-5; "
+                f"launching on {DEFAULT_LLM} instead",
+                file=sys.stderr,
+            )
         # (decision 14) Resume-aware: check ONLY the exact project dir derived from the
         # job's CURRENT cwd (the adapter munged-path convention) — not the glob fallback.
         resume = _cwd_transcript_exists(cwd, args.session_id, config_dir)

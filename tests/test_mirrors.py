@@ -558,7 +558,7 @@ def test_start_job_resumes_when_cwd_transcript_exists(
         "--resume",
         sid,
         "--model",
-        "claude-fable-5",
+        "claude-opus-5",
         "--effort",
         "xhigh",
     ]
@@ -581,7 +581,7 @@ def test_start_job_first_launch_when_transcript_only_in_other_project_dir(
     assert captured["argv"] == [
         "claude",
         "--model",
-        "claude-fable-5",
+        "claude-opus-5",
         "--session-id",
         sid,
         "--effort",

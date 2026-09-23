@@ -255,10 +255,10 @@ def test_render_row_draft_shows_models_readout() -> None:
     session = Session(session_id=sid, cwd="/repo", aim="x", draft=True)
     row = Row(session, None, Status.PARKED, 0, 0)
     lines = ls_view._render_row(row, enabled=False, warn_days=2, aim_threshold=50)
-    # Equal overseer/executor (the fable-5 default) compacts to a single name in the model slot.
-    assert "fable-5" in lines[0]
-    assert "▸" not in lines[0]  # no redundant "fable-5 ▸ fable-5"
-    assert "fable-5" not in lines[1]  # the pair moved off the secondary line
+    # Equal overseer/executor (the opus-5 default) compacts to a single name in the model slot.
+    assert "opus-5" in lines[0]
+    assert "▸" not in lines[0]  # no redundant "opus-5 ▸ opus-5"
+    assert "opus-5" not in lines[1]  # the pair moved off the secondary line
 
     session.llm_overseer = "fable-5"
     session.llm_exec = "sonnet-5"

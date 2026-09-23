@@ -287,6 +287,7 @@ _DRAFT_BLUE = "#5fafff"  # FUTURE (draft) jobs: section header, ✎ icon, prompt
 # Per-model colours for the draft `<overseer> ▸ <executor>` readout (the /next-step cell).
 _LLM_STYLE: dict[str, str] = {
     "fable-5": "#ff9f43",  # orange
+    "opus-5": "#2ecc71",  # green
     "opus-4.8": "#2ecc71",  # green
     "sonnet-5": "#5fafff",  # blue
 }
