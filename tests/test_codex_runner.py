@@ -1122,7 +1122,7 @@ def test_exit_codes_for_new_kinds(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 def test_runs_view_shows_health(
-    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """`runs` shows WHY a live round is quiet: caffeinated, slept, trouble lines."""
     runs = three_seats.home / "runs"  # three_seats sets $CODEX_IN_CLAUDE_RUNS_DIR here
@@ -1318,7 +1318,7 @@ def test_final_heartbeat_folds_in_progress_that_arrived_at_exit(
 
 
 def test_runs_skips_ended_and_prunes_old_ended(
-    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A retained final record is neither listed nor deleted on sight; a stale one is pruned."""
     runs = three_seats.home / "runs"
