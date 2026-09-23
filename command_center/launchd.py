@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from . import config
 
@@ -116,10 +117,11 @@ def _override_env_xml() -> str:
     Without these, a shell whose CCC_HOME/CLAUDE_HOME point elsewhere writes usage
     caches into one tree while the agent housekeeps another — so the daemon would sweep
     orphaned temps (:func:`usage.sweep_stale_temps`) in a directory the producer never
-    touches. Empty when neither is set, which is the common single-tree case.
+    touches. Empty when neither is set, which is the common single-tree case. Values
+    are XML-escaped: a path holding ``&`` or ``<`` would otherwise make the plist invalid.
     """
     return "".join(
-        f"\n        <key>{name}</key>\n        <string>{value}</string>"
+        f"\n        <key>{name}</key>\n        <string>{escape(value)}</string>"
         for name in ("CCC_HOME", "CLAUDE_HOME")
         if (value := os.environ.get(name))
     )

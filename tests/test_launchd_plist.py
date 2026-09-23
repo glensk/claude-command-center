@@ -59,6 +59,20 @@ def test_throttle_interval_set(plist: dict) -> None:
     assert plist["ThrottleInterval"] == 10
 
 
+def test_override_env_values_are_xml_escaped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # tp#409: a CCC_HOME/CLAUDE_HOME holding & or < must still yield a parseable plist.
+    monkeypatch.setenv("CCC_HOME", "/x/a&b")
+    monkeypatch.setenv("CLAUDE_HOME", "/y/<c>")
+    for xml in (
+        launchd.plist_content("/bin/ccc", 60, Path("/tmp/logs"), "com.test.ccc"),
+        launchd.future_sync_plist_content("/bin/ccc", "com.test.fs", "/w", "/l.log"),
+        launchd.quota_probe_plist_content("/bin/ccc", "com.test.qp", "/l.log"),
+    ):
+        env = plistlib.loads(xml.encode("utf-8"))["EnvironmentVariables"]
+        assert env["CCC_HOME"] == "/x/a&b"
+        assert env["CLAUDE_HOME"] == "/y/<c>"
+
+
 def test_run_at_load_true(plist: dict) -> None:
     assert plist["RunAtLoad"] is True
 
