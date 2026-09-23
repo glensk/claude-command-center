@@ -273,7 +273,7 @@ def test_record_run_appends_a_validated_claude_row(
     ("payload", "reason"),
     [
         ({"provider": "claude"}, "missing 'seat'"),
-        (_claude_row(provider="gemini"), "provider 'gemini'"),
+        (_claude_row(provider="mistral"), "provider 'mistral'"),
         (_claude_row(ms="6100"), "'ms' must be int"),
         (_claude_row(ok=1), "'ok' must be bool"),
         (_claude_row(ticket="#255"), "unknown key(s) ticket"),
@@ -341,3 +341,56 @@ def test_sanitize_note_collapses_and_caps() -> None:
     assert codex_ledger.sanitize_note(None) == ""
     assert codex_ledger.sanitize_note("  #255\t\x00ticket \n ") == "#255 ticket"
     assert len(codex_ledger.sanitize_note("x" * 500)) == codex_ledger.NOTE_CHARS
+
+
+# ── tp#392: every routed provider family, `caller`, `attempt_id` ─────────────────────
+@pytest.mark.parametrize(
+    "provider", ["agy", "opencode", "copilot", "gemini", "openai", "anthropic", "claude", "codex"]
+)
+def test_record_run_takes_every_routed_provider_family(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    code, err = _record(monkeypatch, _claude_row(provider=provider, seat="free"))
+    assert (code, err) == (0, "")
+    (row,) = _ledger_rows(three_seats)
+    assert row["provider"] == provider and row["id"] == f"{provider}:free"
+
+
+def test_every_row_gets_a_unique_attempt_id_unless_it_brings_one(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`attempt_id` is per PHYSICAL attempt (unlike `id`, the seat's oracle id); a writer
+    that must reference its line later — ai.py — supplies its own and it is kept."""
+    code, _ = _record(
+        monkeypatch,
+        [_claude_row(), _claude_row(), _claude_row(attempt_id="ai-7f3e", caller=" ai.py:\tpush ")],
+    )
+    assert code == 0
+    first, second, third = _ledger_rows(three_seats)
+    assert first["id"] == second["id"] == "claude:work"
+    assert first["attempt_id"] != second["attempt_id"]
+    assert len(first["attempt_id"]) == 32
+    assert third["attempt_id"] == "ai-7f3e"
+    assert third["caller"] == "ai.py: push", "sanitized like `note`"
+    assert "caller" not in first
+
+
+def test_record_run_type_checks_the_new_keys(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code, err = _record(monkeypatch, _claude_row(attempt_id=7))
+    assert code == 2 and "'attempt_id' must be str" in err
+    code, err = _record(monkeypatch, _claude_row(caller=["ai.py"]))
+    assert code == 2 and "'caller' must be str" in err
+    assert not _ledger_rows(three_seats)
+
+
+def test_non_codex_families_never_stamp_a_codex_seat() -> None:
+    now = int(datetime.fromisoformat("2026-09-23T11:30:00+02:00").timestamp())
+    rows = [
+        codex_ledger.validate_row(
+            _claude_row(provider=p, seat="default", ts="2026-09-23T11:00:00+02:00")
+        )
+        for p in ("agy", "opencode", "copilot")
+    ]
+    assert not codex_ledger.last_runs(rows, now)

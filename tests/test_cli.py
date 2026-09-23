@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import cli
+from command_center import cli, models
 from command_center.cli import cmd_check, cmd_jobs, cmd_new_job, cmd_resume, cmd_subgoals
 from command_center.store import Store
 
@@ -1852,3 +1852,14 @@ def test_open_job_and_terminal_probe_parsers_take_json() -> None:
     assert parser.parse_args(["open-job", "-j", "abc"]).json is True
     assert parser.parse_args(["terminal-probe", "--json"]).json is True
     assert parser.parse_args(["terminal-probe"]).func.__name__ == "cmd_terminal_probe"
+
+
+def test_new_job_offers_and_defaults_to_opus_never_fable() -> None:
+    """tp#392 D8: `new-job -O/-E` no longer offers Fable; stored fable rows still launch."""
+    parser = cli.build_parser()
+    args = parser.parse_args(["new-job", "--aim", "x"])
+    assert (args.overseer, args.executor) == ("opus-5", "opus-5")
+    with pytest.raises(SystemExit):
+        parser.parse_args(["new-job", "--aim", "x", "-O", "fable-5"])
+    assert "fable-5" not in models.NEW_JOB_LLM_CHOICES
+    assert "fable-5" in models.LLM_MODEL_IDS, "parked fable rows must still resolve"

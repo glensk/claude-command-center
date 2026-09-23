@@ -537,6 +537,7 @@ def test_run_cli_envelope_schema(
         "runner_pid",
         "seat",
         "attempts",
+        "attempt_ids",  # additive (tp#392): the ledger lines this call wrote
         "reply",
         "error",
         "session_id",
@@ -552,7 +553,7 @@ def test_run_cli_envelope_schema(
         "home": str(three_seats.seats["private"]),
         "email": "private@example.org",
     }
-    assert set(envelope["attempts"][0]) == {"seat", "home", "elapsed_s", "outcome"}
+    assert set(envelope["attempts"][0]) == {"seat", "home", "elapsed_s", "outcome", "attempt_id"}
 
 
 def test_run_cli_text_mode_prints_model_then_seat(

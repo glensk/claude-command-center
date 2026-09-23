@@ -27,6 +27,18 @@ one JSON object per physical attempt, with ``provider`` naming the family (``cod
 ``codex-runs.jsonl`` on purpose: a long-lived older runner process may still append to
 it, and a rename would split the history across two files.
 
+Since 2026-09-23 (tp#392, the one-ladder plan) every other provider family a routed
+caller spends — ``agy``, ``opencode``, ``copilot``, ``gemini``, ``openai``, ``anthropic`` —
+may file its rows here too, and two optional keys say WHO and WHICH:
+
+* ``attempt_id`` — the identity of ONE physical attempt, unique across the whole ledger
+  (a fresh ``uuid4().hex`` unless the writer brings its own). ``id`` is NOT that: it is the
+  seat's oracle id (``codex:private``) and repeats on every line of the seat. A caller that
+  logs its own row lists the ``attempt_id`` values it caused (``run -j`` returns them as
+  ``attempt_ids``), and ``ai logs`` hides a ledger line only when such a row names it.
+  Lines written before the key existed have none and are never hidden.
+* ``caller`` — who asked (``run -X``: ``ai.py:<attempt>``), sanitized like ``note``.
+
 Append-only, best-effort, never raises into the runner: a ledger that cannot be written
 is a missing measurement, not a failed Codex call. Timestamps are local ISO seconds with
 the UTC offset — the same spelling ai.py's own ``calls-*.jsonl`` uses, so the two sort
@@ -47,6 +59,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 import json
 import os
 import time
+import uuid
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -68,7 +81,7 @@ NOTE_CHARS = 120
 
 #: Provider families a row may name; a row without ``provider`` is ``codex`` (written
 #: before the field existed).
-PROVIDERS = ("codex", "claude")
+PROVIDERS = ("codex", "claude", "agy", "opencode", "copilot", "gemini", "openai", "anthropic")
 
 #: ``ccc record-run`` input contract: a row must carry these, with these types.
 SCHEMA_VERSION = 1
@@ -83,6 +96,8 @@ _REQUIRED: dict[str, type | tuple[type, ...]] = {
 _OPTIONAL: dict[str, type | tuple[type, ...]] = {
     "ts": str,
     "id": str,
+    "attempt_id": str,
+    "caller": str,
     "note": str,
     "model": str,
     "requested_model": str,
@@ -110,6 +125,11 @@ def sanitize_note(note: str | None) -> str:
     return cleaned[:NOTE_CHARS]
 
 
+def new_attempt_id() -> str:
+    """A fresh ``attempt_id`` — unique per physical attempt (see the module docstring)."""
+    return uuid.uuid4().hex
+
+
 def provider_of(row: dict[str, Any]) -> str:
     """The row's provider family — ``codex`` when the key predates the field."""
     return str(row.get("provider") or "codex")
@@ -135,6 +155,7 @@ def attempt_records(
     write: bool,
     workdir: str,
     note: str = "",
+    caller: str = "",
 ) -> list[dict[str, Any]]:
     """The ledger lines for *result*: one per PHYSICAL attempt, oldest first.
 
@@ -142,12 +163,16 @@ def attempt_records(
     call as a whole succeeded on the next seat). ``error`` is the outcome label of a
     non-ok attempt; the runner's prose (``error_message``) is attached to the LAST
     attempt only, which is the one it describes. *note* (the caller's ``-N``, sanitized)
-    rides on EVERY attempt of the round — a hop does not change what it was for.
+    rides on EVERY attempt of the round — a hop does not change what it was for, and so
+    does *caller* (``run -X``). ``attempt_id`` is the attempt's own
+    (:attr:`~command_center.codex_in_claude.RunAttempt.attempt_id`), the one ``run -j``
+    reports, so a caller can reference exactly these lines.
     """
     from .codex_in_claude import _seat_pid  # pylint: disable=import-outside-toplevel
 
     physical = [a for a in result.attempts if not a.outcome.startswith("skipped:")]
     clean_note = sanitize_note(note)
+    clean_caller = sanitize_note(caller)
     rows: list[dict[str, Any]] = []
     for index, attempt in enumerate(physical):
         ok = attempt.outcome == "ok"
@@ -156,6 +181,7 @@ def attempt_records(
             "provider": "codex",
             "seat": attempt.seat,
             "id": _seat_pid(attempt.seat) if attempt.seat else "",
+            "attempt_id": attempt.attempt_id,
             "purpose": purpose,
             "outcome": attempt.outcome,
             "ok": ok,
@@ -169,6 +195,8 @@ def attempt_records(
         }
         if clean_note:
             row["note"] = clean_note
+        if clean_caller:
+            row["caller"] = clean_caller
         if attempt.tokens_in or attempt.tokens_out:
             row["tokens_in"] = attempt.tokens_in
             row["tokens_out"] = attempt.tokens_out
@@ -216,7 +244,8 @@ def validate_row(raw: Any, where: str = "row") -> dict[str, Any]:
     :data:`_REQUIRED` key with its type, every known optional key with its type, an
     unknown key refused, ``provider`` one of :data:`PROVIDERS`, ``schema_version``
     :data:`SCHEMA_VERSION`. ``ts`` defaults to now, ``id`` to ``<provider>:<seat>``
-    (the ccc oracle id — ``claude:work``), ``note`` is sanitized.
+    (the ccc oracle id — ``claude:work``), ``attempt_id`` to a fresh one (a writer that
+    must reference the line later brings its own), ``note`` and ``caller`` are sanitized.
     """
     _check_keys(raw, where)
     provider = raw["provider"]
@@ -229,6 +258,7 @@ def validate_row(raw: Any, where: str = "row") -> dict[str, Any]:
         "provider": provider,
         "seat": raw["seat"],
         "id": str(raw.get("id") or f"{provider}:{raw['seat']}"),
+        "attempt_id": str(raw.get("attempt_id") or new_attempt_id()),
         "purpose": raw["purpose"],
         "outcome": raw["outcome"],
         "ok": raw["ok"],
@@ -237,12 +267,12 @@ def validate_row(raw: Any, where: str = "row") -> dict[str, Any]:
     if _epoch(row["ts"]) == 0:
         raise ValueError(f"{where}: ts {row['ts']!r} is not ISO-8601")
     for key in _OPTIONAL:
-        if key in ("ts", "id"):
+        if key in ("ts", "id", "attempt_id"):
             continue
         value = raw.get(key)
         if value is None or value == "":
             continue
-        row[key] = sanitize_note(value) if key == "note" else value
+        row[key] = sanitize_note(value) if key in ("note", "caller") else value
     if "error_message" in row:
         row["error_message"] = " ".join(str(row["error_message"]).split())[:_ERROR_CHARS]
     return row

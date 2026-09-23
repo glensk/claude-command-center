@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Generate / install the launchd agent that runs ``ccc daemon`` periodically.
+"""Generate / install the launchd agents that run ``ccc daemon`` and ``ccc quota -P``.
 
-macOS only. ``install()`` writes ``~/Library/LaunchAgents/<label>.plist`` and
-loads it; ``uninstall()`` unloads and removes it. The plist sets an explicit
+macOS only. ``install()`` writes ``~/Library/LaunchAgents/<label>.plist`` for the
+periodic daemon AND ``<prefix>.ccc-quota-probe.plist`` for the hourly OpenCode free-tier
+probe (:mod:`command_center.quota_probe`), and loads both; ``uninstall()`` unloads and
+removes both. The plist sets an explicit
 PATH so the daemon can find ``ccc``, ``pgrep``, ``osascript`` and ``claude``
 under launchd's minimal environment.
 """
@@ -40,6 +42,23 @@ def label(cfg: config.Config | None = None) -> str:
 def future_sync_label(cfg: config.Config | None = None) -> str:
     """Label for the WatchPaths future-sync agent (``<launchd_label>-future-sync``)."""
     return f"{label(cfg)}-future-sync"
+
+
+#: How often the quota-probe agent runs ``ccc quota -P``: one free request an hour.
+QUOTA_PROBE_INTERVAL_SEC = 3600
+
+
+def quota_probe_label(cfg: config.Config | None = None) -> str:
+    """Label for the hourly probe agent: ``<launchd_label minus its last dot-segment>`` +
+    ``.ccc-quota-probe`` (``com.example.claude-command-center`` →
+    ``com.example.ccc-quota-probe``, under the same reverse-DNS prefix as the install)."""
+    base = label(cfg)
+    return f"{base.rpartition('.')[0] or base}.ccc-quota-probe"
+
+
+def quota_probe_plist_path(cfg: config.Config | None = None) -> Path:
+    """Where the probe agent's plist lives; its presence is what "installed" means."""
+    return _plist_path(quota_probe_label(cfg))
 
 
 def state_badge(running: bool) -> str:
@@ -208,32 +227,107 @@ def future_sync_plist(cfg: config.Config | None = None) -> str:
     )
 
 
+def quota_probe_plist_content(
+    ccc_path: str, agent_label: str, log_path: str, ai_bin: str = ""
+) -> str:
+    """Return the launchd plist XML for the hourly ``ccc quota -P`` agent.
+
+    ``RunAtLoad`` is false: loading the agent must not spend a request, the first probe
+    comes one interval later. *ai_bin* (resolved at generation time) is written into the
+    environment as ``AI_BIN`` because launchd's minimal PATH rarely reaches ai.py,
+    and without ai.py the probe could only ask config.toml's model, never the registry's.
+    """
+    home = Path.home()
+    ai_env = f"\n        <key>AI_BIN</key>\n        <string>{ai_bin}</string>" if ai_bin else ""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{agent_label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{ccc_path}</string>
+        <string>quota</string>
+        <string>-P</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CCC_INTERNAL</key>
+        <string>1</string>
+        <key>AI_NO_AUTOCOMMIT</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>{_path_env()}</string>
+        <key>HOME</key>
+        <string>{home}</string>{ai_env}{_override_env_xml()}
+    </dict>
+    <key>StartInterval</key>
+    <integer>{QUOTA_PROBE_INTERVAL_SEC}</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>{log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>{log_path}</string>
+</dict>
+</plist>
+"""
+
+
+def quota_probe_plist(cfg: config.Config | None = None) -> str:
+    """Generate the quota-probe agent plist from config (label, log, binaries)."""
+    cfg = cfg or config.load_config()
+    from . import external_deps  # pylint: disable=import-outside-toplevel  # capability-scoped
+
+    return quota_probe_plist_content(
+        _ccc_path(),
+        quota_probe_label(cfg),
+        str(config.app_home() / "quota-probe.log"),
+        external_deps.ai_exe() or "",
+    )
+
+
+def _write_and_load(path: Path, content: str) -> subprocess.CompletedProcess[str]:
+    """Write *path* and (re)load it with ``launchctl``; the ``load`` result."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    subprocess.run(["launchctl", "unload", str(path)], capture_output=True, check=False)
+    return subprocess.run(
+        ["launchctl", "load", str(path)], capture_output=True, text=True, check=False
+    )
+
+
 def install() -> int:
     cfg = config.load_config()
     app = config.app_home()
     app.mkdir(parents=True, exist_ok=True)
     path = _plist_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(plist_content(_ccc_path(), cfg.daemon_interval_sec, app), encoding="utf-8")
-    subprocess.run(["launchctl", "unload", str(path)], capture_output=True, check=False)
-    result = subprocess.run(
-        ["launchctl", "load", str(path)], capture_output=True, text=True, check=False
-    )
+    result = _write_and_load(path, plist_content(_ccc_path(), cfg.daemon_interval_sec, app))
     if result.returncode == 0:
         print(f"installed and loaded launchd agent: {path}")
         print(f"  runs `ccc daemon` every {cfg.daemon_interval_sec}s; logs in {app}")
     else:
         print(f"wrote {path} but `launchctl load` failed:\n{result.stderr.strip()}")
         return 1
+    probe_path = quota_probe_plist_path(cfg)
+    result = _write_and_load(probe_path, quota_probe_plist(cfg))
+    if result.returncode != 0:
+        print(f"wrote {probe_path} but `launchctl load` failed:\n{result.stderr.strip()}")
+        return 1
+    print(f"installed and loaded launchd agent: {probe_path}")
+    print(f"  runs `ccc quota -P` every {QUOTA_PROBE_INTERVAL_SEC}s (not at load)")
     return 0
 
 
 def uninstall() -> int:
-    path = _plist_path()
-    if path.exists():
-        subprocess.run(["launchctl", "unload", str(path)], capture_output=True, check=False)
-        path.unlink()
-        print(f"unloaded and removed {path}")
-    else:
+    removed = False
+    for path in (_plist_path(), quota_probe_plist_path()):
+        if path.exists():
+            subprocess.run(["launchctl", "unload", str(path)], capture_output=True, check=False)
+            path.unlink()
+            print(f"unloaded and removed {path}")
+            removed = True
+    if not removed:
         print("launchd agent not installed")
     return 0

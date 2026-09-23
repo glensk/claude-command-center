@@ -304,6 +304,11 @@ LLM_CHOICES: tuple[str, ...] = (
     "haiku-4.5",
 )
 DEFAULT_LLM = "fable-5"
+# What ``ccc new-job -O/-E`` OFFERS and defaults to (tp#392, D8: no new job on Fable).
+# ``fable-5`` stays in :data:`LLM_CHOICES` / :data:`LLM_MODEL_IDS` only so rows parked
+# before 2026-09-23 still read and launch as they were written.
+NEW_JOB_LLM_CHOICES: tuple[str, ...] = tuple(c for c in LLM_CHOICES if not c.startswith("fable"))
+NEW_JOB_DEFAULT_LLM = "opus-5"
 # Full model ids for ``claude --model`` (the overseer the session runs on).
 # ``opus-4.8-1m`` is the 1M-context beta form; fable-5 and sonnet-5 are natively 1M.
 LLM_MODEL_IDS: dict[str, str] = {

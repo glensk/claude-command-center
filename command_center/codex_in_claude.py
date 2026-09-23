@@ -3649,7 +3649,7 @@ def record_seat_success(cand: SeatCandidate, now: int | None = None) -> None:
 # The runner — the ONE place ccc starts `codex exec`
 # --------------------------------------------------------------------------- #
 @dataclass
-class RunAttempt:
+class RunAttempt:  # pylint: disable=too-many-instance-attributes  # flat attempt record
     """One physical (or skipped) attempt on one seat, for the machine envelope."""
 
     seat: str
@@ -3667,6 +3667,10 @@ class RunAttempt:
     tokens_in: int = 0
     tokens_out: int = 0
     ended_at: float = field(default_factory=time.time)
+    # The ATTEMPT's identity, unique per physical attempt: the ledger line's
+    # ``attempt_id`` and the ``run -j`` envelope's, so a caller that records its own row
+    # (ai.py's ``attempt_ids``) can reference exactly the lines this attempt wrote.
+    attempt_id: str = field(default_factory=codex_ledger.new_attempt_id)
 
 
 @dataclass
@@ -3679,6 +3683,8 @@ class RunResult:  # pylint: disable=too-many-instance-attributes  # flat result 
     attempts: list[RunAttempt] = field(default_factory=list)
     # "" | disabled | all_seats_unavailable | attempts_exhausted | codex_failed |
     # timeout | stalled | network | slept | startup_timeout | seat_refused_midrun | no_codex
+    # | seat_unknown / seat_unavailable / seat_refused (``run -S``: the one confined seat
+    # is not registered / was not eligible / refused — never a hop to another seat)
     error_kind: str = ""
     error_message: str = ""
     earliest_reset: int | None = None
@@ -4083,12 +4089,14 @@ def run_with_fallback(**kwargs: Any) -> RunResult:
     entrance only adds the run ledger: every PHYSICAL attempt the round made is
     appended to ``<app_home>/codex-runs.jsonl`` (:mod:`command_center.codex_ledger`)
     once the round has returned, whatever its outcome, each line carrying the caller's
-    ``note`` (``run -N``). Best-effort — a ledger that cannot be written never fails or
-    delays the call.
+    ``note`` (``run -N``) and ``caller`` (``run -X``). Best-effort — a ledger that
+    cannot be written never fails or delays the call.
     """
-    # ``note`` is ledger-only context (``run -N``): pop it before the round, which does
-    # not know the keyword, so a caller's note can never turn into a TypeError mid-run.
+    # ``note``/``caller`` are ledger-only context (``run -N``/``-X``): pop them before the
+    # round, which does not know the keywords, so a caller's label can never turn into a
+    # TypeError mid-run.
     note = str(kwargs.pop("note", "") or "")
+    caller = str(kwargs.pop("caller", "") or "")
     result = _run_with_fallback(**kwargs)
     workdir = kwargs.get("workdir", "")
     codex_ledger.record_result(
@@ -4100,7 +4108,57 @@ def run_with_fallback(**kwargs: Any) -> RunResult:
         write=bool(kwargs.get("write", False)),
         workdir=os.fspath(workdir) if workdir else "",
         note=note,
+        caller=caller,
     )
+    return result
+
+
+def _seat_names(label: str, pid: str) -> set[str]:
+    """Every spelling ``run -S`` accepts for one seat: its label (``private``), its oracle
+    id (``codex:private``) and its display name (``codex-priv``)."""
+    pid = pid or _seat_pid(label)
+    return {label, pid, _quota_display_id(pid)}
+
+
+def _quota_display_id(pid: str) -> str:
+    """:func:`command_center.quota.display_id`, reached lazily (quota imports this module)."""
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    return quota.display_id(pid)
+
+
+def _confined(pending: list[SeatCandidate], seat: str) -> list[SeatCandidate]:
+    """*pending* narrowed to the ONE seat ``run -S`` named (all of it when *seat* is "")."""
+    if not seat:
+        return pending
+    return [c for c in pending if seat in _seat_names(c.label, c.pid)]
+
+
+def _seat_result(result: RunResult, seat: str) -> RunResult:
+    """Fill *result* in for a ``run -S`` seat that did not serve: never a hop, one kind.
+
+    ``seat_unknown`` = no registered seat answers to *seat*; ``seat_refused`` = it was
+    launched and refused; ``seat_unavailable`` = it was not eligible (held, blocked, a
+    skip reason, the rota, or the ``$CODEX_HOME`` override names another home).
+    """
+    known = any(seat in _seat_names(label, "") for label in canonical_codex_homes())
+    mine = [a for a in result.attempts if seat in _seat_names(a.seat, "")]
+    last = mine[-1].outcome if mine else ""
+    if not known and not mine:
+        result.error_kind = "seat_unknown"
+        result.error_message = f"no registered Codex seat is called {seat!r}"
+    elif last.startswith("refused:"):
+        result.error_kind = "seat_refused"
+        result.error_message = (
+            f"seat {seat} refused ({last.removeprefix('refused:')}) — -S never hops"
+        )
+    else:
+        lines, result.earliest_reset = seat_status_report()
+        why = last or "not eligible right now"
+        result.error_message = f"seat {seat} is unavailable ({why}) — -S never hops" + (
+            ("\n  " + "\n  ".join(lines)) if lines else ""
+        )
+        result.error_kind = "seat_unavailable"
     return result
 
 
@@ -4123,6 +4181,7 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
     on_attempt: Callable[[SeatCandidate, int], None] | None = None,
     headroom: bool = False,
     min_remaining_pct: float = 0.0,
+    seat: str = "",
 ) -> RunResult:
     """The seat-hopping round behind :func:`run_with_fallback` (which adds the ledger).
 
@@ -4167,6 +4226,11 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
       hard budgets and both best-effort. With the opt-in off, ``run`` keeps its session
       file instead (see :func:`ephemeral_default`) so the rollout measures the seat.
 
+    * **``seat`` confines the call to ONE seat** (``run -S``): the candidate list is
+      narrowed to it before every attempt, so a skip or a refusal ends the call with
+      ``seat_unavailable`` / ``seat_refused`` (``seat_unknown`` for a name no seat
+      answers to) instead of hopping. Nothing persistent changes — no pin, no order.
+
     Never raises for a seat problem — everything is reported through
     :attr:`RunResult.error_kind`. :class:`codex_launch.CodexLaunchError` (a launch this
     policy refuses, e.g. ``--write`` on a seat with no ``hardened-rw`` profile) DOES
@@ -4191,15 +4255,16 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
             with contextlib.suppress(Exception):
                 _pre_selection_refresh(codex_homes_in_order(probe=probe_ok), _REFRESH_BUDGET_SEC)
         pending = codex_homes_in_order(probe=probe_ok)
+    pending = _confined(pending, seat)
     if not pending:
-        return _no_seat_result(result)
+        return _seat_result(result, seat) if seat else _no_seat_result(result)
 
     attempted: set[str] = set()
     physical = 0
     while True:
         if attempted and resume_home is None:
             # a hold written mid-run removes a seat
-            pending = codex_homes_in_order(probe=probe_ok)
+            pending = _confined(codex_homes_in_order(probe=probe_ok), seat)
         pending = [c for c in pending if str(c.home) not in attempted]
         if not pending:
             break
@@ -4220,7 +4285,7 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
             # it rather than spend a second round trip on the same experiment (plan D7).
             probe_ok = False
             attempted.discard(str(cand.home))
-            pending = codex_homes_in_order(probe=False)
+            pending = _confined(codex_homes_in_order(probe=False), seat)
             continue
         if max_attempts and physical >= max_attempts:
             result.error_kind = "attempts_exhausted"
@@ -4350,13 +4415,20 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
                     + " — not retried on another seat; review the worktree."
                 )
                 return result
-        nxt = next((c.label for c in codex_homes_in_order() if str(c.home) not in attempted), "")
+        nxt = next(
+            (
+                c.label
+                for c in _confined(codex_homes_in_order(), seat)
+                if str(c.home) not in attempted
+            ),
+            "",
+        )
         print(
             f"seat {cand.label} refused: {failure.kind} ({failure.detail}) — "
             + (f"falling back to {nxt}" if nxt else "no seat left to try"),
             file=sys.stderr,
         )
-    return _no_seat_result(result)
+    return _seat_result(result, seat) if seat else _no_seat_result(result)
 
 
 # CodexStalledError.reason -> RunResult.error_kind
@@ -4460,6 +4532,9 @@ def _run_error_exit(result: RunResult) -> int:
         return EX_QUOTA
     return {
         "disabled": EX_QUOTA,
+        "seat_unavailable": EX_QUOTA,
+        "seat_refused": EX_QUOTA,
+        "seat_unknown": EX_USAGE,
         "no_codex": EX_NO_CODEX,
         "timeout": EX_TIMEOUT,
         "stalled": EX_TIMEOUT,
@@ -4751,6 +4826,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             idle_timeout=_idle_timeout_for(getattr(args, "idle_timeout", None), wall_timeout),
             purpose=args.purpose or "run",
             note=getattr(args, "note", "") or "",
+            caller=getattr(args, "caller", "") or "",
+            seat=getattr(args, "seat", "") or "",
             model=model,
             effort=shown_effort,
             heartbeat_meta={
@@ -4807,8 +4884,15 @@ def _run_cli_report(result: RunResult, args: argparse.Namespace, model: str, eff
                     "home": a.home,
                     "elapsed_s": round(a.elapsed_s, 3),
                     "outcome": a.outcome,
+                    # The ledger line's `attempt_id`; null for a skip (no line, no spend).
+                    "attempt_id": None if a.outcome.startswith("skipped:") else a.attempt_id,
                 }
                 for a in result.attempts
+            ],
+            # Every ledger line this call wrote, oldest first — what a caller that files
+            # its own row records as `attempt_ids`, so `ai logs` can hide exactly these.
+            "attempt_ids": [
+                a.attempt_id for a in result.attempts if not a.outcome.startswith("skipped:")
             ],
             "reply": result.reply,
             "error": (
@@ -4834,9 +4918,16 @@ def _run_cli_report(result: RunResult, args: argparse.Namespace, model: str, eff
 
 def _run_exit_code(result: RunResult) -> int:
     """The exit code for a failed run, WITHOUT printing anything (the ``-j`` path)."""
-    if result.error_kind in ("all_seats_unavailable", "attempts_exhausted", "disabled"):
+    if result.error_kind in (
+        "all_seats_unavailable",
+        "attempts_exhausted",
+        "disabled",
+        "seat_unavailable",
+        "seat_refused",
+    ):
         return EX_QUOTA
     return {
+        "seat_unknown": EX_USAGE,
         "no_codex": EX_NO_CODEX,
         "timeout": EX_TIMEOUT,
         "stalled": EX_TIMEOUT,
@@ -5181,6 +5272,23 @@ def build_parser() -> argparse.ArgumentParser:
         "(e.g. the ticket: '#255'); shown by `ai logs`",
     )
     p_run.add_argument(
+        "-S",
+        "--seat",
+        default="",
+        metavar="SEAT",
+        help="run on THIS seat only (label `private`, id `codex:private` or name "
+        "`codex-priv`): no fallback to another seat, nothing persistent changes; an "
+        "ineligible or refusing seat fails with seat_unavailable / seat_refused",
+    )
+    p_run.add_argument(
+        "-X",
+        "--caller",
+        default="",
+        metavar="NAME",
+        help="who is calling (e.g. 'ai.py:<attempt_id>'), written to the run ledger as "
+        "`caller` on every attempt",
+    )
+    p_run.add_argument(
         "-n",
         "--max-attempts",
         type=int,
@@ -5228,7 +5336,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-j",
         "--json",
         action="store_true",
-        help="one JSON object: {schema_version, model, effort, ok, seat, attempts, reply, error}",
+        help="one JSON object: {schema_version, model, effort, ok, seat, attempts, "
+        "attempt_ids, reply, error}",
     )
     p_run.set_defaults(func=cmd_run)
 

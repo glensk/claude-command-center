@@ -1404,7 +1404,7 @@ ccc lock-release [file|--all]  # force-release without committing (escape hatch)
 ```commands
 ccc daemon --dry-run -v            # preview: what would be reaped/summarized/alerted
 ccc daemon                         # one pass: reap idle, done-check, summaries, alerts
-ccc daemon --install               # load the launchd agent (runs every 5 min)
+ccc daemon --install               # load the launchd agents (daemon every 5 min + hourly quota probe)
 ccc daemon --uninstall             # remove it
 ```
 
@@ -2329,6 +2329,18 @@ ccc quota -P                                    # is the free tier up right now?
 ccc quota -m opencode-free -u 35580 -R "free usage exceeded (TUI: 9h 53m)"
 ccc quota -C 15                                 # the balance you just read in the console
 ```
+
+**The hourly probe (2026-09-23, tp#392).** `ccc daemon --install` also writes and loads a
+second LaunchAgent, `<prefix>.ccc-quota-probe` (the `launchd_label` minus its last
+dot-segment — `com.example.claude-command-center` → `com.example.ccc-quota-probe`), which
+runs `ccc quota -P` every 3600 s and NOT at load; `--uninstall` removes both. The probe asks
+the model of the first `opencode-free` rung of the `cheap` ladder in `ai ladders -j` (the
+LLM ladder registry; `AI_BIN` is written into the agent's environment when ccc finds
+`ai.py` at install time) and falls back to `opencode_free_model` only when ai.py is
+missing, fails or names no such rung — one model, one request, no fallback routing. Every
+probe, an inconclusive one included, appends one run-ledger row (`provider: opencode`,
+`seat: free`, `purpose: probe-opencode-free`), and while the agent's plist is installed the
+free row carries `next_probe_at` and prints `next probe in N min`.
 
 These rows are **visibility only**: no rung in `ai.py`'s ladder, no `_ORACLE_IDS` entry, no
 TUI usage card.

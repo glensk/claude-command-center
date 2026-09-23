@@ -56,8 +56,9 @@ from .models import (
     EFFORT_LEVELS,
     JOB_TYPES,
     LLM_AGENT_ALIAS,
-    LLM_CHOICES,
     LLM_MODEL_IDS,
+    NEW_JOB_DEFAULT_LLM,
+    NEW_JOB_LLM_CHOICES,
     Session,
     Status,
     Subgoal,
@@ -2553,8 +2554,8 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
             depends_on=depends_on,
             job_type=job_type,
             no_codex=no_codex,
-            llm_overseer=getattr(args, "overseer", None) or DEFAULT_LLM,
-            llm_exec=getattr(args, "executor", None) or DEFAULT_LLM,
+            llm_overseer=getattr(args, "overseer", None) or NEW_JOB_DEFAULT_LLM,
+            llm_exec=getattr(args, "executor", None) or NEW_JOB_DEFAULT_LLM,
             config_dir=config_dir,
             fire_at=fire_at,
             fire_window=fire_window,
@@ -3534,6 +3535,14 @@ def _quota_last_run_note(prov: dict[str, Any]) -> str:
     return note
 
 
+def _quota_next_probe_note(prov: dict[str, Any], now: int) -> str:
+    """``next probe in 42 min`` for the OpenCode free row while the hourly probe agent is
+    installed (the row's ``next_probe_at``), else ""."""
+    from . import quota_probe  # pylint: disable=import-outside-toplevel
+
+    return quota_probe.next_probe_note(int(prov.get("next_probe_at") or 0), now)
+
+
 def _quota_age(prov: dict[str, Any], now: int) -> str:
     """How old the evidence behind this row's verdict is.
 
@@ -3827,11 +3836,15 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
         return 0
 
     if args.probe:
-        ok, detail = usage.probe_opencode_free()
-        # An inconclusive probe records NOTHING: overwriting a real verdict with "we
-        # could not tell" would turn a slow network into a blocked rung.
-        if ok is not None:
-            usage.record_opencode_probe(ok, detail, now)
+        from . import quota_probe
+
+        # The target is the ladder registry's first opencode-free rung (`ai ladders -j`),
+        # config.toml's `opencode_free_model` only without ai.py; every probe is a ledger
+        # row. An inconclusive probe leaves the usage cache alone: overwriting a real
+        # verdict with "we could not tell" would turn a slow network into a blocked rung.
+        probed = quota_probe.run(now)
+        ok, detail = probed.ok, probed.detail
+        print(f"quota: probing opencode/{probed.model} (target from {probed.source})")
         if ok is None:
             print(f"quota: opencode-free inconclusive — {detail}")
             return quota.EXIT_UNKNOWN
@@ -3965,6 +3978,8 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
         # another user of the shared login, not a mystery.
         if last_run := _quota_last_run_note(prov):
             detail = f"{detail} · {last_run}" if detail else last_run
+        if next_probe := _quota_next_probe_note(prov, now):
+            detail = f"{detail} · {next_probe}" if detail else next_probe
         if prov.get("email"):
             detail = f"{detail}  [{prov['email']}]" if detail else f"[{prov['email']}]"
         # The name carries the seat's own shell command when that is not the name
@@ -5879,16 +5894,17 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_newjob.add_argument(
         "-O",
         "--overseer",
-        choices=LLM_CHOICES,
-        default=DEFAULT_LLM,
-        help=f"model the session runs on (default: {DEFAULT_LLM})",
+        choices=NEW_JOB_LLM_CHOICES,
+        default=NEW_JOB_DEFAULT_LLM,
+        help=f"model the session runs on (default: {NEW_JOB_DEFAULT_LLM})",
     )
     p_newjob.add_argument(
         "-E",
         "--executor",
-        choices=LLM_CHOICES,
-        default=DEFAULT_LLM,
-        help=f"model subagents implement on when it differs from overseer (default: {DEFAULT_LLM})",
+        choices=NEW_JOB_LLM_CHOICES,
+        default=NEW_JOB_DEFAULT_LLM,
+        help="model subagents implement on when it differs from overseer "
+        f"(default: {NEW_JOB_DEFAULT_LLM})",
     )
     p_newjob.add_argument(
         "-A",
@@ -6205,7 +6221,9 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "--probe",
         action="store_true",
         help="ask the OpenCode free tier for one reply and record whether it was served "
-        "(the only meter it has; takes seconds, never runs on its own)",
+        "(the only meter it has; takes seconds). Asks the first opencode-free rung of "
+        "`ai ladders -j`'s cheap ladder (config opencode_free_model without ai.py), writes "
+        "a run-ledger row; the hourly quota-probe launchd agent runs it",
     )
     p_quota.set_defaults(func=cmd_quota)
 

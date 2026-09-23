@@ -27,7 +27,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
-from extdeps import Dep
+from extdeps import Dep, resolve
 
 # The one external tool the vault mirrors depend on: the secret-broker client. Its
 # `scrub` verb vouches for a document (stdin → scrubbed stdout, exit 0) or withholds it
@@ -64,4 +64,24 @@ EXTERNAL_DEPS: dict[str, Dep] = {
             "never looks for the binary."
         ),
     ),
+    # The LLM ladder registry's CLI (`ai.py`). ccc asks it ONE question: `ai
+    # ladders -j`, i.e. which model the hourly OpenCode free-tier probe should ask
+    # (:mod:`command_center.quota_probe`). Resolved with `resolve`: without it the probe
+    # asks `opencode_free_model` from config.toml instead — the value it always used.
+    "ai.py": Dep(
+        name="ai.py",
+        command="ai.py",
+        env="AI_BIN",
+        install_hint=(
+            "Put `ai.py` on $PATH, or set AI_BIN to its absolute path (the "
+            "quota-probe launchd agent gets it written into its environment when ccc "
+            "finds it at install time). Without it `ccc quota -P` probes "
+            "`opencode_free_model` from config.toml."
+        ),
+    ),
 }
+
+
+def ai_exe() -> str | None:
+    """``ai.py`` (``AI_BIN`` → ``$PATH``), or ``None`` — a missing ai.py is a degrade."""
+    return resolve(EXTERNAL_DEPS["ai.py"])

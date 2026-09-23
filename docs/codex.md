@@ -447,6 +447,20 @@ Codex call it would have described.
 control characters collapsed, 120 chars at most), and `ai logs` prints it in the detail
 column instead of the seat, which the provider column already names.
 
+**Attempt ids, callers, one-seat runs (2026-09-23, tp#392).** Every line carries
+`attempt_id` — unique per physical attempt (a `uuid4` hex), unlike `id`, which is the
+seat's oracle id and repeats on every line of that seat. `run -j` returns the ids of the
+lines the call wrote, per attempt and as a top-level `attempt_ids` list (a skipped seat
+has none), so a caller that logs its own row can name exactly these lines; `ai logs` hides
+a ledger line only when such a row references its `attempt_id`, and lines written before
+the key existed are never hidden. `run -X/--caller NAME` puts `caller` on every line
+(`ai.py:<attempt>`), sanitized like `-N`. `run -S/--seat SEAT` (label `private`, id
+`codex:private` or name `codex-priv`) confines ONE call to that seat: no hop, no pin or
+order change; a seat that is not eligible fails with `error.kind = seat_unavailable`
+(nothing launched, exit 8), one that refuses with `seat_refused` (exit 8), and a name no
+registered seat answers to with `seat_unknown` (exit 2). A ladder walking several Codex
+seats calls `-S` once per seat, in its own order.
+
 **Claude rows — `ccc record-run`.** The same file is the ledger for the headless
 `claude -p` turns an external caller wants next to its Codex ones (the checker pair judges
 every ticket command with Opus AND Codex; `ai logs` used to show only the Codex half).
@@ -461,7 +475,10 @@ The caller pipes ONE JSON object or an array of them — one per physical attemp
  "cwd": "/…/sdsc-automations"}
 ```
 
-`provider` is `codex` | `claude` (a row without the key predates the field and is Codex);
+`provider` is `codex` | `claude` | `agy` | `opencode` | `copilot` | `gemini` | `openai` |
+`anthropic` (a row without the key predates the field and is Codex; every family but
+Codex leaves `last_run` alone); `attempt_id` defaults to a fresh one (bring your own to
+reference the line later), `caller` is optional;
 `seat` is the caller's label (`work` / `private`), `id` defaults to the ccc oracle id
 (`claude:work`); `requested_model` is the alias handed to `--model` (`opus`) and `model`
 the one Claude Code resolved it to; `outcome` is free text with `ok` the verdict

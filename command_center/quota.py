@@ -433,7 +433,7 @@ def seat_color(  # pylint: disable=too-many-return-statements
     """The hex accent a provider row is painted in — the SAME colour its TUI usage card
     is drawn in: gold for the private Claude seat, blue for the work one, OpenAI-green
     for Codex, violet for Copilot, the two Antigravity buckets in their own olive pair,
-    Meta-magenta for Muse Code, teal for the paid OpenCode seat.
+    Meta-magenta for Muse Code, teal for both OpenCode Zen seats.
 
     Published on every ``-j`` provider row as ``color`` so that a consumer painting the
     same seat (``ai logs``, ``ai routing``) reads the value from here instead of keeping
@@ -450,8 +450,8 @@ def seat_color(  # pylint: disable=too-many-return-statements
         return usage._AGY_GPT_ACCENT if pid == "agy:gpt" else usage._AGY_ACCENT  # noqa: SLF001
     if kind == "muse":
         return usage._MUSE_ACCENT  # noqa: SLF001
-    if pid == "opencode:priv":
-        return usage._OPENCODE_PRIV_ACCENT  # noqa: SLF001
+    if kind == "opencode":
+        return usage._OPENCODE_ACCENT  # noqa: SLF001
     return ""
 
 
@@ -511,6 +511,10 @@ class ProviderQuota:
     # spike in a shared seat's usage can be checked against what THIS machine launched.
     # Additive and dropped when empty; never an input to the state.
     last_run: dict[str, Any] = field(default_factory=dict)
+    # ``opencode:free`` only (2026-09-23, tp#392): when the hourly quota-probe agent runs
+    # ``ccc quota -P`` next — the last probe + the INSTALLED agent's interval
+    # (:func:`command_center.quota_probe.next_probe_at`); 0 (dropped) with no agent.
+    next_probe_at: int = 0
 
 
 def _cooldowns_path() -> Path:
@@ -2157,6 +2161,11 @@ def _opencode_quotas(now: int, cooldowns: dict[str, dict]) -> list[ProviderQuota
         if pid in cooldowns:
             row = _cooldown_quota(pid, "opencode", cooldowns[pid], row.windows)
             row.account = seat
+        if seat == "free":
+            from . import quota_probe  # pylint: disable=import-outside-toplevel  # cycle-safe here
+
+            last_verdict = snap.probe.at if snap is not None and snap.probe is not None else 0
+            row.next_probe_at = quota_probe.next_probe_at(last_verdict)
         rows.append(row)
     return rows
 
@@ -2455,6 +2464,7 @@ def _rehydrate(raw: dict[str, Any]) -> ProviderQuota:
         # goes through the serialized form) would report a rota block with no rota (O11).
         rota=dict(raw.get("rota") or {}),
         last_run=dict(raw.get("last_run") or {}),
+        next_probe_at=int(raw.get("next_probe_at", 0) or 0),
     )
 
 

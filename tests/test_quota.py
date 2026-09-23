@@ -753,9 +753,10 @@ def test_snapshot_rows_carry_the_accent_the_report_paints_them_in() -> None:
     assert quota.seat_color("agy", "agy") == usage._AGY_ACCENT  # noqa: SLF001
     assert quota.seat_color("agy:gpt", "agy") == usage._AGY_GPT_ACCENT  # noqa: SLF001
     assert quota.seat_color("muse", "muse") == usage._MUSE_ACCENT  # noqa: SLF001
-    opencode_priv = usage._OPENCODE_PRIV_ACCENT  # noqa: SLF001
-    assert quota.seat_color("opencode:priv", "opencode") == opencode_priv
-    assert quota.seat_color("opencode:free", "opencode") == ""
+    # tp#392: BOTH OpenCode rungs are teal — `ai ladders` paints by provider family.
+    teal = usage._OPENCODE_ACCENT  # noqa: SLF001
+    assert quota.seat_color("opencode:priv", "opencode") == teal
+    assert quota.seat_color("opencode:free", "opencode") == teal
     assert quota.seat_color("gemini", "gemini") == ""
     # Every published row carries it, and the table reads the field, never a copy.
     snap = quota.snapshot(now=NOW)
