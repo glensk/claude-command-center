@@ -46,10 +46,14 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import IO
+from dataclasses import dataclass
+from typing import IO, TYPE_CHECKING, Any
 
 from . import accounts, config, terminal, usage
 from .store import Store
+
+if TYPE_CHECKING:  # the seam's type only — importing peek eagerly would cost every `ccc`
+    from .peek import Frontmost
 
 WINDOW_CHOICES = ("five_hour", "seven_day", "fable_week")
 DEFAULT_BUFFER_SEC = 90
@@ -391,8 +395,9 @@ def _compute_fire(
     return fire_at, snapshot
 
 
-def _derive_aim(args: argparse.Namespace, prompt: str) -> str:
-    aim = (getattr(args, "aim", None) or "").strip()
+def _derive_aim(aim: str, prompt: str) -> str:
+    """The job's AIM: an explicit *aim* wins, else the prompt's first non-empty line."""
+    aim = (aim or "").strip()
     if aim:
         return aim
     first = next((line.strip() for line in prompt.splitlines() if line.strip()), "parked prompt")
@@ -466,7 +471,7 @@ def run_park(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retur
     import uuid
 
     session_id = str(uuid.uuid4())
-    aim = _derive_aim(args, prompt)
+    aim = _derive_aim(getattr(args, "aim", None) or "", prompt)
     with Store() as store:
         store.create_draft(
             session_id,
@@ -512,8 +517,62 @@ def run_park(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retur
     return rc
 
 
-def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-locals,too-many-return-statements,too-many-statements
+@dataclass(frozen=True)
+class GrabOptions:
+    """The per-invocation inputs of ONE ``ccc park -g`` (q+p) grab — everything but the seams.
+
+    The Karabiner chord always passes bare ``-g``, i.e. these defaults; a flag only ever
+    reaches :func:`grab` from the cold CLI. That is the tp#70 D2/V13 contract: the
+    resident panel server is invisible to per-invocation controls, because it only ever
+    serves the flag-less chord and therefore only ever builds ``GrabOptions()``.
+    """
+
+    window: str = "five_hour"
+    buffer_sec: int = DEFAULT_BUFFER_SEC
+    now: bool = False  # -N: skip the wait (deliver / launch immediately)
+    new_job: bool = False  # -j: force a detached job even over a live session
+    clipboard: bool = False  # -c: prefill the panel from the clipboard
+    aim: str = ""  # -a: explicit AIM (else derived from the prompt's first line)
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> GrabOptions:
+        """The options one ``ccc park -g`` argv asks for."""
+        return cls(
+            window=getattr(args, "window", "five_hour"),
+            buffer_sec=int(getattr(args, "buffer", DEFAULT_BUFFER_SEC)),
+            now=bool(getattr(args, "now", False)),
+            new_job=bool(getattr(args, "new_job", False)),
+            clipboard=bool(getattr(args, "clipboard", False)),
+            aim=(getattr(args, "aim", None) or "").strip(),
+        )
+
+
+# How long the panel's caller waits for the (worker-thread) target resolution after the
+# prompt is typed. Past it the prompt is saved UNARMED rather than lost — see `grab`.
+RESOLVE_JOIN_SEC = 15.0
+
+
+def _run_grab(args: argparse.Namespace) -> int:
+    """``ccc park -g`` from the CLI: today's argv → :class:`GrabOptions` → :func:`grab`."""
+    return grab(GrabOptions.from_args(args))
+
+
+def grab(  # pylint: disable=too-many-locals,too-many-return-statements,too-many-statements
+    opts: GrabOptions,
+    *,
+    frontmost: Frontmost | None = None,
+    capture: Any = None,
+) -> int:
     """Global-chord mode (``ccc park -g``, the Karabiner q+p): panel over any tab.
+
+    The shared core BOTH entry points run: the cold ``ccc park -g`` process
+    (:func:`_run_grab`) and the resident panel server, which differ only in the two
+    seams — *frontmost* (:class:`~command_center.peek.Frontmost`, the focus source) and
+    *capture* (the panel itself, defaulting to
+    :func:`~command_center.parkpanel.capture_prompt`; the server wraps it to ack the
+    chord from its ``on_shown`` hook). Everything below — the attach decision, the
+    account rule, arming, the retry lease, notify — is identical on both paths by
+    construction.
 
     There is no shell process to count down in — the prompt is captured in the park
     panel over whatever tab is frontmost (resolved like the peek panel: tracked
@@ -539,28 +598,30 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
     attach target is armed for one retry lease (~15 min) instead, a detached one
     is saved as an UNARMED future job — the prompt is never lost.
     """
-    from . import parkpanel
+    from . import parkpanel, peek
     from .colors import short_folder
     from .models import short_id
     from .notify import notify
 
     parkpanel.warm_appkit()  # ~450 ms framework load overlaps the resolution below
     cfg = config.load_config()
-    window = getattr(args, "window", "five_hour")
-    buffer_sec = int(getattr(args, "buffer", DEFAULT_BUFFER_SEC))
-    want_now = bool(getattr(args, "now", False))
+    front = frontmost or peek.default_frontmost()
+    # Resolved at CALL time, not bound as a default: the panel is the seam the server
+    # replaces (and the test suite monkeypatches `parkpanel.capture_prompt`).
+    capture_panel = capture or parkpanel.capture_prompt
+    window = opts.window
+    buffer_sec = opts.buffer_sec
+    want_now = opts.now
     resolved: dict[str, object] = {}  # worker-thread output; read only after "ready"
 
     def _resolve_target() -> None:  # pylint: disable=too-many-locals  # one linear resolution pass
-        from . import peek
-
         session = None
-        tab_uuid = peek.frontmost_iterm_uuid()
+        tab_uuid = front.uuid()
         if tab_uuid:
             with Store() as store:
                 session = peek._session_for_uuid(store, tab_uuid)  # pylint: disable=protected-access
         attach = None
-        if session is not None and not session.draft and not getattr(args, "new_job", False):
+        if session is not None and not session.draft and not opts.new_job:
             from .adapters.claude import ClaudeAdapter
 
             live = next(
@@ -576,7 +637,7 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
                 attach = session
         cwd = session.cwd if session is not None and os.path.isdir(session.cwd or "") else ""
         if not cwd:
-            cwd = peek.frontmost_iterm_cwd() or os.getcwd()
+            cwd = front.cwd() or os.getcwd()
         config_dir = (
             session.config_dir if session is not None else ""
         ) or accounts.env_config_dir()
@@ -623,7 +684,7 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
     worker.start()
 
     initial = ""
-    if getattr(args, "clipboard", False):
+    if opts.clipboard:
         initial = _clipboard_text()[0] or ""
 
     def _poll() -> tuple[str, str] | None:
@@ -633,10 +694,10 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
         # outranks both (the panel never overwrites a non-empty editor).
         return str(resolved["header"]), ("" if initial else str(resolved["prefill"]))
 
-    prompt = parkpanel.capture_prompt("resolving target…", initial, poll=_poll)
+    prompt = capture_panel("resolving target…", initial, poll=_poll)
     if not prompt:
         return 130  # cancelled — the panel was the whole interaction, stay silent
-    worker.join(timeout=15)
+    worker.join(timeout=RESOLVE_JOIN_SEC)
     size_err = prompt_size_error(prompt)
     if size_err:
         notify("⏳ park failed", size_err, cfg.notify)
@@ -652,7 +713,7 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
             store.create_draft(
                 session_id,
                 os.getcwd(),
-                _derive_aim(args, prompt),
+                _derive_aim(opts.aim, prompt),
                 prompt=prompt,
                 config_dir=accounts.env_config_dir(),
             )
@@ -707,7 +768,7 @@ def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-loca
         store.create_draft(
             session_id,
             cwd,
-            _derive_aim(args, prompt),
+            _derive_aim(opts.aim, prompt),
             prompt=prompt,
             config_dir=config_dir,
             fire_at=fire_at,

@@ -692,6 +692,26 @@ class Store:  # pylint: disable=too-many-public-methods
         columns = _session_columns(rows[0])
         return [_row_to_session(r, columns) for r in rows]
 
+    def _tab_uuid_candidates(self, uuid: str) -> list[Session]:
+        """Rows whose ``iterm_session_id`` CONTAINS *uuid* — a superset of the tab owners.
+
+        :meth:`session_for_tab_uuid` used to materialise the WHOLE store (every row plus
+        the correlated ``aim_history`` sub-queries of :data:`_SESSION_SELECT`) and compare
+        in Python — 44–128 ms on a real store, half the peek chord's latency budget
+        (tp#70 S1). The SQL ``LIKE`` is unanchored and ASCII-case-insensitive, so it only
+        removes rows that can never match; the caller still applies the exact tail
+        comparison. ``%`` / ``_`` / ``\\`` in *uuid* are escaped so they cannot widen it.
+        Archived rows are included, as the caller requires.
+        """
+        pattern = "%" + uuid.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        rows = self.conn.execute(
+            _SESSION_SELECT + " WHERE s.iterm_session_id LIKE ? ESCAPE '\\'", (pattern,)
+        ).fetchall()
+        if not rows:
+            return []
+        columns = _session_columns(rows[0])
+        return [_row_to_session(r, columns) for r in rows]
+
     def session_for_tab_uuid(self, uuid: str) -> Session | None:
         """The session that currently owns the iTerm tab whose UUID is *uuid*, or None.
 
@@ -710,7 +730,7 @@ class Store:  # pylint: disable=too-many-public-methods
             return None
         matches = [
             s
-            for s in self.list_sessions(include_archived=True)
+            for s in self._tab_uuid_candidates(want)
             if s.iterm_session_id and s.iterm_session_id.split(":")[-1].strip().upper() == want
         ]
         if not matches:

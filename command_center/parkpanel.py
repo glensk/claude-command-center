@@ -102,6 +102,8 @@ def capture_prompt(  # noqa: PLR0915  pylint: disable=no-member,too-many-stateme
     header: str,
     initial: str = "",
     poll: Any = None,
+    *,
+    on_shown: Any = None,
 ) -> str | None:
     """Show the park panel and return the typed prompt, or ``None`` on cancel/empty.
 
@@ -113,6 +115,18 @@ def capture_prompt(  # noqa: PLR0915  pylint: disable=no-member,too-many-stateme
     text). Blocks in a modal loop until ⌘↵ (park), ⎋ (cancel), or the smoke-test
     timeout fires. AppKit attributes resolve dynamically via PyObjC, hence the
     pylint disables.
+
+    *on_shown* is called once the window is on screen and its content is in the backing
+    store — after ``makeKeyAndOrderFront_`` + ``displayIfNeeded()``, BEFORE the modal
+    loop is entered (tp#70 D5/V3). The panel server acks the chord request from there;
+    without the hook a caller could never say "shown", because this function blocks in
+    the modal loop from that instant until dismissal. Not passing it leaves the cold
+    path byte-identical — the extra ``displayIfNeeded()`` only runs for a hook.
+
+    Every timer this function schedules is invalidated, the action target's references
+    are dropped and the window is closed in a ``finally:`` — in a resident process a
+    surviving timeout timer would fire during a LATER modal session and
+    ``stopModalWithCode_`` the wrong panel (V3/R3).
     """
     import AppKit  # noqa: PLC0415 (lazy: AppKit must not load for non-GUI commands)
 
@@ -220,30 +234,55 @@ def capture_prompt(  # noqa: PLR0915  pylint: disable=no-member,too-many-stateme
     cancel_btn.setFrame_(AppKit.NSMakeRect(width - pad - 230.0, 10.0, 110.0, 28.0))
     content.addSubview_(cancel_btn)
 
-    app.activateIgnoringOtherApps_(True)
-    window.makeKeyAndOrderFront_(None)
-    window.makeFirstResponder_(text)
+    poll_timer = None
+    timer = None
+    # Everything from ordering the window front to the end of the modal loop is ONE
+    # protected region (tp#70 V19): a raising `on_shown` (the server's ack write) or timer
+    # set-up must still invalidate both timers, drop the target's refs and close the
+    # window — otherwise a resident process leaks a visible panel and a live timer.
+    try:
+        app.activateIgnoringOtherApps_(True)
+        window.makeKeyAndOrderFront_(None)
+        window.makeFirstResponder_(text)
 
-    if poll is not None:  # deferred target resolution: fill header/prefill when ready
-        target.poll = poll
-        target.header_field = header_field
-        target.text_view = text
-        poll_timer = AppKit.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
-            0.1, target, "tick:", None, True
-        )
-        AppKit.NSRunLoop.currentRunLoop().addTimer_forMode_(
-            poll_timer, AppKit.NSModalPanelRunLoopMode
-        )
+        if poll is not None:  # deferred target resolution: fill header/prefill when ready
+            target.poll = poll
+            target.header_field = header_field
+            target.text_view = text
+            poll_timer = AppKit.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.1, target, "tick:", None, True
+            )
+            AppKit.NSRunLoop.currentRunLoop().addTimer_forMode_(
+                poll_timer, AppKit.NSModalPanelRunLoopMode
+            )
 
-    timeout = float(os.environ.get("CCC_PARK_PANEL_TIMEOUT", "0") or 0)
-    if timeout > 0:  # smoke-test hook: auto-cancel so a headless check never hangs
-        timer = AppKit.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
-            timeout, target, "cancel:", None, False
-        )
-        AppKit.NSRunLoop.currentRunLoop().addTimer_forMode_(timer, AppKit.NSModalPanelRunLoopMode)
+        timeout = float(os.environ.get("CCC_PARK_PANEL_TIMEOUT", "0") or 0)
+        if timeout > 0:  # smoke-test hook: auto-cancel so a headless check never hangs
+            timer = AppKit.NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+                timeout, target, "cancel:", None, False
+            )
+            AppKit.NSRunLoop.currentRunLoop().addTimer_forMode_(
+                timer, AppKit.NSModalPanelRunLoopMode
+            )
 
-    response = app.runModalForWindow_(window)
-    result = str(text.string()).strip()
-    window.orderOut_(None)
-    window.close()
+        if on_shown is not None:
+            # The content is laid out but not yet flushed to the backing store; force it
+            # so the ack means "the pixels exist", not "the window object exists" (D11).
+            window.displayIfNeeded()
+            on_shown()
+
+        response = app.runModalForWindow_(window)
+        result = str(text.string()).strip()
+    finally:
+        for stale in (poll_timer, timer):
+            if stale is not None:
+                stale.invalidate()
+        # Drop the target's view/callback references too: the action object is a PyObjC
+        # instance that outlives this call, and a retained text view keeps the whole
+        # (closed) window graph alive in a resident process.
+        for attr in ("poll", "header_field", "text_view"):
+            if hasattr(target, attr):
+                setattr(target, attr, None)
+        window.orderOut_(None)
+        window.close()
     return result if response == 1 and result else None

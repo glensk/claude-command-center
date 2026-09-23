@@ -54,12 +54,14 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 # Lazy imports (colors, AppKit) keep this module — and so every `ccc` command that
 # never peeks — free of their cost; the import sits inside the function on purpose.
 # pylint: disable=import-outside-toplevel
+# pylint: disable=too-many-lines  # one cohesive feature: resolve the tab, then draw it
 import argparse
 import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Protocol
 
 from . import sessionmd
 from .adapters import ClaudeAdapter
@@ -156,22 +158,84 @@ def _focused_tty() -> str | None:
     return current[1] if current else None
 
 
-def _ccc_selected_session(store: Store) -> Session | None:
+class Frontmost(Protocol):
+    """Which tab the user is looking at — the one seam over focus detection (tp#70 D4).
+
+    The resolution logic below never asks iTerm anything directly; it asks a
+    ``Frontmost``. The cold ``ccc peek`` / ``ccc park -g`` process answers with today's
+    AppleScript round-trips (:class:`OsascriptFrontmost`, ~280 ms per query); the
+    resident panel server answers from a warm iTerm2 Python-API link (~1 ms), and tests
+    answer from a table. Nothing else about the resolution changes — that is the point
+    of the seam: warm and cold must resolve identically.
+    """
+
+    def uuid(self) -> str | None:
+        """UUID of the focused iTerm session, or ``None`` when nothing is focused."""
+
+    def cwd(self) -> str | None:
+        """Working directory of the focused iTerm session (the cwd fallback's input)."""
+
+    def tty(self) -> str | None:
+        """Controlling tty of the focused iTerm session, or ``None``."""
+
+    def is_ccc_tui(self) -> bool:
+        """True when the focused tab is the ccc TUI's own tab (→ use its selected row)."""
+
+
+class OsascriptFrontmost:
+    """The default :class:`Frontmost`: today's AppleScript / ``ps`` answers, unchanged.
+
+    Every method dispatches through the module-level function rather than capturing it,
+    so monkeypatching ``peek.frontmost_iterm_uuid`` (and friends) still takes effect —
+    the cold path and the existing tests keep behaving exactly as before.
+    """
+
+    def uuid(self) -> str | None:
+        return frontmost_iterm_uuid()
+
+    def cwd(self) -> str | None:
+        return frontmost_iterm_cwd()
+
+    def tty(self) -> str | None:
+        return _focused_tty()
+
+    def is_ccc_tui(self) -> bool:
+        """The TUI's controlling tty (cheap ``ps`` scan) vs the focused tab's tty.
+
+        The ``ps`` scan runs FIRST on purpose: when no TUI is up there is nothing to
+        compare against, and skipping the AppleScript round-trip is most of what makes
+        the non-TUI case cheap.
+        """
+        from . import jump  # lazy: keep module import cheap
+
+        ccc_tty = jump.find_ccc_tty()
+        return ccc_tty is not None and self.tty() == ccc_tty
+
+
+_DEFAULT_FRONTMOST = OsascriptFrontmost()
+
+
+def default_frontmost() -> Frontmost:
+    """The process-wide default :class:`Frontmost` (AppleScript). Stateless, reusable."""
+    return _DEFAULT_FRONTMOST
+
+
+def _ccc_selected_session(store: Store, frontmost: Frontmost) -> Session | None:
     """The TUI-selected session IFF the focused tab is the ccc TUI itself, else ``None``.
 
     This is how the peek panel reaches PARKED and DONE sessions (which have no live
     tab): focus the ccc TUI, put the cursor on a row, hit the peek chord. Detection
     reuses the exact ``ccc jump`` machinery — the TUI's controlling tty
     (:func:`jump.find_ccc_tty`, a cheap ``ps`` scan, checked FIRST so no AppleScript
-    runs when no TUI is up) compared against the focused tab's tty, then the cursor
-    row from :func:`jumpstate.get_selected`. Checked BEFORE the uuid → session map: a
-    stale uuid mapping recorded on the ccc tab would otherwise shadow the selected row
-    (the ccc tab is never a session tab, so this order can't shadow a real match).
+    runs when no TUI is up) compared against the focused tab's tty
+    (:meth:`Frontmost.is_ccc_tui`), then the cursor row from
+    :func:`jumpstate.get_selected`. Checked BEFORE the uuid → session map: a stale uuid
+    mapping recorded on the ccc tab would otherwise shadow the selected row (the ccc tab
+    is never a session tab, so this order can't shadow a real match).
     """
-    from . import jump, jumpstate  # lazy: keep module import cheap
+    from . import jumpstate  # lazy: keep module import cheap
 
-    ccc_tty = jump.find_ccc_tty()
-    if ccc_tty is None or _focused_tty() != ccc_tty:
+    if not frontmost.is_ccc_tui():
         return None
     sid = jumpstate.get_selected()
     return store.get(sid) if sid else None
@@ -276,6 +340,8 @@ def resolve_peek(
     adapter: ClaudeAdapter | None = None,
     store: Store | None = None,
     session_id: str | None = None,
+    *,
+    frontmost: Frontmost | None = None,
 ) -> PeekData:
     """Resolve the focused iTerm tab to its prompts + AIM history + full session.
 
@@ -290,8 +356,13 @@ def resolve_peek(
     history); (3) the newest transcript in the focused tab's project directory
     (prompts + session only — an untracked tab has no AIM history). When nothing
     resolves, ``resolved`` is ``False`` and ``label`` says why.
+
+    *frontmost* is the focus seam (:class:`Frontmost`) — the AppleScript default unless
+    a caller (the resident panel server, a test) supplies a cheaper or fake one. It is
+    the ONLY thing that differs between the warm and the cold path.
     """
     adapter = adapter or ClaudeAdapter()
+    front = frontmost or default_frontmost()
     own_store = store is None
     store = store or Store()
     try:
@@ -301,11 +372,11 @@ def resolve_peek(
                 return PeekData(label=f"no tracked session {session_id}")
             return _peek_for_session(adapter, store, session)
 
-        session = _ccc_selected_session(store)
+        session = _ccc_selected_session(store, front)
         if session is not None:
             return _peek_for_session(adapter, store, session)
 
-        uuid = frontmost_iterm_uuid()
+        uuid = front.uuid()
         if uuid is None:
             return PeekData(label="no focused iTerm session")
         session = _session_for_uuid(store, uuid)
@@ -316,7 +387,7 @@ def resolve_peek(
         # transcript in its project directory directly (no AIM history for it). We can
         # still colour the id by the cwd's repo colour; the badge is unknown here (the
         # per-tab caches are keyed by the full $ITERM_SESSION_ID, not the bare uuid).
-        cwd = frontmost_iterm_cwd()
+        cwd = front.cwd()
         if cwd:
             project = adapter.projects_dir / cwd.replace("/", "-")
             if project.is_dir():
@@ -423,7 +494,136 @@ def _safe_mtime(path: Path) -> float:
         return 0.0
 
 
-def show_panel(  # noqa: PLR0913,PLR0915  pylint: disable=no-member,too-many-statements,too-many-locals,too-many-arguments,line-too-long
+@dataclass(frozen=True)
+class PanelInputs:  # pylint: disable=too-many-instance-attributes
+    """Everything the peek panel is DRAWN from — :class:`PeekData` rendered for AppKit.
+
+    The pure boundary between resolution and presentation: :func:`panel_inputs` maps a
+    ``PeekData`` to exactly these fields, and both entry points (the cold ``ccc peek``
+    process and the resident panel server) hand them to :func:`build_panel` unchanged.
+    Being a plain frozen dataclass, it is also what a parity test compares — "warm and
+    cold draw the same panel" is an ``==`` on this object.
+    """
+
+    prompts_text: str
+    aim_text: str
+    subtitle: str
+    session_id: str = ""
+    cwd: str = ""
+    badge: str = ""
+    id_rgb: tuple[int, int, int] | None = None
+    prompts_segments: list[tuple[str, str]] | None = None
+    session_segments: list[tuple[str, str]] | None = None
+
+
+def panel_inputs(data: PeekData) -> PanelInputs:
+    """Render *data* into the panel's inputs (the same body ``--print`` dumps).
+
+    An unresolved tab still gets a panel: the body says why nothing showed and the
+    subtitle falls back to the tool's own name.
+    """
+    return PanelInputs(
+        prompts_text=(
+            format_prompts(data.prompts) if data.resolved else f"No prompt to show — {data.label}."
+        ),
+        aim_text=format_aim(data.aim_revisions),
+        subtitle=data.label if data.resolved else "ccc peek",
+        session_id=data.session_id,
+        cwd=data.cwd,
+        badge=data.badge,
+        id_rgb=data.id_rgb,
+        prompts_segments=prompt_segments(data.prompts) if data.resolved else None,
+        session_segments=data.session_segments if data.resolved else None,
+    )
+
+
+class PanelLoop(Protocol):
+    """Whatever run loop the peek panel lives in — the second tp#70 seam (D5).
+
+    Cold, the panel IS the process: ``NSApplication.run()`` / ``stop_()``. In the
+    resident panel server that would be a nested ``NSApplication.run`` inside an already
+    running loop (unsupported), so the server drives a modal session instead
+    (``runModalForWindow_`` / ``stopModal``). :func:`build_panel` only ever calls
+    :meth:`stop` — every dismissal path goes through it.
+    """
+
+    def run(self, panel: PeekPanel) -> None:
+        """Block until something calls :meth:`stop`."""
+
+    def stop(self) -> None:
+        """End the loop started by :meth:`run` (safe to call from a monitor/observer)."""
+
+
+class AppRunLoop:  # pylint: disable=no-member  # AppKit attrs resolve via PyObjC
+    """The cold driver: one panel, one process, ``NSApplication.run()``/``stop_()``."""
+
+    def run(self, panel: PeekPanel) -> None:
+        import AppKit  # noqa: PLC0415 (lazy: AppKit must not load for non-GUI commands)
+
+        del panel  # the app-wide run loop needs no window handle
+        AppKit.NSApplication.sharedApplication().run()
+
+    def stop(self) -> None:
+        import AppKit  # noqa: PLC0415 (lazy: AppKit must not load for non-GUI commands)
+
+        app = AppKit.NSApplication.sharedApplication()
+        app.stop_(None)
+        # Wake the run loop so stop_ takes effect immediately (it only checks
+        # between events, and a key event monitor that swallows its event would
+        # otherwise leave the loop idle until the next keystroke).
+        nudge = AppKit.NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(  # noqa: E501  # pylint: disable=line-too-long
+            AppKit.NSEventTypeApplicationDefined,
+            AppKit.NSMakePoint(0.0, 0.0),
+            0,
+            0.0,
+            0,
+            None,
+            0,
+            0,
+            0,
+        )
+        app.postEvent_atStart_(nudge, True)
+
+
+@dataclass
+class PeekPanel:  # pylint: disable=no-member  # AppKit attrs resolve via PyObjC
+    """A built, visible peek panel and every resource it must give back.
+
+    A one-shot ``ccc peek`` process could leak the local key monitor, the two window
+    observers and the auto-dismiss timer — process exit collects them. A resident panel
+    server cannot: the next panel would inherit the previous one's monitor (every
+    keystroke handled twice) and its resign-key observer (an instant double dismissal).
+    :meth:`close` removes all of them and is idempotent.
+    """
+
+    window: Any
+    monitor: Any = None
+    observers: list[Any] = field(default_factory=list)
+    timer: Any = None
+    closed: bool = False
+
+    def close(self) -> None:
+        """Remove monitor + observers + timer, then order the window out and close it."""
+        if self.closed:
+            return
+        self.closed = True
+        import AppKit  # noqa: PLC0415 (lazy: AppKit must not load for non-GUI commands)
+
+        if self.monitor is not None:
+            AppKit.NSEvent.removeMonitor_(self.monitor)
+            self.monitor = None
+        center = AppKit.NSNotificationCenter.defaultCenter()
+        for observer in self.observers:
+            center.removeObserver_(observer)
+        self.observers = []
+        if self.timer is not None:
+            self.timer.invalidate()
+            self.timer = None
+        self.window.orderOut_(None)
+        self.window.close()
+
+
+def build_panel(  # noqa: PLR0913  pylint: disable=too-many-arguments
     prompts_text: str,
     aim_text: str,
     subtitle: str,
@@ -435,8 +635,61 @@ def show_panel(  # noqa: PLR0913,PLR0915  pylint: disable=no-member,too-many-sta
     prompts_segments: list[tuple[str, str]] | None = None,
     session_segments: list[tuple[str, str]] | None = None,
     timeout: float = 0.0,
-) -> None:
-    """Show *prompts_text* / *aim_text* in a titled two-tab floating macOS panel.
+    loop: PanelLoop | None = None,
+) -> PeekPanel:
+    """Build and SHOW the peek panel, exception-safe — see :func:`_build_panel`.
+
+    If building raises part-way (after the window, the key monitor or an observer
+    already exist), whatever was installed is released through :meth:`PeekPanel.close`
+    before the exception propagates — a resident process must never keep a
+    half-built panel's monitor or observers alive (tp#70 D5).
+    """
+    holder: list[PeekPanel] = []
+    try:
+        return _build_panel(
+            prompts_text,
+            aim_text,
+            subtitle,
+            session_id=session_id,
+            cwd=cwd,
+            badge=badge,
+            id_rgb=id_rgb,
+            prompts_segments=prompts_segments,
+            session_segments=session_segments,
+            timeout=timeout,
+            loop=loop,
+            holder=holder,
+        )
+    except BaseException:
+        for partial in holder:
+            partial.close()
+        raise
+
+
+def _build_panel(  # noqa: PLR0913,PLR0915  pylint: disable=no-member,too-many-statements,too-many-locals,too-many-arguments,line-too-long
+    prompts_text: str,
+    aim_text: str,
+    subtitle: str,
+    *,
+    session_id: str = "",
+    cwd: str = "",
+    badge: str = "",
+    id_rgb: tuple[int, int, int] | None = None,
+    prompts_segments: list[tuple[str, str]] | None = None,
+    session_segments: list[tuple[str, str]] | None = None,
+    timeout: float = 0.0,
+    loop: PanelLoop | None = None,
+    holder: list[PeekPanel],
+) -> PeekPanel:
+    """Build and SHOW the panel, then return it — the caller drives the loop and closes it.
+
+    Everything up to (and including) ``makeKeyAndOrderFront_``: the window, its tabs, the
+    key monitor, the click-away observers and the auto-dismiss timer. It does NOT block —
+    :meth:`PanelLoop.run` does, and :meth:`PeekPanel.close` releases what this built.
+    :func:`show_panel` is that composition for the cold path. *loop* is the run-loop seam
+    (default :class:`AppRunLoop`); every dismissal path calls its :meth:`~PanelLoop.stop`.
+
+    Show *prompts_text* / *aim_text* in a titled two-tab floating macOS panel.
 
     A **title** line names the panel — "ccc peek panel" (also the window's OS title) —
     so it can be referred to unambiguously ("the ccc peek panel"). Below it a
@@ -469,6 +722,7 @@ def show_panel(  # noqa: PLR0913,PLR0915  pylint: disable=no-member,too-many-sta
 
     app = AppKit.NSApplication.sharedApplication()
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+    driver: PanelLoop = loop or AppRunLoop()
 
     width, height = 820.0, 600.0
     screen = AppKit.NSScreen.mainScreen()
@@ -486,6 +740,10 @@ def show_panel(  # noqa: PLR0913,PLR0915  pylint: disable=no-member,too-many-sta
     window.setMovableByWindowBackground_(True)
     window.setLevel_(AppKit.NSFloatingWindowLevel)
     window.setReleasedWhenClosed_(False)
+    # Registered at once so build_panel() can release a half-built panel on failure;
+    # the monitor, observers and timer are attached to it the moment they exist.
+    panel = PeekPanel(window)
+    holder.append(panel)
     # Dark appearance so the tab strip and the scrollers render against the dark panel.
     dark = AppKit.NSAppearance.appearanceNamed_(AppKit.NSAppearanceNameDarkAqua)
     if dark is not None:
@@ -694,22 +952,7 @@ def show_panel(  # noqa: PLR0913,PLR0915  pylint: disable=no-member,too-many-sta
     _scroll_to_bottom(prompts_view)
 
     def _dismiss() -> None:
-        app.stop_(None)
-        # Wake the run loop so stop_ takes effect immediately (it only checks
-        # between events, and a key event monitor that swallows its event would
-        # otherwise leave the loop idle until the next keystroke).
-        nudge = AppKit.NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(  # noqa: E501
-            AppKit.NSEventTypeApplicationDefined,
-            AppKit.NSMakePoint(0.0, 0.0),
-            0,
-            0.0,
-            0,
-            None,
-            0,
-            0,
-            0,
-        )
-        app.postEvent_atStart_(nudge, True)
+        driver.stop()
 
     def _copy_visible_tab() -> None:
         # Copy the focused tab's selection to the clipboard — or, when nothing is
@@ -869,8 +1112,12 @@ def show_panel(  # noqa: PLR0913,PLR0915  pylint: disable=no-member,too-many-sta
         return event
 
     # A local monitor catches the keystroke regardless of first responder (the
-    # selectable text view would otherwise consume keyDown itself).
-    AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(AppKit.NSEventMaskKeyDown, _on_key)
+    # selectable text view would otherwise consume keyDown itself). The token comes back
+    # to the PeekPanel so close() can remove it — a resident process would otherwise stack
+    # one live monitor per panel shown (V9).
+    panel.monitor = AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+        AppKit.NSEventMaskKeyDown, _on_key
+    )
 
     # Click-away dismissal: close the panel the moment it stops being the key window —
     # i.e. the user clicked the terminal (or any other window). A "has been key at
@@ -887,19 +1134,76 @@ def show_panel(  # noqa: PLR0913,PLR0915  pylint: disable=no-member,too-many-sta
         if key_seen["yet"]:
             _dismiss()
 
-    notifications.addObserverForName_object_queue_usingBlock_(
-        AppKit.NSWindowDidBecomeKeyNotification, window, None, _on_become_key
-    )
-    notifications.addObserverForName_object_queue_usingBlock_(
-        AppKit.NSWindowDidResignKeyNotification, window, None, _on_resign_key
-    )
+    for name, handler in (
+        (AppKit.NSWindowDidBecomeKeyNotification, _on_become_key),
+        (AppKit.NSWindowDidResignKeyNotification, _on_resign_key),
+    ):
+        panel.observers.append(
+            notifications.addObserverForName_object_queue_usingBlock_(name, window, None, handler)
+        )
 
     if timeout and timeout > 0:
-        AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+        panel.timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
             timeout, False, lambda _timer: _dismiss()
         )
 
-    app.run()
+    return panel
+
+
+def show_panel(  # noqa: PLR0913  pylint: disable=too-many-arguments
+    prompts_text: str,
+    aim_text: str,
+    subtitle: str,
+    *,
+    session_id: str = "",
+    cwd: str = "",
+    badge: str = "",
+    id_rgb: tuple[int, int, int] | None = None,
+    prompts_segments: list[tuple[str, str]] | None = None,
+    session_segments: list[tuple[str, str]] | None = None,
+    timeout: float = 0.0,
+) -> None:
+    """The cold path's panel: build it, run the app loop, tear it down on dismissal.
+
+    The one-process composition of the two seams — :func:`build_panel` +
+    :class:`AppRunLoop` + :meth:`PeekPanel.close`. Blocks until the panel is dismissed
+    (a key, a click away, or *timeout* seconds). The resident panel server composes the
+    same pieces with a modal loop instead.
+    """
+    loop = AppRunLoop()
+    panel = build_panel(
+        prompts_text,
+        aim_text,
+        subtitle,
+        session_id=session_id,
+        cwd=cwd,
+        badge=badge,
+        id_rgb=id_rgb,
+        prompts_segments=prompts_segments,
+        session_segments=session_segments,
+        timeout=timeout,
+        loop=loop,
+    )
+    try:
+        loop.run(panel)
+    finally:
+        panel.close()
+
+
+def show_panel_for(inputs: PanelInputs, *, timeout: float = 0.0) -> None:
+    """:func:`show_panel` driven straight from :class:`PanelInputs` (what ``run`` uses)."""
+    show_panel(
+        inputs.prompts_text,
+        inputs.aim_text,
+        inputs.subtitle,
+        session_id=inputs.session_id,
+        cwd=inputs.cwd,
+        badge=inputs.badge,
+        id_rgb=inputs.id_rgb,
+        prompts_segments=inputs.prompts_segments,
+        session_segments=inputs.session_segments,
+        timeout=timeout,
+    )
 
 
 def run(args: argparse.Namespace) -> int:
@@ -918,23 +1222,9 @@ def run(args: argparse.Namespace) -> int:
 
         warm_appkit()
     data = resolve_peek(session_id=getattr(args, "session", None))
-    prompts_body = (
-        format_prompts(data.prompts) if data.resolved else f"No prompt to show — {data.label}."
-    )
+    inputs = panel_inputs(data)
     if getattr(args, "print_only", False) or sys.platform != "darwin":
-        print(prompts_body)
+        print(inputs.prompts_text)
         return 0
-    label = data.label if data.resolved else "ccc peek"
-    show_panel(
-        prompts_body,
-        format_aim(data.aim_revisions),
-        label,
-        session_id=data.session_id,
-        cwd=data.cwd,
-        badge=data.badge,
-        id_rgb=data.id_rgb,
-        prompts_segments=prompt_segments(data.prompts) if data.resolved else None,
-        session_segments=data.session_segments if data.resolved else None,
-        timeout=float(getattr(args, "timeout", 0.0) or 0.0),
-    )
+    show_panel_for(inputs, timeout=float(getattr(args, "timeout", 0.0) or 0.0))
     return 0
