@@ -3915,7 +3915,9 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
     head = f"  {'':<{_MARK_WIDTH}} {'provider':<{width}} {'state':<10} {'data age':<{age_w}} "
     if bars:
         head += f"{'session':<{_BAR_CELL_WIDTH}} {'week':<{_BAR_CELL_WIDTH}} "
-    print(head + f"{'renew':<{_RENEW_WIDTH}} windows")
+    head += f"{'renew':<{_RENEW_WIDTH}} windows"
+    # Rows are buffered so the rule under the header can span the widest one.
+    body: list[str] = []
     for prov in snap["providers"]:
         state = prov["state"]
         windows = prov.get("windows") or {}
@@ -3979,10 +3981,11 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
         shown_renew = f"{renew:<{_RENEW_WIDTH}}"
         if colorable and renew_color:
             shown_renew = f"{renew_color}{shown_renew}\033[0m"
-        print(
+        body.append(
             f"  {mark} {shown_name} {shown_state} {ages[prov['id']]:<{age_w}} "
             f"{cells}{shown_renew} {detail}".rstrip()
         )
+    _print_quota_table(head, body, colorable=colorable)
     if snap["best_claude_account"]:
         best = names.get(snap["best_claude_account"]) or quota.display_id(
             snap["best_claude_account"]
@@ -3990,6 +3993,28 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
         print(f"best Claude account (spends what resets soonest): {best}")
     _print_codex_seat_footer(snap, now)
     return 0
+
+
+def _print_quota_table(head: str, body: list[str], *, colorable: bool) -> None:
+    """The provider table: header, a rule as wide as the widest row, then the rows.
+
+    Widths are measured in terminal cells with the colour codes stripped — the bars and
+    painted names carry escapes that would otherwise stretch the rule past the text.
+    """
+    import shutil  # pylint: disable=import-outside-toplevel
+
+    from rich.text import Text  # pylint: disable=import-outside-toplevel
+
+    width = max(Text.from_ansi(line).cell_len for line in [head.rstrip(), *body])
+    # A long `windows` note must not make the rule wrap onto a second line.
+    width = min(width, shutil.get_terminal_size((width, 24)).columns)
+    rule = "  " + "─" * max(0, width - 2)
+    if colorable:
+        head, rule = f"\033[1m{head.rstrip()}\033[0m", f"\033[2m{rule}\033[0m"
+    print(head.rstrip())
+    print(rule)
+    for line in body:
+        print(line)
 
 
 def _print_codex_seat_footer(snap: dict[str, Any], now: int) -> None:

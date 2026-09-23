@@ -142,6 +142,10 @@ _AGY_GPT_ACCENT = "#c9a93e"
 # AI's gradient — the one hue the palette had left that is neither a blue (the work
 # Claude seat), a green (Codex), a violet (Copilot) nor a yellow-olive (Antigravity).
 _MUSE_ACCENT = "#e0529a"
+# The paid OpenCode Zen seat (`opriv`) has no card either: teal-cyan, the last hue free
+# of the blues (work Claude), greens (Codex), violet (Copilot), olives (Antigravity) and
+# magenta (Muse). The free tier stays unpainted — nothing is billed there.
+_OPENCODE_PRIV_ACCENT = "#39c5cf"
 # Reset text is embossed onto the bar: over the bright filled portion it is drawn dark,
 # over the dark track it takes the card's accent colour (so it both matches the box and
 # stays legible). The bar's fill/track colours remain as each glyph's background, so usage

@@ -427,11 +427,13 @@ def canonical_id(name: str) -> str:
     return f"{kind}:{seat}"
 
 
-def seat_color(pid: str, kind: str, account: str = "") -> str:
+def seat_color(  # pylint: disable=too-many-return-statements
+    pid: str, kind: str, account: str = ""
+) -> str:
     """The hex accent a provider row is painted in — the SAME colour its TUI usage card
     is drawn in: gold for the private Claude seat, blue for the work one, OpenAI-green
     for Codex, violet for Copilot, the two Antigravity buckets in their own olive pair,
-    Meta-magenta for Muse Code.
+    Meta-magenta for Muse Code, teal for the paid OpenCode seat.
 
     Published on every ``-j`` provider row as ``color`` so that a consumer painting the
     same seat (``ai logs``, ``ai routing``) reads the value from here instead of keeping
@@ -448,6 +450,8 @@ def seat_color(pid: str, kind: str, account: str = "") -> str:
         return usage._AGY_GPT_ACCENT if pid == "agy:gpt" else usage._AGY_ACCENT  # noqa: SLF001
     if kind == "muse":
         return usage._MUSE_ACCENT  # noqa: SLF001
+    if pid == "opencode:priv":
+        return usage._OPENCODE_PRIV_ACCENT  # noqa: SLF001
     return ""
 
 

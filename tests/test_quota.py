@@ -753,6 +753,9 @@ def test_snapshot_rows_carry_the_accent_the_report_paints_them_in() -> None:
     assert quota.seat_color("agy", "agy") == usage._AGY_ACCENT  # noqa: SLF001
     assert quota.seat_color("agy:gpt", "agy") == usage._AGY_GPT_ACCENT  # noqa: SLF001
     assert quota.seat_color("muse", "muse") == usage._MUSE_ACCENT  # noqa: SLF001
+    opencode_priv = usage._OPENCODE_PRIV_ACCENT  # noqa: SLF001
+    assert quota.seat_color("opencode:priv", "opencode") == opencode_priv
+    assert quota.seat_color("opencode:free", "opencode") == ""
     assert quota.seat_color("gemini", "gemini") == ""
     # Every published row carries it, and the table reads the field, never a copy.
     snap = quota.snapshot(now=NOW)
@@ -982,7 +985,9 @@ def test_quota_report_header_lines_up_with_its_rows(
     assert cli.cmd_quota(_quota_args()) == 0
     lines = capsys.readouterr().out.splitlines()
     header = lines[0]
-    rows = [ln for ln in lines[1:] if ln.startswith("  ")]
+    # A rule separates the header from the body.
+    assert set(lines[1].strip()) == {"─"}, lines[1]
+    rows = [ln for ln in lines[2:] if ln.startswith("  ")]
     assert rows, lines
 
     def at_column(text: str, col: int) -> str:
@@ -1525,7 +1530,7 @@ def test_the_report_states_a_renewal_for_every_row(
     assert cli.cmd_quota(_quota_args()) == 0
     lines = capsys.readouterr().out.splitlines()
     assert "renew" in lines[0] and "unblocks" not in lines[0]
-    rows = [ln for ln in lines[1:] if ln.startswith("  ")]
+    rows = [ln for ln in lines[2:] if ln.startswith("  ")]
     assert rows
     for row in rows:
         assert "renew " in row or "—" in row, row
