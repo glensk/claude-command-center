@@ -43,6 +43,7 @@ from command_center import codex_launch, quota
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "codex_json"
 _MODEL = "gpt-5.6-sol"
+_REAL_LIST_MODELS = cic.list_models  # captured before the autouse fixture stubs it
 
 
 @pytest.fixture(autouse=True)
@@ -1124,9 +1125,8 @@ def test_runs_view_shows_health(
     three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """`runs` shows WHY a live round is quiet: caffeinated, slept, trouble lines."""
-    runs = three_seats.home / "runs"  # RUNS_DIR is resolved at import, before the fixture
+    runs = three_seats.home / "runs"  # three_seats sets $CODEX_IN_CLAUDE_RUNS_DIR here
     runs.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(cic, "RUNS_DIR", runs)
     (runs / "live.json").write_text(
         json.dumps(
             {
@@ -1323,7 +1323,6 @@ def test_runs_skips_ended_and_prunes_old_ended(
     """A retained final record is neither listed nor deleted on sight; a stale one is pruned."""
     runs = three_seats.home / "runs"
     runs.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(cic, "RUNS_DIR", runs)
     fresh = runs / "ended-fresh.json"
     stale = runs / "ended-stale.json"
     base = {
@@ -1414,3 +1413,26 @@ def test_e2e_run_cli_with_real_executable(tmp_path: Path) -> None:
         (fixture.ccc_home / "command-center" / "cooldowns.json").read_text(encoding="utf-8")
     )
     assert "codex:private" in cooldowns["providers"]
+
+
+# ── paths resolved per call, not at import (tp#192) ──────────────────────────────
+def test_run_heartbeat_lands_in_fixture_runs_dir(three_seats: SeatFixture) -> None:
+    """An in-process run writes its heartbeat under ``$CODEX_IN_CLAUDE_RUNS_DIR``."""
+    three_seats.scenarios(private={"scenario": "ok", "reply": "hi"})
+    assert cic.cmd_run(_run_ns(three_seats, json=False)) == cic.EX_OK
+    assert (three_seats.home / "runs" / f"{os.getpid()}.json").is_file()
+
+
+def test_concurrency_slot_uses_fixture_slot_dir(three_seats: SeatFixture) -> None:
+    """The flock gate takes its slot under ``$CODEX_IN_CLAUDE_SLOT_DIR``, never the real one."""
+    with cic._concurrency_slot(1):  # noqa: SLF001
+        assert (three_seats.home / "slots" / "slot0.lock").is_file()
+
+
+def test_models_fallback_reads_current_home_cache() -> None:
+    """The offline models cache follows ``Path.home()`` as it is at call time."""
+    cache = Path.home() / ".codex" / "models_cache.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"models": [{"slug": "tp192-only", "visibility": "list"}]}))
+    models = _REAL_LIST_MODELS(refresh=False, include_hidden=True)
+    assert [m["slug"] for m in models] == ["tp192-only"]

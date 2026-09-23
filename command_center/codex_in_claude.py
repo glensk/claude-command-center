@@ -78,7 +78,7 @@ laptop from idle-sleeping under it (the 2026-09-07 seven-hour hang), codex stder
 streamed through (``codex› `` prefix) for live progress, and the prompt itself tells codex
 its time budget so it spends the clock implementing instead of exploring.
 
-Watchability + rounds: every run refreshes a heartbeat JSON under ``RUNS_DIR``; ``runs``
+Watchability + rounds: every run refreshes a heartbeat JSON under ``_runs_dir()``; ``runs``
 lists all in-flight delegates (elapsed, idle seconds, output volume, last line) from one
 file read each — the cheap way to check on a long run without reading transcripts. Each
 run reports its codex session UUID as a final ``### SESSION`` line (also included in
@@ -138,16 +138,26 @@ if TYPE_CHECKING:  # pragma: no cover - runtime import is local: quota imports T
 DEFAULT_MODEL = "gpt-5.6-sol"  # newest/best per the Codex catalog
 COMMANDS = ("delegate-review", "debate")  # codex-related commands this manager governs
 EFFORTS = ("low", "medium", "high", "xhigh")  # codex reasoning levels (API-validated)
-CODEX_CACHE = Path.home() / ".codex" / "models_cache.json"
+
+
+def _codex_cache() -> Path:
+    """Codex's local models cache, resolved per call (``Path.home()`` may be patched)."""
+    return Path.home() / ".codex" / "models_cache.json"
+
 
 # Concurrency cap: at most this many `delegate` processes run `codex exec` at once.
 DEFAULT_MAX_CONCURRENT = 3
-SLOT_DIR = Path(
-    os.environ.get(
-        "CODEX_IN_CLAUDE_SLOT_DIR",
-        str(Path.home() / ".config" / "codex-in-claude" / "slots"),
+
+
+def _slot_dir() -> Path:
+    """Concurrency-slot lock dir: ``$CODEX_IN_CLAUDE_SLOT_DIR``, read per call (tp#192)."""
+    return Path(
+        os.environ.get(
+            "CODEX_IN_CLAUDE_SLOT_DIR",
+            str(Path.home() / ".config" / "codex-in-claude" / "slots"),
+        )
     )
-)
+
 
 # Default wall timeout for one delegate round, keyed by reasoning effort. Higher
 # effort reasons (and therefore explores) far longer: a fixed 600s default made
@@ -176,19 +186,24 @@ DEFAULT_STARTUP_TIMEOUT = 240  # $CODEX_IN_CLAUDE_STARTUP_TIMEOUT (0 disables)
 SLEEP_GAP_S = 30.0
 TICK_CAP_S = 5.0
 
+
 # Heartbeat files for in-flight delegate runs (see ``runs``): one small JSON per
 # running delegate, refreshed every few seconds. Lets a caller check progress
 # cheaply (one file read) instead of tailing full transcripts. On exit the file is
 # NOT removed: one retained final record (``ended`` set, ``child_state`` "gone") stays
 # behind so a reader that saw the run alive can tell normal completion from a crash;
 # ``_prune_ended_heartbeats`` (and the statusline's ``cc-heartbeat.py gc``) drop it
-# after ``HEARTBEAT_ENDED_RETENTION_S``.
-RUNS_DIR = Path(
-    os.environ.get(
-        "CODEX_IN_CLAUDE_RUNS_DIR",
-        str(Path.home() / ".config" / "codex-in-claude" / "runs"),
+# after ``HEARTBEAT_ENDED_RETENTION_S``. The dir is resolved per call, never at import:
+# an import-time binding ignored a test's ``$CODEX_IN_CLAUDE_RUNS_DIR`` (tp#192).
+def _runs_dir() -> Path:
+    """Heartbeat dir: ``$CODEX_IN_CLAUDE_RUNS_DIR``, else ``~/.config/codex-in-claude/runs``."""
+    return Path(
+        os.environ.get(
+            "CODEX_IN_CLAUDE_RUNS_DIR",
+            str(Path.home() / ".config" / "codex-in-claude" / "runs"),
+        )
     )
-)
+
 
 # Heartbeat contract v1 — the cross-tool keys the Claude Code statusline reader
 # (``cc-waiting.py`` in the user's dotfiles) consumes from every heartbeat writer (this runner
@@ -1192,7 +1207,7 @@ def list_models(*, refresh: bool, include_hidden: bool, timeout: int = 30) -> li
             models = []
     if not models:
         try:
-            models = _parse_models(CODEX_CACHE.read_text(encoding="utf-8"))
+            models = _parse_models(_codex_cache().read_text(encoding="utf-8"))
         except (OSError, ValueError):
             models = []
     if not include_hidden:
@@ -3257,9 +3272,10 @@ def _concurrency_slot(ceiling: int, poll: float = 3.0) -> Iterator[None]:
         yield
         return
     try:
-        SLOT_DIR.mkdir(parents=True, exist_ok=True)
+        slot_dir = _slot_dir()
+        slot_dir.mkdir(parents=True, exist_ok=True)
         handles: list[TextIO] = [
-            open(SLOT_DIR / f"slot{i}.lock", "w", encoding="utf-8") for i in range(ceiling)
+            open(slot_dir / f"slot{i}.lock", "w", encoding="utf-8") for i in range(ceiling)
         ]
     except OSError as exc:
         print(f"… concurrency gate disabled ({exc}); running ungated.", file=sys.stderr)
@@ -3306,8 +3322,9 @@ def cmd_runs(args: argparse.Namespace) -> int:
     that record (crash, SIGKILL) are cleaned up on sight.
     """
     rows: list[dict[str, Any]] = []
-    _prune_ended_heartbeats(RUNS_DIR)
-    for path in sorted(RUNS_DIR.glob("*.json")):
+    runs_dir = _runs_dir()
+    _prune_ended_heartbeats(runs_dir)
+    for path in sorted(runs_dir.glob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             pid = int(data["pid"])
@@ -4267,7 +4284,7 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
         return result
     # The deadline starts BEFORE the refresh: a best-effort measurement must be spent
     # out of the call's budget, never added on top of it (plan D5, debate O13).
-    heartbeat_path = RUNS_DIR / f"{os.getpid()}.json"
+    heartbeat_path = _runs_dir() / f"{os.getpid()}.json"
     started = time.monotonic()
     # A resume binds to one seat, so promoting an unmeasured seat would be meaningless;
     # a write run refuses to experiment at all (plan D5/D7).

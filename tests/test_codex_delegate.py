@@ -804,7 +804,7 @@ def test_delegate_runs_lists_live_and_cleans_dead(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(cic, "RUNS_DIR", tmp_path)
+    monkeypatch.setenv("CODEX_IN_CLAUDE_RUNS_DIR", str(tmp_path))
     import json as _json
 
     live = {
