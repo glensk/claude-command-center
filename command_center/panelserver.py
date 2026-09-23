@@ -43,6 +43,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 # AppKit / PyObjCTools load lazily (only the resident process needs them), and PyObjC
 # resolves AppKit attributes dynamically — hence the two module-wide disables below.
 # pylint: disable=import-outside-toplevel,no-member
+# pylint: disable=too-many-lines  # one cohesive feature: protocol, dispatcher, AppKit host, CLI
 import argparse
 import contextlib
 import fcntl
@@ -430,7 +431,7 @@ ShowFn = Callable[[Request, Any, Callable[[], None]], None]
 
 
 @dataclass
-class _Flight:
+class _Flight:  # pylint: disable=too-many-instance-attributes  # timing marks
     """The one request in flight: its generation and timing marks."""
 
     request: Request

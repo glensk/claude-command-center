@@ -51,6 +51,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 # Lazy imports (colors, AppKit) keep this module — and so every `ccc` command that
 # never peeks — free of their cost; the import sits inside the function on purpose.
 # pylint: disable=import-outside-toplevel
@@ -371,7 +372,7 @@ def _peek_for_session(
     )
 
 
-def resolve_peek(
+def resolve_peek(  # pylint: disable=too-many-return-statements  # one early exit per rung
     adapter: ClaudeAdapter | None = None,
     store: Store | None = None,
     session_id: str | None = None,
