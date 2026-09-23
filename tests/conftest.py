@@ -68,8 +68,8 @@ def _isolate_home(
     monkeypatch.setattr(
         Path, "home", classmethod(lambda _cls: Path(os.environ.get("HOME") or home))
     )
-    from command_center import config as _config
-    from command_center import usage as _usage
+    from command_center import config as _config  # pylint: disable=import-outside-toplevel
+    from command_center import usage as _usage  # pylint: disable=import-outside-toplevel
 
     _config.invalidate_config_cache()
     _usage._codex_cache.clear()  # noqa: SLF001
@@ -100,8 +100,8 @@ def _guard_real_codex_reads(
     """
     if request.node.get_closest_marker("real_home"):
         return
-    from command_center import codex_in_claude as _cic
-    from command_center import usage as _usage
+    from command_center import codex_in_claude as _cic  # pylint: disable=import-outside-toplevel
+    from command_center import usage as _usage  # pylint: disable=import-outside-toplevel
 
     roots = (
         tmp_path_factory.getbasetemp().resolve(),
@@ -212,7 +212,7 @@ def _isolate_peek_focus(monkeypatch: pytest.MonkeyPatch) -> None:
     TUI running that would fire osascript per test; pin the probe to ``None`` —
     tests that exercise the fallback re-patch ``peek._focused_tty`` themselves.
     """
-    from command_center import peek as _peek
+    from command_center import peek as _peek  # pylint: disable=import-outside-toplevel
 
     monkeypatch.setattr(_peek, "_focused_tty", lambda: None)
 
@@ -232,7 +232,7 @@ def _pin_single_claude_account(monkeypatch: pytest.MonkeyPatch) -> None:
     stray value in the developer's shell. Tests needing multiple accounts override this
     fixture explicitly.
     """
-    from command_center import config as _config
+    from command_center import config as _config  # pylint: disable=import-outside-toplevel
 
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CCC_HOME", raising=False)
@@ -261,7 +261,7 @@ def _isolate_vault_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     ``test_core``) would silently resolve against the developer's actual repo tree.
     Blanking it makes the ``$GIT_BASE`` monkeypatch the effective knob under test.
     """
-    from command_center import config as _config
+    from command_center import config as _config  # pylint: disable=import-outside-toplevel
 
     real_load = _config.load_config
 
@@ -304,7 +304,7 @@ def _reset_config_memo() -> None:
     pin already keeps tests apart; resetting it here makes that isolation structural
     rather than a side effect of every test getting a distinct ``tmp_path``.
     """
-    from command_center import config as _config
+    from command_center import config as _config  # pylint: disable=import-outside-toplevel
 
     _config.invalidate_config_cache()
 
@@ -360,7 +360,7 @@ class SeatFixture:
         declares ``hardened-rw``, so a write run on any other seat is refused before
         codex is ever launched.
         """
-        from command_center import config as _config
+        from command_center import config as _config  # pylint: disable=import-outside-toplevel
 
         path = self.ccc_home / "command-center" / "config.toml"
         ranked = ", ".join(f'"{label}"' for label in labels)
@@ -409,7 +409,7 @@ class SeatFixture:
                 + "\n",
                 encoding="utf-8",
             )
-        from command_center import usage as _usage
+        from command_center import usage as _usage  # pylint: disable=import-outside-toplevel
 
         _usage._codex_cache.clear()  # noqa: SLF001
 
@@ -420,7 +420,7 @@ class SeatFixture:
         attempt recorded by phase 1 moves phase 2's probe onto another seat. Clearing it
         makes the phase start from the canonical ranking again.
         """
-        from command_center import quota as _quota
+        from command_center import quota as _quota  # pylint: disable=import-outside-toplevel
 
         _quota._seat_attempts_path().unlink(missing_ok=True)  # noqa: SLF001
 
@@ -545,7 +545,11 @@ def three_seats(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SeatFixture:
     calls it directly, so an env-only pin would still resolve the developer's real
     ``~/.codex`` as the default seat and read their actual credentials.
     """
-    from command_center import codex_launch, config, usage
+    from command_center import (  # pylint: disable=import-outside-toplevel
+        codex_launch,
+        config,
+        usage,
+    )
 
     fixture = make_three_seats(tmp_path)
     for key, value in fixture.env().items():
