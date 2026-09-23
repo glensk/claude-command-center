@@ -43,3 +43,20 @@ order and a 500 ms threshold, firing a detached `shell_command`.
   typing.
 - These rules are **not** wired by `ccc init` or any installer; they live here as
   copy-paste starting points only.
+
+## Optional: the resident panel server (macOS)
+
+The q+p park panel and the s+p peek panel can open in ≤ 0.2 s instead of the cold
+0.35–1.1 s when the opt-in resident server runs (`ccc panel-server --install`, see
+`docs/reference.md` § Resident panel server). It installs a POSIX poker at
+`~/.claude/command-center/panel-poke.sh` (under `$CCC_HOME/command-center` when set);
+point the chord's `shell_command` at it instead of `ccc`:
+
+```json
+"shell_command": "$HOME/.claude/command-center/panel-poke.sh peek >/dev/null 2>&1 &"
+```
+
+(`… panel-poke.sh park …` for q+p). The poker falls back to the cold `ccc peek` /
+`ccc park -g` by itself whenever the server is not installed, not running, degraded or
+wedged, so the rewired rule is safe with or without it. The sample JSONs here stay cold.
+

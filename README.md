@@ -147,7 +147,8 @@ A few features that don't fit in a one-liner but are the reason people keep it r
   fail closed: no scrubber, no write.
 - **The peek panel.** Hold a key, and a floating panel shows every prompt you've typed
   in the focused tab (plus its AIM history) — so *"what have I been asking here?"* is
-  one keystroke, not a scroll through the transcript.
+  one keystroke, not a scroll through the transcript. The opt-in resident panel server
+  (`ccc panel-server --install`, macOS) opens it — and the q+p park panel — in ≤ 0.2 s.
 - **Snapshot the whole desk before a reboot.** `ccc snapshot` saves every iTerm window,
   tab and split — which Claude session ran where (and on which account), and the exact
   `argv` of the other panes. After the update, `ccc restore-snapshot` rebuilds the layout:

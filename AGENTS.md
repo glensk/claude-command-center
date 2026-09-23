@@ -388,6 +388,17 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
   an exit that hangs): heartbeat + exit-grace verdicts, the `tui-watchdog.log` wedge
   report with every thread's Python stack, terminal restore, capped in-place re-exec;
   `views/tui.py` beats it from the fast poll and starts it only on a real tty.
+- **Resident panel server** — `panelserver.py` (`ccc panel-server`, tp#70): opt-in
+  LaunchAgent that serves the q+p / s+p chords warm. File protocol (claim-by-rename,
+  `panel_ack.<nonce>`), pidfile state machine and the dispatcher (`Core`) are plain Python
+  and tested headlessly; `AppKitHost` is the AppKit shell (default + modal-mode timers,
+  modal panels, guarded focus hand-back). Chord side: `assets/panel-poke.sh`, installed by
+  `panelpoke.py`. Seams it relies on: `peek.Frontmost`/`build_panel`/`PanelLoop`,
+  `park.grab`/`GrabOptions`, `parkpanel.capture_prompt(on_shown=…)`,
+  `iterm_api.CookieItermLink`/`LinkThread` (the `iterm2` package never authenticates by
+  itself there), `transcript_cache.TranscriptCache`. Plist + install in `launchd.py`
+  (`panel_server_*`), doctor row `_panel_server_check`, daemon self-heal
+  `_restart_stale_panel_server`.
 - **Packaging** — the wheel ships three console entry points (`ccc`, `codex-in-claude`,
   `claude-session-continue`) and the `command_center/assets/` package data. Every one of
   those `main()`s runs behind `brokenpipe.guard` so a reader that closes our stdout

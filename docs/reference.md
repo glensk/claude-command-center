@@ -104,6 +104,9 @@ check compares the longest declared foreign `Stop` timeout against `stop_barrier
 
 ### Peek — "what have I asked here?" (`ccc peek`)
 
+> [!tip] Opening too slowly? The opt-in resident panel server (§ Parked prompts →
+> *Resident panel server*) opens this panel and the q+p park panel in ≤ 0.2 s.
+
 `ccc peek` resolves the iTerm tab you are looking at to the Claude session running
 in it and shows a floating macOS panel titled **"ccc peek panel"** (so you can refer to
 it by name). A **header** mirrors the Claude Code status
@@ -944,6 +947,59 @@ windows never hold a job back). Markers: the park tab title, `ccc jobs`
 (`[⏳ fires 14:03 (in 37m)]`, overdue-aware), and a `⏳ parked prompt fires …` chip in
 every session's statusline rows. `restore-job`/`unlaunch` clear a stale fire time —
 a restored job never silently auto-launches.
+
+#### Resident panel server — q+p / s+p in ≤ 0.2 s (`ccc panel-server`, macOS, opt-in)
+
+A cold `ccc park -g` / `ccc peek` pays Python start-up, ~210 ms of AppKit framework load
+and ~280 ms per AppleScript focus query before its panel appears (0.35–1.1 s). The
+optional **resident panel server** keeps one process up with AppKit loaded, the park/peek
+code imported and a warm iTerm2 Python-API link, so both chord panels open in ≤ 0.2 s.
+Nothing changes until you opt in:
+
+```commands
+ccc panel-server -I        # --install: LaunchAgent (<launchd_label>-panel-server) + chord poker
+ccc panel-server -t        # --status: agent loaded? pidfile state (ready/busy/degraded)?
+ccc panel-server -x -n 60  # --stats: latency of the last 60 chords (p50/p95)
+ccc panel-server -r        # --restart: re-exec after editing ccc (deferred while a panel is open)
+ccc panel-server -S / -s   # --stop / --start (launchctl bootout / bootstrap)
+ccc panel-server -U [-P]   # --uninstall; -P/--purge also removes the poker
+```
+
+- **Wiring.** `--install` writes `<app_home>/panel-poke.sh`, a POSIX `sh` poker; point the
+  two Karabiner rules at it (`… panel-poke.sh park` / `… panel-poke.sh peek`, see
+  `command_center/assets/karabiner/README.md`). The poker hands the chord to the server
+  through one request file per chord and falls back to the cold command by itself when the
+  server is not installed, not running, `degraded`, or does not claim the request within
+  ~0.5 s. A server that claimed a request and then wedges shows no panel until its
+  watchdog recovers it — never a duplicate panel.
+- **Only the bare chord verbs are served.** Every flagged or env-controlled invocation
+  (`-N`, `-j`, `-c`, `--session`, `--timeout`, `CCC_PARK_PANEL_TIMEOUT`,
+  `CCC_PANEL_COLD=1`) runs cold in its own process, exactly as before.
+- **Same behaviour, same look.** Both paths run the same park/peek code; only the focus
+  source (warm iTerm link vs AppleScript) and the run loop (modal session vs
+  `NSApp.run`) differ. The account rule is unchanged: a tracked tab parks under that
+  session's account, an untracked tab under the default account.
+- **Latency target.** `shown_ms` p95 + 17 ms ≤ 200 ms for park and for peek on a
+  transcript-cache hit or append. The first peek of a transcript the server has not read
+  yet (a cache **miss**, ~0.4 s on a 100 MB transcript) is exempt and reported separately;
+  the server prewarms the cache for recently active sessions after it starts.
+  Per-chord rows go to `<app_home>/panel-metrics.jsonl`; `--stats` prints nearest-rank
+  p50/p95 per verb, peek split by `cache_state`.
+- **Code changes.** The install is editable, so the running server keeps old code until
+  it restarts: `ccc doctor` reports a stale server, `ccc restart-tui` prints a hint, and
+  the daemon pass asks a stale live server to re-exec itself (pid-targeted; deferred while
+  a panel is open). `ccc doctor` → *Daemon* → *panel server*: − not installed, ✅ running
+  current code, ❌ installed but dead / degraded / stale.
+- **iTerm2 access.** The server fetches the iTerm2 API cookie itself through a bounded
+  `osascript` call (the same Automation grant as the AppleScript path; run `--install` at
+  the keyboard in case macOS asks once). The cookie lives in the environment only for the
+  websocket handshake and never reaches a child process. When iTerm is not running or
+  the link drops, the server reports `degraded` (chords run cold) and re-probes with
+  backoff (5 s → 60 s).
+- **Logs.** `<app_home>/panel-server.log` / `.err`, wedge reports in
+  `panel-server-watchdog.log`. `ccc panel-server -k` (`--smoke`) runs 50 invisible
+  park + peek cycles in-process and checks that windows, threads and fds return to
+  baseline.
 
 ### Delegate a task to Codex (`/codex-implement-task-and-claude-review`)
 
