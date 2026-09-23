@@ -25,6 +25,12 @@ This module then does two things the guard cannot do for itself:
   without one is a library, and says so with a pointer to ``ccc`` — rather than importing
   successfully and exiting 0, which would look like a command that silently did nothing.
 
+The repo-root ``codex-in-claude.py`` shim uses the second entry point here,
+:func:`reexec_into_env`, with a wider candidate list: the repo ``.venv`` first, then the
+uv-tool venv (:func:`uv_tool_dir` ``/claude-command-center``). It is on ``PATH`` and is
+called from direnv/nix directories whose ``python3`` has none of the dependencies (tp#394);
+the by-path module runs above keep the ``.venv``-only contract.
+
 Deliberately stdlib-only and dependency-free: it runs BEFORE the venv re-exec, i.e. under
 whatever interpreter the shebang happened to find.
 """
@@ -45,6 +51,44 @@ EX_NOT_A_CLI = 2
 def _repo_root(file: str) -> str:
     """The directory containing the ``command_center`` package."""
     return os.path.dirname(os.path.dirname(os.path.abspath(file)))
+
+
+def uv_tool_dir() -> Path:
+    """Where ``uv tool install`` puts tool venvs: ``$UV_TOOL_DIR``, else the XDG default."""
+    explicit = os.environ.get("UV_TOOL_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return Path(data) / "uv" / "tools"
+
+
+def _inside(root: Path) -> bool:
+    """True when the running interpreter belongs to the venv at ``root``.
+
+    Compares ``sys.prefix``, never the interpreter's realpath: a uv venv's ``bin/python``
+    symlinks to the SHARED uv base interpreter, so two venvs (repo ``.venv`` and the
+    uv-tool venv) resolve to the same binary and a realpath check cannot tell them apart.
+    """
+    return os.path.realpath(sys.prefix) == os.path.realpath(root)
+
+
+def reexec_into_env(candidates: list[Path], script: str) -> None:
+    """Re-run ``script`` under the first usable venv in ``candidates``.
+
+    Each candidate is a venv ROOT (its interpreter is ``<root>/bin/python``). Returns
+    normally — staying on the current interpreter — when we already run inside one of
+    them, or when none has an executable interpreter / every ``execv`` fails.
+    """
+    if any(_inside(root) for root in candidates):
+        return
+    for root in candidates:
+        py = os.path.join(root, "bin", "python")
+        if not (os.path.isfile(py) and os.access(py, os.X_OK)):
+            continue
+        try:
+            os.execv(py, [py, os.path.abspath(script), *sys.argv[1:]])
+        except OSError:
+            continue
 
 
 def _reexec_in_venv(file: str) -> None:

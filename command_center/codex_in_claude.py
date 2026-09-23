@@ -3380,14 +3380,38 @@ def cmd_usage(args: argparse.Namespace) -> int:
     return EX_OK
 
 
+def _headroom_unknown(reason: str) -> dict[str, Any]:
+    """A :func:`codex_headroom`-shaped ``unknown`` decision (offload denied)."""
+    return {
+        "state": "unknown",
+        "offload_allowed": False,
+        "reason": reason,
+        "refused_by": "",
+        "refused_at": None,
+        "captured_at": None,
+        "stale_after_seconds": _HEADROOM_STALE_AFTER_SECONDS,
+        "reset_fresh_within_seconds": _HEADROOM_RESET_FRESH_SECONDS,
+        "windows": [],
+        "seat": "",
+        "seats": [],
+    }
+
+
 def cmd_headroom(args: argparse.Namespace) -> int:
     """Report whether optional Codex offloads can spend quota beyond the reserve.
 
     The verdict is the whole seat POOL's (plan D4): the ``seat:`` line names the seat it
     is about, the window lines are that seat's, and one line per OTHER seat says why it
     did not win — so "DENIED (unknown)" can no longer hide a fresh, idle paid seat.
+
+    A crash while computing the verdict (e.g. a missing dependency, tp#394) is reported
+    as ``unknown`` / exit 3 — the gate's documented fail-closed code — not as exit 1,
+    which callers read as "reserve zone".
     """
-    decision = codex_headroom()
+    try:
+        decision = codex_headroom()
+    except Exception as exc:  # pylint: disable=broad-exception-caught  # any crash = unknown
+        decision = _headroom_unknown(f"unknown: {type(exc).__name__}: {exc}")
     if args.json:
         print(json.dumps(decision))
     else:

@@ -8,6 +8,8 @@ license = { text = "Apache-2.0" }
 dependencies = [
     "textual>=0.80",
     "textual-serve>=1.1",
+    # Imported directly (usage.py, cli.py), not only through textual.
+    "rich>=13",
     # `ccc peek` shows the focused tab's last prompt in a native floating panel
     # (macOS only); imported lazily so non-GUI commands never pay the AppKit cost.
     "pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'",

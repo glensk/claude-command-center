@@ -292,7 +292,10 @@ under `command_center/assets/` and ship as wheel package data. Installers read t
 `importlib.resources`, **never** by resolving a path relative to `__file__` — so a
 non-editable install keeps working. Stdlib-only helper scripts that must survive a
 non-editable install (`codex_in_claude.py`, `session_continue.py`) live *inside* the
-package; the repo-root `codex-in-claude.py` is a thin PATH-compat shim.
+package; the repo-root `codex-in-claude.py` is a thin PATH-compat shim. It re-execs into
+the repo `.venv`, else the uv-tool venv (`command_center._direct.reexec_into_env`), so a
+foreign `python3` first on `PATH` (direnv/nix) cannot break it; with neither venv it exits
+70 with one stderr line (tp#394).
 
 The codex assets ship **marker-free**; `install_commands._codex_stamped()` injects the
 `[codex <model> effort=<e>]` prefix into their `description:` at plan time (see
