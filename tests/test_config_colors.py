@@ -75,7 +75,6 @@ def test_multi_account_config_keys_defaults_and_roundtrip(
         "nixos_overseer_dir",
         "card_nixos_overseer_supervised",
         "card_nixos_overseer_tier_a",
-        "llm_account",
     ):
         assert key in config.DEFAULTS
         assert hasattr(config.Config(), key)
@@ -90,7 +89,6 @@ def test_multi_account_config_keys_defaults_and_roundtrip(
     assert fresh.nixos_overseer_dir == ""
     assert fresh.card_nixos_overseer_supervised is True
     assert fresh.card_nixos_overseer_tier_a is False
-    assert fresh.llm_account == "private"
 
     fresh.claude_accounts = ["private=~/.claude", "work=~/.claude-work"]
     fresh.usage_card_work = False
@@ -98,7 +96,6 @@ def test_multi_account_config_keys_defaults_and_roundtrip(
     fresh.nixos_overseer_dir = "~/overseer"
     fresh.card_nixos_overseer_supervised = False
     fresh.card_nixos_overseer_tier_a = True
-    fresh.llm_account = "work"
     config.save_config(fresh)
     reloaded = config.load_config()
     assert reloaded.claude_accounts == ["private=~/.claude", "work=~/.claude-work"]
@@ -108,7 +105,24 @@ def test_multi_account_config_keys_defaults_and_roundtrip(
     assert reloaded.nixos_overseer_dir == "~/overseer"
     assert reloaded.card_nixos_overseer_supervised is False
     assert reloaded.card_nixos_overseer_tier_a is True
-    assert reloaded.llm_account == "work"
+
+
+def test_removed_llm_keys_are_ignored_without_blocking_config_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CCC_HOME", str(tmp_path))
+    path = config.config_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        'score_backends = ["codex", "claude"]\nllm_model = "old"\nllm_account = "work"\n',
+        encoding="utf-8",
+    )
+    cfg = config.load_config()
+    assert not hasattr(cfg, "score_backends") and not hasattr(cfg, "llm_account")
+    assert config.unknown_config_keys() == []
+    config.save_config(cfg)
+    saved = path.read_text(encoding="utf-8")
+    assert "score_backends" not in saved and "llm_model" not in saved and "llm_account" not in saved
 
 
 def test_claude_config_dirs_parses_validates_and_skips_malformed(

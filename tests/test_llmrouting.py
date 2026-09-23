@@ -38,24 +38,11 @@ def _row(cfg: Config, purpose: str, routes: dict | None = None) -> llmrouting.Ro
 # --------------------------------------------------------------------------- #
 # who bills the Codex seat
 # --------------------------------------------------------------------------- #
-def test_codex_backend_is_reported_as_a_codex_spender() -> None:
-    cfg = _cfg(short_aim=True, short_aim_backend="codex", llm_custom_command="")
-    row = _row(cfg, "short-aim")
-    assert row.cost == llmrouting.CODEX_COST
-    assert llmrouting.codex_spenders(llmrouting.rows(cfg)) == [row]
-
-
-def test_claude_backend_takes_short_aim_off_the_codex_seat() -> None:
-    cfg = _cfg(short_aim=True, short_aim_backend="claude", llm_custom_command="")
-    assert llmrouting.codex_spenders(llmrouting.rows(cfg)) == []
-    assert "Claude subscription" in _row(cfg, "short-aim").cost
-
-
-def test_disabled_codex_row_is_not_counted_as_a_spender() -> None:
-    """`short_aim = false` means the codex backend never runs — it must not be flagged."""
-    cfg = _cfg(short_aim=False, short_aim_backend="codex")
-    assert llmrouting.codex_spenders(llmrouting.rows(cfg)) == []
-    assert _row(cfg, "short-aim").enabled is False
+def test_disabled_codex_route_is_not_counted_as_a_spender() -> None:
+    cfg = _cfg(short_aim=False, llm_custom_command="ai.py prompt -R judge")
+    routes = {"short-aim": ("codex(gpt-5.6)", "ChatGPT/Codex seat", "codex(gpt-5.6)")}
+    assert llmrouting.codex_spenders(llmrouting.rows(cfg, routes)) == []
+    assert _row(cfg, "short-aim", routes).enabled is False
 
 
 def test_bills_codex_matches_either_spelling() -> None:
@@ -69,16 +56,6 @@ def test_a_live_route_that_lands_on_codex_is_still_flagged() -> None:
     routes = {"aim-met": ("codex(gpt-5.6)", "ChatGPT/Codex seat", "codex(gpt-5.6)")}
     cfg = _cfg(llm_custom_command="ai.py prompt -R judge", assess_aim_on_turn=True)
     assert llmrouting.codex_spenders(llmrouting.rows(cfg, routes))[0].purpose == "aim-met"
-
-
-def test_auto_backend_expands_the_way_short_aim_resolves_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cfg = _cfg(short_aim=True, short_aim_backend="auto", llm_custom_command="")
-    monkeypatch.setattr(llmrouting.shutil, "which", lambda _name: "/usr/bin/codex")
-    assert _row(cfg, "short-aim").cost == llmrouting.CODEX_COST
-    monkeypatch.setattr(llmrouting.shutil, "which", lambda _name: None)
-    assert _row(cfg, "short-aim").cost != llmrouting.CODEX_COST
 
 
 # --------------------------------------------------------------------------- #
@@ -105,22 +82,16 @@ def test_unrecognised_router_is_not_claimed_to_be_ai_py() -> None:
     assert _row(cfg, "aim-met").cost == "external router"
 
 
-def test_pinned_claude_names_the_account_it_bills() -> None:
-    cfg = _cfg(llm_custom_command="", llm_account="work", llm_model="claude-haiku-4-5")
+def test_unset_router_is_reported_as_a_failed_call() -> None:
+    cfg = _cfg(llm_custom_command="")
     row = _row(cfg, "aim-met")
-    assert row.cost == "Claude subscription (work)"
-    assert "claude-haiku-4-5" in row.provider
+    assert row.cost == "nothing — call fails"
+    assert row.provider == "(router unset)"
 
 
-def test_score_ladder_lists_every_rung_in_order() -> None:
-    cfg = _cfg(score_backends=["copilot", "codex"], copilot_model="gpt-5.4")
-    row = _row(cfg, "aim-score")
-    assert row.provider.index("opencode") < row.provider.index("codex exec")
-    assert llmrouting.bills_codex(row.cost)
-
-
-def test_empty_score_ladder_does_not_crash() -> None:
-    assert _row(_cfg(score_backends=[]), "aim-score").provider == "(no rungs configured)"
+def test_aim_score_uses_the_same_router_as_every_other_purpose() -> None:
+    cfg = _cfg(llm_custom_command="/opt/mine/router --go")
+    assert _row(cfg, "aim-score").cost == "external router"
 
 
 # --------------------------------------------------------------------------- #
@@ -220,11 +191,17 @@ def test_render_live_false_makes_no_subprocess(monkeypatch: pytest.MonkeyPatch) 
     assert "ccc action" in llmrouting.render(_cfg(llm_custom_command="ai routing"), live=False)
 
 
-def test_render_flags_the_codex_seat_only_when_something_bills_it() -> None:
-    hot = llmrouting.render(_cfg(short_aim=True, short_aim_backend="codex"), live=False)
-    cold = llmrouting.render(_cfg(short_aim=True, short_aim_backend="claude"), live=False)
-    assert "Spending the Codex seat" in hot
-    assert "free for /codex-debate" in cold
+def test_render_flags_the_codex_seat_only_when_router_says_it_bills_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _cfg(short_aim=True, llm_custom_command="ai.py prompt -R judge")
+    monkeypatch.setattr(
+        llmrouting,
+        "fetch_routes",
+        lambda *_a: {"short-aim": ("codex(gpt-5.6)", "ChatGPT/Codex seat", "codex")},
+    )
+    assert "external router currently sends" in llmrouting.render(cfg, live=True)
+    assert "free for /codex-debate" in llmrouting.render(cfg, live=False)
 
 
 def test_ladder_table_appears_only_when_a_route_resolved_one() -> None:

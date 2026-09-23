@@ -155,23 +155,21 @@ def test_new_job_requires_an_aim(
 def test_score_aim_dry_run_reports_serving_backend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`score-aim --dry-run` JSON carries the ladder rung that served the call."""
+    """`score-aim --dry-run` JSON identifies the routed call."""
     import json
 
     from command_center import llm
 
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    monkeypatch.setattr(
-        llm, "run_ladder", lambda *_a, **_k: ("codex", '{"score":70,"reason":"ok"}')
-    )
+    monkeypatch.setattr(llm, "run_model", lambda *_a, **_k: '{"score":70,"reason":"ok"}')
     args = argparse.Namespace(dry_run="ship rate-limit middleware", session=None)
     assert cli.cmd_score_aim(args) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["score"] == 70
-    assert out["backend"] == "codex"
+    assert out["backend"] == "router"
 
 
-def test_score_aim_dry_run_lexical_fallback_when_ladder_fails(
+def test_score_aim_dry_run_lexical_fallback_when_router_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Every rung failing → the offline lexical estimate, tagged backend "lexical"."""
@@ -180,7 +178,7 @@ def test_score_aim_dry_run_lexical_fallback_when_ladder_fails(
     from command_center import llm
 
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    monkeypatch.setattr(llm, "run_ladder", lambda *_a, **_k: None)  # all rungs fail
+    monkeypatch.setattr(llm, "run_model", lambda *_a, **_k: None)
     args = argparse.Namespace(dry_run="improve the thing", session=None)
     assert cli.cmd_score_aim(args) == 0
     out = json.loads(capsys.readouterr().out)
@@ -382,12 +380,7 @@ def test_short_aim_backfills_the_first_revision_label(
     """
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     cfg = _no_score_cfg()
-    for attr, value in (
-        ("short_aim", True),
-        ("short_aim_backend", "codex"),
-        ("short_aim_model", ""),
-    ):
-        setattr(cfg, attr, value)
+    cfg.short_aim = True  # type: ignore[attr-defined]
     monkeypatch.setattr("command_center.cli.config.load_config", lambda: cfg)
     monkeypatch.setattr(
         "command_center.short_aim.generate",

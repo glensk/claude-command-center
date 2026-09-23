@@ -220,8 +220,8 @@ account switch, or any toggle — walking back up to 20 steps per run. See
   all work; `ccc install-shell` adds cross-terminal OSC tab badges; the iTerm-specific
   launch/peek/jump niceties do not.
 - **Linux (Ubuntu) is a supported core path**, not an afterthought — a plain terminal
-  runs the store, CLI, the TUI, the Claude Code hooks, the checkers and the pluggable
-  score ladder, future jobs, `ccc obsidian-setup`, `notify-send` desktop alerts, OSC tab
+  runs the store, CLI, the TUI, the Claude Code hooks, the routed checkers,
+  future jobs, `ccc obsidian-setup`, `notify-send` desktop alerts, OSC tab
   badges (`ccc install-shell`) and a **systemd --user** daemon. Job launch and
   resume-in-a-new-window use **tmux** (`launcher = "tmux"`, recommended). The peek
   floating panel and the `jump` chord (and iTerm tab colors) stay macOS-only. See

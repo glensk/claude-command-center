@@ -262,9 +262,7 @@ def run_for_session(store: Store, adapter: object, session: Session, cfg: Config
     aim_hist = store.list_aim_history(session.session_id)
     original = aim_hist[0].aim if aim_hist else session.aim
     facts = build_facts(original, session.aim, evidence)
-    verdict = check_met(
-        facts, cfg.assess_aim_model or cfg.llm_model, note=llm.concise_note(original or session.aim)
-    )
+    verdict = check_met(facts, "", note=llm.concise_note(original or session.aim))
     if verdict is None:
         return None
     latest = store.get(session.session_id)

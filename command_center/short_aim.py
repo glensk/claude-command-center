@@ -6,11 +6,8 @@ The full AIM is preserved verbatim in the store; this generates a ≤ ~10-word i
 glance in a narrow column. It is generated out-of-band — never on the hot path — and
 regenerated on every AIM change (see :func:`command_center.cli.cmd_set_aim`).
 
-Backend is pluggable (``short_aim_backend``): the default ``auto`` picks ``codex`` when the
-OpenAI Codex CLI is on ``PATH`` (so the cost lands on Codex/ChatGPT quota, NOT Claude tokens)
-and otherwise falls back to ``claude`` (a cheap ``claude -p`` call); explicit ``codex`` /
-``claude`` force one. Either way it NEVER raises — a failure returns ``None`` and callers keep
-showing the full AIM.
+Generation uses ccc's single configured LLM router. ccc never selects a provider itself; a
+router failure returns ``None`` and callers keep showing the full AIM.
 
 Kept dependency-light (only the leaf ``llm``, imported lazily) so importing it is cheap.
 """
@@ -30,7 +27,6 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 
 import re
-import shutil
 
 # Stored labels are capped here (safety net against a runaway model); the column crops
 # further. Kept short on purpose — this is an at-a-glance identifier, not a summary (the
@@ -100,23 +96,6 @@ def _sanitize(raw: str | None) -> str | None:
     return line or None
 
 
-def resolve_backend(backend: str) -> str:
-    """Resolve the short-AIM backend, expanding ``"auto"`` at use time.
-
-    ``"auto"`` (the default) picks ``"codex"`` when the OpenAI Codex CLI is on ``PATH``
-    (keeps the cost off Claude tokens) and otherwise ``"claude"`` — so a box without codex
-    still gets short labels. Explicit ``"codex"``/``"claude"`` pass through unchanged; any
-    other value is returned as-is (the dispatch below treats non-``"claude"`` as codex,
-    the historical default — no behaviour change for unknown values).
-
-    This is the single resolution point every call site funnels through (all go via
-    :func:`generate`).
-    """
-    if backend == "auto":
-        return "codex" if shutil.which("codex") else "claude"
-    return backend
-
-
 def _original_hint(aim: str, original: str | None) -> str:
     """A prompt clause nudging the model toward the session's first/original AIM.
 
@@ -135,16 +114,11 @@ def generate(
     aim: str | None,
     *,
     original: str | None = None,
-    backend: str = "auto",
-    model: str = "",
 ) -> str | None:
-    """Generate a short label for *aim*. ``None`` on empty input or any backend failure.
+    """Generate a short label for *aim*. ``None`` on empty input or router failure.
 
     *original* (the session's first-ever AIM, if different) is offered to the model as a
-    hint. *backend* selects the generator: ``"auto"`` (codex if on ``PATH``, else claude —
-    the default), ``"codex"`` (the OpenAI Codex CLI — keeps the cost off Claude) or
-    ``"claude"`` (a cheap ``claude -p`` call). *model* is the concrete model id; empty means
-    the backend's own default.
+    hint. Provider and model selection belong entirely to ``llm_custom_command``.
     """
     if not aim or not aim.strip():
         return None
@@ -153,13 +127,5 @@ def generate(
     prompt = _PROMPT.format(
         aim=aim.strip(), max_chars=_MAX_CHARS, original_hint=_original_hint(aim, original)
     )
-    backend = resolve_backend(backend)
-    if backend == "claude":
-        # note = the session's first AIM (router-log metadata only); the codex backend
-        # has no label support so it is left untouched.
-        raw = llm.run_model(
-            prompt, model, purpose="short-aim", note=llm.concise_note(original or aim)
-        )
-    else:
-        raw = llm.run_codex(prompt, model)
+    raw = llm.run_model(prompt, "", purpose="short-aim", note=llm.concise_note(original or aim))
     return _sanitize(raw)

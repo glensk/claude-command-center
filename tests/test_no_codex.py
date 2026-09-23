@@ -314,8 +314,7 @@ def test_no_launch_surface_bypasses_the_session_helper() -> None:
 
     ``apply_to_environ`` / ``launch_env_prefix`` are the account-only renderings; a launch
     surface that calls them directly silently drops ``CCC_NO_CODEX``. The two allowed
-    exceptions are ccc's OWN headless calls, which launch no session at all: ``llm._run_claude``
-    and the per-account rate-limit reset detector in ``resume``.
+    exception is the per-account rate-limit reset detector in ``resume``.
     """
     package = Path(accounts.__file__).parent
     allowed = {"accounts.py"}

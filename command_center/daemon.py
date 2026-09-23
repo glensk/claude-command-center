@@ -741,7 +741,7 @@ def _regenerate_summaries(
         note = llm.concise_note(
             next((r.aim for r in store.list_aim_history(session.session_id)), "") or session.aim
         )
-        summary, next_step = llm.summarize(session.aim, transcript, cfg.llm_model, note=note)
+        summary, next_step = llm.summarize(session.aim, transcript, "", note=note)
         fields: dict[str, object] = {"needs_summary": False}
         if summary:
             fields["summary"] = summary
@@ -755,7 +755,7 @@ def _regenerate_summaries(
         # delta grader is conservative). Never derives; only ticks an auto checklist.
         if cfg.autoprogress:
             res = autoprogress.run_for_session(
-                store, session.session_id, transcript, model=cfg.llm_model, full_regrade=True
+                store, session.session_id, transcript, model="", full_regrade=True
             )
             if res.changed():
                 report.progressed.append(session.session_id)

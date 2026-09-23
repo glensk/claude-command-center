@@ -93,25 +93,6 @@ UNMAPPED_INERT: tuple[str, ...] = (
 #: Anchor keys always written when the user supplies a vault (even if == default).
 ANCHOR_KEYS: tuple[str, ...] = ("vault_root",)
 
-#: Score-ladder backend → the CLI whose presence enables it, in ladder order. Detection
-#: writes ``score_backends`` as the available subset (copilot, gemini, codex, then claude
-#: last), so the score call prefers a non-Anthropic backend when one is installed.
-SCORE_BACKEND_TOOLS: tuple[tuple[str, str], ...] = (
-    ("copilot", "opencode"),
-    ("gemini", "gemini"),
-    ("codex", "codex"),
-    ("claude", "claude"),
-)
-
-
-def detect_score_backends() -> list[str]:
-    """The AIM-score ladder for THIS machine: the available backends in preference order.
-
-    Presence-check only (``shutil.which`` — never an LLM/API call). Empty when none of the
-    CLIs are on PATH (the AIM scorer then degrades to the offline lexical estimate).
-    """
-    return [name for name, tool in SCORE_BACKEND_TOOLS if shutil.which(tool)]
-
 
 def scrubber_status() -> tuple[str | None, str]:
     """Whether a credential scrubber resolves: ``(executable, "")`` or ``(None, reason)``.
@@ -205,7 +186,6 @@ class Profile:  # pylint: disable=too-many-instance-attributes
     copilot: bool = False
     resume: bool = False
     reap: bool = False
-    score_backends: list[str] | None = None  # detected AIM-score ladder (None → leave default)
 
 
 def vault_dir_overrides(vault_root: str) -> dict[str, str]:
@@ -227,10 +207,6 @@ def config_values(profile: Profile) -> dict[str, object]:
     if profile.checkers:
         for key in GROUP_A_CHECKERS:
             values[key] = True
-        if profile.score_backends:
-            # Write the detected AIM-score ladder so the score call prefers a non-Anthropic
-            # backend when one is installed (minimal_config_text drops it if it == the default).
-            values["score_backends"] = list(profile.score_backends)
     if profile.vault_root:
         values["vault_root"] = profile.vault_root
         values.update(vault_dir_overrides(profile.vault_root))
@@ -371,7 +347,6 @@ def _interactive_profile(env: Env) -> tuple[Profile, bool]:
             copilot=copilot,
             resume=resume_opt,
             reap=reap,
-            score_backends=detect_score_backends() if checkers else None,
         ),
         codex_opt,
     )
@@ -450,7 +425,6 @@ def run(args) -> int:  # pylint: disable=too-many-branches
             copilot=False,
             resume=False,
             reap=False,
-            score_backends=detect_score_backends(),
         )
     else:
         profile, codex_opt = _interactive_profile(env)

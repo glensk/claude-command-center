@@ -216,47 +216,6 @@ def test_force_backs_up_existing_config(
     assert _load(_claude_home)["grade_on_turn"] is True
 
 
-# ------------------------------ score-backend detection ------------------------------ #
-def test_detect_score_backends_orders_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    present = {"opencode", "codex", "claude"}  # gemini absent
-    monkeypatch.setattr(
-        wizard.shutil, "which", lambda tool: f"/bin/{tool}" if tool in present else None
-    )
-    # copilot (opencode) first, gemini dropped, codex, claude last.
-    assert wizard.detect_score_backends() == ["copilot", "codex", "claude"]
-
-
-def test_detect_score_backends_empty_when_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(wizard.shutil, "which", lambda _tool: None)
-    assert wizard.detect_score_backends() == []
-
-
-def test_yes_writes_detected_score_ladder(
-    monkeypatch: pytest.MonkeyPatch, _claude_home: Path, _stub_installers: dict[str, int]
-) -> None:
-    monkeypatch.setattr(wizard, "detect_score_backends", lambda: ["copilot", "codex", "claude"])
-    assert wizard.run(_args(yes=True)) == 0
-    assert _load(_claude_home)["score_backends"] == ["copilot", "codex", "claude"]
-
-
-def test_yes_omits_score_ladder_when_claude_only(
-    monkeypatch: pytest.MonkeyPatch, _claude_home: Path, _stub_installers: dict[str, int]
-) -> None:
-    # Detection == the default ["claude"] → minimal_config_text drops it (equals the default).
-    monkeypatch.setattr(wizard, "detect_score_backends", lambda: ["claude"])
-    assert wizard.run(_args(yes=True)) == 0
-    assert "score_backends" not in _load(_claude_home)
-
-
-def test_minimal_omits_score_ladder(
-    monkeypatch: pytest.MonkeyPatch, _claude_home: Path, _stub_installers: dict[str, int]
-) -> None:
-    # No checkers → no ladder written even if backends are detected.
-    monkeypatch.setattr(wizard, "detect_score_backends", lambda: ["copilot", "claude"])
-    assert wizard.run(_args(minimal=True)) == 0
-    assert "score_backends" not in _load(_claude_home)
-
-
 # ------------------------------ pure profile → config ------------------------------ #
 def test_minimal_config_text_only_diffs_from_defaults() -> None:
     text = wizard.minimal_config_text(wizard.Profile(checkers=True))
@@ -279,9 +238,3 @@ def test_config_values_splits_future_files_from_mirrors() -> None:
     )
     for key in wizard.GROUP_B_VAULT:
         assert with_mirrors[key] is True
-
-
-def test_score_backends_serialized_as_toml_list() -> None:
-    profile = wizard.Profile(checkers=True, score_backends=["copilot", "gemini", "claude"])
-    text = wizard.minimal_config_text(profile)
-    assert 'score_backends = ["copilot", "gemini", "claude"]' in text

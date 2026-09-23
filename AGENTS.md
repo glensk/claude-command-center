@@ -148,9 +148,11 @@ CLI boundaries, since a newline in that string submits the typed line early.
 means **unknown and fails closed** on every launch-shaped surface (`cmd_resume`,
 `cmd_resume_job`, `cmd_start_job`, and `jump._resume_selected`) when several accounts are
 configured — the shared `accounts.live_conflict` also refuses an id live under two accounts
-at once. ccc's own headless LLM calls must never bill ambiently: `llm._run_claude` pins its
-env to the `llm_account` config, and `llm_custom_command` (with `CCC_LLM_PURPOSE` /
-`CCC_LLM_NOTE` in the env) is the pluggable routing hatch. **`ccc llm-routing` (also embedded
+at once. ccc's own headless LLM calls never pick a provider: `llm_custom_command` (normally
+`ai prompt -R judge -p "$CCC_LLM_PURPOSE"`, with `CCC_LLM_PURPOSE` / `CCC_LLM_NOTE` in the env)
+is the ONE route, and an unset or failing router is a logged failure — no `claude -p`,
+Codex, Copilot or Gemini fallback inside ccc (removed 2026-09-23; the old `score_backends`,
+`short_aim_backend`, `llm_account` and `*_model` keys are ignored when found in a config). **`ccc llm-routing` (also embedded
 in `ccc -h`) resolves every one of those calls against the live config and names the quota it
 bills** — `command_center/llmrouting.py`, the counterpart to `ai.py routing`; check it before
 claiming which provider a ccc action costs, and add a row there (plus its label in
@@ -162,8 +164,8 @@ on every non-hot invocation, an epilog is only printed for `--help`, and the hot
 (`_HOT_SUBCOMMANDS`, see "Startup / refresh cost") build a single epilog-free subparser — so
 keep the block out of the hot path.
 It flags any action still billing the OpenAI Codex seat, which is reserved for
-`/codex-debate` (`short_aim_backend = "codex"` used to spend ~17.6k Codex tokens per ten-word
-label). See the multi-account section of [docs/reference.md](docs/reference.md).
+`/codex-debate` (the retired `short_aim_backend = "codex"` used to spend ~17.6k Codex tokens
+per ten-word label). See the multi-account section of [docs/reference.md](docs/reference.md).
 
 ## The Codex seat switch (`codex_switch.py`)
 
@@ -185,8 +187,8 @@ the SOURCE seat. Tests: `tests/test_codex_switch.py`.
 ## The codex launch policy (do not regress)
 
 `command_center/codex_launch.py` is the ONE place a `codex exec` command line is built, and
-`codex_in_claude.run_with_fallback` is the ONE place ccc STARTS one — `delegate`, the machine
-`run` subcommand and `llm.run_codex` all go through the runner, and nothing else may assemble
+`codex_in_claude.run_with_fallback` is the ONE place ccc STARTS one — `delegate` and the machine
+`run` subcommand both go through the runner, and nothing else may assemble
 or spawn codex argv. External consumers (`codex-review.py`, sdsc-automations' checker) call
 `codex-in-claude run -j` instead of `codex exec`, so they inherit the seat POLICY, the run-time
 fallback and the typed errors for free. Three invariants:

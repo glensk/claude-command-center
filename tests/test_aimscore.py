@@ -98,7 +98,7 @@ def test_score_aim_detailed_returns_breakdown(monkeypatch: pytest.MonkeyPatch) -
         "no_vague": 0,
     }
     assert detail["missing"] == "add a command that exits 0 to decide done"
-    assert detail["backend"] == "claude"  # default ladder rung that served
+    assert detail["backend"] == "router"
 
 
 def test_score_aim_llm_folds_missing_into_reason(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -120,30 +120,17 @@ def test_score_aim_llm_folds_missing_into_reason(monkeypatch: pytest.MonkeyPatch
     assert "fix: name a passing test" in reason
 
 
-def test_score_aim_detailed_reports_non_claude_backend(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The serving ladder rung propagates into the detail dict's `backend` key."""
+def test_score_aim_detailed_none_when_router_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Router failure → `None`, so the caller keeps the provisional lexical score."""
     from command_center import llm
 
-    monkeypatch.setattr(
-        llm, "run_ladder", lambda *_a, **_k: ("copilot", '{"score":88,"reason":"tight"}')
-    )
-    detail = aimscore.score_aim_detailed("ship X: tests green", _CFG)
-    assert detail is not None
-    assert detail["score"] == 88
-    assert detail["backend"] == "copilot"
-
-
-def test_score_aim_detailed_none_when_every_rung_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    """All backends failing → `None`, so the caller keeps the provisional lexical score."""
-    from command_center import llm
-
-    monkeypatch.setattr(llm, "run_ladder", lambda *_a, **_k: None)
+    monkeypatch.setattr(llm, "run_model", lambda *_a, **_k: None)
     assert aimscore.score_aim_detailed("tests pass", _CFG) is None
     assert aimscore.score_aim_llm("tests pass", _CFG) is None
 
 
 def test_score_aim_passes_aim_score_purpose_and_note(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The scorer labels its ladder call ``aim-score`` and forwards the first-AIM note.
+    """The scorer labels its routed call ``aim-score`` and forwards the first-AIM note.
 
     Both are router metadata (exported as ``CCC_LLM_PURPOSE`` / ``CCC_LLM_NOTE`` to the
     rung subprocesses) — they never affect the score itself.
@@ -152,14 +139,12 @@ def test_score_aim_passes_aim_score_purpose_and_note(monkeypatch: pytest.MonkeyP
 
     seen: dict[str, object] = {}
 
-    def _capture(
-        _prompt: str, _cfg: object, backends: object = None, *, purpose: str = "", note: str = ""
-    ) -> tuple[str, str]:
+    def _capture(_prompt: str, _model: str, *, purpose: str = "", note: str = "") -> str:
         seen["purpose"] = purpose
         seen["note"] = note
-        return ("claude", '{"score": 70, "reason": "ok"}')
+        return '{"score": 70, "reason": "ok"}'
 
-    monkeypatch.setattr(llm, "run_ladder", _capture)
+    monkeypatch.setattr(llm, "run_model", _capture)
     result = aimscore.score_aim_llm("tests pass", _CFG, note="ship the parser")
     assert result is not None and result[0] == 70
     assert seen["purpose"] == "aim-score"

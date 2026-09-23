@@ -1094,14 +1094,8 @@ its read/write mode matches the round being asked for, and its recorded root sti
 is recomputed from the new command line; without the journal a resume could quietly run a write
 round in a root the current policy rejects.
 
-**ccc's own text calls** (`short_aim` via `run_codex`) go through the same policy plus
-`--ephemeral` (no session file), a throwaway empty `mkdtemp()` as `-C` (so a label call can
-neither be confused with nor write into a repo), and one `-c mcp_servers.<name>.enabled=false`
-per configured MCP server. They deliberately no longer pass `--ignore-user-config`, which would
-also drop the permission profiles. There is no wholesale "no MCP" switch: codex's `-c` deep-MERGES
-tables, so `-c mcp_servers={}` parses fine and changes nothing (verified against codex-cli
-0.150.1) — servers have to be disabled by name, which is why the disable list is derived from the
-active config.
+ccc's own small text calls do not enter the Codex runner directly. They all go through
+`llm_custom_command`; the external purpose ladder owns provider and model selection.
 
 ### AIM quality (low score → red chip), progress grading & weighting
 
@@ -1111,66 +1105,36 @@ stuck bar, so the center scores every AIM for specificity (0–100):
 - **Two-tier score** — an instant offline lexical estimate the moment the AIM is
   set (`set_aim` is the single chokepoint for CLI, TUI **and** the `SessionStart`
   hook that seeds `$CLAUDE_SESSION_AIM`), refined out-of-band by one cheap LLM call
-  (`ccc score-aim`, spawned detached — routed through the pluggable score-backend
-  ladder below). **Every AIM is always scored**: a daemon pass backfills any row still
+  (`ccc score-aim`, spawned detached — routed through the configured external router).
+  **Every AIM is always scored**: a daemon pass backfills any row still
   at the `-1` sentinel (and re-fires the refine), so no AIM silently escapes the vague
   check.
-- **Pluggable score backend — a fallback ladder, not just `claude -p`.** The refine call
-  walks `score_backends` (default `["claude"]`) in order and the **first rung that returns
-  non-empty text wins**:
-  - `copilot` — GitHub Copilot via `opencode run -m github-copilot/<copilot_model>`;
-  - `gemini` — `gemini -p` (optional `gemini_model`);
-  - `codex` — `codex exec` (its own model resolution);
-  - `claude` — `claude -p` on `score_model` → `llm_model`;
-  - `custom` — the escape hatch below.
-
-  Put `copilot`/`gemini`/`codex` ahead of `claude` and the concreteness score **moves off
-  Anthropic tokens** whenever one of those CLIs is available, with `claude` as the last-resort
-  rung. Unknown rung names are skipped with a stderr warning; if **every** rung fails the score
-  degrades to the offline lexical estimate. `ccc init` writes the ladder it detects on your
-  machine (in the order copilot, gemini, codex, claude), and `ccc doctor` reports per-rung
-  availability. This is a **deliberate behaviour change** — the public default (`["claude"]`)
-  keeps the old single-backend behaviour; add the other rungs to opt in.
-- **`custom` score backend (escape hatch).** Set `score_custom_command` to any shell command:
-  ccc feeds it the full scoring prompt on **stdin** and reads the model's raw text response from
-  **stdout** (a non-zero exit → next rung). This routes the score call through your own
-  multi-provider router (e.g. a local `ai.py`-style script) without ccc depending on any private
-  tool. The JSON extraction (the first `{…}` object) is identical for every rung. Preview which
-  backend serves a candidate — the `--dry-run` JSON now carries the serving rung:
+- **One routed entrance, no hidden fallback.** Set `llm_custom_command` to the routed judge
+  command (normally `ai prompt -R judge -p "$CCC_LLM_PURPOSE"`). ccc feeds every prompt on
+  **stdin** and reads raw model text from **stdout**. A missing command, non-zero exit, timeout,
+  or empty output fails that call and logs a warning; ccc never silently chooses Claude, Codex,
+  Gemini, or Copilot. AIM scoring then keeps its offline lexical estimate. Preview a candidate:
 
   ```commands
-  ccc score-aim --dry-run "<candidate>"   # → {…,"backend":"codex"}  ("backend":"lexical" if all rungs fail)
+  ccc score-aim --dry-run "<candidate>"   # → {…,"backend":"router"} ("lexical" if routing fails)
   ```
 - **Per-action labels for custom routers (`CCC_LLM_PURPOSE` / `CCC_LLM_NOTE`).** Every
   headless call ccc makes carries a **purpose** label (`aim-score`, `aim-met`,
   `subgoal-drift`, `subgoal-derive`, `subgoal-grade`, `summary-nextstep`, `short-aim`)
   and a **note** (the session's first AIM, collapsed to one line). Both are exported
   into the backend subprocess's environment as `CCC_LLM_PURPOSE` / `CCC_LLM_NOTE`
-  (omitted when empty), so a `score_custom_command` / `llm_custom_command` router can
+  (omitted when empty), so the `llm_custom_command` router can
   **log which action and which session** a call served — or route each purpose to a
-  different provider/model. They are metadata only and never change what is generated;
-  the `codex` rung's CLI has no label support, so labels are dropped there.
-- **`llm_custom_command` — route EVERY headless call, not just the score.** The score
-  ladder above covers only AIM scoring; the other checkers (drift, AIM-met, sub-goal
-  derive/grade, summaries, the claude short-aim backend) go through one `run_model`
-  chokepoint. Set `llm_custom_command` to a shell command with the same contract as
-  `score_custom_command` (full prompt on **stdin**, raw model text on **stdout**,
-  labels in the env as above) and **all** of those calls route through it — moving
-  ccc's own housekeeping LLM cost onto whatever provider your router picks. A failed
-  run (non-zero exit / empty output) degrades to the built-in headless `claude -p`,
-  which is env-pinned to the `llm_account` config (default: the default account) so it
-  can never bill an ambient work seat. `""` (the default) disables the hatch.
+  different provider/model. They are routing metadata; ccc does not interpret them.
 - **The score is shown** as a leading chip in the `/aim` column of `ccc ls`, the
   TUI (table + detail) and the status line: `NN%`, or `-1` while a score is still pending.
 - **Short-AIM label (scannable column text + status line).** The full AIM is kept verbatim
   (detail pane, `aim-history`), but the narrow `/aim` **column** (its revision (1) label, see
   below) and the in-session **status line** (the current AIM's) render a ≤10-word label —
   `implement X`, `maria: ws reconnect` — so running sessions are tellable apart at a glance.
-  It is generated out-of-band on every AIM change by a cheap **codex** run (`codex exec`,
-  via `ccc short-aim`, spawned detached) — keeping the cost off Claude tokens — and a daemon
-  pass backfills any session still missing one. The backend is pluggable
-  (`short_aim_backend` = `auto` (codex if on PATH else claude, the default) | `codex` | `claude`,
-  `short_aim_model`); it is **off by default** (fresh-install inert), enable with `short_aim = true`.
+  It is generated out-of-band on every AIM change through the same purpose router
+  (`purpose=short-aim`), and a daemon pass backfills any session still missing one. It is
+  **off by default** (fresh-install inert); enable with `short_aim = true`.
   On any failure the column falls back to the full AIM. Preview a label without saving:
 
   ```commands
@@ -1185,7 +1149,7 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   to rewrite it — *keeping your goal intact, only making it concrete* — grounded in what the
   session has actually been doing (files edited, todo list, task in progress). The agent
   drafts, then verifies each candidate against the **independent rubric checker** (a separate
-  score-backend call — the ladder above, `claude -p` on `score_model` by default — blind to the
+  routed `aim-score` call, blind to the
   agent's reasoning), iterating on its `missing` hint until it clears the bar:
 
   ```commands
@@ -1299,8 +1263,8 @@ mechanisms keep it honest:
   **pinned** by default. The TUI detail pane labels each checklist with its origin:
   `Sub-goals · auto (claude-haiku-4-5) · from AIM v2 · 5/5` — a user-edited list (via
   the `e` form or `ccc subgoals`) reads `manual` instead.
-- **Impartial drift checker** — on every checklist change a **separate** cheap `claude -p`
-  (`drift_model`, **never the session agent**) judges whether the new sub-goals still
+- **Impartial drift checker** — on every checklist change a **separate** routed call
+  (`llm_custom_command`, purpose `subgoal-drift`, **never the session agent**) judges whether the new sub-goals still
   faithfully decompose the AIM, anchored to **both the original and current AIM** (to catch
   slow cumulative drift). It is fed only the AIMs and the before/after sub-goals — never the
   agent's own justification — scores a published rubric (`drift.DRIFT_RUBRIC`: coverage,
@@ -1336,9 +1300,8 @@ distinct from the human-authoritative `ccc done` (the green ✓ + FINISHED bucke
 "this looks finished" never marks the session done.
 
 - **Impartial & out-of-band** — the Stop hook spawns a detached `ccc assess-aim` (never blocks the
-  turn; the daemon runs a capped fallback for any missed spawn). That runs a **separate** cheap
-  `claude -p` (`assess_aim_model` → `llm_model`, Haiku, **never the session agent**), the same
-  pattern as the drift / score-aim checkers.
+  turn; the daemon runs a capped fallback for any missed spawn). That runs a **separate** routed
+  `aim-met` call (**never the session agent**), the same pattern as drift / score-aim.
 - **Grounded in evidence, not self-report** — it is fed the AIM (original + current) and a tail of
   the transcript that **includes truncated tool-result outputs** (command output, test runs, file
   edits), so a `DONE` rests on what actually happened. The published rubric (`aimmet.AIM_MET_RUBRIC`)
@@ -2247,6 +2210,12 @@ keeps naming SEAT LABELS (`default`/`private`/`de`) in its ranked ladder, becaus
 the tokens `ccc set codex-order` takes; only its `next attempt` is a provider id and is
 spelled like the rows.
 
+`ccc ledger-relabel` is the one-shot history repair for sdsc reply judgements that were
+formerly filed as `checker`: by default it lists the qualifying post-cutoff note-less rows;
+`--apply` takes the ledger lock, writes `codex-runs.jsonl.bak`, and atomically relabels them
+to `reply-2nd-opinion` with `relabelled_from: checker`. Tagged genuine checker rows and all
+rows at or before the cutoff remain unchanged.
+
 Every Codex seat appears as its own row — `codex-work` (the canonical team seat,
 `~/.codex`, env-independent; id `codex`), `codex-priv` (`codex_home_private`) and one
 `codex-<label>` per `codex_homes_extra` login — each with the account e-mail from its `auth.json` as identity
@@ -2255,8 +2224,8 @@ deduped away, so one billable identity is never counted twice. A seat on a `code
 is BLOCKED for the weeks that belong to somebody else (`blocked_by="rota"`, the row carrying
 a `rota` object with the week, the holder and when it is yours again). The footer names the seat delegation bills right now
 (`best_codex_account`: an ELIGIBLE pin wins, holds/blocks exclude a seat first,
-team-first otherwise); `codex-in-claude`'s `_codex_home()`, `codex-review.py` (via
-`codex-in-claude.py home -j`) and ccc's own `llm.run_codex` all follow that one
+team-first otherwise); `codex-in-claude`'s `_codex_home()` and `codex-review.py` (via
+`codex-in-claude.py home -j`) both follow that one
 selector. The `data age` column shows how old each row's governing evidence is
 (`marked <age>` for cooldown/hold rows — the age of the mark, not of quota data).
 

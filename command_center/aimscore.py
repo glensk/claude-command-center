@@ -8,11 +8,9 @@ Two tiers, both returning a 0–100 score (higher = more specific/testable):
   score. Deliberately **biased low** so the common path is "provisional red →
   the LLM clears it" (reads as *checked and fine*) rather than the alarming
   reverse.
-* :func:`score_aim_llm` — one cheap LLM call that refines the score out-of-band
-  (daemon / detached ``ccc score-aim``). Routed through the pluggable
-  :func:`command_center.llm.run_ladder` fallback ladder (copilot / gemini / codex /
-  claude / custom, per ``config.score_backends``), so the call can move off Anthropic
-  tokens when another backend is available. Never raises.
+* :func:`score_aim_llm` — one routed LLM call that refines the score out-of-band
+  (daemon / detached ``ccc score-aim``). Provider/model selection belongs to the
+  configured external router. Never raises.
 
 Kept dependency-light (only the leaf ``models``; no store/autoprogress imports) so
 it can be imported from ``store`` without an import cycle; ``llm`` is imported lazily.
@@ -180,9 +178,7 @@ def score_aim_detailed(aim: str | None, cfg: Config, *, note: str = "") -> dict 
 
     Returns ``{"score": int, "criteria": {...}, "reason": str, "missing": str, "backend": str}``
     — the per-criterion breakdown makes the score reproducible, ``missing`` is the actionable
-    hint the sharpener optimizes against, and ``backend`` names the ladder rung that served the
-    call. Runs the rubric (:data:`AIM_RUBRIC`) through :func:`command_center.llm.run_ladder`
-    (``cfg.score_backends``); the claude rung uses ``cfg.score_model`` or ``cfg.llm_model``.
+    hint the sharpener optimizes against, and ``backend`` is ``"router"``.
 
     *note* is the session's first AIM — exported (with the ``aim-score`` purpose) into the
     rung subprocesses' env as ``CCC_LLM_NOTE`` / ``CCC_LLM_PURPOSE``, log/route metadata
@@ -192,10 +188,10 @@ def score_aim_detailed(aim: str | None, cfg: Config, *, note: str = "") -> dict 
         return None
     from . import llm  # lazy: keep import cost off the fast/pure paths
 
-    served = llm.run_ladder(_AIM_SCORE_PROMPT.format(aim=aim), cfg, purpose="aim-score", note=note)
-    if served is None:
+    del cfg  # feature switches live on Config; routing does not.
+    raw = llm.run_model(_AIM_SCORE_PROMPT.format(aim=aim), "", purpose="aim-score", note=note)
+    if raw is None:
         return None
-    backend, raw = served
     obj = first_json_object(raw)
     score = obj.get("score")
     if not isinstance(score, (int, float)) or isinstance(score, bool):
@@ -207,12 +203,12 @@ def score_aim_detailed(aim: str | None, cfg: Config, *, note: str = "") -> dict 
         "criteria": {k: int(crit.get(k, 0) or 0) for k in _CRITERIA},
         "reason": str(obj.get("reason") or "").strip(),
         "missing": str(obj.get("missing") or "").strip(),
-        "backend": backend,
+        "backend": "router",
     }
 
 
 def score_aim_llm(aim: str | None, cfg: Config, *, note: str = "") -> tuple[int, str] | None:
-    """Refine the AIM score via the pluggable score-backend ladder. ``None`` on failure.
+    """Refine the AIM score via the configured LLM router. ``None`` on failure.
 
     Returns ``(score 0-100, reason)``; the reason folds in the rubric's ``missing`` hint so the
     stored ``aim_score_reason`` says how to improve. Never raises — degrades to ``None`` so the

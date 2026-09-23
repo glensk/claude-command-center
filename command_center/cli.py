@@ -417,12 +417,9 @@ def cmd_short_aim(args: argparse.Namespace) -> int:
     """
     from . import short_aim
 
-    cfg = config.load_config()
     candidate = getattr(args, "dry_run", None)
     if candidate is not None:
-        label = short_aim.generate(
-            candidate, backend=cfg.short_aim_backend, model=cfg.short_aim_model
-        )
+        label = short_aim.generate(candidate)
         print(label or "")
         return 0
 
@@ -436,12 +433,7 @@ def cmd_short_aim(args: argparse.Namespace) -> int:
             return 0
         history = store.list_aim_history(session_id)
         original = history[0].aim if history else None
-        label = short_aim.generate(
-            session.aim,
-            original=original,
-            backend=cfg.short_aim_backend,
-            model=cfg.short_aim_model,
-        )
+        label = short_aim.generate(session.aim, original=original)
         if label:
             store.set_short_aim(session_id, label)
         # Revision (1) keeps a label of its own: it is what the `/aim` column renders under
@@ -450,9 +442,7 @@ def cmd_short_aim(args: argparse.Namespace) -> int:
         # drops the original's stale one). Only generated when actually missing, so this
         # costs a second cheap call at most once per original.
         if original and original != session.aim and not history[0].short_aim:
-            if first_label := short_aim.generate(
-                original, backend=cfg.short_aim_backend, model=cfg.short_aim_model
-            ):
+            if first_label := short_aim.generate(original):
                 store.set_first_short_aim(session_id, first_label)
         if not label:
             return 0
@@ -591,6 +581,30 @@ def cmd_record_run(args: argparse.Namespace) -> int:
         return 1
     if not args.quiet:
         print(f"recorded {written} run(s) in {codex_ledger.ledger_path()}")
+    return 0
+
+
+def cmd_ledger_relabel(args: argparse.Namespace) -> int:
+    """One-shot repair of provably mislabelled sdsc reply-judgement history."""
+    from . import codex_ledger
+
+    applying = bool(getattr(args, "apply", False))
+    try:
+        changes = codex_ledger.relabel_reply_history(apply=applying)
+    except OSError as exc:
+        print(f"ledger-relabel: cannot read or rewrite {codex_ledger.ledger_path()}: {exc}")
+        return 1
+    verb = "relabelled" if applying else "would relabel"
+    for line_no, stamp, seat in changes:
+        seat_note = f", seat {seat}" if seat else ""
+        print(
+            f"line {line_no}: checker -> {codex_ledger.REPLY_RELABEL_PURPOSE} ({stamp}{seat_note})"
+        )
+    print(f"ledger-relabel: {verb} {len(changes)} row(s) in {codex_ledger.ledger_path()}")
+    if applying and changes:
+        print(f"backup: {codex_ledger.ledger_path().name}.bak")
+    elif not applying:
+        print("dry-run: pass --apply to rewrite the ledger")
     return 0
 
 
@@ -940,7 +954,7 @@ def cmd_check_drift(args: argparse.Namespace) -> int:
         )
         verdict = drift.check_drift(
             facts,
-            cfg.drift_model or cfg.llm_model,
+            "",
             note=llm.concise_note(evolution[0] or session.aim),
         )
         if verdict is None:
@@ -4944,7 +4958,7 @@ def cmd_autoprogress(args: argparse.Namespace) -> int:
                     store,
                     args.session,
                     transcript,
-                    model=config.load_config().llm_model,
+                    model="",
                     dry_run=args.dry_run,
                 )
             ]
@@ -5431,6 +5445,25 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     )
     p_rec.add_argument("-q", "--quiet", action="store_true", help="no confirmation line on success")
     p_rec.set_defaults(func=cmd_record_run)
+
+    p_relabel = sub.add_parser(
+        "ledger-relabel",
+        help="one-shot dry-run/apply repair of legacy sdsc reply purposes in the run ledger",
+    )
+    mode = p_relabel.add_mutually_exclusive_group()
+    mode.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="show rows that qualify without writing (the default)",
+    )
+    mode.add_argument(
+        "-a",
+        "--apply",
+        action="store_true",
+        help="back up and atomically rewrite qualifying rows",
+    )
+    p_relabel.set_defaults(func=cmd_ledger_relabel)
 
     p_drift = sub.add_parser("check-drift", help="internal: impartial sub-goal drift check (LLM)")
     p_drift.add_argument("--session")

@@ -25,6 +25,7 @@ from conftest import SeatFixture
 from command_center import codex_in_claude as cic
 from command_center import codex_ledger, quota
 from command_center.cli import _quota_last_run_note, cmd_record_run
+from command_center.cli import main as ccc_main
 
 _MODEL = "gpt-5.6-sol"
 
@@ -383,6 +384,45 @@ def test_record_run_type_checks_the_new_keys(
     code, err = _record(monkeypatch, _claude_row(caller=["ai.py"]))
     assert code == 2 and "'caller' must be str" in err
     assert not _ledger_rows(three_seats)
+
+
+def test_relabel_reply_history_dry_run_and_atomic_apply(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = codex_ledger.ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    before = _line("2026-09-21T19:11:13+02:00", "codex:de")
+    genuine = _line("2026-09-22T10:00:00+02:00", "codex:de", note="#255")
+    legacy = _line("2026-09-22T10:01:00+02:00", "codex:de")
+    malformed = "not json"
+    original = "\n".join((before, genuine, legacy, malformed)) + "\n"
+    path.write_text(original, encoding="utf-8")
+
+    assert ccc_main(["ledger-relabel"]) == 0
+    dry = capsys.readouterr().out
+    assert "would relabel 1 row(s)" in dry and "line 3" in dry
+    assert path.read_text(encoding="utf-8") == original
+    assert not path.with_name(path.name + ".bak").exists()
+
+    assert ccc_main(["ledger-relabel", "--apply"]) == 0
+    applied = capsys.readouterr().out
+    assert "relabelled 1 row(s)" in applied
+    assert path.with_name(path.name + ".bak").read_text(encoding="utf-8") == original
+    rows = path.read_text(encoding="utf-8").splitlines()
+    assert rows[0] == before and rows[1] == genuine and rows[3] == malformed
+    changed = json.loads(rows[2])
+    assert changed["purpose"] == "reply-2nd-opinion"
+    assert changed["relabelled_from"] == "checker"
+
+    assert ccc_main(["ledger-relabel", "--apply"]) == 0
+    assert "relabelled 0 row(s)" in capsys.readouterr().out
+
+
+def test_relabelled_from_is_an_optional_record_run_field() -> None:
+    row = codex_ledger.validate_row(
+        _claude_row(purpose="reply-2nd-opinion", relabelled_from="checker")
+    )
+    assert row["relabelled_from"] == "checker"
 
 
 def test_non_codex_families_never_stamp_a_codex_seat() -> None:

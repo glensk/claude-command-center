@@ -3,11 +3,8 @@
 
 ccc makes a handful of small headless LLM calls of its own (AIM scoring, the done-check,
 sub-goal derive/grade, drift detection, parked-session summaries, the short-AIM label).
-Every one of them bills *somebody's* quota, and which one is spread across half a dozen
-config keys (``score_backends``, ``short_aim_backend``, ``llm_custom_command``,
-``llm_account``, the per-action ``*_model`` overrides). That made "what is spending my
-Codex seat?" a source-reading exercise — on 2026-08-31 the answer turned out to be a
-single key (``short_aim_backend``) burning ~17.6k Codex tokens per ten-word label.
+Every one goes through the single ``llm_custom_command`` route; provider/model selection
+belongs to the external purpose ladder rather than ccc.
 
 This module renders the whole picture as one table — the ccc counterpart to
 ``ai.py routing`` — and names the config key that turns each row off or moves it.
@@ -171,96 +168,22 @@ def fetch_routes(command: str, purposes: Sequence[str]) -> dict[str, tuple[str, 
 
 
 def _dispatch_route(
-    cfg: Config, model: str, purpose: str, routes: dict[str, tuple[str, str, str]]
+    cfg: Config, purpose: str, routes: dict[str, tuple[str, str, str]]
 ) -> tuple[str, str, str]:
     """``(provider_cell, cost, ladder)`` for a call that goes through ``llm.run_model``.
 
-    Mirrors :func:`llm._dispatch`: a non-empty ``llm_custom_command`` takes the call and
-    only a failure inside it falls back to the pinned headless ``claude -p``.
+    Mirrors :func:`llm._dispatch`: an empty or failed command fails the call, with no
+    provider fallback inside ccc.
     """
     command = cfg.llm_custom_command.strip()
     if not command:
-        account = cfg.llm_account or "default"
-        return (
-            f"claude -p → {model or '(claude default)'}",
-            f"Claude subscription ({account})",
-            "",
-        )
+        return ("(router unset)", "nothing — call fails", "")
     if resolved := routes.get(purpose):
         first, cost, ladder = resolved
         return (f"ai.py → {first}", cost, ladder)
     if _ai_binary(command):
         return (f"ai.py → {_elide(command, 24)}", "ai.py (route query failed)", "")
     return (f"llm_custom_command → {_elide(command, 28)}", "external router", "")
-
-
-def _codex_seat_label() -> str:
-    """Which Codex seat ccc's own codex calls would bill right now (selector-resolved).
-
-    ``llm.run_codex`` routes through :func:`codex_in_claude.codex_exec_env`, so showing
-    a hardcoded "codex default" here could lie about the billed account whenever a pin
-    or hold is active. Display-only: any failure degrades to the old wording.
-    """
-    try:
-        from . import codex_in_claude, quota
-
-        home = codex_in_claude._codex_home()  # noqa: SLF001
-        for label, path in quota._canonical_codex_homes().items():  # noqa: SLF001
-            if path.expanduser().resolve() == home.expanduser().resolve():
-                return label
-        return str(home)
-    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-        return "codex default"
-
-
-def _rung(
-    name: str, cfg: Config, purpose: str, routes: dict[str, tuple[str, str, str]]
-) -> tuple[str, str, str]:
-    """``(provider_cell, cost, ladder)`` for one ``score_backends`` rung name."""
-    if name == "claude":
-        return _dispatch_route(cfg, cfg.score_model or cfg.llm_model, purpose, routes)
-    if name == "codex":
-        return (f"codex exec → ({_codex_seat_label()} seat)", CODEX_COST, "")
-    if name == "copilot":
-        return (f"opencode → {cfg.copilot_model or '(default)'}", COPILOT_COST, "")
-    if name == "gemini":
-        return (f"gemini → {cfg.gemini_model or '(default)'}", "Gemini quota", "")
-    if name == "custom":
-        command = cfg.score_custom_command.strip()
-        return (
-            f"score_custom_command → {_elide(command, 24)}" if command else "custom (unset)",
-            "external router" if command else "nothing — rung is unset",
-            "",
-        )
-    return (f"unknown rung {name!r}", "skipped at run time", "")
-
-
-def _short_aim_route(cfg: Config, routes: dict[str, tuple[str, str, str]]) -> tuple[str, str, str]:
-    """``(provider_cell, cost, ladder)`` for the short-AIM label generator.
-
-    ``auto`` resolves exactly as :func:`short_aim.resolve_backend` does — codex when the
-    CLI is on ``PATH``, else claude — so the table shows what would REALLY run, not the
-    literal config word.
-    """
-    backend = cfg.short_aim_backend
-    resolved = ("codex" if shutil.which("codex") else "claude") if backend == "auto" else backend
-    suffix = " (auto)" if backend == "auto" else ""
-    if resolved == "claude":
-        cell, cost, ladder = _dispatch_route(cfg, cfg.short_aim_model, "short-aim", routes)
-        return (cell + suffix, cost, ladder)
-    return (f"codex exec → {cfg.short_aim_model or '(codex default)'}{suffix}", CODEX_COST, "")
-
-
-def _score_row(cfg: Config, routes: dict[str, tuple[str, str, str]]) -> tuple[str, str, str]:
-    """``(provider_cell, cost, ladder)`` for the whole ``score_backends`` ladder."""
-    cells = [_rung(name, cfg, "aim-score", routes) for name in cfg.score_backends]
-    if not cells:
-        return ("(no rungs configured)", "—", "")
-    return (
-        "  →  ".join(cell for cell, _, _ in cells),
-        " → ".join(dict.fromkeys(cost for _, cost, _ in cells)),
-        next((lad for _, _, lad in cells if lad), ""),
-    )
 
 
 def rows(
@@ -278,57 +201,57 @@ def rows(
         cfg = load_config()
     routes = routes or {}
 
-    def dispatch(model: str, purpose: str) -> tuple[str, str, str]:
-        return _dispatch_route(cfg, model, purpose, routes)
+    def dispatch(purpose: str) -> tuple[str, str, str]:
+        return _dispatch_route(cfg, purpose, routes)
 
     specs: list[tuple[str, str, tuple[str, str, str], str, bool]] = [
         (
             "score-aim (on /aim set + on turn)",
             "aim-score",
-            _score_row(cfg, routes),
-            "score_backends · score_model · aim_score_on_set · assess_aim_on_turn",
+            dispatch("aim-score"),
+            "aim_score_on_set · assess_aim_on_turn · llm_custom_command",
             cfg.aim_score_on_set or cfg.assess_aim_on_turn,
         ),
         (
             "assess-aim (is the AIM met?)",
             "aim-met",
-            dispatch(cfg.assess_aim_model or cfg.llm_model, "aim-met"),
-            "assess_aim_on_turn · assess_aim_model",
+            dispatch("aim-met"),
+            "assess_aim_on_turn · llm_custom_command",
             cfg.assess_aim_on_turn,
         ),
         (
             "check-drift (sub-goals vs AIM)",
             "subgoal-drift",
-            dispatch(cfg.drift_model or cfg.llm_model, "subgoal-drift"),
-            "drift_check · drift_model",
+            dispatch("subgoal-drift"),
+            "drift_check · llm_custom_command",
             cfg.drift_check,
         ),
         (
             "autoprogress (derive sub-goals)",
             "subgoal-derive",
-            dispatch(cfg.llm_model, "subgoal-derive"),
-            "autoprogress · llm_model",
+            dispatch("subgoal-derive"),
+            "autoprogress · llm_custom_command",
             cfg.autoprogress,
         ),
         (
             "autoprogress (grade sub-goals)",
             "subgoal-grade",
-            dispatch(cfg.llm_model, "subgoal-grade"),
-            "grade_on_turn · llm_model",
+            dispatch("subgoal-grade"),
+            "grade_on_turn · llm_custom_command",
             cfg.grade_on_turn,
         ),
         (
             "daemon summary + next step",
             "summary-nextstep",
-            dispatch(cfg.llm_model, "summary-nextstep"),
-            "summarize · llm_model",
+            dispatch("summary-nextstep"),
+            "summarize · llm_custom_command",
             cfg.summarize,
         ),
         (
             "short-AIM label (/aim column)",
             "short-aim",
-            _short_aim_route(cfg, routes),
-            "short_aim · short_aim_backend · short_aim_model",
+            dispatch("short-aim"),
+            "short_aim · llm_custom_command",
             cfg.short_aim,
         ),
     ]
@@ -406,10 +329,8 @@ def render(cfg: Config | None = None, *, live: bool = True) -> str:
     if spenders:
         names = ", ".join(r.purpose for r in spenders)
         lines += [
-            f"⚠ Spending the Codex seat: {names}. Every `codex exec` re-sends ~17.6k tokens of",
-            "  AGENTS.md + plugin catalogue before your prompt, so a ten-word label costs a full",
-            "  prompt. To keep the Codex window for /codex-debate, set"
-            ' short_aim_backend = "claude".',
+            f"⚠ The external router currently sends these purposes to Codex: {names}.",
+            "  Change their ladders in ai.py; ccc has no provider fallback of its own.",
         ]
     else:
         lines.append("✓ No ccc action bills the Codex seat — it is free for /codex-debate.")
@@ -417,10 +338,8 @@ def render(cfg: Config | None = None, *, live: bool = True) -> str:
     lines += ["", "Change any row in ~/.claude/command-center/config.toml (keys per action):"]
     lines += [f"  {r.purpose:<17} {r.switch}" for r in all_rows]
     lines += [
-        "  llm_custom_command  routes EVERY claude-backed row above through one external",
-        "                      command (purpose in $CCC_LLM_PURPOSE) — the escape hatch off",
-        "                      the Claude subscription; empty = pinned `claude -p`.",
-        "  llm_account         which Claude seat the pinned `claude -p` bills.",
+        "  llm_custom_command  routes EVERY row above through one external command",
+        "                      (purpose in $CCC_LLM_PURPOSE); empty/failure fails the call.",
     ]
     return "\n".join(lines) + "\n"
 

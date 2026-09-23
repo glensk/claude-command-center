@@ -611,11 +611,10 @@ def test_work_halt_does_not_gate_private_resume(two_accounts: dict[str, Path]) -
 
 
 # ---------------------------------------------------------------------------
-# D10 — llm.run_model routes through llm_custom_command, else pinned claude -p
+# D10 — llm.run_model routes through llm_custom_command only
 # ---------------------------------------------------------------------------
 def test_run_model_routes_through_llm_custom_command(monkeypatch: pytest.MonkeyPatch) -> None:
     """A configured llm_custom_command serves the call (claude -p never runs)."""
-    monkeypatch.setattr(llm, "_run_claude", lambda *_a, **_k: pytest.fail("claude -p used"))
     monkeypatch.setattr(
         config, "load_config", lambda: config.Config(llm_custom_command="my-router")
     )
@@ -641,42 +640,11 @@ def test_run_model_routes_through_llm_custom_command(monkeypatch: pytest.MonkeyP
     assert env["CCC_INTERNAL"] == "1" and env["AI_NO_AUTOCOMMIT"] == "1"
 
 
-def test_run_model_falls_back_to_pinned_claude(
-    two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """No llm_custom_command → headless claude -p with llm_account pinned (never ambient)."""
-    monkeypatch.setattr(llm.shutil, "which", lambda _name: "/usr/bin/claude")
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(two_accounts["work"]))  # ambient work
-    captured: dict[str, object] = {}
-
-    class _Result:
-        returncode = 0
-        stdout = "ok"
-
-    def _run(argv: list[str], **kwargs: object) -> _Result:
-        captured["argv"] = argv
-        captured["env"] = kwargs.get("env")
-        return _Result()
-
-    monkeypatch.setattr(llm.subprocess, "run", _run)
-    assert llm.run_model("p", "m") == "ok"
-    argv = captured["argv"]
-    assert isinstance(argv, list)
-    assert argv[:2] == ["claude", "-p"]
-    env = captured["env"]
-    assert isinstance(env, dict)
-    # llm_account defaults to "private" (the default account) → CLAUDE_CONFIG_DIR unset,
-    # even though the ambient env had it set to work.
-    assert "CLAUDE_CONFIG_DIR" not in env
-    assert env["CCC_INTERNAL"] == "1"
-
-
 # ---------------------------------------------------------------------------
 # per-action purpose/note labels exported as CCC_LLM_PURPOSE / CCC_LLM_NOTE
 # ---------------------------------------------------------------------------
 def _capture_custom_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """Route through llm_custom_command and capture the env the subprocess would get."""
-    monkeypatch.setattr(llm, "_run_claude", lambda *_a, **_k: pytest.fail("claude -p used"))
     monkeypatch.setattr(
         config, "load_config", lambda: config.Config(llm_custom_command="my-router")
     )

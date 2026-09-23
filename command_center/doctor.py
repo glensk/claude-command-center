@@ -545,38 +545,6 @@ def _section_terminal() -> Section:
     return section
 
 
-#: Score-ladder backend → the CLI whose presence enables it (custom has no CLI dep).
-_SCORE_BACKEND_TOOL = {
-    "copilot": "opencode",
-    "gemini": "gemini",
-    "codex": "codex",
-    "claude": "claude",
-}
-
-
-def _score_ladder_checks(cfg: config.Config) -> list[Check]:
-    """Per-rung availability of the configured AIM-score fallback ladder (``score_backends``)."""
-    if not cfg.score_backends:
-        return [Check(NA, "score ladder", "no backends configured (offline lexical score only)")]
-    checks: list[Check] = []
-    for name in cfg.score_backends:
-        label = f"score ladder → {name}"
-        if name == "custom":
-            if cfg.score_custom_command.strip():
-                checks.append(Check(OK, label, "score_custom_command configured"))
-            else:
-                checks.append(Check(FAIL, label, "no score_custom_command set"))
-            continue
-        tool = _SCORE_BACKEND_TOOL.get(name)
-        if tool is None:
-            checks.append(Check(FAIL, label, "unknown backend"))
-        elif shutil.which(tool):
-            checks.append(Check(OK, label, f"{tool} on PATH"))
-        else:
-            checks.append(Check(FAIL, label, f"{tool} not found"))
-    return checks
-
-
 def _readable(path: Path) -> bool:
     """True when *path* exists and this process can actually open it for reading."""
     try:
@@ -642,7 +610,10 @@ def _section_features(  # pylint: disable=too-many-branches,too-many-statements
     cfg: config.Config,
 ) -> Section:
     section = Section("Features & dependencies")
-    section.checks.extend(_score_ladder_checks(cfg))
+    if cfg.llm_custom_command.strip():
+        section.checks.append(Check(OK, "LLM router", "llm_custom_command configured"))
+    else:
+        section.checks.append(Check(NA, "LLM router", "llm_custom_command is empty"))
 
     if cfg.copilot_usage:
         if shutil.which("gh"):
@@ -671,22 +642,6 @@ def _section_features(  # pylint: disable=too-many-branches,too-many-statements
                 )
     else:
         section.checks.append(Check(NA, "codex_usage → auth.json", "disabled"))
-
-    if cfg.short_aim and cfg.short_aim_backend in ("codex", "auto"):
-        if shutil.which("codex"):
-            section.checks.append(Check(OK, "short_aim → codex", "codex CLI on PATH"))
-        else:
-            section.checks.append(
-                Check(
-                    FAIL,
-                    "short_aim → codex",
-                    f"codex not found (backend={cfg.short_aim_backend})",
-                )
-            )
-    elif cfg.short_aim:
-        section.checks.append(Check(NA, "short_aim → codex", "using the claude backend"))
-    else:
-        section.checks.append(Check(NA, "short_aim → codex", "disabled"))
 
     if cfg.resume_halted:
         from . import resume  # pylint: disable=import-outside-toplevel

@@ -9,7 +9,6 @@ wizard). This module pins that contract:
   set is exactly the expected one),
 * with the default config and a temp ``CLAUDE_HOME``, the hook entry points and one
   daemon pass spawn NOTHING and write nowhere outside ``CLAUDE_HOME``,
-* ``short_aim_backend = "auto"`` resolves to ``claude`` when the codex CLI is absent.
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import config, daemon, hooks, short_aim
+from command_center import config, daemon, hooks
 from command_center import spawn as spawn_mod
 from command_center.models import now_ms
 from command_center.store import Store
@@ -58,29 +57,6 @@ def test_inert_default_keys_match_and_are_all_false() -> None:
     for key in config.INERT_DEFAULT_KEYS:
         assert config.DEFAULTS[key] is False, f"{key} must be False in DEFAULTS (inert contract)"
         assert getattr(default_cfg, key) is False, f"Config().{key} must default False"
-
-
-def test_short_aim_backend_auto_resolves_to_claude_without_codex(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ "auto" prefers codex when on PATH, falls back to claude otherwise; explicit values stay."""
-    # Codex absent from PATH -> auto falls back to the claude backend.
-    monkeypatch.setattr(short_aim.shutil, "which", lambda _name: None)
-    assert short_aim.resolve_backend("auto") == "claude"
-
-    # Codex present -> auto prefers it (keeps the cost off Claude tokens).
-    monkeypatch.setattr(
-        short_aim.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None
-    )
-    assert short_aim.resolve_backend("auto") == "codex"
-
-    # Explicit values always pass through unchanged (no PATH probe).
-    monkeypatch.setattr(short_aim.shutil, "which", lambda _name: None)
-    assert short_aim.resolve_backend("codex") == "codex"
-    assert short_aim.resolve_backend("claude") == "claude"
-
-    # The shipped default is "auto".
-    assert config.Config().short_aim_backend == "auto"
 
 
 def _files_outside(root: Path, exclude: Path) -> dict[str, bytes]:

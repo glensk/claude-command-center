@@ -3863,7 +3863,7 @@ def _attempt_codex(  # pylint: disable=too-many-locals
 
 
 def ephemeral_default() -> bool:
-    """Whether ``run`` / :func:`command_center.llm.run_codex` pass ``--ephemeral``.
+    """Whether ``run`` passes ``--ephemeral``.
 
     The rule is the mirror image of the routing feedback (plan D6, debate O2): the
     ``codex exec --json`` stream carries NO ``rate_limits`` event (verified live
@@ -4185,7 +4185,7 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
 ) -> RunResult:
     """The seat-hopping round behind :func:`run_with_fallback` (which adds the ledger).
 
-    ``delegate``, ``run`` and :func:`command_center.llm.run_codex` all come through
+    ``delegate`` and ``run`` both come through
     here, so "which seat, in which order, and what happens when it says no" has one
     implementation and one set of tests.
 

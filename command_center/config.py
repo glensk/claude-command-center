@@ -49,23 +49,13 @@ DEFAULTS: dict[str, object] = {
     "launch_effort": "xhigh",
     "stale_days": 7,  # alert when a goal is parked this long with done unmet
     "deadline_warn_days": 2,  # amber badge / alert this many days before a deadline
-    "llm_model": "claude-haiku-4-5",  # model for summary / next-step regeneration
-    "score_model": "",  # model for the INDEPENDENT AIM rubric checker ("" = use llm_model)
-    # Ordered fallback ladder for the AIM-score LLM call. Allowed rungs: "copilot", "gemini",
-    # "codex", "claude", "custom"; the first that returns non-empty text serves, the rest are
-    # tried in order. Unknown entries are skipped with a stderr warning at use time. This is a
-    # DELIBERATE behaviour change (see docs/reference.md): with copilot/gemini/codex ahead of
-    # claude the score call moves OFF Anthropic tokens when those CLIs are available.
-    "score_backends": ["claude"],
-    # shell cmd for the "custom" score rung (full prompt on stdin, model text on stdout)
-    "score_custom_command": "",
-    # Escape hatch for EVERY other headless LLM call ccc makes (summaries, drift,
-    # AIM-met, sub-goal derive/grade, short-aim): when set, this shell command runs
-    # instead of `claude -p` — full prompt on stdin, model text on stdout, with
+    # The ONE route for every headless LLM call ccc makes (AIM score/met, summaries,
+    # drift, sub-goal derive/grade, short-aim). The command receives the full prompt on
+    # stdin and returns model text on stdout, with
     # CCC_LLM_PURPOSE / CCC_LLM_NOTE exported so a router can log or route per action.
-    # Non-zero exit / empty output falls back to `claude -p`. "" = disabled.
+    # Normally: `ai prompt -R judge -p "$CCC_LLM_PURPOSE"`. Non-zero/empty output fails
+    # the call; ccc never picks a fallback provider. "" = disabled.
     "llm_custom_command": "",
-    "gemini_model": "",  # model flag for the gemini score rung ("" = the gemini CLI's own default)
     # alert channels: "auto" (native desktop notifier per platform), "macos", "linux", "slack".
     # Default "auto" -> osascript on macOS, notify-send (libnotify) on Linux.
     "notify": ["auto"],
@@ -78,7 +68,6 @@ DEFAULTS: dict[str, object] = {
     "grade_on_turn": False,  # grade progress right after each turn (detached) (INERT: off)
     "grade_debounce_sec": 30,  # min seconds between after-turn grader spawns per session
     "assess_aim_on_turn": False,  # self-assess "is the AIM fulfilled?" after each turn (INERT)
-    "assess_aim_model": "",  # model for the AIM-met checker ("" = use llm_model); never the session
     "max_aim_assess_per_run": 3,  # cap AIM-met assessments per daemon fallback pass (cost guard)
     "aim_score_threshold": 50,  # AIM specificity < this (0..100) => vague: red + sharpen nudge
     "aim_score_on_set": False,  # refine the AIM score with an LLM call when the AIM changes (INERT)
@@ -86,16 +75,12 @@ DEFAULTS: dict[str, object] = {
     "sharpen_every_n_turns": 1,  # agent re-sharpens a vague AIM every Nth prompt (0 = start only)
     "adapt_subgoals_on_aim_change": True,  # nudge the agent to re-align an adaptive checklist
     "drift_check": False,  # run the impartial drift checker after a sub-goal change (INERT: off)
-    "drift_model": "",  # model for the drift checker ("" = use llm_model); never the session agent
     # Which AIM revision the narrow /aim column (TUI + `ccc ls`) renders: "first" = the
     # done-condition as ORIGINALLY typed (revision (1)) so the column is a stable job
     # identity while the AIM is sharpened; "latest" = the current AIM. Either way the
     # current AIM stays in the status line, the detail pane and `ccc aim-history`.
     "aim_column": "first",
     "short_aim": False,  # derive a short scannable AIM label for the /aim column (INERT: off)
-    # generator: "auto" (codex if on PATH else claude) | "codex" (saves Claude tokens) | "claude"
-    "short_aim_backend": "auto",
-    "short_aim_model": "",  # model for the generator ("" = backend default; codex picks its own)
     "usage_refresh_sec": 5.0,  # TUI usage-card re-read/render cadence (drives the refresh timer)
     "copilot_usage": False,  # show a GitHub Copilot month-to-date usage card (gh API) (INERT: off)
     "copilot_usage_refresh_sec": 900,  # min sec between idle gh billing refreshes (cost guard)
@@ -166,7 +151,7 @@ DEFAULTS: dict[str, object] = {
     # It is ALSO the Codex routing FEEDBACK switch (plan D6, tp#212). ON: the runner
     # refreshes the attempted seat's live figures after every attempt (and every stale
     # candidate once, before selection), so ``codex_seat_policy = "fill"`` re-ranks on
-    # fresh evidence. OFF: ``codex-in-claude run`` and ``llm.run_codex`` drop
+    # fresh evidence. OFF: ``codex-in-claude run`` drops
     # ``--ephemeral`` (they stay UNJOURNALLED) so codex's own rollout file carries the
     # ``rate_limits`` block that measures the seat — the ``codex exec --json`` stream
     # carries none (verified live 2026-09-09, debate O2). ``run --ephemeral`` forces the
@@ -281,7 +266,6 @@ DEFAULTS: dict[str, object] = {
     "nixos_overseer_dir": "",
     "card_nixos_overseer_supervised": True,  # expand the "nixos overseer supervised" card
     "card_nixos_overseer_tier_a": False,  # expand the "nixos overseer tier_a" card (off by default)
-    "llm_account": "private",  # account ccc's own headless `claude -p` calls bill to
     "prune_headless": True,  # daemon deletes contentless leftover rows (headless `claude -p` junk)
     "sync_tab_titles": True,  # daemon keeps every live tab's iTerm title in sync with its badge
     "daemon_interval_sec": 300,  # launchd StartInterval for `ccc daemon`
@@ -388,6 +372,24 @@ DEFAULTS: dict[str, object] = {
         "ssh",
     ],
 }
+
+# Removed routing knobs are accepted in existing files but have no effect. Keeping this
+# explicit allow-list prevents config writers from treating a safe old key as an unknown
+# key that blocks an otherwise unrelated update; the next save simply omits it.
+DEPRECATED_LLM_CONFIG_KEYS = frozenset(
+    {
+        "llm_model",
+        "score_model",
+        "score_backends",
+        "score_custom_command",
+        "gemini_model",
+        "assess_aim_model",
+        "drift_model",
+        "short_aim_backend",
+        "short_aim_model",
+        "llm_account",
+    }
+)
 
 
 # Fresh-install INERT contract: every key below defaults to False so a bare `ccc`
@@ -589,7 +591,9 @@ def unknown_config_keys() -> list[str]:
             data = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError):
         return []
-    return sorted(str(key) for key in data if key not in DEFAULTS)
+    return sorted(
+        str(key) for key in data if key not in DEFAULTS and key not in DEPRECATED_LLM_CONFIG_KEYS
+    )
 
 
 def codex_homes() -> dict[str, Path]:
@@ -841,12 +845,7 @@ class Config:
     launch_effort: str = "xhigh"
     stale_days: int = 7
     deadline_warn_days: int = 2
-    llm_model: str = "claude-haiku-4-5"
-    score_model: str = ""
-    score_backends: list[str] = field(default_factory=lambda: ["claude"])
-    score_custom_command: str = ""
     llm_custom_command: str = ""
-    gemini_model: str = ""
     notify: list[str] = field(default_factory=lambda: ["auto"])
     statusline_enabled: bool = True
     reap: bool = False
@@ -857,7 +856,6 @@ class Config:
     grade_on_turn: bool = False
     grade_debounce_sec: int = 30
     assess_aim_on_turn: bool = False
-    assess_aim_model: str = ""
     max_aim_assess_per_run: int = 3
     aim_score_threshold: int = 50
     aim_score_on_set: bool = False
@@ -865,11 +863,8 @@ class Config:
     sharpen_every_n_turns: int = 1
     adapt_subgoals_on_aim_change: bool = True
     drift_check: bool = False
-    drift_model: str = ""
     aim_column: str = "first"  # /aim column revision: "first" (revision (1)) | "latest"
     short_aim: bool = False
-    short_aim_backend: str = "auto"
-    short_aim_model: str = ""
     usage_refresh_sec: float = 5.0
     copilot_usage: bool = False
     copilot_usage_refresh_sec: int = 900
@@ -928,7 +923,6 @@ class Config:
     nixos_overseer_dir: str = ""  # external overseer root ("" = feature off)
     card_nixos_overseer_supervised: bool = True
     card_nixos_overseer_tier_a: bool = False
-    llm_account: str = "private"
     prune_headless: bool = True
     sync_tab_titles: bool = True
     daemon_interval_sec: int = 300

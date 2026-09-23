@@ -31,7 +31,7 @@ Research notes (informed the design; be skeptical — these are evals, not a law
   we rely on the transcript delta and treat TodoWrite as optional context.
   https://docs.claude.com/en/docs/agent-sdk/todo-tracking
 
-Cost guards: cheap model only (``config.llm_model``), capped at
+Cost guards: routed judge role only, capped at
 ``config.max_autoprogress_per_run`` sessions per daemon pass, and we never
 re-read the whole transcript — only the delta since the last persisted offset.
 
@@ -392,9 +392,7 @@ def run_pass(store: Store, adapter: object, *, dry_run: bool = False) -> list[Au
     for session in candidates[: max(0, cfg.max_autoprogress_per_run)]:
         transcript = _transcript_path(adapter, session.cwd, session.session_id)
         results.append(
-            run_for_session(
-                store, session.session_id, transcript, model=cfg.llm_model, dry_run=dry_run
-            )
+            run_for_session(store, session.session_id, transcript, model="", dry_run=dry_run)
         )
     return results
 

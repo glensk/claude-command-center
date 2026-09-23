@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """The Codex run ledger: one JSON line per PHYSICAL attempt the runner made.
 
-Every Codex call in ccc goes through :func:`command_center.codex_in_claude.run_with_fallback`
-(``run``, ``delegate``, :func:`command_center.llm.run_codex`), and until 2026-09-21 that
+Every direct Codex call in ccc goes through
+:func:`command_center.codex_in_claude.run_with_fallback` (``run`` and ``delegate``), and until
+2026-09-21 that
 single entrance recorded nothing durable about what it launched: the seat-attempts file
 keeps ONE timestamp per seat (the round-robin's input), and with ``codex_usage`` on the run
 is ``--ephemeral``, so not even a rollout file survives. The question "did this Mac spend
@@ -56,8 +57,11 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
     _direct_run(__file__)
 
+import contextlib
 import json
 import os
+import shutil
+import tempfile
 import time
 import uuid
 from collections import Counter
@@ -99,6 +103,7 @@ _OPTIONAL: dict[str, type | tuple[type, ...]] = {
     "attempt_id": str,
     "caller": str,
     "note": str,
+    "relabelled_from": str,
     "model": str,
     "requested_model": str,
     "effort": str,
@@ -114,6 +119,12 @@ _OPTIONAL: dict[str, type | tuple[type, ...]] = {
     "error": str,
     "error_message": str,
 }
+
+# sdsc's real checker began attaching a ticket note on this commit timestamp. After
+# this instant, a note-less `checker` row can only be one of the two formerly
+# mislabelled reply judgements; those two cannot be distinguished from each other.
+REPLY_RELABEL_AFTER = datetime.fromisoformat("2026-09-21T19:11:14+02:00")
+REPLY_RELABEL_PURPOSE = "reply-2nd-opinion"
 
 
 def sanitize_note(note: str | None) -> str:
@@ -329,6 +340,79 @@ def read_runs(path: Path | None = None) -> list[dict[str, Any]]:
         if isinstance(row, dict) and row.get("ts"):
             rows.append(row)
     return rows
+
+
+def _reply_relabel_candidate(row: Any) -> bool:
+    """Whether a legacy row is provably one of sdsc's reply second opinions."""
+    if not isinstance(row, dict) or row.get("purpose") != "checker" or row.get("note"):
+        return False
+    stamp = row.get("ts")
+    if not isinstance(stamp, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        return False
+    return parsed > REPLY_RELABEL_AFTER
+
+
+def relabel_reply_history(
+    path: Path | None = None, *, apply: bool = False
+) -> list[tuple[int, str, str]]:
+    """Find or rewrite provable legacy reply rows under the ledger lock.
+
+    Returns ``[(line_number, timestamp, seat), ...]``. Dry-run is the default. Apply
+    first copies the exact ledger to ``codex-runs.jsonl.bak``, then atomically replaces
+    it; malformed/unrelated lines are preserved byte-for-byte. The operation is
+    idempotent because rewritten rows no longer have purpose ``checker``.
+    """
+    from . import usage  # pylint: disable=import-outside-toplevel  # shared lock contract
+
+    target = ledger_path() if path is None else path
+    if not target.exists():
+        return []
+    with usage._flock(target.with_suffix(".lock")):  # noqa: SLF001
+        raw = target.read_text(encoding="utf-8")
+        lines = raw.splitlines(keepends=True)
+        changed: list[tuple[int, str, str]] = []
+        rewritten: list[str] = []
+        for line_no, line in enumerate(lines, 1):
+            ending = "\n" if line.endswith("\n") else ""
+            body = line[:-1] if ending else line
+            try:
+                row = json.loads(body)
+            except (json.JSONDecodeError, ValueError):
+                rewritten.append(line)
+                continue
+            if not _reply_relabel_candidate(row):
+                rewritten.append(line)
+                continue
+            row["purpose"] = REPLY_RELABEL_PURPOSE
+            row["relabelled_from"] = "checker"
+            changed.append((line_no, str(row["ts"]), str(row.get("seat") or "")))
+            rewritten.append(json.dumps(row, separators=(",", ":")) + ending)
+        if apply and changed:
+            backup = target.with_name(target.name + ".bak")
+            shutil.copy2(target, backup)
+            fd, temp_name = tempfile.mkstemp(
+                dir=str(target.parent), prefix=target.name + ".", suffix=".tmp"
+            )
+            replaced = False
+            try:
+                os.fchmod(fd, target.stat().st_mode & 0o777)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write("".join(rewritten))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_name, target)
+                replaced = True
+            finally:
+                if not replaced:
+                    with contextlib.suppress(OSError):
+                        os.unlink(temp_name)
+        return changed
 
 
 def _epoch(stamp: str) -> int:

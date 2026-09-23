@@ -111,15 +111,9 @@ def test_codex_usage_flag_drives_the_auth_json_check(
     assert ok["codex_usage → auth.json (default)"] == doctor.OK
 
 
-def test_short_aim_codex_backend_check(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(doctor.shutil, "which", _which_factory({"osascript"}))  # no codex
-    cfg = config.Config(short_aim=True, short_aim_backend="codex")
-    assert _feat(cfg, "short_aim → codex") == doctor.FAIL
-    monkeypatch.setattr(doctor.shutil, "which", _which_factory({"codex", "osascript"}))
-    assert _feat(cfg, "short_aim → codex") == doctor.OK
-    # claude backend → the codex dep does not apply.
-    claude_cfg = config.Config(short_aim=True, short_aim_backend="claude")
-    assert _feat(claude_cfg, "short_aim → codex") == doctor.NA
+def test_llm_router_check() -> None:
+    assert _feat(config.Config(llm_custom_command=""), "LLM router") == doctor.NA
+    assert _feat(config.Config(llm_custom_command="ai prompt"), "LLM router") == doctor.OK
 
 
 def test_resume_halted_checks_session_continue(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -150,28 +144,6 @@ def test_launcher_dependency_check(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(doctor.shutil, "which", _which_factory({"tmux"}))
     tmux = _statuses(doctor._section_features(config.Config(launcher="tmux")))
     assert tmux["launcher=tmux → tmux"] == doctor.OK
-
-
-def test_score_ladder_rungs_rendered(monkeypatch: pytest.MonkeyPatch) -> None:
-    # opencode + claude present; gemini absent; custom has no command → per-rung ✅/❌.
-    monkeypatch.setattr(doctor.shutil, "which", _which_factory({"opencode", "claude"}))
-    cfg = config.Config(score_backends=["copilot", "gemini", "claude", "custom"])
-    st = _statuses(doctor._section_features(cfg))
-    assert st["score ladder → copilot"] == doctor.OK  # opencode on PATH
-    assert st["score ladder → gemini"] == doctor.FAIL  # gemini not found
-    assert st["score ladder → claude"] == doctor.OK
-    assert st["score ladder → custom"] == doctor.FAIL  # no score_custom_command set
-
-
-def test_score_ladder_custom_command_makes_it_ok(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(doctor.shutil, "which", _which_factory(set()))
-    cfg = config.Config(score_backends=["custom"], score_custom_command="my-router --score")
-    assert _feat(cfg, "score ladder → custom") == doctor.OK
-
-
-def test_score_ladder_empty_is_na(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(doctor.shutil, "which", _which_factory(set()))
-    assert _feat(config.Config(score_backends=[]), "score ladder") == doctor.NA
 
 
 # ------------------------------ daemon section: platform-aware ------------------------------ #

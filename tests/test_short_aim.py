@@ -53,58 +53,31 @@ def test_generate_none_on_empty_aim() -> None:
     assert short_aim.generate("  ") is None
 
 
-def test_generate_codex_backend_routes_to_run_codex(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generate_routes_to_run_model(monkeypatch: pytest.MonkeyPatch) -> None:
     from command_center import llm
 
     seen: dict[str, str] = {}
 
-    def fake_codex(prompt: str, model: str = "") -> str:
+    def fake_router(prompt: str, model: str, *, purpose: str, note: str) -> str:
         seen["prompt"] = prompt
         seen["model"] = model
+        seen["purpose"] = purpose
+        seen["note"] = note
         return '"implement short aim"\n'
 
-    monkeypatch.setattr(llm, "run_codex", fake_codex)
-    monkeypatch.setattr(llm, "run_model", lambda *_a, **_k: "WRONG — claude path used")
-    out = short_aim.generate("show a short aim in ccc", backend="codex", model="m1")
+    monkeypatch.setattr(llm, "run_model", fake_router)
+    out = short_aim.generate("show a short aim in ccc", original="short original")
     assert out == "implement short aim"  # sanitized
-    assert seen["model"] == "m1"
+    assert seen["model"] == ""
+    assert seen["purpose"] == "short-aim" and seen["note"] == "short original"
     assert "show a short aim in ccc" in seen["prompt"]  # the AIM is in the prompt
 
 
-def test_generate_claude_backend_routes_to_run_model(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generate_none_on_router_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     from command_center import llm
 
-    monkeypatch.setattr(llm, "run_model", lambda *_a, **_k: "fix login bug")
-    monkeypatch.setattr(llm, "run_codex", lambda *_a, **_k: "WRONG — codex path used")
-    assert short_aim.generate("the login bug is fixed", backend="claude") == "fix login bug"
-
-
-def test_generate_claude_backend_passes_short_aim_purpose(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The claude backend labels its ai.py call ``short-aim`` and notes the original AIM."""
-    from command_center import llm
-
-    seen: dict[str, object] = {}
-
-    def _capture(_prompt: str, _model: str, *, purpose: str = "", note: str = "") -> str:
-        seen["purpose"] = purpose
-        seen["note"] = note
-        return "fix login bug"
-
-    monkeypatch.setattr(llm, "run_model", _capture)
-    monkeypatch.setattr(llm, "run_codex", lambda *_a, **_k: "WRONG — codex path used")
-    out = short_aim.generate(
-        "the login bug in the auth flow is fixed", original="fix login", backend="claude"
-    )
-    assert out == "fix login bug"
-    assert seen["purpose"] == "short-aim"
-    assert seen["note"] == "fix login"  # concise first AIM, log context only
-
-
-def test_generate_none_on_backend_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    from command_center import llm
-
-    monkeypatch.setattr(llm, "run_codex", lambda *_a, **_k: None)
-    assert short_aim.generate("ship it", backend="codex") is None
+    monkeypatch.setattr(llm, "run_model", lambda *_a, **_k: None)
+    assert short_aim.generate("ship it") is None
 
 
 def test_original_hint_included_only_when_distinct() -> None:

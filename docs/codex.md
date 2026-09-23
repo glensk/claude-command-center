@@ -91,8 +91,8 @@ default itself.
 
 ## Seat policy: fill (default) or order — next attempt and runtime fallback
 
-Every Codex consumer — `delegate`, the machine `run` subcommand, ccc's own
-`llm.run_codex`, `codex-review.py`, sdsc-automations' checker — goes through one runner
+Every direct Codex consumer — `delegate`, the machine `run` subcommand,
+`codex-review.py`, sdsc-automations' checker — goes through one runner
 (`codex_in_claude.run_with_fallback`), so "which login is billed, and what happens when
 it says no" has one behaviour and one set of tests. It **falls through at run time** when
 a seat is held, exhausted, unpaid or refusing. The trigger was concrete: on 2026-09-04
@@ -391,7 +391,7 @@ dead / machine slept (killed after codex stopped making progress). On failure `e
 **Session files are the measurement.** The `codex exec --json` stream carries no
 `rate_limits` event at all (verified live 2026-09-09), so an ephemeral run leaves nothing
 that says what it cost the seat it just billed — and the `fill` policy needs that to route
-the next one. So while `codex_usage` is **off**, `run` and `llm.run_codex` keep their
+the next one. So while `codex_usage` is **off**, `run` keeps its
 session file (no `--ephemeral`) and the rollout's `rate_limits` block does the measuring;
 they stay UNJOURNALLED either way (only `-P/--persist` journals, which is what `--resume`
 needs). With `codex_usage` **on** they are ephemeral again and the runner fetches the live
