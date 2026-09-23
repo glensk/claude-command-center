@@ -10,11 +10,14 @@ launchd wiring depends on.
 from __future__ import annotations
 
 import plistlib
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from command_center import config, launchd
+
+# pylint: disable=redefined-outer-name  # pytest fixtures are injected by parameter name
 
 
 def _cfg(tmp_path: Path) -> config.Config:
@@ -137,8 +140,6 @@ class _Launchctl:
         self.loaded = loaded
 
     def __call__(self, *args: str):  # noqa: ANN204
-        import subprocess
-
         self.calls.append(args)
         rc = 0
         if args[0] == "print":
@@ -196,12 +197,11 @@ def test_panel_server_start_without_install_fails(fake_launchctl: _Launchctl) ->
     assert not any(call[0] == "bootstrap" for call in fake_launchctl.calls)
 
 
+@pytest.mark.usefixtures("fake_launchctl")
 def test_daemon_install_never_touches_the_panel_server(
-    tmp_path: Path, fake_launchctl: _Launchctl, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Opt-in contract: `ccc daemon --install` does not install the panel server."""
-    import subprocess
-
     monkeypatch.setattr(
         launchd.subprocess,
         "run",
