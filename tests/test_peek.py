@@ -9,9 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from command_center import peek
+from command_center import colors, peek, tabsymbol
 from command_center.adapters import ClaudeAdapter
 from command_center.adapters.claude import events_in_file
+from command_center.models import AimRevision
 from command_center.store import Store
 
 
@@ -175,7 +176,7 @@ def test_all_user_prompts_returns_every_human_turn_in_order(tmp_path: Path) -> N
         "second prompt",
         "third prompt",
     ]
-    assert adapter.all_user_prompts("/Users/x/none", "missing") == []  # no transcript
+    assert not adapter.all_user_prompts("/Users/x/none", "missing")  # no transcript
 
 
 def test_queued_prompts_are_listed_in_conversation_order(tmp_path: Path) -> None:
@@ -241,6 +242,78 @@ def test_queued_prompts_keep_session_events_aligned(tmp_path: Path) -> None:
     assert events == ["first prompt", "queued while busy"]
 
 
+def _asked(questions: list[dict], answers: dict, annotations: dict | None = None) -> dict:
+    """The ``tool_result`` record of an answered AskUserQuestion call."""
+    record = _user([{"type": "tool_result", "tool_use_id": "t1", "content": "answered"}])
+    record["toolUseResult"] = {
+        "questions": questions,
+        "answers": answers,
+        "annotations": annotations or {},
+    }
+    return record
+
+
+def _question(text: str, labels: list[str], header: str = "", multi: bool = False) -> dict:
+    options = [{"label": label, "description": "d"} for label in labels]
+    return {"question": text, "header": header, "options": options, "multiSelect": multi}
+
+
+def test_ask_user_question_answer_is_a_prompt(tmp_path: Path) -> None:
+    # Answering the question tool is a human decision: it is listed as a prompt with
+    # every option shown and the pick ✅, in conversation order, in BOTH numberings.
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    single = _question("Which way?", ["Left (Recommended)", "Right"], header="Route")
+    records = [
+        _user("first prompt"),
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "AskUserQuestion"}],
+            },
+        },
+        _asked([single], {"Which way?": "Right"}),
+        _user("next prompt"),
+    ]
+    path = _transcript(tmp_path, "/Users/x/repo", "sid", records)
+    prompts = adapter.all_user_prompts("/Users/x/repo", "sid")
+    assert prompts == [
+        "first prompt",
+        "❓ Route\nWhich way?\n  ⬜ Left (Recommended)\n  ✅ Right",
+        "next prompt",
+    ]
+    assert [e.text for e in events_in_file(path) if e.kind == "prompt"] == prompts
+
+
+def test_ask_user_question_multi_select_other_and_note(tmp_path: Path) -> None:
+    # Multi-select answers are the ticked labels joined by ", " (a label may contain
+    # ", " itself); leftover text is the typed "Other" answer; notes come from annotations.
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    multi = _question("Which?", ["A, with comma", "B", "C"], header="Levers", multi=True)
+    free = _question("Why?", ["Because"])
+    records = [
+        _asked(
+            [multi, free],
+            {"Which?": "A, with comma, C, my own", "Why?": "no reason"},
+            {"Which?": {"notes": "C first"}},
+        )
+    ]
+    _transcript(tmp_path, "/Users/x/repo", "sid", records)
+    assert adapter.all_user_prompts("/Users/x/repo", "sid") == [
+        "❓ Levers (multi-select)\nWhich?\n  ✅ A, with comma\n  ⬜ B\n  ✅ C\n"
+        "  ✅ Other: my own\n  📝 C first\n\n"
+        "❓ Question\nWhy?\n  ⬜ Because\n  ✅ Other: no reason"
+    ]
+
+
+def test_other_tool_results_stay_out_of_prompts(tmp_path: Path) -> None:
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    plain = _user([{"type": "tool_result", "content": "x"}])
+    plain["toolUseResult"] = {"stdout": "x"}
+    _transcript(tmp_path, "/Users/x/repo", "sid", [_user("ask"), plain])
+    assert adapter.all_user_prompts("/Users/x/repo", "sid") == ["ask"]
+
+
 def test_resolve_peek_via_store_has_prompts_and_aim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -264,8 +337,6 @@ def test_resolve_peek_populates_header_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The header needs session_id, cwd, the tab badge, and the id-background colour.
-    from command_center import tabsymbol
-
     adapter = ClaudeAdapter(claude_home=tmp_path)
     store = Store(tmp_path / "state.db")
     store.ensure("sid", cwd="/Users/x/repo")
@@ -293,8 +364,6 @@ def test_resolve_peek_populates_header_identity(
 def test_tab_rgb_reads_cache_and_rejects_garbage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from command_center import colors
-
     monkeypatch.setenv("CCC_TAB_RGB_DIR", str(tmp_path))
     (tmp_path / "w0t1p0_A").write_text("10;20;30\n", encoding="utf-8")
     (tmp_path / "w0t1p0_B").write_text("300;0;0", encoding="utf-8")  # out of range
@@ -317,7 +386,7 @@ def test_resolve_peek_fallback_has_prompts_but_no_aim(
     data = peek.resolve_peek(adapter=adapter, store=store)
     assert data.resolved is True
     assert data.prompts == ["p1", "p2"]
-    assert data.aim_revisions == []  # an untracked tab has no AIM history
+    assert not data.aim_revisions  # an untracked tab has no AIM history
     store.close()
 
 
@@ -325,7 +394,7 @@ def test_resolve_peek_no_focus(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(peek, "frontmost_iterm_uuid", lambda: None)
     data = peek.resolve_peek()
     assert data.resolved is False
-    assert data.prompts == [] and data.aim_revisions == []
+    assert not data.prompts and not data.aim_revisions
     assert "no focused" in data.label
 
 
@@ -350,8 +419,6 @@ def test_prompt_segments_tags_rules_and_last_prompt() -> None:
 
 
 def test_format_aim_marks_current_and_shows_short() -> None:
-    from command_center.models import AimRevision
-
     revisions = [
         AimRevision("old aim", 40, 1_700_000_000_000, "old short"),
         AimRevision("new aim", 70, 1_700_000_100_000, None),

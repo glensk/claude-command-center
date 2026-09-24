@@ -10,6 +10,8 @@ on-disk layout, so a future Claude Code change can break at most this file:
 ``probe()`` lets callers detect a layout change and degrade gracefully.
 """
 
+# pylint: disable=too-many-lines  # the one reader of Claude Code's on-disk layout, by design
+
 from __future__ import annotations
 
 import dataclasses
@@ -236,14 +238,97 @@ def _queued_prompt_text(record: dict) -> str | None:
     return cleaned or None
 
 
+_ANSWER_PICKED = "✅"
+_ANSWER_UNPICKED = "⬜"
+
+
+def _split_answer(answer: str, labels: list[str], multi: bool) -> tuple[set[str], str]:
+    """``(picked labels, free text)`` of one AskUserQuestion *answer* string.
+
+    Claude Code stores a single-select pick as the bare label and a multi-select one as
+    the ticked labels joined by ``", "``; anything that is no label is the text the
+    human typed into the "Other" box. A label may itself contain ``", "``, so the
+    multi-select split re-joins the longest run of pieces that forms a label.
+    """
+    if answer in labels:
+        return {answer}, ""
+    if not multi:
+        return set(), answer
+    parts = answer.split(", ")
+    picked: set[str] = set()
+    other: list[str] = []
+    i = 0
+    while i < len(parts):
+        for j in range(len(parts), i, -1):
+            candidate = ", ".join(parts[i:j])
+            if candidate in labels:
+                picked.add(candidate)
+                i = j
+                break
+        else:
+            other.append(parts[i])
+            i += 1
+    return picked, ", ".join(other)
+
+
+def _format_question(question: dict, answers: dict, annotations: dict) -> str:
+    """One answered question: header, question text, every option ✅/⬜, Other + note."""
+    text = str(question.get("question", "")).strip()
+    header = str(question.get("header", "")).strip()
+    multi = bool(question.get("multiSelect"))
+    options = [o for o in question.get("options") or [] if isinstance(o, dict)]
+    labels = [str(o.get("label", "")) for o in options]
+    answer = answers.get(text, answers.get(question.get("question")))
+    picked, other = _split_answer(str(answer), labels, multi) if answer is not None else (set(), "")
+    title = f"❓ {header or 'Question'}" + (" (multi-select)" if multi else "")
+    lines = [title, text]
+    for label in labels:
+        lines.append(f"  {_ANSWER_PICKED if label in picked else _ANSWER_UNPICKED} {label}")
+    if other:
+        lines.append(f"  {_ANSWER_PICKED} Other: {other}")
+    if answer is None:
+        lines.append("  (no answer)")
+    note = annotations.get(text) if isinstance(annotations, dict) else None
+    notes = note.get("notes") if isinstance(note, dict) else None
+    if notes:
+        lines.append(f"  📝 {notes}")
+    return "\n".join(lines)
+
+
+def _answer_text(record: dict) -> str | None:
+    """The human's AskUserQuestion decision in *record*, rendered, or ``None``.
+
+    Answering the question tool is a human turn just like typing a prompt, but it is
+    stored as the ``tool_result`` of the ``AskUserQuestion`` call — a ``user`` record
+    whose ``toolUseResult`` carries the ``questions`` (with their options) and the
+    ``answers`` keyed by question text. Each question renders with every option marked
+    ✅ (picked / ticked) or ⬜, plus any free "Other" text and annotation note.
+    """
+    if not isinstance(record, dict) or record.get("type") != "user":
+        return None
+    if record.get("isMeta") or record.get("isSidechain"):
+        return None
+    result = record.get("toolUseResult")
+    if not isinstance(result, dict):
+        return None
+    questions = result.get("questions")
+    answers = result.get("answers")
+    if not isinstance(questions, list) or not isinstance(answers, dict):
+        return None
+    annotations = result.get("annotations") or {}
+    blocks = [_format_question(q, answers, annotations) for q in questions if isinstance(q, dict)]
+    return "\n\n".join(blocks) or None
+
+
 def _prompt_text(record: dict) -> str | None:
-    """The human prompt of *record* — typed at an idle prompt **or** queued while busy.
+    """The human prompt of *record* — typed at an idle prompt, queued while busy, or an
+    AskUserQuestion answer (:func:`_answer_text`).
 
     The single filter behind every prompt listing (``ccc peek``'s prompts tab, the
-    ``(N)`` indexing of its session tab, and the vault session mirrors), so the two
+    ``(N)`` indexing of its session tab, and the vault session mirrors), so the
     on-disk shapes a human turn can take never diverge between them.
     """
-    return _user_prompt_text(record) or _queued_prompt_text(record)
+    return _user_prompt_text(record) or _queued_prompt_text(record) or _answer_text(record)
 
 
 def _tool_result_text(content: object) -> str:
@@ -481,7 +566,7 @@ def _collect_user_events(
     record: dict, events: list[SessionEvent], pending: dict[str, SessionEvent]
 ) -> None:
     """A user record: the typed prompt and/or the ``tool_result`` blocks answering tools."""
-    prompt = _user_prompt_text(record)
+    prompt = _user_prompt_text(record) or _answer_text(record)
     if prompt is not None:
         events.append(SessionEvent(kind="prompt", text=prompt))
     # The same user record may (also) carry tool_result blocks — pair them.

@@ -131,7 +131,11 @@ fallback), and the **working directory**. Below it are **three tabs**:
   **newest prompt renders pronounced in bold gold** so the current ask always stands
   out. A prompt you typed **while Claude was working** is queued by the harness and
   stored in a different transcript shape (a `queued_command` attachment, not a user
-  record) — it is listed too, at the point the queue delivered it. Background-task
+  record) — it is listed too, at the point the queue delivered it. Your answers to
+  Claude's **question tool** (`AskUserQuestion`) are listed as prompts too: each
+  question with its header, every option marked `✅` (picked / ticked on a
+  multi-select) or `⬜`, any typed "Other" answer as `✅ Other: …` and a note as
+  `📝 …`. Background-task
   completion notices (`<task-notification>`) and cross-session messages from a peer
   session are **not** prompts and are filtered out — the list is what *you* typed only.
 - **session** — the **full conversation**, terminal-like: each `## (N) you` prompt
