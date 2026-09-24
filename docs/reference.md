@@ -97,7 +97,16 @@ cannot be ordered after a foreign auto-commit: it polls the process tree instead
 clean scans `stop_barrier_settle_sec` apart, bounded by `stop_barrier_wait_sec`) and is
 **fail-closed** — a timeout with hooks still running, an unreadable `ps`, an unresolvable
 pid or a pid whose identity changed leaves the process and the tab ALIVE, with an
-`events.log` line, a notification and exit 1. `ccc doctor`'s *Stop-hook timeout coverage*
+`events.log` line, a notification and exit 1. A *transient* refusal (hooks still running,
+`ps` unreadable) hands the claimed arm back (`Store.restore_close`): bound to the arm's
+token and to the verified `pid:start` of that Claude process, with its ORIGINAL stamp, so
+the same process's next Stop retries with every check — within the 10-minute TTL, never
+extended. The notification then says "re-armed until HH:MM; it closes after your NEXT turn
+ends". Every other refusal (pid gone or replaced, none resolvable) retires the arm, and so
+do `--undo`, a new arm, a `switch-account -N` and any SessionStart other than `compact` /
+`clear` (a new process); the notification then says to close the tab by hand or run
+`/ccc-mark-done-and-close` again inside that session (`mark-done --close` from another
+shell only arms a close nobody claims while the session sits idle). `ccc doctor`'s *Stop-hook timeout coverage*
 check compares the longest declared foreign `Stop` timeout against `stop_barrier_wait_sec`
 (the window the lock lease covers). Undo a mistaken close with `ccc mark-done --undo
 --session <id>`, then `ccc resume <id>`.

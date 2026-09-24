@@ -21,7 +21,10 @@ Then:
 2. END your turn immediately — no further tool calls, no extra prose. The close
    fires only after ALL of this turn's Stop hooks (including any auto-commit
    hook) have completed; then the Claude process exits and the hosting
-   pane/tab closes.
+   pane/tab closes. If a Stop hook outlives the wait (or `ps` cannot be read),
+   the close is refused and re-armed instead: it then fires after the NEXT
+   turn ends (within 10 minutes of the original request), or the user closes
+   the tab by hand — a desktop notification says which.
 
 Rules:
 

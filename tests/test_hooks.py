@@ -447,6 +447,158 @@ def test_release_locks_claims_armed_close_and_spawns_once(
     assert len(calls) == 1
 
 
+_START = "Tue Sep  2 23:00:00 2026"
+
+
+def _stub_identity(monkeypatch: pytest.MonkeyPatch, start: str) -> None:
+    """The hook's fresh probe of $CLAUDE_PID (8123) sees a claude started at *start*."""
+    from command_center import terminal
+    from command_center.snapshot import PsRow
+
+    monkeypatch.setattr(terminal, "ps_table", lambda: {8123: PsRow(1, "ttys009", "S+", "claude")})
+    monkeypatch.setattr(terminal, "pid_start", lambda _pid: start)
+
+
+def _restored_arm(store: Store, bound: str) -> tuple[int, str]:
+    """An arm a transient close-now refusal handed back, bound to *bound*."""
+    from command_center.models import now_ms
+
+    armed_at = now_ms()
+    token = store.arm_close("s1", armed_at)
+    store.claim_after_turn("s1", armed_at, hooks.CLOSE_REQUEST_TTL_MS)
+    assert store.restore_close(
+        "s1",
+        armed_at=armed_at,
+        token=token,
+        bound=bound,
+        now=armed_at,
+        ttl_ms=hooks.CLOSE_REQUEST_TTL_MS,
+    )
+    return armed_at, token
+
+
+def test_release_locks_passes_the_arm_identity_to_close_now(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh arm spawns close-now with --armed-at/--token (no --bound: nothing bound yet)."""
+    from command_center.models import now_ms
+
+    monkeypatch.setenv("ITERM_SESSION_ID", "w0t1p0:LIVE-UUID")
+    monkeypatch.setenv("CLAUDE_PID", "8123")
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    armed_at = now_ms()
+    token = store.arm_close("s1", armed_at)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+    assert calls == [
+        ["close-now", "--session", "s1", "--iterm", "w0t1p0:LIVE-UUID", "--pid", "8123"]
+        + ["--armed-at", str(armed_at), "--token", token]
+    ]
+
+
+def test_release_locks_fires_a_restored_arm_only_in_its_bound_process(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bound to this very process (pid + start) → spawn with all three flags."""
+    monkeypatch.setenv("ITERM_SESSION_ID", "w0t1p0:LIVE-UUID")
+    monkeypatch.setenv("CLAUDE_PID", "8123")
+    _stub_identity(monkeypatch, _START)
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    armed_at, token = _restored_arm(store, f"8123:{_START}")
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+    assert len(calls) == 1
+    assert calls[0][-6:] == [
+        "--armed-at",
+        str(armed_at),
+        "--token",
+        token,
+        "--bound",
+        f"8123:{_START}",
+    ]
+
+
+@pytest.mark.parametrize("start", ["Wed Sep  3 07:00:00 2026", ""], ids=["relaunched", "no_ps"])
+def test_release_locks_drops_a_restored_arm_bound_to_another_process(
+    home: Path, monkeypatch: pytest.MonkeyPatch, start: str
+) -> None:
+    """A different start (a relaunched claude) or an unreadable probe → no spawn, retired."""
+    monkeypatch.setenv("CLAUDE_PID", "8123")
+    _stub_identity(monkeypatch, start)
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    _restored_arm(store, f"8123:{_START}")
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+    assert calls == []
+    row = store.get("s1")
+    assert row is not None and (row.close_requested_at, row.close_token) == (0, "")
+    log = (home / "command-center" / "events.log").read_text(encoding="utf-8")
+    assert "bound to another process — dropped" in log
+
+
+def test_release_locks_restores_the_arm_when_the_spawn_fails(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """spawn_ccc → False (no ccc on PATH, fork failed): the arm goes back, bound to us."""
+    from command_center.models import now_ms
+
+    monkeypatch.setenv("CLAUDE_PID", "8123")
+    _stub_identity(monkeypatch, _START)
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    armed_at = now_ms()
+    token = store.arm_close("s1", armed_at)
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", lambda _args: False)
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+    row = store.get("s1")
+    assert row is not None
+    assert (row.close_requested_at, row.close_token, row.close_bound) == (
+        armed_at,
+        token,
+        f"8123:{_START}",
+    )
+    log = (home / "command-center" / "events.log").read_text(encoding="utf-8")
+    assert "close-now spawn failed — re-armed" in log
+
+
+@pytest.mark.parametrize(
+    ("source", "keeps"),
+    [
+        ("startup", False),
+        ("resume", False),
+        ("fork", False),
+        ("clear", True),
+        ("compact", True),
+        (None, False),
+        ("something-new", False),
+    ],
+)
+def test_session_start_keeps_the_close_arm_only_within_the_same_process(
+    home: Path, source: str | None, keeps: bool
+) -> None:
+    """compact/clear are the same Claude process; every other source is a new one."""
+    from command_center.models import now_ms
+
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    armed_at = now_ms()
+    token = store.arm_close("s1", armed_at)
+    payload: dict[str, object] = {"session_id": "s1", "cwd": "/repo"}
+    if source is not None:
+        payload["source"] = source
+    hooks.handle_session_start(payload)
+    row = Store().get("s1")
+    assert row is not None
+    expected = (armed_at, token) if keeps else (0, "")
+    assert (row.close_requested_at, row.close_token) == expected
+
+
 def test_release_locks_unarmed_never_spawns(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A session with no armed close request never spawns the closer."""
     store = Store()

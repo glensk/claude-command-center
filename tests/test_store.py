@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center.models import DEFAULT_LLM, LiveSession, TranscriptScan
+from command_center.models import DEFAULT_LLM, CloseClaim, LiveSession, TranscriptScan
 from command_center.store import AmbiguousJobId, Store, resolve_job_id
 
 
@@ -827,9 +827,12 @@ def test_close_requested_at_column_migrates_and_roundtrips(tmp_path: Path) -> No
     from command_center import store as store_mod
 
     db = tmp_path / "legacy.db"
-    legacy_schema = store_mod._SCHEMA.replace(
-        "    close_requested_at INTEGER NOT NULL DEFAULT 0,\n", ""
+    legacy_schema = (
+        store_mod._SCHEMA.replace("    close_requested_at INTEGER NOT NULL DEFAULT 0,\n", "")
+        .replace("    close_token       TEXT    NOT NULL DEFAULT '',\n", "")
+        .replace("    close_bound       TEXT    NOT NULL DEFAULT '',\n", "")
     )
+    assert "close_token" not in legacy_schema
     conn = sqlite3.connect(db)
     conn.executescript(legacy_schema)
     conn.execute("INSERT INTO sessions (session_id, cwd) VALUES ('old', '/repo/old')")
@@ -842,6 +845,18 @@ def test_close_requested_at_column_migrates_and_roundtrips(tmp_path: Path) -> No
         store.update_fields("old", close_requested_at=1234567890)
         got = store.get("old")
         assert got is not None and got.close_requested_at == 1234567890
+        assert (got.close_token, got.close_bound) == ("", "")  # tp#232 columns, '' default
+        # The whole arm → claim → restore → claim cycle works on the migrated row.
+        token = store.arm_close("old", 5_000_000)
+        kind, claim = store.claim_after_turn("old", 5_000_000, 600_000)
+        assert kind == "close" and isinstance(claim, CloseClaim) and claim.token == token
+        assert store.restore_close(
+            "old", armed_at=5_000_000, token=token, bound="1:x", now=5_000_001, ttl_ms=600_000
+        )
+        assert store.claim_after_turn("old", 5_000_002, 600_000) == (
+            "close",
+            CloseClaim(armed_at=5_000_000, token=token, bound="1:x"),
+        )
 
 
 def test_active_subagents_counter_floors_at_zero_and_resets(tmp_path: Path) -> None:
@@ -1203,35 +1218,110 @@ def test_list_sessions_matches_get_field_for_field(tmp_path: Path) -> None:
     store.close()
 
 
-def test_claim_close_request_fires_at_most_once(tmp_path: Path) -> None:
-    """A fresh armed request is claimed exactly once; the second claim returns False."""
+_TTL = 10 * 60 * 1000
+_BOUND = "4321:Tue Sep  2 23:00:00 2026"
+
+
+def _claim_close(store: Store, now: int) -> CloseClaim:
+    kind, claim = store.claim_after_turn("s1", now, _TTL)
+    assert kind == "close" and isinstance(claim, CloseClaim)
+    return claim
+
+
+def test_close_arm_is_claimed_once_with_its_token(tmp_path: Path) -> None:
+    """A fresh arm is claimed exactly once; the claim carries the stamp + token, no binding."""
     store = _store(tmp_path)
     store.ensure("s1")
-    now = 1_000_000
-    ttl = 10 * 60 * 1000
-    store.update_fields("s1", close_requested_at=now)  # arm
-    assert store.claim_close_request("s1", now, ttl) is True  # first caller wins
-    assert store.get("s1").close_requested_at == 0  # type: ignore[union-attr]  # cleared
-    assert store.claim_close_request("s1", now, ttl) is False  # already claimed → no re-fire
+    token = store.arm_close("s1", 1_000_000)
+    claim = _claim_close(store, 1_000_000)
+    assert claim == CloseClaim(armed_at=1_000_000, token=token, bound="")
+    assert store.claim_after_turn("s1", 1_000_000, _TTL) == ("", None)  # no re-fire
+    store.close()
 
 
-def test_claim_close_request_expired_is_cleared_not_claimed(tmp_path: Path) -> None:
-    """A stamp older than the TTL is never claimed (False) but is cleared so it can't linger."""
+def test_restored_close_arm_is_claimed_again_bound_to_its_process(tmp_path: Path) -> None:
+    """A transient refusal hands the arm back: the next Stop claims it with its binding."""
     store = _store(tmp_path)
     store.ensure("s1")
-    ttl = 10 * 60 * 1000
-    armed_at = 1_000_000
-    store.update_fields("s1", close_requested_at=armed_at)
-    now = armed_at + ttl + 1  # one ms past the TTL → expired
-    assert store.claim_close_request("s1", now, ttl) is False
-    assert store.get("s1").close_requested_at == 0  # type: ignore[union-attr]  # still cleared
+    token = store.arm_close("s1", 1_000_000)
+    _claim_close(store, 1_000_000)
+    assert store.restore_close(
+        "s1", armed_at=1_000_000, token=token, bound=_BOUND, now=1_060_000, ttl_ms=_TTL
+    )
+    again = _claim_close(store, 1_120_000)
+    assert again == CloseClaim(armed_at=1_000_000, token=token, bound=_BOUND)  # TTL kept
+    store.close()
 
 
-def test_claim_close_request_unarmed_is_false(tmp_path: Path) -> None:
-    """An unarmed session (close_requested_at == 0) is never claimed."""
+@pytest.mark.parametrize("interloper", ["undo", "rearm", "switch_now"])
+def test_close_restore_is_defeated_once_the_arm_changed(tmp_path: Path, interloper: str) -> None:
+    """Token ABA: an undo, a new arm or a `switch -N` between claim and restore wins."""
     store = _store(tmp_path)
     store.ensure("s1")
-    assert store.claim_close_request("s1", 1_000_000, 10 * 60 * 1000) is False
+    token = store.arm_close("s1", 1_000_000)
+    _claim_close(store, 1_000_000)
+    if interloper == "undo":
+        store.disarm_close("s1")
+    elif interloper == "rearm":
+        store.arm_close("s1", 1_030_000)
+    else:
+        assert (
+            store.arbitrate_now_switch("s1", "/cfg", now=1_030_000, ttl_ms=_TTL, override=True)
+            == ""
+        )
+        store.disarm_close("s1")  # …and the relaunched session's SessionStart
+    assert not store.restore_close(
+        "s1", armed_at=1_000_000, token=token, bound=_BOUND, now=1_060_000, ttl_ms=_TTL
+    )
+    row = store.get("s1")
+    assert row is not None and row.close_bound == ""
+    assert row.close_requested_at == (1_030_000 if interloper == "rearm" else 0)
+    store.close()
+
+
+def test_close_restore_never_outlives_the_original_ttl(tmp_path: Path) -> None:
+    """The retry loop is bounded: past armed_at + TTL the restore fails, the claim expires."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    token = store.arm_close("s1", 1_000_000)
+    _claim_close(store, 1_000_000)
+    assert store.restore_close(
+        "s1", armed_at=1_000_000, token=token, bound=_BOUND, now=1_000_000 + _TTL - 1, ttl_ms=_TTL
+    )
+    assert store.claim_after_turn("s1", 1_000_000 + _TTL, _TTL) == ("", None)  # expired
+    row = store.get("s1")
+    assert row is not None and (row.close_requested_at, row.close_token) == (0, "")
+    assert not store.restore_close(
+        "s1", armed_at=1_000_000, token=token, bound=_BOUND, now=1_000_000 + _TTL, ttl_ms=_TTL
+    )
+    store.close()
+
+
+def test_retire_close_with_a_stale_token_is_a_noop(tmp_path: Path) -> None:
+    """Retiring an old arm's token must not clear a newer arm."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    old = store.arm_close("s1", 1_000_000)
+    new = store.arm_close("s1", 1_010_000)
+    store.retire_close("s1", old)
+    row = store.get("s1")
+    assert row is not None and (row.close_requested_at, row.close_token) == (1_010_000, new)
+    store.retire_close("s1", new)
+    row = store.get("s1")
+    assert row is not None and row.close_token == "" and row.close_requested_at == 1_010_000
+    store.close()
+
+
+def test_close_unarmed_or_expired_is_never_claimed(tmp_path: Path) -> None:
+    """Unarmed → nothing; a stamp past the TTL is cleared (token too), never claimed."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    assert store.claim_after_turn("s1", 1_000_000, _TTL) == ("", None)
+    store.arm_close("s1", 1_000_000)
+    assert store.claim_after_turn("s1", 1_000_000 + _TTL + 1, _TTL) == ("", None)
+    row = store.get("s1")
+    assert row is not None and (row.close_requested_at, row.close_token) == (0, "")
+    store.close()
 
 
 # ---------------------------------------------------------------------------

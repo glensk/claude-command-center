@@ -23,6 +23,7 @@ import json
 import re
 import sqlite3
 import time
+import uuid
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from .models import (
     JOB_TYPES,
     LLM_CHOICES,
     AimRevision,
+    CloseClaim,
     FileLock,
     FileLockWaiter,
     LiveSession,
@@ -98,6 +100,8 @@ _SESSION_COLUMNS = (
     "last_response_at",
     "closed_at",
     "close_requested_at",
+    "close_token",
+    "close_bound",
     "switch_requested_at",
     "switch_config_dir",
     "switch_force",
@@ -202,6 +206,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_response_at  INTEGER NOT NULL DEFAULT 0,
     closed_at         INTEGER NOT NULL DEFAULT 0,
     close_requested_at INTEGER NOT NULL DEFAULT 0,
+    close_token       TEXT    NOT NULL DEFAULT '',
+    close_bound       TEXT    NOT NULL DEFAULT '',
     switch_requested_at INTEGER NOT NULL DEFAULT 0,
     switch_config_dir TEXT    NOT NULL DEFAULT '',
     switch_force      INTEGER NOT NULL DEFAULT 0,
@@ -541,6 +547,10 @@ class Store:  # pylint: disable=too-many-public-methods
         "closed_at": "INTEGER NOT NULL DEFAULT 0",
         # Epoch-ms a `mark-done --close` armed a close-after-turn request (0 = unarmed).
         "close_requested_at": "INTEGER NOT NULL DEFAULT 0",
+        # The in-flight close arm's identity and the "pid:start" a restored arm is bound
+        # to (tp#232) — written only by the close transitions (arm_close … disarm_close).
+        "close_token": "TEXT NOT NULL DEFAULT ''",
+        "close_bound": "TEXT NOT NULL DEFAULT ''",
         # `ccc switch-account`: epoch-ms the relaunch-after-turn was armed (0 = unarmed) and
         # the target account's config dir it relaunches under (claimed together).
         "switch_requested_at": "INTEGER NOT NULL DEFAULT 0",
@@ -967,7 +977,7 @@ class Store:  # pylint: disable=too-many-public-methods
         """One-shot atomic launch claim of a draft: ``True`` for exactly one claimant.
 
         The conditional ``UPDATE ... WHERE draft = 1`` is the claim itself (same
-        pattern as :meth:`claim_close_request`): with several concurrent launchers —
+        pattern as :meth:`claim_fire`): with several concurrent launchers —
         the foreground ``ccc park`` waiter, a daemon dispatch tab, a manual
         ``ccc start-job`` — SQLite serializes the writes and only the first sees
         ``rowcount == 1``; everyone else finds the draft flag already gone and must
@@ -1030,47 +1040,99 @@ class Store:  # pylint: disable=too-many-public-methods
         )
         self.conn.commit()
 
-    def claim_close_request(self, session_id: str, now: int, ttl_ms: int) -> bool:
-        """One-shot atomic claim of a pending close-after-turn request for *session_id*.
-
-        Returns ``True`` exactly once for a FRESH request (armed within *ttl_ms*): the
-        claiming ``UPDATE`` clears the stamp so no later caller can re-fire it, and
-        ``rowcount == 1`` means this caller won. An expired stamp (older than the TTL) is
-        never claimed (``False``) but is still cleared so it can't linger into a resumed
-        session; an unarmed row (``close_requested_at == 0``) returns ``False``. At most
-        one caller ever wins the fresh-request race.
-        """
-        cur = self.conn.execute(
-            "UPDATE sessions SET close_requested_at = 0 "
-            "WHERE session_id = ? AND close_requested_at != 0 AND close_requested_at > ?",
-            (session_id, now - ttl_ms),
-        )
-        claimed = cur.rowcount == 1
-        # Clear any remaining non-zero-but-expired stamp for this session (never claimed).
+    # ------------------------------------------------------------------ close-after-turn
+    # The `mark-done --close` arm lives in three columns that ONLY these transitions write:
+    # ``close_requested_at`` (the stamp the Stop hook claims), ``close_token`` (the arm's
+    # identity, uuid4 hex) and ``close_bound`` (the ``"pid:start"`` a RESTORED arm belongs
+    # to). A claim zeroes the stamp but keeps token and bound as "in flight", so the
+    # detached ``close-now`` can hand a transiently refused arm back (``restore_close``)
+    # without ever reviving an arm that was undone, re-armed or switched meanwhile.
+    def arm_close(self, session_id: str, now: int) -> str:
+        """Arm a close-after-turn for *session_id*: stamp *now*, a fresh token, no binding."""
+        token = uuid.uuid4().hex
         self.conn.execute(
-            "UPDATE sessions SET close_requested_at = 0 "
-            "WHERE session_id = ? AND close_requested_at != 0",
-            (session_id,),
+            "UPDATE sessions SET close_requested_at = ?, close_token = ?, close_bound = '', "
+            "updated_at = ? WHERE session_id = ?",
+            (now, token, now_ms(), session_id),
         )
         self.conn.commit()
-        return claimed
+        return token
+
+    def disarm_close(self, session_id: str) -> None:
+        """Drop any close arm — pending or in flight — so nothing can restore it either."""
+        self.conn.execute(
+            "UPDATE sessions SET close_requested_at = 0, close_token = '', close_bound = '', "
+            "updated_at = ? WHERE session_id = ?",
+            (now_ms(), session_id),
+        )
+        self.conn.commit()
+
+    def restore_close(  # pylint: disable=too-many-arguments
+        self,
+        session_id: str,
+        *,
+        armed_at: int,
+        token: str,
+        bound: str,
+        now: int,
+        ttl_ms: int,
+    ) -> bool:
+        """Hand a claimed-but-refused close arm back, bound to *bound* — ``True`` when it was.
+
+        A compare-and-swap: only while the row still holds THIS arm in flight (same
+        *token*, stamp zeroed by the claim) and the ORIGINAL *armed_at* is inside *ttl_ms*
+        of *now*. The stamp goes back to *armed_at*, never to *now*, so the retry window
+        is never extended; a new arm, an undo, a switch or a SessionStart replaced or
+        cleared the token and defeats it. Never raises (``False`` on a database error).
+        """
+        if not token or armed_at <= 0:
+            return False
+        try:
+            cur = self.conn.execute(
+                "UPDATE sessions SET close_requested_at = ?, close_bound = ?, updated_at = ? "
+                "WHERE session_id = ? AND close_token = ? AND close_requested_at = 0 "
+                "AND ? > ?",
+                (armed_at, bound, now_ms(), session_id, token, armed_at, now - ttl_ms),
+            )
+            self.conn.commit()
+        except sqlite3.Error:
+            try:
+                self.conn.rollback()
+            except sqlite3.Error:
+                pass
+            return False
+        return cur.rowcount == 1
+
+    def retire_close(self, session_id: str, token: str) -> None:
+        """Forget an in-flight arm for good — a no-op once *token* is no longer the row's."""
+        if not token:
+            return
+        self.conn.execute(
+            "UPDATE sessions SET close_token = '', close_bound = '', updated_at = ? "
+            "WHERE session_id = ? AND close_token = ?",
+            (now_ms(), session_id, token),
+        )
+        self.conn.commit()
 
     def claim_after_turn(
         self, session_id: str, now: int, ttl_ms: int
-    ) -> tuple[str, SwitchClaim | None]:
+    ) -> tuple[str, SwitchClaim | CloseClaim | None]:
         """Atomically claim THE after-turn action armed for *session_id* — close beats switch.
 
-        Returns ``("close", None)``, ``("switch", SwitchClaim)`` or ``("", None)``,
-        exactly once per arm: the read and the clearing writes run inside ONE ``BEGIN
-        IMMEDIATE`` transaction, so two concurrent Stop-hook callers can never both win
-        nor split a close and a switch between them. A tab about to close has nowhere
-        to relaunch, so a switch armed alongside a close is dropped. A switch claim
-        returns the immutable launch snapshot (target, force, the row's ``no_codex``,
-        cwd and the prompt the resumed session submits) and keeps ``switch_config_dir``
-        as the account the resumed session is
-        EXPECTED to start under (consumed by :meth:`pop_switch_expectation`); every other
-        outcome clears all switch state. Stamps older than *ttl_ms* are cleared without
-        being claimed, so a stale arm can never fire in a later, unrelated turn.
+        Returns ``("close", CloseClaim)``, ``("switch", SwitchClaim)`` or ``("", None)``,
+        once per arm: the read and the clearing writes run inside ONE ``BEGIN IMMEDIATE``
+        transaction, so two concurrent Stop-hook callers can never both win nor split a
+        close and a switch between them. A close claim zeroes the stamp but keeps the arm's
+        token and binding "in flight": ``close-now`` may hand a TRANSIENTLY refused arm
+        back (:meth:`restore_close`) for the same process's next Stop, within the original
+        TTL — so an arm fires at most once per turn, not once ever. A tab about to close
+        has nowhere to relaunch, so a switch armed alongside a close is dropped. A switch
+        claim returns the immutable launch snapshot (target, force, the row's ``no_codex``,
+        cwd and the prompt the resumed session submits) and keeps ``switch_config_dir`` as
+        the account the resumed session is EXPECTED to start under (consumed by
+        :meth:`pop_switch_expectation`); every other outcome clears all switch AND close
+        state. Stamps older than *ttl_ms* are cleared without being claimed, so a stale arm
+        can never fire in a later, unrelated turn.
         """
         threshold = now - ttl_ms
         if self.conn.in_transaction:
@@ -1079,8 +1141,8 @@ class Store:  # pylint: disable=too-many-public-methods
         try:
             row = self.conn.execute(
                 "SELECT close_requested_at, switch_requested_at, switch_config_dir, "
-                "switch_force, no_codex, cwd, switch_prompt FROM sessions "
-                "WHERE session_id = ?",
+                "switch_force, no_codex, cwd, switch_prompt, close_token, close_bound "
+                "FROM sessions WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
             if row is None:
@@ -1089,9 +1151,12 @@ class Store:  # pylint: disable=too-many-public-methods
             close_at, switch_at = int(row[0] or 0), int(row[1] or 0)
             target = str(row[2] or "")
             kind: str = ""
-            claim: SwitchClaim | None = None
+            claim: SwitchClaim | CloseClaim | None = None
             if close_at > threshold:
                 kind = "close"
+                claim = CloseClaim(
+                    armed_at=close_at, token=str(row[7] or ""), bound=str(row[8] or "")
+                )
             elif switch_at > threshold and target:
                 kind = "switch"
                 claim = SwitchClaim(
@@ -1103,15 +1168,24 @@ class Store:  # pylint: disable=too-many-public-methods
                 )
             if kind == "switch":
                 self.conn.execute(
-                    "UPDATE sessions SET close_requested_at = 0, switch_requested_at = 0, "
-                    "switch_force = 0, switch_prompt = '' WHERE session_id = ?",
+                    "UPDATE sessions SET close_requested_at = 0, close_token = '', "
+                    "close_bound = '', switch_requested_at = 0, switch_force = 0, "
+                    "switch_prompt = '' WHERE session_id = ?",
                     (session_id,),
                 )
-            else:
+            elif kind == "close":
+                # In flight: the stamp goes, the token + binding stay for restore_close.
                 self.conn.execute(
                     "UPDATE sessions SET close_requested_at = 0, switch_requested_at = 0, "
                     "switch_config_dir = '', switch_force = 0, switch_prompt = '' "
                     "WHERE session_id = ?",
+                    (session_id,),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE sessions SET close_requested_at = 0, close_token = '', "
+                    "close_bound = '', switch_requested_at = 0, switch_config_dir = '', "
+                    "switch_force = 0, switch_prompt = '' WHERE session_id = ?",
                     (session_id,),
                 )
         except sqlite3.Error:
@@ -1277,8 +1351,8 @@ class Store:  # pylint: disable=too-many-public-methods
                 return live
             self.conn.execute(
                 "UPDATE sessions SET switch_config_dir = ?, switch_requested_at = 0, "
-                "switch_force = 0, switch_prompt = '', close_requested_at = 0 "
-                "WHERE session_id = ?",
+                "switch_force = 0, switch_prompt = '', close_requested_at = 0, "
+                "close_token = '', close_bound = '' WHERE session_id = ?",
                 (target, session_id),
             )
         except sqlite3.Error:

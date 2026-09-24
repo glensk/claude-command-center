@@ -14,6 +14,7 @@ import pytest
 
 from command_center import cli, models
 from command_center.cli import cmd_check, cmd_jobs, cmd_new_job, cmd_resume, cmd_subgoals
+from command_center.models import CloseClaim
 from command_center.store import Store
 
 
@@ -1422,7 +1423,7 @@ def test_close_now_refuses_while_stop_hooks_are_still_running(
     monkeypatch.setattr(
         cli,
         "_wait_for_stop_drain",
-        lambda *_a: (terminal.DRAIN_RUNNING, ["/bin/zsh /home/me/.claude/run-stop-hook.sh"]),
+        lambda *_a, **_k: (terminal.DRAIN_RUNNING, ["/bin/zsh /home/me/.claude/run-stop-hook.sh"]),
     )
     notes = _refusals(monkeypatch)
     killed: list[tuple[int, int]] = []
@@ -1437,7 +1438,7 @@ def test_close_now_refuses_while_stop_hooks_are_still_running(
     assert "NOT closed" in (tmp_path / "command-center" / "events.log").read_text(encoding="utf-8")
 
 
-def test_close_now_refuses_when_the_chain_cannot_be_observed(
+def test_close_now_refuses_when_the_baseline_table_is_unreadable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An empty ps table is a FAILED observation, never proof of quiet — nothing is killed."""
@@ -1454,7 +1455,7 @@ def test_close_now_refuses_when_the_chain_cannot_be_observed(
     args = argparse.Namespace(session="s1", iterm="w0t1p0:FRESH", pid=_CLOSE_PID)
     assert cli.cmd_close_now(args) == 1
     assert killed == [] and closed == []
-    assert notes and "could not be observed" in notes[0]
+    assert notes and "could not be identified (ps unreadable)" in notes[0]
 
 
 def test_close_now_refuses_a_pid_recycled_during_the_wait(
@@ -1497,6 +1498,264 @@ def test_close_now_refuses_when_no_pid_can_be_resolved(
     assert cli.cmd_close_now(args) == 1
     assert closed == []
     assert notes and "no live Claude pid" in notes[0]
+
+
+# ---- close-now: restore vs retire of the claimed arm (tp#232) ---------------
+_CLOSE_BOUND = f"{_CLOSE_PID}:{_CLOSE_START}"
+
+
+def _claimed_arm(bound: str = "") -> CloseClaim:
+    """Arm + claim a close for s1 as the Stop hook would; *bound* fakes a restored arm."""
+    from command_center.models import now_ms
+
+    with Store() as store:
+        store.ensure("s1", cwd="/repo")
+        armed_at = now_ms()
+        token = store.arm_close("s1", armed_at)
+        if bound:
+            store.claim_after_turn("s1", armed_at, 600_000)
+            assert store.restore_close(
+                "s1", armed_at=armed_at, token=token, bound=bound, now=armed_at, ttl_ms=600_000
+            )
+        kind, claim = store.claim_after_turn("s1", armed_at, 600_000)
+    assert kind == "close" and isinstance(claim, CloseClaim)
+    return claim
+
+
+def _close_args(claim: CloseClaim | None, pid: int = _CLOSE_PID) -> argparse.Namespace:
+    if claim is None:  # legacy argv: no arm identity at all
+        return argparse.Namespace(session="s1", iterm="w0t1p0:FRESH", pid=pid)
+    return argparse.Namespace(
+        session="s1",
+        iterm="w0t1p0:FRESH",
+        pid=pid,
+        armed_at=claim.armed_at,
+        token=claim.token,
+        bound=claim.bound,
+    )
+
+
+def _no_tab_effects(monkeypatch: pytest.MonkeyPatch) -> tuple[list[object], list[str]]:
+    killed: list[object] = []
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    closed: list[str] = []
+    monkeypatch.setattr("command_center.terminal.close_iterm_session", closed.append)
+    monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
+    return killed, closed
+
+
+def _stub_wait(monkeypatch: pytest.MonkeyPatch, state: str, cause: str = "") -> None:
+    """Replace the drain waiter: return *state*, typing an unknown one as *cause*."""
+
+    def _wait(*_a: object, unknown_causes: list[str] | None = None) -> tuple[str, list[str]]:
+        if cause and unknown_causes is not None:
+            unknown_causes.append(cause)
+        running = ["/bin/zsh /home/me/.claude/run-stop-hook.sh"] if state == "running" else []
+        return state, running
+
+    monkeypatch.setattr(cli, "_wait_for_stop_drain", _wait)
+
+
+def _arm_row() -> tuple[int, str, str]:
+    with Store() as store:
+        row = store.get("s1")
+    assert row is not None
+    return row.close_requested_at, row.close_token, row.close_bound
+
+
+def _setup_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _barrier(True)
+    _no_settle(monkeypatch)
+    _stub_drain_probes(monkeypatch, _quiet_tree())
+    return _refusals(monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("state", "cause"),
+    [("running", ""), ("unknown", cli.CLOSE_PS_UNREADABLE)],
+    ids=["hooks_running", "ps_unreadable"],
+)
+def test_close_now_transient_refusal_restores_the_arm_bound_to_the_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str, cause: str
+) -> None:
+    """HOOKS_RUNNING / PS_UNREADABLE hand the arm back, original stamp, bound to pid:start."""
+    notes = _setup_close(tmp_path, monkeypatch)
+    _stub_wait(monkeypatch, state, cause)
+    killed, closed = _no_tab_effects(monkeypatch)
+    claim = _claimed_arm()
+    assert cli.cmd_close_now(_close_args(claim)) == 1
+    assert killed == [] and closed == []
+    assert _arm_row() == (claim.armed_at, claim.token, _CLOSE_BOUND)
+    assert notes and "re-armed until" in notes[0] and "NEXT turn" in notes[0]
+    log = (tmp_path / "command-center" / "events.log").read_text(encoding="utf-8")
+    assert "NOT closed (re-armed)" in log
+
+
+@pytest.mark.parametrize(
+    "cause", [cli.CLOSE_PID_GONE, cli.CLOSE_PID_REPLACED], ids=["pid_gone", "pid_replaced"]
+)
+def test_close_now_permanent_refusal_retires_the_arm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause: str
+) -> None:
+    """A gone or replaced process retires the arm: nothing to restore, advice to close by hand."""
+    notes = _setup_close(tmp_path, monkeypatch)
+    _stub_wait(monkeypatch, "unknown", cause)
+    killed, _closed = _no_tab_effects(monkeypatch)
+    claim = _claimed_arm()
+    assert cli.cmd_close_now(_close_args(claim)) == 1
+    assert killed == []
+    assert _arm_row() == (0, "", "")
+    assert notes and "close the tab yourself" in notes[0] and "re-armed until" not in notes[0]
+
+
+def test_close_now_recycled_pid_retires_the_arm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PID_REPLACED from the FINAL probe (a different start) retires, never signals."""
+    from command_center import terminal
+
+    _setup_close(tmp_path, monkeypatch)
+    starts = iter([_CLOSE_START, "Wed Sep  3 07:00:00 2026"])
+    monkeypatch.setattr(terminal, "pid_start", lambda _pid: next(starts, "later"))
+    killed, _closed = _no_tab_effects(monkeypatch)
+    claim = _claimed_arm()
+    assert cli.cmd_close_now(_close_args(claim)) == 1
+    assert killed == [] and _arm_row() == (0, "", "")
+
+
+def test_close_now_without_a_pid_retires_the_arm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NO_PID retires the arm."""
+    notes = _setup_close(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [])
+    _no_tab_effects(monkeypatch)
+    claim = _claimed_arm()
+    assert cli.cmd_close_now(_close_args(claim, pid=0)) == 1
+    assert _arm_row() == (0, "", "")
+    assert notes and "no live Claude pid" in notes[0]
+
+
+def test_close_now_unreadable_baseline_start_never_signals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty baseline start stamp refuses outright — even a drained chain is not killed."""
+    from command_center import terminal
+
+    _setup_close(tmp_path, monkeypatch)
+    monkeypatch.setattr(terminal, "pid_start", lambda _pid: "")
+    _stub_wait(monkeypatch, "drained")
+    killed, closed = _no_tab_effects(monkeypatch)
+    claim = _claimed_arm()
+    assert cli.cmd_close_now(_close_args(claim)) == 1
+    assert killed == [] and closed == []
+    assert _arm_row() == (0, "", "")  # no verified identity and no hook binding → retired
+
+
+def test_close_now_unreadable_baseline_restores_on_the_hook_verified_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restored arm the hook re-verified this Stop keeps its binding across a ps hiccup."""
+    from command_center import terminal
+
+    _setup_close(tmp_path, monkeypatch)
+    monkeypatch.setattr(terminal, "pid_start", lambda _pid: "")
+    killed, _closed = _no_tab_effects(monkeypatch)
+    claim = _claimed_arm(bound=_CLOSE_BOUND)
+    assert cli.cmd_close_now(_close_args(claim)) == 1
+    assert killed == []
+    assert _arm_row() == (claim.armed_at, claim.token, _CLOSE_BOUND)
+
+
+@pytest.mark.parametrize("which", ["table", "start"])
+def test_close_now_unreadable_final_probe_refuses_and_restores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, which: str
+) -> None:
+    """The post-render probe failing (table or start) is PS_UNREADABLE: no kill, re-armed."""
+    from command_center import terminal
+
+    _setup_close(tmp_path, monkeypatch)
+    _stub_wait(monkeypatch, "drained")
+    if which == "table":
+        tables = iter([_quiet_tree()])
+        monkeypatch.setattr(terminal, "ps_table", lambda: next(tables, {}))
+    else:
+        starts = iter([_CLOSE_START])
+        monkeypatch.setattr(terminal, "pid_start", lambda _pid: next(starts, ""))
+    killed, closed = _no_tab_effects(monkeypatch)
+    claim = _claimed_arm()
+    assert cli.cmd_close_now(_close_args(claim)) == 1
+    assert killed == [] and closed == []
+    assert _arm_row() == (claim.armed_at, claim.token, _CLOSE_BOUND)
+
+
+def test_close_now_legacy_argv_never_restores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A close-now without --token (an old hook) refuses without handing anything back."""
+    _setup_close(tmp_path, monkeypatch)
+    _stub_wait(monkeypatch, "running")
+    _no_tab_effects(monkeypatch)
+    claim = _claimed_arm()
+    assert cli.cmd_close_now(_close_args(None)) == 1
+    assert _arm_row() == (0, claim.token, "")  # in flight, untouched — never restored
+
+
+def test_close_now_message_follows_the_restore_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lost compare-and-swap (the arm was replaced) says 'not re-armed', not 'NEXT turn'."""
+    notes = _setup_close(tmp_path, monkeypatch)
+    _stub_wait(monkeypatch, "running")
+    _no_tab_effects(monkeypatch)
+    claim = _claimed_arm()
+    with Store() as store:
+        newer = store.arm_close("s1", claim.armed_at + 1)  # re-armed while close-now waited
+    assert cli.cmd_close_now(_close_args(claim)) == 1
+    assert _arm_row() == (claim.armed_at + 1, newer, "")  # the newer arm is untouched
+    assert notes and "close the tab yourself" in notes[0]
+    log = (tmp_path / "command-center" / "events.log").read_text(encoding="utf-8")
+    assert "NOT closed (not re-armed)" in log
+
+
+def test_close_now_success_retires_the_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful close spends the arm: nothing is left in flight."""
+    _setup_close(tmp_path, monkeypatch)
+    killed, closed = _no_tab_effects(monkeypatch)
+    claim = _claimed_arm()
+    assert cli.cmd_close_now(_close_args(claim)) == 0
+    assert killed and closed == ["w0t1p0:FRESH"]
+    assert _arm_row() == (0, "", "")
+
+
+@pytest.mark.parametrize(
+    ("kind", "cause"),
+    [
+        ("empty", cli.CLOSE_PS_UNREADABLE),
+        ("gone", cli.CLOSE_PID_GONE),
+        ("node", cli.CLOSE_PID_REPLACED),
+    ],
+)
+def test_wait_for_stop_drain_types_an_unknown_scan(
+    monkeypatch: pytest.MonkeyPatch, kind: str, cause: str
+) -> None:
+    """The waiter reports WHY a scan was unknown, so close-now can restore or retire."""
+    from command_center import terminal
+    from command_center.snapshot import PsRow
+
+    tables: dict[str, dict[int, object]] = {
+        "empty": {},
+        "gone": {1: PsRow(0, "", "S", "launchd")},
+        "node": {_CLOSE_PID: PsRow(1, "ttys009", "S+", "node server.js")},
+    }
+    monkeypatch.setattr(terminal, "ps_table", lambda: tables[kind])
+    monkeypatch.setattr(terminal, "stop_hook_tokens", lambda _cwd: set())
+    causes: list[str] = []
+    state, _running = cli._wait_for_stop_drain(_CLOSE_PID, "/repo", 0, 0, unknown_causes=causes)
+    assert state == terminal.DRAIN_UNKNOWN and causes == [cause]
 
 
 def test_close_now_sigterms_a_fresh_live_pid(

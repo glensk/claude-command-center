@@ -22,6 +22,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from typing import Any
 
 # Named tab colors → RGB (iTerm2 tab background). Hex "#rrggbb" is also accepted.
@@ -1093,6 +1094,47 @@ def pid_start(pid: int) -> str:
     except (subprocess.SubprocessError, OSError):
         return ""
     return out.stdout.strip() if out.returncode == 0 else ""
+
+
+#: :func:`probe_identity` kinds: the probe read a live process (``OK``), ``ps`` itself
+#: failed (``PS_UNREADABLE`` — an empty table or an unreadable start stamp), or the pid is
+#: not in a readable table (``PID_GONE``). ``pid_start``'s bare ``""`` conflates the last
+#: two, so two failed probes used to compare EQUAL and pass an identity check.
+IDENTITY_OK = "ok"
+IDENTITY_PS_UNREADABLE = "ps_unreadable"
+IDENTITY_PID_GONE = "pid_gone"
+
+
+@dataclass(frozen=True)
+class Identity:
+    """One typed observation of a pid: ``kind`` plus, when ``OK``, its start stamp."""
+
+    kind: str
+    start: str = ""
+    is_claude: bool = False
+
+    def token(self, pid: int) -> str:
+        """``"pid:start"`` for an ``OK`` probe with a start stamp, else ``""``."""
+        return f"{pid}:{self.start}" if self.kind == IDENTITY_OK and self.start else ""
+
+
+def probe_identity(pid: int, table: dict[int, Any] | None = None) -> Identity:
+    """Who is *pid* right now — a FRESH ``ps`` table (unless *table* is given) + start stamp.
+
+    ``PS_UNREADABLE`` for an empty table or an empty start stamp of a pid the table
+    lists; ``PID_GONE`` for a non-positive pid or one a readable table does not hold.
+    """
+    if pid <= 0:
+        return Identity(IDENTITY_PID_GONE)
+    rows = ps_table() if table is None else table
+    if not rows:
+        return Identity(IDENTITY_PS_UNREADABLE)
+    if pid not in rows:
+        return Identity(IDENTITY_PID_GONE)
+    start = pid_start(pid)
+    if not start:
+        return Identity(IDENTITY_PS_UNREADABLE)
+    return Identity(IDENTITY_OK, start=start, is_claude=pid_is_claude(pid, rows))
 
 
 def pid_ancestry(pid: int, table: dict[int, Any]) -> frozenset[int]:

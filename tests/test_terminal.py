@@ -354,3 +354,26 @@ def test_wait_for_stop_drain_reports_unknown_when_ps_keeps_failing(
     monkeypatch.setattr(terminal, "stop_hook_tokens", lambda _cwd: set())
     monkeypatch.setattr(terminal, "ps_table", lambda: next(scans, {}))
     assert cli._wait_for_stop_drain(CLAUDE_PID, "", 0.05, 0.0) == (terminal.DRAIN_UNKNOWN, [])
+
+
+# ---- probe_identity (tp#232) ----------------------------------------------
+def test_probe_identity_types_every_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty table or start is PS_UNREADABLE, a missing pid PID_GONE — never an equal ""."""
+    from command_center.snapshot import PsRow
+
+    table = {7: PsRow(1, "ttys001", "S+", "claude"), 8: PsRow(1, "ttys001", "S", "node")}
+    monkeypatch.setattr(terminal, "pid_start", lambda pid: "Tue" if pid in (7, 8) else "")
+    assert terminal.probe_identity(0, table).kind == terminal.IDENTITY_PID_GONE
+    assert terminal.probe_identity(7, {}).kind == terminal.IDENTITY_PS_UNREADABLE
+    assert terminal.probe_identity(9, table).kind == terminal.IDENTITY_PID_GONE
+    ok = terminal.probe_identity(7, table)
+    assert (ok.kind, ok.start, ok.is_claude, ok.token(7)) == (
+        terminal.IDENTITY_OK,
+        "Tue",
+        True,
+        "7:Tue",
+    )
+    assert terminal.probe_identity(8, table).is_claude is False
+    monkeypatch.setattr(terminal, "pid_start", lambda _pid: "")
+    unreadable = terminal.probe_identity(7, table)
+    assert unreadable.kind == terminal.IDENTITY_PS_UNREADABLE and unreadable.token(7) == ""

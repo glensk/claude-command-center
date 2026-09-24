@@ -117,6 +117,21 @@ class SwitchClaim:
     prompt: str = ""
 
 
+@dataclass(frozen=True)
+class CloseClaim:
+    """A claimed ``mark-done --close`` arm, handed from the Stop hook to ``close-now``.
+
+    ``armed_at`` is the original stamp (a restore never extends the TTL), ``token`` the
+    arm's identity (a new arm, an undo or a switch replaces or clears it, so a stale
+    ``close-now`` can never restore someone else's decision) and ``bound`` the
+    ``"pid:start"`` of the Claude process a RESTORED arm belongs to (``""`` = a fresh arm).
+    """
+
+    armed_at: int
+    token: str = ""
+    bound: str = ""
+
+
 @dataclass
 class LiveSession:
     """A session currently registered in ``~/.claude/sessions/<pid>.json``."""
@@ -472,6 +487,11 @@ class Session:
     # Epoch-ms when a close-after-turn was requested (`mark-done --close`); 0 = none.
     # The release-locks Stop hook atomically claims it and spawns the detached closer.
     close_requested_at: int = 0
+    # The in-flight close arm's identity (uuid4 hex, "" = none) and, once a transient
+    # close-now refusal handed it back, the "pid:start" of the process it is bound to.
+    # Written only by the Store close transitions (arm/claim/restore/retire/disarm).
+    close_token: str = ""
+    close_bound: str = ""
     # `ccc switch-account`: epoch-ms the relaunch-after-turn was armed (0 = none) and the
     # target account's config dir. Claimed together by the release-locks Stop hook, which
     # spawns the detached relauncher (`ccc switch-now`).

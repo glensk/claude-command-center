@@ -34,7 +34,16 @@ import time
 from typing import Any
 
 from . import config
-from .models import Session, Status, drift_unresolved, dumps_todos, now_ms, short_id
+from .models import (
+    CloseClaim,
+    Session,
+    Status,
+    SwitchClaim,
+    drift_unresolved,
+    dumps_todos,
+    now_ms,
+    short_id,
+)
 from .store import Store
 
 _ASK_AIM = (
@@ -138,7 +147,8 @@ _LOCK_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 
 # How long a `mark-done --close` close-after-turn request stays claimable (10 min). A
 # stamp older than this is cleared but never fired — so a stale arm can't survive into a
-# resumed session (see store.claim_close_request).
+# resumed session (see Store.claim_after_turn). A restored arm keeps its ORIGINAL stamp,
+# so this also bounds the close-now retry loop (Store.restore_close).
 CLOSE_REQUEST_TTL_MS = 10 * 60 * 1000
 
 
@@ -375,6 +385,10 @@ def _switch_landed_as_expected(store: Store, sid: str) -> bool:
     return accounts.same_config_dir(expected, accounts.env_config_dir())
 
 
+# SessionStart sources that keep the SAME Claude process — and with it the close arm.
+_CLOSE_KEEPING_SOURCES = frozenset({"compact", "clear"})
+
+
 def handle_session_start(payload: dict[str, Any]) -> int:
     sid = _session_id(payload)
     if not sid:
@@ -385,6 +399,11 @@ def handle_session_start(payload: dict[str, Any]) -> int:
         # incarnation was running died with it and never fired its SubagentStop, and a
         # stranded count would veto every `switch-account` for this id from here on.
         store.reset_subagents(sid)
+        # A close arm belongs to the process that armed it: only `compact` / `clear` keep
+        # the SAME Claude process. startup/resume/fork, a missing or an unknown source all
+        # mean a new one, which must never inherit (or have close-now restore) the arm.
+        if payload.get("source") not in _CLOSE_KEEPING_SOURCES:
+            store.disarm_close(sid)
         if switch_warning and _switch_landed_as_expected(store, sid):
             switch_warning = None
         # The iTerm tab id itself is stamped inside ensure_current_session (every
@@ -643,6 +662,55 @@ def handle_stop_failure(payload: dict[str, Any]) -> int:
     return 0
 
 
+def _own_identity(pid: str) -> str:
+    """This hook's ``"$CLAUDE_PID:start"`` from a FRESH probe (``""`` when unreadable)."""
+    if not pid.isdigit():
+        return ""
+    from . import terminal  # lazy: only an armed close ever probes
+
+    return terminal.probe_identity(int(pid)).token(int(pid))
+
+
+def _fire_close_claim(store: Store, sid: str, claim: CloseClaim) -> None:
+    """Spawn ``close-now`` for a claimed close arm — or drop / restore it, never raising.
+
+    A RESTORED arm (``claim.bound`` set) fires only in the process it was bound to: a
+    mismatch or an unreadable probe retires it without spawning. A fresh arm spawns with
+    its identity; when the spawn itself fails the arm is handed back (same compare-and-swap
+    as ``close-now``'s restore), bound to this process when it can be identified.
+    """
+    from . import spawn  # lazy, like _maybe_grade_after_turn
+
+    pid = os.environ.get("CLAUDE_PID", "").strip()
+    if claim.bound and _own_identity(pid) != claim.bound:
+        store.retire_close(sid, claim.token)
+        _log_event(sid, "close-now", "close-now bound to another process — dropped")
+        return
+    args = ["close-now", "--session", sid, "--iterm", os.environ.get("ITERM_SESSION_ID", "")]
+    if pid.isdigit():
+        args += ["--pid", pid]
+    if claim.token:
+        args += ["--armed-at", str(claim.armed_at), "--token", claim.token]
+        if claim.bound:
+            args += ["--bound", claim.bound]
+    if spawn.spawn_ccc(args):
+        return
+    bound = claim.bound or _own_identity(pid)
+    restored = bool(bound) and store.restore_close(
+        sid,
+        armed_at=claim.armed_at,
+        token=claim.token,
+        bound=bound,
+        now=now_ms(),
+        ttl_ms=CLOSE_REQUEST_TTL_MS,
+    )
+    if not restored:
+        store.retire_close(sid, claim.token)
+    _log_event(
+        sid, "close-now", f"close-now spawn failed — {'re-armed' if restored else 'not re-armed'}"
+    )
+
+
 def handle_release_locks(payload: dict[str, Any]) -> int:
     """Lease the session's file locks past the end of its turn — the Stop floor.
 
@@ -656,11 +724,13 @@ def handle_release_locks(payload: dict[str, Any]) -> int:
     still cleared, and its next edit of a file clears that file's lease (a new turn). With
     ``stop_barrier_enabled`` off, the locks are released immediately as they used to be.
 
-    A ``mark-done --close`` may also have armed a one-shot close-after-turn request: claim it
-    atomically (at most one caller ever wins) and, on success, spawn the detached closer. The
-    lease is what protects the files if that kill lands mid-commit. Kept fast and
-    never-raising — no waiting, no process probing, one UPDATE (dispatch swallows too, but we
-    mirror the defensive neighbours).
+    A ``mark-done --close`` may also have armed a close-after-turn request: claim it
+    atomically (at most one caller ever wins per arm) and spawn the detached closer with the
+    arm's identity (``--armed-at``/``--token``/``--bound``), so a TRANSIENT refusal can hand
+    it back for this same process's next Stop (:func:`_fire_close_claim`). The lease is
+    what protects the files if that kill lands mid-commit. Kept fast and never-raising — no
+    waiting, and a process probe only for an arm a refusal restored (dispatch swallows too,
+    but we mirror the defensive neighbours).
     """
     sid = _session_id(payload)
     if sid:
@@ -671,21 +741,9 @@ def handle_release_locks(payload: dict[str, Any]) -> int:
             else:
                 store.release_all_file_locks(sid)
             kind, claim = store.claim_after_turn(sid, now_ms(), CLOSE_REQUEST_TTL_MS)
-            if kind == "close":
-                from . import spawn  # lazy, like _maybe_grade_after_turn
-
-                args = [
-                    "close-now",
-                    "--session",
-                    sid,
-                    "--iterm",
-                    os.environ.get("ITERM_SESSION_ID", ""),
-                ]
-                pid = os.environ.get("CLAUDE_PID", "").strip()
-                if pid.isdigit():
-                    args += ["--pid", pid]
-                spawn.spawn_ccc(args)
-            elif kind == "switch" and claim is not None:
+            if kind == "close" and isinstance(claim, CloseClaim):
+                _fire_close_claim(store, sid, claim)
+            elif kind == "switch" and isinstance(claim, SwitchClaim):
                 # `ccc switch-account`: the relauncher terminates this Claude once its Stop
                 # chain is over, waits for the shell to come back and types the resume into
                 # this very tab under the target account's env pin. Everything the launch

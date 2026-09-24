@@ -29,7 +29,7 @@ import pytest
 
 from command_center import accounts, cli, config, hooks, terminal
 from command_center.adapters import claude as claude_adapter
-from command_center.models import LiveSession, SwitchClaim, now_ms
+from command_center.models import CloseClaim, LiveSession, SwitchClaim, now_ms
 from command_center.snapshot import PsRow
 from command_center.store import Store
 
@@ -328,15 +328,19 @@ def test_claim_after_turn_close_beats_switch_and_drops_every_switch_column(
     """A tab about to close has nowhere to relaunch — the switch is dropped whole."""
     with Store(tmp_path / "db") as store:
         store.ensure(SID, cwd="/repo")
+        armed_at = now_ms()
+        token = store.arm_close(SID, armed_at)
         store.update_fields(
             SID,
-            close_requested_at=now_ms(),
             switch_requested_at=now_ms(),
             switch_config_dir="/target",
             switch_force=1,
             switch_prompt="continue",
         )
-        assert store.claim_after_turn(SID, now_ms(), 60_000) == ("close", None)
+        assert store.claim_after_turn(SID, now_ms(), 60_000) == (
+            "close",
+            CloseClaim(armed_at=armed_at, token=token, bound=""),
+        )
         row = store.get(SID)
         assert row is not None
         assert (row.switch_requested_at, row.switch_config_dir, row.switch_force) == (0, "", 0)

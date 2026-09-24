@@ -86,6 +86,14 @@ _CLOSE_NOW_SETTLE_SEC = 2.0
 # after a proven drain, before the SIGTERM.
 _DRAIN_POLL_SEC = 1.0
 _CLOSE_NOW_RENDER_SEC = 0.5
+# Why a `close-now` refused (tp#232). Only the TRANSIENT causes hand the claimed arm back
+# (`Store.restore_close`) for the same process's next Stop; every other cause retires it.
+CLOSE_HOOKS_RUNNING = "hooks_running"
+CLOSE_PS_UNREADABLE = "ps_unreadable"
+CLOSE_PID_GONE = "pid_gone"
+CLOSE_PID_REPLACED = "pid_replaced"
+CLOSE_NO_PID = "no_pid"
+_CLOSE_RETRYABLE = frozenset({CLOSE_HOOKS_RUNNING, CLOSE_PS_UNREADABLE})
 # `ccc switch-now`: how long to wait for the SIGTERM'd Claude to actually exit before
 # typing the relaunch into its tab (typing earlier would feed Claude's composer), and the
 # poll interval. A process still alive at the deadline aborts the relaunch (logged).
@@ -1090,9 +1098,11 @@ def cmd_mark_done(args: argparse.Namespace) -> int:
                 if session.future_file:
                     futuresync.archive_file(store, cfg, session, "archived")
                 store.update_fields(session_id, archived=True)
-            # --close: arm a one-shot close-after-turn request the release-locks Stop
-            # hook claims + fires (SIGTERM + pane/tab close). A headless/SDK run has no
-            # real tab to close, so arming there is a no-op (stderr note; still done).
+            # --close: arm a close-after-turn request the release-locks Stop hook claims +
+            # fires (SIGTERM + pane/tab close); a transient refusal may re-arm it once more
+            # for the next turn, within the original TTL (Store.restore_close). A
+            # headless/SDK run has no real tab to close, so arming there is a no-op (stderr
+            # note; still done).
             if close:
                 if _close_arming_suppressed():
                     print(
@@ -1101,11 +1111,11 @@ def cmd_mark_done(args: argparse.Namespace) -> int:
                         file=sys.stderr,
                     )
                 else:
-                    store.update_fields(session_id, close_requested_at=now_ms())
+                    store.arm_close(session_id, now_ms())
         else:
             # Reopening disarms any pending close request so a resumed session never
-            # self-closes on a stale arm.
-            store.update_fields(session_id, close_requested_at=0)
+            # self-closes on a stale arm (nor can an in-flight close-now restore one).
+            store.disarm_close(session_id)
             if session is not None and session.draft and session.archived:
                 # Un-doing a future-job draft: clear the archived flag and re-export its
                 # mirror file so it reappears in both ccc's FUTURE list and the Obsidian
@@ -1164,17 +1174,31 @@ def _command_names(commands: list[str]) -> list[str]:
     return list(names)
 
 
-def _close_now_abort(session_id: str, reason: str) -> int:
-    """Refuse a close: log it, notify, and leave BOTH the process and the tab alive."""
+def _close_now_abort(session_id: str, reason: str, rearmed_until: int = 0) -> int:
+    """Refuse a close: log it, notify, and leave BOTH the process and the tab alive.
+
+    *rearmed_until* is the epoch-ms the arm stays claimable when :meth:`Store.restore_close`
+    handed it back (``0`` = it did not), and picks the advice: a restored arm closes after
+    the NEXT turn ends; a retired one needs the tab closed by hand or a fresh arm from
+    INSIDE that session — ``mark-done --close`` from another shell arms a close nobody
+    claims while the session sits idle.
+    """
+    from datetime import datetime
+
     from . import hooks
 
-    detail = f"{reason} — NOT closed"
+    detail = f"{reason} — NOT closed ({'re-armed' if rearmed_until else 'not re-armed'})"
     hooks._log_event(session_id, "close-now", detail)  # pylint: disable=protected-access
     print(f"close-now: {detail}", file=sys.stderr)
-    _notify_close_now(
-        f"{session_id[:8]}: {reason}. Close it by hand: "
-        f"ccc mark-done --close --session {session_id}"
-    )
+    if rearmed_until:
+        until = datetime.fromtimestamp(rearmed_until / 1000).strftime("%H:%M")
+        advice = (
+            f"re-armed until {until}; it closes after your NEXT turn ends, "
+            "or close the tab yourself"
+        )
+    else:
+        advice = "close the tab yourself, or run /ccc-mark-done-and-close again in that session"
+    _notify_close_now(f"{session_id[:8]}: {reason} — {advice}")
     return 1
 
 
@@ -1189,47 +1213,113 @@ def _sigterm(pid: int) -> bool:
     return True
 
 
-def _close_now_reap(session_id: str, pid: int, cfg: config.Config) -> tuple[str, bool]:
-    """Wait out *pid*'s Stop chain, then reap it — ``(refusal reason, reaped)``.
+def _close_now_reap(  # pylint: disable=too-many-return-statements
+    session_id: str, pid: int, cfg: config.Config
+) -> tuple[str, str, str, bool]:
+    """Wait out *pid*'s Stop chain, then reap it — ``(reason, cause, "pid:start", reaped)``.
 
-    An empty reason means the close may proceed. FAIL-CLOSED: an unbindable pid, a timeout
-    with hooks still running, an unobservable chain, or an identity that changed during the
-    wait each return a reason and signal NOTHING. The identity re-check runs on a FRESH
-    snapshot immediately before the SIGTERM, so a pid recycled during a minutes-long wait is
-    never signalled.
+    An empty reason means the close may proceed. FAIL-CLOSED: an unbindable pid, a baseline
+    probe without a start stamp, a timeout with hooks still running, an unobservable chain,
+    or an identity that changed during the wait each return a reason plus its typed cause
+    (``CLOSE_*``) and signal NOTHING. The third element is the VERIFIED ``"pid:start"`` of
+    the baseline probe (``""`` when there was none) — what a restored arm gets bound to.
+    The identity re-check runs on a FRESH snapshot immediately before the SIGTERM, so a pid
+    recycled during a minutes-long wait is never signalled.
     """
     import time
 
     from . import terminal
 
     if pid <= 0:
-        return "no live Claude pid (neither --pid nor registry)", False
+        return "no live Claude pid (neither --pid nor registry)", CLOSE_NO_PID, "", False
     with Store() as store:
-        bound = store.get(session_id)
-    started = terminal.pid_start(pid)
+        row = store.get(session_id)
+    first = terminal.probe_identity(pid)
+    if first.kind == terminal.IDENTITY_PS_UNREADABLE:
+        return f"pid {pid} could not be identified (ps unreadable)", CLOSE_PS_UNREADABLE, "", False
+    if first.kind != terminal.IDENTITY_OK:
+        return f"pid {pid} is gone", CLOSE_PID_GONE, "", False
+    if not first.is_claude:
+        return f"pid {pid} is not a claude process", CLOSE_PID_REPLACED, "", False
+    bound = first.token(pid)
+    causes: list[str] = []
     state, running = _wait_for_stop_drain(
         pid,
-        (bound.cwd if bound else "") or "",
+        (row.cwd if row else "") or "",
         cfg.stop_barrier_wait_sec,
         cfg.stop_barrier_settle_sec,
+        unknown_causes=causes,
     )
     if state == terminal.DRAIN_RUNNING:
         names = ", ".join(_command_names(running)) or "unnamed hook process(es)"
-        return f"Stop hooks still running after {cfg.stop_barrier_wait_sec}s: {names}", False
+        reason = f"Stop hooks still running after {cfg.stop_barrier_wait_sec}s: {names}"
+        return reason, CLOSE_HOOKS_RUNNING, bound, False
     if state != terminal.DRAIN_DRAINED:
-        return "the Stop chain could not be observed (ps unreadable or pid gone)", False
+        cause = causes[-1] if causes else CLOSE_PS_UNREADABLE
+        reason = "the Stop chain could not be observed (ps unreadable or pid gone)"
+        return reason, cause, bound, False
     time.sleep(_CLOSE_NOW_RENDER_SEC)  # let the tab render the turn's last output
-    table = terminal.ps_table()
-    if not terminal.pid_is_claude(pid, table) or terminal.pid_start(pid) != started:
-        return f"pid {pid} is no longer this session's claude after the Stop wait", False
-    return "", _sigterm(pid)
+    final = terminal.probe_identity(pid)
+    if final.kind == terminal.IDENTITY_PS_UNREADABLE:
+        reason = f"pid {pid} could not be re-identified after the Stop wait (ps unreadable)"
+        return reason, CLOSE_PS_UNREADABLE, bound, False
+    if final.kind != terminal.IDENTITY_OK:
+        return f"pid {pid} is gone after the Stop wait", CLOSE_PID_GONE, bound, False
+    if not final.is_claude or final.start != first.start:
+        reason = f"pid {pid} is no longer this session's claude after the Stop wait"
+        return reason, CLOSE_PID_REPLACED, bound, False
+    return "", "", bound, _sigterm(pid)
+
+
+def _close_now_settle_arm(
+    session_id: str, args: argparse.Namespace, cause: str, verified: str
+) -> int:
+    """Restore (transient *cause*) or retire the claimed arm ``close-now`` was handed.
+
+    Returns the epoch-ms the restored arm stays claimable until, ``0`` when it was not
+    restored. A legacy argv (no ``--token``/``--armed-at``) never restores. The binding is
+    the VERIFIED baseline ``"pid:start"``, else the hook's ``--bound`` when it names the
+    same pid (the hook checked it against its own ``$CLAUDE_PID`` this very Stop); with
+    neither the arm is retired — an unbound restore could close a relaunched process.
+    """
+    from .hooks import CLOSE_REQUEST_TTL_MS
+
+    token = str(getattr(args, "token", "") or "")
+    armed_at = int(getattr(args, "armed_at", 0) or 0)
+    if not token:
+        return 0
+    pid = int(getattr(args, "pid", 0) or 0)
+    hinted = str(getattr(args, "bound", "") or "")
+    bound = verified or (hinted if pid > 0 and hinted.startswith(f"{pid}:") else "")
+    try:
+        with Store() as store:
+            if cause in _CLOSE_RETRYABLE and armed_at > 0 and bound:
+                if store.restore_close(
+                    session_id,
+                    armed_at=armed_at,
+                    token=token,
+                    bound=bound,
+                    now=now_ms(),
+                    ttl_ms=CLOSE_REQUEST_TTL_MS,
+                ):
+                    return armed_at + CLOSE_REQUEST_TTL_MS
+            store.retire_close(session_id, token)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        pass
+    return 0
 
 
 def cmd_close_now(args: argparse.Namespace) -> int:
     """Internal: wait out the Stop chain, then SIGTERM the session's Claude and close its tab.
 
     Spawned detached by the ``release-locks`` Stop hook once a ``mark-done --close`` request
-    is claimed. Claude Code runs every hook of one event in PARALLEL, so nothing here can be
+    is claimed. The arm is not strictly one-shot: a TRANSIENT refusal (hooks still running,
+    ``ps`` unreadable) hands it back via :meth:`Store.restore_close`, bound to the verified
+    ``"pid:start"`` and to the arm's ``--token``, so the SAME process's next Stop retries
+    with every check below — within the original TTL, never extended. Every other refusal
+    (no pid, pid gone or replaced) and every success retires it (:func:`_close_now_settle_arm`).
+
+    Claude Code runs every hook of one event in PARALLEL, so nothing here can be
     ordered "after the auto-commit": this command WAITS for the session's Stop-hook chain to
     look drained (:func:`_wait_for_stop_drain`, bounded by ``stop_barrier_wait_sec``) and is
     FAIL-CLOSED — a timeout with hooks still running, an unobservable state, a pid it cannot
@@ -1267,9 +1357,11 @@ def cmd_close_now(args: argparse.Namespace) -> int:
         # (2) Bind the process (the hook's $CLAUDE_PID, else the live registry entry), wait
         #     for its Stop chain and reap it — or refuse and touch nothing.
         pid = int(getattr(args, "pid", 0) or 0) or _live_session_pid(session_id)
-        reason, reaped_pid = _close_now_reap(session_id, pid, cfg)
+        reason, cause, verified, reaped_pid = _close_now_reap(session_id, pid, cfg)
         if reason:
-            return _close_now_abort(session_id, reason)
+            rearmed_until = _close_now_settle_arm(session_id, args, cause, verified)
+            return _close_now_abort(session_id, reason, rearmed_until)
+    _close_now_settle_arm(session_id, args, "", "")  # closing: the arm is spent
     with Store() as store:
         session = store.get(session_id)
     # (3) Terminal close, first match wins. (a) tmux pane.
@@ -1353,7 +1445,11 @@ def _wait_until(predicate: Callable[[], bool], timeout: float, poll: float | Non
 
 
 def _wait_for_stop_drain(
-    pid: int, cwd: str, wait_sec: float, settle_sec: float
+    pid: int,
+    cwd: str,
+    wait_sec: float,
+    settle_sec: float,
+    unknown_causes: list[str] | None = None,
 ) -> tuple[str, list[str]]:
     """Wait until *pid*'s Stop-hook chain looks drained: ``(state, still-running commands)``.
 
@@ -1373,6 +1469,12 @@ def _wait_for_stop_drain(
     Claude process while its Stop hooks are still committing; the files themselves are
     protected by the Stop lease (:meth:`command_center.store.Store.protect_locks`), which
     is why "cannot tell" here means "do not kill" and never "release a lock".
+
+    *unknown_causes*, when given, receives one ``CLOSE_*`` cause per ``DRAIN_UNKNOWN``
+    scan — an empty table is ``CLOSE_PS_UNREADABLE``, a pid missing from a readable table
+    ``CLOSE_PID_GONE``, a non-``claude`` pid ``CLOSE_PID_REPLACED`` — plus a final
+    ``CLOSE_PS_UNREADABLE`` when a lone clean scan is downgraded; its LAST entry types
+    the returned ``DRAIN_UNKNOWN``.
     """
     import time
 
@@ -1388,6 +1490,8 @@ def _wait_for_stop_drain(
         state, running = terminal.drain_state(
             pid, table, tokens, terminal.own_branch_pids(pid, table)
         )
+        if state == terminal.DRAIN_UNKNOWN and unknown_causes is not None:
+            unknown_causes.append(_unknown_scan_cause(pid, table))
         now = time.monotonic()
         if state == terminal.DRAIN_DRAINED:
             if clean_since is not None and now - clean_since >= settle_sec:
@@ -1398,9 +1502,24 @@ def _wait_for_stop_drain(
             clean_since = None
         if time.monotonic() >= deadline:
             if state == terminal.DRAIN_DRAINED:  # clean, but never confirmed by a 2nd scan
+                if unknown_causes is not None:
+                    unknown_causes.append(CLOSE_PS_UNREADABLE)
                 return terminal.DRAIN_UNKNOWN, []
             return state, running
         time.sleep(_DRAIN_POLL_SEC)
+
+
+def _unknown_scan_cause(pid: int, table: dict[int, Any]) -> str:
+    """Type one ``DRAIN_UNKNOWN`` scan of *table* for *pid* as a ``CLOSE_*`` cause."""
+    from . import terminal
+
+    if not table:
+        return CLOSE_PS_UNREADABLE
+    if pid not in table:
+        return CLOSE_PID_GONE
+    if not terminal.pid_is_claude(pid, table):
+        return CLOSE_PID_REPLACED
+    return CLOSE_PS_UNREADABLE
 
 
 def _wait_pid_gone(pid: int, timeout: float) -> bool:
@@ -5667,6 +5786,11 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         default=0,
         help="the hook's $CLAUDE_PID; the process to reap (fail closed when it no longer matches)",
     )
+    # Internal (hook-supplied) arm identity: a transient refusal hands the claimed arm back
+    # through Store.restore_close. Without --token a close-now never restores.
+    p_closenow.add_argument("-A", "--armed-at", type=int, default=0, help=argparse.SUPPRESS)
+    p_closenow.add_argument("-T", "--token", default="", help=argparse.SUPPRESS)
+    p_closenow.add_argument("-B", "--bound", default="", help=argparse.SUPPRESS)
     p_closenow.set_defaults(func=cmd_close_now)
 
     p_switch = sub.add_parser(
