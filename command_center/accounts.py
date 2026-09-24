@@ -202,7 +202,9 @@ def ensure_trusted(config_dir: str, cwd: str | Path | None = None) -> bool:
     # (~/.claude.json next to ~/.claude/), any other account's is inside its dir.
     # Derived from the config dir (not Path.home()) so a test that pins CLAUDE_HOME
     # under tmp can never reach the real ~/.claude.json.
-    resolved = _resolve(config_dir)
+    # An empty *config_dir* (an unstamped row) IS the default account — never
+    # ``_resolve("")``, which is the process cwd and put the file one level above it.
+    resolved = _resolve(config_dir) if config_dir else default_config_dir()
     path = (
         (resolved.parent / ".claude.json")
         if is_default_config_dir(config_dir)

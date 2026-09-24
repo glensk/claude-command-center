@@ -57,3 +57,22 @@ def test_apply_to_environ_trusts_the_process_cwd(
     )
     data = json.loads((work / ".claude.json").read_text(encoding="utf-8"))
     assert data["projects"][str(repo.resolve())] == {"hasTrustDialogAccepted": True}
+
+
+def test_empty_config_dir_trusts_the_default_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unstamped row (``config_dir == ""``) is the default account, not the cwd's parent."""
+    home = tmp_path / "claude-home"
+    monkeypatch.setenv("CLAUDE_HOME", str(home))
+    cfg = home.parent / ".claude.json"
+    _write(cfg, {"projects": {}})
+    repo = tmp_path / "sub" / "repo"
+    repo.mkdir(parents=True)
+    stray = repo.parent / ".claude.json"  # where ``_resolve("")`` used to point
+    _write(stray, {"projects": {}})
+    monkeypatch.chdir(repo)
+    assert accounts.ensure_trusted("") is True
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["projects"][str(repo.resolve())] == {"hasTrustDialogAccepted": True}
+    assert json.loads(stray.read_text(encoding="utf-8")) == {"projects": {}}
