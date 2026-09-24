@@ -38,10 +38,12 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import json
 import os
 import shlex
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -193,10 +195,6 @@ def ensure_trusted(config_dir: str, cwd: str | Path | None = None) -> bool:
     written, atomically; a missing config (an account that never ran) is left
     alone. Returns True when the file was written.
     """
-    import json
-    import os
-    import tempfile
-
     target = str(Path(cwd).resolve()) if cwd else os.getcwd()
     # Claude Code's layout: the DEFAULT account's file is the config dir's SIBLING
     # (~/.claude.json next to ~/.claude/), any other account's is inside its dir.
