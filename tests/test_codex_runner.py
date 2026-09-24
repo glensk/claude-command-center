@@ -41,6 +41,8 @@ from conftest import SeatFixture, make_three_seats
 from command_center import codex_in_claude as cic
 from command_center import codex_launch, quota
 
+# pylint: disable=too-many-lines  # one cohesive suite: the runner's hops, hygiene and CLI
+
 _FIXTURES = Path(__file__).parent / "fixtures" / "codex_json"
 _MODEL = "gpt-5.6-sol"
 _REAL_LIST_MODELS = cic.list_models  # captured before the autouse fixture stubs it
@@ -475,6 +477,38 @@ def test_argv_ephemeral_follows_the_usage_opt_in(
     monkeypatch.setattr(cic, "_pre_selection_refresh", lambda _cands, _budget: None)
     assert cic.cmd_run(_run_ns(three_seats, json=False)) == cic.EX_OK
     assert "--ephemeral" in three_seats.calls()[0]["argv"]
+
+
+def test_attempt_elapsed_excludes_the_post_attempt_refresh(
+    three_seats: SeatFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """tp#418: the live-usage fetch after the exec is not Codex time in the ledger."""
+    skew = [0.0]
+
+    class _Clock:
+        """``time`` for the runner, with a monotonic clock the fake fetch can advance."""
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(time, name)
+
+        @staticmethod
+        def monotonic() -> float:
+            return time.monotonic() + skew[0]
+
+    def _slow_refresh(_cand: object, _budget: float) -> None:
+        skew[0] += 30.0  # a fetch that "took" 30 s
+
+    monkeypatch.setattr(cic, "time", _Clock())
+    monkeypatch.setattr(cic, "_usage_feedback_on", lambda: True)
+    monkeypatch.setattr(cic, "_post_attempt_refresh", _slow_refresh)
+    monkeypatch.setattr(cic, "_pre_selection_refresh", lambda _cands, _budget: None)
+    three_seats.scenarios(private={"scenario": "ok", "reply": "hi"})
+    assert cic.cmd_run(_run_ns(three_seats, timeout=0)) == cic.EX_OK
+    assert skew[0] == 30.0  # the refresh really ran inside the attempt
+    (attempt,) = _envelope(capsys)["attempts"]
+    assert attempt["elapsed_s"] < 30.0
 
 
 def test_delegate_keeps_and_journals_its_session(three_seats: SeatFixture) -> None:
@@ -1207,7 +1241,7 @@ def _collect_heartbeats(
             stdin_text="",
             **exec_kwargs,  # type: ignore[arg-type]
         )
-    except Exception as exc:  # noqa: BLE001  # the scenario decides how the run ends
+    except Exception as exc:  # noqa: BLE001  pylint: disable=broad-exception-caught  # the scenario decides
         raised = exc
     finally:
         done.set()

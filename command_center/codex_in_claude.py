@@ -3926,6 +3926,7 @@ def _attempt_codex(  # pylint: disable=too-many-locals
     heartbeat_path: Path,
     total_timeout: int = 0,
     started: float | None = None,
+    exec_done: list[float] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], str, list[str] | None]:
     """ONE supervised ``codex exec`` on *cand*: ``(proc, reply, worktree before)``.
 
@@ -3942,6 +3943,8 @@ def _attempt_codex(  # pylint: disable=too-many-locals
     BEFORE the ``after`` snapshot is taken: an ephemeral run leaves no rollout, so that
     fetch is the only thing that can make ``after`` differ from ``before`` (tp#227). It
     is also what lets the NEXT ranking — this call's own hop included — see the cost.
+    *exec_done*, when given, receives the ``time.monotonic()`` at which ``codex exec``
+    ended (success or raise), so the caller can time the attempt without that fetch.
     """
     perm_args = codex_launch.permission_args(write, codex_home=cand.home)
     mcp_args = codex_launch.mcp_disable_args(cand.home)
@@ -3966,6 +3969,8 @@ def _attempt_codex(  # pylint: disable=too-many-locals
                 stdin_text=prompt,
             )
         finally:
+            if exec_done is not None:
+                exec_done.append(time.monotonic())
             if _usage_feedback_on():
                 with contextlib.suppress(Exception):
                     _post_attempt_refresh(
@@ -4445,6 +4450,7 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
             _record_attempt(cand)
         physical += 1
         attempt_started = time.monotonic()
+        exec_done: list[float] = []
         try:
             proc, reply, before = _attempt_codex(
                 cand,
@@ -4461,23 +4467,38 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
                 heartbeat_path=heartbeat_path,
                 total_timeout=total_timeout,
                 started=started,
+                exec_done=exec_done,
             )
         except FileNotFoundError:
             result.attempts.append(
-                RunAttempt(cand.label, str(cand.home), time.monotonic() - attempt_started, "failed")
+                RunAttempt(
+                    cand.label,
+                    str(cand.home),
+                    _attempt_elapsed(attempt_started, exec_done),
+                    "failed",
+                )
             )
             result.error_kind = "no_codex"
             result.error_message = "`codex` CLI not found on PATH."
             return result
         except subprocess.TimeoutExpired as exc:
             return _killed_result(
-                result, cand, exc, attempt_started, kind="timeout", budget=total_timeout
+                result,
+                cand,
+                exc,
+                _attempt_elapsed(attempt_started, exec_done),
+                kind="timeout",
+                budget=total_timeout,
             )
         except CodexStalledError as exc:
             return _killed_result(
-                result, cand, exc, attempt_started, kind=_STALL_KINDS.get(exc.reason, "stalled")
+                result,
+                cand,
+                exc,
+                _attempt_elapsed(attempt_started, exec_done),
+                kind=_STALL_KINDS.get(exc.reason, "stalled"),
             )
-        elapsed = time.monotonic() - attempt_started
+        elapsed = _attempt_elapsed(attempt_started, exec_done)
         events = parse_json_events(proc.stdout or "")
         failure = classify_codex_failure(proc.returncode, events, proc.stderr or "")
         result.proc = proc
@@ -4600,11 +4621,21 @@ def _stall_headline(exc: CodexStalledError) -> str:
     return text
 
 
+def _attempt_elapsed(attempt_started: float, exec_done: list[float]) -> float:
+    """Seconds the ``codex exec`` itself took — NOT the post-attempt usage fetch.
+
+    :func:`_attempt_codex` runs that fetch (up to ~15 s) before it returns or re-raises,
+    so ``now - attempt_started`` would book it as Codex time in the ledger and the
+    heartbeat (tp#418). *exec_done* is empty only when the exec never started.
+    """
+    return (exec_done[0] if exec_done else time.monotonic()) - attempt_started
+
+
 def _killed_result(
     result: RunResult,
     cand: SeatCandidate,
     exc: subprocess.TimeoutExpired | CodexStalledError,
-    attempt_started: float,
+    elapsed: float,
     *,
     kind: str,
     budget: int = 0,
@@ -4632,9 +4663,7 @@ def _killed_result(
     tail = _stderr_tail(stderr_text)
     result.session_id = session
     result.seat = cand
-    result.attempts.append(
-        RunAttempt(cand.label, str(cand.home), time.monotonic() - attempt_started, kind)
-    )
+    result.attempts.append(RunAttempt(cand.label, str(cand.home), elapsed, kind))
     result.error_kind = kind
     result.error_message = (
         headline
