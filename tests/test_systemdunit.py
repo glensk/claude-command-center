@@ -52,7 +52,7 @@ def test_service_content_is_oneshot_daemon() -> None:
 
 def _systemd_parse_environment(line: str) -> str:
     """Decode one ``Environment=`` line the way systemd does (specifiers, then unquote+unescape)."""
-    raw = line.removeprefix("Environment=").rstrip("\n").replace("%%", "%")
+    raw = _systemd_unspec(line.removeprefix("Environment=").rstrip("\n"))
     assert raw.startswith('"') and raw.endswith('"'), raw
     body, out, i = raw[1:-1], [], 0
     while i < len(body):
@@ -82,6 +82,7 @@ def _systemd_parse_environment(line: str) -> str:
         "/tmp/100%done",
         "/tmp/tab\there",
         "/tmp/$HOME",
+        "/tmp/it's",
     ],
 )
 def test_service_content_escapes_override_env(value: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -101,6 +102,108 @@ def test_service_content_omits_unset_override_env(monkeypatch: pytest.MonkeyPatc
     monkeypatch.delenv("CCC_HOME", raising=False)
     monkeypatch.delenv("CLAUDE_HOME", raising=False)
     assert "Environment=" not in systemdunit.service_content("/opt/ccc", Path("/logs"))
+
+
+def _systemd_unspec(raw: str) -> str:
+    """Resolve ``%`` the way systemd does: ``%%`` is a literal, any other ``%x`` a specifier."""
+    out, i = [], 0
+    while i < len(raw):
+        if raw[i] == "%":
+            assert raw[i + 1 : i + 2] == "%", f"unescaped % would be read as a specifier: {raw}"
+            i += 2
+            out.append("%")
+            continue
+        out.append(raw[i])
+        i += 1
+    return "".join(out)
+
+
+def _systemd_split_exec(line: str) -> list[str]:
+    """Split one ``ExecStart=`` line into argv like systemd (specifiers, then shell-like words)."""
+    raw = _systemd_unspec(line.removeprefix("ExecStart="))
+    words: list[str] = []
+    word: list[str] | None = None
+    quote, i = "", 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch == "\\":
+            nxt = raw[i + 1]
+            if nxt == "x":
+                ch, i = chr(int(raw[i + 2 : i + 4], 16)), i + 4
+            else:
+                ch, i = nxt, i + 2
+            word = (word or []) + [ch]
+            continue
+        i += 1
+        if quote:
+            if ch == quote:
+                quote = ""
+            else:
+                word = (word or []) + [ch]
+        elif ch in "\"'":
+            quote, word = ch, word or []
+        elif ch.isspace():
+            if word is not None:
+                words.append("".join(word))
+            word = None
+        else:
+            word = (word or []) + [ch]
+    assert not quote, f"unterminated quote: {line}"
+    if word is not None:
+        words.append("".join(word))
+    return words
+
+
+_ODD_PATHS = [
+    "/opt/ccc",
+    "/home/u/My Drive/bin/ccc",
+    '/tmp/we"ird/ccc',
+    "/tmp/it's/ccc",
+    "/tmp/back\\slash/ccc",
+    "/tmp/100%done/ccc",
+    "/tmp/$HOME/ccc",
+]
+
+
+def _line(text: str, key: str) -> str:
+    return next(ln for ln in text.splitlines() if ln.startswith(key))
+
+
+@pytest.mark.parametrize("ccc_path", _ODD_PATHS)
+def test_exec_start_keeps_ccc_path_one_word(ccc_path: str) -> None:
+    # tp#429: ExecStart= interpolated ccc_path raw, so a space split argv and a % was
+    # read as a specifier.
+    daemon = systemdunit.service_content(ccc_path, Path("/logs"))
+    assert _systemd_split_exec(_line(daemon, "ExecStart=")) == [ccc_path, "daemon"]
+    sync = systemdunit.future_sync_service_content(ccc_path, "/logs/f.log")
+    assert _systemd_split_exec(_line(sync, "ExecStart=")) == [ccc_path, "sync-future"]
+
+
+@pytest.mark.parametrize("directory", ["/logs", "/home/u/My Drive/100%/logs", "/tmp/we\"i'rd"])
+def test_append_and_path_units_escape_percent(directory: str) -> None:
+    # tp#429: these settings take the path literally after specifier expansion, so % is
+    # the only character that needs escaping (and must be doubled).
+    daemon = systemdunit.service_content("/opt/ccc", Path(directory))
+    for key, name in (
+        ("StandardOutput=append:", "daemon.log"),
+        ("StandardError=append:", "daemon.err"),
+    ):
+        assert _systemd_unspec(_line(daemon, key).removeprefix(key)) == f"{directory}/{name}"
+    sync = systemdunit.future_sync_service_content("/opt/ccc", f"{directory}/f.log")
+    for key in ("StandardOutput=append:", "StandardError=append:"):
+        assert _systemd_unspec(_line(sync, key).removeprefix(key)) == f"{directory}/f.log"
+    path_unit = systemdunit.future_sync_path_content(directory)
+    for key in ("PathModified=", "PathChanged="):
+        assert _systemd_unspec(_line(path_unit, key).removeprefix(key)) == directory
+
+
+@pytest.mark.parametrize("bad", ["/tmp/new\nline", "/tmp/trailing\\", "/tmp/sp ", " /tmp/sp"])
+def test_unrepresentable_literal_paths_raise(bad: str) -> None:
+    # A newline would inject a new unit directive; a trailing backslash continues the line.
+    with pytest.raises(ValueError):
+        systemdunit.future_sync_path_content(bad)
+    with pytest.raises(ValueError):
+        systemdunit.future_sync_service_content("/opt/ccc", bad)
 
 
 def test_timer_content_fires_every_interval() -> None:

@@ -75,6 +75,21 @@ def _systemctl(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _c_escape(value: str) -> str:
+    """Double ``%`` and C-escape ``\\``/``"``/``'``/control characters for a quoted word."""
+    out = []
+    for ch in value:
+        if ch in "\\\"'":
+            out.append("\\" + ch)
+        elif ch == "%":
+            out.append("%%")
+        elif ord(ch) < 0x20 or ch == "\x7f":
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _environment_line(name: str, value: str) -> str:
     """Return one ``Environment="NAME=value"`` line that systemd parses back verbatim.
 
@@ -83,17 +98,39 @@ def _environment_line(name: str, value: str) -> str:
     ``%`` would be cut, mangled or rejected. Double ``%``, C-escape ``\\``/``"``/control
     characters and quote the whole assignment.
     """
-    out = []
-    for ch in f"{name}={value}":
-        if ch in '\\"':
-            out.append("\\" + ch)
-        elif ch == "%":
-            out.append("%%")
-        elif ord(ch) < 0x20 or ch == "\x7f":
-            out.append(f"\\x{ord(ch):02x}")
-        else:
-            out.append(ch)
-    return f'Environment="{"".join(out)}"\n'
+    return f'Environment="{_c_escape(f"{name}={value}")}"\n'
+
+
+def _exec_word(value: str) -> str:
+    """Return *value* as one ``ExecStart=`` word that systemd splits back verbatim.
+
+    Same parsing as ``Environment=`` (specifiers, then word splitting with quote removal
+    and C unescaping), so a space in the executable path would otherwise split argv.
+    Plain values stay unquoted; anything with whitespace, quotes, backslashes or control
+    characters is quoted + escaped. ``$`` is left alone: systemd never substitutes
+    variables in the executable path it runs.
+    """
+    if any(ch.isspace() or ch in "\"'\\" or ord(ch) < 0x20 or ch == "\x7f" for ch in value):
+        return f'"{_c_escape(value)}"'
+    return value.replace("%", "%%")
+
+
+def _literal_path(value: str) -> str:
+    """Return *value* for a path setting systemd takes literally after specifier expansion.
+
+    ``StandardOutput=append:``, ``PathModified=`` and ``PathChanged=`` do no unquoting
+    or unescaping — only ``%`` specifiers are resolved, so doubling ``%`` is the only
+    escape. A control character (a newline would start a new unit directive), a trailing
+    backslash (line continuation) or leading/trailing whitespace (stripped by the
+    parser) cannot be represented and raises ``ValueError``.
+    """
+    if any(ord(ch) < 0x20 or ch == "\x7f" for ch in value):
+        raise ValueError(
+            f"path contains a control character, not representable in a unit: {value!r}"
+        )
+    if value.endswith("\\") or value != value.strip():
+        raise ValueError(f"path has a trailing backslash or surrounding whitespace: {value!r}")
+    return value.replace("%", "%%")
 
 
 def service_content(ccc_path: str, log_dir: Path) -> str:
@@ -111,9 +148,9 @@ After=default.target
 
 [Service]
 Type=oneshot
-{env}ExecStart={ccc_path} daemon
-StandardOutput=append:{log_dir / "daemon.log"}
-StandardError=append:{log_dir / "daemon.err"}
+{env}ExecStart={_exec_word(ccc_path)} daemon
+StandardOutput=append:{_literal_path(str(log_dir / "daemon.log"))}
+StandardError=append:{_literal_path(str(log_dir / "daemon.err"))}
 """
 
 
@@ -143,8 +180,8 @@ def future_sync_path_content(watch_path: str) -> str:
 Description=ccc future-sync watcher
 
 [Path]
-PathModified={watch_path}
-PathChanged={watch_path}
+PathModified={_literal_path(watch_path)}
+PathChanged={_literal_path(watch_path)}
 Unit={future_sync_label()}.service
 
 [Install]
@@ -165,9 +202,9 @@ Description=ccc future-sync (triggered by the path unit)
 Type=oneshot
 Environment=CCC_INTERNAL=1
 Environment=AI_NO_AUTOCOMMIT=1
-ExecStart={ccc_path} sync-future
-StandardOutput=append:{log_path}
-StandardError=append:{log_path}
+ExecStart={_exec_word(ccc_path)} sync-future
+StandardOutput=append:{_literal_path(log_path)}
+StandardError=append:{_literal_path(log_path)}
 """
 
 
