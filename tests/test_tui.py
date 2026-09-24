@@ -40,6 +40,19 @@ async def settle(pilot) -> None:
     await pilot.pause()
 
 
+async def flush_after_refresh(pilot) -> None:
+    """Run the app's pending ``call_after_refresh`` callbacks and re-lay out the screen.
+
+    Those callbacks fire only once the screen's update timer has ticked and its message
+    queue drained again, and ``pilot.press`` waits for neither: under full-suite load the
+    timer lags, so a check right after a key press reads the pre-callback state (tp#414).
+    The first pause forces the screen update (queuing the callbacks), the second runs them
+    and applies the layout they changed.
+    """
+    await pilot.pause()
+    await pilot.pause()
+
+
 @pytest.fixture(autouse=True)
 def _chord_window_survives_a_slow_test(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stop a slow TEST from firing a chord leader's timeout in the middle of a chord.
@@ -1973,11 +1986,17 @@ def test_inline_edit_long_prompt_keeps_caret_in_view(
             table.focus()
             await pilot.pause()
 
-            await pilot.press("e")
-            await pilot.pause()
+            async def press(key: str) -> None:
+                await pilot.press(key)
+                await flush_after_refresh(pilot)
+
+            # Entering edit mode focuses #edit-aim after a refresh; flushing it first keeps
+            # that deferred focus from stealing the caret back from the prompt (tp#414).
+            await press("e")
             prompt = app.query_one("#edit-prompt", TextArea)
             prompt.focus()
-            await pilot.pause()
+            await flush_after_refresh(pilot)
+            assert app.focused is prompt
             wrap = app.query_one("#detail-wrap", VerticalScroll)
 
             def caret_visible() -> bool:
@@ -1989,18 +2008,18 @@ def test_inline_edit_long_prompt_keeps_caret_in_view(
             assert caret_visible()
             offscreen = 0
             for _ in range(130):  # down past the last line, then some
-                await pilot.press("down")
+                await press("down")
                 offscreen += not caret_visible()
             assert offscreen == 0
             assert prompt.cursor_location[0] == 119  # reached the end of the prompt
 
-            await pilot.press("end")
+            await press("end")
             for char in "tail":
-                await pilot.press(char)
+                await press(char)
             assert caret_visible()
 
             for _ in range(140):  # …and all the way back up
-                await pilot.press("up")
+                await press("up")
             assert caret_visible()
             assert prompt.cursor_location == (0, 0)
 
