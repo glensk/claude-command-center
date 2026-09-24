@@ -97,6 +97,27 @@ _BLOCK_SEP = "\n\n" + "─" * _RULE_WIDTH + "\n\n"
 _TAG_RULE = "rule"
 _TAG_TEXT = "text"
 _TAG_LAST = "last"
+# The ObjC target class of the ✕ close button, defined once per process on first use
+# (a resident panel server builds many panels; an ObjC class can be registered once).
+_CLOSE_TARGET_CLASS: list[Any] = []
+
+
+def _close_target_class() -> Any:
+    """The ``NSObject`` subclass whose ``close:`` action runs the panel's dismiss callback."""
+    if not _CLOSE_TARGET_CLASS:
+        import AppKit  # noqa: PLC0415  # pylint: disable=import-outside-toplevel,no-member
+
+        class _PeekCloseTarget(AppKit.NSObject):  # pylint: disable=no-member
+            """Target of the ✕ button: calls ``self.on_close`` (set per panel)."""
+
+            def close_(self, _sender: object) -> None:  # noqa: N802 (ObjC selector)
+                """✕ clicked: dismiss the panel exactly like ⎋ does."""
+                callback = getattr(self, "on_close", None)
+                if callback is not None:
+                    callback()
+
+        _CLOSE_TARGET_CLASS.append(_PeekCloseTarget)
+    return _CLOSE_TARGET_CLASS[0]
 
 
 def _uuid(iterm_session_id: str | None) -> str | None:
@@ -650,6 +671,7 @@ class PeekPanel:  # pylint: disable=no-member  # AppKit attrs resolve via PyObjC
     monitor: Any = None
     observers: list[Any] = field(default_factory=list)
     timer: Any = None
+    close_target: Any = None  # the ✕ button's target (kept alive; unhooked on close)
     closed: bool = False
 
     def close(self) -> None:
@@ -669,6 +691,9 @@ class PeekPanel:  # pylint: disable=no-member  # AppKit attrs resolve via PyObjC
         if self.timer is not None:
             self.timer.invalidate()
             self.timer = None
+        if self.close_target is not None:
+            self.close_target.on_close = None  # drop the closure over the run loop
+            self.close_target = None
         self.window.orderOut_(None)
         self.window.close()
 
@@ -796,7 +821,7 @@ def _build_panel(  # noqa: PLR0913,PLR0915  pylint: disable=no-member,too-many-s
     # ── Title: the panel's own name, so it can be referred to ("the ccc peek panel")
     # in conversation — also the (hidden) window title for the OS (dark_floating_window).
     title = AppKit.NSTextField.alloc().initWithFrame_(
-        AppKit.NSMakeRect(pad, title_y, width - 2.0 * pad, 22.0)
+        AppKit.NSMakeRect(pad, title_y, width - 2.0 * pad - 40.0, 22.0)
     )
     title.setBezeled_(False)
     title.setDrawsBackground_(False)
@@ -981,6 +1006,17 @@ def _build_panel(  # noqa: PLR0913,PLR0915  pylint: disable=no-member,too-many-s
 
     def _dismiss() -> None:
         driver.stop()
+
+    # ── ✕ close button, top right: a mouse way out when the keys / click-away don't.
+    panel.close_target = _close_target_class().alloc().init()
+    panel.close_target.on_close = _dismiss
+    close_btn = AppKit.NSButton.buttonWithTitle_target_action_("✕", panel.close_target, "close:")
+    close_btn.setBordered_(False)
+    close_btn.setFont_(AppKit.NSFont.systemFontOfSize_(18.0))
+    close_btn.setContentTintColor_(AppKit.NSColor.secondaryLabelColor())
+    close_btn.setToolTip_("Close (Space / ⎋)")
+    close_btn.setFrame_(AppKit.NSMakeRect(width - pad - 28.0, height - 40.0, 28.0, 28.0))
+    content.addSubview_(close_btn)
 
     def _copy_visible_tab() -> None:
         # Copy the focused tab's selection to the clipboard — or, when nothing is

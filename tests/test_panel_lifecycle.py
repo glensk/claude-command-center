@@ -51,6 +51,8 @@ def _fake_appkit(monkeypatch: pytest.MonkeyPatch) -> Any:
         lambda *a, **k: MagicMock(name="timer")
     )
     monkeypatch.setitem(sys.modules, "AppKit", fake)
+    # The ✕ button's target class is cached per process — never let a stub-based one leak.
+    monkeypatch.setattr(peek, "_CLOSE_TARGET_CLASS", [])
     return fake
 
 
@@ -121,6 +123,32 @@ def test_peek_dismissal_goes_through_the_loop_seam(monkeypatch: pytest.MonkeyPat
     block(MagicMock(name="timer"))
     assert stops == ["stop"]
     fake.NSApplication.sharedApplication.return_value.stop_.assert_not_called()
+
+
+def test_peek_close_button_dismisses_through_the_loop_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The top-right ✕ button's ``close:`` action stops the loop; close() unhooks it."""
+    fake = _fake_appkit(monkeypatch)
+    stops: list[str] = []
+
+    class _Loop:
+        def run(self, panel: peek.PeekPanel) -> None:
+            del panel
+
+        def stop(self) -> None:
+            stops.append("stop")
+
+    panel = _build(loop=_Loop())
+    title, target, action = fake.NSButton.buttonWithTitle_target_action_.call_args.args
+    assert (title, action) == ("✕", "close:")
+    assert target is panel.close_target
+    target.close_(None)
+    assert stops == ["stop"]
+    panel.close()
+    assert panel.close_target is None and target.on_close is None
+    target.close_(None)  # a late click after close is a no-op
+    assert stops == ["stop"]
 
 
 # --------------------------------------------------------------------------- #

@@ -165,7 +165,8 @@ counter; **Return** / **⇧Return** step to the next / previous match (search fo
 across tabs), **⌫** edits the query, **⎋** leaves search (a second **⎋** closes). When
 not searching, **Space**, **Return** or **Escape** close the panel — and it also
 **closes on click-away** (the moment you click the terminal or any other window), so it
-never lingers in the foreground; clicking inside the panel keeps it open. The mapping reuses
+never lingers in the foreground; clicking inside the panel keeps it open. The **✕** button
+in the top-right corner closes it by mouse when neither of those works. The mapping reuses
 the `iterm_session_id` (the `$ITERM_SESSION_ID` tab UUID) ccc already records per
 session — found via `$ITERM_SESSION_ID` when run inside the tab's shell, or via
 AppleScript (the focused iTerm session) when triggered by a global hotkey. The AIM
