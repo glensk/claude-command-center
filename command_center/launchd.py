@@ -23,10 +23,11 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 # pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import os
+import plistlib
 import shutil
 import subprocess
 from pathlib import Path
-from xml.sax.saxutils import escape
+from typing import Any
 
 from . import config
 
@@ -112,56 +113,47 @@ def is_loaded() -> bool:
     return result.returncode == 0
 
 
-def _override_env_xml() -> str:
-    """Plist ``EnvironmentVariables`` entries for any CCC_HOME / CLAUDE_HOME override.
+def _override_env() -> dict[str, str]:
+    """``EnvironmentVariables`` entries for any CCC_HOME / CLAUDE_HOME override.
 
     Without these, a shell whose CCC_HOME/CLAUDE_HOME point elsewhere writes usage
     caches into one tree while the agent housekeeps another — so the daemon would sweep
     orphaned temps (:func:`usage.sweep_stale_temps`) in a directory the producer never
-    touches. Empty when neither is set, which is the common single-tree case. Values
-    are XML-escaped: a path holding ``&`` or ``<`` would otherwise make the plist invalid.
+    touches. Empty when neither is set, which is the common single-tree case.
     """
-    return "".join(
-        f"\n        <key>{name}</key>\n        <string>{escape(value)}</string>"
-        for name in ("CCC_HOME", "CLAUDE_HOME")
-        if (value := os.environ.get(name))
-    )
+    return {name: value for name in ("CCC_HOME", "CLAUDE_HOME") if (value := os.environ.get(name))}
+
+
+def _agent_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """The ``EnvironmentVariables`` of the install-time agents: *extra*, PATH, HOME and
+    any CCC_HOME / CLAUDE_HOME override."""
+    return {**(extra or {}), "PATH": _path_env(), "HOME": str(Path.home()), **_override_env()}
+
+
+def _dump(payload: dict[str, Any]) -> str:
+    """Serialise an agent dict with ``plistlib`` — every value XML-escaped (tp#421)."""
+    return plistlib.dumps(payload).decode("utf-8")
+
+
+#: Environment guards of the helper agents: no auto-commit, no recursion into ccc's hooks.
+_GUARD_ENV = {"CCC_INTERNAL": "1", "AI_NO_AUTOCOMMIT": "1"}
 
 
 def plist_content(
     ccc_path: str, interval_sec: int, log_dir: Path, agent_label: str | None = None
 ) -> str:
     """Return the launchd plist XML for the periodic ``ccc daemon`` agent."""
-    home = Path.home()
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{agent_label or label()}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{ccc_path}</string>
-        <string>daemon</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>{_path_env()}</string>
-        <key>HOME</key>
-        <string>{home}</string>{_override_env_xml()}
-    </dict>
-    <key>StartInterval</key>
-    <integer>{interval_sec}</integer>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>{log_dir / "daemon.log"}</string>
-    <key>StandardErrorPath</key>
-    <string>{log_dir / "daemon.err"}</string>
-</dict>
-</plist>
-"""
+    return _dump(
+        {
+            "Label": agent_label or label(),
+            "ProgramArguments": [ccc_path, "daemon"],
+            "EnvironmentVariables": _agent_env(),
+            "StartInterval": interval_sec,
+            "RunAtLoad": True,
+            "StandardOutPath": str(log_dir / "daemon.log"),
+            "StandardErrorPath": str(log_dir / "daemon.err"),
+        }
+    )
 
 
 def future_sync_plist_content(
@@ -174,44 +166,18 @@ def future_sync_plist_content(
     most one run per 10s. Binary path, label, watch path and log path are resolved by
     :func:`future_sync_plist` at generation time.
     """
-    home = Path.home()
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{agent_label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{ccc_path}</string>
-        <string>sync-future</string>
-    </array>
-    <key>WatchPaths</key>
-    <array>
-        <string>{watch_path}</string>
-    </array>
-    <key>ThrottleInterval</key>
-    <integer>10</integer>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>CCC_INTERNAL</key>
-        <string>1</string>
-        <key>AI_NO_AUTOCOMMIT</key>
-        <string>1</string>
-        <key>PATH</key>
-        <string>{_path_env()}</string>
-        <key>HOME</key>
-        <string>{home}</string>{_override_env_xml()}
-    </dict>
-    <key>StandardOutPath</key>
-    <string>{log_path}</string>
-    <key>StandardErrorPath</key>
-    <string>{log_path}</string>
-</dict>
-</plist>
-"""
+    return _dump(
+        {
+            "Label": agent_label,
+            "ProgramArguments": [ccc_path, "sync-future"],
+            "WatchPaths": [watch_path],
+            "ThrottleInterval": 10,
+            "RunAtLoad": True,
+            "EnvironmentVariables": _agent_env(_GUARD_ENV),
+            "StandardOutPath": log_path,
+            "StandardErrorPath": log_path,
+        }
+    )
 
 
 def future_sync_plist(cfg: config.Config | None = None) -> str:
@@ -240,42 +206,18 @@ def quota_probe_plist_content(
     environment as ``AI_BIN`` because launchd's minimal PATH rarely reaches ai.py,
     and without ai.py the probe could only ask config.toml's model, never the registry's.
     """
-    home = Path.home()
-    ai_env = f"\n        <key>AI_BIN</key>\n        <string>{ai_bin}</string>" if ai_bin else ""
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{agent_label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{ccc_path}</string>
-        <string>quota</string>
-        <string>-P</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>CCC_INTERNAL</key>
-        <string>1</string>
-        <key>AI_NO_AUTOCOMMIT</key>
-        <string>1</string>
-        <key>PATH</key>
-        <string>{_path_env()}</string>
-        <key>HOME</key>
-        <string>{home}</string>{ai_env}{_override_env_xml()}
-    </dict>
-    <key>StartInterval</key>
-    <integer>{QUOTA_PROBE_INTERVAL_SEC}</integer>
-    <key>RunAtLoad</key>
-    <false/>
-    <key>StandardOutPath</key>
-    <string>{log_path}</string>
-    <key>StandardErrorPath</key>
-    <string>{log_path}</string>
-</dict>
-</plist>
-"""
+    ai_env = {"AI_BIN": ai_bin} if ai_bin else {}
+    return _dump(
+        {
+            "Label": agent_label,
+            "ProgramArguments": [ccc_path, "quota", "-P"],
+            "EnvironmentVariables": _agent_env({**_GUARD_ENV, **ai_env}),
+            "StartInterval": QUOTA_PROBE_INTERVAL_SEC,
+            "RunAtLoad": False,
+            "StandardOutPath": log_path,
+            "StandardErrorPath": log_path,
+        }
+    )
 
 
 def quota_probe_plist(cfg: config.Config | None = None) -> str:
@@ -349,11 +291,6 @@ def panel_server_plist_path(cfg: config.Config | None = None) -> Path:
     return _plist_path(panel_server_label(cfg))
 
 
-def _override_env() -> dict[str, str]:
-    """CCC_HOME / CLAUDE_HOME overrides of this shell (see :func:`_override_env_xml`)."""
-    return {name: value for name in ("CCC_HOME", "CLAUDE_HOME") if (value := os.environ.get(name))}
-
-
 def panel_server_plist_content(
     ccc_path: str, agent_label: str, app_home: Path, env: dict[str, str] | None = None
 ) -> str:
@@ -363,8 +300,6 @@ def panel_server_plist_content(
     a clean exit (SIGTERM, "already running") is not. ``LimitLoadToSessionType Aqua`` —
     it needs the window server; ``ProcessType Interactive`` — no background throttling.
     """
-    import plistlib  # pylint: disable=import-outside-toplevel  # only for this agent
-
     environment = {"PATH": _path_env(), "HOME": str(Path.home()), **(env or {})}
     payload = {
         "Label": agent_label,
@@ -377,7 +312,7 @@ def panel_server_plist_content(
         "StandardOutPath": str(app_home / "panel-server.log"),
         "StandardErrorPath": str(app_home / "panel-server.err"),
     }
-    return plistlib.dumps(payload).decode("utf-8")
+    return _dump(payload)
 
 
 def _gui_domain() -> str:

@@ -76,7 +76,7 @@ def _systemctl(*args: str) -> subprocess.CompletedProcess[str]:
 
 def service_content(ccc_path: str, log_dir: Path) -> str:
     """Return the ``.service`` unit for one ``ccc daemon`` pass (``Type=oneshot``)."""
-    # Same reason as launchd._override_env_xml: the daemon must housekeep the SAME tree
+    # Same reason as launchd._override_env: the daemon must housekeep the SAME tree
     # the status-line producer writes to, or orphaned usage temps are never reclaimed.
     env = "".join(
         f"Environment={name}={value}\n"

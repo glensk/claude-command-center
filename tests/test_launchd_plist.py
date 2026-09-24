@@ -211,3 +211,92 @@ def test_daemon_install_never_touches_the_panel_server(
     launchd.install()
     assert not launchd.panel_server_plist_path().exists()
     assert not (tmp_path / "claude" / "command-center" / "panel-poke.sh").exists()
+
+
+# ------------------- every interpolated value is XML-escaped (tp#421) ------------------- #
+_NASTY = "/a&b/<c>/d"
+
+
+def _builders(nasty: str) -> dict[str, dict]:
+    """Each install-time builder fed *nasty* in every argument it interpolates."""
+    return {
+        "daemon": plistlib.loads(
+            launchd.plist_content(nasty + "/ccc", 60, Path(nasty), "com.t" + nasty).encode()
+        ),
+        "future_sync": plistlib.loads(
+            launchd.future_sync_plist_content(
+                nasty + "/ccc", "l" + nasty, nasty + "/w", nasty + "/l.log"
+            ).encode()
+        ),
+        "quota_probe": plistlib.loads(
+            launchd.quota_probe_plist_content(
+                nasty + "/ccc", "l" + nasty, nasty + "/l.log", nasty + "/ai"
+            ).encode()
+        ),
+    }
+
+
+def test_every_interpolated_value_round_trips(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(launchd.Path, "home", classmethod(lambda cls: Path("/h&<>")))
+    monkeypatch.setattr(launchd, "_path_env", lambda: "/p&q:/<r>")
+    monkeypatch.delenv("CCC_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_HOME", raising=False)
+    got = _builders(_NASTY)
+    daemon, sync, probe = got["daemon"], got["future_sync"], got["quota_probe"]
+    assert daemon["Label"] == "com.t" + _NASTY
+    assert daemon["ProgramArguments"][0] == _NASTY + "/ccc"
+    assert daemon["StandardOutPath"] == _NASTY + "/daemon.log"
+    assert daemon["StandardErrorPath"] == _NASTY + "/daemon.err"
+    assert sync["Label"] == "l" + _NASTY
+    assert sync["WatchPaths"] == [_NASTY + "/w"]
+    assert sync["StandardOutPath"] == sync["StandardErrorPath"] == _NASTY + "/l.log"
+    assert probe["Label"] == "l" + _NASTY
+    assert probe["ProgramArguments"][0] == _NASTY + "/ccc"
+    assert probe["EnvironmentVariables"]["AI_BIN"] == _NASTY + "/ai"
+    assert probe["StandardOutPath"] == probe["StandardErrorPath"] == _NASTY + "/l.log"
+    for data in got.values():
+        assert data["EnvironmentVariables"]["HOME"] == "/h&<>"
+        assert data["EnvironmentVariables"]["PATH"] == "/p&q:/<r>"
+
+
+def test_builder_parity_with_plain_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pins key set and value types of each builder (strings stay strings, bools bools)."""
+    monkeypatch.setattr(launchd.Path, "home", classmethod(lambda cls: Path("/h")))
+    monkeypatch.setattr(launchd, "_path_env", lambda: "/p")
+    monkeypatch.delenv("CCC_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_HOME", raising=False)
+    base_env = {"PATH": "/p", "HOME": "/h"}
+    guards = {"CCC_INTERNAL": "1", "AI_NO_AUTOCOMMIT": "1"}
+    daemon = plistlib.loads(launchd.plist_content("/c", 300, Path("/l"), "com.d").encode())
+    assert daemon == {
+        "Label": "com.d",
+        "ProgramArguments": ["/c", "daemon"],
+        "EnvironmentVariables": base_env,
+        "StartInterval": 300,
+        "RunAtLoad": True,
+        "StandardOutPath": "/l/daemon.log",
+        "StandardErrorPath": "/l/daemon.err",
+    }
+    sync = plistlib.loads(launchd.future_sync_plist_content("/c", "fs", "/w", "/l").encode())
+    assert sync == {
+        "Label": "fs",
+        "ProgramArguments": ["/c", "sync-future"],
+        "WatchPaths": ["/w"],
+        "ThrottleInterval": 10,
+        "RunAtLoad": True,
+        "EnvironmentVariables": {**guards, **base_env},
+        "StandardOutPath": "/l",
+        "StandardErrorPath": "/l",
+    }
+    probe = plistlib.loads(launchd.quota_probe_plist_content("/c", "qp", "/l").encode())
+    assert probe == {
+        "Label": "qp",
+        "ProgramArguments": ["/c", "quota", "-P"],
+        "EnvironmentVariables": {**guards, **base_env},
+        "StartInterval": launchd.QUOTA_PROBE_INTERVAL_SEC,
+        "RunAtLoad": False,
+        "StandardOutPath": "/l",
+        "StandardErrorPath": "/l",
+    }
+    with_ai = plistlib.loads(launchd.quota_probe_plist_content("/c", "qp", "/l", "/ai").encode())
+    assert with_ai["EnvironmentVariables"] == {**guards, **base_env, "AI_BIN": "/ai"}
