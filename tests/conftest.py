@@ -128,6 +128,47 @@ def _guard_real_codex_reads(
     _wrap(_cic, "_codex_rate_snapshot", 0)
 
 
+# The developer's REAL home, captured at conftest import — before ``_isolate_home``
+# re-points ``$HOME`` / ``Path.home()`` for the first test.
+_REAL_HOME = Path(os.path.expanduser("~")).resolve()
+
+
+@pytest.fixture(autouse=True)
+def _guard_real_trust_writes(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail loudly when a test would trust a folder in a REAL account's ``.claude.json``.
+
+    ``accounts.ensure_trusted`` writes ``projects[<cwd>].hasTrustDialogAccepted`` into the
+    billing account's ``.claude.json``. Between its introduction (2026-09-01) and the
+    ``$HOME`` pin in :func:`_isolate_home` (2026-09-09) a ``~/.claude-work`` account
+    resolved against the real home, and the live cwork file collected ``/repo/new``,
+    ``/repo/x`` and temp-repo entries (tp#442). This proves the pin keeps holding —
+    also for ``@pytest.mark.real_home`` tests, which must never write trust either.
+    """
+    from command_center import accounts as _accounts  # pylint: disable=import-outside-toplevel
+
+    basetemp = tmp_path_factory.getbasetemp().resolve()
+    original = _accounts.ensure_trusted
+
+    def guarded(config_dir: str, cwd: str | Path | None = None) -> bool:
+        resolved = (
+            _accounts._resolve(config_dir)  # noqa: SLF001
+            if config_dir
+            else _accounts.default_config_dir()
+        )
+        target = (
+            resolved.parent / ".claude.json"
+            if _accounts.is_default_config_dir(config_dir)
+            else resolved / ".claude.json"
+        ).resolve()
+        if _REAL_HOME in target.parents and basetemp not in target.parents:
+            raise AssertionError(f"test would write trust into the real {target} (cwd={cwd})")
+        return original(config_dir, cwd)
+
+    monkeypatch.setattr(_accounts, "ensure_trusted", guarded)
+
+
 # Ambient variables a live Claude Code session (or a codex-in-claude run) exports into
 # the shell that runs pytest. ``CLAUDE_HOME`` is excluded: ``_pin_claude_home`` owns it.
 _AMBIENT_ENV_PREFIXES = ("CLAUDE_", "CODEX_IN_CLAUDE_")
