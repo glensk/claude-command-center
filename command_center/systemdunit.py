@@ -237,17 +237,23 @@ def install() -> int:
     unit_dir.mkdir(parents=True, exist_ok=True)
     ccc = _ccc_path()
 
-    _service_path(cfg).write_text(service_content(ccc, app), encoding="utf-8")
-    _timer_path(cfg).write_text(timer_content(cfg.daemon_interval_sec), encoding="utf-8")
-
+    # Render every unit before writing any, so an unrepresentable path leaves no
+    # half-installed set behind and surfaces as a clean error instead of a traceback.
     vault_on = _vault_features_on(cfg)
-    if vault_on:
-        watch_path = Path(cfg.future_dir).expanduser().parent
-        log_path = app / "future-sync.log"
-        _fs_path_unit(cfg).write_text(future_sync_path_content(str(watch_path)), encoding="utf-8")
-        _fs_service_unit(cfg).write_text(
-            future_sync_service_content(ccc, str(log_path)), encoding="utf-8"
-        )
+    units: dict[Path, str] = {}
+    try:
+        units[_service_path(cfg)] = service_content(ccc, app)
+        units[_timer_path(cfg)] = timer_content(cfg.daemon_interval_sec)
+        if vault_on:
+            watch_path = Path(cfg.future_dir).expanduser().parent
+            log_path = app / "future-sync.log"
+            units[_fs_path_unit(cfg)] = future_sync_path_content(str(watch_path))
+            units[_fs_service_unit(cfg)] = future_sync_service_content(ccc, str(log_path))
+    except ValueError as exc:
+        print(f"cannot install systemd user units: {exc}")
+        return 1
+    for path, content in units.items():
+        path.write_text(content, encoding="utf-8")
 
     _systemctl("daemon-reload")
     result = _systemctl("enable", "--now", f"{label(cfg)}.timer")

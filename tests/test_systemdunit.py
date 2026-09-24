@@ -298,3 +298,37 @@ def test_is_installed_reflects_files(_tmp_home: Path, _fake_systemctl: list[list
     assert systemdunit.is_installed() is False
     systemdunit.install()
     assert systemdunit.is_installed() is True
+
+
+# app home only ever appears as a middle component (…/daemon.log), so only a
+# control character makes it unrepresentable.
+@pytest.mark.parametrize("bad", ["new\nline", "tab\there"])
+def test_install_unrepresentable_app_home_returns_1(
+    bad: str,
+    _tmp_home: Path,
+    _fake_systemctl: list[list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(config, "app_home", lambda: _tmp_home / bad)
+    assert systemdunit.install() == 1
+    assert "cannot install systemd user units" in capsys.readouterr().out
+    unit_dir = _tmp_home / ".config" / "systemd" / "user"
+    assert not any(unit_dir.iterdir())  # nothing half-written
+    assert _fake_systemctl == []
+
+
+def test_install_unrepresentable_future_dir_returns_1(
+    _tmp_home: Path, _fake_systemctl: list[list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config.load_config()
+    bad_dir = str(_tmp_home / "vault " / "01-llm-tasks")  # parent ends in a space
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: config.Config(**{**vars(cfg), "future_files": True, "future_dir": bad_dir}),
+    )
+    assert systemdunit.install() == 1
+    unit_dir = _tmp_home / ".config" / "systemd" / "user"
+    assert not any(unit_dir.iterdir())
+    assert _fake_systemctl == []
