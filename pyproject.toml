@@ -63,6 +63,36 @@ disable_error_code = ["import-untyped"]
 warn_unused_ignores = true
 no_implicit_optional = true
 
+# pylint: a repo config REPLACES the user-level ~/.config/pylintrc baseline, so that
+# baseline is replicated here in full, plus C0415 — ccc imports heavy/optional modules
+# inside functions on purpose (CLI start-up time, optional deps); C0415 was 595 of the
+# 2130 full-pylint findings on 2026-09-24.
+[tool.pylint.main]
+init-hook = "import os, sys; sys.path.insert(0, os.getcwd())"
+
+[tool.pylint."messages control"]
+disable = [
+    "C0103",  # invalid-name
+    "C0114",  # missing-module-docstring
+    "C0115",  # missing-class-docstring
+    "C0116",  # missing-function-docstring
+    "R0903",  # too-few-public-methods
+    "R0913",  # too-many-arguments
+    "R0914",  # too-many-locals
+    "W0212",  # protected-access
+    "C0415",  # import-outside-toplevel
+]
+
+[tool.pylint.basic]
+good-names = ["i", "j", "k", "ex", "Run", "_", "id", "df", "ax", "f", "e"]
+
+[tool.pylint.format]
+max-line-length = 100
+
+[tool.pylint.reports]
+reports = "no"
+score = "no"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
