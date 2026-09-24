@@ -24,6 +24,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import os
 import shutil
 import subprocess
@@ -74,12 +75,33 @@ def _systemctl(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _environment_line(name: str, value: str) -> str:
+    """Return one ``Environment="NAME=value"`` line that systemd parses back verbatim.
+
+    systemd expands ``%`` specifiers first, then splits the line into words with C
+    unescaping and quote removal — so a raw path with a space, quote, backslash or
+    ``%`` would be cut, mangled or rejected. Double ``%``, C-escape ``\\``/``"``/control
+    characters and quote the whole assignment.
+    """
+    out = []
+    for ch in f"{name}={value}":
+        if ch in '\\"':
+            out.append("\\" + ch)
+        elif ch == "%":
+            out.append("%%")
+        elif ord(ch) < 0x20 or ch == "\x7f":
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(ch)
+    return f'Environment="{"".join(out)}"\n'
+
+
 def service_content(ccc_path: str, log_dir: Path) -> str:
     """Return the ``.service`` unit for one ``ccc daemon`` pass (``Type=oneshot``)."""
     # Same reason as launchd._override_env: the daemon must housekeep the SAME tree
     # the status-line producer writes to, or orphaned usage temps are never reclaimed.
     env = "".join(
-        f"Environment={name}={value}\n"
+        _environment_line(name, value)
         for name in ("CCC_HOME", "CLAUDE_HOME")
         if (value := os.environ.get(name))
     )

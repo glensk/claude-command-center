@@ -50,6 +50,59 @@ def test_service_content_is_oneshot_daemon() -> None:
     assert "/logs/daemon.log" in text and "/logs/daemon.err" in text
 
 
+def _systemd_parse_environment(line: str) -> str:
+    """Decode one ``Environment=`` line the way systemd does (specifiers, then unquote+unescape)."""
+    raw = line.removeprefix("Environment=").rstrip("\n").replace("%%", "%")
+    assert raw.startswith('"') and raw.endswith('"'), raw
+    body, out, i = raw[1:-1], [], 0
+    while i < len(body):
+        ch = body[i]
+        assert ch != '"', f"unescaped quote would end the word early: {raw}"
+        if ch == "\\":
+            nxt = body[i + 1]
+            if nxt == "x":
+                out.append(chr(int(body[i + 2 : i + 4], 16)))
+                i += 4
+                continue
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/home/u/.ccc",
+        "/home/u/My Drive/ccc",
+        '/tmp/we"ird',
+        "/tmp/back\\slash",
+        "/tmp/100%done",
+        "/tmp/tab\there",
+        "/tmp/$HOME",
+    ],
+)
+def test_service_content_escapes_override_env(value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # tp#426: CCC_HOME/CLAUDE_HOME were interpolated raw, so a space, quote or %
+    # split, mangled or broke the Environment= assignment.
+    monkeypatch.setenv("CCC_HOME", value)
+    monkeypatch.setenv("CLAUDE_HOME", value)
+    text = systemdunit.service_content("/opt/ccc", Path("/logs"))
+    lines = [ln for ln in text.splitlines() if ln.startswith("Environment=")]
+    assert [_systemd_parse_environment(ln) for ln in lines] == [
+        f"CCC_HOME={value}",
+        f"CLAUDE_HOME={value}",
+    ]
+
+
+def test_service_content_omits_unset_override_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CCC_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_HOME", raising=False)
+    assert "Environment=" not in systemdunit.service_content("/opt/ccc", Path("/logs"))
+
+
 def test_timer_content_fires_every_interval() -> None:
     text = systemdunit.timer_content(300)
     assert "OnUnitActiveSec=300" in text
