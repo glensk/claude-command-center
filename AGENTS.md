@@ -410,5 +410,5 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
 
 ## Private/local notes
 
-`CLAUDE.md` is a gitignored shim that imports this file; `CLAUDE.local.md` (also gitignored)
+Claude Code loads this file directly (global `instructionFiles` setting); `CLAUDE.local.md` (gitignored)
 holds machine-specific notes.
