@@ -45,6 +45,8 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
     _direct_run(__file__)
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
+
 
 import base64
 import calendar
@@ -66,11 +68,12 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 from rich.cells import cell_len
 from rich.text import Text
 
-from . import config
+from . import config, seat_rota
 from .codex_in_claude import (
     _FIVE_HOUR_MINUTES,
     _SEVEN_DAY_MINUTES,
@@ -2095,6 +2098,35 @@ def _window_idle(win: Window | None, captured_at: int, window_sec: int) -> bool:
     )
 
 
+def _idle_labels(rota: dict[str, Any] | None) -> tuple[str, str]:
+    """The ``(session, week)`` emboss for a Codex window that has not opened yet.
+
+    An idle window has no reset of its own, so on a seat with no rota the labels just
+    say it is free. On a rota seat the useful dates are the rota's: while it is our week,
+    the last day we hold the seat and the Monday it is ours again after the other
+    holder's week; while it is not (a card expanded by hand), whose it is and the Monday
+    it comes back. Both dates are rendered in the rota's own zone, like its week labels.
+    """
+    default = ("Session: free now", "Week: free · opens on first use")
+    if not rota or not rota.get("holder"):
+        return default
+    zone = str(rota.get("tz") or "")
+    next_mine_at = int(rota.get("next_mine_at") or 0)
+    next_mine = str(rota.get("next_mine_label") or "")
+    if rota.get("mine"):
+        last_day = seat_rota.day_label(int(rota.get("next_other_at") or 0) - 1, zone)
+        if not last_day or not next_mine:
+            return default
+        return f"Session: free through Sun {last_day}", f"Week: yours again {next_mine}"
+    last_day = seat_rota.day_label(next_mine_at - 1, zone) if next_mine_at else ""
+    if not last_day or not next_mine:
+        return default
+    session = f"Session: {rota['holder']} till Sun {last_day}"
+    if cell_len(session) > _CARD_INNER_WIDTH - len("0%"):
+        session = f"Session: {rota['holder']} till {last_day}"
+    return session, f"Week: yours from {next_mine}"
+
+
 def _section(  # pylint: disable=too-many-arguments
     prefix: str,
     win: Window | None,
@@ -2140,6 +2172,7 @@ def _render_card(  # pylint: disable=too-many-arguments
     fill_for_pct: Callable[[float], str] | None = None,
     staleness: tuple[int, int] | None = None,
     idle_window_sec: tuple[int, int] | None = None,
+    rota: dict[str, Any] | None = None,
 ) -> Text:
     """The two-bar card body (session + week), shared by both providers.
 
@@ -2162,10 +2195,11 @@ def _render_card(  # pylint: disable=too-many-arguments
 
     *idle_window_sec*, when given, is ``(session_window_sec, week_window_sec)``: a row
     whose window has not opened yet (0% used, reset a full window length past
-    ``usage.captured_at`` — see :func:`_window_idle`) is embossed ``Session: idle`` /
-    ``Week: idle · opens on first use`` over its 0% bar instead of the drifting
-    ``Resets in …`` placeholder the Codex endpoint reports for it (tp#226). ``None``
-    (the Claude cards) keeps the reset label on every row.
+    ``usage.captured_at`` — see :func:`_window_idle`) is embossed with
+    :func:`_idle_labels` over its 0% bar instead of the drifting ``Resets in …``
+    placeholder the Codex endpoint reports for it (tp#226). ``None`` (the Claude cards)
+    keeps the reset label on every row. *rota* is the seat's ``codex_seat_rota`` payload
+    (:func:`quota.rota_verdict`), which turns those idle labels into dates.
     """
 
     def _fill(win: Window | None) -> str:
@@ -2179,30 +2213,38 @@ def _render_card(  # pylint: disable=too-many-arguments
     session_label: str | None = None
     week_label: str | None = None
     if idle_window_sec is not None:
+        idle_session, idle_week = _idle_labels(rota)
         if _window_idle(usage.five_hour, usage.captured_at, idle_window_sec[0]):
-            session_label = "Session: idle"
+            session_label = idle_session
         if _window_idle(usage.seven_day, usage.captured_at, idle_window_sec[1]):
-            week_label = "Week: idle · opens on first use"
+            week_label = idle_week
 
-    text = Text()
-    text.append_text(
-        _section(
-            "Session: ",
-            usage.five_hour,
-            now,
-            _fill(usage.five_hour),
-            label_color,
-            label=session_label,
-            stale=session_stale,
-        )
+    # A full week makes the session window moot — nothing can be spent until the week
+    # resets — so its row is dropped and the week bar turns red; the two-row card comes
+    # back by itself once a fresh reading shows allowance again.
+    week_full = (
+        not week_stale and usage.seven_day is not None and usage.seven_day.used_percentage >= 100
     )
+    text = Text()
+    if not week_full:
+        text.append_text(
+            _section(
+                "Session: ",
+                usage.five_hour,
+                now,
+                _fill(usage.five_hour),
+                label_color,
+                label=session_label,
+                stale=session_stale,
+            )
+        )
     # No blank line between the windows — keeps the card tight.
     text.append_text(
         _section(
             "Week: ",
             usage.seven_day,
             now,
-            _fill(usage.seven_day),
+            _FILL_RED if week_full else _fill(usage.seven_day),
             label_color,
             label=week_label,
             stale=week_stale,
@@ -2257,7 +2299,9 @@ def render_work_usage(usage: Usage | None, now: int | None = None) -> Text:
     return render_usage(usage, now, accent=_CLAUDE_WORK_ACCENT)
 
 
-def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
+def render_codex_usage(
+    usage: Usage | None, now: int | None = None, *, rota: dict[str, Any] | None = None
+) -> Text:
     """Render the two-bar OpenAI Codex usage card (green bars) as Rich ``Text``.
 
     A refusal normally prefixes the bars with a red banner — but a snapshot whose
@@ -2273,8 +2317,8 @@ def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
 
     A window that has not opened yet (0% used, reset a full window length past the
     capture — the endpoint's placeholder, see :data:`_IDLE_WINDOW_SLACK_SEC`) is embossed
-    ``Session: idle`` / ``Week: idle · opens on first use`` instead of a ``Resets in …``
-    that would creep forward on every refresh.
+    by :func:`_idle_labels` (free now; on a *rota* seat, until when and from when again)
+    instead of a ``Resets in …`` that would creep forward on every refresh.
     """
     now = int(time.time()) if now is None else now
     if usage is not None and usage.blocked:
@@ -2299,6 +2343,7 @@ def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
                 fill_color=_CODEX_FILL,
                 label_color=_CODEX_FILL,
                 idle_window_sec=_CODEX_IDLE_WINDOW_SEC,
+                rota=rota,
             )
         # The bars below are the last SUCCESSFUL call's figures and would read as healthy
         # headroom, so the refusal is stated first, in red, with the age of the numbers.
@@ -2322,6 +2367,7 @@ def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
             fill_color=_CODEX_FILL,
             label_color=_CODEX_FILL,
             idle_window_sec=_CODEX_IDLE_WINDOW_SEC,
+            rota=rota,
         )
     if usage is None or usage.is_empty():
         return Text("—\n(run Codex to populate)", style="grey50")
@@ -2331,6 +2377,7 @@ def render_codex_usage(usage: Usage | None, now: int | None = None) -> Text:
         fill_color=_CODEX_FILL,
         label_color=_CODEX_FILL,
         idle_window_sec=_CODEX_IDLE_WINDOW_SEC,
+        rota=rota,
     )
 
 

@@ -31,6 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
+from typing import Any
 
 from rich.cells import cell_len
 from rich.color import Color
@@ -2698,12 +2699,20 @@ class CommandCenterApp(App[None]):
         work_panel.update(
             usage.render_work_usage(usage.read_usage(work_label) if work_label else None)
         )
-        codex_panel.update(usage.render_codex_usage(self._codex_usage.get("default")))
+        codex_panel.update(
+            usage.render_codex_usage(
+                self._codex_usage.get("default"), rota=self._rota_payload("default")
+            )
+        )
         # The second ChatGPT login (codex_home_private) is snapshotted the same way, just
         # from its own CODEX_HOME; unconfigured, the card is not drawn at all (see below).
         codex_private_home = self._codex_private_home()
         if codex_private_home is not None:
-            codex_private_panel.update(usage.render_codex_usage(self._codex_usage.get("private")))
+            codex_private_panel.update(
+                usage.render_codex_usage(
+                    self._codex_usage.get("private"), rota=self._rota_payload("private")
+                )
+            )
         # …and one card per codex_homes_extra login, rendered from the same worker-read
         # snapshot map. A label whose widget is missing (added to the config under a
         # RUNNING TUI — compose ran before it existed) is skipped, never raised on.
@@ -2713,7 +2722,11 @@ class CommandCenterApp(App[None]):
                 extra_panels[label] = self.query_one(f"#usage-codex-x-{label}", Static)
             except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
                 continue
-            extra_panels[label].update(usage.render_codex_usage(self._codex_usage.get(label)))
+            extra_panels[label].update(
+                usage.render_codex_usage(
+                    self._codex_usage.get(label), rota=self._rota_payload(label)
+                )
+            )
         # Both Codex titles carry their account's e-mail, and a `codex login` can swap
         # it, so they are rebuilt every tick — the lookup is mtime-cached, hence cheap.
         # All four titles can also carry a subscription-end date that rolls at midnight
@@ -4542,6 +4555,11 @@ class CommandCenterApp(App[None]):
             return quota.rota_verdict(seat)
         except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             return None
+
+    def _rota_payload(self, seat: str) -> dict[str, Any] | None:
+        """The seat's rota payload for its usage card's idle labels (``None``: no rota)."""
+        verdict = self._rota_verdict(seat)
+        return verdict.payload if verdict is not None else None
 
     def _rota_blocks(self, seat: str) -> quota.RotaVerdict | None:
         """The verdict when this seat is NOT ours this week, else ``None``."""

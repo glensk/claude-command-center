@@ -795,8 +795,8 @@ def test_render_codex_usage_idle_window_reads_idle_not_a_drifting_reset() -> Non
     )
     for now in (_NOW, _NOW + 3600, _NOW + 4 * 3600):
         plain = usage.render_codex_usage(snap, now=now).plain
-        assert "Session: idle" in plain
-        assert "Week: idle · opens on first use" in plain
+        assert "Session: free now" in plain
+        assert "Week: free · opens on first use" in plain
         assert "Resets" not in plain
         for line in plain.splitlines():
             assert line.endswith("0%") and len(line) == usage._CARD_INNER_WIDTH
@@ -807,8 +807,30 @@ def test_render_codex_usage_idle_window_reads_idle_not_a_drifting_reset() -> Non
         seven_day=usage.Window(16.0, _NOW + 447156),
     )
     plain = usage.render_codex_usage(mixed, now=_NOW).plain
-    assert "Session: idle" in plain
+    assert "Session: free now" in plain
     assert "Week: Resets in 5d 4h 12m" in plain and "16%" in plain
+
+
+def test_full_week_drops_the_session_row_and_turns_red() -> None:
+    """A week at 100% leaves nothing to spend, so the card shows only the red week bar;
+    once a reading shows allowance again both rows come back."""
+    full = usage.Usage(
+        captured_at=_NOW,
+        five_hour=usage.Window(0.0, _NOW + usage._WHAM_FIVE_HOUR_SEC),
+        seven_day=usage.Window(100.0, _NOW + 166560),
+    )
+    card = usage.render_codex_usage(full, now=_NOW)
+    assert card.plain.splitlines() == [line for line in card.plain.splitlines() if "Week" in line]
+    assert "Session" not in card.plain and "100%" in card.plain
+    assert any(usage._FILL_RED in str(span.style) for span in card.spans)
+    open_again = usage.Usage(
+        captured_at=_NOW,
+        five_hour=usage.Window(0.0, _NOW + usage._WHAM_FIVE_HOUR_SEC),
+        seven_day=usage.Window(3.0, _NOW + 600000),
+    )
+    card = usage.render_codex_usage(open_again, now=_NOW)
+    assert "Session: " in card.plain and "Week: " in card.plain
+    assert not any(usage._FILL_RED in str(span.style) for span in card.spans)
 
 
 def test_render_codex_usage_idle_needs_both_zero_and_a_full_window() -> None:
@@ -824,7 +846,7 @@ def test_render_codex_usage_idle_needs_both_zero_and_a_full_window() -> None:
     plain = usage.render_codex_usage(rolled, now=_NOW).plain
     assert "Session: Resets in 4h 50m" in plain
     assert "Week: Resets in 6d 23h 50m" in plain
-    assert "idle" not in plain
+    assert "free" not in plain
     # Inside the slack the window still counts as unopened.
     edge = usage.Usage(
         captured_at=_NOW,
@@ -832,7 +854,7 @@ def test_render_codex_usage_idle_needs_both_zero_and_a_full_window() -> None:
         seven_day=usage.Window(1.0, _NOW + usage._WHAM_SEVEN_DAY_SEC),
     )
     plain = usage.render_codex_usage(edge, now=_NOW).plain
-    assert "Session: idle" in plain
+    assert "Session: free now" in plain
     assert "Week: Resets in 7d 0h 0m" in plain and "1%" in plain
     # Claude cards: same shape, unchanged rendering.
     claude = usage.Usage(
@@ -843,7 +865,7 @@ def test_render_codex_usage_idle_needs_both_zero_and_a_full_window() -> None:
     plain = usage.render_usage(claude, now=_NOW).plain
     assert "Session: Resets in 5h 0m" in plain
     assert "Week: Resets in 7d 0h 0m" in plain
-    assert "idle" not in plain
+    assert "free" not in plain
 
 
 # A realistic per-user enhanced-billing usage payload (verified shape): the current
