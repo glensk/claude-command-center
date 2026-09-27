@@ -3706,8 +3706,9 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
       inherited ``$CODEX_HOME`` narrows them to that one home, but it is still
       intersected with the allowlist: a pin to a forbidden or unregistered home is
       ``not_allowed``.
-    * **evidence**: :func:`_debate_refresh` first; a seat with no FRESH five-hour reading
-      afterwards is ``unknown``. A blocked seat is excluded.
+    * **evidence**: :func:`_debate_refresh` first (under the ``codex_usage`` opt-in); a
+      seat with no FRESH five-hour reading afterwards is ``unknown``. A blocked seat is
+      excluded.
     * **cap**: ``used < cap`` allows; the first allowed candidate in routing order wins.
     """
     from . import config  # pylint: disable=import-outside-toplevel
@@ -3749,7 +3750,9 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
                 seat=cand.label,
                 home=str(cand.home),
             )
-    if refresh and candidates:
+    if refresh and candidates and _usage_feedback_on():
+        # Only under the live-usage opt-in (``codex_usage``), exactly like the runner's
+        # own pre-selection refresh; without it the rollout readings are the evidence.
         _debate_refresh(candidates, stale_after, _DEBATE_REFRESH_BUDGET_SEC)
         candidates = _select()
     seats = [

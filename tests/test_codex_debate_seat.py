@@ -184,6 +184,14 @@ def test_refresh_that_yields_a_fresh_reading_is_judged_on_it(
         assert timeout is not None
 
     monkeypatch.setattr(usage, "fetch_codex_usage", _fetch)
+    assert cic.debate_seat_verdict(tier="strict", now=now)["state"] == "unknown"
+    assert not fetched  # no live fetch without the `codex_usage` opt-in
+    path = three_seats.ccc_home / "command-center" / "config.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("codex_usage = false", "codex_usage = true"),
+        encoding="utf-8",
+    )
+    config.invalidate_config_cache()
     verdict = cic.debate_seat_verdict(tier="strict", now=now)
     assert fetched
     assert verdict["state"] == "allowed"
