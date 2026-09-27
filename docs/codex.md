@@ -50,6 +50,7 @@ codex-in-claude.py set-effort high                           # low|medium|high|x
 codex-in-claude.py sync-skills [--check]                     # re-stamp the model into the help
 codex-in-claude.py usage [--json]                            # Codex 5h + weekly quota
 codex-in-claude.py headroom [--json]                         # learned optional-offload reserve
+codex-in-claude.py debate-seat [-j] [-t strict|default] [-r category/repo]  # may a DEBATE start now, and on which seat
 codex-in-claude.py delegate [--write] [--scout] -C <repo> "<task>"  # one round; prints model first
 codex-in-claude.py home                                      # which CODEX_HOME (account) Codex bills now
 codex-in-claude.py home -j                                   # machine-readable: {home, source, label, email, until, order, candidates, pin_active}
@@ -355,6 +356,45 @@ zero candidates, zero processes, `error.kind = disabled`. A genuinely inherited
 path, and then its refusals are recorded nowhere). Consumers pass their environment
 through untouched; the runner sets `CCC_NO_CODEX=1 CCC_INTERNAL=1 AI_NO_AUTOCOMMIT=1` on
 the **child** only.
+
+### Debate start caps — `codex-in-claude debate-seat` (tp#619)
+
+A Codex **debate** costs 3–23 % of a five-hour window (median about 12–14 %, measured
+2026-09-26), and one that runs out of quota halfway wastes its cache writes. So a debate
+may START only on a seat whose FRESH five-hour reading is **below its cap**: 70 % for the
+`strict` tier (security-relevant, PRI=high, or a repository in `codex_debate_big_repos`),
+75 % for `default`. `headroom` is the wrong question for this (a learned reserve for
+optional offloads); `debate-seat` is the one evaluator, asked by tp (`tp drive`, `tp open`,
+the autopilot) and by `codex-review.py` before round 1. It starts no Codex process.
+
+```
+debate seat: de (5h 42 % < cap 70 %, strict)
+  de: allowed — 5h 42 % < cap 70 %
+  private: capped — 5h 81 % >= cap 70 %
+```
+
+Candidates are `codex_homes_in_order(probe=False)` — the pin, rota, cooldowns and
+fill/order ranking — FILTERED by `codex_debate_seats`; the first allowed one in routing
+order wins. An inherited `$CODEX_HOME` narrows them to that home but is still checked
+against the allowlist and the cap (`not_allowed` for a forbidden or unregistered home).
+Seats without a fresh five-hour reading (younger than `codex_usage_refresh_sec`, before its
+own reset) get one live fetch; still none → `unknown`. A reading from a window that has
+reset is never read as 0 %.
+
+| key                            | default | meaning                                                   |
+| :----------------------------- | :------ | :-------------------------------------------------------- |
+| `codex_debate_seats`           | `[]`    | labels / `codex_seat_aliases` a debate may bill; `[]` = all |
+| `codex_debate_cap_strict_pct`  | `70`    | cap of the strict tier                                    |
+| `codex_debate_cap_default_pct` | `75`    | cap of the default tier                                   |
+| `codex_debate_seat_caps`       | `[]`    | per-seat overrides, `"label=<strict>/<default>"`          |
+| `codex_debate_big_repos`       | `[]`    | `category/repo` or bare names that force strict           |
+
+The four keys are validated together and fail **closed**: a malformed entry, a cap outside
+1..100, a label naming no registered seat, or a `config.toml` that exists but does not
+parse → `unknown`. States: `allowed | capped | not_allowed | unknown | blocked |
+disabled`; exit 0 allowed, 1 a known denial, 3 unknown. The JSON (`schema_version: 1`)
+carries `state, seat, home, email, tier, cap_percent, used_percent, resets_at, reason,
+seats[]`. What happens when the chosen seat fills up MID-debate is tp#620's.
 
 ### `codex-in-claude run` — the machine entry point
 

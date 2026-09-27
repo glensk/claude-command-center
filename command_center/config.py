@@ -8,6 +8,9 @@ in ``~/.claude/command-center/config.toml`` and fall back to ``DEFAULTS``.
 
 from __future__ import annotations
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
+# pylint: disable=too-many-lines  # one settings surface: DEFAULTS, accessors, load/save
+
 if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
     import os as _os
     import sys as _sys
@@ -217,6 +220,27 @@ DEFAULTS: dict[str, object] = {
     # ``"alias=label"`` per entry, e.g. ``["work=default", "gl=private"]``. The labels
     # themselves and the login e-mails are always accepted; aliases are case-insensitive.
     "codex_seat_aliases": [],
+    # DEBATE START CAPS (tp#619, 2026-09-26): a Codex debate may START only on a seat
+    # whose five-hour window is BELOW the debate's cap, and only on a seat listed here.
+    # ``codex-in-claude debate-seat`` is the one evaluator (tp's drive/open/autopilot and
+    # ``codex-review.py`` round 1 all ask it). The four keys are validated TOGETHER and
+    # fail CLOSED: a malformed entry, a cap outside 1..100, a label that names no
+    # registered seat, or an existing config.toml that does not parse makes every
+    # verdict ``unknown`` (a refusal) instead of silently falling back to defaults.
+    #
+    # ``codex_debate_seats``: the labels (or ``codex_seat_aliases`` names) a debate may
+    #   bill — a FILTER over the routing order, never a second order. Empty = every
+    #   registered seat.
+    "codex_debate_seats": [],
+    # The two tiers: ``strict`` (security-relevant, PRI=high, or a big repo below) and
+    # ``default`` (everything else). A seat at or above the cap is ``capped``.
+    "codex_debate_cap_strict_pct": 70,
+    "codex_debate_cap_default_pct": 75,
+    # Per-seat overrides, one ``"label=<strict>/<default>"`` entry each, e.g.
+    # ``["de=65/72"]``.
+    "codex_debate_seat_caps": [],
+    # Repositories that force the strict tier: full ``category/repo`` or a bare repo name.
+    "codex_debate_big_repos": [],
     # Multi-account Claude Code. ``claude_accounts`` maps labels to config dirs, one
     # ``"label=path"`` entry per line (list[str] so save_config round-trips it). Empty
     # (the default) ⇒ a single ``{"private": claude_home()}`` account, i.e. today's
@@ -576,6 +600,126 @@ def codex_seat_rota_me() -> str:
     return str(load_config().codex_seat_rota_me or "").strip()
 
 
+class DebatePolicyError(ValueError):
+    """The ``codex_debate_*`` policy cannot be trusted — the message names the key."""
+
+
+@dataclass(frozen=True)
+class DebateSeatPolicy:
+    """The validated debate start-cap policy (tp#619): see the ``codex_debate_*`` DEFAULTS.
+
+    ``seats`` holds resolved seat LABELS (aliases already mapped) and is EMPTY when every
+    registered seat may bill a debate. ``seat_caps`` maps a label to its own
+    ``(strict, default)`` caps.
+    """
+
+    seats: tuple[str, ...]
+    cap_strict: float
+    cap_default: float
+    seat_caps: dict[str, tuple[float, float]]
+    big_repos: tuple[str, ...]
+
+    def cap_for(self, label: str, tier: str) -> float:
+        """The cap *label* is judged by in *tier* (``strict`` | ``default``)."""
+        strict, default = self.seat_caps.get(label, (self.cap_strict, self.cap_default))
+        return strict if tier == "strict" else default
+
+    def is_big_repo(self, repo: str) -> bool:
+        """True when *repo* (``category/repo`` or a bare name) is listed as big.
+
+        A full entry matches a full repo exactly; when either side is a bare name the
+        bare names are compared, so ``tp`` matches ``home/tp`` but ``sdsc/tp`` does not.
+        """
+        wanted = repo.strip().strip("/")
+        if not wanted:
+            return False
+        for entry in self.big_repos:
+            if "/" in entry and "/" in wanted:
+                if entry == wanted:
+                    return True
+            elif entry.rsplit("/", 1)[-1] == wanted.rsplit("/", 1)[-1]:
+                return True
+        return False
+
+
+def _debate_cap(key: str, raw: object) -> float:
+    """One cap value, 1..100, or a :class:`DebatePolicyError` naming *key*."""
+    if isinstance(raw, bool) or not isinstance(raw, int | float | str):
+        raise DebatePolicyError(f"{key}: {raw!r} is not a number")
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise DebatePolicyError(f"{key}: {raw!r} is not a number") from exc
+    if not 1 <= value <= 100:
+        raise DebatePolicyError(f"{key}: {value:g} is outside 1..100")
+    return value
+
+
+def _debate_str_list(key: str, raw: object) -> list[str]:
+    """A list of non-empty strings, stripped, or a :class:`DebatePolicyError`."""
+    if not isinstance(raw, list):
+        raise DebatePolicyError(f"{key}: expected a list, got {type(raw).__name__}")
+    out: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            raise DebatePolicyError(f"{key}: entry {entry!r} is not a non-empty string")
+        out.append(entry.strip())
+    return out
+
+
+def codex_debate_policy(cfg: Config | None = None) -> DebateSeatPolicy:
+    """The debate start-cap policy, validated as ONE object — fail closed on any doubt.
+
+    Raises :class:`DebatePolicyError` (message names the offending key) for a
+    config.toml that EXISTS but does not parse (the general loader falls back to pure
+    defaults there; this policy does not), a non-list, a malformed ``label=s/d`` entry, a
+    cap outside 1..100, or a seat label (after ``codex_seat_aliases``) that is not a
+    registered Codex seat.
+    """
+    cfg = load_config() if cfg is None else cfg
+    if not cfg.loaded_from_disk:
+        raise DebatePolicyError(f"config.toml does not parse ({config_path()})")
+    registered = set(codex_homes())
+    aliases: dict[str, str] = {}
+    for entry in cfg.codex_seat_aliases:
+        alias, sep, label = str(entry).partition("=")
+        if sep and alias.strip() and label.strip():
+            aliases.setdefault(alias.strip().lower(), label.strip())
+
+    def _label(key: str, token: str) -> str:
+        label = token if token in registered else aliases.get(token.lower(), token)
+        if label not in registered:
+            raise DebatePolicyError(f"{key}: {token!r} is not a registered Codex seat")
+        return label
+
+    seats: list[str] = []
+    for token in _debate_str_list("codex_debate_seats", cfg.codex_debate_seats):
+        label = _label("codex_debate_seats", token)
+        if label not in seats:
+            seats.append(label)
+    seat_caps: dict[str, tuple[float, float]] = {}
+    key = "codex_debate_seat_caps"
+    for entry in _debate_str_list(key, cfg.codex_debate_seat_caps):
+        token, sep, caps = entry.partition("=")
+        strict, slash, default = caps.partition("/")
+        if not sep or not slash or not token.strip():
+            raise DebatePolicyError(f"{key}: {entry!r} is not 'label=<strict>/<default>'")
+        seat_caps[_label(key, token.strip())] = (
+            _debate_cap(key, strict.strip()),
+            _debate_cap(key, default.strip()),
+        )
+    return DebateSeatPolicy(
+        seats=tuple(seats),
+        cap_strict=_debate_cap("codex_debate_cap_strict_pct", cfg.codex_debate_cap_strict_pct),
+        cap_default=_debate_cap("codex_debate_cap_default_pct", cfg.codex_debate_cap_default_pct),
+        seat_caps=seat_caps,
+        big_repos=tuple(
+            entry.strip("/")
+            for entry in _debate_str_list("codex_debate_big_repos", cfg.codex_debate_big_repos)
+        ),
+    )
+
+
 def unknown_config_keys() -> list[str]:
     """Keys in the on-disk ``config.toml`` that :data:`DEFAULTS` does not know, sorted.
 
@@ -906,6 +1050,12 @@ class Config:
     codex_seat_rota: list[str] = field(default_factory=list)
     codex_seat_rota_me: str = ""
     codex_seat_aliases: list[str] = field(default_factory=list)  # "alias=label" for /switch
+    # Debate start caps (tp#619) — validated together by codex_debate_policy().
+    codex_debate_seats: list[str] = field(default_factory=list)  # [] = every registered seat
+    codex_debate_cap_strict_pct: float = 70
+    codex_debate_cap_default_pct: float = 75
+    codex_debate_seat_caps: list[str] = field(default_factory=list)  # "label=strict/default"
+    codex_debate_big_repos: list[str] = field(default_factory=list)  # force the strict tier
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
     subscription_ends: list[str] = field(default_factory=list)  # "card=YYYY-MM-DD|auto"

@@ -3540,6 +3540,277 @@ def cmd_headroom(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Debate start caps (tp#619)
+#
+# A Codex DEBATE may start only on a seat whose five-hour window is below the debate's
+# cap (``codex_debate_cap_*`` / ``codex_debate_seat_caps``) and only on a seat the
+# ``codex_debate_seats`` allowlist names. Unlike ``headroom`` (a learned reserve for
+# OPTIONAL offloads) this is a hard per-tier cap on the five-hour window, and it fails
+# CLOSED on every doubt: no fresh reading, a bad policy, a crash → ``unknown``.
+# What happens when the pinned seat fills up MID-debate is tp#620's, not this gate's.
+# --------------------------------------------------------------------------- #
+DEBATE_TIERS = ("strict", "default")
+_DEBATE_REFRESH_BUDGET_SEC = 20.0
+# Exit codes, the headroom convention: 0 allowed, 1 a known denial, 3 unknown.
+_DEBATE_EXIT = {
+    "allowed": 0,
+    "capped": 1,
+    "not_allowed": 1,
+    "blocked": 1,
+    "disabled": 1,
+    "unknown": 3,
+}
+
+
+def _debate_stale_after() -> int:
+    """How old a five-hour reading may be and still count as FRESH (seconds)."""
+    from . import config  # pylint: disable=import-outside-toplevel
+
+    try:
+        return max(1, int(config.load_config().codex_usage_refresh_sec))
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return 600
+
+
+def _debate_fresh_five(
+    row: quota.ProviderQuota, now: int, stale_after: int
+) -> quota.WindowState | None:
+    """*row*'s five-hour window when it is FRESH, else ``None``.
+
+    Fresh = measured within *stale_after* seconds AND before its own ``resets_at``. A
+    reading from a window that has since reset proves nothing and is never read as 0 %.
+    """
+    win = row.windows.get("five_hour")
+    if win is None:
+        return None
+    measured = int(win.evidence_at or row.captured_at or 0)
+    if not measured or now - measured > stale_after or win.resets_at <= now:
+        return None
+    return win
+
+
+def _debate_refresh(candidates: list[SeatCandidate], stale_after: int, budget: float) -> None:
+    """Fetch live usage for every candidate WITHOUT a fresh five-hour reading.
+
+    Best effort inside *budget*: a seat that still has no fresh reading afterwards is
+    judged ``unknown`` (a refusal), so a failed fetch can never ALLOW anything. A
+    module-level function so tests can replace the network step.
+    """
+    from . import usage  # pylint: disable=import-outside-toplevel
+
+    deadline = time.monotonic() + budget
+    now = int(time.time())
+    for cand in candidates:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        try:
+            if _debate_fresh_five(_candidate_row(cand, now), now, stale_after) is not None:
+                continue
+            usage.fetch_codex_usage(cand.home, now, timeout=min(_REFRESH_FETCH_TIMEOUT_SEC, left))
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            continue
+
+
+def _debate_seat_entry(
+    cand: SeatCandidate, row: quota.ProviderQuota, cap: float, now: int, stale_after: int
+) -> dict[str, Any]:
+    """ONE seat's debate verdict: ``allowed | capped | blocked | unknown``."""
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    five = _debate_fresh_five(row, now, stale_after)
+    used = five.used_pct if five is not None else None
+    resets = five.resets_at if five is not None else None
+    if row.state == quota.BLOCKED:
+        state, reason = "blocked", row.reason or "seat is blocked"
+        resets = row.resets_at or resets
+    elif five is None:
+        state, reason = "unknown", "no fresh five-hour reading"
+    elif five.used_pct >= cap:
+        state, reason = "capped", f"5h {five.used_pct:.0f} % >= cap {cap:g} %"
+    else:
+        state, reason = "allowed", f"5h {five.used_pct:.0f} % < cap {cap:g} %"
+    return {
+        "seat": cand.label,
+        "home": str(cand.home),
+        "email": cand.email or row.email,
+        "state": state,
+        "cap_percent": cap,
+        "used_percent": used,
+        "resets_at": resets,
+        "reason": reason,
+    }
+
+
+def _debate_result(state: str, tier: str, reason: str, **extra: Any) -> dict[str, Any]:
+    """The ``debate-seat`` JSON shape (``schema_version`` 1), unset fields empty."""
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "state": state,
+        "seat": "",
+        "home": "",
+        "email": "",
+        "tier": tier,
+        "cap_percent": None,
+        "used_percent": None,
+        "resets_at": None,
+        "reason": reason,
+        "seats": [],
+    }
+    result.update(extra)
+    return result
+
+
+def _debate_pick(seats: list[dict[str, Any]], tier: str) -> dict[str, Any]:
+    """Fold the per-seat entries (routing order) into the pool verdict."""
+    fields = ("seat", "home", "email", "cap_percent", "used_percent", "resets_at")
+    winner = next((seat for seat in seats if seat["state"] == "allowed"), None)
+    if winner is not None:
+        return _debate_result(
+            "allowed",
+            tier,
+            f"seat {winner['seat']} {winner['reason']}",
+            seats=seats,
+            **{key: winner[key] for key in fields},
+        )
+    for state in ("capped", "unknown", "blocked"):
+        losers = [seat for seat in seats if seat["state"] == state]
+        if not losers:
+            continue
+        first = min(losers, key=lambda seat: int(seat["resets_at"] or 2**62))
+        summary = ", ".join(f"{seat['seat']} {seat['reason']}" for seat in losers)
+        reason = {
+            "capped": f"every allowed seat is at/above its {tier} cap: {summary}",
+            "unknown": f"no allowed seat below its cap is measurable: {summary}",
+            "blocked": f"every allowed seat is blocked: {summary}",
+        }[state]
+        return _debate_result(
+            state, tier, reason, seats=seats, **{key: first[key] for key in fields}
+        )
+    return _debate_result("blocked", tier, "no eligible debate seat", seats=seats)
+
+
+def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-statements,too-many-branches
+    tier: str = "default",
+    repo: str = "",
+    now: int | None = None,
+    *,
+    refresh: bool = True,
+) -> dict[str, Any]:
+    """Which seat may a Codex debate START on now — the tp#619 gate. Starts no Codex.
+
+    * **tier**: ``strict`` when *tier* says so OR *repo* is in ``codex_debate_big_repos``;
+      every input can only raise it.
+    * **candidates**: :func:`codex_homes_in_order` (``probe=False``) — ccc's own pin,
+      rota, cooldowns and fill/order ranking — FILTERED by ``codex_debate_seats``. An
+      inherited ``$CODEX_HOME`` narrows them to that one home, but it is still
+      intersected with the allowlist: a pin to a forbidden or unregistered home is
+      ``not_allowed``.
+    * **evidence**: :func:`_debate_refresh` first; a seat with no FRESH five-hour reading
+      afterwards is ``unknown``. A blocked seat is excluded.
+    * **cap**: ``used < cap`` allows; the first allowed candidate in routing order wins.
+    """
+    from . import config  # pylint: disable=import-outside-toplevel
+
+    if tier not in DEBATE_TIERS:
+        return _debate_result("unknown", tier, f"tier {tier!r} is not strict|default")
+    if os.environ.get("CCC_NO_CODEX"):
+        return _debate_result("disabled", tier, "Codex disabled (CCC_NO_CODEX)")
+    try:
+        policy = config.codex_debate_policy()
+    except config.DebatePolicyError as exc:
+        return _debate_result("unknown", tier, f"debate policy: {exc}")
+    if tier != "strict" and policy.is_big_repo(repo):
+        tier = "strict"
+    now_ts = int(time.time()) if now is None else int(now)
+    registered = canonical_codex_homes()
+    allowed = set(policy.seats) if policy.seats else set(registered)
+    stale_after = _debate_stale_after()
+    inherited = bool(os.environ.get("CODEX_HOME"))
+
+    def _select() -> list[SeatCandidate]:
+        cands = codex_homes_in_order(now_ts, probe=False)
+        return cands if inherited else [cand for cand in cands if cand.label in allowed]
+
+    candidates = _select()
+    if inherited:
+        if not candidates:
+            return _debate_result("unknown", tier, "no seat selected for $CODEX_HOME")
+        cand = candidates[0]
+        if not cand.pid:
+            return _debate_result(
+                "not_allowed", tier, f"$CODEX_HOME {cand.home} is not a registered seat"
+            )
+        if cand.label not in allowed:
+            return _debate_result(
+                "not_allowed",
+                tier,
+                f"$CODEX_HOME pins seat {cand.label}, not in codex_debate_seats",
+                seat=cand.label,
+                home=str(cand.home),
+            )
+    if refresh and candidates:
+        _debate_refresh(candidates, stale_after, _DEBATE_REFRESH_BUDGET_SEC)
+        candidates = _select()
+    seats = [
+        _debate_seat_entry(
+            cand,
+            _candidate_row(cand, now_ts),
+            policy.cap_for(cand.label, tier),
+            now_ts,
+            stale_after,
+        )
+        for cand in candidates
+    ]
+    if not inherited:
+        # Allowed seats the ranking dropped (held / blocked / rota): listed, never chosen.
+        listed = {cand.label for cand in candidates}
+        for label, home in registered.items():
+            if label not in allowed or label in listed:
+                continue
+            ghost = SeatCandidate(label=label, home=home, email="", pid=_seat_pid(label))
+            cap = policy.cap_for(label, tier)
+            entry = _debate_seat_entry(
+                ghost, _candidate_row(ghost, now_ts), cap, now_ts, stale_after
+            )
+            if entry["state"] != "blocked":
+                entry["state"], entry["reason"] = "blocked", "not eligible in routing"
+            seats.append(entry)
+    return _debate_pick(seats, tier)
+
+
+def cmd_debate_seat(args: argparse.Namespace) -> int:
+    """Report which seat a Codex debate may start on (tp#619); exit 0 / 1 / 3.
+
+    A crash while computing the verdict is ``unknown`` / exit 3 — fail closed, never a
+    launch onto an unmeasured seat.
+    """
+    try:
+        verdict = debate_seat_verdict(tier=args.tier, repo=args.repo or "")
+    except Exception as exc:  # pylint: disable=broad-exception-caught  # any crash = unknown
+        verdict = _debate_result("unknown", args.tier, f"{type(exc).__name__}: {exc}")
+    if args.json:
+        print(json.dumps(verdict))
+    else:
+        state = str(verdict["state"])
+        if state == "allowed":
+            print(
+                f"debate seat: {verdict['seat']} (5h {verdict['used_percent']:.0f} % "
+                f"< cap {verdict['cap_percent']:g} %, {verdict['tier']})"
+            )
+        else:
+            reset = (
+                f", resets {_format_reset(int(verdict['resets_at']))}"
+                if verdict.get("resets_at")
+                else ""
+            )
+            print(f"debate seat: {state.upper()} — {verdict['reason']}{reset}")
+        for seat in verdict.get("seats") or []:
+            print(f"  {seat['seat']}: {seat['state']} — {seat['reason']}")
+    return _DEBATE_EXIT.get(str(verdict["state"]), 3)
+
+
+# --------------------------------------------------------------------------- #
 # Run-time refusal classification
 #
 # `codex exec --json` emits one JSON object per line. A refusal is reported as an
@@ -5514,6 +5785,33 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     )
     p_headroom.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")
     p_headroom.set_defaults(func=cmd_headroom)
+
+    p_debate = sub.add_parser(
+        "debate-seat",
+        help="which Codex seat a debate may START on (five-hour cap per tier, tp#619)",
+        description=(
+            "Read-only: judge every allowed seat (codex_debate_seats) against the debate "
+            "cap of its tier (codex_debate_cap_*, codex_debate_seat_caps) on a FRESH "
+            "five-hour reading. Starts no Codex process. Exit 0 = allowed, 1 = capped / "
+            "not_allowed / blocked / disabled, 3 = unknown (no fresh reading, bad policy)."
+        ),
+    )
+    p_debate.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")
+    p_debate.add_argument(
+        "-t",
+        "--tier",
+        choices=DEBATE_TIERS,
+        default="default",
+        help="strict (security / PRI=high) or default (the default)",
+    )
+    p_debate.add_argument(
+        "-r",
+        "--repo",
+        default="",
+        metavar="REPO",
+        help="category/repo of the debated plan (a codex_debate_big_repos entry forces strict)",
+    )
+    p_debate.set_defaults(func=cmd_debate_seat)
 
     p_home = sub.add_parser(
         "home",
