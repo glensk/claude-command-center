@@ -51,6 +51,7 @@ codex-in-claude.py sync-skills [--check]                     # re-stamp the mode
 codex-in-claude.py usage [--json]                            # Codex 5h + weekly quota
 codex-in-claude.py headroom [--json]                         # learned optional-offload reserve
 codex-in-claude.py debate-seat [-j] [-t strict|default] [-r category/repo]  # may a DEBATE start now, and on which seat
+codex-in-claude.py debate-seat -c <seat> [-p tool|human] [-x <seat>]…      # may a RUNNING debate keep its seat (tp#620)
 codex-in-claude.py delegate [--write] [--scout] -C <repo> "<task>"  # one round; prints model first
 codex-in-claude.py home                                      # which CODEX_HOME (account) Codex bills now
 codex-in-claude.py home -j                                   # machine-readable: {home, source, label, email, until, order, candidates, pin_active}
@@ -388,13 +389,47 @@ reset is never read as 0 %.
 | `codex_debate_cap_default_pct` | `75`    | cap of the default tier                                   |
 | `codex_debate_seat_caps`       | `[]`    | per-seat overrides, `"label=<strict>/<default>"`          |
 | `codex_debate_big_repos`       | `[]`    | `category/repo` or bare names that force strict           |
+| `codex_debate_pause_pct`       | `90`    | mid-debate pause point (tp#620), lowered by the P95       |
 
-The four keys are validated together and fail **closed**: a malformed entry, a cap outside
+The keys are validated together and fail **closed**: a malformed entry, a cap outside
 1..100, a label naming no registered seat, or a `config.toml` that exists but does not
 parse → `unknown`. States: `allowed | capped | not_allowed | unknown | blocked |
 disabled`; exit 0 allowed, 1 a known denial, 3 unknown. The JSON (`schema_version: 1`)
 carries `state, seat, home, email, tier, cap_percent, used_percent, resets_at, reason,
-seats[]`. What happens when the chosen seat fills up MID-debate is tp#620's.
+seats[]`.
+
+#### Mid-debate: `debate-seat -c <seat>` (tp#620)
+
+A debate round is stateless on the Codex side (the whole brief is re-sent every round), so
+a debate can move seats between rounds. Before each round after the first,
+`codex-review.py` asks `debate-seat -j -c <current seat> -p tool|human [-x <seat>]… -t
+<tier> -r <repo>`:
+
+- **pool**: `-p tool` (the default — a tool chose the seat) = the routing order computed
+  as if `$CODEX_HOME` were NOT set, filtered by `codex_debate_seats`, minus every `-x`
+  label (`-x` may name the current seat, e.g. after a mid-round refusal); `-p human` =
+  exactly the inherited `$CODEX_HOME`, which must be the `-c` seat (else `unknown`).
+- **continue**: the current seat, refreshed first, has a FRESH five-hour reading below
+  the **pause point**, is not blocked and not excluded.
+- **failover** (`-p tool` only): otherwise the first OTHER candidate in routing order
+  that passes the START rule above (fresh reading, below its tier cap).
+- **paused**: otherwise. `retry_at` is the earliest time a specific seat clears its
+  actual cause — the five-hour reset (over the pause point / its cap), the blocked row's
+  reset (weekly exhaustion, a hold's or cooldown's expiry, the rota's next own week) —
+  and `null` when no time is knowable (auth, entitlement, an open-ended block).
+  `retry_seat` names that seat. When no seat has any KNOWN cause (none is measurable),
+  the verdict is `unknown` instead.
+
+The pause point is `codex_debate_pause_pct`; once ccc holds ≥ 10 measured five-hour
+debate-round costs it is `min(codex_debate_pause_pct, 100 − 1.1 × P95)` (the headroom
+reserve's nearest-rank P95), never below 1. Exit 0 continue / failover, 1 paused /
+disabled, 3 unknown (also a bad policy or a crash); `-p`/`-x` without `-c` is a usage
+error (exit 2). The JSON keeps `schema_version: 1` and adds `continue_from`, `pin`,
+`excluded`, `pause_percent`, `pause_rule` (`config|p95`), `pause_config`, `pause_p95` (the
+P95-derived point, `null` below 10 samples), `pause_samples`, `retry_at` and `retry_seat`,
+plus a `role` (`current | candidate | excluded`) on every `seats[]` entry. `seat`/`cap_percent`/… name
+the current seat (its `cap_percent` = the pause point) for continue / paused / unknown and
+the target (its start cap) for failover.
 
 ### `codex-in-claude run` — the machine entry point
 

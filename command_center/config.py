@@ -223,8 +223,8 @@ DEFAULTS: dict[str, object] = {
     # DEBATE START CAPS (tp#619, 2026-09-26): a Codex debate may START only on a seat
     # whose five-hour window is BELOW the debate's cap, and only on a seat listed here.
     # ``codex-in-claude debate-seat`` is the one evaluator (tp's drive/open/autopilot and
-    # ``codex-review.py`` round 1 all ask it). The four keys are validated TOGETHER and
-    # fail CLOSED: a malformed entry, a cap outside 1..100, a label that names no
+    # ``codex-review.py`` round 1 all ask it). The ``codex_debate_*`` keys are validated
+    # TOGETHER and fail CLOSED: a malformed entry, a cap outside 1..100, a label that names no
     # registered seat, or an existing config.toml that does not parse makes every
     # verdict ``unknown`` (a refusal) instead of silently falling back to defaults.
     #
@@ -241,6 +241,15 @@ DEFAULTS: dict[str, object] = {
     "codex_debate_seat_caps": [],
     # Repositories that force the strict tier: full ``category/repo`` or a bare repo name.
     "codex_debate_big_repos": [],
+    # MID-DEBATE pause point (tp#620): before every round after the first,
+    # ``debate-seat -c <seat>`` checks the debate's CURRENT seat. At or above this
+    # five-hour percentage it is no longer continued: a tool-chosen seat FAILS OVER to
+    # another allowed seat below its start cap, a hand-set ``$CODEX_HOME`` (and a pool
+    # with no such seat) PAUSES until a seat clears. The effective point may be LOWER
+    # than this: once ccc has >= 10 measured debate-round costs it is
+    # ``min(codex_debate_pause_pct, 100 - 1.1 x P95)``. 1..100, validated with the keys
+    # above (fail closed).
+    "codex_debate_pause_pct": 90,
     # Multi-account Claude Code. ``claude_accounts`` maps labels to config dirs, one
     # ``"label=path"`` entry per line (list[str] so save_config round-trips it). Empty
     # (the default) ⇒ a single ``{"private": claude_home()}`` account, i.e. today's
@@ -618,6 +627,7 @@ class DebateSeatPolicy:
     cap_default: float
     seat_caps: dict[str, tuple[float, float]]
     big_repos: tuple[str, ...]
+    pause_pct: float = 90.0  # the configured mid-debate pause point (tp#620)
 
     def cap_for(self, label: str, tier: str) -> float:
         """The cap *label* is judged by in *tier* (``strict`` | ``default``)."""
@@ -674,7 +684,7 @@ def codex_debate_policy(cfg: Config | None = None) -> DebateSeatPolicy:
     config.toml that EXISTS but does not parse (the general loader falls back to pure
     defaults there; this policy does not), a non-list, a malformed ``label=s/d`` entry, a
     cap outside 1..100, or a seat label (after ``codex_seat_aliases``) that is not a
-    registered Codex seat.
+    registered Codex seat. ``codex_debate_pause_pct`` (tp#620) is validated here too.
     """
     cfg = load_config() if cfg is None else cfg
     if not cfg.loaded_from_disk:
@@ -717,6 +727,7 @@ def codex_debate_policy(cfg: Config | None = None) -> DebateSeatPolicy:
             entry.strip("/")
             for entry in _debate_str_list("codex_debate_big_repos", cfg.codex_debate_big_repos)
         ),
+        pause_pct=_debate_cap("codex_debate_pause_pct", cfg.codex_debate_pause_pct),
     )
 
 
@@ -1056,6 +1067,7 @@ class Config:
     codex_debate_cap_default_pct: float = 75
     codex_debate_seat_caps: list[str] = field(default_factory=list)  # "label=strict/default"
     codex_debate_big_repos: list[str] = field(default_factory=list)  # force the strict tier
+    codex_debate_pause_pct: float = 90  # mid-debate pause point (tp#620)
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
     subscription_ends: list[str] = field(default_factory=list)  # "card=YYYY-MM-DD|auto"

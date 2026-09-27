@@ -3077,13 +3077,21 @@ def _format_reset(resets_at: int, now: int | None = None) -> str:
     return "in " + " ".join(parts)
 
 
+def _nearest_rank_p95(values: list[float]) -> float:
+    """Nearest-rank P95 of non-empty *values* (headroom reserve and debate pause point).
+
+    The smallest observed value at or above the 95th percentile.
+    """
+    ordered = sorted(values)
+    return ordered[math.ceil(0.95 * len(ordered)) - 1]
+
+
 def _headroom_reserve(window_minutes: int) -> tuple[float, str]:
     """Reserve percentage and its source for one duration."""
-    deltas = sorted(_debate_cost_deltas(window_minutes))
+    deltas = _debate_cost_deltas(window_minutes)
     if len(deltas) < _HEADROOM_MIN_SAMPLES:
         return (_HEADROOM_BOOTSTRAP_RESERVE_PERCENT, "bootstrap")
-    # Nearest-rank P95: the smallest observed value at or above the 95th percentile.
-    p95 = deltas[math.ceil(0.95 * len(deltas)) - 1]
+    p95 = _nearest_rank_p95(deltas)
     learned = 3.0 * p95 * 1.10
     return (
         min(_HEADROOM_MAX_RESERVE_PERCENT, max(_HEADROOM_MIN_RESERVE_PERCENT, learned)),
@@ -3547,7 +3555,14 @@ def cmd_headroom(args: argparse.Namespace) -> int:
 # ``codex_debate_seats`` allowlist names. Unlike ``headroom`` (a learned reserve for
 # OPTIONAL offloads) this is a hard per-tier cap on the five-hour window, and it fails
 # CLOSED on every doubt: no fresh reading, a bad policy, a crash → ``unknown``.
-# What happens when the pinned seat fills up MID-debate is tp#620's, not this gate's.
+#
+# MID-debate (tp#620): ``debate-seat -c <seat>`` re-judges the debate's CURRENT seat
+# before a round. Fresh and below the pause point (``codex_debate_pause_pct``, lowered to
+# ``100 - 1.1 x P95`` of the measured round costs once there are enough) → ``continue``.
+# Otherwise a TOOL-chosen seat (``-p tool``) fails over to the first other allowed seat
+# that passes the START rule above (``failover``); a hand-set ``$CODEX_HOME``
+# (``-p human``) never moves. With no such seat the debate is ``paused`` until the
+# earliest known time a specific seat clears (``retry_at``, null when unknowable).
 # --------------------------------------------------------------------------- #
 DEBATE_TIERS = ("strict", "default")
 _DEBATE_REFRESH_BUDGET_SEC = 20.0
@@ -3560,6 +3575,9 @@ _DEBATE_EXIT = {
     "disabled": 1,
     "unknown": 3,
 }
+# ``debate-seat -c`` (tp#620): 0 keep going (same or new seat), 1 paused, 3 unknown.
+_DEBATE_CONTINUE_EXIT = {"continue": 0, "failover": 0, "paused": 1, "disabled": 1, "unknown": 3}
+DEBATE_PINS = ("tool", "human")
 
 
 def _debate_stale_after() -> int:
@@ -3782,12 +3800,276 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
     return _debate_pick(seats, tier)
 
 
+def _debate_pause_point(config_pct: float) -> dict[str, Any]:
+    """The effective MID-debate pause point (tp#620 D2) and how it was reached.
+
+    ``codex_debate_pause_pct`` alone until ccc holds ``_HEADROOM_MIN_SAMPLES`` measured
+    five-hour debate-round costs; from then on ``min(config, 100 - 1.1 x P95)`` (the
+    headroom reserve's own nearest-rank P95), never below 1 %. Reading the history can
+    only LOWER the point, and a failure to read it leaves the configured value.
+    """
+    try:
+        deltas = _debate_cost_deltas(_FIVE_HOUR_MINUTES)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        deltas = []
+    point: dict[str, Any] = {
+        "pause_percent": float(config_pct),
+        "pause_rule": "config",
+        "pause_config": float(config_pct),
+        "pause_p95": None,
+        "pause_samples": len(deltas),
+    }
+    if len(deltas) >= _HEADROOM_MIN_SAMPLES:
+        p95_point = round(100.0 - 1.1 * _nearest_rank_p95(deltas), 2)
+        point["pause_p95"] = p95_point
+        point["pause_rule"] = "p95"
+        point["pause_percent"] = max(1.0, min(float(config_pct), p95_point))
+    return point
+
+
+def _debate_retry(
+    entry: dict[str, Any], row: quota.ProviderQuota, now: int
+) -> tuple[bool, int | None]:
+    """``(known cause, retry_at)`` for ONE ineligible seat entry (tp#620 D2, O9).
+
+    * ``capped`` (at/above the pause point or the start cap) → its five-hour reset;
+    * ``blocked`` → the blocked row's own ``resets_at`` (weekly exhaustion, a hold or
+      cooldown's expiry, the rota's next own week); ``null`` for an ``auth`` /
+      ``entitlement`` block, an open-ended one, or a seat the routing dropped for a
+      reason no row states;
+    * ``unknown`` (no fresh reading) → no known cause at all.
+    """
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    state = entry["state"]
+    if state == "capped":
+        resets = int(entry.get("resets_at") or 0)
+        return True, resets if resets > now else None
+    if state == "blocked":
+        if row.state != quota.BLOCKED or row.block_scope in ("auth", "entitlement"):
+            return True, None
+        resets = int(row.resets_at or 0)
+        return True, resets if resets > now else None
+    return False, None
+
+
+def _without_codex_home() -> list[SeatCandidate]:
+    """:func:`codex_homes_in_order` (``probe=False``) as if ``$CODEX_HOME`` were unset.
+
+    A TOOL pin must not narrow the pool to itself (regime 2), or the debate could never
+    fail over. The variable is restored whatever happens.
+    """
+    saved = os.environ.pop("CODEX_HOME", None)
+    try:
+        return codex_homes_in_order(probe=False)
+    finally:
+        if saved is not None:
+            os.environ["CODEX_HOME"] = saved
+
+
+def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-statements,too-many-branches,too-many-statements
+    current: str,
+    *,
+    pin: str = "tool",
+    exclude: tuple[str, ...] | list[str] = (),
+    tier: str = "default",
+    repo: str = "",
+    now: int | None = None,
+    refresh: bool = True,
+) -> dict[str, Any]:
+    """May a running debate keep its seat *current* for the next round — tp#620 D2.
+
+    Starts no Codex. The ``debate-seat`` JSON (``schema_version`` 1) plus the additive
+    ``continue_from, pin, excluded, pause_*, retry_at, retry_seat`` fields and a
+    ``role`` (``current | candidate | excluded``) on every ``seats[]`` entry.
+
+    * **pool**: ``pin="tool"`` → the routing order computed WITHOUT the inherited
+      ``$CODEX_HOME``, filtered by ``codex_debate_seats``, minus *exclude*; ``pin="human"``
+      → exactly the inherited ``$CODEX_HOME``, which must be *current*.
+    * **current**: refreshed first; fresh, not blocked, not excluded and below the pause
+      point → ``continue``.
+    * **failover** (tool only): the first OTHER candidate passing the tier's START rule.
+    * otherwise ``paused`` with the earliest ``retry_at`` a specific seat clears its
+      actual cause — or ``unknown`` when no seat has any KNOWN cause (no fresh reading).
+    """
+    from . import config  # pylint: disable=import-outside-toplevel
+
+    excluded = list(dict.fromkeys(str(label) for label in exclude))
+    base: dict[str, Any] = {
+        "continue_from": current,
+        "pin": pin,
+        "excluded": excluded,
+        "pause_percent": None,
+        "pause_rule": "",
+        "pause_config": None,
+        "pause_p95": None,
+        "pause_samples": 0,
+        "retry_at": None,
+        "retry_seat": "",
+    }
+
+    def _out(state: str, reason: str, **extra: Any) -> dict[str, Any]:
+        result = _debate_result(state, tier, reason, **base)
+        result.update(extra)
+        return result
+
+    if pin not in DEBATE_PINS:
+        return _out("unknown", f"pin {pin!r} is not tool|human")
+    if tier not in DEBATE_TIERS:
+        return _out("unknown", f"tier {tier!r} is not strict|default")
+    if os.environ.get("CCC_NO_CODEX"):
+        return _out("disabled", "Codex disabled (CCC_NO_CODEX)")
+    try:
+        policy = config.codex_debate_policy()
+    except config.DebatePolicyError as exc:
+        return _out("unknown", f"debate policy: {exc}")
+    if tier != "strict" and policy.is_big_repo(repo):
+        tier = "strict"
+    base.update(_debate_pause_point(policy.pause_pct))
+    pause = float(base["pause_percent"])
+    now_ts = int(time.time()) if now is None else int(now)
+    registered = canonical_codex_homes()
+    allowed = set(policy.seats) if policy.seats else set(registered)
+    stale_after = _debate_stale_after()
+    if current not in registered:
+        return _out("unknown", f"--continue {current!r} is not a registered seat")
+
+    if pin == "human":
+        env = os.environ.get("CODEX_HOME")
+        if not env:
+            return _out("unknown", "-p human needs the inherited $CODEX_HOME")
+        pinned = codex_homes_in_order(now_ts, probe=False)
+        if not pinned or pinned[0].label != current:
+            got = pinned[0].label if pinned else "nothing"
+            return _out("unknown", f"$CODEX_HOME pins {got or env}, not the current seat {current}")
+        if current not in allowed:
+            return _out("unknown", f"$CODEX_HOME pins seat {current}, not in codex_debate_seats")
+
+        def _select() -> list[SeatCandidate]:
+            return codex_homes_in_order(now_ts, probe=False)[:1]
+
+    else:
+
+        def _select() -> list[SeatCandidate]:
+            return [cand for cand in _without_codex_home() if cand.label in allowed]
+
+    def _ghost(label: str) -> SeatCandidate:
+        return SeatCandidate(label=label, home=registered[label], email="", pid=_seat_pid(label))
+
+    candidates = _select()
+    if refresh and _usage_feedback_on():
+        targets = [cand for cand in candidates if cand.label not in excluded]
+        if current not in {cand.label for cand in targets}:
+            routed_current = [cand for cand in candidates if cand.label == current]
+            targets.insert(0, routed_current[0] if routed_current else _ghost(current))
+        _debate_refresh(targets, stale_after, _DEBATE_REFRESH_BUDGET_SEC)
+        candidates = _select()
+    routed = {cand.label: cand for cand in candidates}
+    rows: dict[str, quota.ProviderQuota] = {}
+    untimed: set[str] = set()  # ineligible for a policy reason: never a retry time
+
+    cur_cand = routed.get(current) or _ghost(current)
+    rows[current] = _candidate_row(cur_cand, now_ts)
+    cur = _debate_seat_entry(cur_cand, rows[current], pause, now_ts, stale_after)
+    cur["reason"] = cur["reason"].replace(" cap ", " pause point ")
+    if current not in allowed:
+        cur["state"], cur["reason"] = "blocked", "not in codex_debate_seats"
+        untimed.add(current)
+    elif current not in routed and cur["state"] != "blocked":
+        cur["state"], cur["reason"] = "blocked", "not eligible in routing"
+    cur_excluded = current in excluded
+    cur["role"] = "excluded" if cur_excluded else "current"
+    cur_fields = {key: cur[key] for key in ("seat", "home", "email", "used_percent", "resets_at")}
+    cur_fields["cap_percent"] = pause
+    if not cur_excluded and cur["state"] == "allowed":
+        return _out("continue", f"seat {current} {cur['reason']}", seats=[cur], **cur_fields)
+
+    others: list[dict[str, Any]] = []
+    for cand in candidates:
+        if cand.label == current:
+            continue
+        rows[cand.label] = _candidate_row(cand, now_ts)
+        entry = _debate_seat_entry(
+            cand, rows[cand.label], policy.cap_for(cand.label, tier), now_ts, stale_after
+        )
+        entry["role"] = "excluded" if cand.label in excluded else "candidate"
+        others.append(entry)
+    if pin == "tool":
+        # Allowed seats the ranking dropped (held / blocked / rota): listed, never chosen.
+        for label in registered:
+            if label not in allowed or label in routed or label == current:
+                continue
+            ghost = _ghost(label)
+            rows[label] = _candidate_row(ghost, now_ts)
+            entry = _debate_seat_entry(
+                ghost, rows[label], policy.cap_for(label, tier), now_ts, stale_after
+            )
+            if entry["state"] != "blocked":
+                entry["state"], entry["reason"] = "blocked", "not eligible in routing"
+            entry["role"] = "excluded" if label in excluded else "candidate"
+            others.append(entry)
+    seats = [cur, *others]
+    why_not = f"{current} {cur['reason']}" + (" (excluded)" if cur_excluded else "")
+    if pin == "tool":
+        target = next(
+            (e for e in others if e["role"] == "candidate" and e["state"] == "allowed"), None
+        )
+        if target is not None:
+            fields = ("seat", "home", "email", "cap_percent", "used_percent", "resets_at")
+            return _out(
+                "failover",
+                f"{why_not}; failover to {target['seat']} {target['reason']}",
+                seats=seats,
+                **{key: target[key] for key in fields},
+            )
+    considered = [cur] + ([e for e in others if e["role"] == "candidate"] if pin == "tool" else [])
+    known = False
+    best_at: int | None = None
+    best_seat = ""
+    for entry in considered:
+        label = entry["seat"]
+        if label in untimed:
+            cause, retry = True, None
+        else:
+            cause, retry = _debate_retry(entry, rows[label], now_ts)
+            if entry is cur and cur_excluded:
+                cause = True  # the caller excluded it (a refusal it saw): known, untimed
+        known = known or cause
+        if retry is not None and (best_at is None or retry < best_at):
+            best_at, best_seat = retry, label
+    summary = ", ".join(
+        f"{e['seat']} {e['state']} ({e['reason']})" for e in considered if e is not cur
+    )
+    reason = why_not + (f"; no failover seat: {summary}" if summary else "")
+    if pin == "human":
+        reason += "; $CODEX_HOME is a human pin, never failed over"
+    if not known:
+        return _out("unknown", f"no seat is measurable: {reason}", seats=seats, **cur_fields)
+    if best_at is not None:
+        base["retry_at"], base["retry_seat"] = best_at, best_seat
+    return _out("paused", reason, seats=seats, **cur_fields)
+
+
 def cmd_debate_seat(args: argparse.Namespace) -> int:
     """Report which seat a Codex debate may start on (tp#619); exit 0 / 1 / 3.
 
-    A crash while computing the verdict is ``unknown`` / exit 3 — fail closed, never a
+    With ``-c/--continue`` the MID-debate verdict instead (tp#620,
+    :func:`debate_continue_verdict`); ``-p`` / ``-x`` without ``-c`` is a usage error
+    (exit 2). A crash while computing the verdict is ``unknown`` / exit 3 — fail closed, never a
     launch onto an unmeasured seat.
     """
+    current = getattr(args, "continue_from", None)
+    pin = getattr(args, "pin", None)
+    exclude = list(getattr(args, "exclude", None) or [])
+    if current is None and (pin is not None or exclude):
+        message = "-p/--pin and -x/--exclude need -c/--continue"
+        parser = getattr(args, "debate_parser", None)
+        if parser is not None:
+            parser.error(message)  # exits 2
+        print(f"codex-in-claude debate-seat: error: {message}", file=sys.stderr)
+        return 2
+    if current is not None:
+        return _cmd_debate_continue(args, current, pin or "tool", exclude)
     try:
         verdict = debate_seat_verdict(tier=args.tier, repo=args.repo or "")
     except Exception as exc:  # pylint: disable=broad-exception-caught  # any crash = unknown
@@ -3811,6 +4093,53 @@ def cmd_debate_seat(args: argparse.Namespace) -> int:
         for seat in verdict.get("seats") or []:
             print(f"  {seat['seat']}: {seat['state']} — {seat['reason']}")
     return _DEBATE_EXIT.get(str(verdict["state"]), 3)
+
+
+def _cmd_debate_continue(
+    args: argparse.Namespace, current: str, pin: str, exclude: list[str]
+) -> int:
+    """``debate-seat -c``: may the running debate keep its seat (tp#620); exit 0 / 1 / 3."""
+    try:
+        verdict = debate_continue_verdict(
+            current, pin=pin, exclude=exclude, tier=args.tier, repo=args.repo or ""
+        )
+    except Exception as exc:  # pylint: disable=broad-exception-caught  # any crash = unknown
+        verdict = _debate_result(
+            "unknown",
+            args.tier,
+            f"{type(exc).__name__}: {exc}",
+            continue_from=current,
+            pin=pin,
+            excluded=exclude,
+            pause_percent=None,
+            pause_rule="",
+            pause_config=None,
+            pause_p95=None,
+            pause_samples=0,
+            retry_at=None,
+            retry_seat="",
+        )
+    state = str(verdict["state"])
+    if args.json:
+        print(json.dumps(verdict))
+    else:
+        pause = verdict.get("pause_percent")
+        point = f"pause point {pause:g} % ({verdict['pause_rule']})" if pause is not None else ""
+        if state == "continue":
+            print(f"debate seat: continue {verdict['seat']} ({verdict['reason']}; {point})")
+        elif state == "failover":
+            print(f"debate seat: FAILOVER {current} -> {verdict['seat']} ({verdict['reason']})")
+        else:
+            retry = verdict.get("retry_at")
+            when = (
+                f", retry {_format_reset(int(retry))} on {verdict['retry_seat']}"
+                if retry
+                else (", retry unknown" if state == "paused" else "")
+            )
+            print(f"debate seat: {state.upper()} — {verdict['reason']}{when}")
+        for seat in verdict.get("seats") or []:
+            print(f"  {seat['seat']} [{seat['role']}]: {seat['state']} — {seat['reason']}")
+    return _DEBATE_CONTINUE_EXIT.get(state, 3)
 
 
 # --------------------------------------------------------------------------- #
@@ -5791,12 +6120,16 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
 
     p_debate = sub.add_parser(
         "debate-seat",
-        help="which Codex seat a debate may START on (five-hour cap per tier, tp#619)",
+        help="which Codex seat a debate may START on / CONTINUE on (tp#619, tp#620)",
         description=(
             "Read-only: judge every allowed seat (codex_debate_seats) against the debate "
             "cap of its tier (codex_debate_cap_*, codex_debate_seat_caps) on a FRESH "
             "five-hour reading. Starts no Codex process. Exit 0 = allowed, 1 = capped / "
-            "not_allowed / blocked / disabled, 3 = unknown (no fresh reading, bad policy)."
+            "not_allowed / blocked / disabled, 3 = unknown (no fresh reading, bad policy). "
+            "With -c LABEL (mid-debate, tp#620): judge the running debate's seat against "
+            "the pause point (codex_debate_pause_pct, lowered by the measured P95 round "
+            "cost): exit 0 = continue / failover, 1 = paused (retry_at in the JSON), "
+            "3 = unknown."
         ),
     )
     p_debate.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")
@@ -5814,7 +6147,36 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         metavar="REPO",
         help="category/repo of the debated plan (a codex_debate_big_repos entry forces strict)",
     )
-    p_debate.set_defaults(func=cmd_debate_seat)
+    p_debate.add_argument(
+        "-c",
+        "--continue",
+        dest="continue_from",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "MID-debate mode (tp#620): may the debate keep seat LABEL for the next round? "
+            "continue / failover (another seat below its start cap) / paused"
+        ),
+    )
+    p_debate.add_argument(
+        "-p",
+        "--pin",
+        choices=DEBATE_PINS,
+        default=None,
+        help=(
+            "with -c: who chose the seat — tool (the default: may fail over within "
+            "codex_debate_seats, $CODEX_HOME ignored) or human ($CODEX_HOME, never moves)"
+        ),
+    )
+    p_debate.add_argument(
+        "-x",
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="LABEL",
+        help="with -c: never continue on / fail over to LABEL (repeatable; may be the -c seat)",
+    )
+    p_debate.set_defaults(func=cmd_debate_seat, debate_parser=p_debate)
 
     p_home = sub.add_parser(
         "home",
