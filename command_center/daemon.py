@@ -31,6 +31,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import json
 import os
 import signal
@@ -676,7 +677,9 @@ def _spawn_resume_watcher(cfg: config.Config, report: DaemonReport, dry_run: boo
     report.resume_spawned = spawn.spawn_ccc(["resume-halted", "--watch"])
 
 
-def _restart_stale_panel_server(report: DaemonReport, dry_run: bool) -> None:
+def _restart_stale_panel_server(  # pylint: disable=too-many-return-statements  # one exit per guard
+    report: DaemonReport, dry_run: bool
+) -> None:
     """Ask a live panel server running older code than the tree to re-exec (tp#70 D8/S5b).
 
     A complete no-op unless the opt-in agent is installed and its pidfile names a live

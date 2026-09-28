@@ -15,6 +15,8 @@ Subcommands:
   tui / serve             Textual UI, terminal and browser (phases 4-5)
 """
 
+# pylint: disable=too-many-lines  # one CLI surface: every subcommand handler + the parser
+
 # Lazy imports (import-outside-toplevel) keep `ccc ls`/`aim`/`statusline` fast by
 # not importing textual/daemon/llm at startup. Command handlers share a uniform
 # (args) signature, so some ignore it (unused-argument). build_parser is long by
@@ -41,6 +43,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import argparse
 import json
 import os
@@ -218,7 +221,7 @@ def _paint_done_word(
     return "".join(parts)
 
 
-def cmd_aim(args: argparse.Namespace) -> int:
+def cmd_aim(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branches  # one branch per display mode
     """Fast, LLM-free lookup for the status line. Must stay well under ~10 ms."""
     from .models import done_bar_parts, effective_progress, progress_bar
 
@@ -248,17 +251,17 @@ def cmd_aim(args: argparse.Namespace) -> int:
                 # Impartial checker judged the AIM fulfilled → red DONE stamped inside the
                 # bar; letters over filled cells carry the green fill as background.
                 left, done_word, right, fills = done_bar_parts(fraction, 8)
-                bar = _paint_bar_glyphs(left, green, dim, reset)
-                bar += _paint_done_word(done_word, fills, 42, 244)
-                bar += _paint_bar_glyphs(right, green, dim, reset)
-                print(f"{bar}{pct}")
+                bar_text = _paint_bar_glyphs(left, green, dim, reset)
+                bar_text += _paint_done_word(done_word, fills, 42, 244)
+                bar_text += _paint_bar_glyphs(right, green, dim, reset)
+                print(f"{bar_text}{pct}")
             elif fraction is None:
                 print(f"{dim}{'░' * 8}{reset}")  # AIM set, no checklist yet
             else:
                 plain = progress_bar(fraction, 8)
                 filled = plain.count("▓")
-                bar = f"{green}{'▓' * filled}{reset}{dim}{'░' * (8 - filled)}{reset}"
-                print(f"{bar}{pct}")
+                bar_text = f"{green}{'▓' * filled}{reset}{dim}{'░' * (8 - filled)}{reset}"
+                print(f"{bar_text}{pct}")
             return 0
         parts = [f"🎯 {session.aim}"]
         if session.aim_met:  # red DONE stamped inside the bar (same overlay as every bar site)
@@ -371,8 +374,6 @@ def cmd_score_aim(args: argparse.Namespace) -> int:
     WITHOUT touching the store — this is the loop the in-session sharpener iterates against.
     Otherwise it refines the *stored* AIM's score (the detached entry spawned after set-aim).
     """
-    import json
-
     from . import aimscore, llm
 
     candidate = getattr(args, "dry_run", None)
@@ -932,8 +933,6 @@ def cmd_check_drift(args: argparse.Namespace) -> int:
     via a separate cheap ``claude -p`` (never the session agent), then records the verdict
     on the session (the blue dot) and the history row. First-ever version can't drift.
     """
-    import json
-
     from . import drift, llm
 
     cfg = config.load_config()
@@ -2372,7 +2371,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_resume(args: argparse.Namespace) -> int:
+def cmd_resume(args: argparse.Namespace) -> int:  # pylint: disable=inconsistent-return-statements  # ends in os.execvp
     """Resume a session in the current terminal (replaces this process).
 
     Fails closed on the multi-account billing risk (D8/R1): pins the session's own
@@ -2895,7 +2894,7 @@ def has_terminal() -> bool:
         return False
 
 
-def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches
+def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many-return-statements
     args: argparse.Namespace,
 ) -> int:
     """Launch a saved future job: clear its draft flag, then exec ``claude --session-id``.
@@ -3316,7 +3315,7 @@ def cmd_delete_job(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_archive(args: argparse.Namespace) -> int:
+def cmd_archive(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements  # one exit per refusal
     """Soft-hide a PARKED session (``archived=1``) — ``delete-job``'s counterpart for a
     real (non-draft) session, added for tp's single-listing rule.
 
@@ -3372,7 +3371,7 @@ def cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_restore_job(args: argparse.Namespace) -> int:
+def cmd_restore_job(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements  # one exit per refusal
     """Stage a deleted job back into FUTURE (inverse of ``delete-job``).
 
     Normal path: the row still exists (soft-deleted) — clear ``archived`` and move the
@@ -4196,8 +4195,6 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
             shown_state = f"{_QUOTA_STATE_COLOR[state]}{shown_state}\033[0m"
         shown_name = f"{names[prov['id']]:<{width}}"
         if colorable and (accent := _quota_name_color(prov)):
-            from . import usage  # pylint: disable=import-outside-toplevel
-
             r, g, b = usage._hex_rgb(accent)  # noqa: SLF001
             shown_name = f"\033[38;2;{r};{g};{b}m{shown_name}\033[0m"
         shown_renew = f"{renew:<{_RENEW_WIDTH}}"
@@ -4805,8 +4802,6 @@ def _effort_from_statusline_payload(data: dict) -> str | None:
     :data:`~command_center.models.EFFORT_LEVELS` level, else ``None`` — current Claude
     Code payloads carry none of these, so this is future-proofing that no-ops today.
     """
-    from .models import EFFORT_LEVELS
-
     candidates = [data.get("effort"), data.get("effortLevel"), data.get("reasoningEffort")]
     model = data.get("model")
     if isinstance(model, dict):
@@ -4860,7 +4855,7 @@ def _aim_label(index: int) -> str:
     return f"/aim ({index})" if index >= 1 else "/aim"
 
 
-def _first_aim_anchor(
+def _first_aim_anchor(  # pylint: disable=too-many-positional-arguments  # colour triple passed through
     session: Session, index: int, changed: bool, green: str, dim: str, reset: str
 ) -> list[str]:
     """The always-visible ``/aim (1):`` anchor row — the done-condition as originally typed.
@@ -4887,7 +4882,7 @@ def _first_aim_anchor(
     return [f"{prefix}{dim}{first}{reset}"]
 
 
-def _aim_statusline_lines(
+def _aim_statusline_lines(  # pylint: disable=too-many-positional-arguments  # colour triple passed through
     session: Session,
     checked: int,
     total: int,
@@ -4960,7 +4955,7 @@ def _aim_statusline_lines(
     return [*anchor, f"{old_part}   {arrow}{chip}{new_aim}{prog}{tag}"]
 
 
-def cmd_statusline(args: argparse.Namespace) -> int:
+def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branches  # one branch per status-line row
     """Emit the extra status-line rows: aim + progress, status + next step, and —
     when the session has a live TodoWrite list — a one-line ``done/total`` + boxes row.
 

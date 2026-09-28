@@ -5,6 +5,8 @@ Used by the TUI's one-key "resume" action: open a fresh tab rooted in the
 session's cwd and run ``claude --resume <id>``.
 """
 
+# pylint: disable=too-many-lines  # every launcher rung (AppleScript, Python API, tmux) lives here
+
 from __future__ import annotations
 
 if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
@@ -17,6 +19,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import os
 import shlex
 import shutil
@@ -370,7 +373,7 @@ def tmux_pane_for_session(session_id: str) -> tuple[str, str] | None:
     return _tmux_pane_for_session(panes, children, commands, session_id)
 
 
-def focus_tmux_window(session_id: str) -> bool:
+def focus_tmux_window(session_id: str) -> bool:  # pylint: disable=too-many-return-statements  # one exit per probe
     """Select + surface the tmux window hosting *session_id* (launchd-spawned jobs).
 
     A ccc job fired from launchd (the future-sync watcher, gitlab-ci-watch) lands in a tmux
