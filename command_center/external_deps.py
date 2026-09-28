@@ -27,7 +27,10 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
-from extdeps import Dep, resolve
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
+import os
+
+from extdeps import Dep, MissingExternalDependency, require, resolve
 
 # The one external tool the vault mirrors depend on: the secret-broker client. Its
 # `scrub` verb vouches for a document (stdin → scrubbed stdout, exit 0) or withholds it
@@ -79,7 +82,56 @@ EXTERNAL_DEPS: dict[str, Dep] = {
             "`opencode_free_model` from config.toml."
         ),
     ),
+    # The two `ccc await` probes. Both are resolved ONCE, at arm time, and the absolute
+    # path is persisted in the source's spec — the poller never re-resolves, so a PATH
+    # that differs under launchd cannot silently change which script answers. `require`,
+    # not `resolve`: a user who typed `ccc await -z` asked for this dependency.
+    "zoho-api.py": Dep(
+        name="zoho-api.py",
+        command="zoho-api.py",
+        env="ZOHO_API_BIN",
+        requires_subcommand="--inbound-since",
+        install_hint=(
+            "Put the Zoho Desk CLI `zoho-api.py` (with its read-only -i/--inbound-since "
+            "probe) on $PATH, or set ZOHO_API_BIN to its path. Needed only by "
+            "`ccc await -z`."
+        ),
+    ),
+    "slack_api.py": Dep(
+        name="slack_api.py",
+        command="slack_api.py",
+        env="SLACK_API_BIN",
+        requires_subcommand="--dm",
+        install_hint=(
+            "Put the Slack CLI `slack_api.py` (--dm USER --oldest TS --json) on $PATH, or "
+            "set SLACK_API_BIN to its path. Needed only by `ccc await -S`."
+        ),
+    ),
 }
+
+
+def canonical_exe(path: str) -> str:
+    """*path* as the absolute, normalized spelling persisted in an await spec.
+
+    A relative ``ZOHO_API_BIN=./zoho-api.py`` would resolve against whatever cwd the
+    poller runs in; the arm-time answer is made absolute before it is stored. Symlinks
+    are kept (the user's spelling), only ``~``, ``.`` and ``..`` are resolved.
+    """
+    return os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def await_exe(name: str, *, needed_for: str) -> str:
+    """The canonical path of await dependency *name*; raises MissingExternalDependency.
+
+    Also refuses a found-but-not-executable file (the probe would fail at spawn time,
+    every pass, as a "permanent" error — better to say so at arm time).
+    """
+    found = canonical_exe(require(EXTERNAL_DEPS[name], needed_for=needed_for))
+    if not os.access(found, os.X_OK):
+        raise MissingExternalDependency(
+            EXTERNAL_DEPS[name], needed_for, detail=f"found at {found}, but it is not executable."
+        )
+    return found
 
 
 def ai_exe() -> str | None:
