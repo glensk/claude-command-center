@@ -221,6 +221,15 @@ def _paint_done_word(
     return "".join(parts)
 
 
+_MAIN_LINE_AIM_W = 60  # chars of the AIM shown on status-line row 1
+
+
+def _clip(text: str, width: int) -> str:
+    """First line of *text*, cut to *width* chars with a trailing ``…``."""
+    line = text.splitlines()[0] if text else ""
+    return line if len(line) <= width else line[: width - 1] + "…"
+
+
 def cmd_aim(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branches  # one branch per display mode
     """Fast, LLM-free lookup for the status line. Must stay well under ~10 ms."""
     from .models import done_bar_parts, effective_progress, progress_bar
@@ -242,6 +251,8 @@ def cmd_aim(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branch
             return 0
         checked, total = store.progress(session_id)
         fraction = effective_progress(session.manual_progress, checked, total)
+        if args.format == "bar" and config.load_config().aim_on_main_line:
+            print(f"\033[38;5;220m🎯 {_clip(session.aim, _MAIN_LINE_AIM_W)}\033[0m ", end="")
         if args.format == "bar":
             # Compact, colored progress bar for the main status line (line 1). Filled
             # cells green, empty dim; ``progress_bar`` stays the single glyph source.

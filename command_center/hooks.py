@@ -481,6 +481,11 @@ def _intercept_aim(store: Store, sid: str, current: str | None, text: str) -> No
     if text:
         store.set_aim(sid, text)
         _block_prompt(f"🎯 /aim: {text}")
+        session = store.get(sid)
+        if session is not None:
+            from . import tabsymbol  # lazy: AppleScript layer
+
+            tabsymbol.push_title(session)
     else:
         _block_prompt(f"🎯 /aim: {current or '(none — set one with /aim <text>)'}")
 

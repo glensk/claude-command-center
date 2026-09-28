@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from .models import Session
     from .store import Store
 
 # The "waiting for input" marker that ``set-iterm-wait-marker.sh`` prepends to a
@@ -354,12 +355,39 @@ def _wait_marker(marker: str | None) -> str:
     return os.environ.get("CLAUDE_WAIT_MARKER", _DEFAULT_WAIT_MARKER)
 
 
-def title_core(badge: str, cwd: str) -> str:
-    """The non-marker part of a tab title — ``"<badge> <leaf>"``, matching the zsh hook."""
+_TAB_AIM_W = 40  # chars of the AIM appended to a tab title
+
+
+def title_core(badge: str, cwd: str, aim: str | None = None) -> str:
+    """The non-marker part of a tab title — ``"<badge> <leaf>"``, matching the zsh hook.
+
+    With *aim* (``aim_in_tab_title``) the session's AIM follows: ``"<badge> <leaf> 🎯 <aim>"``.
+    """
     from . import colors  # lazy: keep the shell-hook (``ccc tab-symbol``) import light
 
     _category, leaf = colors.folder_split(cwd)
-    return f"{badge} {leaf}"
+    if not aim:
+        return f"{badge} {leaf}"
+    line = aim.splitlines()[0].strip()
+    if len(line) > _TAB_AIM_W:
+        line = line[: _TAB_AIM_W - 1] + "…"
+    return f"{badge} {leaf} 🎯 {line}"
+
+
+def push_title(session: Session, *, marker: str | None = None) -> None:
+    """Re-title ONE session's tab now (after its AIM changed). No-op without a tab/badge."""
+    iid = session.iterm_session_id
+    if session.done or not iid:
+        return
+    badge = assign(iid, folder=session.cwd)
+    if not badge:
+        return
+    from . import config, terminal  # lazy: AppleScript layer, not needed on the read path
+
+    aim = session.aim if config.load_config().aim_in_tab_title else None
+    terminal.set_session_titles_preserving(
+        {iid: title_core(badge, session.cwd, aim)}, marker=_wait_marker(marker)
+    )
 
 
 def seed_title(iterm_session_id: str | None, cwd: str, *, marker: str | None = None) -> str | None:
@@ -395,6 +423,9 @@ def sync_live(store: Store, *, marker: str | None = None) -> list[str]:
     refresh is what keeps open tabs in sync with their rows. Returns the session ids
     that were badged.
     """
+    from . import config  # lazy
+
+    with_aim = config.load_config().aim_in_tab_title
     cores: dict[str, str] = {}
     badged: list[str] = []
     for session in store.list_sessions():
@@ -404,7 +435,7 @@ def sync_live(store: Store, *, marker: str | None = None) -> list[str]:
         badge = assign(iid, folder=session.cwd)
         if not badge:
             continue
-        cores[iid] = title_core(badge, session.cwd)
+        cores[iid] = title_core(badge, session.cwd, session.aim if with_aim else None)
         badged.append(session.session_id)
     if cores:
         from . import terminal  # lazy: AppleScript layer, not needed on the read path

@@ -1307,6 +1307,12 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   `/aim <text>` and sets the AIM itself, then blocks the prompt — no model turn, no tokens.
   A bare `/aim` just shows the current AIM. The agent learns the new AIM as context on the
   next real prompt. With it off, `/aim` falls back to the `commands/aim.md` prompt.
+  Claude Code always labels a swallowed prompt "operation blocked by hook" — exit 2 /
+  `decision: block` is the only no-turn path a `UserPromptSubmit` hook has.
+- **`aim_on_main_line = true`** prefixes `ccc aim --format bar` (status-line row 1) with
+  `🎯 <aim>` (60 chars); **`aim_in_tab_title = true`** makes the iTerm tab title
+  `<badge> <leaf> 🎯 <aim>` (40 chars) — pushed at once by the `/aim` intercept, and kept
+  converged by the daemon / TUI title sync.
 - **Agent-driven sharpening with an independent checker.** While the AIM is vague, the
   `UserPromptSubmit` hook nudges the running session **every turn** (`sharpen_every_n_turns`)
   to rewrite it — *keeping your goal intact, only making it concrete* — grounded in what the

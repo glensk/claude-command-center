@@ -317,3 +317,10 @@ def test_sync_live_no_push_when_nothing_to_badge(monkeypatch: pytest.MonkeyPatch
     store = _FakeStore([Session("d", cwd="/Users/x/rd")])  # no tab ids at all
     assert tabsymbol.sync_live(store) == []  # type: ignore[arg-type]
     assert called is False
+
+
+def test_title_core_appends_clipped_aim() -> None:
+    _cat, leaf = colors.folder_split("/Users/x/repo")
+    assert tabsymbol.title_core("🟧", "/Users/x/repo", "ship X") == f"🟧 {leaf} 🎯 ship X"
+    long = tabsymbol.title_core("🟧", "/Users/x/repo", "a" * 80 + "\nsecond line")
+    assert long.endswith("…") and "second" not in long
