@@ -190,7 +190,7 @@ def test_probe_plist_without_ai_py_has_no_ai_bin(
     assert "AI_BIN" not in plist["EnvironmentVariables"]
 
 
-def test_install_writes_and_loads_both_agents_and_uninstall_removes_both(
+def test_install_writes_and_loads_every_agent_and_uninstall_removes_them(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _no_ai(tmp_path, monkeypatch)
@@ -203,11 +203,12 @@ def test_install_writes_and_loads_both_agents_and_uninstall_removes_both(
     monkeypatch.setattr(launchd.subprocess, "run", fake_run)
     assert launchd.install() == 0
     daemon, probe = launchd._plist_path(), launchd.quota_probe_plist_path()  # noqa: SLF001
-    assert daemon.exists() and probe.exists()
+    poller = launchd.await_poller_plist_path()
+    assert daemon.exists() and probe.exists() and poller.exists()
     loaded = [cmd[2] for cmd in calls if cmd[:2] == ["launchctl", "load"]]
-    assert loaded == [str(daemon), str(probe)]
+    assert loaded == [str(daemon), str(probe), str(poller)]
     assert launchd.uninstall() == 0
-    assert not daemon.exists() and not probe.exists()
+    assert not daemon.exists() and not probe.exists() and not poller.exists()
 
 
 # ── `next probe in N min` ────────────────────────────────────────────────────────────
