@@ -169,6 +169,19 @@ def _guard_real_trust_writes(
     monkeypatch.setattr(_accounts, "ensure_trusted", guarded)
 
 
+@pytest.fixture(autouse=True)
+def _restore_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Put the process cwd back after every test.
+
+    ``resume`` / ``start-job`` / ``fire-attached`` ``os.chdir`` into the session's cwd
+    before their (mocked) exec, so a test driving them in-process used to leave the whole
+    rest of the run in ``/tmp`` or a stale ``tmp_path`` — and ``test_smoke_matrix``'s
+    ``uv venv`` then resolved its interpreter from there (tp#687).
+    ``monkeypatch.chdir`` records the current cwd and restores it at teardown.
+    """
+    monkeypatch.chdir(os.getcwd())
+
+
 # Ambient variables a live Claude Code session (or a codex-in-claude run) exports into
 # the shell that runs pytest. ``CLAUDE_HOME`` is excluded: ``_pin_claude_home`` owns it.
 _AMBIENT_ENV_PREFIXES = ("CLAUDE_", "CODEX_IN_CLAUDE_")
