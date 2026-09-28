@@ -224,7 +224,8 @@ def _zoho_source(ticket: str, interval: int, runner: Any) -> Any:
     ticket = ticket.strip().lstrip("#")
     if not ticket.isdigit():
         raise AwaitError(f"-z {ticket!r}: not a ticket number", EXIT_USAGE)
-    exe = external_deps.await_exe("zoho-api.py", needed_for="ccc await -z")
+    name, needed_for = external_deps.AWAIT_PROBE_DEPS["zoho-reply"]
+    exe = external_deps.await_exe(name, needed_for=needed_for)
     result = runner(await_probes.zoho_argv(exe, ticket, ""), timeout=30.0, max_bytes=512 * 1024)
     try:
         data = json.loads(result.stdout) if result.exit == 0 else None
@@ -244,7 +245,8 @@ def _slack_source(user: str, interval: int, runner: Any) -> Any:
     from . import await_probes, external_deps
     from .await_store import SourceSpec
 
-    exe = external_deps.await_exe("slack_api.py", needed_for="ccc await -S")
+    name, needed_for = external_deps.AWAIT_PROBE_DEPS["slack-dm"]
+    exe = external_deps.await_exe(name, needed_for=needed_for)
     user_id = user.strip()
     if not await_probes.is_slack_user_id(user_id):
         who = runner([exe, "--whois", user_id, "--json"], timeout=30.0, max_bytes=512 * 1024)

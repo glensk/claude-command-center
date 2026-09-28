@@ -21,7 +21,8 @@ flags. Grouped by what they do:
 - `ccc ls` — a flat, clickable, one-line-per-session list (scripting-friendly).
 - `ccc demo [--ls] [--clean]` — a throwaway fake-data command center; safe to try with zero setup.
 - `ccc serve [--host --port]` — serve the TUI in the browser (`textual-serve`).
-- `ccc doctor` — read-only health check of the install + environment (exit 1 on any ❌). Its
+- `ccc doctor` — read-only health check of the install + environment (exit 1 on any ❌;
+  ⚠️ rows are warnings that never change the exit code, and the verdict line counts them). Its
   "Spawn fast path" section names the ccc subcommands the installed status line and hooks
   spawn and whether each takes the short parser (`statusline`, `aim`, `hook`, `tab-symbol`
   do; anything else is informational, never ❌).
@@ -1057,6 +1058,9 @@ deliberate act by the session; automation later only *checks* trust), and the gr
 its sources and (with `-C`) the close-after-turn arm are written in ONE transaction. Any
 failure before that writes nothing. One active group per session; the probe CLIs are
 resolved once (`ZOHO_API_BIN` / `SLACK_API_BIN` → `$PATH`) and stored as absolute paths.
+`ccc doctor` resolves both the same way (path only — it never runs them; ⚠️ when unusable)
+and checks the pinned path of every still-probed source (❌ when it no longer exists or is
+not executable — restoring the env var does not re-pin it).
 
 **Polling.** `ccc daemon --install` also installs a 60 s poller (launchd
 `<launchd_label>.await`, or a systemd `oneshot` timer) running `ccc await -r`; it

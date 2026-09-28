@@ -11,7 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from command_center import config, doctor, hookroutes, install
+from command_center import config, doctor, external_deps, hookroutes, install
+from command_center.await_store import SourceSpec
+from command_center.store import Store
+
+_REAL_AWAIT_DEP_PATH = external_deps.await_dep_path
 
 
 def _which_factory(present: set[str]):
@@ -36,6 +40,14 @@ def _isolate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # coverage check to "cannot prove coverage" in these tests.
     monkeypatch.setattr(doctor, "_MANAGED_SETTINGS_DARWIN", tmp_path / "no-managed.json")
     monkeypatch.setattr(doctor, "_MANAGED_SETTINGS_POSIX", tmp_path / "no-managed.json")
+    # The await probe CLIs: never this machine's real zoho-api.py / slack_api.py, and never
+    # its real await sources. Tests opt back in with `real_await_deps` + an env override.
+    monkeypatch.delenv("ZOHO_API_BIN", raising=False)
+    monkeypatch.delenv("SLACK_API_BIN", raising=False)
+    monkeypatch.setattr(
+        external_deps, "await_dep_path", lambda _name: external_deps.DepPath(None, "not found")
+    )
+    monkeypatch.setattr(config, "db_path", lambda: tmp_path / "doctor-state.db")
 
 
 def _statuses(section: doctor.Section) -> dict[str, str]:
@@ -66,7 +78,7 @@ def test_render_never_raises_with_no_config(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 # ------------------------------ wiring reflects settings ------------------------------ #
-def test_wiring_ok_after_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_wiring_ok_after_install(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(install, "ccc_binary", lambda: "/opt/ccc")
     install.install_hooks()
     install.install_statusline()
@@ -646,7 +658,6 @@ def test_mirror_scrubber_check_states(tmp_path: Path) -> None:
     from scrubstub import stub_scrubber
 
     from command_center.models import MirrorHealth
-    from command_center.store import Store
 
     label = "mirrors → scrubber"
     assert _feat(config.Config(), label) == doctor.NA  # mirrors off → never probed
@@ -704,7 +715,210 @@ def test_panel_server_row_states(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     assert _panel_row(monkeypatch, tmp_path, installed=True) == doctor.FAIL
     ps.write_pidfile(p, os.getpid(), "ready", 0)  # stale code stamp
     assert _panel_row(monkeypatch, tmp_path, installed=True) == doctor.FAIL
-    proc = subprocess.Popen([sys.executable, "-c", "pass"])
-    proc.wait()
+    with subprocess.Popen([sys.executable, "-c", "pass"]) as proc:
+        proc.wait()
     ps.write_pidfile(p, proc.pid, "ready", ps.code_stamp())  # dead
     assert _panel_row(monkeypatch, tmp_path, installed=True) == doctor.FAIL
+
+
+# ------------------------------ ccc await probe dependencies ------------------------------ #
+@pytest.fixture
+def real_await_deps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(external_deps, "await_dep_path", _REAL_AWAIT_DEP_PATH)
+
+
+def _stub(path: Path, *, executable: bool = True) -> Path:
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755 if executable else 0o644)
+    return path
+
+
+def _dep_rows() -> dict[str, doctor.Check]:
+    return {c.label: c for c in doctor._await_dep_checks()}
+
+
+def _only(section_checks: list[doctor.Check]) -> doctor.Report:
+    return doctor.Report([doctor.Section("t", section_checks)])
+
+
+def test_missing_await_clis_warn_without_failing() -> None:
+    rows = _dep_rows()
+    zoho, slack = rows["await -z → zoho-api.py"], rows["await -S → slack_api.py"]
+    assert zoho.status == slack.status == doctor.WARN
+    assert "ZOHO_API_BIN" in zoho.detail and "ccc await -z" in zoho.detail
+    assert "SLACK_API_BIN" in slack.detail
+    report = _only(list(rows.values()))
+    assert report.exit_code == 0 and report.warnings == 2
+    assert doctor.render(report).endswith("⚠️ ccc doctor: 2 warning(s) (see ⚠️ above)")
+
+
+@pytest.mark.usefixtures("real_await_deps")
+def test_await_cli_via_env_override_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZOHO_API_BIN", str(_stub(tmp_path / "zoho-api.py")))
+    zoho = _dep_rows()["await -z → zoho-api.py"]
+    assert zoho.status == doctor.OK
+    assert str(tmp_path / "zoho-api.py") in zoho.detail and "path only" in zoho.detail
+
+
+@pytest.mark.usefixtures("real_await_deps")
+def test_await_cli_not_executable_or_directory_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ZOHO_API_BIN", str(_stub(tmp_path / "zoho-api.py", executable=False)))
+    (tmp_path / "slack_api.py").mkdir()
+    monkeypatch.setenv("SLACK_API_BIN", str(tmp_path / "slack_api.py"))
+    rows = _dep_rows()
+    assert rows["await -z → zoho-api.py"].status == doctor.WARN
+    assert "not executable" in rows["await -z → zoho-api.py"].detail
+    assert "not a regular file" in rows["await -S → slack_api.py"].detail
+
+
+def test_await_cli_check_crash_is_one_warn_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(_name: str) -> external_deps.DepPath:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(external_deps, "await_dep_path", boom)
+    assert {c.detail for c in doctor._await_dep_checks()} == {"check failed: boom"}
+
+
+def test_verdict_line_precedence() -> None:
+    warn = doctor.Check(doctor.WARN, "w")
+    fail = doctor.Check(doctor.FAIL, "f")
+    ok = doctor.Check(doctor.OK, "o")
+    assert doctor.render(_only([warn, fail])).endswith("❌ ccc doctor: issues found (see ❌ above)")
+    assert doctor.render(_only([ok])).endswith("✅ ccc doctor: all good")
+    assert "  ⚠️ w" in doctor.render(_only([warn]))
+
+
+# ------------------------------ pinned await source paths ------------------------------ #
+NOW = 1_900_000_000
+
+
+def _store() -> Store:
+    store = Store(config.db_path())
+    store.ensure("s1", cwd="/repo")
+    store.ensure("s2", cwd="/repo")
+    return store
+
+
+def _arm(store: Store, *specs: SourceSpec, session_id: str = "s1") -> int:
+    return store.arm_await(
+        session_id,
+        config_dir="",
+        cwd="/repo",
+        no_codex=False,
+        prompt_template="{event}",
+        until_epoch=NOW + 3600,
+        sources=list(specs),
+        now=NOW,
+    )
+
+
+def _zoho(exe: object) -> SourceSpec:
+    return SourceSpec(kind="zoho-reply", spec={"exe": exe, "ticket": "209"}, watermark="1:a")
+
+
+def _slack(exe: object) -> SourceSpec:
+    return SourceSpec(kind="slack-dm", spec={"exe": exe, "user_id": "U1AB"}, watermark="5.0")
+
+
+def _schema_and_counts(path: Path) -> tuple[list[tuple], tuple[int, int]]:
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    try:
+        schema = conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall()
+        counts = (
+            conn.execute("SELECT COUNT(*) FROM await_groups").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM await_sources").fetchone()[0],
+        )
+    finally:
+        conn.close()
+    return schema, counts
+
+
+def test_absent_db_yields_no_rows_and_creates_nothing() -> None:
+    assert not doctor._pinned_await_checks()
+    assert not config.db_path().exists()
+
+
+def test_armed_source_with_deleted_path_fails_and_mutates_nothing(tmp_path: Path) -> None:
+    exe = _stub(tmp_path / "zoho-api.py")
+    store = _store()
+    gid = _arm(store, _zoho(str(exe)))
+    store.conn.close()
+    exe.unlink()
+    before = _schema_and_counts(config.db_path())
+    checks = doctor._pinned_await_checks()
+    assert [c.status for c in checks] == [doctor.FAIL]
+    assert f"ccc await -d {gid}" in checks[0].detail and "ZOHO_API_BIN" in checks[0].detail
+    assert _only(checks).exit_code == 1
+    assert _schema_and_counts(config.db_path()) == before
+
+
+def test_live_writer_rows_in_the_wal_are_seen(tmp_path: Path) -> None:
+    exe = _stub(tmp_path / "slack_api.py")
+    store = _store()  # stays open: its rows live in the uncheckpointed WAL
+    _arm(store, _slack(str(exe)))
+    checks = doctor._pinned_await_checks()
+    assert [(c.status, c.label) for c in checks] == [(doctor.OK, "armed await sources")]
+    assert "1 pinned path(s)" in checks[0].detail
+    assert len(store.await_groups_in("armed")) == 1
+
+
+def test_older_schema_without_await_tables_yields_no_rows() -> None:
+    import sqlite3
+
+    conn = sqlite3.connect(config.db_path())
+    conn.execute("CREATE TABLE sessions (session_id TEXT)")
+    conn.commit()
+    conn.close()
+    assert not doctor._pinned_await_checks()
+
+
+def test_blocked_source_in_blocked_group_warns_with_retry_remedy(tmp_path: Path) -> None:
+    exe = _stub(tmp_path / "zoho-api.py")
+    store = _store()
+    gid = _arm(store, _zoho(str(exe)))
+    store.conn.execute("UPDATE await_sources SET state = 'blocked'")
+    store.conn.execute("UPDATE await_groups SET state = 'blocked'")
+    store.conn.commit()
+    checks = doctor._pinned_await_checks()
+    assert [c.status for c in checks] == [doctor.WARN]
+    assert "path usable now" in checks[0].detail and f"ccc await -R {gid}" in checks[0].detail
+
+
+def test_blocked_source_in_armed_group_warns_disarm_rearm(tmp_path: Path) -> None:
+    exe = _stub(tmp_path / "zoho-api.py")
+    store = _store()
+    gid = _arm(store, _zoho(str(exe)), _slack(str(_stub(tmp_path / "slack_api.py"))))
+    store.conn.execute("UPDATE await_sources SET state = 'blocked' WHERE kind = 'zoho-reply'")
+    store.conn.commit()
+    exe.unlink()
+    statuses = {c.label.split(" (")[0]: c for c in doctor._pinned_await_checks()}
+    assert statuses["armed await sources"].status == doctor.OK
+    blocked = next(c for c in statuses.values() if c.status == doctor.WARN)
+    assert "not found" in blocked.detail
+    assert "-R` only works on a blocked group" in blocked.detail
+    assert f"ccc await -d {gid}" in blocked.detail
+
+
+def test_fired_group_with_dead_path_is_ignored(tmp_path: Path) -> None:
+    exe = _stub(tmp_path / "zoho-api.py")
+    store = _store()
+    _arm(store, _zoho(str(exe)))
+    store.conn.execute("UPDATE await_groups SET state = 'fired'")
+    store.conn.commit()
+    exe.unlink()
+    assert not doctor._pinned_await_checks()
+
+
+def test_malformed_spec_is_its_own_finding_and_siblings_still_checked(tmp_path: Path) -> None:
+    good = _stub(tmp_path / "slack_api.py")
+    store = _store()
+    _arm(store, _zoho(None), _slack(str(good)))
+    _arm(store, _zoho("relative/zoho-api.py"), session_id="s2")
+    checks = doctor._pinned_await_checks()
+    fails = [c for c in checks if c.status == doctor.FAIL]
+    assert len(fails) == 2 and all("invalid pinned path" in c.detail for c in fails)
+    assert not any(c.status == doctor.OK for c in checks)  # not "all usable"

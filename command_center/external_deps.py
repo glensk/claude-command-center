@@ -29,6 +29,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 # pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import os
+from dataclasses import dataclass
 
 from extdeps import Dep, MissingExternalDependency, require, resolve
 
@@ -120,18 +121,64 @@ def canonical_exe(path: str) -> str:
     return os.path.normpath(os.path.abspath(os.path.expanduser(path)))
 
 
+#: ``ccc await`` source kind → (registry name, the command that needs it). The one map
+#: the arm path (:mod:`command_center.await_cli`) and ``ccc doctor`` share.
+AWAIT_PROBE_DEPS: dict[str, tuple[str, str]] = {
+    "zoho-reply": ("zoho-api.py", "ccc await -z"),
+    "slack-dm": ("slack_api.py", "ccc await -S"),
+}
+
+
+@dataclass(frozen=True)
+class DepPath:
+    """A passive path verdict: *path* (canonical, when found) and *problem* (``""`` = usable)."""
+
+    path: str | None
+    problem: str
+
+
+def _file_problem(path: str) -> str:
+    """``""`` when *path* is an executable regular file, else the reason it is not."""
+    if not os.path.isfile(path):
+        return "not a regular file" if os.path.exists(path) else "not found"
+    if not os.access(path, os.X_OK):
+        return "not executable"
+    return ""
+
+
+def await_dep_path(name: str) -> DepPath:
+    """Passively resolve await dependency *name*: env override → ``$PATH``, file, X_OK.
+
+    Runs nothing (no ``-h`` capability probe) — safe for ``ccc doctor``. *problem* is one
+    of ``""``, ``"not found"``, ``"not a regular file"``, ``"not executable"``.
+    """
+    found = resolve(EXTERNAL_DEPS[name])
+    if not found:
+        return DepPath(None, "not found")
+    path = canonical_exe(found)
+    return DepPath(path, _file_problem(path))
+
+
+def pinned_path_problem(exe: object) -> str:
+    """The same verdict for a path already persisted in an await spec (``""`` = usable)."""
+    if not isinstance(exe, str) or not exe or not os.path.isabs(exe):
+        return "invalid pinned path"
+    return _file_problem(exe)
+
+
 def await_exe(name: str, *, needed_for: str) -> str:
     """The canonical path of await dependency *name*; raises MissingExternalDependency.
 
-    Also refuses a found-but-not-executable file (the probe would fail at spawn time,
-    every pass, as a "permanent" error — better to say so at arm time).
+    The passive checks run first so a found-but-unusable file (a directory, a missing
+    execute bit) is named precisely instead of as a "likely outdated" copy; then
+    ``require`` runs the ``-h`` capability probe.
     """
-    found = canonical_exe(require(EXTERNAL_DEPS[name], needed_for=needed_for))
-    if not os.access(found, os.X_OK):
-        raise MissingExternalDependency(
-            EXTERNAL_DEPS[name], needed_for, detail=f"found at {found}, but it is not executable."
-        )
-    return found
+    dep = EXTERNAL_DEPS[name]
+    verdict = await_dep_path(name)
+    if verdict.problem:
+        where = f"found at {verdict.path}, but it is " if verdict.path else ""
+        raise MissingExternalDependency(dep, needed_for, detail=f"{where}{verdict.problem}.")
+    return canonical_exe(require(dep, needed_for=needed_for))
 
 
 def ai_exe() -> str | None:

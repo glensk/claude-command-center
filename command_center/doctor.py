@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """``ccc doctor`` — a read-only health check of the ccc install and its environment.
 
-Prints a sectioned ✅ / ❌ / − report (− = not applicable / feature disabled) and exits
-0 when nothing is broken, 1 when any ❌ is present. It mutates nothing and works with no
-config at all (a fresh machine) — it states what is missing without crashing.
+Prints a sectioned ✅ / ⚠️ / ❌ / − report (− = not applicable / feature disabled, ⚠️ =
+a non-failing warning) and exits 0 when nothing is broken, 1 when any ❌ is present. It
+mutates nothing and works with no config at all (a fresh machine) — it states what is
+missing without crashing.
 
 The report is built by the pure :func:`build_report` (easy to test); :func:`run` renders
 it and returns the exit code.
@@ -43,8 +44,8 @@ from . import config, install, scrub
 from .hookroutes import _foreign_ccc_calls, foreign_hook_routes
 from .models import MirrorHealth
 
-OK, FAIL, NA = "ok", "fail", "na"
-_SYMBOL = {OK: "✅", FAIL: "❌", NA: "−"}
+OK, FAIL, NA, WARN = "ok", "fail", "na", "warn"
+_SYMBOL = {OK: "✅", FAIL: "❌", NA: "−", WARN: "⚠️"}
 
 #: Claude Code's own hook timeout when an entry declares none (seconds). A Stop hook may
 #: therefore run this long even where settings.json says nothing at all.
@@ -62,7 +63,7 @@ def _managed_settings_path() -> Path:
 
 @dataclass
 class Check:
-    status: str  # OK | FAIL | NA
+    status: str  # OK | FAIL | NA | WARN (shown, never changes the exit code)
     label: str
     detail: str = ""
 
@@ -81,6 +82,11 @@ class Report:
     def exit_code(self) -> int:
         """1 if any check failed, else 0."""
         return 1 if any(c.status == FAIL for s in self.sections for c in s.checks) else 0
+
+    @property
+    def warnings(self) -> int:
+        """Number of ⚠️ checks (they never change :attr:`exit_code`)."""
+        return sum(c.status == WARN for s in self.sections for c in s.checks)
 
 
 def _claude_version() -> str:
@@ -736,7 +742,158 @@ def _section_features(  # pylint: disable=too-many-branches,too-many-statements
         section.checks.append(Check(OK, "iTerm2 (peek/jump)", "installed"))
     else:
         section.checks.append(Check(NA, "iTerm2 (peek/jump)", "not detected — peek/jump degrade"))
+    section.checks.extend(_await_dep_checks())
+    section.checks.extend(_pinned_await_checks())
     return section
+
+
+def _await_dep_checks() -> list[Check]:
+    """One row per ``ccc await`` probe CLI, resolved passively (env override → ``$PATH``).
+
+    Never runs the CLI (``ccc init --minimal`` runs doctor too); the ``-h`` capability
+    probe stays at arm time. Unusable = ⚠️, never ❌: these are personal, opt-in helpers a
+    public install legitimately lacks, but a clean "all good" would hide them.
+    """
+    from . import external_deps  # pylint: disable=import-outside-toplevel
+
+    checks: list[Check] = []
+    for name, needed_for in external_deps.AWAIT_PROBE_DEPS.values():
+        dep = external_deps.EXTERNAL_DEPS[name]
+        label = f"await {needed_for.rsplit(' ', 1)[-1]} → {name}"
+        try:
+            verdict = external_deps.await_dep_path(name)
+        except Exception as exc:  # pylint: disable=broad-exception-caught  # one row, not the report
+            checks.append(Check(WARN, label, f"check failed: {exc}"))
+            continue
+        if not verdict.problem:
+            checks.append(
+                Check(OK, label, f"{verdict.path} (path only; capability checked at arm time)")
+            )
+            continue
+        where = f"{verdict.path}: " if verdict.path else ""
+        checks.append(
+            Check(
+                WARN,
+                label,
+                f"{where}{verdict.problem} — set {dep.env} or put {dep.command} on $PATH; "
+                f"needed only by `{needed_for}`",
+            )
+        )
+    return checks
+
+
+def _blocked_source_check(
+    label: str, exe: str, problem: str, group_id: int, group_state: str
+) -> Check:
+    """⚠️ for a ``blocked`` source whose group can still resume, with the remedy it allows.
+
+    A spawn failure blocks a source for good (restoring the file does not unblock it), and
+    ``ccc await -R`` accepts only a BLOCKED group — so an armed/grace group needs a re-arm.
+    """
+    state = f"path {problem}" if problem else "path usable now"
+    if group_state == "blocked":
+        remedy = (
+            f"restore the path, then `ccc await -R {group_id}`"
+            if problem
+            else f"`ccc await -R {group_id}` retries it"
+        )
+    else:
+        remedy = (
+            f"`-R` only works on a blocked group — `ccc await -d {group_id}` and re-arm "
+            "(new baseline)"
+        )
+    return Check(WARN, label, f"blocked; {exe or 'no pinned path'}: {state} — {remedy}")
+
+
+def _pinned_await_checks() -> list[Check]:  # pylint: disable=too-many-locals
+    """The CLI paths already pinned in still-probed ``ccc await`` sources.
+
+    Opens the store read-only (never ``Store()``, whose open runs DDL and migrations);
+    an absent DB or one without the await tables yields no rows. A source still probed
+    (``armed`` in an ``armed``/``grace`` group) with an unusable path is ❌ — it fails at
+    its next pass and changing the env var does not re-pin it. A ``blocked`` source in a
+    group that can still resume is ⚠️ with the remedy its group state allows.
+    """
+    import json  # pylint: disable=import-outside-toplevel
+    import sqlite3  # pylint: disable=import-outside-toplevel
+
+    from . import external_deps  # pylint: disable=import-outside-toplevel
+
+    path = config.db_path()
+    if not path.exists():
+        return []
+    kinds = tuple(external_deps.AWAIT_PROBE_DEPS)
+    marks = ", ".join("?" for _ in kinds)
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
+        try:
+            tables = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('await_groups', 'await_sources')"
+                )
+            }
+            if len(tables) < 2:
+                return []
+            rows = conn.execute(
+                "SELECT s.id, s.kind, s.spec, s.state, g.id, g.state, g.winner_source_id "
+                "FROM await_sources s JOIN await_groups g ON g.id = s.group_id "
+                f"WHERE s.kind IN ({marks}) ORDER BY g.id, s.id",
+                kinds,
+            ).fetchall()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as exc:
+        return [Check(WARN, "await sources", f"could not be checked — {exc}")]
+
+    checks: list[Check] = []
+    usable: set[str] = set()
+    problems: dict[str, str] = {}
+    for source_id, kind, spec_text, source_state, group_id, group_state, winner in rows:
+        probed = source_state == "armed" and group_state in ("armed", "grace")
+        resumable = source_state == "blocked" and (
+            group_state in ("armed", "grace") or (group_state == "blocked" and winner is None)
+        )
+        if not (probed or resumable):
+            continue
+        try:
+            spec = json.loads(spec_text)
+        except ValueError:
+            spec = None
+        exe = spec.get("exe") if isinstance(spec, dict) else None
+        key = exe if isinstance(exe, str) else ""
+        if key not in problems:
+            problems[key] = external_deps.pinned_path_problem(exe)
+        problem = problems[key]
+        env = external_deps.EXTERNAL_DEPS[external_deps.AWAIT_PROBE_DEPS[kind][0]].env
+        label = f"await group {group_id} source {source_id} ({kind})"
+        shown = f"{key} {problem}" if key else problem
+        if probed:
+            if problem:
+                checks.append(
+                    Check(
+                        FAIL,
+                        label,
+                        f"{shown} — restore that exact path (the source is pinned to it; "
+                        f"changing {env} does not re-pin) or `ccc await -d {group_id}` and "
+                        "re-arm",
+                    )
+                )
+            else:
+                usable.add(key)
+            continue
+        checks.append(_blocked_source_check(label, key, problem, group_id, group_state))
+    if usable and not any(c.status == FAIL for c in checks):
+        checks.insert(
+            0,
+            Check(
+                OK,
+                "armed await sources",
+                f"{len(usable)} pinned path(s) usable (path only)",
+            ),
+        )
+    return checks
 
 
 def build_report(cfg: config.Config | None = None) -> Report:
@@ -763,8 +920,12 @@ def render(report: Report) -> str:
             symbol = _SYMBOL.get(check.status, "?")
             suffix = f"  — {check.detail}" if check.detail else ""
             lines.append(f"  {symbol} {check.label}{suffix}")
-    verdict = "all good" if report.exit_code == 0 else "issues found (see ❌ above)"
-    lines.append(f"\n{'✅' if report.exit_code == 0 else '❌'} ccc doctor: {verdict}")
+    if report.exit_code:
+        lines.append("\n❌ ccc doctor: issues found (see ❌ above)")
+    elif report.warnings:
+        lines.append(f"\n⚠️ ccc doctor: {report.warnings} warning(s) (see ⚠️ above)")
+    else:
+        lines.append("\n✅ ccc doctor: all good")
     return "\n".join(lines).lstrip("\n")
 
 
