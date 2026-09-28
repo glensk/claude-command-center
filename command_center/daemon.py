@@ -70,6 +70,7 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
     agy_refreshed: bool = False  # routine Antigravity `/usage` fetch; excluded from is_empty()
     resume_spawned: bool = False  # spawned the resume-halted watcher; excluded from is_empty()
     limit_switched: list[str] = field(default_factory=list)  # sessions moved off a capped seat
+    awaited: list[int] = field(default_factory=list)  # `ccc await` groups fired this pass
     temps_swept: int = 0  # orphaned usage temp files reclaimed; excluded from is_empty()
     panel_restart: str = ""  # stale panel server asked to re-exec (tp#70 S5b); routine
 
@@ -82,6 +83,7 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
             or self.alerted
             or self.pruned
             or self.limit_switched
+            or self.awaited
             or self.scored
             or self.short_aimed
             or self.assessed
@@ -279,6 +281,11 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
         # Deliver parked prompts ATTACHED to existing sessions (fire_at on a
         # non-draft row): typed into the live tab, or a resume tab as fallback.
         _deliver_attached_prompts(store, cfg, report, dry_run, live)
+
+        # `ccc await` BACKSTOP: the same evaluation pass the 60 s poller runs, so a
+        # missing poller degrades to this cadence instead of to never. Isolated: an await
+        # failure must not cost the rest of the housekeeping pass.
+        _run_await_backstop(store, report, dry_run)
 
         # Auto-resume session-limit-halted sessions: spawn the watcher when work exists.
         _spawn_resume_watcher(cfg, report, dry_run)
@@ -627,6 +634,22 @@ def _deliver_attached_prompts(
         # tab; fire-attached consumes the lease via its one-shot claim.
         terminal.fire_attached_in_new_tab(job.session_id)
         notify("⏳ parked prompt resuming in a new tab", _label(job), cfg.notify)
+
+
+def _run_await_backstop(store: Store, report: DaemonReport, dry_run: bool) -> None:
+    """One ``await_eval.run_pass`` (dry: probes and delivers nothing); never raises."""
+    from . import await_eval  # pylint: disable=import-outside-toplevel  # module convention
+
+    try:
+        result = await_eval.run_pass(
+            store,
+            dry_run=dry_run,
+            notifier=None if dry_run else await_eval.config_notifier(),
+        )
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        print(f"ccc daemon: await pass failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return
+    report.awaited.extend(result.fired)
 
 
 def _run_limit_switch(

@@ -20,6 +20,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import sys
 
 from . import config
@@ -86,7 +87,9 @@ def status() -> int:
 
         loaded = launchd.is_loaded()
         print(f"launchd agent {launchd.label()}: {launchd.state_badge(loaded)}")
-        return 0 if loaded else 1
+        poller = launchd.await_poller_loaded()
+        print(f"launchd agent {launchd.await_poller_label()}: {launchd.state_badge(poller)}")
+        return 0 if loaded and poller else 1
     if _is_linux():
         from . import systemdunit
 
@@ -118,4 +121,30 @@ def is_active(cfg: config.Config | None = None) -> bool:
         from . import systemdunit
 
         return systemdunit.is_active(cfg)
+    return False
+
+
+def poller_installed(cfg: config.Config | None = None) -> bool:
+    """True when the ``ccc await`` poller agent/units are present (independent of the daemon)."""
+    if _is_macos():
+        from . import launchd
+
+        return launchd.await_poller_installed(cfg)
+    if _is_linux():
+        from . import systemdunit
+
+        return systemdunit.poller_installed(cfg)
+    return False
+
+
+def poller_active(cfg: config.Config | None = None) -> bool:
+    """True when the ``ccc await`` poller is loaded (launchd) / its timer is active (systemd)."""
+    if _is_macos():
+        from . import launchd
+
+        return launchd.await_poller_loaded(cfg)
+    if _is_linux():
+        from . import systemdunit
+
+        return systemdunit.poller_active(cfg)
     return False

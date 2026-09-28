@@ -48,6 +48,15 @@ def future_sync_label(cfg: config.Config | None = None) -> str:
     return f"{label(cfg)}-future-sync"
 
 
+#: The ``ccc await`` poller's cadence (seconds).
+AWAIT_POLLER_INTERVAL_SEC = 60
+
+
+def await_poller_label(cfg: config.Config | None = None) -> str:
+    """Base name of the ``ccc await`` poller timer/service (``<launchd_label>.await``)."""
+    return f"{label(cfg)}.await"
+
+
 def _ccc_path() -> str:
     return shutil.which("ccc") or str(Path.home() / ".local" / "bin" / "ccc")
 
@@ -58,6 +67,14 @@ def _service_path(cfg: config.Config | None = None) -> Path:
 
 def _timer_path(cfg: config.Config | None = None) -> Path:
     return _unit_dir() / f"{label(cfg)}.timer"
+
+
+def _poller_service_path(cfg: config.Config | None = None) -> Path:
+    return _unit_dir() / f"{await_poller_label(cfg)}.service"
+
+
+def _poller_timer_path(cfg: config.Config | None = None) -> Path:
+    return _unit_dir() / f"{await_poller_label(cfg)}.timer"
 
 
 def _fs_path_unit(cfg: config.Config | None = None) -> Path:
@@ -154,10 +171,34 @@ StandardError=append:{_literal_path(str(log_dir / "daemon.err"))}
 """
 
 
-def timer_content(interval_sec: int) -> str:
-    """Return the ``.timer`` unit firing the daemon service every *interval_sec* seconds."""
+def await_poller_service_content(ccc_path: str, log_path: str) -> str:
+    """Return the ``.service`` unit for one ``ccc await -r`` pass (``Type=oneshot``).
+
+    ``oneshot`` means a tick never overlaps the previous one: the timer's next
+    activation waits for this unit to finish. Guarded like the future-sync service.
+    """
+    env = "".join(
+        _environment_line(name, value)
+        for name in ("CCC_HOME", "CLAUDE_HOME")
+        if (value := os.environ.get(name))
+    )
     return f"""[Unit]
-Description=ccc command center daemon timer (every {interval_sec}s)
+Description=ccc await poller (one pass)
+
+[Service]
+Type=oneshot
+Environment=CCC_INTERNAL=1
+Environment=AI_NO_AUTOCOMMIT=1
+{env}ExecStart={_exec_word(ccc_path)} await -r
+StandardOutput=append:{_literal_path(log_path)}
+StandardError=append:{_literal_path(log_path)}
+"""
+
+
+def timer_content(interval_sec: int, what: str = "command center daemon") -> str:
+    """Return the ``.timer`` unit firing its service every *interval_sec* seconds."""
+    return f"""[Unit]
+Description=ccc {what} timer (every {interval_sec}s)
 
 [Timer]
 OnBootSec={interval_sec}
@@ -217,6 +258,19 @@ def is_installed(cfg: config.Config | None = None) -> bool:
     return _service_path(cfg).exists() and _timer_path(cfg).exists()
 
 
+def poller_installed(cfg: config.Config | None = None) -> bool:
+    """True if the await poller's timer + service unit files are present."""
+    return _poller_service_path(cfg).exists() and _poller_timer_path(cfg).exists()
+
+
+def poller_active(cfg: config.Config | None = None) -> bool:
+    """True if the await poller's ``.timer`` reports ``active``."""
+    if shutil.which("systemctl") is None:
+        return False
+    result = _systemctl("is-active", f"{await_poller_label(cfg)}.timer")
+    return result.stdout.strip() == "active"
+
+
 def is_active(cfg: config.Config | None = None) -> bool:
     """True if the daemon ``.timer`` reports ``active`` (scheduled) to ``systemctl --user``.
 
@@ -244,6 +298,10 @@ def install() -> int:
     try:
         units[_service_path(cfg)] = service_content(ccc, app)
         units[_timer_path(cfg)] = timer_content(cfg.daemon_interval_sec)
+        units[_poller_service_path(cfg)] = await_poller_service_content(
+            ccc, str(app / "await-poller.log")
+        )
+        units[_poller_timer_path(cfg)] = timer_content(AWAIT_POLLER_INTERVAL_SEC, "await poller")
         if vault_on:
             watch_path = Path(cfg.future_dir).expanduser().parent
             log_path = app / "future-sync.log"
@@ -264,6 +322,12 @@ def install() -> int:
         _systemctl("enable", "--now", f"{future_sync_label(cfg)}.path")
     print(f"installed and started systemd user units: {_timer_path(cfg)}")
     print(f"  runs `ccc daemon` every {cfg.daemon_interval_sec}s; logs in {app}")
+    result = _systemctl("enable", "--now", f"{await_poller_label(cfg)}.timer")
+    if result.returncode != 0:
+        print(f"the await poller timer failed to start:\n{result.stderr.strip()}")
+        print("  `ccc await` still works: the daemon's pass probes as a slower backstop")
+        return 1
+    print(f"  and `ccc await -r` every {AWAIT_POLLER_INTERVAL_SEC}s: {_poller_timer_path(cfg)}")
     return 0
 
 
@@ -272,10 +336,13 @@ def uninstall() -> int:
     cfg = config.load_config()
     _systemctl("disable", "--now", f"{label(cfg)}.timer")
     _systemctl("disable", "--now", f"{future_sync_label(cfg)}.path")
+    _systemctl("disable", "--now", f"{await_poller_label(cfg)}.timer")
     removed = False
     for path in (
         _timer_path(cfg),
         _service_path(cfg),
+        _poller_timer_path(cfg),
+        _poller_service_path(cfg),
         _fs_path_unit(cfg),
         _fs_service_unit(cfg),
     ):
@@ -295,4 +362,6 @@ def status() -> int:
         return 1
     result = _systemctl("status", f"{label(cfg)}.timer")
     print(result.stdout.strip() or result.stderr.strip())
+    poller = _systemctl("status", f"{await_poller_label(cfg)}.timer")
+    print(poller.stdout.strip() or poller.stderr.strip())
     return 0

@@ -64,6 +64,20 @@ def quota_probe_plist_path(cfg: config.Config | None = None) -> Path:
     return _plist_path(quota_probe_label(cfg))
 
 
+#: How often the ``ccc await`` poller runs ``ccc await -r`` (an idle tick costs one query).
+AWAIT_POLLER_INTERVAL_SEC = 60
+
+
+def await_poller_label(cfg: config.Config | None = None) -> str:
+    """Label for the ``ccc await`` poller agent: ``<launchd_label>.await``."""
+    return f"{label(cfg)}.await"
+
+
+def await_poller_plist_path(cfg: config.Config | None = None) -> Path:
+    """Where the poller agent's plist lives; its presence is what "installed" means."""
+    return _plist_path(await_poller_label(cfg))
+
+
 def state_badge(running: bool) -> str:
     """The shared ``✅ (running)`` / ``❌ (not running)`` badge for a process state."""
     return RUNNING_BADGE if running else NOT_RUNNING_BADGE
@@ -233,6 +247,53 @@ def quota_probe_plist(cfg: config.Config | None = None) -> str:
     )
 
 
+def await_poller_plist_content(ccc_path: str, agent_label: str, log_path: str) -> str:
+    """Return the launchd plist XML for the 60 s ``ccc await -r`` poller agent.
+
+    ``RunAtLoad`` is false (loading must not probe anything); an idle tick — no active
+    await group — returns after one indexed query. Guarded like the other helper agents
+    (no auto-commit, no recursion into ccc's hooks). The daemon's 300 s pass is the
+    backstop when this agent is missing.
+    """
+    return _dump(
+        {
+            "Label": agent_label,
+            "ProgramArguments": [ccc_path, "await", "-r"],
+            "EnvironmentVariables": _agent_env(_GUARD_ENV),
+            "StartInterval": AWAIT_POLLER_INTERVAL_SEC,
+            "RunAtLoad": False,
+            "StandardOutPath": log_path,
+            "StandardErrorPath": log_path,
+        }
+    )
+
+
+def await_poller_plist(cfg: config.Config | None = None) -> str:
+    """Generate the await-poller agent plist from config (label, log, binary)."""
+    cfg = cfg or config.load_config()
+    return await_poller_plist_content(
+        _ccc_path(), await_poller_label(cfg), str(config.app_home() / "await-poller.log")
+    )
+
+
+def await_poller_installed(cfg: config.Config | None = None) -> bool:
+    """True if the poller agent's plist is present."""
+    return await_poller_plist_path(cfg).exists()
+
+
+def await_poller_loaded(cfg: config.Config | None = None) -> bool:
+    """True if the poller agent is loaded (``launchctl list <label>`` exits 0)."""
+    if shutil.which("launchctl") is None:
+        return False
+    result = subprocess.run(
+        ["launchctl", "list", await_poller_label(cfg)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
 def _write_and_load(path: Path, content: str) -> subprocess.CompletedProcess[str]:
     """Write *path* and (re)load it with ``launchctl``; the ``load`` result."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -262,12 +323,20 @@ def install() -> int:
         return 1
     print(f"installed and loaded launchd agent: {probe_path}")
     print(f"  runs `ccc quota -P` every {QUOTA_PROBE_INTERVAL_SEC}s (not at load)")
+    poller_path = await_poller_plist_path(cfg)
+    result = _write_and_load(poller_path, await_poller_plist(cfg))
+    if result.returncode != 0:
+        print(f"wrote {poller_path} but `launchctl load` failed:\n{result.stderr.strip()}")
+        print("  `ccc await` still works: the daemon's pass probes as a slower backstop")
+        return 1
+    print(f"installed and loaded launchd agent: {poller_path}")
+    print(f"  runs `ccc await -r` every {AWAIT_POLLER_INTERVAL_SEC}s (idle unless armed)")
     return 0
 
 
 def uninstall() -> int:
     removed = False
-    for path in (_plist_path(), quota_probe_plist_path()):
+    for path in (_plist_path(), quota_probe_plist_path(), await_poller_plist_path()):
         if path.exists():
             subprocess.run(["launchctl", "unload", str(path)], capture_output=True, check=False)
             path.unlink()

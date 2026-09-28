@@ -26,6 +26,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import shutil
 import subprocess
 import sys
@@ -380,6 +381,7 @@ def _section_daemon() -> Section:
                 Check(FAIL, "launchd agent", "not installed — ccc daemon --install")
             )
         section.checks.append(_panel_server_check())
+        section.checks.append(_await_poller_check())
         return section
     if sys.platform.startswith("linux"):
         from . import systemdunit  # pylint: disable=import-outside-toplevel
@@ -396,9 +398,29 @@ def _section_daemon() -> Section:
             section.checks.append(
                 Check(FAIL, "systemd --user timer", "not installed — ccc daemon --install")
             )
+        section.checks.append(_await_poller_check())
         return section
     section.checks.append(Check(NA, "daemon service", "no launchd/systemd on this platform"))
     return section
+
+
+def _await_poller_check() -> Check:
+    """The ``ccc await`` poller (60 s), checked independently of the daemon it ships with.
+
+    Missing = FAIL with the fix; ``ccc await`` then still works through the daemon's
+    slower pass, which the detail says so the row is not read as "await is broken".
+    """
+    from . import service  # pylint: disable=import-outside-toplevel
+
+    if service.poller_active():
+        return Check(OK, "await poller", "`ccc await -r` every 60 s")
+    if service.poller_installed():
+        return Check(FAIL, "await poller", "installed but not loaded/active")
+    return Check(
+        FAIL,
+        "await poller",
+        "not installed — ccc daemon --install (until then the daemon pass is the backstop)",
+    )
 
 
 def _panel_server_check() -> Check:
