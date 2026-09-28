@@ -4,11 +4,11 @@ desktop/Slack notification, whatever path produced it."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 import pytest
+from awaitstub import seeded_store, zoho_result
 
 from command_center import await_delivery, await_eval, config
 from command_center.await_eval import PassReport
@@ -34,30 +34,12 @@ class Notes:
             assert "req@" not in message
 
 
-def _fired_result() -> StructuredResult:
-    return StructuredResult(
-        exit=0,
-        stdout=json.dumps(
-            {
-                "schema_version": 1,
-                "ticket": "209",
-                "newest_inbound": {
-                    "id": "9",
-                    "time": "2027-01-15T08:00:00.000Z",
-                    "from": f"req@{SECRET}.org",
-                    "summary": SECRET,
-                },
-                "watermark": "2:9",
-                "fired": True,
-            }
-        ),
-    )
-
-
 def _store(tmp_path: Path) -> Store:
-    store = Store(tmp_path / "state.db")
-    store.ensure("s1", cwd=str(tmp_path))
-    return store
+    return seeded_store(tmp_path, cwd=str(tmp_path))
+
+
+def _fired_result() -> StructuredResult:
+    return zoho_result(fired=True, sender=f"req@{SECRET}.org", summary=SECRET)
 
 
 def _arm(store: Store, until: int = NOW + 3600) -> int:

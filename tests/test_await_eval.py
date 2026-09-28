@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from awaitstub import seeded_store as _store
+from awaitstub import zoho_result
 
 from command_center import await_eval
 from command_center.await_store import GRACE_SEC, SourceSpec
@@ -25,21 +27,6 @@ NOW = 1_800_000_000
 DUE = NOW + 120
 ZOHO = "/bin/zoho-api.py"
 SLACK = "/bin/slack_api.py"
-
-
-def _zoho(fired: bool, when: str = "2027-01-15T08:00:00.000Z") -> StructuredResult:
-    return StructuredResult(
-        exit=0,
-        stdout=json.dumps(
-            {
-                "schema_version": 1,
-                "ticket": "209",
-                "newest_inbound": {"id": "9", "time": when, "from": "r@x.org", "summary": "yes"},
-                "watermark": "2:9",
-                "fired": fired,
-            }
-        ),
-    )
 
 
 class Runner:
@@ -63,12 +50,6 @@ class Notes:
 
     def __call__(self, _title: str, message: str) -> None:
         self.messages.append(message)
-
-
-def _store(tmp_path: Path) -> Store:
-    store = Store(tmp_path / "state.db")
-    store.ensure("s1", cwd="/repo")
-    return store
 
 
 def _arm(store: Store, *specs: SourceSpec, session_id: str = "s1", until: int = NOW + 3600) -> int:
@@ -105,7 +86,7 @@ def test_idle_pass_touches_nothing(tmp_path: Path) -> None:
 def test_not_due_is_not_probed(tmp_path: Path) -> None:
     store = _store(tmp_path)
     _arm(store, ZSRC)
-    runner = Runner({ZOHO: _zoho(False)})
+    runner = Runner({ZOHO: zoho_result(fired=False)})
     report = _pass(store, runner, now=NOW + 10)
     assert not runner.calls and not report.probed
 
@@ -113,7 +94,7 @@ def test_not_due_is_not_probed(tmp_path: Path) -> None:
 def test_not_fired_advances_watermark_and_reschedules(tmp_path: Path) -> None:
     store = _store(tmp_path)
     gid = _arm(store, ZSRC)
-    report = _pass(store, Runner({ZOHO: _zoho(False)}))
+    report = _pass(store, Runner({ZOHO: zoho_result(fired=False)}))
     [src] = store.await_sources_of(gid)
     assert report.not_fired == [src.id]
     assert (src.watermark, src.next_check_at, src.lease_token) == ("2:9", DUE + 120, "")
@@ -123,7 +104,7 @@ def test_first_fired_source_wins_and_disarms_the_sibling(tmp_path: Path) -> None
     store = _store(tmp_path)
     gid = _arm(store, ZSRC, SSRC)
     slack_quiet = StructuredResult(exit=0, stdout='{"channel":"D1","messages":[]}')
-    report = _pass(store, Runner({ZOHO: _zoho(True), SLACK: slack_quiet}))
+    report = _pass(store, Runner({ZOHO: zoho_result(fired=True), SLACK: slack_quiet}))
     group = store.get_await_group(gid)
     assert group is not None
     assert report.fired == [gid]
@@ -143,7 +124,7 @@ def test_both_fire_in_one_pass_only_one_wins(tmp_path: Path) -> None:
             {"channel": "D1", "messages": [{"ts": "9.0", "user": "U1AB", "text": "hi"}]}
         ),
     )
-    report = _pass(store, Runner({ZOHO: _zoho(True), SLACK: slack_hit}))
+    report = _pass(store, Runner({ZOHO: zoho_result(fired=True), SLACK: slack_hit}))
     assert report.fired == [gid]
     assert sorted(s.state for s in store.await_sources_of(gid)) == ["disarmed", "done"]
 
@@ -159,7 +140,7 @@ def test_transient_backs_off_and_keeps_watermark(tmp_path: Path) -> None:
     [src] = store.await_sources_of(gid)
     assert (src.fail_count, src.next_check_at) == (2, DUE + 240 + 480)
     # A clean probe resets the count.
-    _pass(store, Runner({ZOHO: _zoho(False)}), now=DUE + 720)
+    _pass(store, Runner({ZOHO: zoho_result(fired=False)}), now=DUE + 720)
     [src] = store.await_sources_of(gid)
     assert src.fail_count == 0
 
@@ -199,7 +180,7 @@ def test_retry_after_block_catches_what_arrived_during_the_outage(tmp_path: Path
     gid = _arm(store, ZSRC)
     _pass(store, Runner({ZOHO: StructuredResult(exit=4)}))
     assert store.retry_group(gid, DUE + 10) == "armed"
-    runner = Runner({ZOHO: _zoho(True)})
+    runner = Runner({ZOHO: zoho_result(fired=True)})
     _pass(store, runner, now=DUE + 10)
     assert runner.calls[0] == [ZOHO, "-i", "209", "1:a"]  # the ORIGINAL watermark
     assert store.get_await_group(gid).state == "fired"  # type: ignore[union-attr]
@@ -209,7 +190,7 @@ def test_grace_accepts_an_event_from_before_the_deadline_only(tmp_path: Path) ->
     store = _store(tmp_path)
     until = 1_800_003_600
     gid = _arm(store, ZSRC, until=until)
-    late = _zoho(True, when="2027-01-15T12:00:00.000Z")  # epoch > until
+    late = zoho_result(fired=True, when="2027-01-15T12:00:00.000Z")  # epoch > until
     report = _pass(store, Runner({ZOHO: late}), now=until + 10)
     assert store.get_await_group(gid).state == "grace"  # type: ignore[union-attr]
     [src] = store.await_sources_of(gid)
@@ -221,7 +202,7 @@ def test_grace_fire_with_a_timestamp_before_until(tmp_path: Path) -> None:
     store = _store(tmp_path)
     until = 1_800_003_600  # 2027-01-15T09:00:00Z
     gid = _arm(store, ZSRC, until=until)
-    before = _zoho(True, when="2027-01-15T08:59:00.000Z")
+    before = zoho_result(fired=True, when="2027-01-15T08:59:00.000Z")
     report = _pass(store, Runner({ZOHO: before}), now=until + 500)
     assert report.fired == [gid]
 
@@ -231,7 +212,7 @@ def test_expiry_notifies_once_and_never_resumes(tmp_path: Path) -> None:
     gid = _arm(store, ZSRC, until=NOW + 60)
     notes = Notes()
     calls: list[Any] = []
-    runner = Runner({ZOHO: _zoho(False)})
+    runner = Runner({ZOHO: zoho_result(fired=False)})
     report = await_eval.run_pass(
         store,
         now=NOW + 60 + GRACE_SEC,
@@ -252,7 +233,7 @@ def test_done_session_disarms_its_group(tmp_path: Path) -> None:
     gid = _arm(store, ZSRC)
     store.update_fields("s1", done=True)
     notes = Notes()
-    runner = Runner({ZOHO: _zoho(True)})
+    runner = Runner({ZOHO: zoho_result(fired=True)})
     report = _pass(store, runner, notifier=notes)
     assert report.disarmed == [gid]
     assert not runner.calls
@@ -264,7 +245,7 @@ def test_cap_of_ten_sources_per_pass(tmp_path: Path) -> None:
     for i in range(13):
         store.ensure(f"x{i}")
         _arm(store, ZSRC, session_id=f"x{i}")
-    runner = Runner({ZOHO: _zoho(False)})
+    runner = Runner({ZOHO: zoho_result(fired=False)})
     assert len(_pass(store, runner).probed) == 10
     assert len(_pass(store, runner).probed) == 3
 
@@ -275,11 +256,11 @@ def test_deadline_releases_unstarted_leases(tmp_path: Path) -> None:
         store.ensure(f"x{i}")
         _arm(store, ZSRC, session_id=f"x{i}")
     ticks = iter([0.0] + [0.0] * 4 + [100.0] * 100)  # the deadline passes after 4 starts
-    report = _pass(store, Runner({ZOHO: _zoho(False)}), clock=lambda: next(ticks))
+    report = _pass(store, Runner({ZOHO: zoho_result(fired=False)}), clock=lambda: next(ticks))
     assert len(report.probed) == 4
     assert len(report.released) == 4
     # Released leases are due again immediately.
-    assert len(_pass(store, Runner({ZOHO: _zoho(False)})).probed) == 4
+    assert len(_pass(store, Runner({ZOHO: zoho_result(fired=False)})).probed) == 4
 
 
 def test_probe_crash_is_transient(tmp_path: Path) -> None:
@@ -297,7 +278,7 @@ def test_probe_crash_is_transient(tmp_path: Path) -> None:
 def test_dry_run_probes_nothing(tmp_path: Path) -> None:
     store = _store(tmp_path)
     gid = _arm(store, ZSRC)
-    runner = Runner({ZOHO: _zoho(True)})
+    runner = Runner({ZOHO: zoho_result(fired=True)})
     report = await_eval.run_pass(store, now=DUE, runner=runner, dry_run=True)
     assert report.would_probe == [store.await_sources_of(gid)[0].id]
     assert not runner.calls
@@ -312,7 +293,9 @@ def test_delivery_runs_after_probes(tmp_path: Path) -> None:
     def delivery(st: Store, **_k: Any) -> None:
         seen.append(st.await_groups_in("fired")[0].state)
 
-    await_eval.run_pass(store, now=DUE, runner=Runner({ZOHO: _zoho(True)}), delivery=delivery)
+    await_eval.run_pass(
+        store, now=DUE, runner=Runner({ZOHO: zoho_result(fired=True)}), delivery=delivery
+    )
     assert seen == ["fired"]
 
 
@@ -322,7 +305,7 @@ def test_crash_between_lease_and_publish_reprobes_after_the_lease(tmp_path: Path
     gid = _arm(store, ZSRC)
     leased = store.lease_due_sources(DUE)  # a pass leased … and died before recording
     assert leased
-    runner = Runner({ZOHO: _zoho(True)})
+    runner = Runner({ZOHO: zoho_result(fired=True)})
     assert not _pass(store, runner, now=DUE + 10).probed  # still leased
     report = _pass(store, runner, now=DUE + 46)  # lease expired
     assert report.fired == [gid]
@@ -331,7 +314,9 @@ def test_crash_between_lease_and_publish_reprobes_after_the_lease(tmp_path: Path
 def test_crash_between_publish_and_delivery_delivers_next_pass(tmp_path: Path) -> None:
     store = _store(tmp_path)
     gid = _arm(store, ZSRC)
-    _pass(store, Runner({ZOHO: _zoho(True)}))  # fired; deliver=False = "crashed" before it
+    _pass(
+        store, Runner({ZOHO: zoho_result(fired=True)})
+    )  # fired; deliver=False = "crashed" before it
     seen: list[int] = []
     await_eval.run_pass(
         store,
@@ -348,7 +333,7 @@ def test_crash_after_the_delivery_cas_is_reclaimed_when_stale(tmp_path: Path, st
 
     store = _store(tmp_path)
     gid = _arm(store, ZSRC)
-    _pass(store, Runner({ZOHO: _zoho(True)}))
+    _pass(store, Runner({ZOHO: zoho_result(fired=True)}))
     group = store.get_await_group(gid)
     assert group is not None and store.mark_delivering(gid, group.delivery_token, DUE)
     later = DUE + (await_delivery.STALE_DELIVERY_SEC if stale else 60)

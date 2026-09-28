@@ -13,18 +13,13 @@ import threading
 from pathlib import Path
 
 import pytest
+from awaitstub import seeded_store as _store
 
 from command_center import store as store_mod
 from command_center.await_store import GRACE_SEC, AwaitConflict, SourceSpec
 from command_center.store import Store
 
 NOW = 1_800_000_000
-
-
-def _store(tmp_path: Path) -> Store:
-    store = Store(tmp_path / "state.db")
-    store.ensure("s1", cwd="/repo")
-    return store
 
 
 def _arm(store: Store, session_id: str = "s1", *, kinds: tuple[str, ...] = ("zoho-reply",)) -> int:
