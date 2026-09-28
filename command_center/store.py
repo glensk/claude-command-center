@@ -32,6 +32,7 @@ from typing import Any
 
 from . import config
 from .aimscore import score_aim_lexical
+from .await_store import AWAIT_SCHEMA, AwaitStoreMixin
 from .models import (
     DEFAULT_LLM,
     JOB_TYPES,
@@ -450,7 +451,7 @@ _WAL_RETRY_SLEEP = 0.03
 _LIMIT_SWITCH_TERMINAL: tuple[str, ...] = ("started", "failed", "refused", "abandoned")
 
 
-class Store:  # pylint: disable=too-many-public-methods
+class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
     """Thin wrapper over the SQLite database."""
 
     def __init__(self, path: Path | None = None, *, check_same_thread: bool = True) -> None:
@@ -463,7 +464,7 @@ class Store:  # pylint: disable=too-many-public-methods
         self.conn.execute("PRAGMA busy_timeout=3000")
         self._enable_wal()
         self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.executescript(_SCHEMA)
+        self.conn.executescript(_SCHEMA + AWAIT_SCHEMA)
         self.conn.commit()
         self._ensure_columns()
 
