@@ -45,6 +45,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 # pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -2382,7 +2383,29 @@ def cmd_prune(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_resume(args: argparse.Namespace) -> int:  # pylint: disable=inconsistent-return-statements  # ends in os.execvp
+def _exec_in(cwd: str, argv: list[str], *, strict: bool = False) -> None:
+    """``os.execvp(argv)`` from inside *cwd*, leaving this process's cwd untouched if it returns.
+
+    The ``chdir`` happens immediately before the exec and is undone when the exec raises
+    (or, in tests, is mocked and returns), so an in-process caller whose launch does not
+    happen is never left in the session's directory (tp#689). A missing or non-directory
+    *cwd* is skipped, unless *strict*: then the ``chdir`` itself raises ``OSError``.
+    """
+    try:
+        prev: str | None = os.getcwd()
+    except OSError:  # our own cwd was deleted: nothing to restore
+        prev = None
+    if strict or (cwd and os.path.isdir(cwd)):
+        os.chdir(cwd)
+    try:
+        os.execvp(argv[0], argv)  # replaces this process on success
+    finally:
+        if prev is not None:
+            with contextlib.suppress(OSError):
+                os.chdir(prev)
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
     """Resume a session in the current terminal (replaces this process).
 
     Fails closed on the multi-account billing risk (D8/R1): pins the session's own
@@ -2417,12 +2440,11 @@ def cmd_resume(args: argparse.Namespace) -> int:  # pylint: disable=inconsistent
             file=sys.stderr,
         )
         return 1
-    if cwd and os.path.isdir(cwd):
-        os.chdir(cwd)
     # Pin the session's account AND its own env flags (CCC_NO_CODEX) into os.environ,
     # then exec (D8) — os.execvp inherits the mutated environment.
     accounts.session_apply_to_environ(accounts.LaunchTarget(config_dir, no_codex))
-    os.execvp("claude", ["claude", "--resume", args.session_id])  # replaces this process
+    _exec_in(cwd, ["claude", "--resume", args.session_id])  # replaces this process
+    return 0  # unreachable on success (execvp replaced the process)
 
 
 def _account_config_dir(label: str | None) -> tuple[str, str | None]:
@@ -2487,11 +2509,9 @@ def cmd_fire_attached(args: argparse.Namespace) -> int:
         prompt = (session.prompt or "").strip()
         cwd = session.cwd
         launch = accounts.LaunchTarget(session.config_dir, bool(session.no_codex))
-    if cwd and os.path.isdir(cwd):
-        os.chdir(cwd)
     accounts.session_apply_to_environ(launch)
     try:
-        os.execvp("claude", ["claude", "--resume", args.session_id, prompt])
+        _exec_in(cwd, ["claude", "--resume", args.session_id, prompt])
     except OSError as exc:
         with Store() as store:  # undo the claim: re-arm so the daemon retries
             store.update_fields(args.session_id, fire_at=int(_time.time()) + 900)
@@ -2550,9 +2570,8 @@ def cmd_fire_await(args: argparse.Namespace) -> int:
             return 1
         prompt = compose_prompt(group.prompt_template, group.event_payload)
     try:
-        os.chdir(group.cwd)
         accounts.pin_environ(group.config_dir, group.no_codex)
-        os.execvp("claude", ["claude", "--resume", group.session_id, prompt])
+        _exec_in(group.cwd, ["claude", "--resume", group.session_id, prompt], strict=True)
     except OSError as exc:
         with Store() as store:
             store.revert_delivery(
@@ -3118,8 +3137,6 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
             return 1
         if had_file:  # (c) file leaves the live scan with a terminal status
             futuresync.archive_file(store, cfg, session, "launched")
-    if cwd and os.path.isdir(cwd):
-        os.chdir(cwd)
     if resume:
         # The original prompt was already submitted; a bare resume continues it (NO prompt
         # argument). --model + --resume is accepted by the CLI (smoke-checked). No delegation
@@ -3163,7 +3180,7 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
     # -N/--no-codex job). os.execvp inherits the mutated environment.
     accounts.session_apply_to_environ(accounts.LaunchTarget(config_dir, no_codex))
     try:
-        os.execvp("claude", argv)  # replaces this process on success
+        _exec_in(cwd, argv)  # replaces this process on success
     except OSError as exc:  # (d) launch failed — undo the promotion so the job survives
         with Store() as store:
             store.update_fields(args.session_id, draft=True)

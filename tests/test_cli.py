@@ -2161,3 +2161,57 @@ def test_new_job_offers_and_defaults_to_opus_never_fable() -> None:
     assert "fable-5" not in models.LLM_CHOICES
     assert "fable-5" not in models.LLM_MODEL_IDS
     assert "fable-5" not in models.LLM_AGENT_ALIAS
+
+
+def test_exec_in_restores_cwd_when_the_exec_does_not_happen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#689: the chdir into the session's cwd must not outlive a launch that failed."""
+    target = tmp_path / "session-cwd"
+    target.mkdir()
+    before = Path.cwd()
+    seen: list[Path] = []
+
+    def boom(_file: str, _argv: list[str]) -> None:
+        seen.append(Path.cwd())
+        raise OSError("no claude on PATH")
+
+    monkeypatch.setattr("command_center.cli.os.execvp", boom)
+    with pytest.raises(OSError, match="no claude"):
+        cli._exec_in(str(target), ["claude"])
+    assert seen == [target.resolve()]  # the exec itself ran from the session's cwd
+    assert Path.cwd() == before
+    # A mocked exec that RETURNS (what the command tests do) restores it too.
+    monkeypatch.setattr("command_center.cli.os.execvp", lambda _f, _a: None)
+    cli._exec_in(str(target), ["claude"])
+    assert Path.cwd() == before
+    # strict (fire-await): a missing cwd raises instead of launching from the wrong dir.
+    with pytest.raises(OSError):
+        cli._exec_in(str(tmp_path / "gone"), ["claude"], strict=True)
+    assert Path.cwd() == before
+
+
+def test_start_job_failed_exec_leaves_caller_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#689: an in-process ``cmd_start_job`` whose exec fails keeps the caller's cwd."""
+    from command_center.cli import cmd_start_job
+
+    job_cwd = tmp_path / "job-cwd"
+    job_cwd.mkdir()
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("CCC_INTERNAL", "1")
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft("job-y", str(job_cwd), "Do the thing", prompt="run it")
+    store.close()
+    before = Path.cwd()
+    seen: list[Path] = []
+
+    def boom(_file: str, _argv: list[str]) -> None:
+        seen.append(Path.cwd())
+        raise OSError("no claude on PATH")
+
+    monkeypatch.setattr("command_center.cli.os.execvp", boom)
+    assert cmd_start_job(argparse.Namespace(session_id="job-y")) == 1
+    assert seen == [job_cwd.resolve()]
+    assert Path.cwd() == before
