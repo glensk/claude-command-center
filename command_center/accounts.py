@@ -174,7 +174,9 @@ def _claude_json_path(config_dir: str | Path) -> Path:
     a sibling of ``~/.claude/``, NOT inside it — while any other account's file is
     ``<config_dir>/.claude.json``.
     """
-    if _resolve(config_dir) == default_config_dir():
+    # An empty *config_dir* (an unstamped row) IS the default account — never
+    # ``_resolve("")``, which is the process cwd (the same rule ensure_trusted applies).
+    if not config_dir or _resolve(config_dir) == default_config_dir():
         return Path.home() / ".claude.json"
     return _resolve(config_dir) / ".claude.json"
 

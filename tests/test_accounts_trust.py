@@ -76,3 +76,19 @@ def test_empty_config_dir_trusts_the_default_account(
     data = json.loads(cfg.read_text(encoding="utf-8"))
     assert data["projects"][str(repo.resolve())] == {"hasTrustDialogAccepted": True}
     assert json.loads(stray.read_text(encoding="utf-8")) == {"projects": {}}
+
+
+def test_is_trusted_reads_the_default_account_for_an_empty_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # "" is the default account for BOTH halves: is_trusted used to resolve "" to the
+    # process cwd and read <cwd>/.claude.json, so ensure_trusted("") + is_trusted("")
+    # disagreed wherever the cwd was not $HOME.
+    home = Path.home()
+    monkeypatch.setenv("CLAUDE_HOME", str(home / ".claude"))
+    _write(home / ".claude.json", {"projects": {}})
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert accounts.ensure_trusted("", str(tmp_path)) is True
+    assert accounts.is_trusted("", str(tmp_path)) is True
