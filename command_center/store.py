@@ -6,6 +6,7 @@ concurrently. User-authored fields (aim, next_step, blocked_on, deadline, …)
 are never clobbered by the automatic reconcile from the live registry.
 """
 
+# pylint: disable=too-many-lines  # one cohesive store: schema, migrations, every transition
 from __future__ import annotations
 
 if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
@@ -18,6 +19,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position  # the direct-run shim comes first
 import dataclasses
 import json
 import re
@@ -702,18 +704,18 @@ class Store:  # pylint: disable=too-many-public-methods
         columns = _session_columns(rows[0])
         return [_row_to_session(r, columns) for r in rows]
 
-    def _tab_uuid_candidates(self, uuid: str) -> list[Session]:
-        """Rows whose ``iterm_session_id`` CONTAINS *uuid* — a superset of the tab owners.
+    def _tab_uuid_candidates(self, tab_uuid: str) -> list[Session]:
+        """Rows whose ``iterm_session_id`` CONTAINS *tab_uuid* — a superset of the tab owners.
 
         :meth:`session_for_tab_uuid` used to materialise the WHOLE store (every row plus
         the correlated ``aim_history`` sub-queries of :data:`_SESSION_SELECT`) and compare
         in Python — 44–128 ms on a real store, half the peek chord's latency budget
         (tp#70 S1). The SQL ``LIKE`` is unanchored and ASCII-case-insensitive, so it only
         removes rows that can never match; the caller still applies the exact tail
-        comparison. ``%`` / ``_`` / ``\\`` in *uuid* are escaped so they cannot widen it.
+        comparison. ``%`` / ``_`` / ``\\`` in *tab_uuid* are escaped so they cannot widen it.
         Archived rows are included, as the caller requires.
         """
-        pattern = "%" + uuid.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        pattern = "%" + tab_uuid.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         rows = self.conn.execute(
             _SESSION_SELECT + " WHERE s.iterm_session_id LIKE ? ESCAPE '\\'", (pattern,)
         ).fetchall()
@@ -722,8 +724,8 @@ class Store:  # pylint: disable=too-many-public-methods
         columns = _session_columns(rows[0])
         return [_row_to_session(r, columns) for r in rows]
 
-    def session_for_tab_uuid(self, uuid: str) -> Session | None:
-        """The session that currently owns the iTerm tab whose UUID is *uuid*, or None.
+    def session_for_tab_uuid(self, tab_uuid: str) -> Session | None:
+        """The session that currently owns the iTerm tab whose UUID is *tab_uuid*, or None.
 
         A tab outlives its sessions: a relaunch in the same tab (a resume, an
         account switch, a driver starting the next run after the previous one hit its
@@ -735,7 +737,7 @@ class Store:  # pylint: disable=too-many-public-methods
         UUID tail (``w0t1p0:UUID`` → ``UUID``); archived rows are included so a tab
         whose only owner is archived still resolves.
         """
-        want = uuid.split(":")[-1].strip().upper()
+        want = tab_uuid.split(":")[-1].strip().upper()
         if not want:
             return None
         matches = [
