@@ -195,7 +195,8 @@ def _handle(  # pylint: disable=too-many-arguments
             notifier(
                 "ccc await",
                 f"await group {group.id}: source {src.id} ({src.kind}) blocked — "
-                f"`ccc await -l` shows why, `ccc await -R {group.id}` retries",
+                f"`ccc await -l` shows why; the group keeps waiting on its other sources "
+                f"(`ccc await -R {group.id}` re-arms it only once the whole group is blocked)",
             )
     if store.viable_source_count(group.id) == 0 and store.block_group(
         group.id, "no viable source left", now, from_states=POLLING_GROUP_STATES

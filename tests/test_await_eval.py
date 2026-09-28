@@ -159,6 +159,9 @@ def test_permanent_blocks_the_source_not_the_group(tmp_path: Path) -> None:
     assert store.get_await_group(gid).state == "armed"  # type: ignore[union-attr]
     assert len(notes.messages) == 1 and "blocked" in notes.messages[0]
     assert "r@x.org" not in notes.messages[0]  # content-free
+    # tp#686: -R refuses a group that is still armed, so the notice must not promise it.
+    assert "once the whole group is blocked" in notes.messages[0]
+    assert store.retry_group(gid, DUE) == ""
 
 
 def test_last_viable_source_blocking_blocks_the_group_once(tmp_path: Path) -> None:
