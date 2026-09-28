@@ -567,6 +567,23 @@ def session_launch_env_prefix(session: SessionLaunch) -> str:
     return prefix + exports
 
 
+def pin_environ(config_dir: str, no_codex: bool) -> None:
+    """Pin an account + the session flags into ``os.environ`` WITHOUT granting trust.
+
+    The :func:`session_apply_to_environ` rendering for AUTOMATIC recovery surfaces
+    (``ccc fire-await``): the same billing pin and ``CCC_NO_CODEX``, but no
+    :func:`ensure_trusted` — automation only ever CHECKS trust (``is_trusted``); a
+    machine decision must not grant a seat execution rights in a folder no human
+    approved for it.
+    """
+    os.environ.pop(_SECURE_VAR, None)
+    if is_default_config_dir(config_dir):
+        os.environ.pop(_CONFIG_VAR, None)
+    else:
+        os.environ[_CONFIG_VAR] = _export_value(config_dir)
+    os.environ.update(session_env_flags(LaunchTarget(config_dir, no_codex)))
+
+
 def relaunch_command(session: SessionLaunch, session_id: str, cwd: str, prompt: str = "") -> str:
     """The ONE-LINE shell command that relaunches *session_id* under *session*'s account.
 

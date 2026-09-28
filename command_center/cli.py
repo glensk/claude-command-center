@@ -2490,6 +2490,73 @@ def cmd_fire_attached(args: argparse.Namespace) -> int:
     return 0  # unreachable on success (execvp replaced the process)
 
 
+def cmd_fire_await(args: argparse.Namespace) -> int:
+    """internal: resume a FIRED ``ccc await`` group's session with its event.
+
+    Runs in the tab ``await_delivery`` opened for a CLOSED session. The outbox row must
+    be ``delivering`` under *token*; the claim ``delivering → delivered`` happens BEFORE
+    the exec (at-most-once), so a second tab for the same token refuses. The account
+    is pinned with ``accounts.pin_environ`` — trust is only CHECKED (it was granted at
+    arm time), never granted here. A failed exec (or no terminal) hands the row back
+    (``fired`` for a bounded number of retries, then ``blocked``).
+    """
+    import time as _time
+
+    from . import accounts, await_delivery
+    from .await_prompt import compose_prompt
+
+    now = int(_time.time())
+    with Store() as store:
+        group = store.get_await_group(args.group_id)
+        if group is None or group.state != "delivering" or group.delivery_token != args.token:
+            print(
+                f"error: await group {args.group_id} is not awaiting this delivery", file=sys.stderr
+            )
+            return 1
+        if not has_terminal():
+            store.revert_delivery(
+                group.id,
+                args.token,
+                now,
+                max_attempts=await_delivery.MAX_ATTEMPTS,
+                reason="fire-await ran without a terminal",
+            )
+            print(
+                "error: fire-await needs a terminal (it execs an interactive claude)",
+                file=sys.stderr,
+            )
+            return 1
+        if not accounts.is_trusted(group.config_dir, group.cwd):
+            store.revert_delivery(
+                group.id, args.token, now, max_attempts=1, reason="cwd no longer trusted"
+            )
+            print(f"error: {group.cwd} is not trusted for the session's account", file=sys.stderr)
+            return 1
+        if not store.mark_delivered(group.id, args.token, now):
+            print(
+                f"error: await group {args.group_id} was claimed by another launcher",
+                file=sys.stderr,
+            )
+            return 1
+        prompt = compose_prompt(group.prompt_template, group.event_payload)
+    try:
+        os.chdir(group.cwd)
+        accounts.pin_environ(group.config_dir, group.no_codex)
+        os.execvp("claude", ["claude", "--resume", group.session_id, prompt])
+    except OSError as exc:
+        with Store() as store:
+            store.revert_delivery(
+                group.id,
+                args.token,
+                int(_time.time()),
+                max_attempts=await_delivery.MAX_ATTEMPTS,
+                reason=f"resume failed: {type(exc).__name__}",
+            )
+        print(f"error: could not resume {group.session_id}: {exc}", file=sys.stderr)
+        return 1
+    return 0  # unreachable on success (execvp replaced the process)
+
+
 def cmd_claim_fire(args: argparse.Namespace) -> int:
     """internal: one-shot claim of a session's armed parked prompt (prints it).
 
@@ -6232,6 +6299,14 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     )
     p_fireattached.add_argument("session_id")
     p_fireattached.set_defaults(func=cmd_fire_attached)
+
+    p_fireawait = sub.add_parser(
+        "fire-await",
+        help="internal: resume a fired `ccc await` group's session with its event",
+    )
+    p_fireawait.add_argument("group_id", type=int)
+    p_fireawait.add_argument("token")
+    p_fireawait.set_defaults(func=cmd_fire_await)
 
     p_claimfire = sub.add_parser(
         "claim-fire",

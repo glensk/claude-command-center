@@ -469,12 +469,17 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
         fail_class: str = "",
         last_error: str = "",
         blocked: bool = False,
+        watermark: str | None = None,
     ) -> bool:
-        """Record a NOT-fired probe outcome under the lease; ``False`` if the lease is gone."""
+        """Record a NOT-fired probe outcome under the lease; ``False`` if the lease is gone.
+
+        *watermark* (a clean probe's answer) advances the source's remote watermark; a
+        failed probe passes ``None`` and keeps it, so nothing is skipped over an outage.
+        """
         cur = self.conn.execute(
             "UPDATE await_sources SET next_check_at = ?, fail_count = ?, fail_class = ?, "
             "last_error = ?, state = CASE WHEN ? THEN 'blocked' ELSE state END, "
-            "lease_token = '', lease_until = 0 "
+            "watermark = COALESCE(?, watermark), lease_token = '', lease_until = 0 "
             "WHERE id = ? AND lease_token = ? AND state = 'armed'",
             (
                 next_check_at,
@@ -482,6 +487,7 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
                 fail_class,
                 last_error,
                 int(blocked),
+                watermark,
                 source_id,
                 lease_token,
             ),
@@ -529,7 +535,8 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
             self.conn.execute(
                 "UPDATE await_groups SET state = 'fired', winner_source_id = ?, event_id = ?, "
                 "event_payload = ?, event_remote_epoch = ?, delivery_token = ?, "
-                "delivery_attempts = 0, blocked_reason = '', updated_at = ? WHERE id = ?",
+                "delivery_attempts = 0, blocked_reason = '', notified_at = 0, updated_at = ? "
+                "WHERE id = ?",
                 (source_id, event_id, payload, remote_epoch, token, now, group_id),
             )
             self.conn.execute(
@@ -598,6 +605,15 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
                 ),
             )
         return state
+
+    def stale_deliveries(self, now: int, stale_sec: int) -> list[AwaitGroup]:
+        """``delivering`` groups untouched for *stale_sec*: the deliverer crashed between
+        the CAS and the send/launch, or the tab never ran ``fire-await``."""
+        rows = self.conn.execute(
+            "SELECT * FROM await_groups WHERE state = 'delivering' AND updated_at <= ?",
+            (now - stale_sec,),
+        ).fetchall()
+        return [_row_to_group(r) for r in rows]
 
     def block_group(
         self, group_id: int, reason: str, now: int, *, from_states: tuple[str, ...]

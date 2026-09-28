@@ -1439,6 +1439,21 @@ def fire_attached_in_new_tab(session_id: str) -> bool:
     return bool(_open_tab(command, tmux_fallback=True))
 
 
+def fire_await_in_new_tab(group_id: int, token: str) -> bool:
+    """Open a new tab that resumes a FIRED ``ccc await`` group's session with its event.
+
+    The tab runs ``ccc fire-await <group> <token>``: it claims the outbox row by the
+    token (``delivering → delivered``), pins the snapshot account WITHOUT granting
+    trust, and execs ``claude --resume <id> "<prompt>"``. The token is a one-shot CAS
+    nonce, not a credential. The prompt itself never passes through the shell or
+    AppleScript — ``fire-await`` reads it from the store.
+    """
+    command = f"ccc fire-await {int(group_id)} {shlex.quote(token)}"
+    if _launcher_mode() == "tmux":
+        return _tmux_window(command)
+    return bool(_open_tab(command, tmux_fallback=True))
+
+
 def _iterm(command: str) -> bool:
     """Open an iTerm2 tab (AppleScript) and type *command* into it; False when that failed.
 
