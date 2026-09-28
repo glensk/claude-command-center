@@ -50,6 +50,7 @@ flags. Grouped by what they do:
 - `ccc quota` — cache-first quota oracle: which provider/account still has tokens, when each allowance renews, and when each blocked one unblocks.
 - `ccc start-job <id>` / `ccc open-job <id>|--file` — launch a saved job (in place / in a new tab, safe from Obsidian). Prefer `open-job` from scripts and agents: `start-job` execs in place and refuses without a TTY (it opens a tab instead) — see "Terminal guard" below.
 - `ccc done-job` · `ccc delete-job` · `ccc restore-job` · `ccc unlaunch` — the lifecycle: done-without-running / trash / restore / back-to-draft.
+- `ccc await -z TICKET | -S USER | -x CMD -u DATE -m '…{event}…' [-C]` — park THIS session on an external event (a Zoho Desk reply, a Slack DM, a shell predicate) and resume it when the first one fires; `-l` / `-d` / `-R` / `-r` list, disarm, retry, run one pass. See "Await — resume a parked session on an external event" below.
 
 Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique prefix), not just the full UUID — exact match wins, an ambiguous prefix errors with the matches listed, matching is case-insensitive.
 
@@ -1014,6 +1015,87 @@ ccc panel-server -U [-P]   # --uninstall; -P/--purge also removes the poker
   `panel-server-watchdog.log`. `ccc panel-server -k` (`--smoke`) runs 50 invisible
   park + peek cycles in-process and checks that windows, threads and fds return to
   baseline.
+
+### Await — resume a parked session on an external event (`ccc await`)
+
+A session that is waiting on a *person* — a requester's answer on a Zoho Desk ticket, a
+Slack DM from one colleague, or any condition a shell command can test — arms an **await
+group** on itself and closes. A dedicated poller checks the group's sources cheaply (no
+model, no tokens); the first source to fire wins, and ccc resumes **that exact session**
+(same transcript, same account) with your message template, `{event}` replaced by the
+event as bounded JSON. Nothing fires before the deadline → the group expires with a
+notification and nothing is resumed.
+
+```commands
+ccc await -z 123 -u 2026-10-05 -m "The requester replied: {event}. Continue." -C
+ccc await -S U012AB3CD -z 123 -u 3d -m "An answer arrived: {event}"
+ccc await -x 'gh pr checks 12 --required' -i 300 -u 1d -m "CI finished: {event}"
+ccc await -l          # this session's groups + sources (-A: every session)
+ccc await -d 7        # disarm group 7 (-d all: this session's active groups)
+ccc await -R 7        # retry a BLOCKED group (payload + watermarks kept)
+ccc await -r          # one evaluation pass now (what the poller runs)
+```
+
+| Flag                   | Meaning                                                                                   |
+| :--------------------- | :---------------------------------------------------------------------------------------- |
+| `-s/--session ID`      | target session (default: the calling session)                                             |
+| `-z/--zoho TICKET`     | fire on a NEW inbound reply on that Zoho Desk ticket (`zoho-api.py -i`) — repeatable       |
+| `-S/--slack-dm USER`   | fire on a DM from USER (member id, `@handle` or email; `slack_api.py`) — repeatable        |
+| `-x/--cmd CMD`         | fire when CMD exits 0 in the session's cwd; its stdout is the event — repeatable           |
+| `-i/--interval SEC`    | seconds between probes of each source (≥ 60, default 120)                                  |
+| `-u/--until DATE`      | deadline (required): `YYYY-MM-DD` (end of day), `YYYY-MM-DDTHH:MM`, or `30m`/`12h`/`3d`/`2w` |
+| `-m/--message TEMPLATE`| the resume prompt (required); must contain `{event}`                                       |
+| `-C/--close`           | close this tab after the current turn (calling, interactive session only)                  |
+| `-n/--dry-run`         | arm: take the baselines, write nothing; `-r`: probe and deliver nothing                    |
+| `-j/--json`            | machine-readable output                                                                   |
+| `-l` `-d` `-R` `-r`    | list / disarm / retry / run — mutually exclusive with arming and with each other          |
+
+**Arming.** Each source's REMOTE baseline is taken first — the ticket's newest inbound
+thread (`<epoch_ms>:<thread_id>`), the DM's newest `ts` — so only what arrives *after*
+the arm counts. The session's cwd is then trusted for the session's account (a
+deliberate act by the session; automation later only *checks* trust), and the group,
+its sources and (with `-C`) the close-after-turn arm are written in ONE transaction. Any
+failure before that writes nothing. One active group per session; the probe CLIs are
+resolved once (`ZOHO_API_BIN` / `SLACK_API_BIN` → `$PATH`) and stored as absolute paths.
+
+**Polling.** `ccc daemon --install` also installs a 60 s poller (launchd
+`<launchd_label>.await`, or a systemd `oneshot` timer) running `ccc await -r`; it
+returns after one query when nothing is armed. The daemon's own pass is the backstop,
+so a missing poller only slows the reaction to the daemon interval. Each pass leases at
+most 10 due sources, probes them 4 at a time under a 50 s pass deadline (a probe dies at
+30 s), and records every outcome:
+
+| Kind         | Fired                          | Not fired            | Transient (backoff ×2, ≤ 30 min)       | Permanent (source blocked)          |
+| :----------- | :----------------------------- | :------------------- | :------------------------------------- | :---------------------------------- |
+| `zoho-reply` | exit 0 + `fired: true`         | exit 0 + `fired: false` | exit 5, timeout, any other exit      | exit 2/3/4, malformed JSON, spawn error |
+| `slack-dm`   | a message from USER, `ts > W`  | none                 | timeout, rate limit / 5xx / network    | auth error, malformed JSON, spawn error |
+| `cmd`        | exit 0                         | non-zero exit        | timeout                                | spawn error                         |
+
+A permanent failure blocks only that SOURCE (one notification); the group blocks only
+when no viable source is left. `-R` re-arms blocked sources at their ORIGINAL watermark,
+so replies that arrived during an outage are still caught. At `--until` the group
+enters a 24 h **grace**: sources keep polling, but an event only fires if it is dated at
+or before the deadline; after the grace the group expires.
+
+**Delivery** (outbox + token). Before any claim: the session is not done; its transcript
+exists under the snapshot account's OWN projects dir (no cross-account fallback); the
+cwd is trusted for that account; and the session has no pending attached prompt
+(delivery waits, never overwrites). A failed check blocks the group with a reason —
+`ccc await -l` shows it, `-R` retries. Then:
+
+- **live, idle, interactive, same account, no conflict** → the prompt is typed into the
+  tab (at-least-once: a crash between the keystrokes and the mark can repeat it);
+- **live but busy / waiting / another account** → wait for the next pass;
+- **closed** → a new tab runs `ccc fire-await <group> <token>`, which claims the outbox
+  row by its token BEFORE `claude --resume` (at-most-once). A launcher that fails hands
+  the row back, at most 3 times, then blocks it.
+
+**The prompt** is a fixed framing (the event is untrusted data from an outside party;
+re-check the source before acting) followed by your template with `{event}` =
+`{"source","sender","time","snippet","event_id"}` on one line — controls, bidi and
+zero-width characters stripped, the snippet clipped to 1500 bytes, `<` `>` and backticks
+escaped. Risk reduction, not sanitization. Notifications (`notify`) never carry any of
+that text: "await group 7 fired (zoho-reply); session resuming in a new tab".
 
 ### Delegate a task to Codex (`/codex-implement-task-and-claude-review`)
 

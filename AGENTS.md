@@ -256,6 +256,41 @@ enumerates them. The flag is never *cleared* — an ambient `CCC_NO_CODEX` is pr
 mutually exclusive with a `codex`/`codex-write` job type (`models.no_codex_conflict`), refused at
 creation AND again at launch.
 
+## `ccc await` — event-triggered resume (do not regress)
+
+`await_store.py` (schema + every transition, a `Store` mixin), `await_probes.py`,
+`await_eval.py` (`run_pass` — the ONE evaluation both the 60 s poller `ccc await -r`
+and the daemon backstop call), `await_delivery.py`, `await_prompt.py`, `await_cli.py`.
+Invariants:
+
+- **State machine** (`await_groups.state`): `armed → grace → expired`; the first fired
+  source wins `armed|grace → fired` in ONE `BEGIN IMMEDIATE` (`Store.fire_group`, which
+  also disarms every sibling); `fired → delivering → delivered` is an OUTBOX keyed by
+  `delivery_token` (CAS on every step); `blocked` only via a failed preflight, exhausted
+  delivery retries, or no viable source left; `-R` re-opens it (a fresh token, the
+  payload and every watermark kept). One ACTIVE group per session (partial UNIQUE index).
+  A permanent probe failure blocks the SOURCE, never the group directly.
+- **Delivery guarantees.** Live idle tab: type-in, at-least-once. Closed session:
+  `ccc fire-await <group> <token>` claims `delivering → delivered` BEFORE the exec,
+  at-most-once; a failed launch/exec hands the row back (`revert_delivery`, ≤ 3 tries,
+  then `blocked`); a `delivering` row older than 15 min is reclaimed. An unreadable
+  live-session registry delivers NOTHING that pass (a live session misread as closed
+  would be resumed twice). A pending attached prompt (`fire_at > 0`) makes delivery
+  WAIT — it is never overwritten.
+- **Trust rule.** Trust is ensured at ARM time (`accounts.ensure_trusted`, a deliberate
+  act of the session) and only CHECKED at delivery (`accounts.is_trusted`);
+  `fire-await` pins the account with `accounts.pin_environ`, which never grants trust.
+  The transcript must exist under the snapshot account's OWN projects dir
+  (`await_delivery.account_transcript`, no cross-account fallback).
+- **The store connection never crosses a thread**: probes run in the pool, every
+  outcome is recorded by the pass's own thread. Probe CLIs go through
+  `checks.run_structured` (argv; `shell=True` only for the user-authored `cmd` kind;
+  output capped; the process GROUP killed at the timeout; stderr sanitized).
+- **Content-free notifications**, one per state (`notified_at`); the event text reaches
+  only the prompt, framed as untrusted and defanged (`await_prompt.build_payload`).
+- `await` is a hot subcommand (`cli._HOT_SUBCOMMANDS`): `await_cli` imports nothing
+  heavy at load time, and `-r` returns after one indexed query when nothing is armed.
+
 ## Launching jobs: always a tab (do not regress)
 
 **Agents: never run `ccc start-job` from a background/piped shell — use `ccc open-job <id>`.**

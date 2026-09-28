@@ -149,6 +149,12 @@ A few features that don't fit in a one-liner but are the reason people keep it r
   in the focused tab (plus its AIM history) — so *"what have I been asking here?"* is
   one keystroke, not a scroll through the transcript. The opt-in resident panel server
   (`ccc panel-server --install`, macOS) opens it — and the q+p park panel — in ≤ 0.2 s.
+- **Park on an event, not a clock.** `ccc await -z 123 -u 3d -m "Reply: {event}" -C`
+  closes a session that is waiting on a person and resumes *that* session — same
+  transcript, same account — when the requester answers the Zoho Desk ticket, a Slack
+  DM arrives, or a shell predicate turns true. A 60 s poller checks with zero tokens;
+  the first source wins, a deadline expires the wait with a notification, and the event
+  reaches the model as bounded, explicitly untrusted JSON.
 - **Snapshot the whole desk before a reboot.** `ccc snapshot` saves every iTerm window,
   tab and split — which Claude session ran where (and on which account), and the exact
   `argv` of the other panes. After the update, `ccc restore-snapshot` rebuilds the layout:
