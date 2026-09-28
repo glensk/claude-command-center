@@ -450,22 +450,65 @@ def handle_session_start(payload: dict[str, Any]) -> int:
     return 0
 
 
+def _aim_command_text(prompt: str) -> str | None:
+    """The AIM a typed ``/aim <text>`` prompt sets, ``""`` for a bare ``/aim``, else None.
+
+    ``/aim-history`` and anything else that merely starts with ``/aim`` is not a match. One
+    pair of surrounding quotes is stripped, so ``/aim 'x y'`` and ``/aim x y`` agree.
+    """
+    import re  # local: only a typed prompt pays for it
+
+    m = re.match(r"^/aim(?:\s+(?P<text>.*?))?\s*$", prompt.strip(), re.DOTALL)
+    if m is None:
+        return None
+    text = (m.group("text") or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        text = text[1:-1].strip()
+    return text
+
+
+def _block_prompt(reason: str) -> None:
+    """Swallow the prompt (no model turn) and show *reason* to the user."""
+    json.dump({"decision": "block", "reason": reason}, sys.stdout)
+    sys.stdout.write("\n")
+
+
+_AIM_CHANGED = "The user changed this session's AIM (done-condition) to: {aim}"
+
+
+def _intercept_aim(store: Store, sid: str, current: str | None, text: str) -> None:
+    """Set (``/aim <text>``) or show (bare ``/aim``) the AIM and swallow the prompt."""
+    if text:
+        store.set_aim(sid, text)
+        _block_prompt(f"🎯 /aim: {text}")
+    else:
+        _block_prompt(f"🎯 /aim: {current or '(none — set one with /aim <text>)'}")
+
+
 def handle_user_prompt(payload: dict[str, Any]) -> int:
     sid = _session_id(payload)
     if not sid:
         return 0
+    cfg = config.load_config()
+    aim_text = _aim_command_text(str(payload.get("prompt") or ""))
     with Store() as store:
         session, _ = ensure_current_session(store, sid, payload.get("cwd", ""))
+        if cfg.aim_intercept and aim_text is not None:
+            # `/aim <text>` is set here, programmatically: the prompt is blocked, so the
+            # command costs no model turn. The next real prompt tells the agent (below).
+            _intercept_aim(store, sid, session.aim, aim_text)
+            return 0
         count = session.prompt_count + 1
-        store.update_fields(sid, last_response_at=now_ms(), prompt_count=count)
         # A new turn begins: clear any "AIM just changed" marker so the status-line
-        # transition (old ====> new) is scoped to the turn it changed in.
-        if session.aim_prev:
-            store.update_fields(sid, aim_prev=None)
-        cfg = config.load_config()
+        # transition (old ====> new) is scoped to the turn it changed in. An AIM set by
+        # the intercepted `/aim` (no turn of its own) is announced to the agent here.
+        aim_changed = (
+            cfg.aim_intercept and bool(session.aim_prev) and session.aim_prev != session.aim
+        )
+        store.update_fields(sid, last_response_at=now_ms(), prompt_count=count, aim_prev=None)
         # AIM-related nudges are mutually exclusive (no-aim > vague > stale checklist);
         # an unresolved drift nudge is additive — it can fire alongside any of them.
-        parts: list[str] = []
+        parts: list[str] = [_AIM_CHANGED.format(aim=session.aim)] if aim_changed else []
         if not session.aim:
             every = cfg.nag_every_n_turns
             if every > 0 and (count - 1) % every == 0:

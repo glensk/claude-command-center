@@ -4969,10 +4969,13 @@ def cmd_statusline(args: argparse.Namespace) -> int:
 
     cfg = config.load_config()
     threshold = cfg.aim_score_threshold
-    if not cfg.aim_score:  # score hidden: blank chip (-1 = unscored) and no "vague" marker
-        import dataclasses
+    import dataclasses
 
+    if not cfg.aim_score:  # score hidden: blank chip (-1 = unscored) and no "vague" marker
         session = dataclasses.replace(session, aim_score=-1)
+    if not cfg.aim_history:  # plain "/aim: <current>": no (N), no anchor row, no transition
+        session = dataclasses.replace(session, aim_prev=None)
+        aim_index = 0
     aim_lines = _aim_statusline_lines(
         session, checked, total, threshold, (green, dim, reset, status_color["failed"]), aim_index
     )

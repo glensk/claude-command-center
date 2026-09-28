@@ -733,3 +733,49 @@ def test_session_end_resets_the_subagent_count(home: Path) -> None:
     store.bump_subagents("s1", 2)
     hooks.handle_session_end({"session_id": "s1", "cwd": "/repo"})
     assert store.active_subagents("s1") == 0
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        ("/aim ship X", "ship X"),
+        ("/aim  'ship X' ", "ship X"),
+        ('/aim "ship X"', "ship X"),
+        ("/aim", ""),
+        ("/aim-history", None),
+        ("/aimless", None),
+        ("please /aim x", None),
+    ],
+)
+def test_aim_command_text(prompt: str, expected: str | None) -> None:
+    assert hooks._aim_command_text(prompt) == expected  # pylint: disable=protected-access
+
+
+@pytest.mark.usefixtures("home")
+def test_user_prompt_aim_is_set_without_a_model_turn(capsys: pytest.CaptureFixture[str]) -> None:
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.set_aim("s1", "old aim")
+    store.update_fields("s1", aim_prev=None, prompt_count=3)
+    capsys.readouterr()
+    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": "/aim new aim"})
+    out = capsys.readouterr().out
+    assert '"decision": "block"' in out and "new aim" in out  # swallowed: no model turn
+    got = Store().get("s1")
+    assert got is not None and got.aim == "new aim" and got.prompt_count == 3
+    # The next real prompt tells the agent the AIM changed.
+    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": "go on"})
+    assert "changed this session's AIM" in capsys.readouterr().out
+
+
+@pytest.mark.usefixtures("home")
+def test_user_prompt_aim_intercept_off_passes_through(capsys: pytest.CaptureFixture[str]) -> None:
+    _set_cfg(aim_intercept=False)
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.set_aim("s1", "old aim")
+    capsys.readouterr()
+    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": "/aim new aim"})
+    assert '"decision"' not in capsys.readouterr().out
+    got = Store().get("s1")
+    assert got is not None and got.aim == "old aim"

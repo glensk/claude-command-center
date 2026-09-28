@@ -3476,8 +3476,14 @@ class CommandCenterApp(App[None]):
         aim_reason = getattr(session, "aim_score_reason", None)
         # Show ONLY the first AIM ever defined and the last (current) one — never the
         # middle revisions. The `ah` chord / `ccc aim-history` has the full progression.
-        revisions = self.store.list_aim_history(session.session_id) if self.store else []
-        if not revisions:
+        revisions = (
+            self.store.list_aim_history(session.session_id)
+            if self.store and self.cfg.aim_history
+            else []
+        )
+        if not self.cfg.aim_history:
+            self._append_aim_line(text, 0, aim_val, aim_score, aim_reason)
+        elif not revisions:
             # Pre-history session: the live AIM is the sole revision (first == last).
             self._append_aim_line(text, 1 if aim_val else 0, aim_val, aim_score, aim_reason)
         else:

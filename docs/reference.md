@@ -1217,6 +1217,14 @@ stuck bar, so the center scores every AIM for specificity (0–100):
 - **`aim_score = false`** hides the `NN%` chip (and the red/`⚠ vague` marker) in `ccc ls`,
   the TUI table/detail and the status line, and stops the daemon's score backfill. The
   stored score is kept; the AIM-history modal still lists it.
+- **`aim_history = false`** renders the AIM as a plain `/aim: <current>` in the status line
+  and the TUI detail pane — no `/aim (N)` numbering, no first-AIM anchor row, no
+  `old ====> new` transition. Pair it with `aim_column = "latest"` so `ccc ls` / the TUI
+  table show the current AIM too. History is still recorded (`ccc aim-history`).
+- **`aim_intercept = true`** (default): the `UserPromptSubmit` hook catches a typed
+  `/aim <text>` and sets the AIM itself, then blocks the prompt — no model turn, no tokens.
+  A bare `/aim` just shows the current AIM. The agent learns the new AIM as context on the
+  next real prompt. With it off, `/aim` falls back to the `commands/aim.md` prompt.
 - **Agent-driven sharpening with an independent checker.** While the AIM is vague, the
   `UserPromptSubmit` hook nudges the running session **every turn** (`sharpen_every_n_turns`)
   to rewrite it — *keeping your goal intact, only making it concrete* — grounded in what the
