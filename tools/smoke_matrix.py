@@ -76,8 +76,21 @@ _VOLATILE_NAMES = {
     "resume_watch.lock",
     "resume_queue.json",
     "resume_reset.signal",
+    "jump_tui",
+    "panel_restart",
+    "cooldowns.json",
+    "codex-seat-attempts.json",
+    "codex-runs.jsonl",
+    "cost-history.jsonl",
+    "panel-metrics.jsonl",
 }
 _VOLATILE_SUFFIXES = (".log", ".err", ".lock", ".signal", ".tmp", "-wal", "-shm", "-journal")
+# Per-provider / per-seat / per-account quota caches the daemon refreshes every minute:
+# agy_usage.json, muse_usage.json, opencode_usage.json, codex_usage-<hash8>.json,
+# usage-<label>-<hash8>.json, profile-<label>-<hash8>.json.
+_VOLATILE_PREFIXES = ("usage-", "profile-", "codex_usage-")
+# Subdirectories only ever written by live sessions (``ccc snapshot``, ``ccc codex-switch``).
+_VOLATILE_DIRS = ("snapshots/", "codex-switch/")
 
 # Ccc hook events (mirrors install.HOOK_SPEC) — used only to explain the uninstall check.
 _HOOK_EVENTS = frozenset(
@@ -98,11 +111,14 @@ _HOOK_EVENTS = frozenset(
 
 def _is_volatile(rel: str) -> bool:
     """True when *rel* (posix path under command-center) is a daemon-owned runtime file."""
+    if rel.startswith(_VOLATILE_DIRS):
+        return True
     base = rel.rsplit("/", 1)[-1]
     if base in _VOLATILE_NAMES or base.startswith("state.db") or base.startswith("."):
         return True
-    # Per-account usage caches (usage.account_usage_path): usage-<label>-<hash8>.json.
-    if base.startswith("usage-") and base.endswith(".json"):
+    if base.endswith(".json") and (
+        base.startswith(_VOLATILE_PREFIXES) or base.endswith("_usage.json")
+    ):
         return True
     return any(base.endswith(suf) for suf in _VOLATILE_SUFFIXES)
 
@@ -207,15 +223,26 @@ def build_wheel(uv: str, out_dir: Path, *, verbose: bool) -> Path:
 
 
 def make_venv_and_install(uv: str, ctx: Ctx, wheel: Path) -> None:
-    """``uv venv`` + ``uv pip install <wheel>`` into the sandbox venv."""
+    """``uv venv`` + ``uv pip install <wheel>`` into the sandbox venv.
+
+    Both run from the repo root, like ``build_wheel``: ``uv venv`` picks its interpreter
+    from the cwd's project (``requires-python``), so a caller sitting elsewhere could get
+    a Python the wheel refuses (tp#687: 3.8 from ``/tmp``).
+    """
     proc = subprocess.run(
-        [uv, "venv", str(ctx.venv)], capture_output=True, text=True, check=False, timeout=300
+        [uv, "venv", str(ctx.venv)],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"uv venv failed:\n{proc.stdout}\n{proc.stderr}")
     py = ctx.venv / "bin" / "python"
     proc = subprocess.run(
         [uv, "pip", "install", "--python", str(py), str(wheel)],
+        cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
         check=False,
