@@ -245,7 +245,8 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
         # Self-heal: score any AIM that slipped in unscored (aim_score < 0), so the
         # "vague → sharpen" machinery and the /aim chip always have a number. New
         # AIMs are scored at their source now; this backfills legacy/edge rows.
-        _backfill_aim_scores(store, cfg, report, dry_run)
+        if cfg.aim_score:
+            _backfill_aim_scores(store, cfg, report, dry_run)
 
         # Self-heal: generate a short-AIM label for any AIM session still missing one
         # (legacy rows from before the feature, or a set-aim whose detached codex run died).

@@ -72,6 +72,7 @@ DEFAULTS: dict[str, object] = {
     "grade_debounce_sec": 30,  # min seconds between after-turn grader spawns per session
     "assess_aim_on_turn": False,  # self-assess "is the AIM fulfilled?" after each turn (INERT)
     "max_aim_assess_per_run": 3,  # cap AIM-met assessments per daemon fallback pass (cost guard)
+    "aim_score": True,  # NN% AIM-specificity chip + daemon backfill (False = none)
     "aim_score_threshold": 50,  # AIM specificity < this (0..100) => vague: red + sharpen nudge
     "aim_score_on_set": False,  # refine the AIM score with an LLM call when the AIM changes (INERT)
     "verify_subgoals_llm": False,  # also LLM-verify each derived sub-goal is checkable (extra cost)
@@ -1012,6 +1013,7 @@ class Config:
     grade_debounce_sec: int = 30
     assess_aim_on_turn: bool = False
     max_aim_assess_per_run: int = 3
+    aim_score: bool = True
     aim_score_threshold: int = 50
     aim_score_on_set: bool = False
     verify_subgoals_llm: bool = False

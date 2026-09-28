@@ -3105,12 +3105,13 @@ class CommandCenterApp(App[None]):
                     running_span = (start, len(model_cell.plain))
             model_cell.append(cachettl.cell_padding(cache_text), style=style)
             model_cell.append(home + model_effort_cell(session.model, session.effort), style=style)
-        low_score = low_aim_score(session.aim, session.aim_score, self.cfg.aim_score_threshold)
+        score = session.aim_score if self.cfg.aim_score else -1
+        low_score = low_aim_score(session.aim, score, self.cfg.aim_score_threshold)
         aim_style = _DONE_STYLE if done else (_GOLD if session.aim else "grey50")
         # Leading score chip ('NN%', or '-1' while unscored) so /aim quality is visible.
         # Right-aligned in a fixed 4-cell field (and blanked to the same width when there
         # is no chip) so a 2- ('-1') or 4-char ('100%') chip never shifts the AIM text.
-        chip = aim_score_pct(session.aim, session.aim_score)
+        chip = aim_score_pct(session.aim, score)
         chip_style = "bold red" if low_score else (_DONE_STYLE if done else "grey46")
         aim = Text("  ")
         if chip:
@@ -3521,6 +3522,8 @@ class CommandCenterApp(App[None]):
         """
         label = f"/aim ({index}): " if index >= 1 else "/aim: "
         text.append(label, style="white")
+        if not self.cfg.aim_score:
+            score = -1
         chip = aim_score_pct(aim, score)
         low_score = low_aim_score(aim, score, self.cfg.aim_score_threshold)
         if chip:

@@ -183,8 +183,9 @@ def _render_row(
         aim = _paint(_DIM, "(no done-condition set)", enabled)
     else:
         # Leading score chip ('NN%', or '-1' while unscored) so /aim quality is visible.
-        chip = aim_score_pct(session.aim, session.aim_score)
-        low_score = low_aim_score(session.aim, session.aim_score, aim_threshold)
+        score = session.aim_score if config.load_config().aim_score else -1  # memoized read
+        chip = aim_score_pct(session.aim, score)
+        low_score = low_aim_score(session.aim, score, aim_threshold)
         chip_str = _paint(_SEVERITY_COLOR["red"] if low_score else _DIM, chip, enabled)
         # Show the compact short-AIM label (cheap-model) when present, else the full AIM —
         # of revision (1) under `aim_column = "first"` (the default), else the current AIM.

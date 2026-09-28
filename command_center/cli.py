@@ -4860,7 +4860,8 @@ def _aim_statusline_lines(
     label = _aim_label(index)
     low_score = low_aim_score(session.aim, session.aim_score, threshold)
     chip_color = red if low_score else dim
-    chip = f"{chip_color}{aim_score_pct(session.aim, session.aim_score)}{reset}"
+    score_pct = aim_score_pct(session.aim, session.aim_score)
+    chip = f"{chip_color}{score_pct}{reset} " if score_pct else ""
     new_aim = display_aim(session) or ""
     fraction = effective_progress(session.manual_progress, checked, total)
     if session.aim_met:
@@ -4883,13 +4884,13 @@ def _aim_statusline_lines(
     changed = bool(session.aim_prev) and session.aim_prev != session.aim
     anchor = _first_aim_anchor(session, index, changed, green, dim, reset)
     if not changed:
-        return [*anchor, f"{green}{label}:{reset} {chip} {new_aim}{prog}{tag}"]
+        return [*anchor, f"{green}{label}:{reset} {chip}{new_aim}{prog}{tag}"]
     bold = "\033[1m"
     old_part = f"{green}{_aim_label(index - 1)}:{reset} {dim}{session.aim_prev}{reset}"
     arrow = f"{bold}====>{reset} {green}{label}:{reset} "
     # Always ONE line — old AIM, arrow, new AIM, bar and marker never split across rows;
     # an over-wide line soft-wraps in the terminal rather than costing three status-line rows.
-    return [*anchor, f"{old_part}   {arrow}{chip} {new_aim}{prog}{tag}"]
+    return [*anchor, f"{old_part}   {arrow}{chip}{new_aim}{prog}{tag}"]
 
 
 def cmd_statusline(args: argparse.Namespace) -> int:
@@ -4966,7 +4967,12 @@ def cmd_statusline(args: argparse.Namespace) -> int:
     except OSError:
         pass
 
-    threshold = config.load_config().aim_score_threshold
+    cfg = config.load_config()
+    threshold = cfg.aim_score_threshold
+    if not cfg.aim_score:  # score hidden: blank chip (-1 = unscored) and no "vague" marker
+        import dataclasses
+
+        session = dataclasses.replace(session, aim_score=-1)
     aim_lines = _aim_statusline_lines(
         session, checked, total, threshold, (green, dim, reset, status_color["failed"]), aim_index
     )

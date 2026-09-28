@@ -1214,6 +1214,9 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   `ccc ls`, the TUI (table, detail, AIM history) and the status line — the AIM text itself
   stays its normal colour, so the red flags the *quality*, not the goal. The status line also
   keeps its dim `⚠ vague — sharpen it` nudge.
+- **`aim_score = false`** hides the `NN%` chip (and the red/`⚠ vague` marker) in `ccc ls`,
+  the TUI table/detail and the status line, and stops the daemon's score backfill. The
+  stored score is kept; the AIM-history modal still lists it.
 - **Agent-driven sharpening with an independent checker.** While the AIM is vague, the
   `UserPromptSubmit` hook nudges the running session **every turn** (`sharpen_every_n_turns`)
   to rewrite it — *keeping your goal intact, only making it concrete* — grounded in what the
