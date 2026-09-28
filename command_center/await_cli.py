@@ -320,8 +320,10 @@ def _snapshot(session: Any, sid: str) -> tuple[str, str]:
     config_dir = session.config_dir or (
         accounts.env_config_dir() if _caller_session_id() == sid else ""
     )
-    if not config_dir and accounts.is_multi_account():
-        raise AwaitError("the session's account is unknown; resume it once first")
+    if not config_dir:
+        if accounts.is_multi_account():
+            raise AwaitError("the session's account is unknown; resume it once first")
+        config_dir = str(accounts.default_config_dir())  # single account: it is the default
     cwd = session.cwd
     if not cwd or not os.path.isdir(cwd):
         raise AwaitError(f"the session's working directory {cwd!r} is missing")

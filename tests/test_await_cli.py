@@ -295,3 +295,15 @@ def test_parse_until_forms() -> None:
     assert await_cli.parse_until("2w", now) == int(now) + 14 * 86400
     day = await_cli.parse_until("2027-01-20", now)
     assert day - await_cli.parse_until("2027-01-20T00:00", now) == 86399
+
+
+def test_an_unstamped_single_account_session_snapshots_the_default_dir(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center import accounts  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")  # armed from OUTSIDE the session
+    assert _run("-s", SID, "-z", "209", "-u", "1d", "-m", "{event}", runner=_runner()) == 0
+    with Store() as store:
+        group = store.active_await(SID)
+    assert group is not None and group.config_dir == str(accounts.default_config_dir())
