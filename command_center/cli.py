@@ -5489,6 +5489,20 @@ def _add_aim(sub: Any) -> None:
     p_aim.set_defaults(func=cmd_aim)
 
 
+def cmd_await(args: argparse.Namespace) -> int:
+    """`ccc await` — see :mod:`command_center.await_cli`."""
+    from . import await_cli
+
+    return await_cli.cmd_await(args)
+
+
+def _add_await(sub: Any) -> None:
+    """`ccc await` — the await poller spawns `ccc await -r` every 60 s."""
+    from . import await_cli
+
+    await_cli.add_parser(sub, cmd_await)
+
+
 def _add_hook(sub: Any) -> None:
     """`ccc hook <event>` — spawned by Claude Code on every hook event."""
     p_hook = sub.add_parser("hook", help="internal: invoked by Claude Code hooks")
@@ -5547,6 +5561,7 @@ _HOT_SUBCOMMANDS: dict[str, Callable[[Any], None]] = {
     "aim": _add_aim,
     "hook": _add_hook,
     "tab-symbol": _add_tab_symbol,
+    "await": _add_await,
 }
 
 
@@ -6589,6 +6604,7 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_syncm.set_defaults(func=cmd_sync_mirrors)
 
     _add_hook(sub)
+    _add_await(sub)
 
     p_ih = sub.add_parser(
         "install-hooks",
