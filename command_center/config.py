@@ -74,6 +74,7 @@ DEFAULTS: dict[str, object] = {
     "max_aim_assess_per_run": 3,  # cap AIM-met assessments per daemon fallback pass (cost guard)
     "aim_history": True,  # /aim (N) labels, first-AIM anchor, old ====> new (False = "/aim: X")
     "aim_intercept": True,  # UserPromptSubmit sets "/aim <text>" itself: no model turn
+    "aim_intercept_block": True,  # True: swallow `/aim` (no turn; CC shows "blocked by hook")
     "aim_on_main_line": False,  # `ccc aim --format bar` prefixes "🎯 <aim>" (status-line row 1)
     "aim_in_tab_title": False,  # iTerm tab title "<badge> <leaf> 🎯 <aim>"
     "aim_score": True,  # NN% AIM-specificity chip + daemon backfill (False = none)
@@ -1019,6 +1020,7 @@ class Config:
     max_aim_assess_per_run: int = 3
     aim_history: bool = True
     aim_intercept: bool = True
+    aim_intercept_block: bool = True
     aim_on_main_line: bool = False
     aim_in_tab_title: bool = False
     aim_score: bool = True

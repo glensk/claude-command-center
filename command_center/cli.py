@@ -370,6 +370,13 @@ def cmd_set_aim(args: argparse.Namespace) -> int:
     # (cheap codex run — keeps the column scannable without spending Claude tokens).
     if changed:
         cfg = config.load_config()
+        if getattr(cfg, "aim_in_tab_title", False):
+            from . import tabsymbol
+
+            with Store() as store:
+                fresh = store.get(session_id)
+            if fresh is not None:
+                tabsymbol.push_title(fresh)
         from .spawn import spawn_ccc
 
         if cfg.aim_score_on_set and rescore:

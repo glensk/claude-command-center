@@ -1313,6 +1313,12 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   next real prompt. With it off, `/aim` falls back to the `commands/aim.md` prompt.
   Claude Code always labels a swallowed prompt "operation blocked by hook" — exit 2 /
   `decision: block` is the only no-turn path a `UserPromptSubmit` hook has.
+  **`aim_intercept_block = false`** sets the AIM just the same but lets the prompt through
+  with a "reply with exactly one line" instruction: no "blocked" label and the status line
+  redraws at once (a blocked prompt does not redraw it until the next `refreshInterval`),
+  for the price of one tiny model turn. The zero-token, no-label path is Claude Code's shell
+  mode: `!aim <text>` with a tiny `aim` shell script on PATH that calls `ccc set-aim`.
+  `ccc set-aim` re-titles the tab too when `aim_in_tab_title` is on.
 - **`aim_on_main_line = true`** prefixes `ccc aim --format bar` (status-line row 1) with
   `🎯 <aim>` (60 chars); **`aim_in_tab_title = true`** makes the iTerm tab title
   `<badge> <leaf> 🎯 <aim>` (40 chars) — pushed at once by the `/aim` intercept, and kept

@@ -476,18 +476,33 @@ def _block_prompt(reason: str) -> None:
 _AIM_CHANGED = "The user changed this session's AIM (done-condition) to: {aim}"
 
 
-def _intercept_aim(store: Store, sid: str, current: str | None, text: str) -> None:
-    """Set (``/aim <text>``) or show (bare ``/aim``) the AIM and swallow the prompt."""
+_AIM_REPLY = (
+    "The user's `/aim` command was already handled by the ccc hook: this session's AIM is "
+    "now `{aim}`. Do NOT run any tool or command. Reply with exactly this one line and "
+    "nothing else: 🎯 /aim: {aim}"
+)
+
+
+def _intercept_aim(store: Store, sid: str, current: str | None, text: str, block: bool) -> None:
+    """Set (``/aim <text>``) or show (bare ``/aim``) the AIM at once.
+
+    *block* swallows the prompt (no model turn, but Claude Code labels it "operation blocked
+    by hook"); otherwise the prompt goes on with a one-line-reply instruction, so the status
+    line redraws immediately and no error-looking label appears.
+    """
     if text:
         store.set_aim(sid, text)
-        _block_prompt(f"🎯 /aim: {text}")
         session = store.get(sid)
         if session is not None:
             from . import tabsymbol  # lazy: AppleScript layer
 
             tabsymbol.push_title(session)
+    aim = text or current or "(none — set one with /aim <text>)"
+    if block:
+        _block_prompt(f"🎯 /aim: {aim}")
     else:
-        _block_prompt(f"🎯 /aim: {current or '(none — set one with /aim <text>)'}")
+        store.update_fields(sid, aim_prev=None)  # announced right now: no repeat next turn
+        _emit_context("UserPromptSubmit", _AIM_REPLY.format(aim=aim))
 
 
 def handle_user_prompt(payload: dict[str, Any]) -> int:
@@ -499,9 +514,9 @@ def handle_user_prompt(payload: dict[str, Any]) -> int:
     with Store() as store:
         session, _ = ensure_current_session(store, sid, payload.get("cwd", ""))
         if cfg.aim_intercept and aim_text is not None:
-            # `/aim <text>` is set here, programmatically: the prompt is blocked, so the
-            # command costs no model turn. The next real prompt tells the agent (below).
-            _intercept_aim(store, sid, session.aim, aim_text)
+            # `/aim <text>` is set here, programmatically. Blocking costs no model turn (the
+            # next real prompt tells the agent, below); non-blocking costs one tiny reply.
+            _intercept_aim(store, sid, session.aim, aim_text, cfg.aim_intercept_block)
             return 0
         count = session.prompt_count + 1
         # A new turn begins: clear any "AIM just changed" marker so the status-line

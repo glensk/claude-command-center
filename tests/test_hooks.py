@@ -779,3 +779,19 @@ def test_user_prompt_aim_intercept_off_passes_through(capsys: pytest.CaptureFixt
     assert '"decision"' not in capsys.readouterr().out
     got = Store().get("s1")
     assert got is not None and got.aim == "old aim"
+
+
+@pytest.mark.usefixtures("home")
+def test_user_prompt_aim_non_blocking_sets_and_asks_for_one_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_cfg(aim_intercept_block=False)
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.set_aim("s1", "old aim")
+    capsys.readouterr()
+    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": "/aim new aim"})
+    out = capsys.readouterr().out
+    assert '"decision"' not in out and "additionalContext" in out and "new aim" in out
+    got = Store().get("s1")
+    assert got is not None and got.aim == "new aim" and not got.aim_prev
