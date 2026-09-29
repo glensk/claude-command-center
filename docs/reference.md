@@ -1319,6 +1319,11 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   for the price of one tiny model turn. The zero-token, no-label path is Claude Code's shell
   mode: `!aim <text>` with a tiny `aim` shell script on PATH that calls `ccc set-aim`.
   `ccc set-aim` re-titles the tab too when `aim_in_tab_title` is on.
+- **`aim_from_session_name = true`**: Claude Code's built-in **`/rename <text>`** sets the
+  AIM — no model turn, no tokens, no "blocked" label. The status line passes the session
+  name as `ccc aim --format bar -n <name>`; a name that differs from the last one adopted
+  (marker file `command-center/session-names/<session>`) becomes the AIM and re-titles the
+  tab, so a later `/aim` is never undone by the unchanged old name.
 - **`aim_on_main_line = true`** prefixes `ccc aim --format bar` (status-line row 1) with
   `🎯 <aim>` (60 chars); **`aim_in_tab_title = true`** makes the iTerm tab title
   `<badge> <leaf> 🎯 <aim>` (40 chars) — pushed at once by the `/aim` intercept, and kept
