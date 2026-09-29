@@ -2215,25 +2215,3 @@ def test_start_job_failed_exec_leaves_caller_cwd(
     assert cmd_start_job(argparse.Namespace(session_id="job-y")) == 1
     assert seen == [job_cwd.resolve()]
     assert Path.cwd() == before
-
-
-def test_adopt_session_name_sets_aim_once_per_new_name(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``/rename X`` → the AIM becomes X; a later ``/aim`` is not undone by the same name."""
-    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    monkeypatch.setenv("CCC_HOME", str(tmp_path))
-    (tmp_path / "command-center").mkdir(parents=True, exist_ok=True)
-    with Store(tmp_path / "command-center" / "state.db") as store:
-        store.ensure("s1", cwd="/repo")
-        store.set_aim("s1", "old aim")
-        cli._adopt_session_name(store, "s1", "renamed aim")  # pylint: disable=protected-access
-        got = store.get("s1")
-        assert got is not None and got.aim == "renamed aim"
-        store.set_aim("s1", "set by /aim")
-        cli._adopt_session_name(store, "s1", "renamed aim")  # pylint: disable=protected-access
-        got = store.get("s1")
-        assert got is not None and got.aim == "set by /aim"
-        cli._adopt_session_name(store, "s1", "renamed again")  # pylint: disable=protected-access
-        got = store.get("s1")
-        assert got is not None and got.aim == "renamed again"

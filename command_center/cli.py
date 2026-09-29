@@ -231,38 +231,6 @@ def _clip(text: str, width: int) -> str:
     return line if len(line) <= width else line[: width - 1] + "…"
 
 
-def _adopt_session_name(store: Store, session_id: str, name: str | None) -> None:
-    """Take a NEW Claude Code session name (``/rename <text>``) as the AIM.
-
-    ``/rename`` is built in: no model turn, no tokens, and the status line receives the
-    name as ``session_name``. Only a name that differs from the last one adopted counts
-    (per-session marker file), so a later ``/aim`` or ``ccc set-aim`` is never overwritten
-    by the unchanged old name on the next status-line render.
-    """
-    name = (name or "").strip()
-    if not name:
-        return
-    marker = config.app_home() / "session-names" / session_id
-    try:
-        if marker.read_text(encoding="utf-8") == name:
-            return
-    except OSError:
-        pass
-    session = store.get(session_id)
-    if session is not None and session.aim != name:
-        store.set_aim(session_id, name)
-        fresh = store.get(session_id)
-        if fresh is not None and config.load_config().aim_in_tab_title:
-            from . import tabsymbol
-
-            tabsymbol.push_title(fresh)
-    try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(name, encoding="utf-8")
-    except OSError:
-        pass
-
-
 def cmd_aim(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branches  # one branch per display mode
     """Fast, LLM-free lookup for the status line. Must stay well under ~10 ms."""
     from .models import done_bar_parts, effective_progress, progress_bar
@@ -272,8 +240,6 @@ def cmd_aim(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branch
     if not session_id:
         return 0
     with Store() as store:
-        if getattr(args, "name", None) and config.load_config().aim_from_session_name:
-            _adopt_session_name(store, session_id, args.name)
         session = store.get(session_id)
         if session is None or not session.aim:
             if args.format == "statusline":
@@ -5556,12 +5522,6 @@ def _add_aim(sub: Any) -> None:
     p_aim = sub.add_parser("aim", help="status-line lookup of a session's done-condition")
     p_aim.add_argument("--session")
     p_aim.add_argument("--format", choices=["statusline", "plain", "bar"], default="statusline")
-    p_aim.add_argument(
-        "-n",
-        "--name",
-        help="the session's Claude Code name (statusline session_name); a NEW one becomes "
-        "the AIM when aim_from_session_name is on (/rename <text> = zero-token /aim)",
-    )
     p_aim.set_defaults(func=cmd_aim)
 
 
