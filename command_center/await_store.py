@@ -23,7 +23,8 @@ Every timestamp in these two tables is epoch SECONDS (the sessions table uses ms
 Rows are read by column NAME and unknown columns are ignored, so a newer ccc that adds
 a column never breaks an older long-lived reader (the TUI) — the same rule as
 ``store._row_to_session``. The tables are created with ``IF NOT EXISTS`` inside the
-store's schema script, which is safe under concurrent opens.
+store's schema script, which is safe under concurrent opens; a column added later
+(``await_sources.label``) is also ALTERed into an older DB by ``Store._ensure_columns``.
 
 This module is a mixin: :class:`AwaitStoreMixin` needs only ``self.conn``.
 """
@@ -118,7 +119,8 @@ CREATE TABLE IF NOT EXISTS await_sources (
     fail_count    INTEGER NOT NULL DEFAULT 0,
     fail_class    TEXT    NOT NULL DEFAULT '',
     last_error    TEXT    NOT NULL DEFAULT '',
-    notified_at   INTEGER NOT NULL DEFAULT 0
+    notified_at   INTEGER NOT NULL DEFAULT 0,
+    label         TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_await_sources_group ON await_sources(group_id);
 CREATE INDEX IF NOT EXISTS idx_await_sources_due
@@ -138,6 +140,7 @@ class SourceSpec:
     spec: dict[str, Any]
     watermark: str = ""
     interval_sec: int = DEFAULT_INTERVAL_SEC
+    label: str = ""  # optional human name (``ccc await -L``); display only
 
 
 @dataclasses.dataclass
@@ -158,6 +161,7 @@ class AwaitSource:  # pylint: disable=too-many-instance-attributes  # one row, f
     fail_class: str = ""
     last_error: str = ""
     notified_at: int = 0
+    label: str = ""
 
     def spec_dict(self) -> dict[str, Any]:
         """The parsed ``spec`` JSON (``{}`` when unreadable)."""
@@ -273,7 +277,7 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
             interval = max(MIN_INTERVAL_SEC, int(src.interval_sec))
             self.conn.execute(
                 "INSERT INTO await_sources (group_id, kind, spec, watermark, interval_sec, "
-                "next_check_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "next_check_at, label) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     group_id,
                     src.kind,
@@ -281,6 +285,7 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
                     src.watermark,
                     interval,
                     now + interval,
+                    src.label,
                 ),
             )
         return group_id

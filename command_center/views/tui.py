@@ -31,6 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
+from time import time as _epoch_now
 from typing import Any
 
 from rich.cells import cell_len
@@ -64,6 +65,7 @@ from textual.worker import Worker, WorkerState, get_current_worker
 
 from .. import (
     accounts,
+    await_view,
     cachettl,
     colors,
     config,
@@ -87,6 +89,7 @@ from .. import (
     watchdog,
 )
 from ..adapters.claude import ClaudeAdapter
+from ..await_view import AWAITING_HINT, AWAITING_LABEL, AwaitEntry, visible_awaits
 from ..core import Row, build_rows
 from ..models import (
     DEFAULT_LLM,
@@ -565,6 +568,31 @@ def _draft_id_cell(session: Session) -> Text:
         uri = future_files.obsidian_uri(session.future_file)
         text.stylize(Style(link=uri), 0, len(hash_))
     return text
+
+
+def _read_awaits(store: Store) -> list[AwaitEntry]:
+    """The AWAITING section's snapshot, read on the refresh worker's own store. Best
+    effort: a failed read shows no section instead of costing the whole repaint."""
+    try:
+        return visible_awaits(store)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return []
+
+
+def _await_row_cells(entry: AwaitEntry, now: float, root: str | None) -> list[Text]:
+    """One AWAITING row: ``◷`` · the target folder · its short id · in ``/aim`` the
+    group summary (sources — state · until · next probe) then the session's AIM, dim."""
+    cells = [Text("") for _ in _HEADERS]
+    style = "bold red" if entry.group.state == "blocked" else _DRAFT_BLUE
+    cells[0] = Text("◷", style=style)  # one cell wide, like every status icon
+    cells[_FOLDER_COL] = Text("  " + colors.short_folder(entry.cwd, root), style=_DRAFT_BLUE)
+    cells[_ID_COL] = Text("  " + entry.group.session_id[:4], style="grey50")
+    aim = Text("  " + await_view.summary(entry.group, entry.sources, now), style=style)
+    if label := await_view.aim_text(entry):
+        aim.append("  │ ", style="grey42")
+        aim.append(label, style="grey62")
+    cells[_AIM_COL] = aim
+    return cells
 
 
 def _draft_next_cell(session: Session, base_style: str) -> Text:
@@ -2160,6 +2188,11 @@ class CommandCenterApp(App[None]):
         # Category-divider rows that _fit_rule_separators paints as a full-width blue
         # rule once the real column widths are known: sep row key → category name.
         self._rule_seps: dict[str, str] = {}
+        # `ccc await` groups for the AWAITING section (read by the refresh worker, never
+        # on the UI thread) and its rows: await row key → the target session id, so
+        # Enter on an await row moves the cursor to that session's row.
+        self._awaits: list[AwaitEntry] = []
+        self._await_targets: dict[str, str] = {}
         self._show_finished = False  # DONE (green) hidden by default; toggled by `td`
         self._show_future = True  # FUTURE jobs (blue) shown by default; toggled by `tf`
         # Leader-chord state (`td`/`tf` = toggles, `ah` = aim-history): the pending leader
@@ -2467,7 +2500,8 @@ class CommandCenterApp(App[None]):
                     include_future=self._show_future,
                     reconcile_first=False,
                 )
-            self.call_from_thread(self._apply_rows, quick)
+                quick_awaits = _read_awaits(store)
+            self.call_from_thread(self._apply_rows, quick, None, quick_awaits)
         # One read per configured CODEX_HOME, off the UI thread (see the docstring). A
         # failed read is a None snapshot (the card's placeholder), never an aborted build.
         snapshots: dict[str, usage.Usage | None] = {}
@@ -2494,13 +2528,17 @@ class CommandCenterApp(App[None]):
                 codex_usage=snapshots.get("default"),
             )
             self._sync_tab_badges(rows, store)  # AppleScript spawn — belongs off-loop too
+            awaits = _read_awaits(store)
         if get_current_worker().is_cancelled:
             return  # superseded by a newer refresh — let that one repaint
         # Rows AND snapshots in ONE handoff: a build that raises publishes neither.
-        self.call_from_thread(self._apply_rows, rows, snapshots)
+        self.call_from_thread(self._apply_rows, rows, snapshots, awaits)
 
     def _apply_rows(
-        self, rows: list[Row], codex_usage: dict[str, usage.Usage | None] | None = None
+        self,
+        rows: list[Row],
+        codex_usage: dict[str, usage.Usage | None] | None = None,
+        awaits: list[AwaitEntry] | None = None,
     ) -> None:
         # UI thread: everything the old refresh_data did AFTER build_rows, minus
         # _sync_tab_badges (now done in the worker).
@@ -2511,6 +2549,8 @@ class CommandCenterApp(App[None]):
         # which leaves the previous map (empty at startup) in place.
         if codex_usage is not None:
             self._codex_usage = codex_usage
+        if awaits is not None:  # None = the caller read none; keep the last section
+            self._awaits = awaits
         table = self.query_one("#sessions", DataTable)
         previous = self._current
         table.clear()
@@ -2545,6 +2585,17 @@ class CommandCenterApp(App[None]):
         self._sep_seq = 0
         self._sep_category = {}
         self._rule_seps = {}
+        self._await_targets = {}
+        awaiting_added = False
+
+        def add_awaiting() -> None:
+            # The AWAITING block closes the active part: directly above FUTURE (or
+            # FINISHED / SCHEDULED when FUTURE is off), else at the very bottom.
+            nonlocal awaiting_added
+            if not awaiting_added:
+                awaiting_added = True
+                self._add_awaiting_section(table)
+
         current_category: str | None = None
         finished_started = False
         future_started = False
@@ -2558,6 +2609,8 @@ class CommandCenterApp(App[None]):
                 # separator mid-active-section (nor a stray category splitter).
                 self._add_session_row(table, row, indent_repo=not (row.is_draft or row.is_finished))
                 continue
+            if row.is_draft or row.is_finished:
+                add_awaiting()
             if row.is_draft and scheduled_date(row.session) is not None:
                 # SCHEDULED — future jobs with a FIXED start date, the very bottom block
                 # (they sort after FINISHED). Keep the FUTURE divider above it so the
@@ -2596,6 +2649,7 @@ class CommandCenterApp(App[None]):
             self._add_session_row(table, row, indent_repo=True)
         # No drafts and no FINISHED block above to anchor it → still surface an empty
         # FUTURE line at the bottom so `tf` always toggles at least this one line.
+        add_awaiting()
         if self._show_future and not future_started:
             self._add_future_separator(table, has_jobs=has_future)
         # Keep selection if possible, else land on the first real session.
@@ -2905,6 +2959,29 @@ class CommandCenterApp(App[None]):
         key = self._next_sep_key()
         self._rule_seps[key] = f"{_SCHEDULED_LABEL}  (fixed start date · r / Enter asks first)"
         table.add_row(*cells, key=key)
+
+    def _add_awaiting_section(self, table: DataTable) -> None:
+        """The ``AWAITING`` rule plus one row per active ``ccc await`` group.
+
+        Read-only: renders the snapshot the refresh worker read (:func:`_read_awaits`) —
+        never probes a source or writes. Nothing at all when no group is active. The rows
+        carry ``__sep__`` keys, so every session action ignores them; Enter moves the
+        cursor to the target session's row (``_await_targets``,
+        :meth:`on_data_table_row_selected`).
+        """
+        if not self._awaits:
+            return
+        cells = [Text("") for _ in _HEADERS]
+        # Bare word as the pre-layout fallback (see _add_future_separator).
+        cells[_FOLDER_COL] = Text(AWAITING_LABEL, style=f"bold {_DRAFT_BLUE}")
+        key = self._next_sep_key()
+        self._rule_seps[key] = f"{AWAITING_LABEL}  {AWAITING_HINT}"
+        table.add_row(*cells, key=key)
+        now = _epoch_now()
+        for entry in self._awaits:
+            key = self._next_sep_key()
+            self._await_targets[key] = entry.group.session_id
+            table.add_row(*_await_row_cells(entry, now, self._root), key=key)
 
     def _add_category_splitter(self, table: DataTable, category: str) -> None:
         """A full-line header naming one repo category; its repos nest beneath it.
@@ -4328,6 +4405,14 @@ class CommandCenterApp(App[None]):
         the field instead — so this only fires in whole-row mode.
         """
         key = event.row_key.value
+        if key in self._await_targets:  # an AWAITING row → its session's row, if listed
+            target = self._await_targets[key]
+            if target in self._rows:
+                try:
+                    event.data_table.move_cursor(row=event.data_table.get_row_index(target))
+                except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                    pass
+            return
         if not key or key.startswith("__sep__") or self.store is None:
             return
         if self.store.get(key) is None:

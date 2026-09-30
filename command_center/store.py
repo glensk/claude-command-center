@@ -603,6 +603,12 @@ class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
         "protected_until": "INTEGER NOT NULL DEFAULT 0",
     }
 
+    # Same, for the await_sources table (await_store.AWAIT_SCHEMA). '' = no label, which
+    # is what every source armed before ``ccc await -L`` existed correctly means.
+    _ADDED_AWAIT_SOURCE_COLUMNS = {
+        "label": "TEXT NOT NULL DEFAULT ''",
+    }
+
     def _add_column(self, table: str, column: str, decl: str) -> None:
         """``ALTER TABLE`` *table* to add *column*, tolerating a peer that just did it.
 
@@ -617,6 +623,13 @@ class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
         except sqlite3.OperationalError as exc:
             if "duplicate column" not in str(exc).lower():
                 raise
+
+    def _ensure_table_columns(self, table: str, added: dict[str, str]) -> None:
+        """ALTER every column of *added* that *table* does not have yet into it."""
+        existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+        for column, decl in added.items():
+            if column not in existing:
+                self._add_column(table, column, decl)
 
     def _ensure_columns(self) -> None:
         existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(sessions)")}
@@ -643,6 +656,7 @@ class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
         for column, decl in self._ADDED_FILE_LOCK_COLUMNS.items():
             if column not in fl_existing:
                 self._add_column("file_locks", column, decl)
+        self._ensure_table_columns("await_sources", self._ADDED_AWAIT_SOURCE_COLUMNS)
         # Partial index for the armed-fire scan (statusline chip + daemon dispatch).
         # Created HERE, not in _SCHEMA: an old DB only gains fire_at via the ALTER
         # loop above, and an index referencing a missing column would fail the open.

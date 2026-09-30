@@ -8,11 +8,13 @@ to plain text when piped or under ``NO_COLOR``.
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
-from .. import accounts, cachettl, config, repos, resume, tabsymbol
+from .. import accounts, await_view, cachettl, colors, config, repos, resume, tabsymbol
 from ..adapters.base import Adapter
 from ..adapters.claude import ClaudeAdapter
 from ..core import Row, build_rows
@@ -63,6 +65,7 @@ _CACHE_COLOR = {
     "running": _STATUS_COLOR[Status.WORKING],
 }
 _DIM = 240
+_AWAIT_BLUE = 75  # xterm #5fafff — the TUI's FUTURE / AWAITING blue
 _WHITE = 15
 _BLACK = 16
 _BLUE = 39  # the unresolved-drift dot
@@ -295,6 +298,34 @@ def _quote(path: str) -> str:
     return urllib.parse.quote(path, safe="")
 
 
+def _awaiting_block(store: Store, enabled: bool, root: str | None = None) -> list[str]:
+    """The trailing ``AWAITING`` block: one plain line per active ``ccc await`` group
+    (folder · short id · sources — state · until · next probe │ AIM). Empty when no
+    group is active. Read-only, like the rest of ``ccc ls``; a failed read shows nothing."""
+    try:
+        entries = await_view.visible_awaits(store)
+    except sqlite3.Error:
+        return []
+    if not entries:
+        return []
+    now = time.time()
+    out = [
+        "",
+        _paint(_AWAIT_BLUE, f"{await_view.AWAITING_LABEL}  {await_view.AWAITING_HINT}", enabled),
+    ]
+    for entry in entries:
+        color = 196 if entry.group.state == "blocked" else _AWAIT_BLUE
+        line = (
+            f"◷ group {entry.group.id}  {colors.short_folder(entry.cwd, root)}  "
+            f"{entry.group.session_id[:4]}  "
+            f"{await_view.summary(entry.group, entry.sources, now)}"
+        )
+        if aim := await_view.aim_text(entry):
+            line += f"  │ {aim}"
+        out.append(_paint(color, line, enabled))
+    return out
+
+
 def render(
     store: Store,
     adapter: Adapter,
@@ -311,7 +342,8 @@ def render(
     )
     enabled = _color_enabled()
     if not rows:
-        return _paint(_DIM, "No Claude Code sessions tracked yet.", enabled)
+        empty = [_paint(_DIM, "No Claude Code sessions tracked yet.", enabled)]
+        return "\n".join(empty + _awaiting_block(store, enabled))
     # Resolved once per listing; drives the home-icon marker. Identity-corrected, so a drifted
     # login marks each row with the account it TRULY bills — one .claude.json read per configured
     # account here, never one per row (see accounts.effective_home_markers).
@@ -356,4 +388,5 @@ def render(
     )
     out.append("")
     out.append(summary)
+    out.extend(_awaiting_block(store, enabled, root))
     return "\n".join(out)

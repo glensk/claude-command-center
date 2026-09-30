@@ -72,6 +72,8 @@ def add_parser(sub: Any, func: Any) -> argparse.ArgumentParser:
             "examples:\n"
             "  ccc await -z 123 -u 2026-10-05 -m 'The requester replied: {event}. Continue.' -C\n"
             "  ccc await -S U012AB3CD -z 123 -u 3d -m 'Answer arrived: {event}'\n"
+            "  ccc await -z 123 -x 'test -f done' -L 'vendor reply' -L 'build flag' ...\n"
+            "                          # -L names sources: every -z, then -S, then -x\n"
             "  ccc await -x 'gh pr checks 12 --required' -i 300 -u 1d -m 'CI done: {event}'\n"
             "  ccc await -l            # this session's groups (-A: every session)\n"
             "  ccc await -d 7          # disarm group 7 (-d all: this session's)\n"
@@ -103,6 +105,17 @@ def add_parser(sub: Any, func: Any) -> argparse.ArgumentParser:
         default=[],
         metavar="CMD",
         help="fire when this shell predicate exits 0 (its stdout is the event)",
+    )
+    p.add_argument(
+        "-L",
+        "--label",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help=(
+            "optional display name for a source (repeatable); labels go to the sources in "
+            "the order every -z, then every -S, then every -x, each as given"
+        ),
     )
     p.add_argument(
         "-i",
@@ -299,7 +312,25 @@ def _validate_arm(args: argparse.Namespace, now: float) -> int:
         raise AwaitError(problem, EXIT_USAGE)
     if args.interval < MIN_INTERVAL_SEC:
         raise AwaitError(f"-i/--interval must be >= {MIN_INTERVAL_SEC}", EXIT_USAGE)
+    n_sources = len(args.zoho) + len(args.slack_dm) + len(args.cmd)
+    if len(args.label) > n_sources:
+        raise AwaitError(f"{len(args.label)} -L label(s) for {n_sources} source(s)", EXIT_USAGE)
     return parse_until(args.until, now)
+
+
+def clean_label(text: str) -> str:
+    """A ``-L`` label as stored: control characters and runs of whitespace collapsed to
+    one space, capped at 80 characters (display only — it never reaches a shell)."""
+    flat = "".join(ch if ch.isprintable() else " " for ch in text or "")
+    return " ".join(flat.split())[:80]
+
+
+def apply_labels(sources: list[Any], labels: list[str]) -> list[Any]:
+    """Give ``labels[i]`` to ``sources[i]`` — sources are built every ``-z``, then every
+    ``-S``, then every ``-x`` (argparse keeps no order ACROSS the three options)."""
+    for src, label in zip(sources, labels, strict=False):
+        src.label = clean_label(label)
+    return sources
 
 
 def _check_close(session: Any, sid: str) -> None:
@@ -337,7 +368,7 @@ def _baselines(args: argparse.Namespace, cwd: str, runner: Any) -> list[Any]:
     sources = [_zoho_source(t, args.interval, runner) for t in args.zoho]
     sources += [_slack_source(u, args.interval, runner) for u in args.slack_dm]
     sources += [_cmd_source(c, cwd, args.interval) for c in args.cmd]
-    return sources
+    return apply_labels(sources, args.label)
 
 
 def _arm(args: argparse.Namespace, runner: Any) -> int:
@@ -415,6 +446,7 @@ def _group_json(group: Any, sources: list[Any]) -> dict[str, Any]:
             {
                 "id": s.id,
                 "kind": s.kind,
+                "label": s.label,
                 "state": s.state,
                 "next_check_at": s.next_check_at,
                 "fail_count": s.fail_count,
@@ -445,9 +477,10 @@ def _list(args: argparse.Namespace) -> int:
         )
         for src in sources:
             err = f"  last error: {src.last_error}" if src.last_error else ""
+            label = f"  [{src.label}]" if src.label else ""
             print(
                 f"    source {src.id}  {src.kind:<10}  {src.state:<8}  "
-                f"next {_fmt(src.next_check_at)}  fails {src.fail_count}{err}"
+                f"next {_fmt(src.next_check_at)}  fails {src.fail_count}{label}{err}"
             )
     return 0
 
@@ -521,7 +554,9 @@ def cmd_await(args: argparse.Namespace, *, runner: Any = None) -> int:
 
         runner = run_structured
     verb = args.run or args.list or bool(args.disarm) or args.retry is not None
-    arming = bool(args.zoho or args.slack_dm or args.cmd or args.message or args.until)
+    arming = bool(
+        args.zoho or args.slack_dm or args.cmd or args.message or args.until or args.label
+    )
     if verb and (arming or args.close):
         print("error: -l, -d, -R and -r cannot be combined with arming", file=sys.stderr)
         return EXIT_USAGE

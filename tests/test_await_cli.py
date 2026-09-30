@@ -307,3 +307,40 @@ def test_an_unstamped_single_account_session_snapshots_the_default_dir(
     with Store() as store:
         group = store.active_await(SID)
     assert group is not None and group.config_dir == str(accounts.default_config_dir())
+
+
+# --------------------------------------------------------------------------- -L labels
+def test_labels_go_to_zoho_then_slack_then_cmd(env: dict[str, Any], capsys: Any) -> None:
+    code = _run(
+        "-x", "test -f done", "-S", "U1AB", "-z", "209",
+        "-L", "vendor\nreply", "-L", "boss DM",
+        "-u", "1d", "-m", "{event}", runner=_runner(),
+    )  # fmt: skip
+    assert code == 0
+    with Store() as store:
+        [(_g, sources)] = store.list_awaits(SID)
+    # -z first, then -S, then -x (argparse keeps no order across options); control
+    # characters are flattened, and a source without a label keeps ''.
+    assert [(s.kind, s.label) for s in sources] == [
+        ("zoho-reply", "vendor reply"),
+        ("slack-dm", "boss DM"),
+        ("cmd", ""),
+    ]
+    capsys.readouterr()
+    assert _run("-l") == 0
+    assert "[vendor reply]" in capsys.readouterr().out
+    assert _run("-l", "-j") == 0
+    labels = [s["label"] for s in json.loads(capsys.readouterr().out)[0]["sources"]]
+    assert labels == ["vendor reply", "boss DM", ""]
+
+
+def test_more_labels_than_sources_is_refused(env: dict[str, Any], capsys: Any) -> None:
+    code = _run("-z", "209", "-L", "a", "-L", "b", "-u", "1d", "-m", "{event}", runner=_runner())
+    assert code == 2 and "2 -L label(s) for 1 source(s)" in capsys.readouterr().err
+    with Store() as store:
+        assert store.list_awaits(SID, include_inactive=True) == []
+
+
+def test_label_with_a_verb_is_refused(env: dict[str, Any], capsys: Any) -> None:
+    assert _run("-l", "-L", "x") == 2
+    assert "cannot be combined" in capsys.readouterr().err
