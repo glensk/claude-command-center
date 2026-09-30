@@ -112,18 +112,34 @@ def _clock(epoch: int, now: float) -> str:
     return stamp.strftime("%H:%M" if same_day else "%m-%d %H:%M")
 
 
+def delivery_marker(group: AwaitGroup) -> str:
+    """``→ new session`` (``ccc await -F``) or ``→ resume`` — how the event is delivered."""
+    return "→ new session" if group.fresh else "→ resume"
+
+
+def delivery_mode_text(group: AwaitGroup, cwd: str, root: str | None = None) -> str:
+    """The detail pane's ``Delivery mode``: ``fresh — starts a new session in <folder>``
+    or ``resume <short id>``."""
+    if group.fresh:
+        from . import colors  # pylint: disable=import-outside-toplevel
+
+        return f"fresh — starts a new session in {colors.short_folder(cwd, root)}"
+    return f"resume {group.session_id[:8]}"
+
+
 def summary(group: AwaitGroup, sources: list[AwaitSource], now: float) -> str:
-    """``zoho #123 · slack DM U1 — armed · until 2026-10-05 23:59 · next 14:02``.
+    """``zoho #123 · slack DM U1 — armed · until 2026-10-05 23:59 · next 14:02 · → resume``.
 
     Every source is listed (the fired winner and disarmed losers included, so the line
     still says what the group waited on); the next-probe part appears only while a
-    source is still armed.
+    source is still armed; the :func:`delivery_marker` closes the line.
     """
     what = " · ".join(source_text(s) for s in sources) or "(no sources)"
     parts = [state_text(group), f"until {_date(group.until_epoch)}"]
     probe = next_probe(sources) if group.state in ("armed", "grace") else 0
     if probe:
         parts.append(f"next {_clock(probe, now)}")
+    parts.append(delivery_marker(group))
     return f"{what} — " + " · ".join(parts)
 
 
@@ -237,8 +253,9 @@ def detail_lines(
     Read-only and pure (no store, no clock; *root* is the resolved repo root, see
     ``colors.short_folder``): Purpose, Related items, Target session,
     one ``Source N`` per source (kind, label, FULL spec, state, next probe, fail count,
-    last error), Until, Group state, Armed at, Delivery channels (the recorded
-    *channels*, :func:`channel_detail_text`), Resume prompt (the template, full text).
+    last error), Until, Group state, Armed at, Delivery mode (:func:`delivery_mode_text`),
+    Delivery channels (the recorded *channels*, :func:`channel_detail_text`), Resume
+    prompt (the template, full text).
     """
     group = entry.group
     lines: list[tuple[str, str]] = [
@@ -254,6 +271,7 @@ def detail_lines(
         ("Until", _date(group.until_epoch)),
         ("Group state", f"{state_text(group)}  (group {group.id})"),
         ("Armed at", _date(group.created_at)),
+        ("Delivery mode", delivery_mode_text(group, entry.cwd, root)),
         ("Delivery channels", channel_detail_text(channels, now)),
         ("Resume prompt", group.prompt_template or "—"),
     ]

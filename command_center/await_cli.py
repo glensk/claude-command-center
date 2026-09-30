@@ -75,7 +75,9 @@ def add_parser(sub: Any, func: Any) -> argparse.ArgumentParser:
             "grace for events dated before the deadline) with a notification.\n\n"
             "Arming needs -P/--purpose: one or two sentences saying what the session\n"
             "waits for and what the event will resolve (>= 20 characters). -T names the\n"
-            "related work items (repeatable).\n\n"
+            "related work items (repeatable). -F delivers into a NEW session (claude\n"
+            "without --resume, in the session's folder and account) that starts with a\n"
+            "short note on where it comes from — the old transcript is not loaded.\n\n"
             "examples:\n"
             "  ccc await -z 123 -u 2026-10-05 -C \\\n"
             "      -m 'The requester replied: {event}. Continue.' -T zoho#123 \\\n"
@@ -87,6 +89,9 @@ def add_parser(sub: Any, func: Any) -> argparse.ArgumentParser:
             "                          # -L names sources: every -z, then -S, then -x\n"
             "  ccc await -x 'gh pr checks 12 --required' -i 300 -u 1d -m 'CI done: {event}' \\\n"
             "      -P 'Waiting for the required CI checks of PR 12 before merging it.' -T tp#12\n"
+            "  ccc await -F -x 'gh run watch 42 --exit-status' -u 1d -C \\\n"
+            "      -m 'The nightly run finished: {event}. Pick up the plan.' \\\n"
+            "      -P 'Continue the migration in a fresh session once the nightly run passes.'\n"
             "  ccc await -l            # this session's groups (-A: every session)\n"
             "  ccc await -d 7          # disarm group 7 (-d all: this session's)\n"
             "  ccc await -R 7          # retry a blocked group\n"
@@ -145,6 +150,15 @@ def add_parser(sub: Any, func: Any) -> argparse.ArgumentParser:
         default=[],
         metavar="REF",
         help="a related work item (repeatable), e.g. zoho#256, tp#123, SD-69829 or a URL",
+    )
+    p.add_argument(
+        "-F",
+        "--fresh",
+        action="store_true",
+        help=(
+            "deliver into a NEW Claude session (no --resume) in the session's folder and "
+            "account, never typed into a live tab; the prompt starts with where it comes from"
+        ),
     )
     p.add_argument(
         "-i",
@@ -465,6 +479,7 @@ def _arm(args: argparse.Namespace, runner: Any) -> int:
             "close": bool(args.close),
             "purpose": clean_purpose(args.purpose),
             "items": clean_items(args.item),
+            "fresh": bool(args.fresh),
             "sources": [dataclasses.asdict(s) for s in sources],
         }
         if args.dry_run:
@@ -487,6 +502,7 @@ def _arm(args: argparse.Namespace, runner: Any) -> int:
             "now": int(now),
             "purpose": preview["purpose"],
             "items": preview["items"],
+            "fresh": preview["fresh"],
         }
         try:
             if args.close:
@@ -500,9 +516,15 @@ def _arm(args: argparse.Namespace, runner: Any) -> int:
         args,
         {"group_id": group_id, **preview},
         f"armed await group {group_id} on {sid[:8]}: {kinds}; until {_fmt(until)}"
+        + ("; delivers into a NEW session" if args.fresh else "")
         + ("; this tab closes after the turn" if args.close else ""),
     )
     return 0
+
+
+def mode_text(group: Any) -> str:
+    """``fresh session`` (``-F``: a new session) or ``resume`` (the default)."""
+    return "fresh session" if group.fresh else "resume"
 
 
 def _group_json(group: Any, sources: list[Any]) -> dict[str, Any]:
@@ -517,6 +539,8 @@ def _group_json(group: Any, sources: list[Any]) -> dict[str, Any]:
         "delivery_attempts": group.delivery_attempts,
         "purpose": group.purpose,
         "items": group.items_list(),
+        "fresh": bool(group.fresh),
+        "mode": mode_text(group),
         "sources": [
             {
                 "id": s.id,
@@ -551,6 +575,7 @@ def _list(args: argparse.Namespace) -> int:
             f"until {_fmt(group.until_epoch)}{extra}"
         )
         print(f"    purpose: {group.purpose or '(no purpose recorded)'}")
+        print(f"    mode: {mode_text(group)}")
         if items := group.items_list():
             print(f"    items: {', '.join(items)}")
         for src in sources:
@@ -641,6 +666,7 @@ def cmd_await(args: argparse.Namespace, *, runner: Any = None) -> int:
         or args.label
         or args.purpose
         or args.item
+        or args.fresh
     )
     if verb and (arming or args.close):
         print("error: -l, -d, -R and -r cannot be combined with arming", file=sys.stderr)

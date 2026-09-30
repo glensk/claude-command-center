@@ -14,8 +14,11 @@ from command_center.await_prompt import (
     clean_text,
     clip_bytes,
     compose_prompt,
+    delivery_prompt,
+    fresh_preamble,
     template_error,
 )
+from command_center.await_store import AwaitGroup
 
 
 def _event(snippet: str, **over: str) -> Event:
@@ -106,3 +109,43 @@ def test_template_errors(template: str, fragment: str) -> None:
 
 def test_a_good_template_passes() -> None:
     assert template_error("The requester replied: {event}.\nContinue.") == ""
+
+
+def _group(**over: object) -> AwaitGroup:
+    base: dict[str, object] = {
+        "id": 7,
+        "session_id": "1a2b3c4d-1111-2222-3333-444444444444",
+        "cwd": "/work/repo",
+        "prompt_template": "Run done: {event}.",
+        "event_payload": '{"snippet":"ok"}',
+        "created_at": 1_790_000_000,
+        "purpose": "Continue the migration once the nightly run passes",
+        "items": '["tp#12", "zoho#256"]',
+        "fresh": True,
+    }
+    base.update(over)
+    return AwaitGroup(**base)  # type: ignore[arg-type]
+
+
+def test_fresh_preamble_names_group_session_folder_purpose_and_items() -> None:
+    text = fresh_preamble(_group())
+    assert text.startswith(
+        "This is a NEW session started by ccc await group 7 (armed by session 1a2b3c4d "
+        "in /work/repo on 2026-09-"
+    )
+    assert "Purpose: Continue the migration once the nightly run passes. " in text
+    assert "Related items: tp#12, zoho#256. " in text
+    assert "transcript is NOT loaded — rely on the repo's plan/tickets.\n\n" in text
+    assert text.count("\n") == 2  # one paragraph, then the blank line
+
+
+def test_fresh_preamble_without_purpose_or_items() -> None:
+    text = fresh_preamble(_group(purpose="", items="[]"))
+    assert "Purpose: (no purpose recorded). Related items: none." in text
+
+
+def test_delivery_prompt_prefixes_only_fresh_groups() -> None:
+    fresh = _group()
+    composed = compose_prompt(fresh.prompt_template, fresh.event_payload)
+    assert delivery_prompt(fresh) == fresh_preamble(fresh) + composed
+    assert delivery_prompt(_group(fresh=False)) == composed

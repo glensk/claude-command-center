@@ -25,6 +25,12 @@ The group is an outbox row keyed by its ``delivery_token``:
   A launcher that returns False (or an exec that fails) moves the group back to
   ``fired`` under the same token, at most :data:`MAX_ATTEMPTS` times, then ``blocked``.
 
+* **Fresh group** (``ccc await -F``) — never typed into a tab, live or not: always the
+  new-tab path, whose ``fire-await`` execs ``claude "<preamble + prompt>"`` WITHOUT
+  ``--resume`` (a new session, so a live old session is no double-resume). Preflight
+  skips the two checks that only protect a resume (the old transcript, a pending
+  attached prompt); a failed registry read does not hold it back either.
+
 A ``delivering`` row nobody finished within :data:`STALE_DELIVERY_SEC` (a crash
 between the CAS and the send, a tab that never ran ``fire-await``) is handed back the
 same way. When the live-session registry cannot be read, NOTHING is delivered that
@@ -51,7 +57,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import accounts
-from .await_prompt import compose_prompt
+from .await_prompt import delivery_prompt
 from .await_store import AwaitGroup
 
 if TYPE_CHECKING:
@@ -98,20 +104,26 @@ def preflight(  # pylint: disable=too-many-return-statements  # one per check
         return "the session is done"
     if not group.config_dir and accounts.is_multi_account():
         return "the session's account is unknown"
-    if account_transcript(group.config_dir, group.cwd, group.session_id) is None:
+    if (
+        not group.fresh
+        and account_transcript(group.config_dir, group.cwd, group.session_id) is None
+    ):
         return "no transcript under the session's own account"
     if not group.cwd or not os.path.isdir(group.cwd):
         return "the session's working directory is missing"
     if not accounts.is_trusted(group.config_dir, group.cwd):
         return "the working directory is not trusted for the session's account"
-    if session.fire_at > 0 and (session.prompt or "").strip():
+    if not group.fresh and session.fire_at > 0 and (session.prompt or "").strip():
         return "wait"
     return ""
 
 
 def live_verdict(group: AwaitGroup, live: LiveSession | None) -> str:
-    """``closed`` / ``type`` (idle live tab) / ``wait`` (live but not typeable now)."""
-    if live is None or not live.alive:
+    """``closed`` / ``type`` (idle live tab) / ``wait`` (live but not typeable now).
+
+    A fresh group is always ``closed``: it starts a NEW session in a new tab, so the old
+    session's liveness does not matter."""
+    if group.fresh or live is None or not live.alive:
         return "closed"
     typeable = all(
         (
@@ -201,8 +213,7 @@ def _deliver_one(ctx: _Ctx, group: AwaitGroup, live: LiveSession | None) -> None
         return  # another deliverer took it
     kind = _winner_kind(ctx.store, group)
     if verdict == "type":
-        prompt = compose_prompt(group.prompt_template, group.event_payload)
-        via = ctx.typer(tab, prompt)
+        via = ctx.typer(tab, delivery_prompt(group))
         if via and ctx.store.mark_delivered(group.id, token, ctx.now):
             ctx.report.delivered.append(group.id)
             channel = f" via {via}" if isinstance(via, str) else ""
@@ -218,9 +229,8 @@ def _deliver_one(ctx: _Ctx, group: AwaitGroup, live: LiveSession | None) -> None
         return
     if ctx.launcher(group.id, token):
         ctx.report.launched.append(group.id)
-        ctx.notify(
-            group.id, f"await group {group.id} fired ({kind}); session resuming in a new tab"
-        )
+        what = "a new session starting" if group.fresh else "session resuming"
+        ctx.notify(group.id, f"await group {group.id} fired ({kind}); {what} in a new tab")
     else:
         ctx.fail(group, token, "no terminal tab could be opened")
 
@@ -249,11 +259,15 @@ def deliver_pending(  # pylint: disable=too-many-arguments
     fired = store.await_groups_in("fired")
     if not fired:
         return
-    try:
-        live_map = {ls.session_id: ls for ls in (discover or _default_discover)()}
-    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-        report.waiting.extend(g.id for g in fired)
-        return  # fail closed: a live session misread as closed would resume twice
+    live_map: dict[str, LiveSession] = {}
+    if any(not g.fresh for g in fired):
+        try:
+            live_map = {ls.session_id: ls for ls in (discover or _default_discover)()}
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            # fail closed: a live session misread as closed would resume twice. A fresh
+            # group starts a new session, so it never needs the registry.
+            report.waiting.extend(g.id for g in fired if not g.fresh)
+            fired = [g for g in fired if g.fresh]
     for group in fired:
         _deliver_one(ctx, group, live_map.get(group.session_id))
 

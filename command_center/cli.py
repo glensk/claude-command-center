@@ -2535,12 +2535,13 @@ def cmd_fire_await(args: argparse.Namespace) -> int:
     the exec (at-most-once), so a second tab for the same token refuses. The account
     is pinned with ``accounts.pin_environ`` — trust is only CHECKED (it was granted at
     arm time), never granted here. A failed exec (or no terminal) hands the row back
-    (``fired`` for a bounded number of retries, then ``blocked``).
+    (``fired`` for a bounded number of retries, then ``blocked``). A ``-F/--fresh``
+    group execs ``claude "<preamble + prompt>"`` instead — a NEW session, no ``--resume``.
     """
     import time as _time
 
     from . import accounts, await_delivery
-    from .await_prompt import compose_prompt
+    from .await_prompt import delivery_prompt
 
     now = int(_time.time())
     with Store() as store:
@@ -2575,10 +2576,11 @@ def cmd_fire_await(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        prompt = compose_prompt(group.prompt_template, group.event_payload)
+        prompt = delivery_prompt(group)
+    argv = ["claude", prompt] if group.fresh else ["claude", "--resume", group.session_id, prompt]
     try:
         accounts.pin_environ(group.config_dir, group.no_codex)
-        _exec_in(group.cwd, ["claude", "--resume", group.session_id, prompt], strict=True)
+        _exec_in(group.cwd, argv, strict=True)
     except OSError as exc:
         with Store() as store:
             store.revert_delivery(
@@ -2586,9 +2588,12 @@ def cmd_fire_await(args: argparse.Namespace) -> int:
                 args.token,
                 int(_time.time()),
                 max_attempts=await_delivery.MAX_ATTEMPTS,
-                reason=f"resume failed: {type(exc).__name__}",
+                reason=f"{'launch' if group.fresh else 'resume'} failed: {type(exc).__name__}",
             )
-        print(f"error: could not resume {group.session_id}: {exc}", file=sys.stderr)
+        what = (
+            f"start a new session in {group.cwd}" if group.fresh else f"resume {group.session_id}"
+        )
+        print(f"error: could not {what}: {exc}", file=sys.stderr)
         return 1
     return 0  # unreachable on success (execvp replaced the process)
 

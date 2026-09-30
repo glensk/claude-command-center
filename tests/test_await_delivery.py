@@ -52,7 +52,7 @@ def env_fixture(tmp_path: Path) -> dict[str, Any]:
     return {"store": store, "acct": str(acct), "cwd": str(cwd), "tmp": tmp_path}
 
 
-def _fired(env: dict[str, Any], *, no_codex: bool = False) -> int:
+def _fired(env: dict[str, Any], *, no_codex: bool = False, fresh: bool = False) -> int:
     store: Store = env["store"]
     gid = store.arm_await(
         SID,
@@ -63,6 +63,9 @@ def _fired(env: dict[str, Any], *, no_codex: bool = False) -> int:
         until_epoch=NOW + 3600,
         sources=[SourceSpec(kind="zoho-reply", spec={}, watermark="w")],
         now=NOW,
+        purpose="Waiting for the requester to confirm the quota.",
+        items=["zoho#209", "tp#12"],
+        fresh=fresh,
     )
     [(src, _grp)] = store.lease_due_sources(NOW + 120)
     token = store.fire_group(
@@ -291,8 +294,10 @@ def test_account_transcript_is_account_local(env: dict[str, Any]) -> None:
 
 
 # --------------------------------------------------------------------------- fire-await
-def _claimable(env: dict[str, Any], *, no_codex: bool = False) -> tuple[int, str]:
-    gid = _fired(env, no_codex=no_codex)
+def _claimable(
+    env: dict[str, Any], *, no_codex: bool = False, fresh: bool = False
+) -> tuple[int, str]:
+    gid = _fired(env, no_codex=no_codex, fresh=fresh)
     group = env["store"].get_await_group(gid)
     assert env["store"].mark_delivering(gid, group.delivery_token, NOW)
     return gid, group.delivery_token
@@ -390,3 +395,97 @@ def test_pin_environ_never_grants_trust(monkeypatch: pytest.MonkeyPatch, tmp_pat
     accounts.pin_environ("", True)  # the default account: UNSET
     assert "CLAUDE_CONFIG_DIR" not in os.environ
     assert os.environ["CCC_NO_CODEX"] == "1"
+
+
+# --------------------------------------------------------------------------- -F/--fresh
+def test_fresh_group_with_an_idle_live_session_goes_to_the_launcher(env: dict[str, Any]) -> None:
+    gid = _fired(env, fresh=True)
+    report, typed, launched, notes = _deliver(env, live=[_live(env)])
+    token = env["store"].get_await_group(gid).delivery_token
+    assert not typed and launched == [(gid, token)]
+    assert report.launched == [gid] and _state(env, gid) == "delivering"
+    assert "new session" in notes.messages[0]
+
+
+def test_fresh_group_needs_no_old_transcript_nor_registry(env: dict[str, Any]) -> None:
+    for jsonl in Path(env["acct"]).glob("projects/*/*.jsonl"):
+        jsonl.unlink()
+    gid = _fired(env, fresh=True)
+    typed: list[Any] = []
+    launched: list[Any] = []
+
+    def broken() -> list[LiveSession]:
+        raise RuntimeError("registry unreadable")
+
+    def typer(tab: str, text: str) -> bool:
+        typed.append((tab, text))
+        return True
+
+    def launcher(group_id: int, token: str) -> bool:
+        launched.append((group_id, token))
+        return True
+
+    await_delivery.deliver_pending(
+        env["store"],
+        now=NOW + 200,
+        report=PassReport(),
+        notifier=Notes(),
+        discover=broken,
+        typer=typer,
+        launcher=launcher,
+    )
+    assert not typed and [g for g, _t in launched] == [gid]
+
+
+def test_resume_group_still_fails_closed_on_a_broken_registry(env: dict[str, Any]) -> None:
+    gid = _fired(env)
+    report = PassReport()
+
+    def broken() -> list[LiveSession]:
+        raise RuntimeError("registry unreadable")
+
+    await_delivery.deliver_pending(
+        env["store"],
+        now=NOW + 200,
+        report=report,
+        notifier=Notes(),
+        discover=broken,
+        typer=lambda *_a: pytest.fail("typed"),
+        launcher=lambda *_a: pytest.fail("launched"),
+    )
+    assert report.waiting == [gid] and _state(env, gid) == "fired"
+
+
+def _fire_await_exec_in(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, Any], gid: int, token: str
+) -> tuple[int, list[Any]]:
+    calls: list[Any] = []
+    _register_env(monkeypatch, env)
+    monkeypatch.setattr(cli, "Store", lambda: Store(env["tmp"] / "state.db"))
+    monkeypatch.setattr(cli, "_exec_in", lambda cwd, argv, **kw: calls.append((cwd, argv, kw)))
+    code = cli.cmd_fire_await(argparse.Namespace(group_id=gid, token=token))
+    return code, calls
+
+
+def test_fire_await_fresh_execs_a_new_session(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gid, token = _claimable(env, fresh=True)
+    code, calls = _fire_await_exec_in(monkeypatch, env, gid, token)
+    assert code == 0
+    [(cwd, argv, kw)] = calls
+    assert cwd == env["cwd"] and kw == {"strict": True}
+    assert len(argv) == 2 and argv[0] == "claude" and "--resume" not in argv
+    assert argv[1].startswith(f"This is a NEW session started by ccc await group {gid} ")
+    assert f"\n\n{FRAMING}" in argv[1] and "Reply arrived:" in argv[1]
+    assert os.environ.get("CLAUDE_CONFIG_DIR") == env["acct"]
+    assert _state(env, gid) == "delivered"
+
+
+def test_fire_await_resume_argv(env: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    gid, token = _claimable(env)
+    code, calls = _fire_await_exec_in(monkeypatch, env, gid, token)
+    assert code == 0
+    [(_cwd, argv, _kw)] = calls
+    assert argv[:3] == ["claude", "--resume", SID] and len(argv) == 4
+    assert argv[3].startswith(FRAMING) and "NEW session" not in argv[3]

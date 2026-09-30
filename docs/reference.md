@@ -51,7 +51,7 @@ flags. Grouped by what they do:
 - `ccc quota` — cache-first quota oracle: which provider/account still has tokens, when each allowance renews, and when each blocked one unblocks.
 - `ccc start-job <id>` / `ccc open-job <id>|--file` — launch a saved job (in place / in a new tab, safe from Obsidian). Prefer `open-job` from scripts and agents: `start-job` execs in place and refuses without a TTY (it opens a tab instead) — see "Terminal guard" below.
 - `ccc done-job` · `ccc delete-job` · `ccc restore-job` · `ccc unlaunch` — the lifecycle: done-without-running / trash / restore / back-to-draft.
-- `ccc await -z TICKET | -S USER | -x CMD [-L LABEL] -P PURPOSE [-T ITEM] -u DATE -m '…{event}…' [-C]` — park THIS session on an external event (a Zoho Desk reply, a Slack DM, a shell predicate) and resume it when the first one fires; `-l` / `-d` / `-R` / `-r` list, disarm, retry, run one pass. Active groups show in the TUI's `AWAITING` section and at the end of `ccc ls`. See "Await — resume a parked session on an external event" below.
+- `ccc await -z TICKET | -S USER | -x CMD [-L LABEL] -P PURPOSE [-T ITEM] -u DATE -m '…{event}…' [-C] [-F]` — park THIS session on an external event (a Zoho Desk reply, a Slack DM, a shell predicate) and resume it when the first one fires (`-F`: start a NEW session instead); `-l` / `-d` / `-R` / `-r` list, disarm, retry, run one pass. Active groups show in the TUI's `AWAITING` section and at the end of `ccc ls`. See "Await — resume a parked session on an external event" below.
 
 Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique prefix), not just the full UUID — exact match wins, an ambiguous prefix errors with the matches listed, matching is case-insensitive.
 
@@ -1093,12 +1093,41 @@ columns on first open and its groups read as `(no purpose recorded)` with no ite
 `ccc await -l` prints a `purpose:` (and, when set, an `items:`) line under each group,
 `-l -j` carries `purpose` and `items` fields.
 
+**Fresh delivery — `-F/--fresh`.** By default the event resumes THE waiting session
+(`claude --resume <id>`), so it wakes up with its whole old conversation. With `-F` the
+event starts a NEW session instead: `claude "<preamble + prompt>"`, no `--resume`, in
+the group's folder under the same pinned account — useful when the old context is stale
+or huge and the repo's plan/tickets carry the state. The group still belongs to (and
+occupies the one active slot of) the arming session, and `-C` still closes its tab.
+Stored as `await_groups.fresh` (0/1; an older DB gains the column on first open, its
+groups read as resume). A fresh group is NEVER typed into a live tab — it always takes
+the new-tab `ccc fire-await` path (same at-most-once claim, trust check and hand-back),
+and preflight skips the two checks that only protect a resume (the old transcript, a
+pending attached prompt). The new session's prompt starts with one paragraph:
+
+```text
+This is a NEW session started by ccc await group 7 (armed by session 1a2b3c4d in /path/to/repo on 2026-09-30). Purpose: Continue the migration once the nightly run passes. Related items: tp#12. The previous session's transcript is NOT loaded — rely on the repo's plan/tickets.
+```
+
+then a blank line and the usual framed prompt. `ccc await -l` prints `mode: fresh
+session` / `mode: resume` under each group, `-l -j` carries `fresh` and `mode`; the
+AWAITING row and the `ccc ls` line end with `→ new session` / `→ resume`, and the detail
+pane has a `Delivery mode:` line (`fresh — starts a new session in <folder>` / `resume
+<short id>`).
+
+```commands
+ccc await -F -x 'gh run watch 42 --exit-status' -u 1d -C \
+    -m 'The nightly run finished: {event}. Pick up the plan.' \
+    -P 'Continue the migration in a fresh session once the nightly run passes.'
+```
+
 **Seeing what is armed — the AWAITING section.** While at least one group is active
 (`armed`, `grace`, `fired`, `delivering` or `blocked` — never `delivered` / `expired` /
 `disarmed`), the TUI shows a full-width blue `AWAITING  (ccc await -l · -d GROUP
 disarms)` rule directly above `FUTURE` (at the end of the active block when `tf` hides
 FUTURE), with one `◷` row per group: the target folder, the session's short id, and in
-the `/aim` column `<sources> — <state> · until <deadline> · next <probe>` followed by
+the `/aim` column `<sources> — <state> · until <deadline> · next <probe> · → resume` (`→ new session`
+for a `-F` group) followed by
 `│ <the session's AIM>`. Each source reads as its label, else `zoho #<ticket>`,
 `slack DM <user>` or `cmd <first 40 chars>…`; a blocked group shows
 `blocked(<reason>)` in red; `next` is the soonest armed source's next probe (only while
@@ -1113,7 +1142,7 @@ channel that was down, `?` when nothing was ever recorded.
 
 ```text
 AWAITING  (ccc await -l · -d GROUP disarms)  Python API: ❌ · AppleScript: ✅ (checked 14:02)
-◷ group 7  work/repo  bbbb  vendor reply · slack DM U1AB — armed · until 2026-10-05 23:59 · next 14:02  │ the vendor answered
+◷ group 7  work/repo  bbbb  vendor reply · slack DM U1AB — armed · until 2026-10-05 23:59 · next 14:02 · → resume  │ the vendor answered
     ↳ Waiting for the vendor to confirm the quota fix before closing the ticket.  · items: zoho#256
 ```
 
@@ -1123,7 +1152,8 @@ pane describes that group, read-only, one field per line (`await_view.detail_lin
 `live (<status>)` — AIM), one `Source N` line per source (kind, `[label]`, its FULL spec
 — the whole shell command and its cwd for `cmd`, `ticket #N` for Zoho, `user U… (DM
 D…)` for Slack — then state, next probe, fail count and the last error), `Until`,
-`Group state` (with the blocked reason), `Armed at`, `Delivery channels` (the header's
+`Group state` (with the blocked reason), `Armed at`, `Delivery mode` (`fresh — starts a
+new session in <folder>` / `resume <short id>`), `Delivery channels` (the header's
 channel text plus, when the Python API is down, why — e.g. `Delivery channels: Python
 API: ❌ · AppleScript: ✅ (checked 14:02) — Python API: connection refused — iTerm
 Settings → General → Magic → Enable Python API`) and `Resume prompt` (the message
@@ -1161,7 +1191,9 @@ cwd is trusted for that account; and the session has no pending attached prompt
 - **live but busy / waiting / another account** → wait for the next pass;
 - **closed** → a new tab runs `ccc fire-await <group> <token>`, which claims the outbox
   row by its token BEFORE `claude --resume` (at-most-once). A launcher that fails hands
-  the row back, at most 3 times, then blocks it.
+  the row back, at most 3 times, then blocks it;
+- **fresh group (`-F`)** → always the new-tab path, live session or not: `fire-await`
+  execs `claude "<preamble + prompt>"` (a new session, no `--resume`).
 
 **The prompt** is a fixed framing (the event is untrusted data from an outside party;
 re-check the source before acting) followed by your template with `{event}` =

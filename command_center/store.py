@@ -609,11 +609,13 @@ class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
         "label": "TEXT NOT NULL DEFAULT ''",
     }
 
-    # Same, for the await_groups table. '' / '[]' = no purpose / no related items, which
-    # is what every group armed before ``ccc await -P`` / ``-T`` existed correctly means.
+    # Same, for the await_groups table. '' / '[]' / 0 = no purpose / no related items /
+    # resume delivery, which is what every group armed before ``ccc await -P`` / ``-T`` /
+    # ``-F`` existed correctly means.
     _ADDED_AWAIT_GROUP_COLUMNS = {
         "purpose": "TEXT NOT NULL DEFAULT ''",
         "items": "TEXT NOT NULL DEFAULT '[]'",
+        "fresh": "INTEGER NOT NULL DEFAULT 0",
     }
 
     def _add_column(self, table: str, column: str, decl: str) -> None:

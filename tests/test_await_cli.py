@@ -492,3 +492,35 @@ def test_every_help_example_that_arms_carries_a_purpose() -> None:
         b for b in blocks if "ccc await" in b and any(f" {o} " in b for o in ("-z", "-S", "-x"))
     ]
     assert arming and all(" -P " in b for b in arming), arming
+
+
+# --------------------------------------------------------------------------- -F/--fresh
+def test_fresh_is_parsed_stored_and_listed(env: dict[str, Any], capsys: Any) -> None:
+    assert _args("-F").fresh is True and _args("--fresh").fresh is True
+    assert _args().fresh is False
+    code = _run("-F", "-z", "209", "-u", "1d", "-m", "{event}", "-P", PURPOSE, runner=_runner())
+    assert code == 0
+    assert "delivers into a NEW session" in capsys.readouterr().out
+    with Store() as store:
+        [(group, _s)] = store.list_awaits(SID)
+    assert group.fresh is True
+    assert _run("-l") == 0
+    assert "    mode: fresh session" in capsys.readouterr().out
+    assert _run("-l", "-j") == 0
+    [row] = json.loads(capsys.readouterr().out)
+    assert row["fresh"] is True and row["mode"] == "fresh session"
+
+
+def test_default_mode_is_resume(env: dict[str, Any], capsys: Any) -> None:
+    assert _run("-z", "209", "-u", "1d", "-m", "{event}", "-P", PURPOSE, runner=_runner()) == 0
+    capsys.readouterr()
+    assert _run("-l") == 0
+    assert "    mode: resume" in capsys.readouterr().out
+    assert _run("-l", "-j") == 0
+    [row] = json.loads(capsys.readouterr().out)
+    assert row["fresh"] is False and row["mode"] == "resume"
+
+
+def test_fresh_with_a_verb_is_refused(env: dict[str, Any], capsys: Any) -> None:
+    assert _run("-l", "-F") == 2
+    assert "cannot be combined" in capsys.readouterr().err

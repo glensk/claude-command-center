@@ -104,10 +104,12 @@ def test_purpose_and_items_columns_are_added_to_an_older_db(tmp_path: Path) -> N
     old_schema = AWAIT_SCHEMA.replace(
         "updated_at         INTEGER NOT NULL DEFAULT 0,\n"
         "    purpose            TEXT    NOT NULL DEFAULT '',\n"
-        "    items              TEXT    NOT NULL DEFAULT '[]'\n",
+        "    items              TEXT    NOT NULL DEFAULT '[]',\n"
+        "    fresh              INTEGER NOT NULL DEFAULT 0\n",
         "updated_at         INTEGER NOT NULL DEFAULT 0\n",
     )
     assert "purpose" not in old_schema and "items " not in old_schema
+    assert "fresh" not in old_schema
     conn = sqlite3.connect(db)
     conn.executescript(store_mod._SCHEMA + old_schema)  # noqa: SLF001
     conn.execute("INSERT INTO sessions (session_id, cwd) VALUES ('s1', '/repo')")
@@ -121,8 +123,9 @@ def test_purpose_and_items_columns_are_added_to_an_older_db(tmp_path: Path) -> N
     with Store(db) as store:
         cols = {r["name"] for r in store.conn.execute("PRAGMA table_info(await_groups)")}
         [(group, _sources)] = store.list_awaits("s1")
-    assert {"purpose", "items"} <= cols
+    assert {"purpose", "items", "fresh"} <= cols
     assert group.purpose == "" and group.items_list() == []
+    assert group.fresh is False and await_view.delivery_marker(group) == "→ resume"
     assert await_view.purpose_text(group) == await_view.NO_PURPOSE
 
 
@@ -152,6 +155,7 @@ def test_summary_state_until_and_next_probe() -> None:
     text = await_view.summary(group, sources, now)
     assert text.startswith("zoho #209 · cmd true — armed · until ")
     assert "next " + time.strftime("%H:%M", time.localtime(due)) in text
+    assert text.endswith(" · → resume")
     blocked = AwaitGroup(id=3, session_id=SID, state="blocked", blocked_reason="no source left")
     text = await_view.summary(blocked, sources, now)
     assert "blocked(no source left)" in text and "next" not in text
@@ -174,8 +178,10 @@ def test_detail_lines_describe_the_whole_group(home: Path) -> None:
     fields = dict(lines)
     assert [f for f, _v in lines] == [
         "Purpose", "Related items", "Target session", "Source 1", "Source 2", "Source 3",
-        "Until", "Group state", "Armed at", "Delivery channels", "Resume prompt",
+        "Until", "Group state", "Armed at", "Delivery mode", "Delivery channels",
+        "Resume prompt",
     ]  # fmt: skip
+    assert fields["Delivery mode"] == f"resume {SID[:8]}"
     assert fields["Purpose"] == PURPOSE
     assert fields["Related items"] == "zoho#256, tp#12"
     target = fields["Target session"]
@@ -331,3 +337,24 @@ def test_tui_has_no_section_without_active_groups(home: Path) -> None:
 
     asyncio.run(scenario())
     assert not any("AWAITING" in f for f in folders)
+
+
+# --------------------------------------------------------------------------- -F/--fresh
+def test_fresh_group_marker_and_delivery_mode_line() -> None:
+    now = time.time()
+    fresh = AwaitGroup(id=5, session_id=SID, cwd="/x/proj", until_epoch=int(now) + 60, fresh=True)
+    sources = [_src("zoho-reply", '{"ticket": "7"}')]
+    assert await_view.delivery_marker(fresh) == "→ new session"
+    assert await_view.summary(fresh, sources, now).endswith(" · → new session")
+    fields = dict(await_view.detail_lines(await_view.AwaitEntry(fresh, sources, None), "/x"))
+    assert fields["Delivery mode"] == "fresh — starts a new session in proj"
+
+
+def test_ls_line_carries_the_fresh_marker(home: Path) -> None:
+    with Store() as store:
+        gid = _arm(store)
+        store.conn.execute("UPDATE await_groups SET fresh = 1 WHERE id = ?", (gid,))
+        store.conn.commit()
+        text = _ls(store)
+    [line] = [ln for ln in text.splitlines() if ln.startswith(f"◷ group {gid}")]
+    assert "· → new session" in line and "→ resume" not in line
