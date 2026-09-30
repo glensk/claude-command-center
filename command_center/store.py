@@ -609,6 +609,13 @@ class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
         "label": "TEXT NOT NULL DEFAULT ''",
     }
 
+    # Same, for the await_groups table. '' / '[]' = no purpose / no related items, which
+    # is what every group armed before ``ccc await -P`` / ``-T`` existed correctly means.
+    _ADDED_AWAIT_GROUP_COLUMNS = {
+        "purpose": "TEXT NOT NULL DEFAULT ''",
+        "items": "TEXT NOT NULL DEFAULT '[]'",
+    }
+
     def _add_column(self, table: str, column: str, decl: str) -> None:
         """``ALTER TABLE`` *table* to add *column*, tolerating a peer that just did it.
 
@@ -657,6 +664,7 @@ class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
             if column not in fl_existing:
                 self._add_column("file_locks", column, decl)
         self._ensure_table_columns("await_sources", self._ADDED_AWAIT_SOURCE_COLUMNS)
+        self._ensure_table_columns("await_groups", self._ADDED_AWAIT_GROUP_COLUMNS)
         # Partial index for the armed-fire scan (statusline chip + daemon dispatch).
         # Created HERE, not in _SCHEMA: an old DB only gains fire_at via the ALTER
         # loop above, and an index referencing a missing column would fail the open.

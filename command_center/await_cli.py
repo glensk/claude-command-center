@@ -42,9 +42,13 @@ from typing import Any
 
 MAX_UNTIL_DAYS = 180
 _RELATIVE = re.compile(r"^(\d+)([mhdw])$")
+_HASH_REF = re.compile(r"^([A-Za-z][A-Za-z0-9_.-]*)\s*#\s*(\d+)$")
 _UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
 
 EXIT_USAGE = 2
+MIN_PURPOSE_CHARS = 20
+MAX_PURPOSE_CHARS = 400
+MAX_ITEM_CHARS = 200
 EXIT_MISSING_DEP = 3
 
 
@@ -69,12 +73,20 @@ def add_parser(sub: Any, func: Any) -> argparse.ArgumentParser:
             "template, {event} replaced by the event as bounded JSON. No model runs\n"
             "while waiting. Nothing fires before --until -> the group expires (24 h\n"
             "grace for events dated before the deadline) with a notification.\n\n"
+            "Arming needs -P/--purpose: one or two sentences saying what the session\n"
+            "waits for and what the event will resolve (>= 20 characters). -T names the\n"
+            "related work items (repeatable).\n\n"
             "examples:\n"
-            "  ccc await -z 123 -u 2026-10-05 -m 'The requester replied: {event}. Continue.' -C\n"
-            "  ccc await -S U012AB3CD -z 123 -u 3d -m 'Answer arrived: {event}'\n"
-            "  ccc await -z 123 -x 'test -f done' -L 'vendor reply' -L 'build flag' ...\n"
+            "  ccc await -z 123 -u 2026-10-05 -C \\\n"
+            "      -m 'The requester replied: {event}. Continue.' -T zoho#123 \\\n"
+            "      -P 'Waiting for the requester to confirm the quota; it unblocks the fix.'\n"
+            "  ccc await -S U012AB3CD -z 123 -u 3d -m 'Answer arrived: {event}' \\\n"
+            "      -P 'Need the account owner to approve the migration window before we start.'\n"
+            "  ccc await -z 123 -x 'test -f done' -L 'vendor reply' -L 'build flag' \\\n"
+            "      -P 'The vendor answer or the build flag, either unblocks the deploy.' ...\n"
             "                          # -L names sources: every -z, then -S, then -x\n"
-            "  ccc await -x 'gh pr checks 12 --required' -i 300 -u 1d -m 'CI done: {event}'\n"
+            "  ccc await -x 'gh pr checks 12 --required' -i 300 -u 1d -m 'CI done: {event}' \\\n"
+            "      -P 'Waiting for the required CI checks of PR 12 before merging it.' -T tp#12\n"
             "  ccc await -l            # this session's groups (-A: every session)\n"
             "  ccc await -d 7          # disarm group 7 (-d all: this session's)\n"
             "  ccc await -R 7          # retry a blocked group\n"
@@ -116,6 +128,23 @@ def add_parser(sub: Any, func: Any) -> argparse.ArgumentParser:
             "optional display name for a source (repeatable); labels go to the sources in "
             "the order every -z, then every -S, then every -x, each as given"
         ),
+    )
+    p.add_argument(
+        "-P",
+        "--purpose",
+        metavar="TEXT",
+        help=(
+            "REQUIRED when arming: one or two sentences — what the session waits for and "
+            f"what the event will resolve ({MIN_PURPOSE_CHARS}-{MAX_PURPOSE_CHARS} characters)"
+        ),
+    )
+    p.add_argument(
+        "-T",
+        "--item",
+        action="append",
+        default=[],
+        metavar="REF",
+        help="a related work item (repeatable), e.g. zoho#256, tp#123, SD-69829 or a URL",
     )
     p.add_argument(
         "-i",
@@ -307,6 +336,7 @@ def _validate_arm(args: argparse.Namespace, now: float) -> int:
         raise AwaitError("arm needs at least one source: -z, -S or -x", EXIT_USAGE)
     if not args.message or not args.until:
         raise AwaitError("arming needs -u/--until and -m/--message", EXIT_USAGE)
+    purpose_problem(args.purpose)
     problem = template_error(args.message)
     if problem:
         raise AwaitError(problem, EXIT_USAGE)
@@ -323,6 +353,45 @@ def clean_label(text: str) -> str:
     one space, capped at 80 characters (display only — it never reaches a shell)."""
     flat = "".join(ch if ch.isprintable() else " " for ch in text or "")
     return " ".join(flat.split())[:80]
+
+
+def clean_purpose(text: str | None) -> str:
+    """A ``-P`` purpose as stored: whitespace flattened like :func:`clean_label`, capped at
+    :data:`MAX_PURPOSE_CHARS` characters."""
+    flat = "".join(ch if ch.isprintable() else " " for ch in text or "")
+    return " ".join(flat.split())[:MAX_PURPOSE_CHARS]
+
+
+def purpose_problem(text: str | None) -> None:
+    """AwaitError(2) when the ``-P`` purpose is missing or too short to say anything."""
+    purpose = clean_purpose(text)
+    if not purpose:
+        raise AwaitError(
+            "arming needs -P/--purpose: what the session waits for and what the event "
+            "will resolve (one or two sentences)",
+            EXIT_USAGE,
+        )
+    if len(purpose) < MIN_PURPOSE_CHARS:
+        raise AwaitError(
+            f"-P/--purpose is too short ({len(purpose)} < {MIN_PURPOSE_CHARS} characters): "
+            "say what the session waits for and what the event will resolve",
+            EXIT_USAGE,
+        )
+
+
+def clean_items(refs: list[str]) -> list[str]:
+    """The ``-T`` items as stored: each flattened like a label (capped at
+    :data:`MAX_ITEM_CHARS`), a ``tracker #N`` reference normalised to ``tracker#N``
+    (``Zoho # 256`` → ``zoho#256``), blanks and duplicates dropped, order kept."""
+    out: list[str] = []
+    for ref in refs:
+        flat = "".join(ch if ch.isprintable() else " " for ch in ref or "")
+        item = " ".join(flat.split())[:MAX_ITEM_CHARS]
+        if hashref := _HASH_REF.match(item):
+            item = f"{hashref.group(1).lower()}#{hashref.group(2)}"
+        if item and item not in out:
+            out.append(item)
+    return out
 
 
 def apply_labels(sources: list[Any], labels: list[str]) -> list[Any]:
@@ -394,6 +463,8 @@ def _arm(args: argparse.Namespace, runner: Any) -> int:
             "config_dir": config_dir,
             "cwd": cwd,
             "close": bool(args.close),
+            "purpose": clean_purpose(args.purpose),
+            "items": clean_items(args.item),
             "sources": [dataclasses.asdict(s) for s in sources],
         }
         if args.dry_run:
@@ -414,6 +485,8 @@ def _arm(args: argparse.Namespace, runner: Any) -> int:
             "until_epoch": until,
             "sources": sources,
             "now": int(now),
+            "purpose": preview["purpose"],
+            "items": preview["items"],
         }
         try:
             if args.close:
@@ -442,6 +515,8 @@ def _group_json(group: Any, sources: list[Any]) -> dict[str, Any]:
         "blocked_reason": group.blocked_reason,
         "event_id": group.event_id,
         "delivery_attempts": group.delivery_attempts,
+        "purpose": group.purpose,
+        "items": group.items_list(),
         "sources": [
             {
                 "id": s.id,
@@ -475,6 +550,9 @@ def _list(args: argparse.Namespace) -> int:
             f"group {group.id}  {group.state:<10}  session {group.session_id[:8]}  "
             f"until {_fmt(group.until_epoch)}{extra}"
         )
+        print(f"    purpose: {group.purpose or '(no purpose recorded)'}")
+        if items := group.items_list():
+            print(f"    items: {', '.join(items)}")
         for src in sources:
             err = f"  last error: {src.last_error}" if src.last_error else ""
             label = f"  [{src.label}]" if src.label else ""
@@ -555,7 +633,14 @@ def cmd_await(args: argparse.Namespace, *, runner: Any = None) -> int:
         runner = run_structured
     verb = args.run or args.list or bool(args.disarm) or args.retry is not None
     arming = bool(
-        args.zoho or args.slack_dm or args.cmd or args.message or args.until or args.label
+        args.zoho
+        or args.slack_dm
+        or args.cmd
+        or args.message
+        or args.until
+        or args.label
+        or args.purpose
+        or args.item
     )
     if verb and (arming or args.close):
         print("error: -l, -d, -R and -r cannot be combined with arming", file=sys.stderr)

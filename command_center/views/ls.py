@@ -299,9 +299,10 @@ def _quote(path: str) -> str:
 
 
 def _awaiting_block(store: Store, enabled: bool, root: str | None = None) -> list[str]:
-    """The trailing ``AWAITING`` block: one plain line per active ``ccc await`` group
-    (folder · short id · sources — state · until · next probe │ AIM). Empty when no
-    group is active. Read-only, like the rest of ``ccc ls``; a failed read shows nothing."""
+    """The trailing ``AWAITING`` block: two lines per active ``ccc await`` group —
+    folder · short id · sources — state · until · next probe │ AIM, then an indented dim
+    line with its ``-P`` purpose and ``-T`` items. Empty when no group is active.
+    Read-only, like the rest of ``ccc ls``; a failed read shows nothing."""
     try:
         entries = await_view.visible_awaits(store)
     except sqlite3.Error:
@@ -323,6 +324,10 @@ def _awaiting_block(store: Store, enabled: bool, root: str | None = None) -> lis
         if aim := await_view.aim_text(entry):
             line += f"  │ {aim}"
         out.append(_paint(color, line, enabled))
+        why = f"    ↳ {await_view.purpose_text(entry.group)}"
+        if items := await_view.items_text(entry.group):
+            why += f"  · items: {items}"
+        out.append(_paint(_DIM, why, enabled))
     return out
 
 

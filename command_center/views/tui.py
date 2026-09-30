@@ -595,6 +595,20 @@ def _await_row_cells(entry: AwaitEntry, now: float, root: str | None) -> list[Te
     return cells
 
 
+def _await_detail_text(entry: AwaitEntry, root: str | None) -> Text:
+    """The detail pane of an AWAITING row: one ``Field: value`` line per
+    :func:`await_view.detail_lines` entry, styled like the session fields (read-only)."""
+    text = Text()
+    for label, value in await_view.detail_lines(entry, root):
+        text.append(f"{label}: ", style="bold")
+        text.append(f"{value}\n", style=_GOLD if label == "Purpose" else "white")
+    text.append(
+        f"\n— Enter moves to the session's row · ccc await -d {entry.group.id} disarms —",
+        style="grey50",
+    )
+    return text
+
+
 def _draft_next_cell(session: Session, base_style: str) -> Text:
     """A draft row's next-step cell: ``@tags · <start_when note>`` (tags/notes column)."""
     prefix = "  "
@@ -2193,6 +2207,8 @@ class CommandCenterApp(App[None]):
         # Enter on an await row moves the cursor to that session's row.
         self._awaits: list[AwaitEntry] = []
         self._await_targets: dict[str, str] = {}
+        # … and await row key → its entry, for the read-only detail pane of that row.
+        self._await_entries: dict[str, AwaitEntry] = {}
         self._show_finished = False  # DONE (green) hidden by default; toggled by `td`
         self._show_future = True  # FUTURE jobs (blue) shown by default; toggled by `tf`
         # Leader-chord state (`td`/`tf` = toggles, `ah` = aim-history): the pending leader
@@ -2586,6 +2602,7 @@ class CommandCenterApp(App[None]):
         self._sep_category = {}
         self._rule_seps = {}
         self._await_targets = {}
+        self._await_entries = {}
         awaiting_added = False
 
         def add_awaiting() -> None:
@@ -2981,6 +2998,7 @@ class CommandCenterApp(App[None]):
         for entry in self._awaits:
             key = self._next_sep_key()
             self._await_targets[key] = entry.group.session_id
+            self._await_entries[key] = entry
             table.add_row(*_await_row_cells(entry, now, self._root), key=key)
 
     def _add_category_splitter(self, table: DataTable, category: str) -> None:
@@ -3471,6 +3489,18 @@ class CommandCenterApp(App[None]):
                 text.append("Press r (resume) or Enter to launch it in its repo.\n", style="grey50")
         return text
 
+    def _show_await_detail(self, head: Static, fview: Static, bottom: Static) -> bool:
+        """Fill the pane for an AWAITING row (a read-only description of its group);
+        False when the cursor is not on one. The row key is a separator, so `_current`
+        stays None and no session-editing key acts on this pane."""
+        entry = self._await_entries.get(self._highlight_key or "")
+        if self._current or entry is None:
+            return False
+        head.update(Text("◷ AWAITING — ccc await group\n", style=f"bold {_DRAFT_BLUE}"))
+        fview.update(_await_detail_text(entry, self._root))
+        bottom.update("")
+        return True
+
     def update_detail(self) -> None:
         if getattr(self, "_editing", False):
             return
@@ -3478,6 +3508,8 @@ class CommandCenterApp(App[None]):
         head = self.query_one("#detail-head", Static)
         fview = self.query_one("#detail-fields-view", Static)
         bottom = self.query_one("#detail-bottom", Static)
+        if self._show_await_detail(head, fview, bottom):
+            return
         if not self._current:
             head.update("Select a session.")
             fview.update("")

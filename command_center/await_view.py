@@ -125,3 +125,92 @@ def aim_text(entry: AwaitEntry) -> str:
     if entry.session is None:
         return ""
     return display_aim(entry.session) or ""
+
+
+#: What the ``-P`` line says for a group armed before ``ccc await -P`` existed.
+NO_PURPOSE = "(no purpose recorded)"
+
+
+def purpose_text(group: AwaitGroup) -> str:
+    """The group's ``-P`` purpose, or :data:`NO_PURPOSE`."""
+    return group.purpose.strip() or NO_PURPOSE
+
+
+def items_text(group: AwaitGroup) -> str:
+    """The group's ``-T`` related items, comma-joined ('' when none)."""
+    return ", ".join(group.items_list())
+
+
+def source_spec_text(src: AwaitSource) -> str:
+    """One source's FULL spec, uncut: the whole shell command (and its cwd) of a ``cmd``,
+    the ticket of a ``zoho-reply``, the user (and DM channel) of a ``slack-dm``."""
+    spec: dict[str, Any] = src.spec_dict()
+    if src.kind == "zoho-reply":
+        return f"ticket #{spec.get('ticket') or '?'}"
+    if src.kind == "slack-dm":
+        channel = spec.get("channel")
+        return f"user {spec.get('user_id') or '?'}" + (f" (DM {channel})" if channel else "")
+    if src.kind == "cmd":
+        cwd = spec.get("cwd")
+        return f"$ {spec.get('cmd') or ''}" + (f"   (in {cwd})" if cwd else "")
+    return src.spec or ""
+
+
+def _source_detail(src: AwaitSource) -> str:
+    parts = [src.kind]
+    if (src.label or "").strip():
+        parts.append(f"[{src.label.strip()}]")
+    parts.append(source_spec_text(src))
+    status = [src.state]
+    if src.state == "armed" and src.next_check_at:
+        status.append(f"next probe {_date(src.next_check_at)}")
+    status.append(f"fails {src.fail_count}")
+    if src.last_error:
+        status.append(f"last error: {src.last_error}")
+    return " ".join(parts) + " — " + " · ".join(status)
+
+
+def _session_state(entry: AwaitEntry) -> str:
+    """``parked`` / ``done`` / ``live (<status>)``; ``unknown session`` without a row."""
+    if entry.session is None:
+        return "unknown session"
+    status = entry.session.status or "?"
+    return status if status in ("parked", "done", "failed") else f"live ({status})"
+
+
+def _session_detail(entry: AwaitEntry, root: str | None) -> str:
+    """``folder · abcd1234 · parked — <AIM>``."""
+    from . import colors  # pylint: disable=import-outside-toplevel
+
+    text = f"{colors.short_folder(entry.cwd, root)} · {entry.group.session_id[:8]} · "
+    text += _session_state(entry)
+    if aim := aim_text(entry):
+        text += f" — {aim}"
+    return text
+
+
+def detail_lines(entry: AwaitEntry, root: str | None = None) -> list[tuple[str, str]]:
+    """The TUI detail pane of an AWAITING row, one ``(field, value)`` per line.
+
+    Read-only and pure (no store, no clock; *root* is the resolved repo root, see
+    ``colors.short_folder``): Purpose, Related items, Target session,
+    one ``Source N`` per source (kind, label, FULL spec, state, next probe, fail count,
+    last error), Until, Group state, Armed at, Resume prompt (the template, full text).
+    """
+    group = entry.group
+    lines: list[tuple[str, str]] = [
+        ("Purpose", purpose_text(group)),
+        ("Related items", items_text(group) or "—"),
+        ("Target session", _session_detail(entry, root)),
+    ]
+    for n, src in enumerate(entry.sources, 1):
+        lines.append((f"Source {n}", _source_detail(src)))
+    if not entry.sources:
+        lines.append(("Sources", "(none)"))
+    lines += [
+        ("Until", _date(group.until_epoch)),
+        ("Group state", f"{state_text(group)}  (group {group.id})"),
+        ("Armed at", _date(group.created_at)),
+        ("Resume prompt", group.prompt_template or "—"),
+    ]
+    return lines

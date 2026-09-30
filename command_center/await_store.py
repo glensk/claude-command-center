@@ -24,7 +24,8 @@ Rows are read by column NAME and unknown columns are ignored, so a newer ccc tha
 a column never breaks an older long-lived reader (the TUI) — the same rule as
 ``store._row_to_session``. The tables are created with ``IF NOT EXISTS`` inside the
 store's schema script, which is safe under concurrent opens; a column added later
-(``await_sources.label``) is also ALTERed into an older DB by ``Store._ensure_columns``.
+(``await_sources.label``, ``await_groups.purpose`` / ``items``) is also ALTERed into an
+older DB by ``Store._ensure_columns``.
 
 This module is a mixin: :class:`AwaitStoreMixin` needs only ``self.conn``.
 """
@@ -98,7 +99,9 @@ CREATE TABLE IF NOT EXISTS await_groups (
     blocked_reason     TEXT    NOT NULL DEFAULT '',
     notified_at        INTEGER NOT NULL DEFAULT 0,
     created_at         INTEGER NOT NULL DEFAULT 0,
-    updated_at         INTEGER NOT NULL DEFAULT 0
+    updated_at         INTEGER NOT NULL DEFAULT 0,
+    purpose            TEXT    NOT NULL DEFAULT '',
+    items              TEXT    NOT NULL DEFAULT '[]'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_await_groups_active
     ON await_groups(session_id) WHERE state IN {_ACTIVE_SQL};
@@ -195,6 +198,16 @@ class AwaitGroup:  # pylint: disable=too-many-instance-attributes  # one row, fl
     notified_at: int = 0
     created_at: int = 0
     updated_at: int = 0
+    purpose: str = ""  # why the session waits (``ccc await -P``); '' on pre-purpose groups
+    items: str = "[]"  # JSON list of related work items (``ccc await -T``)
+
+    def items_list(self) -> list[str]:
+        """The parsed ``items`` JSON (``[]`` when unreadable)."""
+        try:
+            data = json.loads(self.items or "[]")
+        except ValueError:
+            return []
+        return [str(x) for x in data] if isinstance(data, list) else []
 
 
 _GROUP_FIELDS = frozenset(f.name for f in dataclasses.fields(AwaitGroup))
@@ -246,6 +259,8 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
         until_epoch: int,
         sources: list[SourceSpec],
         now: int,
+        purpose: str = "",
+        items: tuple[str, ...] | list[str] = (),
     ) -> int:
         if not sources:
             raise ValueError("an await group needs at least one source")
@@ -253,7 +268,7 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
             cur = self.conn.execute(
                 "INSERT INTO await_groups (session_id, config_dir, cwd, no_codex, "
                 "prompt_template, until_epoch, grace_until_epoch, state, created_at, "
-                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'armed', ?, ?)",
+                "updated_at, purpose, items) VALUES (?, ?, ?, ?, ?, ?, ?, 'armed', ?, ?, ?, ?)",
                 (
                     session_id,
                     config_dir,
@@ -264,6 +279,8 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
                     until_epoch + GRACE_SEC,
                     now,
                     now,
+                    purpose,
+                    json.dumps(list(items)),
                 ),
             )
         except sqlite3.IntegrityError as exc:
@@ -301,6 +318,8 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
         until_epoch: int,
         sources: list[SourceSpec],
         now: int,
+        purpose: str = "",
+        items: tuple[str, ...] | list[str] = (),
     ) -> int:
         """Insert one group + its sources atomically; :class:`AwaitConflict` if one is active."""
         with self._immediate():
@@ -313,6 +332,8 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
                 until_epoch=until_epoch,
                 sources=sources,
                 now=now,
+                purpose=purpose,
+                items=items,
             )
 
     def arm_await_and_close(  # pylint: disable=too-many-arguments
@@ -327,6 +348,8 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
         sources: list[SourceSpec],
         now: int,
         close_now_ms: int,
+        purpose: str = "",
+        items: tuple[str, ...] | list[str] = (),
     ) -> tuple[int, str]:
         """:meth:`arm_await` plus the close-after-turn arm in the SAME transaction.
 
@@ -345,6 +368,8 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
                 until_epoch=until_epoch,
                 sources=sources,
                 now=now,
+                purpose=purpose,
+                items=items,
             )
             cur = self.conn.execute(
                 "UPDATE sessions SET close_requested_at = ?, close_token = ?, close_bound = '', "

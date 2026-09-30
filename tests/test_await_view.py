@@ -26,7 +26,16 @@ from command_center.views import ls as ls_view
 SID = "bbbbbbbb-1111-2222-3333-444444444444"
 
 
-def _arm(store: Store, *, labels: tuple[str, ...] = ("", "", "")) -> int:
+PURPOSE = "Waiting for the vendor to confirm the quota fix before closing the ticket."
+
+
+def _arm(
+    store: Store,
+    *,
+    labels: tuple[str, ...] = ("", "", ""),
+    purpose: str = PURPOSE,
+    items: tuple[str, ...] = ("zoho#256", "tp#12"),
+) -> int:
     now = int(time.time())
     specs = [
         SourceSpec(kind="zoho-reply", spec={"schema_version": 1, "ticket": "209"}),
@@ -44,6 +53,8 @@ def _arm(store: Store, *, labels: tuple[str, ...] = ("", "", "")) -> int:
         until_epoch=now + 86400,
         sources=specs,
         now=now,
+        purpose=purpose,
+        items=items,
     )
 
 
@@ -88,6 +99,33 @@ def test_label_column_is_added_to_an_older_db(tmp_path: Path) -> None:
     assert src.label == ""
 
 
+def test_purpose_and_items_columns_are_added_to_an_older_db(tmp_path: Path) -> None:
+    db = tmp_path / "legacy.db"
+    old_schema = AWAIT_SCHEMA.replace(
+        "updated_at         INTEGER NOT NULL DEFAULT 0,\n"
+        "    purpose            TEXT    NOT NULL DEFAULT '',\n"
+        "    items              TEXT    NOT NULL DEFAULT '[]'\n",
+        "updated_at         INTEGER NOT NULL DEFAULT 0\n",
+    )
+    assert "purpose" not in old_schema and "items " not in old_schema
+    conn = sqlite3.connect(db)
+    conn.executescript(store_mod._SCHEMA + old_schema)  # noqa: SLF001
+    conn.execute("INSERT INTO sessions (session_id, cwd) VALUES ('s1', '/repo')")
+    conn.execute(
+        "INSERT INTO await_groups (session_id, prompt_template, until_epoch, grace_until_epoch) "
+        "VALUES ('s1', '{event}', 9999999999, 9999999999)"
+    )
+    conn.execute("INSERT INTO await_sources (group_id, kind, spec) VALUES (1, 'cmd', '{}')")
+    conn.commit()
+    conn.close()
+    with Store(db) as store:
+        cols = {r["name"] for r in store.conn.execute("PRAGMA table_info(await_groups)")}
+        [(group, _sources)] = store.list_awaits("s1")
+    assert {"purpose", "items"} <= cols
+    assert group.purpose == "" and group.items_list() == []
+    assert await_view.purpose_text(group) == await_view.NO_PURPOSE
+
+
 # --------------------------------------------------------------------------- formatter
 def _src(kind: str, spec: str, **kw: Any) -> AwaitSource:
     return AwaitSource(id=1, group_id=1, kind=kind, spec=spec, **kw)
@@ -119,6 +157,55 @@ def test_summary_state_until_and_next_probe() -> None:
     assert "blocked(no source left)" in text and "next" not in text
 
 
+def test_detail_lines_describe_the_whole_group(home: Path) -> None:
+    with Store() as store:
+        gid = _arm(store, labels=("vendor reply", "", ""))
+        store.conn.execute(
+            "UPDATE await_sources SET fail_count = 2, last_error = 'exit 1: boom' "
+            "WHERE kind = 'cmd'"
+        )
+        store.conn.execute(
+            "UPDATE await_sources SET spec = ? WHERE kind = 'cmd'",
+            ('{"cmd": "gh pr checks 12 --required && test -f ' + "y" * 60 + '", "cwd": "/w"}',),
+        )
+        store.conn.commit()
+        [entry] = await_view.visible_awaits(store)
+    lines = await_view.detail_lines(entry, root="/nowhere")
+    fields = dict(lines)
+    assert [f for f, _v in lines] == [
+        "Purpose", "Related items", "Target session", "Source 1", "Source 2", "Source 3",
+        "Until", "Group state", "Armed at", "Resume prompt",
+    ]  # fmt: skip
+    assert fields["Purpose"] == PURPOSE
+    assert fields["Related items"] == "zoho#256, tp#12"
+    target = fields["Target session"]
+    assert SID[:8] in target and "live (idle)" in target and "the vendor answered" in target
+    assert fields["Source 1"].startswith("zoho-reply [vendor reply] ticket #209 — armed")
+    assert "next probe " in fields["Source 1"] and "fails 0" in fields["Source 1"]
+    assert fields["Source 2"].startswith("slack-dm user U1AB — armed")
+    assert "y" * 60 in fields["Source 3"]  # the FULL command, never cut
+    assert "(in /w)" in fields["Source 3"]
+    assert "fails 2 · last error: exit 1: boom" in fields["Source 3"]
+    assert fields["Group state"] == f"armed  (group {gid})"
+    assert fields["Resume prompt"] == "got {event}"
+    assert fields["Armed at"] != "-" and fields["Until"] != "-"
+
+
+def test_detail_lines_of_a_legacy_blocked_group_without_session() -> None:
+    entry = await_view.AwaitEntry(
+        AwaitGroup(id=4, session_id=SID, cwd="/x/proj", state="blocked", blocked_reason="gone"),
+        [],
+        None,
+    )
+    fields = dict(await_view.detail_lines(entry, root="/nowhere"))
+    assert fields["Purpose"] == "(no purpose recorded)"
+    assert fields["Related items"] == "—"
+    assert "unknown session" in fields["Target session"]
+    assert fields["Sources"] == "(none)"
+    assert fields["Group state"] == "blocked(gone)  (group 4)"
+    assert fields["Armed at"] == "-"
+
+
 @pytest.mark.parametrize("state", ["delivered", "expired", "disarmed"])
 def test_finished_groups_are_hidden(home: Path, state: str) -> None:
     with Store() as store:
@@ -127,6 +214,14 @@ def test_finished_groups_are_hidden(home: Path, state: str) -> None:
         store.conn.execute("UPDATE await_groups SET state = ? WHERE id = ?", (state, gid))
         store.conn.commit()
         assert await_view.visible_awaits(store) == []
+
+
+def test_ls_says_no_purpose_recorded_for_a_legacy_group(home: Path) -> None:
+    with Store() as store:
+        _arm(store, purpose="", items=())
+        out = _ls(store)
+    tail = out[out.index("AWAITING") :].splitlines()
+    assert tail[2] == "    ↳ (no purpose recorded)"
 
 
 def test_visible_entry_carries_the_session_and_its_aim(home: Path) -> None:
@@ -152,6 +247,7 @@ def test_ls_has_an_awaiting_block_only_while_a_group_is_active(home: Path) -> No
         assert f"group {gid}" in tail[1] and "vendor reply · slack DM U1AB · cmd gh pr" in tail[1]
         assert "armed · until" in tail[1]
         assert "│ the vendor answered" in tail[1]
+        assert tail[2] == f"    ↳ {PURPOSE}  · items: zoho#256, tp#12"
         store.disarm_group(gid, int(time.time()))
         assert "AWAITING" not in _ls(store)
 
@@ -199,6 +295,9 @@ def test_tui_shows_the_section_and_enter_focuses_the_session(home: Path) -> None
             seen["aim"] = plain(table.get_row_at(header + 1)[_AIM_COL])
             table.move_cursor(row=header + 1)
             await pilot.pause()
+            detail = app.query_one("#detail-fields-view")
+            seen["detail"] = str(detail.render())
+            seen["current"] = app._current  # noqa: SLF001
             await pilot.press("enter")
             await pilot.pause()
             seen["cursor_key"] = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
@@ -208,6 +307,11 @@ def test_tui_shows_the_section_and_enter_focuses_the_session(home: Path) -> None
     assert seen["order"], seen["folders"]
     assert "vendor reply · slack DM U1AB" in seen["aim"]
     assert seen["cursor_key"].value == seen["target"]
+    # The AWAITING row fills the detail pane (read-only: no session is "current").
+    assert seen["current"] is None
+    assert f"Purpose: {PURPOSE}" in seen["detail"]
+    assert "Related items: zoho#256, tp#12" in seen["detail"]
+    assert "Resume prompt: got {event}" in seen["detail"]
 
 
 def test_tui_has_no_section_without_active_groups(home: Path) -> None:

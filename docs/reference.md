@@ -51,7 +51,7 @@ flags. Grouped by what they do:
 - `ccc quota` — cache-first quota oracle: which provider/account still has tokens, when each allowance renews, and when each blocked one unblocks.
 - `ccc start-job <id>` / `ccc open-job <id>|--file` — launch a saved job (in place / in a new tab, safe from Obsidian). Prefer `open-job` from scripts and agents: `start-job` execs in place and refuses without a TTY (it opens a tab instead) — see "Terminal guard" below.
 - `ccc done-job` · `ccc delete-job` · `ccc restore-job` · `ccc unlaunch` — the lifecycle: done-without-running / trash / restore / back-to-draft.
-- `ccc await -z TICKET | -S USER | -x CMD [-L LABEL] -u DATE -m '…{event}…' [-C]` — park THIS session on an external event (a Zoho Desk reply, a Slack DM, a shell predicate) and resume it when the first one fires; `-l` / `-d` / `-R` / `-r` list, disarm, retry, run one pass. Active groups show in the TUI's `AWAITING` section and at the end of `ccc ls`. See "Await — resume a parked session on an external event" below.
+- `ccc await -z TICKET | -S USER | -x CMD [-L LABEL] -P PURPOSE [-T ITEM] -u DATE -m '…{event}…' [-C]` — park THIS session on an external event (a Zoho Desk reply, a Slack DM, a shell predicate) and resume it when the first one fires; `-l` / `-d` / `-R` / `-r` list, disarm, retry, run one pass. Active groups show in the TUI's `AWAITING` section and at the end of `ccc ls`. See "Await — resume a parked session on an external event" below.
 
 Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique prefix), not just the full UUID — exact match wins, an ambiguous prefix errors with the matches listed, matching is case-insensitive.
 
@@ -1028,10 +1028,14 @@ event as bounded JSON. Nothing fires before the deadline → the group expires w
 notification and nothing is resumed.
 
 ```commands
-ccc await -z 123 -u 2026-10-05 -m "The requester replied: {event}. Continue." -C
-ccc await -S U012AB3CD -z 123 -u 3d -m "An answer arrived: {event}"
-ccc await -x 'gh pr checks 12 --required' -i 300 -u 1d -m "CI finished: {event}"
-ccc await -z 123 -x 'test -f done' -L 'vendor reply' -L 'build flag' -u 3d -m "{event}"
+ccc await -z 123 -u 2026-10-05 -m "The requester replied: {event}. Continue." -C \
+    -P "Waiting for the requester to confirm the quota; the reply unblocks the fix." -T zoho#123
+ccc await -S U012AB3CD -z 123 -u 3d -m "An answer arrived: {event}" \
+    -P "Need the account owner to approve the migration window before we start."
+ccc await -x 'gh pr checks 12 --required' -i 300 -u 1d -m "CI finished: {event}" \
+    -P "Waiting for the required CI checks of PR 12 before merging it." -T tp#12
+ccc await -z 123 -x 'test -f done' -L 'vendor reply' -L 'build flag' -u 3d -m "{event}" \
+    -P "Either the vendor answers or the build flag appears; both unblock the deploy."
 ccc await -l          # this session's groups + sources (-A: every session)
 ccc await -d 7        # disarm group 7 (-d all: this session's active groups)
 ccc await -R 7        # retry a BLOCKED group (payload + watermarks kept)
@@ -1045,6 +1049,8 @@ ccc await -r          # one evaluation pass now (what the poller runs)
 | `-S/--slack-dm USER`   | fire on a DM from USER (member id, `@handle` or email; `slack_api.py`) — repeatable        |
 | `-x/--cmd CMD`         | fire when CMD exits 0 in the session's cwd; its stdout is the event — repeatable           |
 | `-L/--label TEXT`      | optional display name for a source — repeatable, see "Labels" below                        |
+| `-P/--purpose TEXT`    | REQUIRED when arming: what the session waits for and what the event resolves (20–400 chars) |
+| `-T/--item REF`        | a related work item (`zoho#256`, `tp#123`, `SD-69829`, a URL) — repeatable, optional       |
 | `-i/--interval SEC`    | seconds between probes of each source (≥ 60, default 120)                                  |
 | `-u/--until DATE`      | deadline (required): `YYYY-MM-DD` (end of day), `YYYY-MM-DDTHH:MM`, or `30m`/`12h`/`3d`/`2w` |
 | `-m/--message TEMPLATE`| the resume prompt (required); must contain `{event}`                                       |
@@ -1073,6 +1079,20 @@ capped at 80 characters. Stored in `await_sources.label` (an older DB gains the 
 on first open; its sources read as unlabelled). A label cannot be added to an existing
 group — disarm and re-arm.
 
+**Purpose and related items.** Every arm must say WHY the session waits: `-P/--purpose`
+takes one or two sentences — what the session is waiting for and what the event will
+resolve. It is flattened like a label (control characters and whitespace runs → one
+space), capped at 400 characters, and a purpose that is missing or shorter than 20
+characters is a usage error (exit 2) — so a parked session never sits in `AWAITING`
+with nobody remembering what it was for. `-T/--item REF` (repeatable, optional) records
+the related work items as free text: `tracker #N` is normalised to `tracker#N`
+(`Zoho # 256` → `zoho#256`), anything else (`SD-69829`, a URL) is kept as given;
+blanks and duplicates are dropped. Both live on the group row
+(`await_groups.purpose`, `await_groups.items` — a JSON list); an older DB gains the
+columns on first open and its groups read as `(no purpose recorded)` with no items.
+`ccc await -l` prints a `purpose:` (and, when set, an `items:`) line under each group,
+`-l -j` carries `purpose` and `items` fields.
+
 **Seeing what is armed — the AWAITING section.** While at least one group is active
 (`armed`, `grace`, `fired`, `delivering` or `blocked` — never `delivered` / `expired` /
 `disarmed`), the TUI shows a full-width blue `AWAITING  (ccc await -l · -d GROUP
@@ -1084,13 +1104,25 @@ the `/aim` column `<sources> — <state> · until <deadline> · next <probe>` fo
 `blocked(<reason>)` in red; `next` is the soonest armed source's next probe (only while
 polling). Enter on such a row moves the cursor to the target session's row (nothing
 when that row is not listed, e.g. a hidden done session). `ccc ls` appends the same
-lines as a trailing `AWAITING` block (plain text, `group <id>` first). Both views only
-READ the store — rendering never probes a source, calls the network or writes.
+lines as a trailing `AWAITING` block (plain text, `group <id>` first), each followed by
+an indented dim `↳ <purpose>  · items: <items>` line. Both views only READ the store —
+rendering never probes a source, calls the network or writes.
 
 ```text
 AWAITING  (ccc await -l · -d GROUP disarms)
 ◷ group 7  work/repo  bbbb  vendor reply · slack DM U1AB — armed · until 2026-10-05 23:59 · next 14:02  │ the vendor answered
+    ↳ Waiting for the vendor to confirm the quota fix before closing the ticket.  · items: zoho#256
 ```
+
+**The detail pane of an AWAITING row.** With the cursor on a `◷` row the TUI's detail
+pane describes that group, read-only, one field per line (`await_view.detail_lines`):
+`Purpose`, `Related items`, `Target session` (folder · short id · `parked` / `done` /
+`live (<status>)` — AIM), one `Source N` line per source (kind, `[label]`, its FULL spec
+— the whole shell command and its cwd for `cmd`, `ticket #N` for Zoho, `user U… (DM
+D…)` for Slack — then state, next probe, fail count and the last error), `Until`,
+`Group state` (with the blocked reason), `Armed at` and `Resume prompt` (the message
+template, full text, wrapped). The row is a separator row, so no session-editing key
+(`e`, `a`, `n`, `D`, `b`, ←/→ edits, …) acts on it; Enter still moves to the session.
 
 **Polling.** `ccc daemon --install` also installs a 60 s poller (launchd
 `<launchd_label>.await`, or a systemd `oneshot` timer) running `ccc await -r`; it

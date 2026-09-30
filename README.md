@@ -149,7 +149,8 @@ A few features that don't fit in a one-liner but are the reason people keep it r
   in the focused tab (plus its AIM history) — so *"what have I been asking here?"* is
   one keystroke, not a scroll through the transcript. The opt-in resident panel server
   (`ccc panel-server --install`, macOS) opens it — and the q+p park panel — in ≤ 0.2 s.
-- **Park on an event, not a clock.** `ccc await -z 123 -u 3d -m "Reply: {event}" -C`
+- **Park on an event, not a clock.** `ccc await -z 123 -u 3d -m "Reply: {event}" -C -P
+  "Waiting for the requester's answer on the quota question." -T zoho#123` records why,
   closes a session that is waiting on a person and resumes *that* session — same
   transcript, same account — when the requester answers the Zoho Desk ticket, a Slack
   DM arrives, or a shell predicate turns true. A 60 s poller checks with zero tokens;
