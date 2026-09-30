@@ -299,7 +299,9 @@ def _quote(path: str) -> str:
 
 
 def _awaiting_block(store: Store, enabled: bool, root: str | None = None) -> list[str]:
-    """The trailing ``AWAITING`` block: two lines per active ``ccc await`` group —
+    """The trailing ``AWAITING`` block: a header carrying the recorded live-tab delivery
+    channels (``Python API: ✅ · AppleScript: ✅ (checked 14:02)``), then two lines per
+    active ``ccc await`` group —
     folder · short id · sources — state · until · next probe │ AIM, then an indented dim
     line with its ``-P`` purpose and ``-T`` items. Empty when no group is active.
     Read-only, like the rest of ``ccc ls``; a failed read shows nothing."""
@@ -312,7 +314,12 @@ def _awaiting_block(store: Store, enabled: bool, root: str | None = None) -> lis
     now = time.time()
     out = [
         "",
-        _paint(_AWAIT_BLUE, f"{await_view.AWAITING_LABEL}  {await_view.AWAITING_HINT}", enabled),
+        _paint(
+            _AWAIT_BLUE,
+            f"{await_view.AWAITING_LABEL}  {await_view.AWAITING_HINT}  "
+            f"{await_view.channel_health_text(await_view.read_channel_health(store), now)}",
+            enabled,
+        ),
     ]
     for entry in entries:
         color = 196 if entry.group.state == "blocked" else _AWAIT_BLUE

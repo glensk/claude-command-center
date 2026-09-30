@@ -98,5 +98,6 @@ testpaths = ["tests"]
 markers = [
     "slow: end-to-end tests that build a wheel + spin a sandbox (deselect with -m 'not slow')",
     "real_home: opt OUT of the tmp-HOME isolation in tests/conftest.py (see _isolate_home)",
+    "real_channel_probe: keep the real terminal.delivery_channel_health (see _stub_channel_probe)",
 ]
 

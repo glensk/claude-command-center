@@ -128,6 +128,16 @@ CREATE TABLE IF NOT EXISTS await_sources (
 CREATE INDEX IF NOT EXISTS idx_await_sources_group ON await_sources(group_id);
 CREATE INDEX IF NOT EXISTS idx_await_sources_due
     ON await_sources(next_check_at) WHERE state = 'armed';
+-- Live-tab delivery channels as the POLLER last measured them (single row, id = 1):
+-- written by await_eval.record_channel_health at most every 5 min, only READ by the
+-- TUI / ccc ls / doctor (rendering never probes iTerm).
+CREATE TABLE IF NOT EXISTS await_channel_health (
+    id               INTEGER PRIMARY KEY CHECK (id = 1),
+    checked_at       INTEGER NOT NULL,
+    python_api       INTEGER NOT NULL DEFAULT 0,
+    applescript      INTEGER NOT NULL DEFAULT 0,
+    python_api_error TEXT    NOT NULL DEFAULT ''
+);
 """
 
 
@@ -776,3 +786,38 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
         )
         self.conn.commit()
         return cur.rowcount == 1
+
+    # ------------------------------------------------------------------ channel health
+    def put_channel_health(self, health: dict[str, Any]) -> None:
+        """Overwrite the single ``await_channel_health`` row (see
+        ``terminal.delivery_channel_health`` for the keys)."""
+        self.conn.execute(
+            "INSERT INTO await_channel_health "
+            "(id, checked_at, python_api, applescript, python_api_error) "
+            "VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+            "checked_at=excluded.checked_at, python_api=excluded.python_api, "
+            "applescript=excluded.applescript, python_api_error=excluded.python_api_error",
+            (
+                int(health.get("checked_at") or 0),
+                int(bool(health.get("python_api"))),
+                int(bool(health.get("applescript"))),
+                str(health.get("python_api_error") or ""),
+            ),
+        )
+        self.conn.commit()
+
+    def channel_health(self) -> dict[str, Any] | None:
+        """The last recorded channel health, or ``None`` when never recorded."""
+        row = self.conn.execute(
+            "SELECT checked_at, python_api, applescript, python_api_error "
+            "FROM await_channel_health WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        checked_at, python_api, applescript, error = tuple(row)
+        return {
+            "python_api": bool(python_api),
+            "applescript": bool(applescript),
+            "checked_at": int(checked_at),
+            "python_api_error": str(error or ""),
+        }

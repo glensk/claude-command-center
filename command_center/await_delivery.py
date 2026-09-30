@@ -14,6 +14,9 @@ The group is an outbox row keyed by its ``delivery_token``:
 * **Live session** — typed into its tab only when it is alive, interactive, not a
   D9 conflict, under the snapshot account and ``idle``; any other live state leaves the
   group ``fired`` for the next pass. CAS ``fired → delivering``, type, ``delivered``.
+  Typing is ``terminal.send_text_via``: the iTerm2 Python API, falling back to
+  AppleScript; the channel that delivered lands in ``PassReport.typed_via`` (the
+  poller log's ``typed_via=['7:applescript']``).
   AT-LEAST-ONCE: a crash between the keystrokes and the mark can repeat the text
   (the stale-delivery reclaim re-sends it).
 * **Closed session** — CAS ``fired → delivering``, then a new tab runs
@@ -59,7 +62,9 @@ if TYPE_CHECKING:
 MAX_ATTEMPTS = 3
 STALE_DELIVERY_SEC = 15 * 60
 
-Typer = Callable[[str, str], bool]
+#: Types into a live tab: truthy on success — the channel name (``python-api`` /
+#: ``applescript``) when known, else ``True``.
+Typer = Callable[[str, str], bool | str]
 Launcher = Callable[[int, str], bool]
 Discover = Callable[[], list["LiveSession"]]
 
@@ -128,10 +133,10 @@ def _default_discover() -> list[LiveSession]:
     return list(ClaudeAdapter().discover())
 
 
-def _default_typer(iterm_session_id: str, text: str) -> bool:
+def _default_typer(iterm_session_id: str, text: str) -> str:
     from . import terminal  # pylint: disable=import-outside-toplevel
 
-    return terminal.send_text_to_session(iterm_session_id, text)
+    return terminal.send_text_via(iterm_session_id, text)
 
 
 def _default_launcher(group_id: int, token: str) -> bool:
@@ -197,11 +202,16 @@ def _deliver_one(ctx: _Ctx, group: AwaitGroup, live: LiveSession | None) -> None
     kind = _winner_kind(ctx.store, group)
     if verdict == "type":
         prompt = compose_prompt(group.prompt_template, group.event_payload)
-        if ctx.typer(tab, prompt) and ctx.store.mark_delivered(group.id, token, ctx.now):
+        via = ctx.typer(tab, prompt)
+        if via and ctx.store.mark_delivered(group.id, token, ctx.now):
             ctx.report.delivered.append(group.id)
+            channel = f" via {via}" if isinstance(via, str) else ""
+            if channel:
+                ctx.report.typed_via.append(f"{group.id}:{via}")
             ctx.notify(
                 group.id,
-                f"await group {group.id} fired ({kind}); event typed into the live session",
+                f"await group {group.id} fired ({kind}); event typed into the live "
+                f"session{channel}",
             )
         else:
             ctx.fail(group, token, "typing into the live tab failed")

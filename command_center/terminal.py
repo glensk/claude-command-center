@@ -21,10 +21,12 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 # pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -802,19 +804,20 @@ def close_iterm_session(iterm_session_id: str) -> str:
     return result if result in ("tab", "session") else ""
 
 
-def _osascript(script: str, timeout: float = 10) -> str | None:
+def _osascript(script: str, timeout: float = 10, args: Sequence[str] = ()) -> str | None:
     """Run an AppleScript; return its stdout on success, or None on failure.
 
     *timeout* is the bound on a pending macOS Automation (TCC) prompt: ``osascript``
     blocks until the dialog is answered, so a launch from an unattended launchd job
     gives up after *timeout* seconds and the ladder moves on (the dialog stays on
     screen; once Allow is clicked the grant persists for that executable path).
+    *args* reach the script's ``on run argv`` handler — the way to hand it untrusted text.
     """
     if not shutil.which("osascript"):
         return None
     try:
         result = subprocess.run(
-            ["osascript", "-e", script],
+            ["osascript", "-e", script, *args],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -909,34 +912,52 @@ def _iterm_api_tab(command: str) -> bool:
         return False
 
 
-def send_text_to_session(iterm_session_id: str, text: str) -> bool:
-    """Type *text* into an EXISTING iTerm session (by ``$ITERM_SESSION_ID``) and submit.
+#: The AppleScript half of :func:`send_text_via`. The session UUID and the text arrive
+#: as ``on run argv`` ARGUMENTS, never spliced into the source, so quotes, backslashes,
+#: newlines and unicode reach iTerm byte-for-byte. NO bracketed-paste markers: iTerm's
+#: ``write text`` drops the ESC byte (live test 2026-09-30: ``\x1b[200~`` arrived as a
+#: literal ``[200~``), so a multi-line text would be submitted line by line. The caller
+#: therefore flattens the text to ONE line (:func:`_one_line`); after a 0.4 s beat a lone CR
+#: (``character id 13``, ``newline NO``: ``write text``'s own newline is a LF, which a
+#: composer may take as "insert newline" rather than "submit") submits it.
+_APPLESCRIPT_PASTE = """
+on run argv
+    set wanted to item 1 of argv
+    set lineText to item 2 of argv
+    tell application "iTerm2"
+        repeat with aWindow in windows
+            repeat with aTab in tabs of aWindow
+                repeat with aSession in sessions of aTab
+                    if id of aSession is wanted then
+                        tell aSession to write text lineText newline NO
+                        delay 0.4
+                        tell aSession to write text (character id 13) newline NO
+                        return "ok"
+                    end if
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    return ""
+end run
+"""
 
-    The delivery path for a parked prompt attached to a live Claude session: the
-    text goes in wrapped in bracketed-paste markers — a multi-line prompt must
-    arrive as ONE paste, since a bare newline would submit each line separately —
-    followed, after a beat for the composer to ingest the paste, by a lone CR that
-    submits it. Python-API socket; ``False`` on any failure so the caller can fall
-    back to a resume tab.
+#: What the Python-API rung reports: ``sent`` (paste + CR delivered), ``none`` (nothing
+#: reached the tab — the AppleScript rung may try), ``partial`` (the paste went out but
+#: the CR did not — falling back would type the text a second time, so it does not).
+_API_SENT, _API_NONE, _API_PARTIAL = "sent", "none", "partial"
 
-    NOT TCC-free (tp#90): unless iTerm2's auth-disable switch is set, the ``iterm2``
-    package obtains its cookie over an Apple event with no timeout, so a launchd
-    daemon whose executable lacks (or is waiting on a prompt for) the Automation
-    grant would hang here. Hence the bounded pre-check: a 5 s AppleScript version
-    query must succeed first — it proves the grant, so the package's own request
-    returns promptly; if it fails we return ``False`` before connecting.
-    """
-    uuid = (iterm_session_id or "").split(":")[-1].strip()
-    if not uuid or not text:
-        return False
-    if not _iterm_api_auth_is_tcc_free() and not _iterm_reachable_by_apple_event():
-        return False
+
+def _send_text_python_api(uuid: str, text: str) -> str:
+    """The Python-API rung of :func:`send_text_via` (see :data:`_API_SENT`)."""
+    sent_paste = False
     try:
         import asyncio  # pylint: disable=import-outside-toplevel
 
         import iterm2  # pylint: disable=import-outside-toplevel
 
         async def _go() -> bool:
+            nonlocal sent_paste
             conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
             app = await iterm2.async_get_app(conn)
             if app is None:
@@ -945,13 +966,137 @@ def send_text_to_session(iterm_session_id: str, text: str) -> bool:
             if session is None:
                 return False
             await session.async_send_text("\x1b[200~" + text + "\x1b[201~")
+            sent_paste = True
             await asyncio.sleep(0.4)
             await session.async_send_text("\r")
             return True
 
-        return bool(asyncio.run(_go()))
+        if asyncio.run(_go()):
+            return _API_SENT
     except Exception:  # pylint: disable=broad-exception-caught
-        return False
+        pass
+    return _API_PARTIAL if sent_paste else _API_NONE
+
+
+def _one_line(text: str) -> str:
+    """*text* with every line break (CR, LF, CRLF) turned into ONE space, so typing it
+    cannot submit early; other characters are kept exactly."""
+    return re.sub(r"[ \t]*(?:\r\n|\r|\n)+[ \t]*", " ", text).strip()
+
+
+def _send_text_applescript(uuid: str, text: str) -> bool:
+    """The AppleScript rung of :func:`send_text_via`: True only when ``osascript`` exited
+    0 AND reported the session found (``ok``). Bounded by :func:`_osascript`'s 10 s. The
+    text is typed as ONE line (see :data:`_APPLESCRIPT_PASTE` for why)."""
+    out = _osascript(_APPLESCRIPT_PASTE, args=(uuid, _one_line(text)))
+    return out is not None and out.strip() == "ok"
+
+
+def send_text_via(iterm_session_id: str, text: str) -> str:
+    """Type *text* into an EXISTING iTerm session and submit; return the channel used.
+
+    ``"python-api"`` / ``"applescript"`` on success, ``""`` when nothing delivered. The
+    delivery path for a prompt aimed at a live, idle Claude session (``ccc await``,
+    attached prompts): the text goes in wrapped in bracketed-paste markers — a multi-line
+    prompt must arrive as ONE paste, since a bare newline would submit each line
+    separately — followed, after a beat for the composer to ingest the paste, by a lone CR
+    that submits it.
+
+    Rung 1 is the iTerm2 Python-API socket; when it fails for ANY reason (API server
+    disabled → connection refused, timeout, session unknown to the API, package missing)
+    before the paste went out, rung 2 is AppleScript (:data:`_APPLESCRIPT_PASTE`, the same
+    by-UUID window/tab/session walk as :func:`close_iterm_session`). A Python-API attempt
+    that sent the paste but not the CR does NOT fall back (the text would arrive twice).
+
+    NOT TCC-free (tp#90): unless iTerm2's auth-disable switch is set, the ``iterm2``
+    package obtains its cookie over an Apple event with no timeout, so a launchd daemon
+    whose executable lacks (or is waiting on a prompt for) the Automation grant would hang
+    here. Hence the bounded pre-check: a 5 s AppleScript version query must succeed first —
+    it proves the grant (which the AppleScript rung needs anyway); if it fails we return
+    ``""`` before connecting.
+    """
+    uuid = (iterm_session_id or "").split(":")[-1].strip()
+    if not uuid or not text:
+        return ""
+    if not _iterm_api_auth_is_tcc_free() and not _iterm_reachable_by_apple_event():
+        return ""
+    api = _send_text_python_api(uuid, text)
+    if api == _API_SENT:
+        return "python-api"
+    if api == _API_PARTIAL:
+        return ""
+    return "applescript" if _send_text_applescript(uuid, text) else ""
+
+
+def send_text_to_session(iterm_session_id: str, text: str) -> bool:
+    """:func:`send_text_via` as a bool — ``False`` on any failure, so the caller can fall
+    back to a resume tab."""
+    return bool(send_text_via(iterm_session_id, text))
+
+
+#: :func:`delivery_channel_health`'s bound on the Python-API connect.
+CHANNEL_PROBE_TIMEOUT = 3.0
+#: What ``python_api_error`` says for a refused / missing API socket.
+PYTHON_API_DISABLED = "connection refused — iTerm Settings → General → Magic → Enable Python API"
+
+
+def _python_api_error(exc: BaseException) -> str:
+    """A short, user-facing reason for a failed Python-API connect."""
+    if isinstance(exc, (ConnectionRefusedError, FileNotFoundError)):
+        return PYTHON_API_DISABLED
+    import asyncio  # pylint: disable=import-outside-toplevel
+
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return f"no answer within {CHANNEL_PROBE_TIMEOUT:g} s"
+    if isinstance(exc, ImportError):
+        return "the iterm2 Python package is not installed"
+    text = " ".join(str(exc).split())[:120]
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def _probe_python_api() -> str:
+    """``""`` when a bounded Python-API connect succeeds (closed again, nothing sent),
+    else the reason it did not."""
+    if not _iterm_api_auth_is_tcc_free() and not _iterm_reachable_by_apple_event():
+        return "no Automation grant for iTerm2 (the API cookie request would hang)"
+    try:
+        import asyncio  # pylint: disable=import-outside-toplevel
+
+        import iterm2  # pylint: disable=import-outside-toplevel
+
+        async def _go() -> None:
+            conn = await asyncio.wait_for(
+                iterm2.Connection.async_create(), timeout=CHANNEL_PROBE_TIMEOUT
+            )
+            websocket = getattr(conn, "websocket", None)
+            if websocket is not None:
+                await websocket.close()
+
+        asyncio.run(_go())
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return _python_api_error(exc)
+    return ""
+
+
+def delivery_channel_health() -> dict[str, Any]:
+    """Which live-tab delivery channels :func:`send_text_via` can use from THIS process.
+
+    ``{"python_api": bool, "applescript": bool, "checked_at": epoch,
+    "python_api_error": str}`` — ``python_api`` = a bounded
+    (:data:`CHANNEL_PROBE_TIMEOUT`) ``iterm2.Connection.async_create()`` succeeded (then
+    closed; nothing is sent to any session), ``applescript`` =
+    :func:`_iterm_reachable_by_apple_event`. Measured by the ``ccc await`` poller (the
+    process that delivers) and recorded; views only read the record.
+    """
+    import time  # pylint: disable=import-outside-toplevel
+
+    error = _probe_python_api()
+    return {
+        "python_api": not error,
+        "applescript": _iterm_reachable_by_apple_event(),
+        "checked_at": int(time.time()),
+        "python_api_error": error,
+    }
 
 
 def type_into_iterm_session(iterm_session_id: str, text: str, *, newline: bool = True) -> bool:

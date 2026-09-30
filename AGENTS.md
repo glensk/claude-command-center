@@ -288,6 +288,12 @@ Invariants:
   output capped; the process GROUP killed at the timeout; stderr sanitized).
 - **Content-free notifications**, one per state (`notified_at`); the event text reaches
   only the prompt, framed as untrusted and defanged (`await_prompt.build_payload`).
+- **Live-tab typing is a ladder**: `terminal.send_text_via` tries the iTerm2 Python API,
+  then AppleScript (text passed as an `osascript` argv argument, never in the script
+  source; a half-sent API paste never falls back). The poller records both channels'
+  health (single-row `await_channel_health`, ≤ every 5 min); the TUI, `ccc ls` and the
+  detail pane only READ it — rendering never probes iTerm. Tests never probe it either
+  (`conftest._stub_channel_probe`).
 - `await` is a hot subcommand (`cli._HOT_SUBCOMMANDS`): `await_cli` imports nothing
   heavy at load time, and `-r` returns after one indexed query when nothing is armed.
 

@@ -170,6 +170,31 @@ def _guard_real_trust_writes(
 
 
 @pytest.fixture(autouse=True)
+def _stub_channel_probe(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a test probe the developer's real iTerm2 for delivery-channel health.
+
+    ``ccc await -r`` passes and ``ccc doctor`` call ``terminal.delivery_channel_health``
+    (a Python-API connect + an AppleScript version query). Stubbed suite-wide to "both
+    down, never connected"; a test of the probe itself opts out with
+    ``@pytest.mark.real_channel_probe`` and stubs the rungs underneath instead.
+    """
+    if request.node.get_closest_marker("real_channel_probe"):
+        return
+    from command_center import terminal
+
+    monkeypatch.setattr(
+        terminal,
+        "delivery_channel_health",
+        lambda: {
+            "python_api": False,
+            "applescript": False,
+            "checked_at": int(time.time()),
+            "python_api_error": "stubbed in tests",
+        },
+    )
+
+
+@pytest.fixture(autouse=True)
 def _restore_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
     """Put the process cwd back after every test.
 

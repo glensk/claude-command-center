@@ -579,6 +579,34 @@ def _read_awaits(store: Store) -> list[AwaitEntry]:
         return []
 
 
+def _awaiting_rule_text(channels: dict[str, Any] | None, now: float | None = None) -> str:
+    """The AWAITING rule's label: name, hint and the recorded live-tab delivery channels
+    (``AWAITING  (…)  Python API: ✅ · AppleScript: ✅ (checked 14:02)``)."""
+    return f"{AWAITING_LABEL}  {AWAITING_HINT}  {await_view.channel_health_text(channels, now)}"
+
+
+def _slice_cells(text: str, widths: list[int]) -> list[str]:
+    """Cut *text* into one piece per column width, counted in DISPLAY cells (``✅`` is
+    two), each piece padded to its width. A wide character that would straddle a column
+    edge is replaced by a space so no piece overflows its column."""
+    pieces: list[str] = []
+    chars = iter(text)
+    carry = ""
+    for width in widths:
+        piece, used = "", 0
+        while used < width:
+            char, carry = carry or next(chars, " "), ""
+            size = cell_len(char)
+            if used + size > width:  # straddles the edge: pad, retry in the next column
+                piece += " " * (width - used)
+                carry = char
+                break
+            piece += char
+            used += size
+        pieces.append(piece)
+    return pieces
+
+
 def _await_row_cells(entry: AwaitEntry, now: float, root: str | None) -> list[Text]:
     """One AWAITING row: ``◷`` · the target folder · its short id · in ``/aim`` the
     group summary (sources — state · until · next probe) then the session's AIM, dim."""
@@ -595,11 +623,14 @@ def _await_row_cells(entry: AwaitEntry, now: float, root: str | None) -> list[Te
     return cells
 
 
-def _await_detail_text(entry: AwaitEntry, root: str | None) -> Text:
+def _await_detail_text(
+    entry: AwaitEntry, root: str | None, channels: dict[str, Any] | None = None
+) -> Text:
     """The detail pane of an AWAITING row: one ``Field: value`` line per
-    :func:`await_view.detail_lines` entry, styled like the session fields (read-only)."""
+    :func:`await_view.detail_lines` entry, styled like the session fields (read-only).
+    *channels* is the recorded delivery-channel health (never probed here)."""
     text = Text()
-    for label, value in await_view.detail_lines(entry, root):
+    for label, value in await_view.detail_lines(entry, root, channels):
         text.append(f"{label}: ", style="bold")
         text.append(f"{value}\n", style=_GOLD if label == "Purpose" else "white")
     text.append(
@@ -2206,6 +2237,8 @@ class CommandCenterApp(App[None]):
         # on the UI thread) and its rows: await row key → the target session id, so
         # Enter on an await row moves the cursor to that session's row.
         self._awaits: list[AwaitEntry] = []
+        # The await poller's last recorded delivery-channel health (read, never probed).
+        self._channel_health: dict[str, Any] | None = None
         self._await_targets: dict[str, str] = {}
         # … and await row key → its entry, for the read-only detail pane of that row.
         self._await_entries: dict[str, AwaitEntry] = {}
@@ -2517,7 +2550,8 @@ class CommandCenterApp(App[None]):
                     reconcile_first=False,
                 )
                 quick_awaits = _read_awaits(store)
-            self.call_from_thread(self._apply_rows, quick, None, quick_awaits)
+                quick_channels = await_view.read_channel_health(store)
+            self.call_from_thread(self._apply_rows, quick, None, quick_awaits, quick_channels)
         # One read per configured CODEX_HOME, off the UI thread (see the docstring). A
         # failed read is a None snapshot (the card's placeholder), never an aborted build.
         snapshots: dict[str, usage.Usage | None] = {}
@@ -2545,16 +2579,18 @@ class CommandCenterApp(App[None]):
             )
             self._sync_tab_badges(rows, store)  # AppleScript spawn — belongs off-loop too
             awaits = _read_awaits(store)
+            channels = await_view.read_channel_health(store)
         if get_current_worker().is_cancelled:
             return  # superseded by a newer refresh — let that one repaint
         # Rows AND snapshots in ONE handoff: a build that raises publishes neither.
-        self.call_from_thread(self._apply_rows, rows, snapshots, awaits)
+        self.call_from_thread(self._apply_rows, rows, snapshots, awaits, channels)
 
     def _apply_rows(
         self,
         rows: list[Row],
         codex_usage: dict[str, usage.Usage | None] | None = None,
         awaits: list[AwaitEntry] | None = None,
+        channels: dict[str, Any] | None = None,
     ) -> None:
         # UI thread: everything the old refresh_data did AFTER build_rows, minus
         # _sync_tab_badges (now done in the worker).
@@ -2567,6 +2603,7 @@ class CommandCenterApp(App[None]):
             self._codex_usage = codex_usage
         if awaits is not None:  # None = the caller read none; keep the last section
             self._awaits = awaits
+            self._channel_health = channels
         table = self.query_one("#sessions", DataTable)
         previous = self._current
         table.clear()
@@ -2992,7 +3029,7 @@ class CommandCenterApp(App[None]):
         # Bare word as the pre-layout fallback (see _add_future_separator).
         cells[_FOLDER_COL] = Text(AWAITING_LABEL, style=f"bold {_DRAFT_BLUE}")
         key = self._next_sep_key()
-        self._rule_seps[key] = f"{AWAITING_LABEL}  {AWAITING_HINT}"
+        self._rule_seps[key] = _awaiting_rule_text(self._channel_health)
         table.add_row(*cells, key=key)
         now = _epoch_now()
         for entry in self._awaits:
@@ -3046,18 +3083,13 @@ class CommandCenterApp(App[None]):
             except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
                 continue  # row gone (cleared mid-refresh) — skip it
             lead = ("─" * (left - 1) + " ") if left else ""  # gap before the name
-            after = span - len(lead) - len(word)  # cells remaining right of the name
+            after = span - len(lead) - cell_len(word)  # cells remaining right of the name
             tail = (" " + "─" * (after - 1)) if after >= 1 else ""  # gap then dashes
-            full = (lead + word + tail)[:span].ljust(span)
-            start = 0
-            for col in range(len(cols)):  # slice the rule across every column
-                width = widths[col]
+            # Sliced in display cells, not characters: the AWAITING rule carries ✅/❌.
+            for col, piece in enumerate(_slice_cells(lead + word + tail, widths)):
                 table.update_cell_at(
-                    Coordinate(row, col),
-                    Text(full[start : start + width], style=style),
-                    update_width=False,
+                    Coordinate(row, col), Text(piece, style=style), update_width=False
                 )
-                start += width
 
     def _add_session_row(self, table: DataTable, row: Row, indent_repo: bool = True) -> None:
         session = row.session
@@ -3497,7 +3529,7 @@ class CommandCenterApp(App[None]):
         if self._current or entry is None:
             return False
         head.update(Text("◷ AWAITING — ccc await group\n", style=f"bold {_DRAFT_BLUE}"))
-        fview.update(_await_detail_text(entry, self._root))
+        fview.update(_await_detail_text(entry, self._root, self._channel_health))
         bottom.update("")
         return True
 

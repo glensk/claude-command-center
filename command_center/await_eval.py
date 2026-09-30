@@ -15,7 +15,9 @@ behaviour. A pass:
    thread): a fired source wins the group in ONE transaction (``Store.fire_group``),
    a transient failure backs the source off, a permanent one blocks the source, and the
    group blocks only when no viable source is left;
-6. runs the deliveries (:mod:`command_center.await_delivery`).
+6. records the live-tab delivery channels (:func:`record_channel_health`, at most every
+   :data:`CHANNEL_HEALTH_EVERY_SEC`) — measured here because this is the process that types;
+7. runs the deliveries (:mod:`command_center.await_delivery`).
 
 A dry run (``daemon --dry-run``, ``await -r -n``) runs no probe and no delivery; it
 reports what WOULD be probed.
@@ -51,6 +53,8 @@ if TYPE_CHECKING:
 MAX_SOURCES_PER_PASS = 10
 POOL_SIZE = 4
 PASS_DEADLINE_SEC = 50.0
+#: How often a pass re-measures the delivery channels (``terminal.delivery_channel_health``).
+CHANNEL_HEALTH_EVERY_SEC = 5 * 60
 
 Notifier = Callable[[str, str], None]
 
@@ -74,6 +78,10 @@ class PassReport:  # pylint: disable=too-many-instance-attributes  # a flat tall
     delivered: list[int] = dataclasses.field(default_factory=list)
     launched: list[int] = dataclasses.field(default_factory=list)
     waiting: list[int] = dataclasses.field(default_factory=list)
+    #: ``"<group>:<channel>"`` per live-tab delivery (``python-api`` / ``applescript``).
+    typed_via: list[str] = dataclasses.field(default_factory=list)
+    #: The channel health this pass measured (empty = not due, see CHANNEL_HEALTH_EVERY_SEC).
+    channels: dict[str, object] = dataclasses.field(default_factory=dict)
 
     def is_empty(self) -> bool:
         """True when the pass changed nothing worth reporting."""
@@ -97,6 +105,35 @@ def notify_group(store: Store, group_id: int, message: str, now: int, notifier: 
     """One content-free notification per group state (``notified_at`` dedup)."""
     if store.claim_group_notice(group_id, now):
         notifier("ccc await", message)
+
+
+ChannelProbe = Callable[[], dict[str, object]]
+
+
+def _default_channel_probe() -> dict[str, object]:
+    from . import terminal  # pylint: disable=import-outside-toplevel
+
+    return terminal.delivery_channel_health()
+
+
+def record_channel_health(
+    store: Store, now: int, probe: ChannelProbe | None = None
+) -> dict[str, object] | None:
+    """Measure and record the delivery channels unless the last record is younger than
+    :data:`CHANNEL_HEALTH_EVERY_SEC`; the recorded dict, or ``None`` when not due.
+
+    The record lives in the single-row ``await_channel_health`` table (the
+    ``mirror_health`` pattern): the TUI, ``ccc ls`` and ``ccc doctor`` only read it."""
+    last = store.channel_health()
+    if last is not None and 0 <= now - int(last["checked_at"]) < CHANNEL_HEALTH_EVERY_SEC:
+        return None
+    try:
+        health = dict((probe or _default_channel_probe)())
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return None  # a failed probe records nothing; the next pass retries
+    health.setdefault("checked_at", now)
+    store.put_channel_health(health)
+    return health
 
 
 def _lifecycle(store: Store, now: int, report: PassReport, notifier: Notifier) -> None:
@@ -278,6 +315,7 @@ def run_pass(  # pylint: disable=too-many-arguments
     deadline_sec: float = PASS_DEADLINE_SEC,
     clock: Callable[[], float] = time.monotonic,
     delivery: Callable[..., None] | None = None,
+    channel_probe: ChannelProbe | None = None,
 ) -> PassReport:
     """One evaluation pass (see the module docstring). Never raises for a probe failure."""
     report = PassReport()
@@ -312,6 +350,7 @@ def run_pass(  # pylint: disable=too-many-arguments
             clock=clock,
         )
     if deliver:
+        report.channels = record_channel_health(store, now, channel_probe) or {}
         if delivery is None:
             from . import await_delivery  # pylint: disable=import-outside-toplevel
 

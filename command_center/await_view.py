@@ -21,6 +21,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 # pylint: disable=wrong-import-position  # the direct-run shim comes first
 import dataclasses
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -51,6 +52,14 @@ class AwaitEntry:
     def cwd(self) -> str:
         """The folder the group resumes in (the session's, else the arm-time snapshot)."""
         return (self.session.cwd if self.session is not None else "") or self.group.cwd
+
+
+def read_channel_health(store: Store) -> dict[str, Any] | None:
+    """The recorded channel health (``None`` = never recorded or unreadable). A read only."""
+    try:
+        return store.channel_health()
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return None
 
 
 def visible_awaits(store: Store) -> list[AwaitEntry]:
@@ -189,13 +198,47 @@ def _session_detail(entry: AwaitEntry, root: str | None) -> str:
     return text
 
 
-def detail_lines(entry: AwaitEntry, root: str | None = None) -> list[tuple[str, str]]:
+def _mark(value: object) -> str:
+    return "✅" if value else "❌"
+
+
+def channel_health_text(health: dict[str, Any] | None, now: float | None = None) -> str:
+    """``Python API: ✅ · AppleScript: ❌ (checked 14:02)`` — the live-tab delivery channels
+    as the poller last recorded them (``Store.channel_health``); ``?`` for both when never
+    recorded. Pure: never probes iTerm."""
+    if not health:
+        return "Python API: ? · AppleScript: ?"
+    text = f"Python API: {_mark(health.get('python_api'))} · "
+    text += f"AppleScript: {_mark(health.get('applescript'))}"
+    checked = int(health.get("checked_at") or 0)
+    if checked:
+        text += f" (checked {_clock(checked, time.time() if now is None else now)})"
+    return text
+
+
+def channel_detail_text(health: dict[str, Any] | None, now: float | None = None) -> str:
+    """:func:`channel_health_text` plus, when the Python API is down, its reason."""
+    text = channel_health_text(health, now)
+    if health and not health.get("python_api"):
+        reason = str(health.get("python_api_error") or "").strip()
+        if reason:
+            text += f" — Python API: {reason}"
+    return text
+
+
+def detail_lines(
+    entry: AwaitEntry,
+    root: str | None = None,
+    channels: dict[str, Any] | None = None,
+    now: float | None = None,
+) -> list[tuple[str, str]]:
     """The TUI detail pane of an AWAITING row, one ``(field, value)`` per line.
 
     Read-only and pure (no store, no clock; *root* is the resolved repo root, see
     ``colors.short_folder``): Purpose, Related items, Target session,
     one ``Source N`` per source (kind, label, FULL spec, state, next probe, fail count,
-    last error), Until, Group state, Armed at, Resume prompt (the template, full text).
+    last error), Until, Group state, Armed at, Delivery channels (the recorded
+    *channels*, :func:`channel_detail_text`), Resume prompt (the template, full text).
     """
     group = entry.group
     lines: list[tuple[str, str]] = [
@@ -211,6 +254,7 @@ def detail_lines(entry: AwaitEntry, root: str | None = None) -> list[tuple[str, 
         ("Until", _date(group.until_epoch)),
         ("Group state", f"{state_text(group)}  (group {group.id})"),
         ("Armed at", _date(group.created_at)),
+        ("Delivery channels", channel_detail_text(channels, now)),
         ("Resume prompt", group.prompt_template or "—"),
     ]
     return lines

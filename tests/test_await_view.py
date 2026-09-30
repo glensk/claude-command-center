@@ -174,7 +174,7 @@ def test_detail_lines_describe_the_whole_group(home: Path) -> None:
     fields = dict(lines)
     assert [f for f, _v in lines] == [
         "Purpose", "Related items", "Target session", "Source 1", "Source 2", "Source 3",
-        "Until", "Group state", "Armed at", "Resume prompt",
+        "Until", "Group state", "Armed at", "Delivery channels", "Resume prompt",
     ]  # fmt: skip
     assert fields["Purpose"] == PURPOSE
     assert fields["Related items"] == "zoho#256, tp#12"
@@ -243,7 +243,8 @@ def test_ls_has_an_awaiting_block_only_while_a_group_is_active(home: Path) -> No
         gid = _arm(store, labels=("vendor reply", "", ""))
         out = _ls(store)
         tail = out[out.index("AWAITING") :].splitlines()
-        assert tail[0] == f"AWAITING  {await_view.AWAITING_HINT}"
+        hint = f"AWAITING  {await_view.AWAITING_HINT}"
+        assert tail[0] == f"{hint}  Python API: ? · AppleScript: ?"  # never recorded
         assert f"group {gid}" in tail[1] and "vendor reply · slack DM U1AB · cmd gh pr" in tail[1]
         assert "armed · until" in tail[1]
         assert "│ the vendor answered" in tail[1]

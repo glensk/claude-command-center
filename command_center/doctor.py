@@ -34,6 +34,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from . import config, install, scrub
 
@@ -499,6 +500,50 @@ def _iterm_api_server_enabled() -> bool | None:
     return proc.stdout.strip() == "1" if proc.returncode == 0 else None
 
 
+#: A recorded channel-health row younger than this is trusted; older → probe once.
+CHANNEL_HEALTH_FRESH_SEC = 3600
+
+
+def _recorded_channel_health() -> dict[str, Any] | None:
+    """The ``ccc await`` poller's last channel-health record, or ``None`` (best effort)."""
+    try:
+        from .store import Store  # pylint: disable=import-outside-toplevel
+
+        with Store() as store:
+            return store.channel_health()
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return None
+
+
+def _delivery_channels_check(now: float | None = None) -> Check:
+    """Can ``ccc await`` type into a live tab? (``terminal.send_text_via``'s two rungs.)
+
+    ❌ when BOTH the Python API and AppleScript are down (live-tab delivery impossible),
+    ⚠️ when only the Python API is down (the AppleScript fallback carries it), ✅ otherwise.
+    Uses the poller's record when it is younger than :data:`CHANNEL_HEALTH_FRESH_SEC`
+    (that is the process that delivers), else probes once from here.
+    """
+    import time  # pylint: disable=import-outside-toplevel
+
+    from . import await_view, terminal  # pylint: disable=import-outside-toplevel
+
+    label = "await live-tab delivery channels"
+    now = time.time() if now is None else now
+    health = _recorded_channel_health()
+    source = "poller record"
+    if health is None or not 0 <= now - int(health.get("checked_at") or 0) < (
+        CHANNEL_HEALTH_FRESH_SEC
+    ):
+        health = terminal.delivery_channel_health()
+        source = "probed by doctor"
+    detail = f"{await_view.channel_detail_text(health, now)} [{source}]"
+    if not health.get("python_api") and not health.get("applescript"):
+        return Check(FAIL, label, f"{detail} — live-tab delivery impossible")
+    if not health.get("python_api"):
+        return Check(WARN, label, f"{detail} — AppleScript fallback in use")
+    return Check(OK, label, detail)
+
+
 def _section_terminal() -> Section:
     """The iTerm2 launch path (tp#90): can a launchd-started ccc still reach a tab?
 
@@ -581,6 +626,7 @@ def _section_terminal() -> Section:
                 "(it fetches its cookie via AppleScript), so it is skipped once AppleScript failed",
             )
         )
+    section.checks.append(_delivery_channels_check())
     section.checks.append(
         Check(
             NA,

@@ -1106,10 +1106,13 @@ polling). Enter on such a row moves the cursor to the target session's row (noth
 when that row is not listed, e.g. a hidden done session). `ccc ls` appends the same
 lines as a trailing `AWAITING` block (plain text, `group <id>` first), each followed by
 an indented dim `↳ <purpose>  · items: <items>` line. Both views only READ the store —
-rendering never probes a source, calls the network or writes.
+rendering never probes a source, calls the network or writes. Both headers (the TUI
+rule and the `ccc ls` line) end with the recorded **delivery channels** (see "Live-tab
+delivery channels" below): `Python API: ✅ · AppleScript: ✅ (checked 14:02)`, ❌ for a
+channel that was down, `?` when nothing was ever recorded.
 
 ```text
-AWAITING  (ccc await -l · -d GROUP disarms)
+AWAITING  (ccc await -l · -d GROUP disarms)  Python API: ❌ · AppleScript: ✅ (checked 14:02)
 ◷ group 7  work/repo  bbbb  vendor reply · slack DM U1AB — armed · until 2026-10-05 23:59 · next 14:02  │ the vendor answered
     ↳ Waiting for the vendor to confirm the quota fix before closing the ticket.  · items: zoho#256
 ```
@@ -1120,7 +1123,10 @@ pane describes that group, read-only, one field per line (`await_view.detail_lin
 `live (<status>)` — AIM), one `Source N` line per source (kind, `[label]`, its FULL spec
 — the whole shell command and its cwd for `cmd`, `ticket #N` for Zoho, `user U… (DM
 D…)` for Slack — then state, next probe, fail count and the last error), `Until`,
-`Group state` (with the blocked reason), `Armed at` and `Resume prompt` (the message
+`Group state` (with the blocked reason), `Armed at`, `Delivery channels` (the header's
+channel text plus, when the Python API is down, why — e.g. `Delivery channels: Python
+API: ❌ · AppleScript: ✅ (checked 14:02) — Python API: connection refused — iTerm
+Settings → General → Magic → Enable Python API`) and `Resume prompt` (the message
 template, full text, wrapped). The row is a separator row, so no session-editing key
 (`e`, `a`, `n`, `D`, `b`, ←/→ edits, …) acts on it; Enter still moves to the session.
 
@@ -1150,7 +1156,8 @@ cwd is trusted for that account; and the session has no pending attached prompt
 `ccc await -l` shows it, `-R` retries. Then:
 
 - **live, idle, interactive, same account, no conflict** → the prompt is typed into the
-  tab (at-least-once: a crash between the keystrokes and the mark can repeat it);
+  tab (at-least-once: a crash between the keystrokes and the mark can repeat it) — see
+  "Live-tab delivery channels" below;
 - **live but busy / waiting / another account** → wait for the next pass;
 - **closed** → a new tab runs `ccc fire-await <group> <token>`, which claims the outbox
   row by its token BEFORE `claude --resume` (at-most-once). A launcher that fails hands
@@ -1162,6 +1169,42 @@ re-check the source before acting) followed by your template with `{event}` =
 zero-width characters stripped, the snippet clipped to 1500 bytes, `<` `>` and backticks
 escaped. Risk reduction, not sanitization. Notifications (`notify`) never carry any of
 that text: "await group 7 fired (zoho-reply); session resuming in a new tab".
+
+**Live-tab delivery channels.** Typing into a live tab (`terminal.send_text_via`) is a
+two-rung ladder, both rungs locating the session by the UUID of its `$ITERM_SESSION_ID`
+and both sending a bracketed paste (`ESC[200~…ESC[201~`, so a multi-line prompt arrives
+as ONE paste), a 0.4 s beat, then a lone CR that submits it:
+
+1. **iTerm2 Python API** (the `iterm2` websocket) — needs iTerm Settings → General →
+   Magic → *Enable Python API*;
+2. **AppleScript** — used when rung 1 fails for ANY reason (API server disabled →
+   connection refused, timeout, session unknown to the API, package missing) before the
+   paste went out. `osascript -e <script> <uuid> <text>`: the text reaches the script's
+   `on run argv` handler as an ARGUMENT, never spliced into its source, so quotes,
+   backslashes, newlines and unicode survive untouched; `write text (ESC & "[200~" & text
+   & ESC & "[201~") newline NO`, `delay 0.4`, `write text (character id 13) newline NO`.
+   Bounded at 10 s; success only when `osascript` exits 0 AND reports the session found.
+
+A Python-API attempt that sent the paste but not the CR does not fall back (the text
+would arrive twice). Both rungs need the macOS Automation grant for iTerm2 (the API
+fetches its cookie over AppleScript), so a 5 s AppleScript version query gates the
+whole ladder. The channel that delivered is logged by the poller
+(`typed_via=['7:applescript']`) and named in the notification ("… typed into the live
+session via applescript").
+
+The poller also MEASURES both channels — where delivery happens, under the poller's own
+executable and Automation grant — at most every 5 minutes
+(`terminal.delivery_channel_health`: a ≤ 3 s Python-API connect that is closed again
+and sends nothing, plus the AppleScript version query) and records the result in the
+single-row `await_channel_health` table of the store (`checked_at`, `python_api`,
+`applescript`, `python_api_error` — the `mirror_health` pattern). The pass that
+measured logs it as `channels={…}`. The TUI AWAITING rule, the AWAITING detail pane and
+the `ccc ls` AWAITING header only READ that row — rendering never probes iTerm. It is
+written only while a group is active (an idle poller tick exits before any work).
+`ccc doctor` (Terminal section, "await live-tab delivery channels") reports ❌ when both
+channels are down (live-tab delivery impossible), ⚠️ when only the Python API is down
+(the AppleScript fallback carries delivery), ✅ otherwise — from the poller's record
+when it is younger than 1 h, else from one probe of its own.
 
 ### Delegate a task to Codex (`/codex-implement-task-and-claude-review`)
 
