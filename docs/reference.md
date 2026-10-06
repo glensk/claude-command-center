@@ -1685,9 +1685,16 @@ ccc lock-release [file|--all]  # force-release without committing (escape hatch)
 ```commands
 ccc daemon --dry-run -v            # preview: what would be reaped/summarized/alerted
 ccc daemon                         # one pass: reap idle, done-check, summaries, alerts
-ccc daemon --install               # load the launchd agents (daemon every 5 min + hourly quota probe)
-ccc daemon --uninstall             # remove it
+ccc daemon --install               # load the launchd agents (daemon every 5 min, await poller, hourly quota probe, future-sync watcher)
+ccc daemon --uninstall             # remove them
+ccc daemon --print <prefix>.ccc-future-sync     # print one agent's plist; writes and loads nothing
 ```
+
+`--print LABEL` renders exactly the plist `--install` would write for one of the four
+agents (`<launchd_label>`, `<launchd_label>.await`, `<prefix>.ccc-quota-probe`,
+`<prefix>.ccc-future-sync`, where `<prefix>` is the label minus its last dot-segment) and
+exits 2 for any other label. `mac-regular-running-tasks/regular-tasks.py` uses it to check
+and restore these agents.
 
 Reaping is **off by default** (`reap = false` — fresh-install inert; enable it to
 auto-close). When on it is conservative: only `interactive`, only `idle` past

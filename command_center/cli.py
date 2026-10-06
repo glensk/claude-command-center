@@ -5123,6 +5123,10 @@ def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many
 def cmd_daemon(args: argparse.Namespace) -> int:
     from . import daemon, service
 
+    if getattr(args, "print_label", None):
+        from . import launchd
+
+        return launchd.print_plist(args.print_label)
     if args.install:
         return service.install()
     if args.uninstall:
@@ -6903,6 +6907,13 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     )
     p_daemon.add_argument(
         "--status", action="store_true", help="report whether the recurring service is running"
+    )
+    p_daemon.add_argument(
+        "--print",
+        metavar="LABEL",
+        dest="print_label",
+        help="print the launchd plist --install would write for LABEL; writes and loads "
+        "nothing (macOS)",
     )
     p_daemon.set_defaults(func=cmd_daemon)
 

@@ -26,6 +26,7 @@ import os
 import plistlib
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -43,8 +44,17 @@ def label(cfg: config.Config | None = None) -> str:
 
 
 def future_sync_label(cfg: config.Config | None = None) -> str:
-    """Label for the WatchPaths future-sync agent (``<launchd_label>-future-sync``)."""
-    return f"{label(cfg)}-future-sync"
+    """Label for the WatchPaths future-sync agent: ``<launchd_label minus its last
+    dot-segment>`` + ``.ccc-future-sync`` (``com.example.claude-command-center`` →
+    ``com.example.ccc-future-sync``), the same scheme as :func:`quota_probe_label` and
+    as the systemd unit, and the label the installed agent has always used."""
+    base = label(cfg)
+    return f"{base.rpartition('.')[0] or base}.ccc-future-sync"
+
+
+def future_sync_plist_path(cfg: config.Config | None = None) -> Path:
+    """Where the future-sync agent's plist lives."""
+    return _plist_path(future_sync_label(cfg))
 
 
 #: How often the quota-probe agent runs ``ccc quota -P``: one free request an hour.
@@ -197,7 +207,7 @@ def future_sync_plist_content(
 def future_sync_plist(cfg: config.Config | None = None) -> str:
     """Generate the future-sync WatchPaths agent plist from config.
 
-    Label = ``<launchd_label>-future-sync``; watch path = the parent of ``future_dir``
+    Label = :func:`future_sync_label`; watch path = the parent of ``future_dir``
     (the vault's task-files root, so any future/running/done edit triggers a sync);
     log = ``future-sync.log`` under the command-center home. The ``ccc`` binary is
     resolved on PATH at generation time.
@@ -331,12 +341,53 @@ def install() -> int:
         return 1
     print(f"installed and loaded launchd agent: {poller_path}")
     print(f"  runs `ccc await -r` every {AWAIT_POLLER_INTERVAL_SEC}s (idle unless armed)")
+    sync_path = future_sync_plist_path(cfg)
+    result = _write_and_load(sync_path, future_sync_plist(cfg))
+    if result.returncode != 0:
+        print(f"wrote {sync_path} but `launchctl load` failed:\n{result.stderr.strip()}")
+        return 1
+    print(f"installed and loaded launchd agent: {sync_path}")
+    print("  runs `ccc sync-future` whenever the vault's task files change")
+    return 0
+
+
+def plists(cfg: config.Config | None = None) -> dict[str, str]:
+    """Every agent :func:`install` writes, as ``{label: plist XML}`` (nothing is written)."""
+    cfg = cfg or config.load_config()
+    return {
+        label(cfg): plist_content(
+            _ccc_path(), cfg.daemon_interval_sec, config.app_home(), label(cfg)
+        ),
+        await_poller_label(cfg): await_poller_plist(cfg),
+        quota_probe_label(cfg): quota_probe_plist(cfg),
+        future_sync_label(cfg): future_sync_plist(cfg),
+    }
+
+
+def print_plist(agent_label: str) -> int:
+    """Print the plist :func:`install` would write for *agent_label*; 2 for an unknown label.
+
+    Side-effect free (no file write, no ``launchctl``): regular-tasks.py's restore and
+    drift check render ccc's agents through this (tp#769)."""
+    rendered = plists()
+    if agent_label not in rendered:
+        print(
+            f"unknown ccc launchd label {agent_label!r}; known: {', '.join(sorted(rendered))}",
+            file=sys.stderr,
+        )
+        return 2
+    sys.stdout.write(rendered[agent_label])
     return 0
 
 
 def uninstall() -> int:
     removed = False
-    for path in (_plist_path(), quota_probe_plist_path(), await_poller_plist_path()):
+    for path in (
+        _plist_path(),
+        quota_probe_plist_path(),
+        await_poller_plist_path(),
+        future_sync_plist_path(),
+    ):
         if path.exists():
             subprocess.run(["launchctl", "unload", str(path)], capture_output=True, check=False)
             path.unlink()

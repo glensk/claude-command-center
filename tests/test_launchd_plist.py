@@ -20,6 +20,16 @@ from command_center import config, launchd
 # pylint: disable=redefined-outer-name  # pytest fixtures are injected by parameter name
 
 
+def _real_cfg(tmp_path: Path) -> config.Config:
+    """A config whose label looks like the real one (the future-sync scheme tells apart)."""
+    vault = tmp_path / "vault"
+    return config.Config(
+        launchd_label="com.test.claude-command-center",
+        vault_root=str(vault),
+        future_dir=str(vault / "01-llm-tasks" / "future"),
+    )
+
+
 def _cfg(tmp_path: Path) -> config.Config:
     vault = tmp_path / "vault"
     return config.Config(
@@ -41,9 +51,14 @@ def test_plist_parses(plist: dict) -> None:
 
 
 def test_label_derives_from_config(plist: dict) -> None:
-    # The future-sync label is the configured launchd_label plus a "-future-sync" suffix.
+    # The future-sync label is the configured label's prefix + ".ccc-future-sync", the label
+    # the installed agent uses (tp#769) — not "<launchd_label>-future-sync".
     assert plist["Label"] == "com.test.ccc-future-sync"
-    assert launchd.future_sync_label(_cfg(Path("/tmp"))) == "com.test.ccc-future-sync"
+    assert launchd.future_sync_label(_real_cfg(Path("/tmp"))) == "com.test.ccc-future-sync"
+    assert (
+        launchd.future_sync_label(_real_cfg(Path("/tmp")))
+        != "com.test.claude-command-center-future-sync"
+    )
 
 
 def test_program_arguments_run_sync_future(plist: dict) -> None:
@@ -300,3 +315,53 @@ def test_builder_parity_with_plain_values(monkeypatch: pytest.MonkeyPatch) -> No
     }
     with_ai = plistlib.loads(launchd.quota_probe_plist_content("/c", "qp", "/l", "/ai").encode())
     assert with_ai["EnvironmentVariables"] == {**guards, **base_env, "AI_BIN": "/ai"}
+
+
+def test_print_plist_renders_every_installed_agent_without_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "home"))
+    cfg = _real_cfg(tmp_path)
+    monkeypatch.setattr(launchd.config, "load_config", lambda: cfg)
+    monkeypatch.setattr(launchd, "_plist_path", lambda *_: tmp_path / "never-written.plist")
+
+    def no_launchctl(*_a: object, **_k: object) -> None:
+        raise AssertionError("print must not call launchctl")
+
+    monkeypatch.setattr(launchd.subprocess, "run", no_launchctl)
+    rendered = launchd.plists(cfg)
+    assert set(rendered) == {
+        "com.test.claude-command-center",
+        "com.test.claude-command-center.await",
+        "com.test.ccc-quota-probe",
+        "com.test.ccc-future-sync",
+    }
+    for agent_label, xml in rendered.items():
+        assert launchd.print_plist(agent_label) == 0
+        out = capsys.readouterr().out
+        assert out == xml
+        assert plistlib.loads(out.encode("utf-8"))["Label"] == agent_label
+    assert launchd.print_plist("com.test.nope") == 2
+    assert not (tmp_path / "never-written.plist").exists()
+
+
+def test_install_and_uninstall_cover_the_future_sync_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "home"))
+    cfg = _real_cfg(tmp_path)
+    agents = tmp_path / "LaunchAgents"
+    monkeypatch.setattr(launchd.config, "load_config", lambda: cfg)
+    monkeypatch.setattr(
+        launchd, "_plist_path", lambda name=None: agents / f"{name or cfg.launchd_label}.plist"
+    )
+    monkeypatch.setattr(
+        launchd.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", ""),
+    )
+    assert launchd.install() == 0
+    assert (agents / "com.test.ccc-future-sync.plist").exists()
+    assert len(list(agents.glob("*.plist"))) == 4
+    assert launchd.uninstall() == 0
+    assert not list(agents.glob("*.plist"))

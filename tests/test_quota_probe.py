@@ -204,11 +204,13 @@ def test_install_writes_and_loads_every_agent_and_uninstall_removes_them(
     assert launchd.install() == 0
     daemon, probe = launchd._plist_path(), launchd.quota_probe_plist_path()  # noqa: SLF001
     poller = launchd.await_poller_plist_path()
-    assert daemon.exists() and probe.exists() and poller.exists()
+    sync = launchd.future_sync_plist_path()
+    assert daemon.exists() and probe.exists() and poller.exists() and sync.exists()
     loaded = [cmd[2] for cmd in calls if cmd[:2] == ["launchctl", "load"]]
-    assert loaded == [str(daemon), str(probe), str(poller)]
+    assert loaded == [str(daemon), str(probe), str(poller), str(sync)]
     assert launchd.uninstall() == 0
     assert not daemon.exists() and not probe.exists() and not poller.exists()
+    assert not sync.exists()
 
 
 # ── `next probe in N min` ────────────────────────────────────────────────────────────

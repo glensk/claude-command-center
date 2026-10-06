@@ -384,7 +384,8 @@ DEFAULTS: dict[str, object] = {
     # the shell). "" hides/disables the TUI "create new repo" affordance.
     "create_repo_command": "",
     # launchd agent label prefix (macOS). The periodic daemon agent uses this label; the
-    # WatchPaths future-sync agent derives "<launchd_label>-future-sync".
+    # WatchPaths future-sync agent derives "<prefix>.ccc-future-sync" (the label minus its
+    # last dot-segment), like the quota-probe agent.
     "launchd_label": "com.claude-command-center",
     # Persistent tmux session hosting launcher="tmux" windows (resume/start-job).
     "tmux_session": "ccc",
