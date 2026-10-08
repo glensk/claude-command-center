@@ -252,6 +252,12 @@ a second install. Three complementary channels — all verified on a de-Googled
    terminal shows up in the app, so you can start at the desk and steer from the couch.
    Caveats: the app can't answer permission prompts (pick your permission mode
    accordingly), and it only spawns under the server's root — anything else is channel 2.
+   On macOS the server runs fine without a TTY, so a LaunchAgent (`KeepAlive`) replaces
+   tmux; start it through `zsh -i -l -c` so spawned sessions get the PATH and env your
+   `~/.zshrc` sets (launchd never reads it). The author's setup is
+   `claude-remote-control.py -I` (mydotfiles `bin/`; `-s` status, `-r` restart, `-U`
+   remove): `~/obsidian/42-Git`, `--permission-mode bypassPermissions`, shown in the app
+   as `mac 42-Git` under *Select environment → Remote control*. The Mac must be awake.
 2. **Termux + SSH + tmux (the full-control channel).** A private overlay network
    (WireGuard or similar) plus `ssh <host>` from [Termux](https://termux.dev) attaches
    the host's persistent tmux session: the full `ccc` TUI renders fine on a phone
