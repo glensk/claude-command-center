@@ -211,6 +211,38 @@ class ItermLink:
             self._drop()
             return None
 
+    async def retitle_overridden_tabs(self, rename: Callable[[str, list[str]], str | None]) -> int:
+        """Apply *rename* to every tab carrying a user title override; tabs retitled.
+
+        A tab renamed via iTerm's "Edit Tab Title" shows its ``titleOverride`` instead of
+        the session name ccc sets, so a badge pushed into the session name never shows.
+        *rename(override, session_uuids)* (current session first) returns the new title,
+        or None to leave the tab alone. The new title is set as a literal: backslashes
+        are escaped because iTerm treats the override as an interpolated string.
+        """
+        if not await self.ensure():
+            return 0
+        changed = 0
+        try:
+            await self._app.async_refresh()
+            for window in self._app.terminal_windows:
+                for tab in window.tabs:
+                    override = await tab.async_get_variable("titleOverride")
+                    if not override:
+                        continue
+                    uuids = [s.session_id for s in tab.sessions]
+                    current = tab.current_session
+                    if current is not None and current.session_id in uuids:
+                        uuids.remove(current.session_id)
+                        uuids.insert(0, current.session_id)
+                    new = rename(str(override), uuids)
+                    if new and new != override:
+                        await tab.async_set_title(new.replace("\\", "\\\\"))
+                        changed += 1
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            self._drop()
+        return changed
+
     async def focus_session(self, iterm_session_id: str) -> bool:
         """Bring the tab/window for *iterm_session_id* forward (and iTerm frontmost).
 
