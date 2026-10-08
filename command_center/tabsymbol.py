@@ -43,6 +43,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import contextlib
 import fcntl
 import hashlib
@@ -442,3 +443,111 @@ def sync_live(store: Store, *, marker: str | None = None) -> list[str]:
 
         terminal.set_session_titles_preserving(cores, marker=_wait_marker(marker))
     return badged
+
+
+def badge_for_uuid(uuid: str) -> str | None:
+    """The badge cached for the tab whose session UUID is *uuid* (any ``wNtNpN`` prefix).
+
+    The cache key is the full ``$ITERM_SESSION_ID`` (``w0t3p0:UUID``) but the Python API
+    only knows the UUID, and the ``wNtNpN`` part goes stale when a tab moves — so match
+    on the UUID suffix and prefer the most recently written file.
+    """
+    if not uuid:
+        return None
+    paths = [p for p in cache_dir().glob(f"*_{uuid}") if p.is_file()]
+    for path in sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if value:
+            return value
+    return None
+
+
+def healed_title(title: str, badge: str | None) -> str | None:
+    """*title* with *badge* in front, or None when it already starts with it.
+
+    A different palette badge already leading the title (the tab's badge was recycled
+    since the rename) is replaced rather than stacked.
+    """
+    if not badge or title.startswith(badge):
+        return None
+    rest = title
+    for other in PALETTE:
+        if rest.startswith(f"{other} "):
+            rest = rest[len(other) + 1 :]
+            break
+    return f"{badge} {rest}"
+
+
+def _rename_with_badge(override: str, uuids: list[str]) -> str | None:
+    """``ItermLink.retitle_overridden_tabs`` callback: badge of the tab's first badged session."""
+    badge = next((b for b in map(badge_for_uuid, uuids) if b), None)
+    return healed_title(override, badge)
+
+
+WATCH_INTERVAL_SEC = 2.0
+_WATCH_RETRY_SEC = 30.0
+_WATCH_OP_TIMEOUT_SEC = 15.0
+
+
+def heal_renamed_tabs_once() -> int:
+    """One pass of :func:`watch`: badge every renamed tab now; tabs retitled (0 if offline)."""
+    import asyncio  # pylint: disable=import-outside-toplevel
+
+    from . import iterm_api  # pylint: disable=import-outside-toplevel
+
+    api_link = iterm_api.CookieItermLink()
+
+    async def _once() -> int:
+        if not await asyncio.wait_for(api_link.reconnect(), _WATCH_OP_TIMEOUT_SEC):
+            return 0
+        return await asyncio.wait_for(
+            api_link.retitle_overridden_tabs(_rename_with_badge), _WATCH_OP_TIMEOUT_SEC
+        )
+
+    try:
+        return asyncio.run(_once())
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return 0
+
+
+def watch(interval: float = WATCH_INTERVAL_SEC, *, iterations: int | None = None) -> int:
+    """Keep the badge in front of every tab title the user renamed (``ccc tab-symbol -w``).
+
+    ccc puts ``"<badge> <leaf>"`` into the session *name*; a tab renamed via iTerm's
+    "Edit Tab Title" displays its title override instead, so the badge vanished. This
+    loop holds one iTerm2 Python-API connection and every *interval* seconds prefixes
+    the tab's badge onto any override lacking it. iTerm not running / no cookie → retry
+    every 30 s. *iterations* bounds the loop (tests); None runs until killed.
+    """
+    import asyncio  # pylint: disable=import-outside-toplevel
+
+    from . import iterm_api  # pylint: disable=import-outside-toplevel
+
+    link = iterm_api.CookieItermLink()
+
+    async def _loop() -> None:
+        done = 0
+        while iterations is None or done < iterations:
+            done += 1
+            if not link.ready:
+                try:
+                    ok = await asyncio.wait_for(link.reconnect(), _WATCH_OP_TIMEOUT_SEC)
+                except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                    ok = False
+                if not ok:
+                    await asyncio.sleep(_WATCH_RETRY_SEC)
+                    continue
+            try:
+                await asyncio.wait_for(
+                    link.retitle_overridden_tabs(_rename_with_badge), _WATCH_OP_TIMEOUT_SEC
+                )
+            except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                link.drop()
+            await asyncio.sleep(interval)
+
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(_loop())
+    return 0

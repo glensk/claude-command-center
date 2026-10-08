@@ -88,6 +88,17 @@ def await_poller_plist_path(cfg: config.Config | None = None) -> Path:
     return _plist_path(await_poller_label(cfg))
 
 
+def tab_watch_label(cfg: config.Config | None = None) -> str:
+    """Label for the resident ``ccc tab-symbol --watch`` agent (``<prefix>.ccc-tab-watch``)."""
+    base = label(cfg)
+    return f"{base.rpartition('.')[0] or base}.ccc-tab-watch"
+
+
+def tab_watch_plist_path(cfg: config.Config | None = None) -> Path:
+    """Where the tab-watch agent's plist lives."""
+    return _plist_path(tab_watch_label(cfg))
+
+
 def state_badge(running: bool) -> str:
     """The shared ``✅ (running)`` / ``❌ (not running)`` badge for a process state."""
     return RUNNING_BADGE if running else NOT_RUNNING_BADGE
@@ -304,6 +315,36 @@ def await_poller_loaded(cfg: config.Config | None = None) -> bool:
     return result.returncode == 0
 
 
+def tab_watch_plist_content(ccc_path: str, agent_label: str, log_path: str) -> str:
+    """Return the launchd plist XML for the resident ``ccc tab-symbol --watch`` agent.
+
+    Keeps the badge in front of tab titles renamed in iTerm (see ``tabsymbol.watch``).
+    ``KeepAlive`` restarts it if it dies; ``LimitLoadToSessionType Aqua`` — it talks to
+    iTerm in the GUI session. Guarded like the other helper agents.
+    """
+    return _dump(
+        {
+            "Label": agent_label,
+            "ProgramArguments": [ccc_path, "tab-symbol", "--watch"],
+            "EnvironmentVariables": _agent_env(_GUARD_ENV),
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "ThrottleInterval": 30,
+            "LimitLoadToSessionType": "Aqua",
+            "StandardOutPath": log_path,
+            "StandardErrorPath": log_path,
+        }
+    )
+
+
+def tab_watch_plist(cfg: config.Config | None = None) -> str:
+    """Generate the tab-watch agent plist from config (label, log, binary)."""
+    cfg = cfg or config.load_config()
+    return tab_watch_plist_content(
+        _ccc_path(), tab_watch_label(cfg), str(config.app_home() / "tab-watch.log")
+    )
+
+
 def _write_and_load(path: Path, content: str) -> subprocess.CompletedProcess[str]:
     """Write *path* and (re)load it with ``launchctl``; the ``load`` result."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -348,6 +389,13 @@ def install() -> int:
         return 1
     print(f"installed and loaded launchd agent: {sync_path}")
     print("  runs `ccc sync-future` whenever the vault's task files change")
+    watch_path = tab_watch_plist_path(cfg)
+    result = _write_and_load(watch_path, tab_watch_plist(cfg))
+    if result.returncode != 0:
+        print(f"wrote {watch_path} but `launchctl load` failed:\n{result.stderr.strip()}")
+        return 1
+    print(f"installed and loaded launchd agent: {watch_path}")
+    print("  runs `ccc tab-symbol --watch` (keeps the badge on renamed iTerm tabs)")
     return 0
 
 
@@ -361,6 +409,7 @@ def plists(cfg: config.Config | None = None) -> dict[str, str]:
         await_poller_label(cfg): await_poller_plist(cfg),
         quota_probe_label(cfg): quota_probe_plist(cfg),
         future_sync_label(cfg): future_sync_plist(cfg),
+        tab_watch_label(cfg): tab_watch_plist(cfg),
     }
 
 
@@ -387,6 +436,7 @@ def uninstall() -> int:
         quota_probe_plist_path(),
         await_poller_plist_path(),
         future_sync_plist_path(),
+        tab_watch_plist_path(),
     ):
         if path.exists():
             subprocess.run(["launchctl", "unload", str(path)], capture_output=True, check=False)

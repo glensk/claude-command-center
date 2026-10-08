@@ -25,18 +25,18 @@ def test_palette_front_loads_shape_and_color_diversity() -> None:
     """The first badges claimed must be maximally distinct (the same-folder case)."""
     badges = tabsymbol.BADGES
     shapes = [shape for _e, shape, _c in badges]
-    colors = [color for _e, _s, color in badges]
+    families = [color for _e, _s, color in badges]
 
     # First 6 cover all 6 shapes before any shape repeats.
     assert len(set(shapes[:6])) == 6
     # First 8 are 8 distinct colors before any hue repeats.
-    assert len(set(colors[:8])) == 8
+    assert len(set(families[:8])) == 8
     # Only one red and one warm-yellow among the first six (avoid look-alikes early).
-    assert colors[:6].count("red") == 1
-    assert colors[:6].count("warm") == 1
+    assert families[:6].count("red") == 1
+    assert families[:6].count("warm") == 1
     # No two adjacent badges share a shape or a color family.
     assert all(shapes[i] != shapes[i + 1] for i in range(len(shapes) - 1))
-    assert all(colors[i] != colors[i + 1] for i in range(len(colors) - 1))
+    assert all(families[i] != families[i + 1] for i in range(len(families) - 1))
 
 
 def _assign_many(prefix: str, folder: str, count: int) -> list[str]:
@@ -158,8 +158,8 @@ def test_symbol_for_repo_is_deterministic_and_in_palette() -> None:
 
 
 def test_symbol_for_repo_distinct_repos_usually_differ() -> None:
-    repos = [f"/Users/x/cat/repo-{i}" for i in range(8)]
-    symbols = {tabsymbol.symbol_for_repo(r) for r in repos}
+    paths = [f"/Users/x/cat/repo-{i}" for i in range(8)]
+    symbols = {tabsymbol.symbol_for_repo(r) for r in paths}
     assert len(symbols) >= 6  # 24-slot palette → 8 repos almost always spread out
 
 
@@ -315,7 +315,7 @@ def test_sync_live_no_push_when_nothing_to_badge(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(terminal, "set_session_titles_preserving", _fail)
     store = _FakeStore([Session("d", cwd="/Users/x/rd")])  # no tab ids at all
-    assert tabsymbol.sync_live(store) == []  # type: ignore[arg-type]
+    assert not tabsymbol.sync_live(store)  # type: ignore[arg-type]
     assert called is False
 
 
@@ -324,3 +324,31 @@ def test_title_core_appends_clipped_aim() -> None:
     assert tabsymbol.title_core("🟧", "/Users/x/repo", "ship X") == f"🟧 {leaf} 🎯 ship X"
     long = tabsymbol.title_core("🟧", "/Users/x/repo", "a" * 80 + "\nsecond line")
     assert long.endswith("…") and "second" not in long
+
+
+def test_badge_for_uuid_matches_any_tab_prefix(tmp_path: Path) -> None:
+    """The API only knows the UUID; the cache key carries a (stale-able) ``wNtNpN`` prefix."""
+    cache = tmp_path / "iterm-tab-symbol"
+    cache.mkdir()
+    (cache / "w0t3p0_ABC-123").write_text("🟤\n", encoding="utf-8")
+    (cache / "w0t3p0_ABC-123.dir").write_text("notion-api", encoding="utf-8")
+    assert tabsymbol.badge_for_uuid("ABC-123") == "🟤"
+    assert tabsymbol.badge_for_uuid("NOPE") is None
+    assert tabsymbol.badge_for_uuid("") is None
+
+
+def test_healed_title_prefixes_once_and_replaces_stale_badge() -> None:
+    assert tabsymbol.healed_title("pitch", "🔷") == "🔷 pitch"
+    assert tabsymbol.healed_title("🔷 pitch", "🔷") is None  # already badged: leave it
+    assert tabsymbol.healed_title("pitch", None) is None  # no badge for the tab
+    stale = next(b for b in tabsymbol.PALETTE if b != "🔷")
+    assert tabsymbol.healed_title(f"{stale} pitch", "🔷") == "🔷 pitch"  # recycled badge
+
+
+def test_rename_callback_uses_first_badged_session(tmp_path: Path) -> None:
+    cache = tmp_path / "iterm-tab-symbol"
+    cache.mkdir()
+    (cache / "w1t2p1_SPLIT").write_text("🟢", encoding="utf-8")
+    rename = tabsymbol._rename_with_badge  # pylint: disable=protected-access
+    assert rename("LuckyLuke", ["UNBADGED", "SPLIT"]) == "🟢 LuckyLuke"
+    assert rename("LuckyLuke", ["UNBADGED"]) is None

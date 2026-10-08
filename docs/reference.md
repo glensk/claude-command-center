@@ -1685,14 +1685,14 @@ ccc lock-release [file|--all]  # force-release without committing (escape hatch)
 ```commands
 ccc daemon --dry-run -v            # preview: what would be reaped/summarized/alerted
 ccc daemon                         # one pass: reap idle, done-check, summaries, alerts
-ccc daemon --install               # load the launchd agents (daemon every 5 min, await poller, hourly quota probe, future-sync watcher)
+ccc daemon --install               # load the launchd agents (daemon every 5 min, await poller, hourly quota probe, future-sync watcher, tab-title watcher)
 ccc daemon --uninstall             # remove them
 ccc daemon --print <prefix>.ccc-future-sync     # print one agent's plist; writes and loads nothing
 ```
 
-`--print LABEL` renders exactly the plist `--install` would write for one of the four
+`--print LABEL` renders exactly the plist `--install` would write for one of the five
 agents (`<launchd_label>`, `<launchd_label>.await`, `<prefix>.ccc-quota-probe`,
-`<prefix>.ccc-future-sync`, where `<prefix>` is the label minus its last dot-segment) and
+`<prefix>.ccc-future-sync`, `<prefix>.ccc-tab-watch`, where `<prefix>` is the label minus its last dot-segment) and
 exits 2 for any other label. `mac-regular-running-tasks/regular-tasks.py` uses it to check
 and restore these agents.
 
@@ -1954,7 +1954,17 @@ stable for the life of the tab. Assignment is owned by:
 ccc tab-symbol            # claim (or reuse) this tab's badge, print it; idempotent
 ccc tab-symbol --read     # print the existing badge only, never assign
 ccc tab-symbol --sync     # ensure every tracked live tab has a badge AND its title shows it
+ccc tab-symbol --heal     # prefix the badge onto every tab title renamed in iTerm (one pass)
+ccc tab-symbol --watch    # --heal every 2 s until killed (the <prefix>.ccc-tab-watch agent)
 ```
+
+A tab renamed via iTerm's *Edit Tab Title* shows its title override instead of the
+session name ccc sets, so the badge would vanish. `--heal`/`--watch` read each tab's
+`titleOverride` over the iTerm2 Python API and put the tab's badge in front of it
+(a stale palette badge left from before a recycle is replaced, not stacked). The
+`<prefix>.ccc-tab-watch` LaunchAgent (installed by `ccc daemon --install`, `KeepAlive`)
+runs `--watch`, so a rename gets its badge back within ~2 s; log in
+`~/.claude/command-center/tab-watch.log`.
 
 `--sync` (and the daemon, every pass — see below) is **marker-preserving**: it
 rewrites only the `<emoji> repo` *core* of a tab title, so a tab flagged

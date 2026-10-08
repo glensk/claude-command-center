@@ -5463,6 +5463,8 @@ def cmd_tab_symbol(args: argparse.Namespace) -> int:
       also prints the folder's colour (hex/name).
     * ``--sync`` — re-apply every tracked live session's ``<emoji> repo`` title to its
       iTerm tab via AppleScript (badge tabs already open before the hook landed).
+    * ``--heal`` / ``--watch`` — prefix the badge onto tab titles renamed in iTerm (whose
+      title override hides the session name ccc sets); once, or every 2 s.
     * default — claim (or ``--read``) this iTerm tab's unique badge keyed by
       ``$ITERM_SESSION_ID`` and print it (the macOS zsh ``chpwd`` hook path).
 
@@ -5486,6 +5488,13 @@ def cmd_tab_symbol(args: argparse.Namespace) -> int:
         with Store() as store:
             badged = tabsymbol.sync_live(store)
         print(f"synced {len(badged)} tab title(s)")
+        return 0
+
+    if getattr(args, "watch", False):
+        return tabsymbol.watch()
+
+    if getattr(args, "heal", False):
+        print(f"badged {tabsymbol.heal_renamed_tabs_once()} renamed tab title(s)")
         return 0
 
     iterm = args.session_id or os.environ.get("ITERM_SESSION_ID")
@@ -5594,6 +5603,19 @@ def _add_tab_symbol(sub: Any) -> None:
         action="store_true",
         help="re-apply every tracked live tab's '<emoji> repo' title via AppleScript "
         "(badge tabs that were already open before the hook landed)",
+    )
+    p_sym.add_argument(
+        "-H",
+        "--heal",
+        action="store_true",
+        help="prefix the tab's badge onto every tab title renamed in iTerm (one pass, "
+        "iTerm2 Python API)",
+    )
+    p_sym.add_argument(
+        "-w",
+        "--watch",
+        action="store_true",
+        help="run --heal every 2 s until killed (the ccc-tab-watch launchd agent)",
     )
     p_sym.set_defaults(func=cmd_tab_symbol)
 

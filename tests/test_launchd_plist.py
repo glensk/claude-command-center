@@ -335,6 +335,7 @@ def test_print_plist_renders_every_installed_agent_without_side_effects(
         "com.test.claude-command-center.await",
         "com.test.ccc-quota-probe",
         "com.test.ccc-future-sync",
+        "com.test.ccc-tab-watch",
     }
     for agent_label, xml in rendered.items():
         assert launchd.print_plist(agent_label) == 0
@@ -362,6 +363,18 @@ def test_install_and_uninstall_cover_the_future_sync_agent(
     )
     assert launchd.install() == 0
     assert (agents / "com.test.ccc-future-sync.plist").exists()
-    assert len(list(agents.glob("*.plist"))) == 4
+    assert (agents / "com.test.ccc-tab-watch.plist").exists()
+    assert len(list(agents.glob("*.plist"))) == 5
     assert launchd.uninstall() == 0
     assert not list(agents.glob("*.plist"))
+
+
+def test_tab_watch_plist_runs_resident_watcher(tmp_path: Path) -> None:
+    cfg = _real_cfg(tmp_path)
+    plist = plistlib.loads(launchd.tab_watch_plist(cfg).encode("utf-8"))
+    assert plist["Label"] == "com.test.ccc-tab-watch"
+    assert plist["ProgramArguments"][1:] == ["tab-symbol", "--watch"]
+    assert plist["KeepAlive"] is True
+    assert plist["RunAtLoad"] is True
+    assert plist["EnvironmentVariables"]["AI_NO_AUTOCOMMIT"] == "1"
+    assert launchd.tab_watch_label(cfg) in launchd.plists(cfg)
