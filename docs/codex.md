@@ -63,7 +63,13 @@ codex-in-claude.py home -c                                   # drop the pin
 moves `delegate`, `usage`/`headroom` AND `codex-review.py` (the `/codex-debate` adversary)
 to that login at once and lapses by itself after the date; an explicit `$CODEX_HOME` in the
 environment still overrides it. Create the second login once with
-`CODEX_HOME=~/.codex-private codex login` (same value as ccc's `codex_home_private`).
+`CODEX_HOME=~/.codex-private codex login` (same value as ccc's `codex_home_private`),
+then link the shared config and global instructions into the new home —
+`ln -s ../.codex/config.toml ~/.codex-private/config.toml` and
+`ln -s ../obsidian/42-Git/home/mydotfiles/dotfiles/codex/.codex/AGENTS.md ~/.codex-private/AGENTS.md` —
+and add that home's `[hooks.state."<home>/config.toml:<event>:<group>:<handler>"]` rows
+(same hashes as `~/.codex`) to mydotfiles' `config.toml`: `codex exec` skips an
+untrusted hook silently.
 The pin must point at a home **ccc knows** — `~/.codex`, `codex_home_private`, or an entry
 of `codex_homes_extra`. A path outside those maps to no seat label, so the selector treats
 the pin as absent and ignores it; add the login to `codex_homes_extra` first
