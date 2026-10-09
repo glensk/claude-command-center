@@ -6,7 +6,7 @@ characters, e.g. ``voice bridge``) that the user, the voice bridge and other age
 address it. The rules (PLAN_claude-bridge.md §7.1, decisions D2/D3):
 
 * **Generated once.** Through ccc's single LLM route (``llm_custom_command``, purpose
-  ``session-name``, 10 s budget) when a router is configured, else deterministically:
+  ``session-name``, 30 s budget) when a router is configured, else deterministically:
   the repo folder plus at most one meaningful AIM noun (origin ``fallback``). The AIM the
   name came from is stored (``name_source_aim``); later AIM changes never rename.
 * **A ``fallback`` name is provisional.** ``ccc sessions -j`` hands one out without an
@@ -73,7 +73,9 @@ MAX_UPGRADE_TRIES = 3
 # A name the user typed (``ccc name``, a hand-set tab title) may be longer than a
 # generated one, but stays a name, not a sentence.
 MAX_MANUAL_CHARS = 48
-LLM_TIMEOUT_SEC = 10
+# The router ladder can take 7–12 s when its first providers are out of quota; naming
+# runs in the background (daemon pass, set-aim), so a generous budget costs nothing.
+LLM_TIMEOUT_SEC = 30
 # A live title that differs from ccc's last write counts as hand-set only this long after
 # that write: ccc's title writes are detached AppleScript runs that land a moment later.
 MANUAL_GRACE_MS = 5000
@@ -263,14 +265,24 @@ def _key(name: str) -> str:
 # --------------------------------------------------------------------------- #
 # Generation
 # --------------------------------------------------------------------------- #
+_TICKET_RE = re.compile(r"#?\b(?:tp|tp#|ticket)\s*#?\s*\d+\b|#\w+|\b\d+\b", re.IGNORECASE)
+
+
+def aim_has_substance(aim: str) -> bool:
+    """True when the AIM says WHAT is worked on (not just "#tp 855"): an LLM given only a
+    ticket number invents a name, which then sticks."""
+    words = re.findall(r"[^\W\d_]{3,}", _TICKET_RE.sub(" ", aim or ""))
+    return len(words) >= 2
+
+
 def llm_name(aim: str, cwd: str, command: str) -> str | None:
-    """Ask the configured router (purpose ``session-name``, 10 s) for a name, or ``None``."""
-    if not command.strip() or not aim.strip():
+    """Ask the configured router (purpose ``session-name``, 30 s) for a name, or ``None``."""
+    if not command.strip() or not aim_has_substance(aim):
         return None
     from . import llm
 
     prompt = _PROMPT.format(max_chars=MAX_CHARS, folder=repo_folder(cwd) or "-", aim=aim.strip())
-    # run_custom (not run_model) only for the 10 s budget: the route is the same single
+    # run_custom (not run_model) only for its own time budget: the route is the same single
     # llm_custom_command, and a failure is logged like llm._dispatch does.
     raw = llm.run_custom(
         prompt,
@@ -421,7 +433,7 @@ def ensure_name(
     Generated ONCE — except a provisional ``fallback`` name, which *use_llm* may replace
     exactly once with an LLM name (:func:`upgradable`); ``llm``, ``manual`` and
     ``manual-tab`` names are returned as they are. The LLM call runs BEFORE the
-    transaction, so the write lock is never held across a 10 s network call; a peer that
+    transaction, so the write lock is never held across a network call; a peer that
     named (or renamed) the row meanwhile wins.
     """
     session = store.get(session_id)

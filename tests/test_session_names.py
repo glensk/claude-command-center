@@ -49,7 +49,7 @@ def test_normalize_generated_shapes_a_model_reply() -> None:
     assert session_names.normalize_generated("!!!") is None
 
 
-def test_llm_namer_uses_the_session_name_purpose_with_a_10s_budget(
+def test_llm_namer_uses_the_session_name_purpose_with_a_30s_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: dict[str, Any] = {}
@@ -66,7 +66,9 @@ def test_llm_namer_uses_the_session_name_purpose_with_a_10s_budget(
         session_names.llm_name("build the voice bridge", "/r/my-stt-tts", "router")
         == "voice bridge"
     )
-    assert seen["purpose"] == "session-name" and seen["timeout"] == 10
+    assert (
+        seen["purpose"] == "session-name" and seen["timeout"] == session_names.LLM_TIMEOUT_SEC == 30
+    )
     assert seen["command"] == "router" and "my-stt-tts" in seen["prompt"]
 
 
@@ -482,3 +484,18 @@ def test_reconcile_never_clobbers_the_canonical_name(store: Store) -> None:
     store.upsert_from_live(LiveSession(pid=1, session_id="s1", cwd="/r", name="voice bridge"))
     got = store.get("s1")
     assert got is not None and got.runtime_name_applied_at > 0
+
+
+@pytest.mark.parametrize(
+    ("aim", "ok"),
+    [
+        ("#tp 855", False),
+        ("tp#855", False),
+        ("ticket 12 #wip", False),
+        ("", False),
+        ("build the voice bridge", True),
+        ("fix tp#855 voice bridge", True),
+    ],
+)
+def test_aim_without_substance_is_not_sent_to_the_llm(aim: str, ok: bool) -> None:
+    assert session_names.aim_has_substance(aim) is ok
