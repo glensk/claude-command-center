@@ -77,6 +77,11 @@ DEFAULTS: dict[str, object] = {
     "aim_intercept_block": True,  # True: swallow `/aim` (no turn; CC shows "blocked by hook")
     "aim_on_main_line": False,  # `ccc aim --format bar` prefixes "🎯 <aim>" (status-line row 1)
     "aim_in_tab_title": False,  # iTerm tab title "<badge> <leaf> 🎯 <aim>"
+    # Memorable 1-2 word session names (`ccc name`, `ccc sessions -j`, tab titles,
+    # `claude --name` on ccc launches). Generated once per session: through
+    # llm_custom_command when one is set, else a deterministic repo-folder name — so
+    # a fresh install spends no tokens. A tab title set by hand becomes the name.
+    "session_names": True,
     "aim_score": True,  # NN% AIM-specificity chip + daemon backfill (False = none)
     "aim_score_threshold": 50,  # AIM specificity < this (0..100) => vague: red + sharpen nudge
     "aim_score_on_set": False,  # refine the AIM score with an LLM call when the AIM changes (INERT)
@@ -1024,6 +1029,7 @@ class Config:
     aim_intercept_block: bool = True
     aim_on_main_line: bool = False
     aim_in_tab_title: bool = False
+    session_names: bool = True
     aim_score: bool = True
     aim_score_threshold: int = 50
     aim_score_on_set: bool = False

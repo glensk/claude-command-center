@@ -447,13 +447,15 @@ def resume_in_new_tab(
     sets it) and inherits ``CCC_NO_CODEX=1`` when the row demands it — a fresh tab's
     ambient env can never silently bill the wrong account or re-enable Codex.
     """
-    from .accounts import LaunchTarget, ensure_trusted, session_launch_env_prefix
+    from . import launch_argv
+    from .accounts import LaunchTarget, ensure_trusted
 
     ensure_trusted(config_dir, cwd)  # the tab's claude must not park on the trust dialog
-    prefix = session_launch_env_prefix(LaunchTarget(config_dir, no_codex))
+    target = LaunchTarget(config_dir, no_codex)
+    argv = launch_argv.claude_argv(resume=session_id)
     if _launcher_mode() == "tmux":
-        return _tmux_window(f"{prefix}claude --resume {shlex.quote(session_id)}", cwd=cwd)
-    command = f"{prefix}cd {shlex.quote(cwd)} && claude --resume {shlex.quote(session_id)}"
+        return _tmux_window(launch_argv.claude_command(target, argv), cwd=cwd)
+    command = launch_argv.claude_command(target, argv, cwd=cwd)
     return bool(_open_tab(command, tmux_fallback=False))
 
 
@@ -1018,23 +1020,177 @@ def send_text_via(iterm_session_id: str, text: str) -> str:
     it proves the grant (which the AppleScript rung needs anyway); if it fails we return
     ``""`` before connecting.
     """
+    return send_text_detailed(iterm_session_id, text)[0]
+
+
+def send_text_detailed(iterm_session_id: str, text: str) -> tuple[str, str]:
+    """:func:`send_text_via` with the delivery state: ``(channel, sent|none|partial)``.
+
+    ``partial`` = the Python-API paste went out but its CR did not — the text may sit
+    unsubmitted in the composer (``ccc send`` reports that as an ``unknown`` outcome
+    instead of the bare ``""`` :func:`send_text_via` returns for both failures).
+    """
     uuid = (iterm_session_id or "").split(":")[-1].strip()
     if not uuid or not text:
-        return ""
+        return "", _API_NONE
     if not _iterm_api_auth_is_tcc_free() and not _iterm_reachable_by_apple_event():
-        return ""
+        return "", _API_NONE
     api = _send_text_python_api(uuid, text)
     if api == _API_SENT:
-        return "python-api"
+        return "python-api", _API_SENT
     if api == _API_PARTIAL:
-        return ""
-    return "applescript" if _send_text_applescript(uuid, text) else ""
+        return "", _API_PARTIAL
+    if _send_text_applescript(uuid, text):
+        return "applescript", _API_SENT
+    return "", _API_NONE
 
 
 def send_text_to_session(iterm_session_id: str, text: str) -> bool:
     """:func:`send_text_via` as a bool — ``False`` on any failure, so the caller can fall
     back to a resume tab."""
     return bool(send_text_via(iterm_session_id, text))
+
+
+#: Raw bytes per key name for :func:`send_keys_via`. Arrows use the normal-mode CSI form
+#: (Claude Code's key parser also accepts the application-mode SS3 form).
+KEY_BYTES: dict[str, str] = {
+    "up": "\x1b[A",
+    "down": "\x1b[B",
+    "right": "\x1b[C",
+    "left": "\x1b[D",
+    "enter": "\r",
+    "space": " ",
+    "tab": "\t",
+    "btab": "\x1b[Z",
+    "esc": "\x1b",
+}
+#: Pause between two keys, so a TUI re-renders before the next one arrives.
+KEY_DELAY = 0.15
+#: Longest ``wait:<s>`` token accepted.
+KEY_WAIT_MAX = 10.0
+
+
+def key_payloads(keys: Sequence[str]) -> list[tuple[str, str]]:
+    """Validate *keys* into ``[(token, bytes-as-str)]``; ``ValueError`` on a bad token.
+
+    Vocabulary: the names in :data:`KEY_BYTES`, a single digit ``0``–``9`` (typed as
+    is), ``text:<str>`` (typed literally; no control characters) and ``wait:<seconds>``
+    (a pause, payload ``""``, at most :data:`KEY_WAIT_MAX`).
+    """
+    out: list[tuple[str, str]] = []
+    for raw in keys:
+        if raw.startswith("text:"):
+            text = raw[5:]
+            if not text or any(
+                ord(c) < 0x20 or ord(c) == 0x7F or 0x80 <= ord(c) <= 0x9F for c in text
+            ):
+                raise ValueError("text: token is empty or holds control characters")
+            out.append((raw, text))
+            continue
+        token = raw.strip().lower()
+        if token in KEY_BYTES:
+            out.append((token, KEY_BYTES[token]))
+        elif len(token) == 1 and token.isdigit():
+            out.append((token, token))
+        elif token.startswith("wait:"):
+            seconds = float(token[5:])
+            if not 0 <= seconds <= KEY_WAIT_MAX:
+                raise ValueError(f"wait out of range: {token!r}")
+            out.append((token, ""))
+        else:
+            raise ValueError(f"unknown key token {raw!r}")
+    return out
+
+
+def send_keys_via(iterm_session_id: str, keys: Sequence[str], *, delay: float = KEY_DELAY) -> str:
+    """Type raw *keys* into an EXISTING iTerm session; ``sent`` / ``none`` / ``partial``.
+
+    The iTerm2 Python API ONLY — no AppleScript rung (``write text`` drops ESC, so arrow
+    keys cannot travel that way) and no focus change: ``Session.async_send_text`` writes to
+    the session's pty "as though the user had typed it" whether or not the tab is visible;
+    ``suppress_broadcast=True`` keeps broadcast-input groups out of it. The App singleton
+    is invalidated before connecting (a second connection in one process would otherwise
+    reuse the first one's dead socket). The same bounded TCC pre-check as
+    :func:`send_text_via` runs first (the cookie request has no timeout of its own).
+
+    ``none`` = nothing reached the tab; ``partial`` = some keys did — never retried, since
+    a repeated key sequence would act twice. Bad tokens raise ``ValueError`` before any
+    connection is made (see :func:`key_payloads`).
+    """
+    payloads = key_payloads(keys)
+    uuid = (iterm_session_id or "").split(":")[-1].strip()
+    total = sum(1 for token, _payload in payloads if not token.startswith("wait:"))
+    if not uuid or not total:
+        return _API_NONE
+    if not _iterm_api_auth_is_tcc_free() and not _iterm_reachable_by_apple_event():
+        return _API_NONE
+    sent = 0
+    try:
+        import asyncio  # pylint: disable=import-outside-toplevel
+
+        import iterm2  # pylint: disable=import-outside-toplevel
+
+        async def _go() -> None:
+            nonlocal sent
+            iterm2.app.invalidate_app()
+            conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
+            app = await iterm2.async_get_app(conn)
+            if app is None:
+                return
+            session = app.get_session_by_id(uuid)
+            if session is None:
+                return
+            for token, payload in payloads:
+                if token.startswith("wait:"):
+                    await asyncio.sleep(float(token[5:]))
+                    continue
+                await session.async_send_text(payload, suppress_broadcast=True)
+                sent += 1
+                await asyncio.sleep(delay)
+
+        asyncio.run(_go())
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    if sent == total:
+        return _API_SENT
+    return _API_PARTIAL if sent else _API_NONE
+
+
+def iterm_session_vars(
+    iterm_session_id: str, names: Sequence[str] = ("tty", "jobPid")
+) -> dict[str, str] | None:
+    """Read-only iTerm session variables over the Python API (``None`` = unreachable).
+
+    ``tty`` is the session's ``/dev/ttysNNN``, ``jobPid`` the pid of its foreground job —
+    what ``ccc send`` revalidates right before typing. A session the API does not know
+    yields ``{}``.
+    """
+    uuid = (iterm_session_id or "").split(":")[-1].strip()
+    if not uuid:
+        return None
+    if not _iterm_api_auth_is_tcc_free() and not _iterm_reachable_by_apple_event():
+        return None
+    try:
+        import asyncio  # pylint: disable=import-outside-toplevel
+
+        import iterm2  # pylint: disable=import-outside-toplevel
+
+        async def _go() -> dict[str, str]:
+            iterm2.app.invalidate_app()
+            conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
+            app = await iterm2.async_get_app(conn)
+            session = app.get_session_by_id(uuid) if app is not None else None
+            if session is None:
+                return {}
+            out: dict[str, str] = {}
+            for name in names:
+                value = await session.async_get_variable(name)
+                out[name] = "" if value is None else str(value)
+            return out
+
+        return asyncio.run(_go())
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
 
 
 #: :func:`delivery_channel_health`'s bound on the Python-API connect.

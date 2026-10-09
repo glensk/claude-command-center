@@ -75,6 +75,8 @@ PURPOSES: tuple[str, ...] = (
     "subgoal-grade",
     "summary-nextstep",
     "short-aim",
+    "session-name",
+    "voice-brief",
 )
 
 
@@ -253,6 +255,20 @@ def rows(
             dispatch("short-aim"),
             "short_aim · llm_custom_command",
             cfg.short_aim,
+        ),
+        (
+            "session name (once per session, ccc name)",
+            "session-name",
+            dispatch("session-name"),
+            "session_names · llm_custom_command",
+            cfg.session_names,
+        ),
+        (
+            "voice briefing (ccc inspect)",
+            "voice-brief",
+            dispatch("voice-brief"),
+            "llm_custom_command",
+            bool(cfg.llm_custom_command.strip()),
         ),
     ]
     return [

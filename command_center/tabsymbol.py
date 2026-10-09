@@ -45,14 +45,17 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 # pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import contextlib
+import dataclasses
 import fcntl
 import hashlib
 import os
+import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from .config import Config
     from .models import Session
     from .store import Store
 
@@ -359,89 +362,297 @@ def _wait_marker(marker: str | None) -> str:
 _TAB_AIM_W = 40  # chars of the AIM appended to a tab title
 
 
-def title_core(badge: str, cwd: str, aim: str | None = None) -> str:
+def title_core(badge: str, cwd: str, aim: str | None = None, *, name: str | None = None) -> str:
     """The non-marker part of a tab title — ``"<badge> <leaf>"``, matching the zsh hook.
 
-    With *aim* (``aim_in_tab_title``) the session's AIM follows: ``"<badge> <leaf> 🎯 <aim>"``.
+    Precedence is left to right, so a narrow tab truncates the least important part
+    first: the badge, then the session's NAME (``session_names``; the folder leaf when it
+    has none), then — with *aim* (``aim_in_tab_title``) — the AIM:
+    ``"<badge> <name> 🎯 <aim>"``.
     """
     from . import colors  # lazy: keep the shell-hook (``ccc tab-symbol``) import light
 
-    _category, leaf = colors.folder_split(cwd)
+    head = name.strip() if name and name.strip() else colors.folder_split(cwd)[1]
     if not aim:
-        return f"{badge} {leaf}"
+        return f"{badge} {head}"
     line = aim.splitlines()[0].strip()
     if len(line) > _TAB_AIM_W:
         line = line[: _TAB_AIM_W - 1] + "…"
-    return f"{badge} {leaf} 🎯 {line}"
+    return f"{badge} {head} 🎯 {line}"
+
+
+def _session_core(session: Session, badge: str, cfg: Config) -> str:
+    """*session*'s title core under *cfg* (its name when ``session_names``, its AIM if wanted)."""
+    from . import session_names  # lazy
+
+    aim = session.aim if cfg.aim_in_tab_title else None
+    return title_core(badge, session.cwd, aim, name=session_names.title_name(session, cfg))
+
+
+def _write_titles(plain: dict[str, str], cas: dict[str, tuple[str, str]], marker: str) -> None:
+    """Dispatch one batch of title writes: unconditional *plain* cores, compare-and-swap *cas*."""
+    from . import tab_titles, terminal  # lazy: AppleScript layer, not needed on the read path
+
+    if plain:
+        terminal.set_session_titles_preserving(plain, marker=marker)
+    if cas:
+        tab_titles.set_titles_cas(cas, marker=marker)
+
+
+def _record_writes(store: object, writes: list[tuple[str, str]]) -> None:
+    """Stamp ``title_written``/``title_generation`` for each ``(session_id, core)`` written.
+
+    Tolerates stand-in stores without a connection (unit tests of the title sync).
+    """
+    if not writes or getattr(store, "conn", None) is None:
+        return
+    from . import session_names  # lazy
+
+    for session_id, core in writes:
+        session_names.record_title_write(store, session_id, core)  # type: ignore[arg-type]
+
+
+def _plan_write(
+    session: Session,
+    core: str,
+    plain: dict[str, str],
+    cas: dict[str, tuple[str, str]],
+    writes: list[tuple[str, str]],
+) -> None:
+    """File *session*'s *core* as an unconditional first write or a compare-and-swap.
+
+    Once ccc has written a title (``title_written``) every later write is conditional on
+    the tab still showing it — a title the user typed meanwhile is never replaced.
+    """
+    iid = session.iterm_session_id or ""
+    if session.title_written:
+        cas[iid] = (session.title_written, core)
+    else:
+        plain[iid] = core
+    if core != session.title_written:
+        writes.append((session.session_id, core))
+
+
+_AIM_SEPARATOR = "🎯"
+_TITLE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_TITLE_WS_RE = re.compile(r"\s+")
+
+
+def clean_title(title: str, marker: str | None = None) -> str:
+    """The name a user meant by a tab *title*: wait marker, badge, AIM tail, controls stripped."""
+    text = _TITLE_CONTROL_RE.sub("", title or "")
+    marker = _DEFAULT_WAIT_MARKER if marker is None else marker
+    for _ in range(2):  # marker before the badge, and a stray second marker
+        if marker and text.startswith(marker):
+            text = text[len(marker) :]
+        stripped = text.lstrip()
+        for badge in PALETTE:
+            if stripped.startswith(badge):
+                stripped = stripped[len(badge) :]
+                break
+        text = stripped
+    if _AIM_SEPARATOR.strip() in text:
+        text = text.split(_AIM_SEPARATOR.strip(), 1)[0]
+    return _TITLE_WS_RE.sub(" ", text).strip()
+
+
+def ccc_title_shapes(session: Session, marker: str | None = None) -> set[str]:
+    """Every cleaned title body ccc itself could have written for *session*.
+
+    :func:`clean_title` drops the badge and the AIM tail, so these are the folder leaf
+    (no name yet), the session's name and whatever ccc last wrote. A live title equal to
+    one of them is ccc's own — possibly a stale write that never landed — never a
+    hand-set one.
+    """
+    shapes = {
+        clean_title(title_core(PALETTE[0], session.cwd), marker),
+        clean_title(session.title_written or "", marker),
+    }
+    if session.canonical_name:
+        shapes.add(clean_title(session.canonical_name, marker))
+    shapes.discard("")
+    return shapes
+
+
+def manual_title_candidate(
+    session: Session, live_title: str | None, now_ms: int, marker: str | None = None
+) -> str | None:
+    """The hand-set name *live_title* carries for *session*, or ``None`` (pure).
+
+    ``None`` when: ccc never wrote this tab's title (no baseline to differ from), the
+    last write is younger than ``session_names.MANUAL_GRACE_MS`` (it may still be
+    landing), the cleaned title is empty or too long, it is one of ccc's own shapes, or
+    it already is the name.
+    """
+    from . import session_names  # lazy
+
+    if live_title is None or not session.title_written:
+        return None
+    if now_ms - session.title_written_at < session_names.MANUAL_GRACE_MS:
+        return None
+    cleaned = clean_title(live_title, marker)
+    if not cleaned or len(cleaned) > session_names.MAX_MANUAL_CHARS:
+        return None
+    if session_names.already_named(session, cleaned):
+        return None
+    if cleaned in ccc_title_shapes(session, marker):
+        return None
+    return cleaned
 
 
 def push_title(session: Session, *, marker: str | None = None) -> None:
-    """Re-title ONE session's tab now (after its AIM changed). No-op without a tab/badge."""
+    """Re-title ONE session's tab now (after its AIM changed). No-op without a tab/badge.
+
+    Never touches a tab whose title the user set by hand (``session_names.titles_frozen``).
+    """
     iid = session.iterm_session_id
     if session.done or not iid:
+        return
+    from . import config, session_names  # lazy
+
+    if session_names.titles_frozen(session):
         return
     badge = assign(iid, folder=session.cwd)
     if not badge:
         return
-    from . import config, terminal  # lazy: AppleScript layer, not needed on the read path
+    core = _session_core(session, badge, config.load_config())
+    plain: dict[str, str] = {}
+    cas: dict[str, tuple[str, str]] = {}
+    writes: list[tuple[str, str]] = []
+    _plan_write(session, core, plain, cas, writes)
+    _write_titles(plain, cas, _wait_marker(marker))
+    if writes:
+        from .store import Store  # lazy: the hook / CLI callers hold no store here
 
-    aim = session.aim if config.load_config().aim_in_tab_title else None
-    terminal.set_session_titles_preserving(
-        {iid: title_core(badge, session.cwd, aim)}, marker=_wait_marker(marker)
-    )
+        try:
+            with Store() as store:
+                _record_writes(store, writes)
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            pass  # bookkeeping only: the next sync re-records
 
 
-def seed_title(iterm_session_id: str | None, cwd: str, *, marker: str | None = None) -> str | None:
+def seed_title(
+    iterm_session_id: str | None,
+    cwd: str,
+    *,
+    marker: str | None = None,
+    session: Session | None = None,
+    store: Store | None = None,
+) -> str | None:
     """Claim this tab's badge (if unassigned) and seed its iTerm title with it.
 
     Marker-preserving, so a tab already flagged "waiting" keeps its marker. Called at
     session start so a freshly-launched session's tab shows its badge immediately —
     without waiting for the next ``cd`` (the zsh hook) or the next daemon pass.
-    Returns the badge, or ``None`` when there is nothing to key on. Fail-safe: the
-    title push is detached and swallows its own errors.
+    With *session* the title carries its name (``session_names``), a hand-set title is
+    left alone, and the write is recorded in *store*. Returns the badge, or ``None``
+    when there is nothing to key on. Fail-safe: the title push is detached and swallows
+    its own errors.
     """
     badge = assign(iterm_session_id, folder=cwd)
     if not badge or not iterm_session_id:
         return None
-    from . import terminal  # lazy: AppleScript layer, not needed on the read path
+    if session is None:
+        _write_titles({iterm_session_id: title_core(badge, cwd)}, {}, _wait_marker(marker))
+        return badge
+    from . import config, session_names  # lazy
 
-    terminal.set_session_titles_preserving(
-        {iterm_session_id: title_core(badge, cwd)}, marker=_wait_marker(marker)
+    if session_names.titles_frozen(session):
+        return badge
+    cfg = config.load_config()
+    name = session_names.title_name(session, cfg)
+    core = title_core(badge, cwd or session.cwd, name=name)
+    plain: dict[str, str] = {}
+    cas: dict[str, tuple[str, str]] = {}
+    writes: list[tuple[str, str]] = []
+    seeded = (
+        session
+        if session.iterm_session_id == iterm_session_id
+        else dataclasses.replace(session, iterm_session_id=iterm_session_id)
     )
+    _plan_write(seeded, core, plain, cas, writes)
+    _write_titles(plain, cas, _wait_marker(marker))
+    if store is not None:
+        _record_writes(store, writes)
     return badge
+
+
+def tab_owners(sessions: Iterable[Session]) -> list[Session]:
+    """ONE session per iTerm tab — the one the tab is really showing.
+
+    A tab outlives its sessions, so several rows may carry the same tab id; the owner is
+    the row whose ``last_seen_pid`` is still running, then the most recently active.
+    Writing a title per row instead made the tab flip between the rows' titles.
+    """
+    from .store import pid_alive  # lazy
+
+    by_tab: dict[str, list[Session]] = {}
+    for session in sessions:
+        uuid = (session.iterm_session_id or "").split(":")[-1].strip().upper()
+        if uuid:
+            by_tab.setdefault(uuid, []).append(session)
+    owners = []
+    for rows in by_tab.values():
+        rows.sort(
+            key=lambda s: (not pid_alive(s.last_seen_pid), -s.last_response_at, -s.updated_at)
+        )
+        owners.append(rows[0])
+    return owners
 
 
 def sync_live(store: Store, *, marker: str | None = None) -> list[str]:
     """Ensure every non-done tracked session has a badge AND its iTerm tab shows it.
 
-    For each session carrying an ``iterm_session_id``: claim a badge if missing (so
-    *every* session gets a symbol) and push ``"<badge> <leaf>"`` to its tab title,
-    preserving any leading wait marker. This is the single convergence point the
-    daemon runs every pass, ``ccc tab-symbol --sync`` runs on demand, and the TUI
-    runs on each refresh — it heals tabs whose badge was assigned (or reshuffled by
-    palette recycling) after the title was last set, which the ``cd``-driven zsh hook
-    can never reach while a CLI holds the foreground. With no daemon loaded the TUI
-    refresh is what keeps open tabs in sync with their rows. Returns the session ids
-    that were badged.
-    """
-    from . import config  # lazy
+    For each tab carrying a session's ``iterm_session_id`` (its owner, see
+    :func:`tab_owners`): claim a badge if missing (so *every* session gets a symbol) and
+    push ``"<badge> <name or leaf>"`` to its tab title, preserving any leading wait
+    marker. This is the single convergence point the daemon runs every pass, ``ccc
+    tab-symbol --sync`` runs on demand, and the TUI runs on each refresh — it heals tabs
+    whose badge was assigned (or reshuffled by palette recycling) after the title was
+    last set, which the ``cd``-driven zsh hook can never reach while a CLI holds the
+    foreground. With no daemon loaded the TUI refresh is what keeps open tabs in sync
+    with their rows.
 
-    with_aim = config.load_config().aim_in_tab_title
-    cores: dict[str, str] = {}
+    With ``session_names`` on it is also where a title the user typed by hand is noticed
+    (one ``osascript`` read of the live titles, only when some tab has a ccc baseline):
+    it becomes the session's name and that tab is never written again. Every write after
+    the first is compare-and-swap. Returns the session ids that were badged.
+    """
+    import time  # pylint: disable=import-outside-toplevel
+
+    from . import config, session_names  # lazy
+
+    cfg = config.load_config()
+    owners = tab_owners(s for s in store.list_sessions() if not s.done and s.iterm_session_id)
+    wait_marker = _wait_marker(marker)
+    live: dict[str, str] | None = None
+    if getattr(cfg, "session_names", False) and any(s.title_written for s in owners):
+        from . import tab_titles  # lazy: osascript read
+
+        panes = tab_titles.read_panes()
+        live = {p.uuid: p.name for p in panes} if panes is not None else None
+    now = int(time.time() * 1000)
+    plain: dict[str, str] = {}
+    cas: dict[str, tuple[str, str]] = {}
+    writes: list[tuple[str, str]] = []
     badged: list[str] = []
-    for session in store.list_sessions():
-        iid = session.iterm_session_id
-        if session.done or not iid:
+    for session in owners:
+        iid = session.iterm_session_id or ""
+        if live is not None and getattr(store, "conn", None) is not None:
+            uuid = iid.split(":")[-1].strip().upper()
+            hand = manual_title_candidate(session, live.get(uuid), now, wait_marker)
+            if hand and not session_names.already_named(session, hand):
+                session_names.adopt_manual_title(store, session.session_id, hand)
+                continue
+        if session_names.titles_frozen(session):
             continue
         badge = assign(iid, folder=session.cwd)
         if not badge:
             continue
-        cores[iid] = title_core(badge, session.cwd, session.aim if with_aim else None)
+        _plan_write(session, _session_core(session, badge, cfg), plain, cas, writes)
         badged.append(session.session_id)
-    if cores:
-        from . import terminal  # lazy: AppleScript layer, not needed on the read path
-
-        terminal.set_session_titles_preserving(cores, marker=_wait_marker(marker))
+    _write_titles(plain, cas, wait_marker)
+    _record_writes(store, writes)
     return badged
 
 
@@ -487,6 +698,60 @@ def _rename_with_badge(override: str, uuids: list[str]) -> str | None:
     return healed_title(override, badge)
 
 
+def adopt_overrides(pairs: list[tuple[str, list[str]]], store: Store | None = None) -> int:
+    """Make each tab title override the user typed the name of the session in that tab (D3).
+
+    *pairs* are ``(override, session_uuids)`` as the watcher saw them (current session
+    first). ccc never writes an override itself (only the badge in front of one), so no
+    grace is needed: the cleaned text (badge, wait marker and AIM tail stripped) becomes
+    the owner's name with origin ``manual-tab``. Returns the number of names adopted;
+    never raises.
+    """
+    if not pairs:
+        return 0
+    try:
+        from . import config, session_names  # lazy
+
+        if not config.load_config().session_names:
+            return 0
+        from .store import Store as _Store  # lazy
+
+        adopted = 0
+        with contextlib.ExitStack() as stack:
+            db = store if store is not None else stack.enter_context(_Store())
+            for override, uuids in pairs:
+                cleaned = clean_title(override)
+                if not cleaned or not uuids or len(cleaned) > session_names.MAX_MANUAL_CHARS:
+                    continue
+                session = db.session_for_tab_uuid(uuids[0])
+                if session is None or session.done or session_names.already_named(session, cleaned):
+                    continue
+                if session_names.adopt_manual_title(db, session.session_id, cleaned):
+                    adopted += 1
+        return adopted
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return 0
+
+
+class _OverrideWatch:
+    """The watcher's rename callback that also queues changed overrides for adoption."""
+
+    def __init__(self) -> None:
+        self.seen: dict[str, str] = {}
+        self.pending: list[tuple[str, list[str]]] = []
+
+    def __call__(self, override: str, uuids: list[str]) -> str | None:
+        key = uuids[0] if uuids else ""
+        if key and self.seen.get(key) != override:
+            self.seen[key] = override
+            self.pending.append((override, list(uuids)))
+        return _rename_with_badge(override, uuids)
+
+    def flush(self) -> int:
+        pending, self.pending = self.pending, []
+        return adopt_overrides(pending)
+
+
 WATCH_INTERVAL_SEC = 2.0
 _WATCH_RETRY_SEC = 30.0
 _WATCH_OP_TIMEOUT_SEC = 15.0
@@ -499,18 +764,21 @@ def heal_renamed_tabs_once() -> int:
     from . import iterm_api  # pylint: disable=import-outside-toplevel
 
     api_link = iterm_api.CookieItermLink()
+    callback = _OverrideWatch()
 
     async def _once() -> int:
         if not await asyncio.wait_for(api_link.reconnect(), _WATCH_OP_TIMEOUT_SEC):
             return 0
         return await asyncio.wait_for(
-            api_link.retitle_overridden_tabs(_rename_with_badge), _WATCH_OP_TIMEOUT_SEC
+            api_link.retitle_overridden_tabs(callback), _WATCH_OP_TIMEOUT_SEC
         )
 
     try:
         return asyncio.run(_once())
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return 0
+    finally:
+        callback.flush()
 
 
 def watch(interval: float = WATCH_INTERVAL_SEC, *, iterations: int | None = None) -> int:
@@ -527,6 +795,7 @@ def watch(interval: float = WATCH_INTERVAL_SEC, *, iterations: int | None = None
     from . import iterm_api  # pylint: disable=import-outside-toplevel
 
     link = iterm_api.CookieItermLink()
+    callback = _OverrideWatch()
 
     async def _loop() -> None:
         done = 0
@@ -542,10 +811,11 @@ def watch(interval: float = WATCH_INTERVAL_SEC, *, iterations: int | None = None
                     continue
             try:
                 await asyncio.wait_for(
-                    link.retitle_overridden_tabs(_rename_with_badge), _WATCH_OP_TIMEOUT_SEC
+                    link.retitle_overridden_tabs(callback), _WATCH_OP_TIMEOUT_SEC
                 )
             except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
                 link.drop()
+            callback.flush()
             await asyncio.sleep(interval)
 
     with contextlib.suppress(KeyboardInterrupt):

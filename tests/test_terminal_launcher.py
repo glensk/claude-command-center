@@ -17,6 +17,8 @@ _BOTH_TOOLS: dict[str, str | None] = {
 # The account-pin prefix every launch command now carries (D8). Under the single-account
 # test fixture the account is the default, so the prefix unsets both Claude env vars.
 _PIN = "unset CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CONFIG_DIR; "
+# Every ccc launch keeps Claude Code off the tab title (accounts.session_env_flags).
+_PIN += "export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; "
 
 
 def _cfg(launcher: str) -> config.Config:

@@ -1002,7 +1002,7 @@ def _action(
 
 def _claude_action(pane: SnapPane, blockers: Blockers) -> PaneAction:
     """Plan a live-free Claude pane: refuse when blocked, else resume on its own seat."""
-    from . import accounts  # pylint: disable=import-outside-toplevel
+    from . import launch_argv  # pylint: disable=import-outside-toplevel
 
     reasons = blockers(pane.session_id, pane.cwd, pane.config_dir)
     if reasons:
@@ -1012,9 +1012,8 @@ def _claude_action(pane: SnapPane, blockers: Blockers) -> PaneAction:
             "cannot resume: " + "; ".join(reasons),
             error=True,
         )
-    prefix = accounts.session_launch_env_prefix(pane)
-    resume = f"cd {shlex.quote(pane.cwd)} && claude --resume {shlex.quote(pane.session_id)}"
-    return _action(pane, prefix + resume)
+    argv = launch_argv.claude_argv(resume=pane.session_id)
+    return _action(pane, launch_argv.claude_command(pane, argv, cwd=pane.cwd))
 
 
 def _pane_action(  # pylint: disable=too-many-return-statements

@@ -1069,7 +1069,8 @@ def test_switch_now_types_the_exact_relaunch_into_the_iterm_tab(
     assert cli.cmd_switch_now(env.args) == 0
     expected = (
         f"cd {shlex.quote(env.args.cwd)} && ( unset CLAUDE_SECURESTORAGE_CONFIG_DIR; "
-        f"export CLAUDE_CONFIG_DIR={shlex.quote(str(work))}; claude --resume {SID} )"
+        f"export CLAUDE_CONFIG_DIR={shlex.quote(str(work))}; "
+        f"export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; claude --resume {SID} )"
     )
     assert env.kill.signals == [(PID, signal.SIGTERM)]
     assert env.typed == {"iterm": [(ITERM, expected)], "tmux": []}
@@ -1088,7 +1089,8 @@ def test_switch_now_types_the_resume_with_the_prompt_appended(
     assert cli.cmd_switch_now(env.args) == 0
     expected = (
         f"cd {shlex.quote(env.args.cwd)} && ( unset CLAUDE_SECURESTORAGE_CONFIG_DIR; "
-        f"export CLAUDE_CONFIG_DIR={shlex.quote(str(work))}; claude --resume {SID} "
+        f"export CLAUDE_CONFIG_DIR={shlex.quote(str(work))}; "
+        f"export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; claude --resume {SID} "
         "'pick up the re-route' )"
     )
     assert env.typed["iterm"] == [(ITERM, expected)]
@@ -1341,7 +1343,8 @@ def test_relaunch_command_pins_a_non_default_account(
     _private, work = two_accounts
     assert accounts.relaunch_command(accounts.LaunchTarget(str(work)), SID, "/repo") == (
         f"cd /repo && ( unset CLAUDE_SECURESTORAGE_CONFIG_DIR; "
-        f"export CLAUDE_CONFIG_DIR={shlex.quote(str(work))}; claude --resume {SID} )"
+        f"export CLAUDE_CONFIG_DIR={shlex.quote(str(work))}; "
+        f"export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; claude --resume {SID} )"
     )
 
 
@@ -1352,7 +1355,7 @@ def test_relaunch_command_unsets_both_vars_for_the_default_account(
     private, _work = two_accounts
     assert accounts.relaunch_command(accounts.LaunchTarget(str(private)), SID, "/repo") == (
         f"cd /repo && ( unset CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CONFIG_DIR; "
-        f"claude --resume {SID} )"
+        f"export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; claude --resume {SID} )"
     )
 
 

@@ -416,7 +416,9 @@ def handle_session_start(payload: dict[str, Any]) -> int:
         if iterm:
             from . import tabsymbol  # lazy: keep the hook import light
 
-            tabsymbol.seed_title(iterm, session.cwd or payload.get("cwd", ""))
+            tabsymbol.seed_title(
+                iterm, session.cwd or payload.get("cwd", ""), session=session, store=store
+            )
         env_aim = os.environ.get("CLAUDE_SESSION_AIM")
         if env_aim and env_aim.strip() and not session.aim:
             # Go through set_aim (not a bare update_fields) so the AIM is scored on
@@ -703,10 +705,17 @@ def handle_stop_failure(payload: dict[str, Any]) -> int:
     under a 10 s timeout inside the session that is about to be terminated. So it filters
     (rate limit, feature on) and spawns the detached worker, which re-reads everything.
     The spawn is NOT marked ``CCC_INTERNAL``: that marker makes ``switch-account`` refuse.
+
+    Every StopFailure — whatever its error kind — is first persisted as a ``stop_failure``
+    row in the store's ``events`` table (``ccc events``, the voice bridge's problem stream).
     """
+    sid = _session_id(payload)
+    if sid:  # every error kind is a problem event for `ccc events` (voice bridge)
+        from .bridge_events import record_stop_failure
+
+        record_stop_failure(sid, str(payload.get("error") or ""))
     if str(payload.get("error") or "") not in _FAILOVER_ERRORS:
         return 0
-    sid = _session_id(payload)
     if not sid:
         return 0
     cwd = str(payload.get("cwd") or "")

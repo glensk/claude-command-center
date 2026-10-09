@@ -132,6 +132,12 @@ class CloseClaim:
     bound: str = ""
 
 
+#: Registry ``status`` values that mean mid-turn. Claude Code 2.1.295 writes ``busy`` |
+#: ``shell`` | ``idle`` | ``waiting``; ``shell`` = a shell tool is running (the CLI's own
+#: ``claude agents`` view folds it into ``busy``).
+BUSY_RAW_STATUSES = frozenset({"busy", "shell"})
+
+
 @dataclass
 class LiveSession:
     """A session currently registered in ``~/.claude/sessions/<pid>.json``."""
@@ -141,7 +147,7 @@ class LiveSession:
     cwd: str
     kind: str = "interactive"  # interactive | bg | fleet
     entrypoint: str = "cli"  # cli (real user session) | sdk-cli (headless `claude -p`)
-    raw_status: str = "idle"  # busy | idle | waiting
+    raw_status: str = "idle"  # busy | shell | idle | waiting (see BUSY_RAW_STATUSES)
     name: str | None = None
     agent: str = "claude"
     started_at: int = 0  # epoch ms
@@ -600,6 +606,29 @@ class Session:
     archived: bool = False
     created_at: int = 0
     updated_at: int = 0
+    # --- session names (session_names.py) ---------------------------------------------
+    # The memorable 1-2 word name the user, the voice bridge and other agents address the
+    # session by. Generated ONCE (origin "llm" / "fallback"), set by `ccc name` ("manual")
+    # or adopted from a tab title the user typed in iTerm ("manual-tab", never overwritten
+    # by ccc again). Unique (casefolded) among the active rows of every account.
+    canonical_name: str | None = None
+    canonical_name_origin: str = ""
+    # The AIM the name was derived from — a snapshot, so a later AIM change never renames.
+    name_source_aim: str | None = None
+    # The name Claude Code's own registry reports (``claude --name`` / ``/rename``), kept
+    # apart from ``canonical_name`` so reconcile never clobbers it, and when that runtime
+    # name was first seen equal to the canonical one (0 = not yet).
+    observed_runtime_name: str | None = None
+    runtime_name_applied_at: int = 0
+    # The tab-title core ccc last wrote for this session, a per-write generation counter
+    # and the write's epoch ms. A live title that differs from it (after a grace for the
+    # detached write to land) is a title the user typed by hand.
+    title_written: str | None = None
+    title_generation: int = 0
+    title_written_at: int = 0
+    # Failed LLM attempts at replacing a provisional "fallback" name (session_names.py
+    # gives up after MAX_UPGRADE_TRIES; a successful one makes the name "llm", final).
+    name_upgrade_tries: int = 0
     # DERIVED, not columns: the session's FIRST recorded AIM — revision (1) — and that
     # revision's cheap-model short label, joined off ``aim_history`` by every Store read
     # (see store._SESSION_SELECT). Both are None when the AIM predates history tracking;
@@ -1136,7 +1165,7 @@ def derive_status(
     is exhausted becomes WAITING_CODEX until the reset window passes.
     """
     if stored is not None and stored.done:
-        if live is not None and live.alive and (live.raw_status or "").lower() == "busy":
+        if live is not None and live.alive and (live.raw_status or "").lower() in BUSY_RAW_STATUSES:
             return Status.WORKING  # done, but still mid-turn — ✓ waits for the turn to end
         return Status.DONE
     if live is None or not live.alive:
@@ -1144,7 +1173,7 @@ def derive_status(
     if halted:
         return Status.HALTED
     raw = (live.raw_status or "").lower()
-    if raw == "busy":
+    if raw in BUSY_RAW_STATUSES:
         return Status.WORKING
     if raw.startswith("wait"):
         return Status.WAITING_INPUT

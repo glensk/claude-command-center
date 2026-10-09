@@ -535,13 +535,23 @@ class SessionLaunch(Protocol):
 def session_env_flags(session: SessionLaunch) -> dict[str, str]:
     """The NON-account env a session's launch must carry (the single source of that list).
 
-    Today exactly one entry: ``CCC_NO_CODEX=1`` when the row's ``no_codex`` flag is set,
-    which is the kill switch every Codex integration honours (plan-gate debates, the
-    optional-offload hook, ``codex-in-claude``). It is only ever ADDED — an ambient
-    ``CCC_NO_CODEX`` from the parent shell is left exactly as it was, so a session
-    launched from inside a no-codex shell keeps that inheritance.
+    ``CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`` always: ccc is the only automatic writer of
+    a tab title (badge, session name, AIM — ``tabsymbol.title_core``), and Claude Code's
+    own title (including the one ``--name`` would set) would fight it. Plus
+    ``CCC_NO_CODEX=1`` when the row's ``no_codex`` flag is set, which is the kill switch
+    every Codex integration honours (plan-gate debates, the optional-offload hook,
+    ``codex-in-claude``). Entries are only ever ADDED — an ambient ``CCC_NO_CODEX`` from
+    the parent shell is left exactly as it was, so a session launched from inside a
+    no-codex shell keeps that inheritance.
     """
-    return {"CCC_NO_CODEX": "1"} if getattr(session, "no_codex", False) else {}
+    flags = {TITLE_VAR: "1"}
+    if getattr(session, "no_codex", False):
+        flags["CCC_NO_CODEX"] = "1"
+    return flags
+
+
+# Claude Code's switch that keeps it from setting the terminal (tab) title.
+TITLE_VAR = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
 
 
 def session_launch_env(
@@ -604,10 +614,10 @@ def relaunch_command(session: SessionLaunch, session_id: str, cwd: str, prompt: 
     shell-quoted here; the caller owns rejecting control characters (the whole line is
     TYPED into a shell, where a newline would submit early).
     """
-    quoted_id = shlex.quote(session_id)
-    cd_prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
-    tail = f" {shlex.quote(prompt)}" if prompt else ""
-    return f"{cd_prefix}( {session_launch_env_prefix(session)}claude --resume {quoted_id}{tail} )"
+    from . import launch_argv  # pylint: disable=import-outside-toplevel
+
+    argv = launch_argv.claude_argv(resume=session_id, prompt=prompt or None)
+    return launch_argv.claude_command(session, argv, cwd=cwd, subshell=True)
 
 
 def env_config_dir() -> str:

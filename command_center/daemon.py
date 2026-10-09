@@ -44,7 +44,7 @@ from pathlib import Path
 from . import config
 from .adapters.claude import ClaudeAdapter
 from .core import headless_leak_ids, orphan_launched_ids, reconcile
-from .models import Session, Status, deadline_badge, now_ms
+from .models import LiveSession, Session, Status, deadline_badge, now_ms
 from .notify import notify
 from .store import Store
 
@@ -311,6 +311,12 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
         # symbol assigned mid-session — which the `cd`-driven zsh hook can't reach while a
         # CLI holds the foreground — still reaches the tab. Side-effect only (no report
         # noise every pass); skipped on dry-run since it assigns badges + sets titles.
+        # Name every live session that still has none — generated ONCE, detached like
+        # the short-AIM backfill (the LLM call takes up to 10 s). Before the title sync,
+        # so a tab picks the name up in the same pass once it lands.
+        if cfg.session_names:
+            _backfill_session_names(store, cfg, live, dry_run)
+
         if cfg.sync_tab_titles and not dry_run:
             from . import tabsymbol
 
@@ -429,6 +435,36 @@ def _backfill_short_aims(
         from . import spawn
 
         spawn.spawn_ccc(["short-aim", "--session", session.session_id])
+
+
+def _backfill_session_names(
+    store: Store, cfg: config.Config, live: dict[str, LiveSession], dry_run: bool
+) -> list[str]:
+    """Spawn ``ccc name -A`` for live sessions with an AIM that still need a name (capped).
+
+    "Need" = no name yet, or a provisional ``fallback`` name an LLM may still replace
+    once (:func:`session_names.upgradable` — a router is configured and the bounded
+    retries are not used up). Sessions without an AIM are left to ``ccc sessions -j``
+    (deterministic name on first listing) or a later ``set-aim``: an LLM name needs the
+    AIM to describe. Returns the ids it spawned for.
+    """
+    from . import session_names
+
+    pending = [
+        s.session_id
+        for s in store.list_sessions()
+        if s.session_id in live
+        and live[s.session_id].alive
+        and s.aim
+        and not s.done
+        and (not s.canonical_name or session_names.upgradable(s, cfg))
+    ][: cfg.max_summaries_per_run]
+    if not dry_run:
+        from . import spawn
+
+        for session_id in pending:
+            spawn.spawn_ccc(["name", "-A", "-s", session_id])
+    return pending
 
 
 def _refresh_copilot_usage(

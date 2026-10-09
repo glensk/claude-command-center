@@ -31,6 +31,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -280,6 +281,48 @@ def _isolate_tab_symbol_side_effects(tmp_path: Path, monkeypatch: pytest.MonkeyP
     """Keep every test off the real badge cache and the real iTerm session."""
     monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))
     monkeypatch.delenv("ITERM_SESSION_ID", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_bridge_from_iterm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the voice-bridge commands and the tab-title writer off the real iTerm.
+
+    ``tab_titles.read_panes`` lists iTerm over osascript and ``set_titles_cas`` writes
+    titles; ``bridge_target.default_deps`` would type into a real tab. Every test gets
+    an unreadable iTerm, a no-op title writer and bridge deps whose machine seams refuse;
+    tests that drive them patch their own fakes over these (monkeypatch is last-wins).
+    """
+    # pylint: disable=import-outside-toplevel
+    from command_center import bridge_target, tab_titles
+
+    def _no_iterm(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    def _refuse(*_args: object, **_kwargs: object) -> NoReturn:
+        raise AssertionError("a test reached the real iTerm through the voice bridge")
+
+    monkeypatch.setattr(tab_titles, "read_panes", _no_iterm)
+    monkeypatch.setattr(tab_titles, "set_titles_cas", _no_iterm)
+    monkeypatch.setattr(
+        bridge_target,
+        "default_deps",
+        lambda: bridge_target.BridgeDeps(
+            tab_vars=_refuse, panes=_refuse, send_text=_refuse, send_keys=_refuse
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_claude_agents(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep every test off the real ``claude agents --json`` (both accounts' rosters).
+
+    ``ccc sessions`` and the bridge's background-job refusal ask the real ``claude``
+    binary per account. Every test sees an empty roster instead; tests of the roster
+    pass their own ``runner`` / ``agents_reader`` (monkeypatch is last-wins).
+    """
+    from command_center.adapters import claude_agents  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(claude_agents, "_run_one", lambda *_a, **_k: "[]")
 
 
 @pytest.fixture(autouse=True)

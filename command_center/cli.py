@@ -53,9 +53,10 @@ import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from . import __version__, brokenpipe, config, hookspec
+from . import __version__, brokenpipe, config, hookspec, launch_argv
 from .adapters import ClaudeAdapter
 from .models import (
+    BUSY_RAW_STATUSES,
     DEFAULT_LLM,
     EFFORT_LEVELS,
     JOB_TYPES,
@@ -383,6 +384,18 @@ def cmd_set_aim(args: argparse.Namespace) -> int:
             spawn_ccc(["score-aim", "--session", session_id])
         if cfg.short_aim:
             spawn_ccc(["short-aim", "--session", session_id])
+        if getattr(cfg, "session_names", False):
+            # The memorable name is generated ONCE, from the first AIM it sees (LLM when a
+            # router is set, else the fallback); a provisional fallback name may still be
+            # replaced once by an LLM name. `name -A` is a no-op for a final name.
+            from . import session_names
+
+            with Store() as store:
+                named = store.get(session_id)
+            if named is not None and (
+                not named.canonical_name or session_names.upgradable(named, cfg)
+            ):
+                spawn_ccc(["name", "-A", "-s", session_id])
     return 0
 
 
@@ -1914,7 +1927,7 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
         and transcript_turn_in_flight(transcript) is False
     )
     if (
-        live.raw_status == "busy"
+        live.raw_status in BUSY_RAW_STATUSES
         and not args.force
         and not busy_by_this_prompt
         and not adapter.is_halted(cwd, session_id)
@@ -1925,7 +1938,12 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
             file=sys.stderr,
         )
         return 1
-    if gate_continue and not prompt and live.raw_status == "busy" and not busy_by_this_prompt:
+    if (
+        gate_continue
+        and not prompt
+        and live.raw_status in BUSY_RAW_STATUSES
+        and not busy_by_this_prompt
+    ):
         # Only reachable with -f: a REAL turn was just cut off mid-work, which -K counts as
         # interrupted for the same reason a halt is — the relaunch resumes it.
         prompt = SWITCH_CONTINUE_PROMPT
@@ -2450,7 +2468,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     # Pin the session's account AND its own env flags (CCC_NO_CODEX) into os.environ,
     # then exec (D8) — os.execvp inherits the mutated environment.
     accounts.session_apply_to_environ(accounts.LaunchTarget(config_dir, no_codex))
-    _exec_in(cwd, ["claude", "--resume", args.session_id])  # replaces this process
+    _exec_in(cwd, launch_argv.claude_argv(resume=args.session_id))  # replaces this process
     return 0  # unreachable on success (execvp replaced the process)
 
 
@@ -2518,7 +2536,7 @@ def cmd_fire_attached(args: argparse.Namespace) -> int:
         launch = accounts.LaunchTarget(session.config_dir, bool(session.no_codex))
     accounts.session_apply_to_environ(launch)
     try:
-        _exec_in(cwd, ["claude", "--resume", args.session_id, prompt])
+        _exec_in(cwd, launch_argv.claude_argv(resume=args.session_id, prompt=prompt))
     except OSError as exc:
         with Store() as store:  # undo the claim: re-arm so the daemon retries
             store.update_fields(args.session_id, fire_at=int(_time.time()) + 900)
@@ -2577,7 +2595,12 @@ def cmd_fire_await(args: argparse.Namespace) -> int:
             )
             return 1
         prompt = delivery_prompt(group)
-    argv = ["claude", prompt] if group.fresh else ["claude", "--resume", group.session_id, prompt]
+    # A -F/--fresh group starts a NEW session (no id yet → no name to carry).
+    argv = (
+        launch_argv.claude_argv(name="", prompt=prompt)
+        if group.fresh
+        else launch_argv.claude_argv(resume=group.session_id, prompt=prompt)
+    )
     try:
         accounts.pin_environ(group.config_dir, group.no_codex)
         _exec_in(group.cwd, argv, strict=True)
@@ -3149,26 +3172,18 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
             return 1
         if had_file:  # (c) file leaves the live scan with a terminal status
             futuresync.archive_file(store, cfg, session, "launched")
-    if resume:
-        # The original prompt was already submitted; a bare resume continues it (NO prompt
-        # argument). --model + --resume is accepted by the CLI (smoke-checked). No delegation
-        # prefix — that was applied on the first launch.
-        argv = ["claude", "--resume", args.session_id, "--model", LLM_MODEL_IDS[overseer]]
-    else:
-        # First launch: the session runs ON the overseer's model, prompt sent.
-        argv = ["claude", "--model", LLM_MODEL_IDS[overseer], "--session-id", args.session_id]
     # Explicit effort (both paths): the launched session's effort must not silently depend
     # on settings.json's effortLevel. --effort is accepted alongside any --model
     # (smoke-checked incl. haiku). "" omits the flag; an unknown value is ignored loudly.
     effort = str(getattr(cfg, "launch_effort", "") or "").strip().lower()
-    if effort in EFFORT_LEVELS:
-        argv += ["--effort", effort]
-    elif effort:
+    if effort and effort not in EFFORT_LEVELS:
         print(
             f"warning: launch_effort {effort!r} is not one of "
             f"{', '.join(EFFORT_LEVELS)} — flag omitted",
             file=sys.stderr,
         )
+        effort = ""
+    launch_prompt: str | None = None
     if not resume and prompt:
         # An overseer/executor split (Claude jobs only): tell the overseer to delegate
         # implementation to Agent-tool subagents on the executor's model. Prepended before
@@ -3184,7 +3199,17 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
                 f"'{LLM_AGENT_ALIAS[executor]}'; keep planning, review, verification and "
                 f"integration yourself. " + prompt
             )
-        argv.append(job_launch_prefix(job_type) + prompt)  # single argv element — no quoting
+        launch_prompt = job_launch_prefix(job_type) + prompt  # single argv element — no quoting
+    # The original prompt of a resumed job was already submitted; a bare resume continues
+    # it (NO prompt argument). --model + --resume is accepted by the CLI (smoke-checked).
+    # A first launch runs ON the overseer's model with the prompt sent.
+    argv = launch_argv.claude_argv(
+        resume=args.session_id if resume else "",
+        session_id="" if resume else args.session_id,
+        model=LLM_MODEL_IDS[overseer],
+        effort=effort,
+        prompt=launch_prompt,
+    )
     _spawn_sync_mirrors(cfg)  # (BEFORE execvp: the success path replaces this process)
     # Pin the job's OWN Claude account (D8) into os.environ before exec — the default
     # account unsets CLAUDE_CONFIG_DIR, any other sets it — so an ambient value in this
@@ -7130,6 +7155,11 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_tag_type.add_argument("color")
     p_tag.set_defaults(func=cmd_tag)
 
+    # Voice-bridge JSON commands (`sessions`, `name`; PLAN_claude-bridge.md §6).
+    from . import bridge_cli
+
+    bridge_cli.add_parsers(sub)
+
     return parser
 
 
@@ -7140,6 +7170,12 @@ def _dispatch(argv: list[str] | None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     only = argv[0] if argv and argv[0] in _HOT_SUBCOMMANDS else None
     parser = build_parser(only=only)
+    if argv and only is None:
+        from . import bridge_cli
+
+        if argv[0] in bridge_cli.JSON_COMMANDS:
+            # argv errors of a `-j` command are answered with a JSON envelope (exit 2).
+            return bridge_cli.dispatch(parser, argv)
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):
         # Default surface: the interactive TUI in a terminal, the flat list when piped.

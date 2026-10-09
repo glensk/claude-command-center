@@ -19,9 +19,10 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
-# pylint: disable=wrong-import-position  # the direct-run shim comes first
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import dataclasses
 import json
+import os
 import re
 import sqlite3
 import time
@@ -33,6 +34,12 @@ from typing import Any
 from . import config
 from .aimscore import score_aim_lexical
 from .await_store import AWAIT_SCHEMA, AwaitStoreMixin
+from .bridge_store import (
+    ADDED_DELIVERY_COLUMNS,
+    ADDED_EVENT_COLUMNS,
+    BRIDGE_SCHEMA,
+    BridgeStoreMixin,
+)
 from .models import (
     DEFAULT_LLM,
     JOB_TYPES,
@@ -57,6 +64,21 @@ from .models import (
 
 _JOB_TYPES = frozenset(JOB_TYPES)
 _LLM_CHOICES = frozenset(LLM_CHOICES)
+
+
+def pid_alive(pid: int | None) -> bool:
+    """True when *pid* names a running process (signal-0 probe; ``None``/``<= 0`` → False)."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    except OSError:
+        return False
+    return True
 
 
 def _llm_or_default(value: str | None) -> str:
@@ -157,6 +179,15 @@ _SESSION_COLUMNS = (
     "archived",
     "created_at",
     "updated_at",
+    "canonical_name",
+    "canonical_name_origin",
+    "name_source_aim",
+    "observed_runtime_name",
+    "runtime_name_applied_at",
+    "title_written",
+    "title_generation",
+    "title_written_at",
+    "name_upgrade_tries",
 )
 _BOOL_COLUMNS = frozenset(
     {
@@ -174,7 +205,17 @@ _BOOL_COLUMNS = frozenset(
 # Columns the automatic reconcile is allowed to touch (never user-authored fields).
 # ``config_dir`` is the last-observed live account, stamped by core.reconcile.
 _RECONCILE_COLUMNS = frozenset(
-    {"cwd", "agent", "config_dir", "name", "status", "last_response_at", "last_seen_pid"}
+    {
+        "cwd",
+        "agent",
+        "config_dir",
+        "name",
+        "status",
+        "last_response_at",
+        "last_seen_pid",
+        "observed_runtime_name",
+        "runtime_name_applied_at",
+    }
 )
 
 _SCHEMA = """
@@ -262,7 +303,16 @@ CREATE TABLE IF NOT EXISTS sessions (
     future_missing_since INTEGER NOT NULL DEFAULT 0,
     archived          INTEGER NOT NULL DEFAULT 0,
     created_at        INTEGER NOT NULL DEFAULT 0,
-    updated_at        INTEGER NOT NULL DEFAULT 0
+    updated_at        INTEGER NOT NULL DEFAULT 0,
+    canonical_name    TEXT,
+    canonical_name_origin TEXT NOT NULL DEFAULT '',
+    name_source_aim   TEXT,
+    observed_runtime_name TEXT,
+    runtime_name_applied_at INTEGER NOT NULL DEFAULT 0,
+    title_written     TEXT,
+    title_generation  INTEGER NOT NULL DEFAULT 0,
+    title_written_at  INTEGER NOT NULL DEFAULT 0,
+    name_upgrade_tries INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS subgoals (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -451,7 +501,7 @@ _WAL_RETRY_SLEEP = 0.03
 _LIMIT_SWITCH_TERMINAL: tuple[str, ...] = ("started", "failed", "refused", "abandoned")
 
 
-class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
+class Store(AwaitStoreMixin, BridgeStoreMixin):  # pylint: disable=too-many-public-methods
     """Thin wrapper over the SQLite database."""
 
     def __init__(self, path: Path | None = None, *, check_same_thread: bool = True) -> None:
@@ -464,7 +514,7 @@ class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
         self.conn.execute("PRAGMA busy_timeout=3000")
         self._enable_wal()
         self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.executescript(_SCHEMA + AWAIT_SCHEMA)
+        self.conn.executescript(_SCHEMA + AWAIT_SCHEMA + BRIDGE_SCHEMA)
         self.conn.commit()
         self._ensure_columns()
 
@@ -578,6 +628,19 @@ class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
         # SubagentStop hook pair (see bump_subagents): the one signal a subagent with
         # no child process and no transcript record yet still shows up in.
         "active_subagents": "INTEGER NOT NULL DEFAULT 0",
+        # Session names + hand-set tab titles (session_names.py). All nullable / zero
+        # defaults, so a row an older build writes simply has no name yet.
+        "canonical_name": "TEXT",
+        "canonical_name_origin": "TEXT NOT NULL DEFAULT ''",
+        "name_source_aim": "TEXT",
+        "observed_runtime_name": "TEXT",
+        "runtime_name_applied_at": "INTEGER NOT NULL DEFAULT 0",
+        "title_written": "TEXT",
+        "title_generation": "INTEGER NOT NULL DEFAULT 0",
+        "title_written_at": "INTEGER NOT NULL DEFAULT 0",
+        # Failed LLM attempts at replacing a provisional ``fallback`` name (bounded, so a
+        # broken router is not asked again on every daemon pass).
+        "name_upgrade_tries": "INTEGER NOT NULL DEFAULT 0",
     }
     # Same, for the subgoals table (auto-progress marks its rows source='auto').
     _ADDED_SUBGOAL_COLUMNS = {
@@ -667,6 +730,8 @@ class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
                 self._add_column("file_locks", column, decl)
         self._ensure_table_columns("await_sources", self._ADDED_AWAIT_SOURCE_COLUMNS)
         self._ensure_table_columns("await_groups", self._ADDED_AWAIT_GROUP_COLUMNS)
+        self._ensure_table_columns("deliveries", ADDED_DELIVERY_COLUMNS)  # voice bridge
+        self._ensure_table_columns("events", ADDED_EVENT_COLUMNS)
         # Partial index for the armed-fire scan (statusline chip + daemon dispatch).
         # Created HERE, not in _SCHEMA: an old DB only gains fire_at via the ALTER
         # loop above, and an index referencing a missing column would fail the open.
@@ -685,6 +750,13 @@ class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_idempotency_key "
             "ON sessions(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
+        # Name lookups are case-insensitive (`ccc name`, the voice bridge's targets). NOT
+        # unique: names are unique among ACTIVE rows only (session_names.assign checks that
+        # inside one transaction), so a done session may keep a name a live one reuses.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_canonical_name "
+            "ON sessions(lower(canonical_name)) WHERE canonical_name IS NOT NULL"
         )
         self.conn.commit()
 
@@ -755,8 +827,10 @@ class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
         A tab outlives its sessions: a relaunch in the same tab (a resume, an
         account switch, a driver starting the next run after the previous one hit its
         limit) leaves several rows carrying the same ``iterm_session_id``. The one the
-        user is looking at is the live one — so a not-done row beats a done one, then
-        the most recently active wins (``last_response_at``, then ``updated_at``).
+        user is looking at is the live one — so a row whose ``last_seen_pid`` is still a
+        running process wins first (a parked row of a dead process can be more recent
+        than the live one, S-IDENT 2026-10-09), then a not-done row beats a done one,
+        then the most recently active wins (``last_response_at``, then ``updated_at``).
         Naive first-match returned the OLDEST row (SQL insertion order), which sent
         ``f+j`` and peek to the dead session. Matching is case-insensitive on the
         UUID tail (``w0t1p0:UUID`` → ``UUID``); archived rows are included so a tab
@@ -772,7 +846,15 @@ class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
         ]
         if not matches:
             return None
-        matches.sort(key=lambda s: (s.done, s.archived, -s.last_response_at, -s.updated_at))
+        matches.sort(
+            key=lambda s: (
+                not pid_alive(s.last_seen_pid),
+                s.done,
+                s.archived,
+                -s.last_response_at,
+                -s.updated_at,
+            )
+        )
         return matches[0]
 
     def delete(self, session_id: str) -> None:
@@ -1458,7 +1540,17 @@ class Store(AwaitStoreMixin):  # pylint: disable=too-many-public-methods
         existing = self.ensure(live.session_id, cwd=live.cwd, agent=live.agent)
         patch: dict[str, Any] = {"cwd": live.cwd, "agent": live.agent, "last_seen_pid": live.pid}
         if live.name:
+            # The registry's runtime name (`claude --name`, `/rename`) is an OBSERVATION:
+            # it lands in `name` / `observed_runtime_name`, never in `canonical_name` — the
+            # name ccc and the user own (session_names.py).
             patch["name"] = live.name
+            patch["observed_runtime_name"] = live.name
+            if (
+                existing.canonical_name
+                and live.name == existing.canonical_name
+                and not existing.runtime_name_applied_at
+            ):
+                patch["runtime_name_applied_at"] = now_ms()
         self.update_fields(
             live.session_id, **{k: v for k, v in patch.items() if k in _RECONCILE_COLUMNS}
         )
