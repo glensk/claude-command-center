@@ -958,6 +958,9 @@ def _send_text_python_api(uuid: str, text: str) -> str:
 
         async def _go() -> bool:
             nonlocal sent_paste
+            # The process-wide App singleton is bound to the first connection; a
+            # second send in the same process would use its dead socket (tp#70 V16).
+            iterm2.app.invalidate_app()
             conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
             app = await iterm2.async_get_app(conn)
             if app is None:
