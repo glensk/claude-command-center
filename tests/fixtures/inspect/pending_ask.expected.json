@@ -1,0 +1,36 @@
+{
+  "state": "waiting",
+  "last_reply": "Two settings need your choice before I continue.",
+  "last_prompt": "Set up the example service with sensible defaults.",
+  "decision": {
+    "decision_id": "<sha256>",
+    "source": "ask_user_question",
+    "questions": [
+      {
+        "text": "Which storage engine should the example service use?",
+        "multi_select": false,
+        "options": [
+          {"label": "Embedded file", "consequence": "No extra process; fine for one user."},
+          {"label": "Local server", "consequence": "Needs a running daemon; handles many users."},
+          {"label": "In-memory only", "consequence": "Fastest; all data is lost on restart."}
+        ]
+      },
+      {
+        "text": "Which optional features should be enabled?",
+        "multi_select": true,
+        "options": [
+          {"label": "Metrics", "consequence": "Expose a metrics endpoint."},
+          {"label": "Audit log", "consequence": "Write every change to a log file."},
+          {"label": "Email alerts", "consequence": "Send a mail when a job fails."}
+        ]
+      }
+    ],
+    "recommendation": "1) Embedded file",
+    "recommendation_reason": "1) No extra process; fine for one user.",
+    "context": {
+      "aim": null,
+      "ticket": null,
+      "recent_summary": "Two settings need your choice before I continue."
+    }
+  }
+}

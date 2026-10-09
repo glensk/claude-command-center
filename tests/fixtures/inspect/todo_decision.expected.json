@@ -1,0 +1,35 @@
+{
+  "state": "idle",
+  "last_reply": "The example build now runs in four minutes instead of nine. Two choices remain before the release. Everything else is committed and the tests are green. The cache experiment is described in the notes file.\n\n## To-do list\n\n1. You [decision]: Which cache backend should the build use? a) Local disk (Recommended) — fastest, no setup b) Shared bucket — survives a machine wipe c) No cache — slowest but simplest\n2. You [decision]: Release the patch today or wait for the second review? I recommend waiting for the second review because the migration touches stored data.\n3. Me, after 1: switch the build to the chosen cache backend.",
+  "last_prompt": "Speed up the example build and tell me what is left to decide.",
+  "decision": {
+    "decision_id": "<sha256>",
+    "source": "todo_line",
+    "questions": [
+      {
+        "text": "Which cache backend should the build use?",
+        "multi_select": false,
+        "options": [
+          {"label": "Local disk", "consequence": "fastest, no setup"},
+          {"label": "Shared bucket", "consequence": "survives a machine wipe"},
+          {"label": "No cache", "consequence": "slowest but simplest"}
+        ]
+      },
+      {
+        "text": "Release the patch today or wait for the second review?",
+        "multi_select": false,
+        "options": [
+          {"label": "Release the patch today", "consequence": null},
+          {"label": "Wait for the second review", "consequence": null}
+        ]
+      }
+    ],
+    "recommendation": "1) Local disk; 2) waiting for the second review",
+    "recommendation_reason": "1) fastest, no setup; 2) the migration touches stored data",
+    "context": {
+      "aim": null,
+      "ticket": null,
+      "recent_summary": "The example build now runs in four minutes instead of nine. Two choices remain before the release. Everything else is committed and the tests are green."
+    }
+  }
+}

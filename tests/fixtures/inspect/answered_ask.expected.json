@@ -1,0 +1,6 @@
+{
+  "state": "idle",
+  "last_reply": "Done: the cache is small and logs misses and evictions.",
+  "last_prompt": "\"Which cache size should the example use?\"=\"Small (Recommended)\", \"Which cache events should be logged?\"=\"Misses, Evictions\"",
+  "decision": null
+}
