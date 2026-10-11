@@ -66,9 +66,9 @@ environment still overrides it. Create the second login once with
 `CODEX_HOME=~/.codex-private codex login` (same value as ccc's `codex_home_private`),
 then link the shared config and global instructions into the new home —
 `ln -s ../.codex/config.toml ~/.codex-private/config.toml` and
-`ln -s ../obsidian/42-Git/home/mydotfiles/dotfiles/codex/.codex/AGENTS.md ~/.codex-private/AGENTS.md` —
+`ln -s <your dotfiles>/codex/.codex/AGENTS.md ~/.codex-private/AGENTS.md` —
 and add that home's `[hooks.state."<home>/config.toml:<event>:<group>:<handler>"]` rows
-(same hashes as `~/.codex`) to mydotfiles' `config.toml`: `codex exec` skips an
+(same hashes as `~/.codex`) to your dotfiles' `config.toml`: `codex exec` skips an
 untrusted hook silently.
 The pin must point at a home **ccc knows** — `~/.codex`, `codex_home_private`, or an entry
 of `codex_homes_extra`. A path outside those maps to no seat label, so the selector treats
