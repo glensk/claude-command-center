@@ -375,6 +375,47 @@ def tmux_pane_for_session(session_id: str) -> tuple[str, str] | None:
     return _tmux_pane_for_session(panes, children, commands, session_id)
 
 
+# How long ``open-job -j`` keeps looking for the pane of a job it just landed in tmux. The
+# new window first runs ``ccc start-job <id>``, which execs claude (the process carrying
+# ``--session-id``) only after its own startup — so the locator needs a short grace period.
+TMUX_LOCATE_WAIT_S = 5.0
+TMUX_LOCATE_POLL_S = 0.25
+
+
+def tmux_landing(session_id: str, wait_s: float | None = None) -> dict[str, Any] | None:
+    """Where a tmux-landed job runs: ``{session, window, pane, attach_argv}`` or ``None``.
+
+    Built from :func:`tmux_pane_for_session` (``list-panes`` format fields, never prose),
+    polled for up to *wait_s* seconds (default :data:`TMUX_LOCATE_WAIT_S`) because the
+    session's claude appears only once ``ccc start-job`` has exec'd it. *window* is the
+    window index (an ``int``; the raw string when tmux reports a non-numeric one), *pane*
+    the pane id (``%12``), and ``attach_argv`` attaches to the session with that window
+    selected (``tmux attach -t <session>:<window>``). ``None`` when the pane is not found.
+    """
+    import time  # pylint: disable=import-outside-toplevel  # only open-job -j polls
+
+    budget = TMUX_LOCATE_WAIT_S if wait_s is None else wait_s
+    deadline = time.monotonic() + max(budget, 0.0)
+    while True:
+        located = tmux_pane_for_session(session_id)
+        if located is not None or time.monotonic() >= deadline:
+            break
+        time.sleep(TMUX_LOCATE_POLL_S)
+    if located is None:
+        return None
+    target, pane_id = located
+    session, _sep, window_text = target.rpartition(":")
+    if not session or not window_text:
+        return None
+    window: int | str = int(window_text) if window_text.isdigit() else window_text
+    return {
+        "session": session,
+        "window": window,
+        "pane": pane_id,
+        "attach_argv": ["tmux", "attach", "-t", f"{session}:{window_text}"],
+    }
+
+
 def focus_tmux_window(session_id: str) -> bool:  # pylint: disable=too-many-return-statements  # one exit per probe
     """Select + surface the tmux window hosting *session_id* (launchd-spawned jobs).
 

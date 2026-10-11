@@ -308,8 +308,14 @@ tab and no error anywhere. That is how job `42fc3505` was lost on 2026-08-28.
 
 **A tab is never assumed, it is reported (tp#90).** `open-job` exits 0 whenever the job
 launched — in an iTerm2 tab (`iterm_applescript` / `iterm_api`) OR a tmux window (`tmux`) —
-and says which (`-j/--json` → `{"version": 1, "session_id", "launcher"}`); it exits 1 only when
-nothing launched. Under launchd the AppleScript rung depends on the macOS Automation grant for
+and says which (`-j/--json` → `{"version": 2, "session_id", "launcher"}`); it exits 1 only when
+nothing launched. A tmux landing's JSON adds `"tmux": {"session", "window", "pane",
+"attach_argv"}` (e.g. `{"session": "ccc", "window": 7, "pane": "%12", "attach_argv": ["tmux",
+"attach", "-t", "ccc:7"]}`), built by `terminal.tmux_landing` from the same `list-panes` data
+`tmux_pane_for_session` uses and polled for up to `TMUX_LOCATE_WAIT_S` (5 s) while `start-job`
+execs claude; `"tmux": null` when the pane is not found in that time (exit status unchanged —
+the job runs). Other launchers have no `tmux` key. Version 2 added the field (open-job has its
+own `OPEN_JOB_JSON_VERSION`; `new-job`/`jobs`/`terminal-probe` stay at 1). Under launchd the AppleScript rung depends on the macOS Automation grant for
 the launchd job's *executable path* (a new python build = a new prompt), and the Python-API
 rung is NOT an escape from that gate (the `iterm2` package fetches its cookie via AppleScript,
 with no timeout — so it runs only behind iTerm2's `disable-automation-auth` switch). To prove

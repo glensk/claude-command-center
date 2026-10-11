@@ -5,6 +5,7 @@ session, never a global DB id that may belong to a different session sharing the
 working directory.
 """
 
+# pylint: disable=too-many-lines  # one module covers every CLI handler
 from __future__ import annotations
 
 import argparse
@@ -36,7 +37,7 @@ def test_new_job_creates_draft_and_jobs_lists_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    monkeypatch.setattr("command_center.cli.config.load_config", lambda: _no_score_cfg())
+    monkeypatch.setattr("command_center.cli.config.load_config", _no_score_cfg)
     args = argparse.Namespace(
         aim="Migrate Zendesk tickets to Zoho Desk",
         prompt="move my zendesk tickets to zoho",
@@ -92,7 +93,7 @@ def test_install_shell_dry_run_writes_nothing(
 
 
 def test_install_shell_install_and_uninstall(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from command_center import shell_install
 
@@ -607,7 +608,7 @@ def test_open_job_rejects_unknown_id(
     calls = _stub_open_tab(monkeypatch)
 
     assert cmd_open_job(argparse.Namespace(session_id="nope")) == 1
-    assert calls == []  # never opened a tab
+    assert not calls  # never opened a tab
     assert "no such job" in capsys.readouterr().err
 
 
@@ -623,7 +624,7 @@ def test_open_job_rejects_non_draft_session(
     calls = _stub_open_tab(monkeypatch)
 
     assert cmd_open_job(argparse.Namespace(session_id="live-sess")) == 1
-    assert calls == []
+    assert not calls
     assert "not a future job" in capsys.readouterr().err
 
 
@@ -640,7 +641,7 @@ def test_open_job_rejects_archived_draft(
     calls = _stub_open_tab(monkeypatch)
 
     assert cmd_open_job(argparse.Namespace(session_id="job-archived")) == 1
-    assert calls == []
+    assert not calls
     assert "archived" in capsys.readouterr().err
 
 
@@ -685,7 +686,7 @@ def test_open_job_rejects_both_id_and_file(
     job_file = _write_job_file(tmp_path, "8442ec48-2890-4b41-8315-0f12df96077c")
 
     assert cmd_open_job(argparse.Namespace(session_id="8442", file=str(job_file))) == 1
-    assert calls == []
+    assert not calls
     assert "not both" in capsys.readouterr().err
 
 
@@ -699,7 +700,7 @@ def test_open_job_rejects_neither_id_nor_file(
     calls = _stub_open_tab(monkeypatch)
 
     assert cmd_open_job(argparse.Namespace(session_id=None, file=None)) == 1
-    assert calls == []
+    assert not calls
     assert "session_id or --file" in capsys.readouterr().err
 
 
@@ -715,7 +716,7 @@ def test_open_job_file_without_session_id_rejected(
     bad.write_text("just some text, no session_id", encoding="utf-8")
 
     assert cmd_open_job(argparse.Namespace(session_id=None, file=str(bad))) == 1
-    assert calls == []
+    assert not calls
     assert "no session_id" in capsys.readouterr().err
 
 
@@ -730,7 +731,7 @@ def test_open_job_file_missing_path_rejected(
 
     missing = str(tmp_path / "does-not-exist.md")
     assert cmd_open_job(argparse.Namespace(session_id=None, file=missing)) == 1
-    assert calls == []
+    assert not calls
     assert "cannot read" in capsys.readouterr().err
 
 
@@ -792,7 +793,7 @@ def test_open_job_ambiguous_prefix_is_rejected(
 
     # `ad2096` is a prefix of BOTH A and B → ambiguous, no tab opened.
     assert cmd_open_job(argparse.Namespace(session_id="ad2096")) == 1
-    assert calls == []
+    assert not calls
     assert "ambiguous job id ad2096" in capsys.readouterr().err
 
 
@@ -808,7 +809,7 @@ def test_open_job_unknown_prefix_reports_no_such_job(
     calls = _stub_open_tab(monkeypatch)
 
     assert cmd_open_job(argparse.Namespace(session_id="ffffffff")) == 1
-    assert calls == []
+    assert not calls
     assert "no such job" in capsys.readouterr().err
 
 
@@ -1061,7 +1062,7 @@ def test_restore_job_stages_deleted_job_back(
         row = store.get(_JOB_UUID)
         assert row is not None
         assert row.draft is True and row.archived is False
-    assert list(Path(cfg.delete_dir).expanduser().rglob("*.md")) == []  # trash emptied
+    assert not list(Path(cfg.delete_dir).expanduser().rglob("*.md"))  # trash emptied
     live = list(Path(cfg.future_dir).expanduser().rglob("*.md"))
     assert len(live) == 1
     text = live[0].read_text(encoding="utf-8")
@@ -1232,7 +1233,7 @@ def test_capture_usage_skips_write_when_account_none(
     assert usage.read_usage() is None
     assert usage.read_usage("work") is None
     # Nothing was written at all.
-    assert list(config.app_home().glob("usage*.json")) == []
+    assert not list(config.app_home().glob("usage*.json"))
 
 
 # ---- restart-tui ------------------------------------------------------------
@@ -1250,7 +1251,7 @@ def test_restart_tui_with_no_running_tui_exits_1(
     monkeypatch.setattr(jumpstate, "request_restart", lambda: requested.append(True))
 
     assert cmd_restart_tui(argparse.Namespace()) == 1
-    assert requested == []  # never even asked for a restart
+    assert not requested  # never even asked for a restart
     assert "no running ccc TUI" in capsys.readouterr().err
 
 
@@ -1260,7 +1261,7 @@ def test_restart_tui_exit_code_unchanged_with_stale_panel_server(
     """tp#70 D8: a stale panel server only adds a hint; the TUI contract (exit 0) holds."""
     import os
 
-    from command_center import cli, jumpstate
+    from command_center import jumpstate
     from command_center import panelserver as ps
 
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
@@ -1433,7 +1434,7 @@ def test_close_now_refuses_while_stop_hooks_are_still_running(
     monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
     args = argparse.Namespace(session="s1", iterm="w0t1p0:FRESH", pid=_CLOSE_PID)
     assert cli.cmd_close_now(args) == 1
-    assert killed == [] and closed == []
+    assert not killed and not closed
     assert notes and "Stop hooks still running" in notes[0] and "run-stop-hook.sh" in notes[0]
     assert "NOT closed" in (tmp_path / "command-center" / "events.log").read_text(encoding="utf-8")
 
@@ -1454,7 +1455,7 @@ def test_close_now_refuses_when_the_baseline_table_is_unreadable(
     monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
     args = argparse.Namespace(session="s1", iterm="w0t1p0:FRESH", pid=_CLOSE_PID)
     assert cli.cmd_close_now(args) == 1
-    assert killed == [] and closed == []
+    assert not killed and not closed
     assert notes and "could not be identified (ps unreadable)" in notes[0]
 
 
@@ -1478,7 +1479,7 @@ def test_close_now_refuses_a_pid_recycled_during_the_wait(
     monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
     args = argparse.Namespace(session="s1", iterm="w0t1p0:FRESH", pid=_CLOSE_PID)
     assert cli.cmd_close_now(args) == 1
-    assert killed == [] and closed == []
+    assert not killed and not closed
     assert notes and "no longer this session's claude" in notes[0]
 
 
@@ -1496,7 +1497,7 @@ def test_close_now_refuses_when_no_pid_can_be_resolved(
     monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
     args = argparse.Namespace(session="s1", iterm="w0t1p0:FRESH", pid=0)
     assert cli.cmd_close_now(args) == 1
-    assert closed == []
+    assert not closed
     assert notes and "no live Claude pid" in notes[0]
 
 
@@ -1585,7 +1586,7 @@ def test_close_now_transient_refusal_restores_the_arm_bound_to_the_process(
     killed, closed = _no_tab_effects(monkeypatch)
     claim = _claimed_arm()
     assert cli.cmd_close_now(_close_args(claim)) == 1
-    assert killed == [] and closed == []
+    assert not killed and not closed
     assert _arm_row() == (claim.armed_at, claim.token, _CLOSE_BOUND)
     assert notes and "re-armed until" in notes[0] and "NEXT turn" in notes[0]
     log = (tmp_path / "command-center" / "events.log").read_text(encoding="utf-8")
@@ -1604,7 +1605,7 @@ def test_close_now_permanent_refusal_retires_the_arm(
     killed, _closed = _no_tab_effects(monkeypatch)
     claim = _claimed_arm()
     assert cli.cmd_close_now(_close_args(claim)) == 1
-    assert killed == []
+    assert not killed
     assert _arm_row() == (0, "", "")
     assert notes and "close the tab yourself" in notes[0] and "re-armed until" not in notes[0]
 
@@ -1621,7 +1622,7 @@ def test_close_now_recycled_pid_retires_the_arm(
     killed, _closed = _no_tab_effects(monkeypatch)
     claim = _claimed_arm()
     assert cli.cmd_close_now(_close_args(claim)) == 1
-    assert killed == [] and _arm_row() == (0, "", "")
+    assert not killed and _arm_row() == (0, "", "")
 
 
 def test_close_now_without_a_pid_retires_the_arm(
@@ -1649,7 +1650,7 @@ def test_close_now_unreadable_baseline_start_never_signals(
     killed, closed = _no_tab_effects(monkeypatch)
     claim = _claimed_arm()
     assert cli.cmd_close_now(_close_args(claim)) == 1
-    assert killed == [] and closed == []
+    assert not killed and not closed
     assert _arm_row() == (0, "", "")  # no verified identity and no hook binding → retired
 
 
@@ -1664,7 +1665,7 @@ def test_close_now_unreadable_baseline_restores_on_the_hook_verified_binding(
     killed, _closed = _no_tab_effects(monkeypatch)
     claim = _claimed_arm(bound=_CLOSE_BOUND)
     assert cli.cmd_close_now(_close_args(claim)) == 1
-    assert killed == []
+    assert not killed
     assert _arm_row() == (claim.armed_at, claim.token, _CLOSE_BOUND)
 
 
@@ -1686,7 +1687,7 @@ def test_close_now_unreadable_final_probe_refuses_and_restores(
     killed, closed = _no_tab_effects(monkeypatch)
     claim = _claimed_arm()
     assert cli.cmd_close_now(_close_args(claim)) == 1
-    assert killed == [] and closed == []
+    assert not killed and not closed
     assert _arm_row() == (claim.armed_at, claim.token, _CLOSE_BOUND)
 
 
@@ -1796,7 +1797,7 @@ def test_close_now_no_pid_no_iterm_leaves_stale_tab_alone(
     closed: list[str] = []
     monkeypatch.setattr("command_center.terminal.close_iterm_session", closed.append)
     assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="", pid=0)) == 0
-    assert closed == []  # never close on a store-only (stale) id
+    assert not closed  # never close on a store-only (stale) id
 
 
 def test_close_now_iterm_flag_closes_even_without_a_pid(
@@ -1956,7 +1957,7 @@ def test_codex_usage_prints_one_line_per_home_and_never_fails(
 
 
 # --------------------------- direct-execution shim ---------------------------- #
-def test_every_module_is_runnable_by_path(tmp_path: Path) -> None:
+def test_every_module_is_runnable_by_path() -> None:
     """`./command_center/<mod>.py` must never die on the relative-import error.
 
     Regression for the original report: `./command_center/quota.py` gave
@@ -1965,9 +1966,8 @@ def test_every_module_is_runnable_by_path(tmp_path: Path) -> None:
     """
     import os
     import subprocess
-    from pathlib import Path as _Path
 
-    pkg = _Path(__file__).resolve().parent.parent / "command_center"
+    pkg = Path(__file__).resolve().parent.parent / "command_center"
     library_exit, cli_exit = 2, 0
     checked = 0
     for module in sorted(pkg.glob("*.py")):
@@ -1984,9 +1984,11 @@ def test_every_module_is_runnable_by_path(tmp_path: Path) -> None:
     assert "library module, not a command" in lib.stderr
     assert "attempted relative import" not in lib.stderr
 
-    cli = subprocess.run([str(pkg / "quota.py"), "-h"], capture_output=True, text=True, check=False)
-    assert cli.returncode == cli_exit
-    assert "usage: ccc quota" in cli.stdout
+    cli_run = subprocess.run(
+        [str(pkg / "quota.py"), "-h"], capture_output=True, text=True, check=False
+    )
+    assert cli_run.returncode == cli_exit
+    assert "usage: ccc quota" in cli_run.stdout
 
 
 # ---- archive (tp single-listing) ---------------------------------------------
@@ -2083,7 +2085,78 @@ def test_open_job_json_is_one_line_naming_the_launcher(
     assert cmd_open_job(argparse.Namespace(session_id="job-json", json=True)) == 0
     lines = capsys.readouterr().out.strip().splitlines()
     assert len(lines) == 1
-    assert json.loads(lines[0]) == {"version": 1, "session_id": "job-json", "launcher": "iterm_api"}
+    reply = json.loads(lines[0])
+    assert reply == {"version": 2, "session_id": "job-json", "launcher": "iterm_api"}
+    assert "tmux" not in reply  # only a tmux landing carries the tmux object
+
+
+def test_open_job_json_tmux_landing_carries_attach_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#906/tp#896: a tmux landing names session/window/pane and a runnable attach argv."""
+    import json
+
+    from command_center.cli import cmd_open_job
+
+    _draft(tmp_path, monkeypatch, "job-tmux-json")
+    _stub_open_tab(monkeypatch, launcher="tmux")
+    monkeypatch.setattr("command_center.terminal.degraded_launch_warning", lambda _l: "")
+    looked_up: list[str] = []
+
+    def _fake_pane(session_id: str) -> tuple[str, str] | None:
+        looked_up.append(session_id)
+        return ("ccc:7", "%12")
+
+    monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", _fake_pane)
+    assert cmd_open_job(argparse.Namespace(session_id="job-tmux-json", json=True)) == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 1
+    reply = json.loads(lines[0])
+    assert looked_up == ["job-tmux-json"]
+    assert reply == {
+        "version": 2,
+        "session_id": "job-tmux-json",
+        "launcher": "tmux",
+        "tmux": {
+            "session": "ccc",
+            "window": 7,
+            "pane": "%12",
+            "attach_argv": ["tmux", "attach", "-t", "ccc:7"],
+        },
+    }
+
+
+def test_open_job_json_tmux_pane_not_located_is_null_and_exit_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The job launched but its pane never showed up: ``tmux: null``, exit status unchanged."""
+    import json
+
+    from command_center.cli import cmd_open_job
+
+    _draft(tmp_path, monkeypatch, "job-tmux-lost")
+    _stub_open_tab(monkeypatch, launcher="tmux")
+    monkeypatch.setattr("command_center.terminal.degraded_launch_warning", lambda _l: "")
+    monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
+    monkeypatch.setattr("command_center.terminal.TMUX_LOCATE_WAIT_S", 0.0)
+    assert cmd_open_job(argparse.Namespace(session_id="job-tmux-lost", json=True)) == 0
+    reply = json.loads(capsys.readouterr().out)
+    assert reply["version"] == 2
+    assert "tmux" in reply and reply["tmux"] is None
+
+
+def test_tmux_landing_polls_until_the_pane_appears(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``start-job`` execs claude after its own startup: the locator retries within its budget."""
+    from command_center import terminal
+
+    answers: list[tuple[str, str] | None] = [None, None, ("work:3", "%40")]
+    monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _s: answers.pop(0))
+    monkeypatch.setattr("command_center.terminal.TMUX_LOCATE_POLL_S", 0.0)
+    landing = terminal.tmux_landing("sid-1", wait_s=30.0)
+    assert landing is not None
+    assert landing["attach_argv"] == ["tmux", "attach", "-t", "work:3"]
+    assert (landing["session"], landing["window"], landing["pane"]) == ("work", 3, "%40")
+    assert not answers
 
 
 def test_open_job_tmux_landing_exits_zero_names_tmux_and_warns(

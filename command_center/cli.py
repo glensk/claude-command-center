@@ -2651,6 +2651,8 @@ def cmd_claim_fire(args: argparse.Namespace) -> int:
 # The machine-readable contract of `ccc new-job --json` / `ccc jobs --json`. Bump only
 # on an incompatible change; additive fields keep version 1 (consumers read by key).
 JSON_SCHEMA_VERSION = 1
+# `ccc open-job --json` has its own version: 2 added the `tmux` object of a tmux landing.
+OPEN_JOB_JSON_VERSION = 2
 
 
 def _new_job_json(session: Session, created: bool) -> str:
@@ -3543,10 +3545,13 @@ def cmd_open_job(args: argparse.Namespace) -> int:
 
     The launch ladder is iTerm2 (AppleScript) → iTerm2 (Python API, only when TCC-free) →
     tmux, and the rung that landed it is REPORTED, never hidden (tp#90): the human line says
-    where the job runs, ``-j/--json`` prints exactly one line ``{"version": 1, "session_id",
+    where the job runs, ``-j/--json`` prints exactly one line ``{"version": 2, "session_id",
     "launcher"}`` with ``launcher`` ∈ ``iterm_applescript | iterm_api | tmux``, and a tmux
-    landing on an iTerm2-configured Mac adds a ``warning:`` on stderr. Exit 0 iff something
-    launched (tmux included — the job IS running); 1 iff nothing did.
+    landing on an iTerm2-configured Mac adds a ``warning:`` on stderr. A tmux landing's JSON
+    also carries ``"tmux": {"session", "window", "pane", "attach_argv"}`` (see
+    :func:`terminal.tmux_landing`), or ``"tmux": null`` when the pane is not found right after
+    the launch; other launchers have no ``tmux`` key. Exit 0 iff something launched (tmux
+    included — the job IS running, located or not); 1 iff nothing did.
     """
     from . import terminal
 
@@ -3579,11 +3584,16 @@ def cmd_open_job(args: argparse.Namespace) -> int:
         )
         return 1
     if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {"version": JSON_SCHEMA_VERSION, "session_id": session_id, "launcher": launcher}
-            )
-        )
+        reply: dict[str, Any] = {
+            "version": OPEN_JOB_JSON_VERSION,
+            "session_id": session_id,
+            "launcher": launcher,
+        }
+        if launcher == terminal.LAUNCHER_TMUX:
+            # None (JSON null) when the pane is not found in time: the job still launched,
+            # so the exit status stays 0 — the caller just has no attach target.
+            reply["tmux"] = terminal.tmux_landing(session_id)
+        print(json.dumps(reply))
     else:
         print(f"opening future job {session_id} {terminal.describe_launcher(launcher)}")
     warning = terminal.degraded_launch_warning(launcher)
@@ -6432,8 +6442,10 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "-j",
         "--json",
         action="store_true",
-        help="print one JSON line {version, session_id, launcher} instead of the human line; "
-        "launcher is iterm_applescript | iterm_api | tmux (tmux = the job runs, but not in a tab)",
+        help="print one JSON line {version, session_id, launcher[, tmux]} instead of the human "
+        "line; launcher is iterm_applescript | iterm_api | tmux (tmux = the job runs, but not in "
+        "a tab; then tmux = {session, window, pane, attach_argv}, or null if the pane was not "
+        "found)",
     )
     p_openjob.set_defaults(func=cmd_open_job)
 
