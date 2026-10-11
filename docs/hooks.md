@@ -31,7 +31,7 @@ own the wiring: delete the forwarder, don't wrap it.
 | **PreToolUse** (`Edit\|Write\|MultiEdit\|NotebookEdit`) | acquires the cross-session file lock on the target file (or denies + queues) |
 | **PostToolUse**     | forwards the session's live `TodoWrite`/Task list into ccc; nudges the lock holder to hand off when a peer waits |
 | **Stop**            | end-of-turn: spawns the detached progress grader / AIM-met assessment (when enabled) |
-| **release-locks**   | LEASES every file lock the session holds past the end of the turn (`stop_barrier_wait_sec`) instead of dropping it — see below |
+| **release-locks**   | LEASES every file lock the session holds past the end of the turn (`stop_barrier_wait_sec`) instead of dropping it, fires an armed `mark-done --close` / `switch-account`, then runs the staff close guard — see below |
 | **SessionEnd**      | final reconcile so the row parks cleanly                                          |
 | **PreCompact**      | preserves state across a context compaction                                       |
 | **SubagentStart**   | counts in-process subagents so `switch-account` refuses while one runs            |
@@ -97,6 +97,42 @@ guarantee: even a kill that lands mid-commit cannot hand a half-written file to 
 / `delete_many` — pruning, `ccc rm`) erases its leased locks without consulting
 `protected_until`. That is deliberate: removing a session is an explicit operator action,
 not an automatic expiry.
+
+## The staff close guard (llm-staff agents)
+
+An llm-staff agent such as `mac-overseer` ends its episode with `staff lease -r` and then
+`ccc mark-done --close`. When it forgets the close, its idle `claude` keeps counting as a live
+agent and blocks every later launch. `staff lease -r` therefore writes a pending-close marker
+`$STAFF_STATE/released/<agent>/<session_id>.json` (`{agent, owner, generation, nonce,
+released_at_iso}`; `STAFF_STATE` defaults to `~/.local/state/llm-staff`) before it frees the
+lease, and `release-locks` — after it has handled the close/switch claim, so it can never keep
+`close-now` from firing — checks it on every Stop
+(`command_center/staff_close_guard.py`):
+
+- **No marker → one `lstat()` per guarded agent**, nothing else (no subprocess, no store
+  write). Guarded agents: `CC_STAFF_CLOSE_GUARD_AGENTS` (comma list, default `mac-overseer`).
+  Agent and session ids must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; the marker is read
+  with `O_NOFOLLOW` and must be a regular file owned by you, in a directory owned by you,
+  naming this agent and session. An untrusted marker never blocks.
+- **Marker + a claimed `mark-done --close`, or a session marked done → pass.**
+- **Otherwise the read-only probe** `staff lease -s -j -a <agent> -o <session_id>` (2 s;
+  `staff` resolves through `STAFF_BIN` → `$PATH`): `held_by_owner: true` means the episode
+  went on and re-took the lease — the marker is stale, ccc deletes it (only while it still
+  carries the same nonce) and passes. Anything else — free, lapsed, held by someone else, a
+  timeout, a missing `staff`, bad JSON — **blocks**: a marker exists and re-hold is not proven.
+- **A block** is `{"decision": "block", "reason": "… Call Skill ccc-mark-done-and-close now;
+  if the episode continues, re-take the lease first (staff lease -a <agent> -o <sid>) …"}` on
+  stdout with exit 0 — on EVERY Stop, not once. A per-nonce counter in the store
+  (`staff_close_guard` table) is read and bumped in one `BEGIN IMMEDIATE`, and the block is
+  printed before the commit: a hook killed in between under-counts, it never suppresses a
+  block. After **5** consecutive blocks on one nonce the next Stop passes once and logs
+  `escalated`; the launch trigger's `blocked:` alert is then the backstop. Any other pass
+  resets the counter.
+- Every decision taken while a marker exists lands in `events.log` as `staff-close-guard`
+  with `agent=… nonce=… decision=…` (block, escalated, pass-close, pass-done, pass-reheld,
+  invalid-marker) — never command or transcript text.
+- **Off switch:** `CC_NO_STAFF_CLOSE_GUARD=1`. Any exception inside the guard means no block
+  (fail open).
 
 ## The status line
 

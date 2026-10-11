@@ -404,6 +404,22 @@ def _isolate_vault_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.fixture(autouse=True)
+def _isolate_llm_staff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the release-locks staff close guard off the developer's real llm-staff state.
+
+    Every ``release-locks`` call ``lstat()``s ``$STAFF_STATE/released/<agent>/<sid>.json``
+    and, on a marker hit, runs ``$STAFF_BIN lease -s -j``. Pin the state dir under
+    ``tmp_path`` and point ``STAFF_BIN`` at a path that does not exist, so no test can read
+    a real marker or run the real ``staff``; tests of the guard re-point both
+    (``tests/test_staff_close_guard.py``). The guard's own env knobs are cleared too.
+    """
+    monkeypatch.setenv("STAFF_STATE", str(tmp_path / "staff-state"))
+    monkeypatch.setenv("STAFF_BIN", str(tmp_path / "no-such-staff"))
+    monkeypatch.delenv("CC_NO_STAFF_CLOSE_GUARD", raising=False)
+    monkeypatch.delenv("CC_STAFF_CLOSE_GUARD_AGENTS", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _allow_headless_start_job(monkeypatch: pytest.MonkeyPatch) -> None:
     """Let the exec-path tests run without a pseudo-terminal.
 

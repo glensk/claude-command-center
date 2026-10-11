@@ -297,6 +297,31 @@ Invariants:
 - `await` is a hot subcommand (`cli._HOT_SUBCOMMANDS`): `await_cli` imports nothing
   heavy at load time, and `-r` returns after one indexed query when nothing is armed.
 
+## The staff close guard in `release-locks` (do not regress)
+
+`command_center/staff_close_guard.py` refuses a Stop of a session that released an
+allowlisted llm-staff lease (`staff lease -r` writes `$STAFF_STATE/released/<agent>/<sid>.json`)
+without arming `mark-done --close`. Full behaviour: [docs/hooks.md](docs/hooks.md) § "The staff
+close guard". Invariants:
+
+- **It runs LAST in `release-locks`**, after the lock lease and the close/switch claim, so it
+  can never keep `close-now` from firing; `staff_close_guard.guard` swallows every exception
+  (fail open = no block).
+- **No marker = one `lstat()` per guarded agent** (`CC_STAFF_CLOSE_GUARD_AGENTS`, default
+  `mac-overseer`) — no subprocess, no store write. Only a marker hit may run the read-only
+  probe `staff lease -s -j` (2 s, `STAFF_BIN` → `$PATH` via `external_deps`). ccc never reads
+  llm-staff's SQLite: that subprocess contract is the only coupling.
+- **Pass** only on a claimed `CloseClaim`, a done session, or a probe that PROVES
+  `held_by_owner` (then the stale marker is deleted). Probe failure or timeout blocks.
+- **Block every Stop** (`{"decision": "block", "reason": …}` on stdout, exit 0), counted per
+  marker nonce in the `staff_close_guard` table inside one `BEGIN IMMEDIATE`
+  (`Store.staff_guard_block`), the block printed BEFORE the commit (a kill under-counts, never
+  suppresses). After 5 blocks one Stop passes and `escalated` is logged; any other pass
+  resets the count. `events.log` gets ids and the decision only.
+- Kill switch `CC_NO_STAFF_CLOSE_GUARD=1`. Tests (`tests/test_staff_close_guard.py`) use a
+  stand-in `staff` on `STAFF_BIN` that records its calls; `tests/conftest.py` pins
+  `STAFF_STATE` under `tmp_path` and points `STAFF_BIN` at a missing file for every test.
+
 ## Launching jobs: always a tab (do not regress)
 
 **Agents: never run `ccc start-job` from a background/piped shell — use `ccc open-job <id>`.**

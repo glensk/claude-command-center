@@ -27,6 +27,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import json
 import os
 import sys
@@ -803,6 +804,9 @@ def handle_release_locks(payload: dict[str, Any]) -> int:
     what protects the files if that kill lands mid-commit. Kept fast and never-raising — no
     waiting, and a process probe only for an arm a refusal restored (dispatch swallows too,
     but we mirror the defensive neighbours).
+
+    Last, :func:`staff_close_guard.guard` may print a Stop ``{"decision": "block"}``: a
+    guarded llm-staff lease was released (``staff lease -r``) but no close is armed.
     """
     sid = _session_id(payload)
     if sid:
@@ -848,6 +852,11 @@ def handle_release_locks(payload: dict[str, Any]) -> int:
                 if claim.no_codex:
                     args.append("--no-codex")
                 spawn.spawn_ccc(args)
+            # LAST, after the claim fired, so it never keeps close-now from running; it
+            # swallows its own errors (fail open = no block). See staff_close_guard.py.
+            from . import staff_close_guard
+
+            staff_close_guard.guard(store, sid, claim, _log_event)
     return 0
 
 

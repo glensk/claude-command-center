@@ -27,7 +27,7 @@ import re
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -408,6 +408,20 @@ CREATE TABLE IF NOT EXISTS mirror_health (
     withheld  INTEGER NOT NULL DEFAULT 0,
     deferred  INTEGER NOT NULL DEFAULT 0,
     reason    TEXT    NOT NULL DEFAULT ''
+);
+-- The staff close guard's consecutive-block counter (hooks.release-locks, see
+-- command_center/staff_close_guard.py): one row per released-lease marker NONCE that the
+-- Stop hook has refused to let end. Read and bumped in ONE `BEGIN IMMEDIATE`, so two
+-- parallel Stop hooks of a session never lose a count; a pass for any reason but the
+-- escalation deletes the row. No foreign key: the counter is about a marker file, and a
+-- Stop hook must never fail on who wrote the session row first.
+CREATE TABLE IF NOT EXISTS staff_close_guard (
+    session_id  TEXT    NOT NULL,
+    agent       TEXT    NOT NULL,
+    nonce       TEXT    NOT NULL,
+    blocks      INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (session_id, agent, nonce)
 );
 """
 
@@ -2255,6 +2269,78 @@ class Store(AwaitStoreMixin, BridgeStoreMixin):  # pylint: disable=too-many-publ
         self.conn.execute("DELETE FROM file_lock_waiters WHERE session_id = ?", (session_id,))
         self.conn.commit()
         return cur.rowcount
+
+    # ---- staff close guard (staff_close_guard.py) ------------------------------------
+    def staff_guard_block(
+        self,
+        session_id: str,
+        agent: str,
+        nonce: str,
+        *,
+        limit: int,
+        emit: Callable[[int], None],
+    ) -> tuple[str, int]:
+        """Count one refused Stop for marker *nonce* — or escalate — in ONE transaction.
+
+        Returns ``("block", n)`` after calling ``emit(n)`` (``n`` = this block's 1-based
+        consecutive number), or ``("escalated", n)`` without calling it once *n* earlier
+        blocks reached *limit*; the escalation deletes the row, so the next Stop starts a
+        fresh run of blocks. The read and the increment run inside ONE ``BEGIN IMMEDIATE``,
+        so two parallel Stop hooks serialize and never lose a count. ``emit`` (which prints
+        the block decision) runs BEFORE the commit: a process killed between the two has
+        shown its block but not counted it — the counter under-counts, it never swallows a
+        block. Any exception rolls the increment back and is re-raised.
+        """
+        if self.conn.in_transaction:
+            self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT blocks FROM staff_close_guard "
+                "WHERE session_id = ? AND agent = ? AND nonce = ?",
+                (session_id, agent, nonce),
+            ).fetchone()
+            blocks = int(row[0] or 0) if row is not None else 0
+            if blocks >= limit:
+                self.conn.execute(
+                    "DELETE FROM staff_close_guard "
+                    "WHERE session_id = ? AND agent = ? AND nonce = ?",
+                    (session_id, agent, nonce),
+                )
+                decision = "escalated"
+                count = blocks
+            else:
+                count = blocks + 1
+                self.conn.execute(
+                    "INSERT INTO staff_close_guard "
+                    "(session_id, agent, nonce, blocks, updated_at) VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(session_id, agent, nonce) DO UPDATE SET "
+                    "blocks = excluded.blocks, updated_at = excluded.updated_at",
+                    (session_id, agent, nonce, count, now_ms()),
+                )
+                emit(count)
+                decision = "block"
+        except BaseException:
+            self.conn.rollback()
+            raise
+        self.conn.commit()
+        return decision, count
+
+    def staff_guard_reset(self, session_id: str, agent: str, nonce: str) -> None:
+        """Forget the consecutive-block count of marker *nonce* (a pass that is no escalation)."""
+        self.conn.execute(
+            "DELETE FROM staff_close_guard WHERE session_id = ? AND agent = ? AND nonce = ?",
+            (session_id, agent, nonce),
+        )
+        self.conn.commit()
+
+    def staff_guard_blocks(self, session_id: str, agent: str, nonce: str) -> int:
+        """The current consecutive-block count of marker *nonce* (0 = none recorded)."""
+        row = self.conn.execute(
+            "SELECT blocks FROM staff_close_guard WHERE session_id = ? AND agent = ? AND nonce = ?",
+            (session_id, agent, nonce),
+        ).fetchone()
+        return int(row[0] or 0) if row is not None else 0
 
     def add_waiter(self, session_id: str, file_path: str, now: int) -> None:
         """Record that *session_id* is waiting to edit *file_path* (idempotent)."""

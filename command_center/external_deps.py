@@ -108,6 +108,21 @@ EXTERNAL_DEPS: dict[str, Dep] = {
             "set SLACK_API_BIN to its path. Needed only by `ccc await -S`."
         ),
     ),
+    # The llm-staff CLI. The release-locks Stop hook asks it ONE read-only question, and
+    # only when a released-lease marker exists for a guarded agent: `staff lease -s -j -a
+    # <agent> -o <session>` (is that lease held by this session again?). Resolved with
+    # `resolve`, never `require`: no `-h` probe on the hook path, and a missing `staff`
+    # simply means "re-hold not proven" (staff_close_guard.py).
+    "staff": Dep(
+        name="staff",
+        command="staff",
+        env="STAFF_BIN",
+        install_hint=(
+            "Put the llm-staff CLI `staff` on $PATH, or set STAFF_BIN to its absolute path. "
+            "Needed only by the staff close guard of the release-locks Stop hook, and only "
+            "after `staff lease -r` left a released-lease marker for a guarded agent."
+        ),
+    ),
 }
 
 
