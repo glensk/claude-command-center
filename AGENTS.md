@@ -471,6 +471,13 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
   itself there), `transcript_cache.TranscriptCache`. Plist + install in `launchd.py`
   (`panel_server_*`), doctor row `_panel_server_check`, daemon self-heal
   `_restart_stale_panel_server`.
+- **Codex run log** — `codex_runlog.py`: one directory per physical `codex exec` attempt
+  (argv, seat, exit, cause, events, stderr, reply), opened in `_run_with_fallback` and
+  closed on every exit path (ok, task failure, refusal, kill, missing binary); listed by
+  `codex-in-claude runlog`. A failure's `error.cause` comes from `failure_cause` and its kind
+  from `classify_task_failure` (only for failures `classify_codex_failure` does NOT pin on
+  the seat); `_KIND_EXIT` is the ONE kind → exit-code table for `run` and `delegate`. Never
+  let the run log raise into the runner — every entrance swallows its own errors.
 - **Packaging** — the wheel ships three console entry points (`ccc`, `codex-in-claude`,
   `claude-session-continue`) and the `command_center/assets/` package data. Every one of
   those `main()`s runs behind `brokenpipe.guard` so a reader that closes our stdout

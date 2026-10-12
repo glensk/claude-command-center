@@ -118,6 +118,7 @@ _OPTIONAL: dict[str, type | tuple[type, ...]] = {
     "session": str,
     "error": str,
     "error_message": str,
+    "run_dir": str,
 }
 
 # sdsc's real checker began attaching a ticket note on this commit timestamp. After
@@ -208,6 +209,9 @@ def attempt_records(
             row["note"] = clean_note
         if clean_caller:
             row["caller"] = clean_caller
+        if getattr(attempt, "run_dir", ""):
+            # The attempt's run-log directory (`codex-in-claude runlog`), when one exists.
+            row["run_dir"] = attempt.run_dir
         if attempt.tokens_in or attempt.tokens_out:
             row["tokens_in"] = attempt.tokens_in
             row["tokens_out"] = attempt.tokens_out

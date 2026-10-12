@@ -1,0 +1,7 @@
+// SHAPE of the 2026-10-12 debate failure (the runner heartbeat kept its last line): the
+// turn ran for minutes, then the server failed it. rc 1, EMPTY stderr — the cause lives
+// only in this event, which the runner used to drop ("Codex exited 1:" and nothing else).
+{"type":"thread.started","thread_id":"01a06cfb-0000-7000-8000-00000000cafe"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"reading the plan"}}
+{"type":"turn.failed","error":{"message":"Selected model is at capacity. Please try a different model."}}

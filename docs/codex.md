@@ -459,12 +459,22 @@ then `seat:` then the reply; `-j` prints ONE JSON object:
  "reply": "…", "error": null, "session_id": "…"}
 ```
 
-Exit codes match `delegate`: 0 ok, 2 usage, 3 unknown model, 4 no codex, 5 timeout/stall,
-6 codex failed / refused mid-run, 8 no eligible seat (or `-n` budget spent), 9 network
-dead / machine slept (killed after codex stopped making progress). On failure `error` is
-`{"kind", "message", "earliest_reset"}` with `kind` one of `disabled`,
-`all_seats_unavailable`, `attempts_exhausted`, `codex_failed`, `timeout`, `stalled`,
-`network`, `slept`, `startup_timeout`, `seat_refused_midrun`, `no_codex`.
+Exit codes match `delegate`: 0 ok, 2 usage, 3 unknown model (also `model_unavailable`:
+the server does not serve the slug to this seat), 4 no codex, 5 timeout/stall, 6 codex
+failed / refused mid-run, 8 no eligible seat (or `-n` budget spent), 9 network dead /
+machine slept (killed after codex stopped making progress), 10 `model_capacity` (the
+server says the model is at capacity / overloaded — transient, retry later), 11
+`codex_usage` (codex rejected its own argv or config), 12 `codex_crashed` (a signal or a
+panic). `run --help` prints the same table. On failure `error` is `{"kind", "message",
+"earliest_reset", "cause", "run_dir"}` with `kind` one of `disabled`,
+`all_seats_unavailable`, `attempts_exhausted`, `codex_failed`, `model_capacity`,
+`model_unavailable`, `codex_usage`, `codex_crashed`, `timeout`, `stalled`, `network`,
+`slept`, `startup_timeout`, `seat_refused_midrun`, `no_codex`. `cause` is ONE scrubbed
+line (at most 400 chars) saying why the last attempt failed — the server's `turn.failed`
+message, else its last `error` event, else the last stderr lines, else what the exit
+status says; never empty once codex ran. `message` is single-line too. Every attempt in
+`attempts` and the envelope itself carry `run_dir`, the attempt's run-log directory
+(below; `null` when the run log is off).
 
 `delegate` prints the same `seat: <label> (<email>)` line as its SECOND stdout line
 (`[fallback]` appended on a hop), right after the guaranteed `model:` line.
@@ -491,6 +501,40 @@ cost of one round once ten debate samples exist, else 10 %; `-F 0` disables it).
 also never promote a probe — an unmeasured seat is a read-only experiment. A `--resume`
 binds to exactly one seat, so it gets NO floor and no headroom filter: there is no second
 seat to move to, and the documented trade-off is a possible `SEAT-REFUSED-MIDRUN` review.
+
+### The run log — one directory per attempt (`codex-in-claude runlog`)
+
+The ledger says what ran; the run log says WHY it ended the way it did. On 2026-10-12 a
+debate round died after four minutes with `ERROR: Codex codex_failed: Codex exited 1:` and
+nothing after the colon: `codex exec --json` reports its failures as events on STDOUT
+(`turn.failed: Selected model is at capacity`), stderr was empty, the runner quoted only
+stderr, and the `--ephemeral` run left no rollout. Since then every physical attempt
+writes `<app_home>/codex-runlog/<YYYYmmddTHHMMSS>-<purpose>[-<note>]-<session8>-<attempt8>/`
+(`$CODEX_IN_CLAUDE_RUNLOG_DIR` overrides the root; `codex_runlog.py`):
+
+| File           | Content                                                                                                  |
+| :------------- | :------------------------------------------------------------------------------------------------------- |
+| `run.json`     | argv, seat + `CODEX_HOME`, model, effort, cwd, session, `-N` note, start/end/duration, exit, outcome, kind, cause, `thread_id`, Codex's own session file (non-ephemeral runs) |
+| `prompt.txt`   | the prompt codex got on stdin                                                                            |
+| `events.jsonl` | codex's `--json` event stream                                                                            |
+| `stderr.log`   | codex's stderr                                                                                           |
+| `reply.txt`    | the `-o` reply, when there is one                                                                        |
+
+`run.json` is written when the attempt starts (`status: running`) and rewritten when it
+ends. Everything passes a token scrubber (API keys, bearer tokens, JWTs, GitHub/GitLab/
+Slack tokens → `[redacted]`); directories are 0700, files 0600. Retention runs on every
+new record: newest 200, at most 14 days, at most 500 MB (`$CODEX_IN_CLAUDE_RUNLOG_KEEP` /
+`_DAYS` / `_MAX_MB`, `0` disables a rule); `$CODEX_IN_CLAUDE_RUNLOG=0` turns it off. The
+ledger line, the `-j` envelope and the text-mode `run log:` stderr line all name the
+directory. Best-effort: an unwritable run log never fails the call.
+
+```commands
+codex-in-claude runlog                    # newest 20 (-n N), failures with their cause
+codex-in-claude runlog -f                 # failures only
+codex-in-claude runlog -s last-failed     # one run: facts, cause, stderr/event tails (-T N)
+codex-in-claude runlog -s 05a7cfc4 -j     # by dir-name or attempt-id prefix, as JSON
+codex-in-claude runlog -p | -P            # print the root | prune now
+```
 
 ### The run ledger — `codex-runs.jsonl`
 

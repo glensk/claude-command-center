@@ -50,6 +50,10 @@ Scenarios (see ``tests/test_codex_runner.py``):
                                   never got a model response (the startup guard's case)
 ``trouble_then_ok``               three reconnect error events and THEN a real reply — a
                                   flap the progress watchdog must NOT kill
+``model_capacity``                the 2026-10-12 debate failure: a ``turn.failed`` "Selected
+                                  model is at capacity", rc 1, NOTHING on stderr
+``scripted``                      prints ``stdout`` (list of lines) and ``stderr`` (list of
+                                  lines) from the control record and exits ``rc`` (default 1)
 """
 
 from __future__ import annotations
@@ -248,7 +252,7 @@ def _ignore_first_sigterm() -> None:
     signal.signal(signal.SIGTERM, _handler)
 
 
-def main() -> int:  # pylint: disable=too-many-branches,too-many-return-statements
+def main() -> int:  # pylint: disable=too-many-branches,too-many-return-statements,too-many-statements  # one branch per scenario
     """Behave like ``codex exec`` for the configured scenario; return its exit code."""
     argv = sys.argv[1:]
     stdin_text = "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read()
@@ -301,6 +305,17 @@ def main() -> int:  # pylint: disable=too-many-branches,too-many-return-statemen
         if scenario == "refuse_auth":
             print("codex: not logged in", file=sys.stderr)
         return 1
+
+    if scenario == "model_capacity":
+        _replay("model_capacity")
+        return 1
+
+    if scenario == "scripted":
+        for line in control.get("stdout") or []:
+            print(line)
+        for line in control.get("stderr") or []:
+            print(line, file=sys.stderr)
+        return int(control.get("rc", 1))
 
     if scenario == "server_overloaded":
         _replay("server_overloaded")

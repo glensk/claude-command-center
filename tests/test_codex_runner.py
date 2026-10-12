@@ -573,6 +573,7 @@ def test_run_cli_envelope_schema(
         "seat",
         "attempts",
         "attempt_ids",  # additive (tp#392): the ledger lines this call wrote
+        "run_dir",  # additive: the last physical attempt's run-log directory
         "reply",
         "error",
         "session_id",
@@ -588,7 +589,14 @@ def test_run_cli_envelope_schema(
         "home": str(three_seats.seats["private"]),
         "email": "private@example.org",
     }
-    assert set(envelope["attempts"][0]) == {"seat", "home", "elapsed_s", "outcome", "attempt_id"}
+    assert set(envelope["attempts"][0]) == {
+        "seat",
+        "home",
+        "elapsed_s",
+        "outcome",
+        "attempt_id",
+        "run_dir",
+    }
 
 
 def test_run_cli_text_mode_prints_model_then_seat(

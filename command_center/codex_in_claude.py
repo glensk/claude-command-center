@@ -78,6 +78,13 @@ laptop from idle-sleeping under it (the 2026-09-07 seven-hour hang), codex stder
 streamed through (``codex› `` prefix) for live progress, and the prompt itself tells codex
 its time budget so it spends the clock implementing instead of exploring.
 
+Debuggability: every physical attempt leaves a directory under ``codex-in-claude runlog
+-p`` (:mod:`command_center.codex_runlog`) with the argv, seat, model, exit code, duration,
+codex's event stream, stderr, reply and a pointer to its own session file; a failure's
+message carries a one-line CAUSE (the server's ``turn.failed``/``error`` message, else the
+stderr tail, scrubbed) and is classified (``model_capacity`` / ``model_unavailable`` /
+``codex_usage`` / ``codex_crashed`` / ``codex_failed``) with its own exit code.
+
 Watchability + rounds: every run refreshes a heartbeat JSON under ``_runs_dir()``; ``runs``
 lists all in-flight delegates (elapsed, idle seconds, output volume, last line) from one
 file read each — the cheap way to check on a long run without reading transcripts. Each
@@ -133,7 +140,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
-from . import brokenpipe, codex_launch, codex_ledger
+from . import brokenpipe, codex_launch, codex_ledger, codex_runlog
 
 if TYPE_CHECKING:  # pragma: no cover - runtime import is local: quota imports THIS module
     from . import quota, seat_rota
@@ -311,6 +318,9 @@ EX_OK, EX_USAGE = 0, 2
 EX_INVALID_MODEL, EX_NO_CODEX, EX_TIMEOUT, EX_CODEX_FAIL, EX_BAD_PATCH = 3, 4, 5, 6, 7
 EX_QUOTA = 8  # skipped: Codex quota exhausted (>=100% used on a live window)
 EX_NETWORK = 9  # killed: codex reported a dead network / the machine slept; no progress
+EX_MODEL_CAPACITY = 10  # the server said the model is at capacity / overloaded: retry later
+EX_CODEX_USAGE = 11  # codex rejected its own argv or config (clap usage error, bad config)
+EX_CODEX_CRASH = 12  # codex died on a signal or panicked
 
 
 def _effective_timeout(explicit: int | None, effort: str) -> int:
@@ -3392,6 +3402,57 @@ def _concurrency_slot(ceiling: int, poll: float = 3.0) -> Iterator[None]:
             handle.close()
 
 
+RUN_EXIT_CODES_HELP = (
+    "Exit codes (run and delegate):\n"
+    "  0  ok                     2  usage / unknown -S seat\n"
+    "  3  unknown model (also error.kind model_unavailable: the server does not serve it)\n"
+    "  4  codex not installed    5  wall timeout / stall / no first model response\n"
+    "  6  codex_failed (any other task failure) / seat_refused_midrun\n"
+    "  7  bad patch (delegate)   8  no eligible seat / -n budget spent / disabled\n"
+    "  9  network dead / the machine slept\n"
+    "  10 model_capacity: the model is at capacity / overloaded server-side (retry later)\n"
+    "  11 codex_usage: codex rejected its argv or its config\n"
+    "  12 codex_crashed: codex died on a signal or panicked\n"
+    "Every failure's error.cause is one scrubbed line (the server's error event, else the\n"
+    "stderr tail); every physical attempt leaves a run log: `codex-in-claude runlog`."
+)
+
+
+def cmd_runlog(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements  # one per mode
+    """``runlog`` — list or show the per-attempt run-log directories (:mod:`codex_runlog`)."""
+    root = codex_runlog.runlog_root()
+    if args.path:
+        print(local_link(root) if sys.stdout.isatty() else str(root))
+        return EX_OK
+    if args.prune:
+        removed = codex_runlog.prune(root)
+        print(f"✅ pruned {len(removed)} run log(s) under {local_link(root)}")
+        return EX_OK
+    if args.show:
+        target = codex_runlog.resolve(args.show, root)
+        if target is None:
+            print(
+                f"❌ no single run log matches {args.show!r} under {root} "
+                "(use `runlog` to list them, or `last` / `last-failed`)",
+                file=sys.stderr,
+            )
+            return EX_USAGE
+        if args.json:
+            print(json.dumps(codex_runlog.read_record(target) or {}, indent=1))
+        else:
+            print("\n".join(codex_runlog.render_show(target, tail=max(1, args.tail))))
+        return EX_OK
+    rows = codex_runlog.list_runs(root, limit=max(0, args.limit), failed_only=args.failed)
+    if args.json:
+        print(json.dumps(rows))
+        return EX_OK
+    if not rows:
+        print(f"no run logs under {root}.")
+        return EX_OK
+    print("\n".join(codex_runlog.render_list(rows)))
+    return EX_OK
+
+
 def cmd_runs(args: argparse.Namespace) -> int:
     """List in-flight delegate runs from their heartbeat files (one cheap read each).
 
@@ -4290,6 +4351,146 @@ def classify_codex_failure(returncode: int, events: list[dict], stderr: str) -> 
     return CodexFailure(kind, phrase, None)
 
 
+# --------------------------------------------------------------------------- #
+# Task-failure cause + kind (a failure the SEAT is not to blame for)
+#
+# `classify_codex_failure` answers "is the seat at fault?" (hop or not). Everything it
+# returns "" for used to be reported as `codex_failed` with the stderr tail as the only
+# detail — and `codex exec --json` reports its own failures as EVENTS on stdout, so the
+# 2026-10-12 debate round that died on "Selected model is at capacity" read
+# `Codex exited 1:` with nothing after the colon. The two functions below give such a
+# failure its cause (one scrubbed line, never empty) and a kind a caller can act on.
+# Classification reads the same inputs as the seat classifier: failure EVENTS first,
+# else the stderr tail — never item text, never the prompt.
+# --------------------------------------------------------------------------- #
+_TASK_FAILURE_PHRASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "model_capacity",
+        (
+            "at capacity",
+            "server_overloaded",
+            "overloaded",
+            "service unavailable",
+            "temporarily unavailable",
+            "server is busy",
+        ),
+    ),
+    (
+        "model_unavailable",
+        (
+            "model_not_found",
+            "model is not supported",
+            "model is not available",
+            "unknown model",
+            "invalid model",
+            "does not exist or you do not have access",
+        ),
+    ),
+)
+# clap's usage errors and codex's config loader: codex refused to START, so the argv or
+# a config.toml is wrong — read from stderr only (these never arrive as events).
+_CODEX_USAGE_RE = re.compile(
+    r"^error: (?:unexpected argument|invalid value|unrecognized subcommand|the argument)"
+    r"|^Usage: codex|error loading config|invalid configuration|failed to parse config",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PANIC_RE = re.compile(r"panicked at|thread '[^']*' panicked", re.IGNORECASE)
+# Stderr lines that never explain a failure: codex's stdin banner.
+_STDERR_NOISE = ("Reading additional input from stdin",)
+
+
+def _signal_label(returncode: int) -> str:
+    """``SIGKILL`` for -9; ``signal N`` when the platform has no name for it."""
+    try:
+        return signal.Signals(-returncode).name
+    except ValueError:
+        return f"signal {-returncode}"
+
+
+def failure_cause(returncode: int, events: list[dict], stderr: str, stdout: str = "") -> str:
+    """WHY one finished ``codex exec`` failed, as ONE scrubbed, bounded line — never empty.
+
+    Evidence, most specific first: the last ``turn.failed`` event's message, else the
+    last ``error`` event's (codex's own retries — "Reconnecting… 2/5" — are ``error``
+    events too, so ``turn.failed`` wins when both exist); then the last three meaningful
+    stderr lines; then the last non-JSON stdout line; then what the exit status alone
+    says. Token-shaped strings are redacted (:func:`codex_runlog.scrub`).
+    """
+    failures = _failure_events(events)
+    for wanted in ("turn.failed", "error"):
+        for event in reversed(failures):
+            if event.get("type") == wanted:
+                message = _event_message(event)
+                if message.strip():
+                    return codex_runlog.one_line(message)
+    kept = [
+        line.strip()
+        for line in (stderr or "").splitlines()
+        if line.strip() and not any(noise in line for noise in _STDERR_NOISE)
+    ]
+    if kept:
+        return codex_runlog.one_line(" | ".join(kept[-3:]))
+    loose = [ln.strip() for ln in (stdout or "").splitlines() if ln.strip() and ln[:1] != "{"]
+    if loose:
+        return codex_runlog.one_line(loose[-1])
+    if returncode < 0:
+        return f"codex was killed by {_signal_label(returncode)} (no error event, no stderr)"
+    last = str(events[-1].get("type") or "?") if events else "none"
+    return (
+        f"no error event and no stderr (exit {returncode}; {len(events)} event(s), "
+        f"last: {last}) — see the run log"
+    )
+
+
+def classify_task_failure(returncode: int, events: list[dict], stderr: str) -> tuple[str, str]:
+    """``(kind, evidence)`` for a failure :func:`classify_codex_failure` did not pin on the seat.
+
+    ``model_capacity`` (the server is overloaded — transient, retry later),
+    ``model_unavailable`` (the model slug is unknown or not served to this account),
+    ``codex_usage`` (codex rejected its argv or config), ``codex_crashed`` (a signal or a
+    panic), else ``codex_failed``. Events decide first; stderr only when no failure
+    event names a known phrase.
+    """
+    texts = [_event_message(e) for e in reversed(_failure_events(events))]
+    texts.append("\n".join((stderr or "").splitlines()[-_STDERR_CLASSIFY_LINES:]))
+    for text in texts:
+        lowered = (text or "").lower()
+        for kind, phrases in _TASK_FAILURE_PHRASES:
+            for phrase in phrases:
+                if phrase in lowered:
+                    return kind, phrase
+    match = _CODEX_USAGE_RE.search(stderr or "")
+    if match:
+        return "codex_usage", match.group(0)
+    if returncode < 0:
+        return "codex_crashed", _signal_label(returncode)
+    match = _PANIC_RE.search(stderr or "")
+    if match:
+        return "codex_crashed", match.group(0)
+    return "codex_failed", ""
+
+
+_TASK_FAILURE_HEADLINES = {
+    "model_capacity": (
+        "the model is at capacity / overloaded on the server side (transient — retry in a "
+        "few minutes, or use another model)"
+    ),
+    "model_unavailable": "the model is unknown or not available to this seat",
+    "codex_usage": "codex rejected its arguments or its config",
+    "codex_crashed": "codex crashed",
+}
+
+
+def task_failure_message(kind: str, returncode: int, cause: str, model: str = "") -> str:
+    """The one-line ``error.message`` of a task failure: what happened, then the cause."""
+    headline = _TASK_FAILURE_HEADLINES.get(kind)
+    if headline is None:
+        return f"Codex exited {returncode}: {cause}"
+    if kind == "model_unavailable" and model:
+        headline = f"the model {model} is unknown or not available to this seat"
+    return f"Codex exited {returncode} — {headline}: {cause}"
+
+
 def _quota_deadline(home: Path, now: int) -> int:
     """When a quota-refused seat comes back: its exhausted window's reset, else +1 h.
 
@@ -4388,6 +4589,9 @@ class RunAttempt:  # pylint: disable=too-many-instance-attributes  # flat attemp
     # ``attempt_id`` and the ``run -j`` envelope's, so a caller that records its own row
     # (ai.py's ``attempt_ids``) can reference exactly the lines this attempt wrote.
     attempt_id: str = field(default_factory=codex_ledger.new_attempt_id)
+    # The attempt's run-log directory (:mod:`codex_runlog`); "" for a skip or when the
+    # run log is off / could not be written.
+    run_dir: str = ""
 
 
 @dataclass
@@ -4399,15 +4603,27 @@ class RunResult:  # pylint: disable=too-many-instance-attributes  # flat result 
     seat: SeatCandidate | None = None
     attempts: list[RunAttempt] = field(default_factory=list)
     # "" | disabled | all_seats_unavailable | attempts_exhausted | codex_failed |
+    # model_capacity | model_unavailable | codex_usage | codex_crashed |
     # timeout | stalled | network | slept | startup_timeout | seat_refused_midrun | no_codex
     # | seat_unknown / seat_unavailable / seat_refused (``run -S``: the one confined seat
     # is not registered / was not eligible / refused — never a hop to another seat)
     error_kind: str = ""
     error_message: str = ""
+    # One scrubbed line saying WHY the last physical attempt failed (:func:`failure_cause`);
+    # "" when no attempt ran or it succeeded.
+    error_cause: str = ""
     earliest_reset: int | None = None
     proc: subprocess.CompletedProcess[str] | None = None
     session_id: str = ""
     changed_paths: list[str] = field(default_factory=list)
+
+    @property
+    def run_dir(self) -> str:
+        """The run-log directory of the LAST physical attempt ("" when none)."""
+        for attempt in reversed(self.attempts):
+            if attempt.run_dir:
+                return attempt.run_dir
+        return ""
 
 
 # Item types that prove codex only TALKED. Anything else in an `item.completed`
@@ -4530,6 +4746,7 @@ def _attempt_codex(  # pylint: disable=too-many-locals
     total_timeout: int = 0,
     started: float | None = None,
     exec_done: list[float] | None = None,
+    runlog: codex_runlog.RunLog | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], str, list[str] | None]:
     """ONE supervised ``codex exec`` on *cand*: ``(proc, reply, worktree before)``.
 
@@ -4554,6 +4771,8 @@ def _attempt_codex(  # pylint: disable=too-many-locals
     handle, out_path = tempfile.mkstemp(prefix="ccc-codex-", suffix=".txt")
     os.close(handle)
     cmd = build_cmd(cand, out_path, perm_args, mcp_args)
+    if runlog is not None:
+        runlog.started(cmd, prompt)
     env = codex_exec_env(home=cand.home)
     env["CCC_NO_CODEX"] = "1"  # never let a nested run re-trigger the codex automation
     env["CCC_INTERNAL"] = "1"
@@ -4837,7 +5056,7 @@ def run_with_fallback(**kwargs: Any) -> RunResult:
     # TypeError mid-run.
     note = str(kwargs.pop("note", "") or "")
     caller = str(kwargs.pop("caller", "") or "")
-    result = _run_with_fallback(**kwargs)
+    result = _run_with_fallback(**kwargs, log_context={"note": note, "caller": caller})
     workdir = kwargs.get("workdir", "")
     codex_ledger.record_result(
         result,
@@ -4902,6 +5121,48 @@ def _seat_result(result: RunResult, seat: str) -> RunResult:
     return result
 
 
+@dataclass
+class _AttemptDone:  # pylint: disable=too-many-instance-attributes  # one finished exec
+    """One FINISHED ``codex exec`` (rc known): writes its run log, builds its RunAttempt."""
+
+    cand: SeatCandidate
+    proc: subprocess.CompletedProcess[str]
+    reply: str
+    elapsed: float
+    tokens: tuple[int, int]
+    thread_id: str
+    attempt_id: str
+    runlog: codex_runlog.RunLog
+
+    def finish(
+        self, outcome: str, kind: str = "", cause: str = "", message: str = ""
+    ) -> RunAttempt:
+        """Close the run log with *outcome* and return the matching :class:`RunAttempt`."""
+        self.runlog.finish(
+            outcome=outcome,
+            returncode=self.proc.returncode,
+            stdout=self.proc.stdout or "",
+            stderr=self.proc.stderr or "",
+            reply=self.reply,
+            error_kind=kind,
+            cause=cause,
+            message=message,
+            thread_id=self.thread_id,
+            tokens=self.tokens,
+            elapsed_s=self.elapsed,
+        )
+        return RunAttempt(
+            self.cand.label,
+            str(self.cand.home),
+            self.elapsed,
+            outcome,
+            self.tokens[0],
+            self.tokens[1],
+            attempt_id=self.attempt_id,
+            run_dir=self.runlog.dir,
+        )
+
+
 def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements,too-many-locals,too-many-return-statements
     *,
     prompt: str,
@@ -4922,8 +5183,12 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
     headroom: bool = False,
     min_remaining_pct: float = 0.0,
     seat: str = "",
+    log_context: dict[str, str] | None = None,
 ) -> RunResult:
     """The seat-hopping round behind :func:`run_with_fallback` (which adds the ledger).
+
+    *log_context* (``note``/``caller``) only labels each attempt's run-log directory
+    (:mod:`codex_runlog`); it never changes what runs.
 
     ``delegate`` and ``run`` both come through
     here, so "which seat, in which order, and what happens when it says no" has one
@@ -5052,6 +5317,20 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
             # A claimed probe already wrote its attempt record — the claim IS the record.
             _record_attempt(cand)
         physical += 1
+        attempt_id = codex_ledger.new_attempt_id()
+        runlog = codex_runlog.RunLog.begin(
+            attempt_id=attempt_id,
+            purpose=purpose,
+            note=str((log_context or {}).get("note") or ""),
+            caller=str((log_context or {}).get("caller") or ""),
+            seat=cand.label,
+            seat_id=cand.pid,
+            home=cand.home,
+            model=model,
+            effort=effort,
+            cwd=os.fspath(workdir) if workdir else "",
+            write=write,
+        )
         attempt_started = time.monotonic()
         exec_done: list[float] = []
         try:
@@ -5071,18 +5350,31 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
                 total_timeout=total_timeout,
                 started=started,
                 exec_done=exec_done,
+                runlog=runlog,
             )
         except FileNotFoundError:
+            elapsed = _attempt_elapsed(attempt_started, exec_done)
+            result.error_kind = "no_codex"
+            result.error_message = "`codex` CLI not found on PATH."
+            result.error_cause = result.error_message
+            runlog.finish(
+                outcome="failed",
+                returncode=None,
+                error_kind=result.error_kind,
+                cause=result.error_cause,
+                message=result.error_message,
+                elapsed_s=elapsed,
+            )
             result.attempts.append(
                 RunAttempt(
                     cand.label,
                     str(cand.home),
-                    _attempt_elapsed(attempt_started, exec_done),
+                    elapsed,
                     "failed",
+                    attempt_id=attempt_id,
+                    run_dir=runlog.dir,
                 )
             )
-            result.error_kind = "no_codex"
-            result.error_message = "`codex` CLI not found on PATH."
             return result
         except subprocess.TimeoutExpired as exc:
             return _killed_result(
@@ -5092,6 +5384,8 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
                 _attempt_elapsed(attempt_started, exec_done),
                 kind="timeout",
                 budget=total_timeout,
+                attempt_id=attempt_id,
+                runlog=runlog,
             )
         except CodexStalledError as exc:
             return _killed_result(
@@ -5100,6 +5394,8 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
                 exc,
                 _attempt_elapsed(attempt_started, exec_done),
                 kind=_STALL_KINDS.get(exc.reason, "stalled"),
+                attempt_id=attempt_id,
+                runlog=runlog,
             )
         elapsed = _attempt_elapsed(attempt_started, exec_done)
         events = parse_json_events(proc.stdout or "")
@@ -5108,14 +5404,23 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
         result.session_id = _thread_id_of(events) or (_session_id_of(proc.stderr or "") or "")
         tokens_in, tokens_out = _turn_usage(events)
 
+        done = _AttemptDone(
+            cand=cand,
+            proc=proc,
+            reply=reply,
+            elapsed=elapsed,
+            tokens=(tokens_in, tokens_out),
+            thread_id=result.session_id,
+            attempt_id=attempt_id,
+            runlog=runlog,
+        )
+
         if not failure.kind and proc.returncode == 0:
             record_seat_success(cand)
             result.ok = True
             result.reply = reply or _agent_message_of(events)
             result.seat = cand
-            result.attempts.append(
-                RunAttempt(cand.label, str(cand.home), elapsed, "ok", tokens_in, tokens_out)
-            )
+            result.attempts.append(done.finish("ok"))
             if persistent and result.session_id:
                 codex_launch.record_launch(
                     result.session_id, workdir, write=write, codex_home=cand.home
@@ -5124,27 +5429,24 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
                 result.changed_paths = _changed_paths(before, _git_status(workdir))
             return result
 
+        cause = failure_cause(proc.returncode, events, proc.stderr or "", proc.stdout or "")
+        result.error_cause = cause
         if not failure.kind:
             # Non-zero exit the seat is not to blame for: report it, keep the seat.
-            result.attempts.append(
-                RunAttempt(cand.label, str(cand.home), elapsed, "failed", tokens_in, tokens_out)
-            )
+            kind, _evidence = classify_task_failure(proc.returncode, events, proc.stderr or "")
             result.seat, result.reply = cand, reply
-            result.error_kind = "codex_failed"
-            result.error_message = (
-                f"Codex exited {proc.returncode}:\n{_stderr_tail(proc.stderr or '', 20)}"
-            )
+            result.error_kind = kind
+            result.error_message = task_failure_message(kind, proc.returncode, cause, model)
+            result.attempts.append(done.finish("failed", kind, cause, result.error_message))
             return result
 
         record_seat_refusal(cand, failure)
         result.attempts.append(
-            RunAttempt(
-                cand.label,
-                str(cand.home),
-                elapsed,
+            done.finish(
                 f"refused:{failure.kind}",
-                tokens_in,
-                tokens_out,
+                failure.kind,
+                cause,
+                f"seat {cand.label} refused ({failure.kind}: {failure.detail})",
             )
         )
         if write:
@@ -5165,7 +5467,7 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
                         if not unknown
                         else "started work and the worktree state is unknown (git status failed)"
                     )
-                    + " — not retried on another seat; review the worktree."
+                    + f" — not retried on another seat; review the worktree. Cause: {cause}"
                 )
                 return result
         nxt = next(
@@ -5242,6 +5544,8 @@ def _killed_result(
     *,
     kind: str,
     budget: int = 0,
+    attempt_id: str = "",
+    runlog: codex_runlog.RunLog | None = None,
 ) -> RunResult:
     """Fill *result* in for a run WE killed (wall timeout or the progress watchdog). Terminal.
 
@@ -5262,17 +5566,37 @@ def _killed_result(
             f"Codex hit the {budget}s wall timeout (whole process tree killed). Retry with a "
             "larger -t (or -t 0), a tighter task, or lower effort."
         )
-    session = _thread_id_of(parse_json_events(stdout_text)) or (_session_id_of(stderr_text) or "")
-    tail = _stderr_tail(stderr_text)
+    events = parse_json_events(stdout_text)
+    session = _thread_id_of(events) or (_session_id_of(stderr_text) or "")
+    tail = codex_runlog.one_line(" | ".join(_stderr_tail(stderr_text).splitlines()))
     result.session_id = session
     result.seat = cand
-    result.attempts.append(RunAttempt(cand.label, str(cand.home), elapsed, kind))
     result.error_kind = kind
     result.error_message = (
         headline
         + (f" Resume its context with --resume {session}." if session else "")
-        + (f" Last output:\n{tail}" if tail else "")
+        + (f" Last output: {tail}" if tail else "")
     )
+    result.error_cause = codex_runlog.one_line(headline)
+    if runlog is not None:
+        runlog.finish(
+            outcome=kind,
+            returncode=None,
+            stdout=stdout_text,
+            stderr=stderr_text,
+            error_kind=kind,
+            cause=result.error_cause,
+            message=result.error_message,
+            thread_id=session,
+            tokens=_turn_usage(events),
+            elapsed_s=elapsed,
+        )
+    attempt = RunAttempt(
+        cand.label, str(cand.home), elapsed, kind, run_dir="" if runlog is None else runlog.dir
+    )
+    if attempt_id:
+        attempt.attempt_id = attempt_id
+    result.attempts.append(attempt)
     return result
 
 
@@ -5290,21 +5614,33 @@ def _run_error_exit(result: RunResult) -> int:
                 f"earliest seat reset: {_format_reset(result.earliest_reset)}",
                 file=sys.stderr,
             )
-        return EX_QUOTA
-    return {
-        "disabled": EX_QUOTA,
-        "seat_unavailable": EX_QUOTA,
-        "seat_refused": EX_QUOTA,
-        "seat_unknown": EX_USAGE,
-        "no_codex": EX_NO_CODEX,
-        "timeout": EX_TIMEOUT,
-        "stalled": EX_TIMEOUT,
-        "startup_timeout": EX_TIMEOUT,
-        "network": EX_NETWORK,
-        "slept": EX_NETWORK,
-        "codex_failed": EX_CODEX_FAIL,
-        "seat_refused_midrun": EX_CODEX_FAIL,
-    }.get(kind, EX_CODEX_FAIL)
+    if result.run_dir:
+        print(f"run log: {local_link(Path(result.run_dir))}", file=sys.stderr)
+    return _run_exit_code(result)
+
+
+# ``error.kind`` → exit code, shared by ``run`` (text and ``-j``) and ``delegate``. A kind
+# not listed is EX_CODEX_FAIL. Documented in ``run --help`` and docs/codex.md.
+_KIND_EXIT = {
+    "all_seats_unavailable": EX_QUOTA,
+    "attempts_exhausted": EX_QUOTA,
+    "disabled": EX_QUOTA,
+    "seat_unavailable": EX_QUOTA,
+    "seat_refused": EX_QUOTA,
+    "seat_unknown": EX_USAGE,
+    "no_codex": EX_NO_CODEX,
+    "timeout": EX_TIMEOUT,
+    "stalled": EX_TIMEOUT,
+    "startup_timeout": EX_TIMEOUT,
+    "network": EX_NETWORK,
+    "slept": EX_NETWORK,
+    "codex_failed": EX_CODEX_FAIL,
+    "seat_refused_midrun": EX_CODEX_FAIL,
+    "model_capacity": EX_MODEL_CAPACITY,
+    "model_unavailable": EX_INVALID_MODEL,
+    "codex_usage": EX_CODEX_USAGE,
+    "codex_crashed": EX_CODEX_CRASH,
+}
 
 
 def _seat_line(cand: SeatCandidate, index: int) -> str:
@@ -5647,9 +5983,13 @@ def _run_cli_report(result: RunResult, args: argparse.Namespace, model: str, eff
                     "outcome": a.outcome,
                     # The ledger line's `attempt_id`; null for a skip (no line, no spend).
                     "attempt_id": None if a.outcome.startswith("skipped:") else a.attempt_id,
+                    # The attempt's run-log directory (`codex-in-claude runlog -s …`).
+                    "run_dir": a.run_dir or None,
                 }
                 for a in result.attempts
             ],
+            # The LAST physical attempt's run-log directory — what to open first.
+            "run_dir": result.run_dir or None,
             # Every ledger line this call wrote, oldest first — what a caller that files
             # its own row records as `attempt_ids`, so `ai logs` can hide exactly these.
             "attempt_ids": [
@@ -5663,6 +6003,9 @@ def _run_cli_report(result: RunResult, args: argparse.Namespace, model: str, eff
                     "kind": result.error_kind,
                     "message": result.error_message,
                     "earliest_reset": result.earliest_reset,
+                    # One scrubbed line: WHY the last attempt failed ("" before any launch).
+                    "cause": result.error_cause,
+                    "run_dir": result.run_dir or None,
                 }
             ),
             "session_id": result.session_id,
@@ -5679,23 +6022,7 @@ def _run_cli_report(result: RunResult, args: argparse.Namespace, model: str, eff
 
 def _run_exit_code(result: RunResult) -> int:
     """The exit code for a failed run, WITHOUT printing anything (the ``-j`` path)."""
-    if result.error_kind in (
-        "all_seats_unavailable",
-        "attempts_exhausted",
-        "disabled",
-        "seat_unavailable",
-        "seat_refused",
-    ):
-        return EX_QUOTA
-    return {
-        "seat_unknown": EX_USAGE,
-        "no_codex": EX_NO_CODEX,
-        "timeout": EX_TIMEOUT,
-        "stalled": EX_TIMEOUT,
-        "startup_timeout": EX_TIMEOUT,
-        "network": EX_NETWORK,
-        "slept": EX_NETWORK,
-    }.get(result.error_kind, EX_CODEX_FAIL)
+    return _KIND_EXIT.get(result.error_kind, EX_CODEX_FAIL)
 
 
 def _git_status(cwd: codex_launch.Workdir | str | None) -> list[str] | None:
@@ -5744,6 +6071,7 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
             "  codex-in-claude policy fill                 # rank by weekly reset, not order\n"
             "  codex-in-claude rota set default -s 2026-09-14 alice bob   # share a seat weekly\n"
             "  codex-in-claude run -j -C . 'reply OK'      # machine entry point (-j envelope)\n"
+            "  codex-in-claude runlog -s last-failed       # why did the last run fail?\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -5985,6 +6313,8 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
             "at run time when one is held/exhausted/refusing, and reports a typed "
             "result. Read-only and ephemeral; -j prints one JSON object."
         ),
+        epilog=RUN_EXIT_CODES_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_run.add_argument(
         "prompt",
@@ -6305,6 +6635,48 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     )
     p_runs.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")
     p_runs.set_defaults(func=cmd_runs)
+
+    p_runlog = sub.add_parser(
+        "runlog",
+        help="list/show the per-attempt run logs (argv, seat, exit, cause, events, stderr)",
+        description=(
+            "Every physical codex attempt leaves a directory (run.json, prompt.txt, "
+            "events.jsonl, stderr.log, reply.txt) under the run-log root "
+            "($CODEX_IN_CLAUDE_RUNLOG_DIR, default <app_home>/codex-runlog). Retention: "
+            f"newest {codex_runlog.DEFAULT_KEEP}, at most {codex_runlog.DEFAULT_DAYS} days, "
+            f"at most {codex_runlog.DEFAULT_MAX_MB} MB ($CODEX_IN_CLAUDE_RUNLOG_KEEP / _DAYS / "
+            "_MAX_MB; 0 disables a rule); $CODEX_IN_CLAUDE_RUNLOG=0 turns run logs off."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  codex-in-claude runlog                 # newest 20, failures with their cause\n"
+            "  codex-in-claude runlog -f -n 5         # the last five failures\n"
+            "  codex-in-claude runlog -s last-failed  # full record + stderr/event tails\n"
+            "  codex-in-claude runlog -s 20261012T1507 -T 50\n"
+            "  codex-in-claude runlog -j              # JSON list of run.json records\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_runlog.add_argument(
+        "-n", "--limit", type=int, default=20, metavar="N", help="list at most N (0 = all)"
+    )
+    p_runlog.add_argument("-f", "--failed", action="store_true", help="list failures only")
+    p_runlog.add_argument(
+        "-s",
+        "--show",
+        default=None,
+        metavar="REF",
+        help="show one run: last, last-failed, a directory (name prefix) or attempt id",
+    )
+    p_runlog.add_argument(
+        "-T", "--tail", type=int, default=20, metavar="N", help="with -s: stderr/event lines"
+    )
+    p_runlog.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")
+    p_runlog.add_argument("-p", "--path", action="store_true", help="print the run-log root")
+    p_runlog.add_argument(
+        "-P", "--prune", action="store_true", help="apply the retention policy now"
+    )
+    p_runlog.set_defaults(func=cmd_runlog)
     return parser
 
 
