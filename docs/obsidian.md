@@ -16,7 +16,7 @@ ccc obsidian-setup [-r VAULT] [--install-plugins] [-n] [-u]
 
 `obsidian-setup` is **content-only and offline by default**. It:
 
-- creates the ccc task folders under your vault (`01-llm-tasks/{future,delete,running,done,sessions}`
+- creates the ccc task folders under your vault (`01-llm/ccc-tasks/{future,delete,running,done,sessions}`
   plus the capture pad `new-prompt.md`) — the exact paths come from your config, not
   hard-coded;
 - renders the dashboards (below) from templates, substituting your folder paths and the
@@ -49,7 +49,7 @@ against a pinned manifest. After it runs, reload Obsidian so the plugins load.
 ## Future-job files
 
 Every future job (draft) is mirrored to one editable markdown file under
-`01-llm-tasks/future/<category>/<repo>/<slug>-<hash>.md`. The file is the source of
+`01-llm/ccc-tasks/future/<category>/<repo>/<slug>-<hash>.md`. The file is the source of
 truth you can edit by hand — the sync reconciles file edits back into ccc (file wins) and
 exports ccc-side changes to the file, atomically and idempotently.
 
@@ -106,11 +106,11 @@ authentication; the spawn chain then upgrades automatically via its Python-API s
 With the mirror flags on, every tracked session becomes a markdown note (export-only —
 ccc owns them, your edits are overwritten):
 
-| Tree                         | Flag              | Contents                                                    |
-| :--------------------------- | :---------------- | :---------------------------------------------------------- |
-| `01-llm-tasks/running/`      | `mirror_running`  | one note per active session (AIM, sub-goals, next step, prompts) |
-| `01-llm-tasks/done/`         | `mirror_done`     | the final snapshot of every finished session                |
-| `01-llm-tasks/sessions/`     | `mirror_sessions` | the **whole conversation** rendered terminal-like, per session |
+| Tree                         | Flag              | Contents                                                         |
+| :--------------------------- | :---------------- | :--------------------------------------------------------------- |
+| `01-llm/ccc-tasks/running/`  | `mirror_running`  | one note per active session (AIM, sub-goals, next step, prompts) |
+| `01-llm/ccc-tasks/done/`     | `mirror_done`     | the final snapshot of every finished session                     |
+| `01-llm/ccc-tasks/sessions/` | `mirror_sessions` | the **whole conversation** rendered terminal-like, per session   |
 
 The mirrors are byte-stable (rewritten only on a real change) and slugged from the
 session's *first* AIM so filenames never churn when the AIM is sharpened. Each
@@ -140,14 +140,14 @@ the job file.
 Three dataviewjs dashboards sit one level above the mirror trees (so they never mirror
 themselves):
 
-- **`01-llm-tasks/future.md`** — editable: native dropdowns write frontmatter, ▶ launches
+- **`01-llm/ccc-tasks/future.md`** — editable: native dropdowns write frontmatter, ▶ launches
   a job via `ccc open-job`.
-- **`01-llm-tasks/running.md`** — read-only over the running tree; ⤢ focuses a live tab via
+- **`01-llm/ccc-tasks/running.md`** — read-only over the running tree; ⤢ focuses a live tab via
   `ccc focus-job`.
-- **`01-llm-tasks/parked.md`** — the running tree filtered to closed-but-unfinished (`☾`)
+- **`01-llm/ccc-tasks/parked.md`** — the running tree filtered to closed-but-unfinished (`☾`)
   sessions; ▶ resumes one in a new tab via `ccc resume-job`.
 
-The trash has its own `01-llm-tasks/delete/delete.md` with an ↩ restore column.
+The trash has its own `01-llm/ccc-tasks/delete/delete.md` with an ↩ restore column.
 
 ## Troubleshooting
 

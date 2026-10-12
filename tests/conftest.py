@@ -366,7 +366,7 @@ def _isolate_vault_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     """Keep every test off the real Obsidian vault.
 
     The future-job files and the running/done mirrors default to real paths under
-    ``~/obsidian/01-llm-tasks/``. A test that reaches ``config.load_config()``
+    ``~/obsidian/01-llm/ccc-tasks/``. A test that reaches ``config.load_config()``
     indirectly (e.g. ``daemon.run_once``, CLI handlers) would otherwise export
     its fixture sessions into the developer's actual vault — which happened once:
     daemon tests isolated the store via ``CLAUDE_HOME`` but ``run_once``'s
@@ -391,12 +391,12 @@ def _isolate_vault_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
         cfg = real_load()
         vault = tmp_path / "vault"
         cfg.vault_root = str(vault)
-        cfg.future_dir = str(vault / "01-llm-tasks" / "future")
-        cfg.delete_dir = str(vault / "01-llm-tasks" / "delete")
-        cfg.future_pad = str(vault / "01-llm-tasks" / "new-prompt.md")
-        cfg.running_dir = str(vault / "01-llm-tasks" / "running")
-        cfg.done_dir = str(vault / "01-llm-tasks" / "done")
-        cfg.sessions_dir = str(vault / "01-llm-tasks" / "sessions")
+        cfg.future_dir = str(vault / "01-llm" / "ccc-tasks" / "future")
+        cfg.delete_dir = str(vault / "01-llm" / "ccc-tasks" / "delete")
+        cfg.future_pad = str(vault / "01-llm" / "ccc-tasks" / "new-prompt.md")
+        cfg.running_dir = str(vault / "01-llm" / "ccc-tasks" / "running")
+        cfg.done_dir = str(vault / "01-llm" / "ccc-tasks" / "done")
+        cfg.sessions_dir = str(vault / "01-llm" / "ccc-tasks" / "sessions")
         cfg.repo_root = ""  # let each test's $GIT_BASE monkeypatch govern the repo tree
         return cfg
 

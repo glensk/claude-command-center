@@ -123,7 +123,7 @@ def test_yes_with_vault_enables_vault_features(
     for key in wizard.GROUP_B_VAULT:
         assert data[key] is True
     assert data["vault_root"] == str(vault)
-    assert data["future_dir"] == f"{vault}/01-llm-tasks/future"
+    assert data["future_dir"] == f"{vault}/01-llm/ccc-tasks/future"
     assert _stub_installers.get("obsidian")
 
 

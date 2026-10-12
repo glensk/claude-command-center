@@ -47,11 +47,11 @@ def test_default_run_creates_folders_and_pad(vault: Path) -> None:
 # ------------------------------ dashboards ------------------------------ #
 def test_dashboards_render_from_config_paths(vault: Path) -> None:
     obsidian.run_setup()
-    future_md = vault / "01-llm-tasks" / "future.md"
+    future_md = vault / "01-llm" / "ccc-tasks" / "future.md"
     assert future_md.is_file()
     text = future_md.read_text(encoding="utf-8")
     # Folder query + binary come from config, not hardcoded/personal values.
-    assert 'const FOLDER = "01-llm-tasks/future"' in text
+    assert 'const FOLDER = "01-llm/ccc-tasks/future"' in text
     assert '"/opt/ccc"' in text
     assert "{{CCC_BIN}}" not in text and "{{FUTURE_FOLDER}}" not in text
     assert obsidian.has_marker(text)
@@ -85,7 +85,7 @@ def test_dashboard_folder_token_follows_custom_config(
 
 
 def test_marker_guarded_overwrite(vault: Path) -> None:
-    dest = vault / "01-llm-tasks" / "future.md"
+    dest = vault / "01-llm" / "ccc-tasks" / "future.md"
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text("# my own note, no marker\n", encoding="utf-8")
     obsidian.run_setup()
@@ -95,11 +95,11 @@ def test_marker_guarded_overwrite(vault: Path) -> None:
 
 def test_rerun_dashboard_is_idempotent(vault: Path) -> None:
     obsidian.run_setup()
-    dest = vault / "01-llm-tasks" / "future.md"
+    dest = vault / "01-llm" / "ccc-tasks" / "future.md"
     before = dest.stat().st_mtime_ns
     obsidian.run_setup()
     assert dest.stat().st_mtime_ns == before
-    assert not list((vault / "01-llm-tasks").glob("future.md.ccc-backup-*"))
+    assert not list((vault / "01-llm" / "ccc-tasks").glob("future.md.ccc-backup-*"))
 
 
 # ------------------------------ shellcommands ------------------------------ #
@@ -152,17 +152,17 @@ def test_shellcommands_absent_plugin_prints_instructions(
 # ------------------------------ dry-run + uninstall ------------------------------ #
 def test_dry_run_writes_nothing(vault: Path) -> None:
     assert obsidian.run_setup(dry_run=True) == 0
-    assert not (vault / "01-llm-tasks" / "future.md").exists()
-    assert not (vault / "01-llm-tasks" / "future").exists()
+    assert not (vault / "01-llm" / "ccc-tasks" / "future.md").exists()
+    assert not (vault / "01-llm" / "ccc-tasks" / "future").exists()
 
 
 def test_uninstall_removes_only_marked(vault: Path) -> None:
     obsidian.run_setup()
     # An unmarked user file at a dashboard path is not removed.
-    parked = vault / "01-llm-tasks" / "parked.md"
+    parked = vault / "01-llm" / "ccc-tasks" / "parked.md"
     parked.write_text("mine, no marker\n", encoding="utf-8")
     assert obsidian.run_setup(uninstall=True) == 0
-    assert not (vault / "01-llm-tasks" / "future.md").exists()
+    assert not (vault / "01-llm" / "ccc-tasks" / "future.md").exists()
     assert parked.exists()
 
 

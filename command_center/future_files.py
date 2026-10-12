@@ -2,7 +2,7 @@
 """The single source of truth for the *future-job* markdown file format.
 
 A future job (a ``draft=1`` row in the store) is mirrored as exactly one markdown
-file under ``~/obsidian/01-llm-tasks/future/<cat>/<repo>/<slug>-<hash>.md`` — the
+file under ``~/obsidian/01-llm/ccc-tasks/future/<cat>/<repo>/<slug>-<hash>.md`` — the
 human editing surface (see ``PLAN_future-job-files.md``). This module owns the
 file *shape* only: parse, serialize (canonical form), validate, the slug/hash
 derivation, the ``obsidian://`` URI, and the managed ``> [!error]`` callout. The

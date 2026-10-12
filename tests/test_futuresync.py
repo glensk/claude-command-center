@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from futurestub import FutureEnv, future_env
 
 from command_center import config, futuresync
 from command_center.future_files import display_hash, job_filename, parse_job_file, serialize
@@ -21,37 +22,15 @@ from command_center.store import Store
 
 
 @dataclass
-class Env:
+class Env(FutureEnv):
     store: Store
-    cfg: config.Config
-    git_base: Path
-    vault: Path
-    future_dir: Path
-    pad: Path
 
 
 @pytest.fixture
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Env]:
-    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))
-    monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress detached score-aim/short-aim spawns
-    git_base = tmp_path / "git"
-    (git_base / "home" / "ccc").mkdir(parents=True)
-    (git_base / "sdsc" / "zoho").mkdir(parents=True)
-    monkeypatch.setenv("GIT_BASE", str(git_base))
-    vault = tmp_path / "vault"
-    future_dir = vault / "01-llm-tasks" / "future"
-    pad = vault / "01-llm-tasks" / "new-prompt.md"
-    future_dir.mkdir(parents=True)
-    cfg = config.Config(
-        vault_root=str(vault),
-        future_dir=str(future_dir),
-        future_pad=str(pad),
-        future_delete_grace_sec=600,
-        aim_score_on_set=False,
-        short_aim=False,
-    )
+    fe = future_env(tmp_path, monkeypatch)
     store = Store(tmp_path / "claude" / "command-center" / "state.db")
-    yield Env(store, cfg, git_base, vault, future_dir, pad)
+    yield Env(**vars(fe), store=store)
     store.close()
 
 

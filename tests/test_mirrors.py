@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from futurestub import hermetic_ccc
 from scrubstub import DUMMY_VALUE, PLACEHOLDER, Stub, stub_scrubber
 
 from command_center import config, futuresync, mirrors, sessionmd
@@ -39,14 +40,8 @@ class Env:
 
 @pytest.fixture
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Env]:
-    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))
-    monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress any detached ccc spawn
-    git_base = tmp_path / "git"
-    (git_base / "home" / "ccc").mkdir(parents=True)
-    (git_base / "sdsc" / "zoho").mkdir(parents=True)
-    monkeypatch.setenv("GIT_BASE", str(git_base))
-    vault = tmp_path / "vault"
-    tasks = vault / "01-llm-tasks"
+    git_base, vault = hermetic_ccc(tmp_path, monkeypatch)
+    tasks = vault / "01-llm" / "ccc-tasks"
     running = tasks / "running"
     done = tasks / "done"
     future = tasks / "future"
@@ -738,7 +733,7 @@ def test_unlaunch_refuses_when_live(
 
     monkeypatch.setattr("command_center.cli.config.load_config", lambda: env.cfg)
     sid = _running_session(env, "Live one")
-    env.store.update_fields(sid, future_file="01-llm-tasks/future/home/ccc/x.md")
+    env.store.update_fields(sid, future_file="01-llm/ccc-tasks/future/home/ccc/x.md")
     monkeypatch.setattr("command_center.cli._adapter", lambda: _FakeAdapter([sid]))  # live
     assert cmd_unlaunch(argparse.Namespace(session_id=sid)) == 1
     assert "still live" in capsys.readouterr().err
@@ -765,7 +760,7 @@ def test_unlaunch_refuses_when_done(
 
     monkeypatch.setattr("command_center.cli.config.load_config", lambda: env.cfg)
     sid = _running_session(env, "Done one")
-    env.store.update_fields(sid, future_file="01-llm-tasks/future/home/ccc/x.md")
+    env.store.update_fields(sid, future_file="01-llm/ccc-tasks/future/home/ccc/x.md")
     _mark_done(env, sid)
     monkeypatch.setattr("command_center.cli._adapter", lambda: _FakeAdapter([]))
     assert cmd_unlaunch(argparse.Namespace(session_id=sid)) == 1
@@ -1008,7 +1003,7 @@ def test_running_and_done_mirrors_link_full_session(env: Env) -> None:
     sid = _running_session(env, aim)
     _write_transcript(env, str(env.git_base / "home/ccc"), sid, ["hi"])
     mirrors.run_mirrors(env.store, env.cfg)
-    link = f"[[01-llm-tasks/sessions/home/ccc/{slugify(aim)}-{sid[:4]}|full session]]"
+    link = f"[[01-llm/ccc-tasks/sessions/home/ccc/{slugify(aim)}-{sid[:4]}|full session]]"
     assert link in _rpath(env, aim, sid).read_text(encoding="utf-8")
 
     # Finishing the job moves the running mirror to done/ — the SESSION file stays
@@ -1056,7 +1051,7 @@ def test_session_file_path_helper(env: Env) -> None:
     hit = mirrors.session_file_path(env.cfg, sid)
     assert hit is not None
     assert hit.abs_path == _spath(env, aim, sid)
-    assert hit.vault_relpath == f"01-llm-tasks/sessions/home/ccc/{slugify(aim)}-{sid[:4]}.md"
+    assert hit.vault_relpath == f"01-llm/ccc-tasks/sessions/home/ccc/{slugify(aim)}-{sid[:4]}.md"
     assert mirrors.session_file_path(env.cfg, "not-a-session") is None
 
 
@@ -1100,7 +1095,7 @@ def test_mirror_frontmatter_carries_both_links(env: Env) -> None:
     sid = _running_session(env, aim)
     mirrors.run_mirrors(env.store, env.cfg)
     text = _rpath(env, aim, sid).read_text(encoding="utf-8")
-    link = f"01-llm-tasks/sessions/home/ccc/{slugify(aim)}-{sid[:4]}"
+    link = f"01-llm/ccc-tasks/sessions/home/ccc/{slugify(aim)}-{sid[:4]}"
     assert f'session: "[[{link}|full session]]"' in text
     munged = str(env.git_base / "home/ccc").replace("/", "-")
     jsonl = env.store.path.parents[1] / "projects" / munged / f"{sid}.jsonl"

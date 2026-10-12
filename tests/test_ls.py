@@ -225,7 +225,7 @@ def test_render_row_draft_shows_hash_linked_when_future_file_set() -> None:
     assert "obsidian://" not in line
 
     # Synced to a future-job file: the hash is wrapped in an OSC 8 link to it.
-    session.future_file = "01-llm-tasks/future/home/claude-command-center/3a8b-fix.md"
+    session.future_file = "01-llm/ccc-tasks/future/home/claude-command-center/3a8b-fix.md"
     linked_line = ls_view._render_row(row, enabled=False, warn_days=2, aim_threshold=50)[0]
     expected = osc8_link(obsidian_uri(session.future_file), display_hash(sid))
     assert expected in linked_line

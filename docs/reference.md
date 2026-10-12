@@ -676,12 +676,12 @@ done without running": the draft is promoted out of draft-hood (`draft=0, done=1
 reconciled to 100%), its file is archived with a terminal `done` status, and the next mirror pass
 writes its snapshot under `done/` — distinct from `ccc mark-done` on a draft, which *cancels* it
 (archived, never mirrored). **🗑 delete-job** soft-deletes the row (`archived=1`) and moves the file
-to the **`01-llm-tasks/delete/` trash** (keeping the `<cat>/<repo>` substructure) with
+to the **`01-llm/ccc-tasks/delete/` trash** (keeping the `<cat>/<repo>` substructure) with
 `status: deleted`, a `deleted: <date>` stamp and a single **↩ Stage job back in** button;
 `ccc restore-job` (the button, the trash dashboard's ↩ column, or the CLI) un-archives the row and
 moves the file back to its live spot (`status: registered`) — and can re-register from the file
 alone (same UUID) even if the row was pruned. The trash has its own dashboard
-(`01-llm-tasks/delete/delete.md`) with an ↩ restore column; the future dashboard deliberately
+(`01-llm/ccc-tasks/delete/delete.md`) with an ↩ restore column; the future dashboard deliberately
 keeps only ▶ per row — ✓ done / 🗑 delete live inside each job note.
 
 > **Troubleshooting — buttons show "Button ID not Found".** Meta Bind keys its button registry
@@ -726,12 +726,12 @@ You can also **capture a new job as a file first**: `ccc new-prompt [-r cat/repo
 fresh, hash-named draft page under the future root (prefilled frontmatter + Meta Bind repo
 picker) and prints its clickable `obsidian://` path (`-o` opens it in Obsidian); fill in the
 AIM/prompt and flip `status: ready` to register it. The persistent capture pad
-`01-llm-tasks/new-prompt.md` is the manual variant — write into it, flip it to `ready`, and the
+`01-llm/ccc-tasks/new-prompt.md` is the manual variant — write into it, flip it to `ready`, and the
 sync registers its content into a hash-named file and resets the pad (a deleted pad self-heals).
 
 **Whole-lifecycle vault mirrors.** The FUTURE file is the *editable* draft; the other two lifecycle
 phases get **export-only** read mirrors so every tracked session is one markdown file in the vault:
-**RUNNING** (`01-llm-tasks/running/<cat>/<repo>/<slug>-<hash>.md`, for every active session) and
+**RUNNING** (`01-llm/ccc-tasks/running/<cat>/<repo>/<slug>-<hash>.md`, for every active session) and
 **DONE** (`.../done/…`, the final snapshot of every finished session). They are generated from the
 store (a banner + `ccc_mirror: running|done` frontmatter mark them; user edits are overwritten),
 byte-stable (rewritten only on a real change — the only timestamps are `created`/`last_response`/
@@ -762,7 +762,7 @@ Both are **off by default** (fresh-install inert); enable with `mirror_running =
 `mirror_done = true` — and only together with a working credential scrubber, which is what
 actually lets ccc write them (next-but-one paragraph).
 
-**Full-session mirrors (`01-llm-tasks/sessions/`).** A third export-only tree holds ONE file per
+**Full-session mirrors (`01-llm/ccc-tasks/sessions/`).** A third export-only tree holds ONE file per
 tracked session (parked, running or done — membership is independent of the running/done
 switches; its own kill-switch is `mirror_sessions = false`, root `sessions_dir`) with the **whole
 conversation** rendered terminal-like: `## (N) you` / `## claude` sections, every prompt and reply,
@@ -829,10 +829,10 @@ it says so and leaves them off (the future-job files, which hold no verbatim tra
 on).
 
 **Vault dashboards.** Three dataviewjs dashboards sit one level above the mirror trees (outside the
-queried folders, so they never mirror themselves): **`01-llm-tasks/future.md`** (editable — native
-dropdowns write frontmatter, ▶ launches via `ccc open-job`), **`01-llm-tasks/running.md`**
+queried folders, so they never mirror themselves): **`01-llm/ccc-tasks/future.md`** (editable — native
+dropdowns write frontmatter, ▶ launches via `ccc open-job`), **`01-llm/ccc-tasks/running.md`**
 (read-only over the RUNNING tree, ⤢ focuses a live tab via `ccc focus-job`) and
-**`01-llm-tasks/parked.md`** (read-only view over the SAME running tree filtered on
+**`01-llm/ccc-tasks/parked.md`** (read-only view over the SAME running tree filtered on
 `status: "parked"` — every ☾ row, i.e. closed-but-unfinished sessions; ▶ resumes in a new iTerm tab
 via `ccc resume-job`). Running and parked stack the Models cell identically: `ran` — the observed
 `model:` key with its `effort:` next to it — above the `ovr`/`exe` config chips. Gotcha baked into all three: the Hash cell derives from `session_id`,

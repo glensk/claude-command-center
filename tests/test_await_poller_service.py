@@ -9,17 +9,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from futurestub import launchd_cfg
 
-from command_center import await_eval, config, daemon, doctor, launchd, service, systemdunit
+from command_center import await_eval, daemon, doctor, launchd, service, systemdunit
 
-
-def _cfg(tmp_path: Path) -> config.Config:
-    vault = tmp_path / "vault"
-    return config.Config(
-        launchd_label="com.test.ccc",
-        vault_root=str(vault),
-        future_dir=str(vault / "01-llm-tasks" / "future"),
-    )
+_cfg = launchd_cfg
 
 
 # --------------------------------------------------------------------------- launchd

@@ -190,7 +190,7 @@ class Profile:  # pylint: disable=too-many-instance-attributes
 
 def vault_dir_overrides(vault_root: str) -> dict[str, str]:
     """The task-dir layout under *vault_root* (mirrors the ``~/obsidian`` defaults)."""
-    base = f"{vault_root.rstrip('/')}/01-llm-tasks"
+    base = f"{vault_root.rstrip('/')}/01-llm/ccc-tasks"
     return {
         "future_dir": f"{base}/future",
         "delete_dir": f"{base}/delete",

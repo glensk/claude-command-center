@@ -214,9 +214,9 @@ def test_timer_content_fires_every_interval() -> None:
 
 
 def test_future_sync_path_unit_watches_dir_and_targets_service() -> None:
-    text = systemdunit.future_sync_path_content("/vault/01-llm-tasks")
-    assert "PathModified=/vault/01-llm-tasks" in text
-    assert "PathChanged=/vault/01-llm-tasks" in text
+    text = systemdunit.future_sync_path_content("/vault/01-llm/ccc-tasks")
+    assert "PathModified=/vault/01-llm/ccc-tasks" in text
+    assert "PathChanged=/vault/01-llm/ccc-tasks" in text
     assert f"Unit={systemdunit.future_sync_label()}.service" in text
 
 

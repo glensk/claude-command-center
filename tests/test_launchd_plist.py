@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from futurestub import launchd_cfg
 
 from command_center import config, launchd
 
@@ -26,17 +27,11 @@ def _real_cfg(tmp_path: Path) -> config.Config:
     return config.Config(
         launchd_label="com.test.claude-command-center",
         vault_root=str(vault),
-        future_dir=str(vault / "01-llm-tasks" / "future"),
+        future_dir=str(vault / "01-llm" / "ccc-tasks" / "future"),
     )
 
 
-def _cfg(tmp_path: Path) -> config.Config:
-    vault = tmp_path / "vault"
-    return config.Config(
-        launchd_label="com.test.ccc",
-        vault_root=str(vault),
-        future_dir=str(vault / "01-llm-tasks" / "future"),
-    )
+_cfg = launchd_cfg
 
 
 @pytest.fixture
@@ -70,7 +65,7 @@ def test_program_arguments_run_sync_future(plist: dict) -> None:
 def test_watch_paths_covers_future_task_root(tmp_path: Path, plist: dict) -> None:
     # Watches the parent of future_dir — the vault's task-files root — so any
     # future/running/done edit triggers a sync.
-    assert plist["WatchPaths"] == [str(tmp_path / "vault" / "01-llm-tasks")]
+    assert plist["WatchPaths"] == [str(tmp_path / "vault" / "01-llm" / "ccc-tasks")]
 
 
 def test_throttle_interval_set(plist: dict) -> None:

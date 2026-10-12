@@ -458,8 +458,8 @@ dashboard](running.md) reads — the rows shown here are simply the mirrors whos
 frontmatter `status` is `parked`. Those notes are **export-only**: ccc regenerates
 them from its database, so any edit you make there is **overwritten** on the next
 sync. To change a job, change the session (in the ccc Terminal User Interface (TUI)
-or via `ccc`), never the file. **This dashboard lives one level up at
-`01-llm-tasks/parked.md`** — outside the queried folder, so it never mirrors itself
+or via `ccc`), never the file. **This dashboard lives one level above
+`{{RUNNING_FOLDER}}/`** — outside the queried folder, so it never mirrors itself
 (and it carries no `ccc_mirror` frontmatter, so ccc's mirror cleanup never touches
 it either). Rows are sorted exactly like the ccc TUI: category (`infra` → `llms` →
 `private` → `sdsc`, anything else last), then most-recent `last_response` first

@@ -1454,7 +1454,7 @@ def test_draft_id_cell_links_hash_when_future_file_set() -> None:
     from command_center.views.tui import _draft_id_cell
 
     sid = "3a8b7c12-1111-2222-3333-444444444444"
-    relpath = "01-llm-tasks/future/home/claude-command-center/3a8b-fix-x.md"
+    relpath = "01-llm/ccc-tasks/future/home/claude-command-center/3a8b-fix-x.md"
     session = Session(
         session_id=sid,
         cwd="/repo",
@@ -1539,7 +1539,7 @@ def test_oo_chord_opens_future_file_in_obsidian(
 ) -> None:
     """`oo` shells out to macOS `open` on the selected draft's future-job file."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    relpath = "01-llm-tasks/future/home/repo/j-migrate-tickets.md"
+    relpath = "01-llm/ccc-tasks/future/home/repo/j-migrate-tickets.md"
     store = Store(tmp_path / "command-center" / "state.db")
     store.create_draft("job-1", "/Users/x/repo", "Migrate tickets", start_when="during holidays")
     store.update_fields("job-1", future_file=relpath)
@@ -2589,7 +2589,7 @@ def test_action_open_session_obsidian_opens_exact_uri(
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     sid = _seed(tmp_path)
     # A session-mirror file in the isolated vault (conftest points load_config there).
-    sdir = tmp_path / "vault" / "01-llm-tasks" / "sessions" / "other" / "repo"
+    sdir = tmp_path / "vault" / "01-llm" / "ccc-tasks" / "sessions" / "other" / "repo"
     sdir.mkdir(parents=True)
     mirror = sdir / "ship-the-thing-abcd.md"
     mirror.write_text(
@@ -2619,7 +2619,8 @@ def test_action_open_session_obsidian_opens_exact_uri(
     asyncio.run(scenario())
     # conftest points vault_root at tmp_path/"vault", so the derived vault name is "vault".
     expected = (
-        "obsidian://open?vault=vault&file=01-llm-tasks/sessions/other/repo/ship-the-thing-abcd.md"
+        "obsidian://open?vault=vault"
+        "&file=01-llm/ccc-tasks/sessions/other/repo/ship-the-thing-abcd.md"
     )
     assert opened == [["open", expected]]
 

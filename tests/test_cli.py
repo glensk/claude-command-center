@@ -1034,7 +1034,7 @@ def test_delete_job_moves_file_to_trash_and_soft_deletes(
         row = store.get(_JOB_UUID)
         assert row is not None
         assert row.draft is True and row.archived is True
-        assert (row.future_file or "").startswith("01-llm-tasks/delete/")
+        assert (row.future_file or "").startswith("01-llm/ccc-tasks/delete/")
     assert not file.exists()
     trash = list(Path(_config.load_config().delete_dir).expanduser().rglob("*.md"))
     assert len(trash) == 1

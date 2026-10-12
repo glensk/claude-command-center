@@ -356,16 +356,16 @@ DEFAULTS: dict[str, object] = {
     "done_max_age_days": 3,  # hide done sessions older than this many days (0 = show all)
     "future_files": False,  # mirror each FUTURE job (draft) as an Obsidian md file (INERT: off)
     "vault_root": "~/obsidian",  # Obsidian vault root; sessions.future_file is relative to it
-    "future_dir": "~/obsidian/01-llm-tasks/future",  # root of the future-job files
-    "delete_dir": "~/obsidian/01-llm-tasks/delete",  # trash for deleted future jobs (restorable)
-    "future_pad": "~/obsidian/01-llm-tasks/new-prompt.md",  # persistent manual capture pad
+    "future_dir": "~/obsidian/01-llm/ccc-tasks/future",  # root of the future-job files
+    "delete_dir": "~/obsidian/01-llm/ccc-tasks/delete",  # trash for deleted jobs (restorable)
+    "future_pad": "~/obsidian/01-llm/ccc-tasks/new-prompt.md",  # persistent manual capture pad
     "future_delete_grace_sec": 600,  # missing job file grace before its draft is archived
     "mirror_running": False,  # export-only markdown mirror of RUNNING sessions (INERT: off)
     "mirror_done": False,  # export-only markdown mirror of DONE sessions (INERT: off)
-    "running_dir": "~/obsidian/01-llm-tasks/running",  # root of the RUNNING session mirrors
-    "done_dir": "~/obsidian/01-llm-tasks/done",  # root of the DONE session mirrors
+    "running_dir": "~/obsidian/01-llm/ccc-tasks/running",  # root of the RUNNING session mirrors
+    "done_dir": "~/obsidian/01-llm/ccc-tasks/done",  # root of the DONE session mirrors
     "mirror_sessions": False,  # export-only full-conversation mirror per session (INERT: off)
-    "sessions_dir": "~/obsidian/01-llm-tasks/sessions",  # root of the full-session mirrors
+    "sessions_dir": "~/obsidian/01-llm/ccc-tasks/sessions",  # root of the full-session mirrors
     # Mirror scrubber — every byte the three export-only mirror roots receive passes through
     # it first (docs/reference.md § mirrors). First token = the scrubber executable, resolved
     # through the external-deps registry ($SECRET_BROKER_CLIENT → $PATH; a token containing
@@ -1132,16 +1132,16 @@ class Config:
     done_max_age_days: int = 3
     future_files: bool = False
     vault_root: str = "~/obsidian"
-    future_dir: str = "~/obsidian/01-llm-tasks/future"
-    delete_dir: str = "~/obsidian/01-llm-tasks/delete"
-    future_pad: str = "~/obsidian/01-llm-tasks/new-prompt.md"
+    future_dir: str = "~/obsidian/01-llm/ccc-tasks/future"
+    delete_dir: str = "~/obsidian/01-llm/ccc-tasks/delete"
+    future_pad: str = "~/obsidian/01-llm/ccc-tasks/new-prompt.md"
     future_delete_grace_sec: int = 600
     mirror_running: bool = False
     mirror_done: bool = False
-    running_dir: str = "~/obsidian/01-llm-tasks/running"
-    done_dir: str = "~/obsidian/01-llm-tasks/done"
+    running_dir: str = "~/obsidian/01-llm/ccc-tasks/running"
+    done_dir: str = "~/obsidian/01-llm/ccc-tasks/done"
     mirror_sessions: bool = False
-    sessions_dir: str = "~/obsidian/01-llm-tasks/sessions"
+    sessions_dir: str = "~/obsidian/01-llm/ccc-tasks/sessions"
     mirror_scrub_cmd: str = "secret-broker-client.py scrub --shapes"
     mirror_allow_unscrubbed: bool = False
     vault_name: str = ""
