@@ -53,9 +53,10 @@ def test_expand_llm_choice() -> None:
     assert expand_llm_choice("opus-5") == "opus-5"  # exact
     assert expand_llm_choice("fable") is None  # retired models cannot be selected
     assert expand_llm_choice("SONNET") == "sonnet-5"  # case-insensitive
-    # Bare "opus" prefixes opus-5, opus-4.8 AND opus-4.8-1m, so shortest-wins cannot
-    # decide it — LLM_PREFIX_ALIASES pins it to the current Opus generation.
-    assert expand_llm_choice("  opus ") == "opus-5"  # trimmed; explicit alias
+    # Bare "opus" prefixes opus-5.5, opus-5, opus-4.8 AND opus-4.8-1m, so shortest-wins
+    # cannot decide it — LLM_PREFIX_ALIASES pins it to the current Opus generation.
+    assert expand_llm_choice("  opus ") == "opus-5.5"  # trimmed; explicit alias
+    assert expand_llm_choice("opus-5.") == "opus-5.5"  # unique prefix
     assert expand_llm_choice("haiku") == "haiku-4.5"  # unique prefix
     assert expand_llm_choice("opus-4") == "opus-4.8"  # shortest wins over -1m
     assert expand_llm_choice("opus-4.8-") == "opus-4.8-1m"  # longer prefix → 1M variant

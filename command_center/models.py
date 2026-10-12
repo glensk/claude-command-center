@@ -317,6 +317,7 @@ class MirrorHealth:
 # The session runs ON the overseer's model; when the executor differs, the overseer is
 # told to delegate implementation to Agent-tool subagents on the executor's model.
 LLM_CHOICES: tuple[str, ...] = (
+    "opus-5.5",
     "opus-5",
     "opus-4.8",
     "opus-4.8-1m",
@@ -331,6 +332,7 @@ NEW_JOB_DEFAULT_LLM = DEFAULT_LLM
 # Full model ids for ``claude --model`` (the overseer the session runs on).
 # ``opus-4.8-1m`` is the 1M-context beta form; sonnet-5 is natively 1M.
 LLM_MODEL_IDS: dict[str, str] = {
+    "opus-5.5": "claude-opus-5-5",
     "opus-5": "claude-opus-5",
     "opus-4.8": "claude-opus-4-8",
     "opus-4.8-1m": "claude-opus-4-8[1m]",
@@ -340,6 +342,7 @@ LLM_MODEL_IDS: dict[str, str] = {
 # The Agent-tool ``model`` enum used in the delegation instruction (executor subagents).
 # The enum has no 1M variant, so opus-4.8-1m delegates to plain "opus".
 LLM_AGENT_ALIAS: dict[str, str] = {
+    "opus-5.5": "opus",
     "opus-5": "opus",
     "opus-4.8": "opus",
     "opus-4.8-1m": "opus",
@@ -355,11 +358,11 @@ RETIRED_LLM_REPLACEMENTS: dict[str, str] = {"fable-5": DEFAULT_LLM}
 # display without putting the raw id back into the executable ``LLM_MODEL_IDS`` map.
 _RETIRED_MODEL_LABELS: dict[str, str] = {"claude-fable-5": "fable-5"}
 # Shorthands whose prefix match is genuinely ambiguous and so must be pinned explicitly.
-# ``"opus"`` prefixes three choices (opus-5, opus-4.8, opus-4.8-1m) and none of them is a
-# prefix of the others, so :func:`expand_llm_choice`'s shortest-wins rule cannot decide and
-# would reject the input. Bare ``"opus"`` means the CURRENT Opus generation; an older
-# generation needs its version (``"opus-4"`` → opus-4.8).
-LLM_PREFIX_ALIASES: dict[str, str] = {"opus": "opus-5"}
+# ``"opus"`` prefixes four choices (opus-5.5, opus-5, opus-4.8, opus-4.8-1m) and the shortest
+# of them (opus-5) is not a prefix of the 4.8 ones, so :func:`expand_llm_choice`'s
+# shortest-wins rule cannot decide and would reject the input. Bare ``"opus"`` means the
+# CURRENT Opus generation; an older generation needs its version (``"opus-4"`` → opus-4.8).
+LLM_PREFIX_ALIASES: dict[str, str] = {"opus": "opus-5.5"}
 # Separator glyph between the overseer and executor model in a draft's models readout.
 LLM_ARROW = "▸"
 # Valid ``claude --effort`` levels. Job launches pass the config ``launch_effort``

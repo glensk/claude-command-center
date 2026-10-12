@@ -42,13 +42,14 @@ tags: [ccc, future-jobs, dashboard]
 	// Mirror of ccc's models.LLM_CHOICES / DEFAULT_LLM — keep in sync when the
 	// choice list changes there. opus-4.8-1m = the 1M-context beta form
 	// (claude-opus-4-8[1m]); plain opus-4.8 is the 200K default.
-	const MODELS = ["opus-5", "opus-4.8", "opus-4.8-1m", "sonnet-5", "haiku-4.5"];
+	const MODELS = ["opus-5.5", "opus-5", "opus-4.8", "opus-4.8-1m", "sonnet-5", "haiku-4.5"];
 	const DEFAULT_MODEL = "opus-5";
 	// Per-model accent: text/border colour + a low-alpha background tint so the
 	// select is legible in both light and dark themes (colour carries the signal,
-	// the tint just hints). opus-5/opus-4.8 → green, opus-4.8-1m → teal,
+	// the tint just hints). opus-5.5/opus-5/opus-4.8 → green, opus-4.8-1m → teal,
 	// sonnet-5 → blue, haiku-4.5 → purple.
 	const MODEL_COLORS = {
+		"opus-5.5": { fg: "#16a34a", bg: "rgba(22, 163, 74, 0.12)" },
 		"opus-5": { fg: "#16a34a", bg: "rgba(22, 163, 74, 0.12)" },
 		"opus-4.8": { fg: "#16a34a", bg: "rgba(22, 163, 74, 0.12)" },
 		"opus-4.8-1m": { fg: "#0d9488", bg: "rgba(13, 148, 136, 0.12)" },
