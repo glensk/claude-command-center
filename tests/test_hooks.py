@@ -768,6 +768,58 @@ def test_user_prompt_aim_is_set_without_a_model_turn(capsys: pytest.CaptureFixtu
     assert "changed this session's AIM" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        ("/cwork-to-cpriv", ("private", [])),
+        ("/cpriv-to-cwork -f", ("work", ["-f"])),
+        ('/cwork-to-cpriv -p "go on" ', ("private", ["-p", "go on"])),
+        ("/cwork-to-cpriv\n-C", ("private", ["-C"])),
+        ("/cwork-to-cpriv 'x", ("private", ["--invalid"])),
+        ("/cwork-to-cprivx", None),
+        ("please /cwork-to-cpriv", None),
+        ("/aim x", None),
+    ],
+)
+def test_switch_command_args(prompt: str, expected: tuple[str, list[str]] | None) -> None:
+    assert hooks._switch_command_args(prompt) == expected  # pylint: disable=protected-access
+
+
+@pytest.mark.usefixtures("home")
+def test_user_prompt_switch_runs_without_a_model_turn(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        env = kw["env"]
+        assert isinstance(env, dict)
+        calls.append((cmd, env))
+        return subprocess.CompletedProcess(cmd, 0, "relaunching now", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": "/cwork-to-cpriv -f"})
+    out = capsys.readouterr().out
+    assert '"decision": "block"' in out and "relaunching now" in out
+    assert len(calls) == 1
+    cmd, env = calls[0]
+    assert cmd[1:] == ["switch-account", "private", "-s", "s1", "-N", "-K", "-f"]
+    assert env["CLAUDE_CODE_SESSION_ID"] == "s1"
+
+
+@pytest.mark.usefixtures("home")
+def test_user_prompt_switch_intercept_off_passes_through(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_cfg(switch_intercept=False)
+    Store().ensure("s1", cwd="/repo")
+    capsys.readouterr()
+    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": "/cpriv-to-cwork"})
+    assert '"decision"' not in capsys.readouterr().out
+
+
 @pytest.mark.usefixtures("home")
 def test_user_prompt_aim_intercept_off_passes_through(capsys: pytest.CaptureFixture[str]) -> None:
     _set_cfg(aim_intercept=False)

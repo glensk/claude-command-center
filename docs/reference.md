@@ -1444,6 +1444,11 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   and the TUI detail pane — no `/aim (N)` numbering, no first-AIM anchor row, no
   `old ====> new` transition. Pair it with `aim_column = "latest"` so `ccc ls` / the TUI
   table show the current AIM too. History is still recorded (`ccc aim-history`).
+- **`switch_intercept = true`** (default): the `UserPromptSubmit` hook catches a typed
+  `/cwork-to-cpriv [args]` / `/cpriv-to-cwork [args]`, runs `ccc switch-account
+  <private|work> -s <session> -N -K [args]` itself and blocks the prompt with its output —
+  no model request, so it works on a seat that hit its limit. The commands' former `!`
+  inline expansion is no longer reliable: Claude Code may hand inline commands to the model.
 - **`aim_intercept = true`** (default): the `UserPromptSubmit` hook catches a typed
   `/aim <text>` and sets the AIM itself, then blocks the prompt — no model turn, no tokens.
   A bare `/aim` just shows the current AIM. The agent learns the new AIM as context on the

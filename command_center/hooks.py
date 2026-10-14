@@ -508,11 +508,61 @@ def _intercept_aim(store: Store, sid: str, current: str | None, text: str, block
         _emit_context("UserPromptSubmit", _AIM_REPLY.format(aim=aim))
 
 
+# Seat-switch slash commands → the `claude_accounts` label they move the session to.
+_SWITCH_COMMANDS = {"/cwork-to-cpriv": "private", "/cpriv-to-cwork": "work"}
+
+
+def _switch_command_args(prompt: str) -> tuple[str, list[str]] | None:
+    """``(label, extra argv)`` for a typed ``/cwork-to-cpriv [args]`` style prompt, else None.
+
+    Unparseable arguments (an unbalanced quote) come back as one ``--invalid`` token, so
+    ``switch-account`` refuses them loudly instead of the prompt reaching the model.
+    """
+    import re  # local: only a typed prompt pays for these
+    import shlex
+
+    m = re.match(r"^(\S+)(?:\s+(.*))?$", prompt.strip(), re.DOTALL)
+    label = _SWITCH_COMMANDS.get(m.group(1)) if m else None
+    if m is None or label is None:
+        return None
+    try:
+        return label, shlex.split(m.group(2) or "")
+    except ValueError:
+        return label, ["--invalid"]
+
+
+def _intercept_switch(sid: str, label: str, extra: list[str]) -> None:
+    """Run ``ccc switch-account <label> -N -K`` for *sid* and swallow the prompt.
+
+    The slash command's own ``!`` inline expansion is no longer guaranteed to run
+    client-side (Claude Code may hand it to the model instead), and a capped seat rejects
+    that model request — the one moment the switch is needed. This hook runs before any
+    model request, so the switch works with the current seat out of quota.
+    """
+    import subprocess  # local: only the intercepted prompt pays for it
+
+    argv = [sys.argv[0] if sys.argv and sys.argv[0] else "ccc"]
+    cmd = [*argv, "switch-account", label, "-s", sid, "-N", "-K", *extra]
+    env = {**os.environ, "CLAUDE_CODE_SESSION_ID": sid}
+    try:
+        res = subprocess.run(  # noqa: S603
+            cmd, env=env, capture_output=True, text=True, timeout=90, check=False
+        )
+        out = (res.stdout + res.stderr).strip() or f"switch-account exited {res.returncode}"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        out = f"error: could not run switch-account ({exc})"
+    _block_prompt(out)
+
+
 def handle_user_prompt(payload: dict[str, Any]) -> int:
     sid = _session_id(payload)
     if not sid:
         return 0
     cfg = config.load_config()
+    switch = _switch_command_args(str(payload.get("prompt") or ""))
+    if cfg.switch_intercept and switch is not None:
+        _intercept_switch(sid, *switch)
+        return 0
     aim_text = _aim_command_text(str(payload.get("prompt") or ""))
     with Store() as store:
         session, _ = ensure_current_session(store, sid, payload.get("cwd", ""))

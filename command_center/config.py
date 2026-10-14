@@ -75,6 +75,7 @@ DEFAULTS: dict[str, object] = {
     "aim_history": True,  # /aim (N) labels, first-AIM anchor, old ====> new (False = "/aim: X")
     "aim_intercept": True,  # UserPromptSubmit sets "/aim <text>" itself: no model turn
     "aim_intercept_block": True,  # True: swallow `/aim` (no turn; CC shows "blocked by hook")
+    "switch_intercept": True,  # UserPromptSubmit runs /cwork-to-cpriv & co itself: no model turn
     "aim_on_main_line": False,  # `ccc aim --format bar` prefixes "🎯 <aim>" (status-line row 1)
     "aim_in_tab_title": False,  # iTerm tab title "<badge> <leaf> 🎯 <aim>"
     # Memorable 1-2 word session names (`ccc name`, `ccc sessions -j`, tab titles,
@@ -1027,6 +1028,7 @@ class Config:
     aim_history: bool = True
     aim_intercept: bool = True
     aim_intercept_block: bool = True
+    switch_intercept: bool = True
     aim_on_main_line: bool = False
     aim_in_tab_title: bool = False
     session_names: bool = True
