@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import hooks
+from command_center import hooks, switch_intercept
 from command_center.models import Status
 from command_center.store import Store
 
@@ -782,7 +782,7 @@ def test_user_prompt_aim_is_set_without_a_model_turn(capsys: pytest.CaptureFixtu
     ],
 )
 def test_switch_command_args(prompt: str, expected: tuple[str, list[str]] | None) -> None:
-    assert hooks._switch_command_args(prompt) == expected  # pylint: disable=protected-access
+    assert switch_intercept.switch_command_args(prompt) == expected
 
 
 @pytest.mark.usefixtures("home")
