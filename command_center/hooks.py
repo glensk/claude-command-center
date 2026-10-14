@@ -509,8 +509,7 @@ def _intercept_aim(store: Store, sid: str, current: str | None, text: str, block
 
 
 def handle_user_prompt(payload: dict[str, Any]) -> int:
-    sid = _session_id(payload)
-    if not sid:
+    if not (sid := _session_id(payload)):
         return 0
     cfg = config.load_config()
     if cfg.switch_intercept and switch_intercept.intercept(sid, str(payload.get("prompt") or "")):
