@@ -67,6 +67,7 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 - `ccc rm` · `ccc prune` — drop a tracked row / delete leftovers (contentless, headless `claude -p`, and dead-launched jobs that never had a turn).
 - `ccc peek` (`--print`) · `ccc jump` — the macOS peek panel / the ccc↔session toggle.
 - `ccc snapshot` (`-l/--list`, `-n/--dry-run`) · `ccc restore-snapshot [name]` (`-n/--dry-run`, `-y/--yes`) — save the whole iTerm layout before a reboot, rebuild it afterwards.
+- `ccc sessions` · `ccc inspect` · `ccc send` · `ccc answer` · `ccc delivery` · `ccc events` · `ccc name` (all `-j`) — the voice-bridge JSON CLI: list, read, message and answer live sessions; see "The voice-bridge JSON CLI" below.
 
 **Obsidian & mirrors**
 
@@ -2935,6 +2936,155 @@ refuses to restore auth-scoped rungs (an unpaid seat rejects every attempt until
 human acts). Expiry is filtered on READ, so concurrent invocations racing an expired
 entry can each probe once before the first failure re-records — accepted; they
 converge via `observed_at` ordering.
+
+## The voice-bridge JSON CLI — `ccc sessions | inspect | send | answer | delivery | events`
+
+Machine-facing commands (no TUI key) that the mac-voice Claude bridge (my-stt-tts
+`claude_sessions.py` / `attention.py`) and other agents drive to list, read, message and
+answer live Claude Code sessions. Code: `command_center/bridge_cli.py` and the
+`bridge_{json,target,inspect,send,answer,delivery,events,store}.py` modules beside it.
+
+```commands
+ccc sessions -j                                    # every live session of every account
+ccc inspect -s <session-id> -j                     # state, last reply/prompt, pending decision
+ccc inspect -s <session-id> -N -j                  # the same without the voice-brief LLM summary
+echo 'run the tests' | ccc send -s <session-id> -j # type a message into the session's tab
+echo '{"decision_id": "…", "answers": [{"question_index": 0, "option_indices": [1]}]}' \
+  | ccc answer -s <session-id> -j                  # answer its AskUserQuestion picker
+ccc delivery -i <delivery-id> -j                   # follow one send up
+ccc events -a 0 -l 200 -j                          # the problem stream after a cursor
+```
+
+### The envelope
+
+With `-j/--json`, stdout carries exactly one JSON line; logs go to stderr only:
+
+```json
+{"schema_version": 1, "ok": true, "data": {}, "error": null}
+{"schema_version": 1, "ok": false, "data": null, "error": {"code": "not_running", "message": "session … is not running"}}
+```
+
+| Exit | Meaning                                                    |
+| :--- | :--------------------------------------------------------- |
+| `0`  | ok                                                         |
+| `1`  | refused or failed — `error.code` says why                  |
+| `2`  | usage (bad argument, unknown input field, stdin not given) |
+| `3`  | internal (`error.code` `internal`; traceback on stderr)    |
+
+Times are ISO-8601 UTC (`2026-10-09T12:00:00Z`). Unknown input — an argument or a JSON field —
+is a usage error; with `-j` even an argv error comes back as an envelope. A command that
+already acted (a delivery exists) and did not succeed returns `ok: false` WITH its `data`, so
+the caller can follow the delivery up. Without `-j` the data is printed as indented JSON and a
+refusal as one `❌ <code>: <message>` line on stderr; the exit codes are the same. Message text
+travels on stdin only, never in argv (readable by every `ps`).
+
+### `ccc sessions` (`-j/--json`)
+
+Lists the interactive and background Claude Code sessions of every configured account —
+background jobs from `claude agents --json` too. Headless `claude -p` runs (registry
+`entrypoint` `sdk-cli`) are never listed. `data.sessions[]`:
+
+| Field                  | Meaning                                                                                            |
+| :--------------------- | :------------------------------------------------------------------------------------------------- |
+| `session_id`           | the Claude session id                                                                              |
+| `name` / `name_origin` | the memorable canonical name and where it came from (`llm` / `fallback` / `manual` / `manual-tab`) |
+| `account`              | the account label of the session's config dir                                                      |
+| `account_conflict`     | the id is live under two accounts at once (never messaged)                                         |
+| `pid`                  | the claude process                                                                                 |
+| `kind`                 | `interactive` or `background` (background: listed and read, never messaged)                        |
+| `status` / `status_at` | `busy` / `idle` / `waiting` / `blocked` / `unknown` (a registry `shell` = busy)                    |
+| `aim_short`            | the short AIM label                                                                                |
+| `tab.iterm_session_id` | the iTerm session of the tab (null for a background job)                                           |
+| `tab.validated`        | the registry pid's controlling tty is the tab's tty                                                |
+
+`ccc name -s ID "x y"` (`-s/--session`, `-A/--auto`, `-j/--json`) shows or sets the name;
+data `{session_id, name, name_origin, changed, rename_command}`; codes `name_taken`,
+`invalid_name`, `not_found`, `ambiguous_session`.
+
+### `ccc inspect` (`-s/--session ID`, `-N/--no-llm`, `-j/--json`)
+
+Reads the session's transcript. `data`:
+
+| Field         | Meaning                                                                 |
+| :------------ | :---------------------------------------------------------------------- |
+| `state`       | the live registry status while running, else the transcript's own state |
+| `live`        | the session's process is alive                                          |
+| `last_reply`  | the last assistant reply, ≤ 1500 characters, tail kept                  |
+| `last_prompt` | the last user prompt, ≤ 500 characters, head kept                       |
+| `decision`    | the pending decision or `null` (below)                                  |
+
+`decision = {decision_id, source, questions: [{text, multi_select, options: [{label,
+consequence}]}], recommendation, recommendation_reason, context: {aim, ticket,
+recent_summary}}`. `source` is `ask_user_question` (a pending picker) or `todo_line` (only
+while idle: the `You [decision]:` lines of the last reply's `## To-do list`, options from
+`a)/b)` markers or an "X or Y" split, the recommendation from a `(Recommended)` marker or an
+"I recommend" sentence). `decision_id` is a sha256 over the anchor and the questions — pass it
+to `ccc answer`. `recent_summary` (≤ 800 characters) comes from the ccc LLM purpose
+`voice-brief` (10 s budget, cached per transcript size); `-N`, no router or a failed call fall
+back to the first three sentences of the last reply. Codes: `unknown_session`,
+`transcript_missing`, `transcript_unknown`.
+
+### `ccc send` (`-s/--session ID`, `-j/--json`)
+
+Message on stdin: ≤ 4000 characters, no control characters except newline and tab (ESC, NUL
+and CR are rejected). Inside a per-tab lock and right before the first byte the target is
+revalidated: live, interactive, one account, the tab's tty is the registry pid's, the tab's
+foreground job is that claude, no pending picker. `idle` expects a `user` record, `busy` a
+`queue-operation/enqueue`; `waiting`, `blocked` and background sessions are refused. The text
+is typed through the iTerm2 Python API (AppleScript fallback) and matched against records
+appended after the anchor (normalised-text sha256, FIFO — no marker is added to the text).
+Never retried.
+
+`data = {delivery_id, outcome, channel}` — `outcome` `accepted` (matching record within 8 s),
+`unknown` (typed, no record yet; `ok: false`, code `delivery_unknown`) or `failed` (nothing
+typed; code `delivery_failed`).
+
+### `ccc answer` (`-s/--session ID`, `-j/--json`)
+
+stdin: `{"decision_id": "<from ccc inspect>", "answers": [{"question_index": 0,
+"option_indices": [1]} | {"question_index": 1, "other_text": "…"}]}` — one entry per question,
+`other_text` ≤ 500 characters. Only for exactly one pending AskUserQuestion whose recomputed
+`decision_id` matches, with the session `waiting`. The keys go through
+`terminal.send_keys_via` (Python API only, no focus change); single- and multi-select are
+supported. The answer is verified within 10 s through the call's `tool_use_id` and
+`toolUseResult.answers` — every expected label must match.
+
+`data = {decision_id, tool_use_id, outcome, channel, keys}` (`mismatched_questions` on a
+mismatch); `outcome` `accepted` / `unknown` / `failed`.
+
+### `ccc delivery` (`-i/--id ID`, `-j/--json`)
+
+Advances the delivery's session, then returns `{delivery_id, session_id, kind, state, outcome,
+channel, matched_kind, reason, created_at, accepted_at, terminal_at}`. States: `sending` →
+`accepted` | `unknown` (a later matching record promotes it) | `failed`; from `accepted`:
+`completed` (the first turn end after the prompt was consumed), `needs_input` (an
+AskUserQuestion after it), `failed` (a StopFailure after it, process gone, transcript replaced)
+or `timed_out` (no turn end within 6 h). Each terminal state is written once. Code:
+`unknown_delivery`.
+
+### `ccc events` (`-a/--after CURSOR`, default 0; `-l/--limit N`, default 200; `-j/--json`)
+
+Advances every open delivery, then returns `{events: [{cursor, kind, session_id, at, detail}],
+next_cursor}`. `kind`: `stop_failure` (one per failed turn, from the StopFailure hook, every
+error kind; `detail.error`), `needs_input`, `delivery_failed` (a delivery `failed` or
+`timed_out`; `detail` carries `delivery_id`, `state`, `reason`). Successes emit no event;
+details never carry message text. Code: `invalid_cursor` (a negative cursor, exit 2).
+
+### Error codes
+
+| Code                                                                                                                                                                    | Commands              | Meaning                                                                 |
+| :---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------- | :---------------------------------------------------------------------- |
+| `not_running` / `background` / `account_conflict`                                                                                                                       | send, answer          | not live / a background session (read-only) / live under two accounts   |
+| `no_tab` / `stale_tab` / `foreground_not_claude` / `iterm_unreachable`                                                                                                  | send, answer          | the tab cannot be proven to be this session's claude                    |
+| `tab_locked`                                                                                                                                                            | send, answer          | another send/answer to this tab is running (3 s wait)                   |
+| `waiting` / `blocked` / `unknown_status` / `picker_pending`                                                                                                             | send                  | not typed into in this state (`picker_pending`: use `ccc answer`)       |
+| `delivery_failed` / `delivery_unknown`                                                                                                                                  | send                  | nothing reached the tab / typed, but no matching record within 8 s      |
+| `not_waiting` / `decision_changed` / `unsupported_shape` / `invalid_answer`                                                                                             | answer                | no single pending picker matching the `decision_id`, or a bad choice    |
+| `answer_failed` / `answer_unknown` / `answer_mismatch`                                                                                                                  | answer                | no key reached / no answer recorded in 10 s / a different answer        |
+| `unknown_session` / `transcript_missing` / `transcript_unknown`                                                                                                         | inspect, send, answer | ccc does not know it / no transcript / a transcript that does not parse |
+| `unknown_delivery` / `invalid_cursor`                                                                                                                                   | delivery, events      | no such delivery / negative cursor                                      |
+| `empty_message` / `message_too_long` / `control_characters` / `stdin_required` / `invalid_json` / `invalid_answers` / `invalid_decision_id` / `unknown_field` / `usage` | all                   | usage errors (exit 2)                                                   |
+| `internal`                                                                                                                                                              | all                   | unexpected exception (exit 3)                                           |
 
 ## Layout
 
