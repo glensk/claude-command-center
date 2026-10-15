@@ -21,6 +21,7 @@ from bridgestub import (
     user,
 )
 
+from command_center.adapters import claude_bridge as cb
 from command_center.adapters.claude_agents import AgentEntry
 from command_center.store import Store
 
@@ -247,8 +248,6 @@ def test_fresh_session_whose_transcript_never_appears_is_unknown(
 
 
 def test_project_dir_name_replaces_every_non_alphanumeric() -> None:
-    from command_center.adapters import claude_bridge as cb
-
     assert cb.project_dir_name("/private/tmp/bridge-scratch") == "-private-tmp-bridge-scratch"
     assert cb.project_dir_name("/Users/a/my_repo.v2") == "-Users-a-my-repo-v2"
     path = cb.expected_transcript_path("/cfg", "/private/tmp/bridge-scratch", SID)
@@ -294,6 +293,56 @@ def test_no_matching_record_within_eight_seconds_is_unknown(
     assert rc == 1 and env is not None and env["data"]["outcome"] == "unknown"
     (d,) = _deliveries(world)
     assert d.reason == "no_matching_record"
+
+
+def _pasted(text: str, paste_id: str = "2f43") -> str:
+    """*text* as Claude Code records a long bracketed paste (2.1.299, tp#1054)."""
+    return f'\n\n<pasted_content id="{paste_id}">\n{text}\n</pasted_content id="{paste_id}">\n'
+
+
+def test_busy_send_recorded_as_a_wrapped_user_record_correlates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#1054: a busy target ended its turn before the paste and recorded it as a
+    ``user`` record wrapped in ``<pasted_content>`` — the delivery is still accepted."""
+    world = World(tmp_path, status="busy")
+    world.write(user("long job"))
+    world.on_text = lambda w, text: w.write(*turn_end(), user(_pasted(text)))
+    message = "RELAY (from Albert): wrap up.\n\n(1) start no new work.\n(2) reply DRAINED."
+    code, env, _err = _send(world, monkeypatch, capsys, message)
+    assert code == 0 and env is not None and env["data"]["outcome"] == "accepted"
+    (d,) = _deliveries(world)
+    assert d.expected == "queue-operation/enqueue" and d.matched_kind == "user"
+
+
+def test_wrapped_enqueue_record_correlates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = World(tmp_path, status="busy")
+    world.write(user("long job"))
+    world.on_text = lambda w, text: w.write(enqueue(_pasted(text, "fa5b")))
+    code, env, _err = _send(world, monkeypatch, capsys, "line one\nline two\nline three")
+    assert code == 0 and env is not None and env["data"]["outcome"] == "accepted"
+    (d,) = _deliveries(world)
+    assert d.matched_kind == "queue-operation/enqueue"
+
+
+def test_wrapped_record_of_another_text_does_not_correlate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = _idle_world(tmp_path)
+    world.on_text = lambda w, text: w.write(user(_pasted("something else")))
+    rc, env, _err = _send(world, monkeypatch, capsys, "hello\nworld")
+    assert rc == 1 and env is not None and env["data"]["outcome"] == "unknown"
+
+
+def test_unwrap_pastes_restores_the_pasted_text() -> None:
+    wrapped = "see ```" + _pasted("a\n\nb") + "``` and" + _pasted("c", "x1")
+    assert cb.unwrap_pastes(wrapped) == "see ```\n\na\n\nb\n``` and\n\nc\n"
+    assert cb.unwrap_pastes("<pasted_content>\nbare\n</pasted_content>") == "bare"
+    mismatched = '<pasted_content id="a">\nx\n</pasted_content id="b">'
+    assert cb.unwrap_pastes(mismatched) == mismatched
+    assert cb.unwrap_pastes("no paste") == "no paste"
 
 
 def test_applescript_one_line_form_still_correlates(

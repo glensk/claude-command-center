@@ -218,6 +218,25 @@ def text_sha(text: str) -> str:
     return hashlib.sha256(normalise(text).encode("utf-8")).hexdigest()
 
 
+#: A bracketed paste as Claude Code stores it in a prompt record (``user``,
+#: ``queue-operation/enqueue``, ``attachment/queued_command``): the pasted text between
+#: ``<pasted_content id="…">`` and a closing tag carrying the same id.
+PASTED_CONTENT_RE = re.compile(
+    r'<pasted_content(?: id="(?P<id>[^"]*)")?>\n?(?P<body>.*?)\n?'
+    r'</pasted_content(?(id) id="(?P=id)")>',
+    re.DOTALL,
+)
+
+
+def unwrap_pastes(text: str) -> str:
+    """*text* with every ``<pasted_content>`` wrapper replaced by the text it wraps.
+
+    ``ccc send`` types its message as one bracketed paste; a long one is recorded
+    wrapped, so the sha of the raw record text never equals the sha of what was sent.
+    """
+    return PASTED_CONTENT_RE.sub(lambda m: m.group("body"), text)
+
+
 def _payload_text(content: Any) -> str | None:
     """A message content (str or block list) as plain text; None if it holds no text."""
     if isinstance(content, str):

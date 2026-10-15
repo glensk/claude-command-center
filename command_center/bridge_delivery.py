@@ -76,8 +76,13 @@ class Assignment:
 
 
 def _sha_matches(delivery: Delivery, text: str) -> bool:
-    sha = cb.text_sha(text)
-    return sha == delivery.content_sha or (bool(delivery.alt_sha) and sha == delivery.alt_sha)
+    """The record text (raw, or with ``<pasted_content>`` wrappers removed) is this
+    delivery's message (or its one-line AppleScript form)."""
+    wanted = {delivery.content_sha} | ({delivery.alt_sha} if delivery.alt_sha else set())
+    if cb.text_sha(text) in wanted:
+        return True
+    unwrapped = cb.unwrap_pastes(text)
+    return unwrapped != text and cb.text_sha(unwrapped) in wanted
 
 
 def _first_unclaimed(
