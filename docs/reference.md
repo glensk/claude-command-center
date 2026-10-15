@@ -32,6 +32,9 @@ flags. Grouped by what they do:
 
 - `ccc set-aim "<done-when>"` — set the done-condition (the single chokepoint for CLI/TUI/hook);
   `-f/--first` instead rewrites the FIRST recorded AIM (`/aim (1)`) in place, adding no revision.
+- `ccc set-aim-eta [ETA]` (`-s/--session`, `-c/--clear`, `-g/--get`) — store the session's estimated time of done
+  BESIDE the AIM (one line, ≤ 40 chars: `17:30`, `45 min`, `tomorrow`, `?`); never touches the AIM or anything
+  derived from it. `-g` prints it back (empty line when none); the TUI detail pane shows it as `· ~<eta>`.
 - `ccc aim` · `ccc aim-history` — the current AIM / its first→current progression.
 - `ccc set-next` · `ccc set-blocked` · `ccc set-deadline` · `ccc set-donecheck` — the other job fields.
 - `ccc subgoals "step" …` (`--list`, `--adaptive`, `--merge`) — the progress checklist.

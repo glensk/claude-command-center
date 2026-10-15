@@ -201,6 +201,8 @@ def test_jobs_json_lists_every_draft_with_the_agreed_fields(
         "session_id",
         "cwd",
         "aim",
+        "aim_eta",
+        "aim_eta_set_at",
         "draft",
         "archived",
         "created_at",

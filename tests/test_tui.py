@@ -381,6 +381,28 @@ def test_codex_card_shows_the_placeholder_before_the_first_snapshot(
     asyncio.run(scenario())
 
 
+def test_detail_fields_append_the_eta_dim_after_the_current_aim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ccc set-aim-eta`: the detail pane shows ` · ~<eta>` (dim) after the current AIM."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center.models import Session
+    from command_center.views.tui import CommandCenterApp
+
+    app = CommandCenterApp()
+    app.cfg.aim_history = False
+    app.cfg.aim_score = False
+    with_eta = Text()
+    app._append_fields(with_eta, Session(session_id="s1", aim="ship it", aim_eta="17:30"))
+    assert with_eta.plain.splitlines()[0] == "/aim: ship it · ~17:30"
+    assert _styled_fragments(with_eta, "grey50")[0] == " · ~17:30"
+
+    without = Text()
+    app._append_fields(without, Session(session_id="s1", aim="ship it"))
+    assert without.plain.splitlines()[0] == "/aim: ship it"
+    assert "~" not in without.plain
+
+
 def test_detail_aim_line_paints_only_low_score_chip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

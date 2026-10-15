@@ -476,6 +476,10 @@ class Session:
     aim_met: bool = False  # impartial "is the AIM fulfilled?" verdict (out-of-band, latest-wins)
     aim_assessed_at: int = 0  # epoch ms of the last self-assessment (drives the new-turn gate)
     aim_met_reason: str | None = None  # one-line "why", from the AIM-met checker
+    # Estimated time of done, free text BESIDE the AIM (``ccc set-aim-eta``), and the
+    # epoch seconds it was set. Not a second done-condition: nothing AIM-derived reads it.
+    aim_eta: str | None = None
+    aim_eta_set_at: int | None = None
     status: str = Status.IDLE.value
     done: bool = False
     done_at: int = 0  # epoch ms when marked done (0 = not done / unknown)

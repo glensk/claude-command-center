@@ -4,7 +4,7 @@
 Subcommands:
   ls                      flat clickable list of every tracked session
   aim                     fast store lookup for the status line (no LLM)
-  set-aim / set-next / set-blocked / set-deadline / set-donecheck
+  set-aim / set-aim-eta / set-next / set-blocked / set-deadline / set-donecheck
   subgoals / check        manage the progress checklist
   mark-done / keep        lifecycle flags
   resume <id>             resume a session in this terminal
@@ -396,6 +396,60 @@ def cmd_set_aim(args: argparse.Namespace) -> int:
                 not named.canonical_name or session_names.upgradable(named, cfg)
             ):
                 spawn_ccc(["name", "-A", "-s", session_id])
+    return 0
+
+
+AIM_ETA_MAX = 40  # the ETA is a short label (``17:30``, ``45 min``, ``tomorrow``), never prose
+
+
+def _aim_eta_problem(eta: str) -> str | None:
+    """Why *eta* is not an acceptable ETA label, or None when it is."""
+    if not eta.strip():
+        return "the ETA is empty (use -c/--clear to remove it)"
+    if any(ord(ch) < 32 or ord(ch) == 127 or 0x80 <= ord(ch) < 0xA0 for ch in eta):
+        return "the ETA holds a control character or a line break (one line only)"
+    if len(eta.strip()) > AIM_ETA_MAX:
+        return f"the ETA is longer than {AIM_ETA_MAX} characters"
+    return None
+
+
+def _aim_eta_usage_problem(eta: str | None, *, clear: bool, get: bool) -> str | None:
+    """Why this ``set-aim-eta`` flag combination is a usage error, or None when it is fine."""
+    if get and (eta is not None or clear):
+        return "-g/--get takes no ETA and no -c/--clear"
+    if clear and eta is not None:
+        return "pass an ETA or -c/--clear, not both"
+    if not get and not clear and eta is None:
+        return "pass an ETA, -c/--clear or -g/--get"
+    return _aim_eta_problem(eta) if eta is not None else None
+
+
+def cmd_set_aim_eta(args: argparse.Namespace) -> int:
+    """`ccc set-aim-eta` — store / read / clear the session's ETA beside its AIM.
+
+    The ETA is NOT a second done-condition: it never touches the AIM, its history, the
+    short label or the DONE verdict. Exit 0 = done, 1 = unknown session, 2 = usage.
+    """
+    eta: str | None = args.eta
+    if problem := _aim_eta_usage_problem(eta, clear=args.clear, get=args.get):
+        print(f"error: {problem}", file=sys.stderr)
+        return 2
+    session_id = resolve_session_id(_adapter(), args.session, None)
+    if not session_id:
+        print("error: could not resolve a session (pass --session <id>)", file=sys.stderr)
+        return 1
+    with Store() as store:
+        if args.get:
+            session = store.get(session_id)
+            if session is None:
+                print(f"error: unknown session {session_id}", file=sys.stderr)
+                return 1
+            print(session.aim_eta or "")
+            return 0
+        if not store.set_aim_eta(session_id, None if args.clear else eta):
+            print(f"error: unknown session {session_id}", file=sys.stderr)
+            return 1
+    print(f"aim eta {'cleared' if args.clear else 'set'} for {session_id}")
     return 0
 
 
@@ -3653,6 +3707,8 @@ def cmd_jobs(args: argparse.Namespace) -> int:
                             "session_id": s.session_id,
                             "cwd": s.cwd,
                             "aim": s.aim or "",
+                            "aim_eta": s.aim_eta or None,
+                            "aim_eta_set_at": s.aim_eta_set_at,
                             "draft": bool(s.draft),
                             "archived": bool(s.archived),
                             "created_at": s.created_at,
@@ -5739,6 +5795,30 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "the current one — fixes how the original goal was stated, adds no revision",
     )
     p_set_aim.set_defaults(func=cmd_set_aim)
+
+    p_eta = sub.add_parser(
+        "set-aim-eta",
+        help="store the session's estimated time of done (ETA) beside its AIM",
+        description="Store, read back or clear the session's ETA — a short free-text label\n"
+        "kept BESIDE the AIM (the AIM stays the one done-condition).\n"
+        "Exit 0 = done, 1 = unknown session, 2 = usage.",
+        epilog="examples:\n  ccc set-aim-eta 17:30\n  ccc set-aim-eta '45 min'\n"
+        "  ccc set-aim-eta -g\n  ccc set-aim-eta -c --session <id>",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_eta.add_argument(
+        "eta",
+        nargs="?",
+        metavar="ETA",
+        help=f"one line, at most {AIM_ETA_MAX} characters "
+        "(e.g. 17:30, '45 min', 2026-10-20, tomorrow, ?)",
+    )
+    p_eta.add_argument("-s", "--session", help="session id (default: the current session)")
+    p_eta.add_argument("-c", "--clear", action="store_true", help="remove the stored ETA")
+    p_eta.add_argument(
+        "-g", "--get", action="store_true", help="print the stored ETA (empty line when none)"
+    )
+    p_eta.set_defaults(func=cmd_set_aim_eta)
 
     p_score = sub.add_parser("score-aim", help="internal: refine the AIM specificity score (LLM)")
     p_score.add_argument("--session")

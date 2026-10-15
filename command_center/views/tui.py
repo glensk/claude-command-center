@@ -3635,6 +3635,10 @@ class CommandCenterApp(App[None]):
                 # (history rows carry only a cheap lexical score) and its vague reason.
                 text.append("\n")
                 self._append_aim_line(text, len(revisions), aim_val, aim_score, aim_reason)
+        # The ETA (`ccc set-aim-eta`) trails the CURRENT AIM line — always the last one
+        # appended above. Detail pane only: the narrow /aim column keeps its width budget.
+        if eta := getattr(session, "aim_eta", None):
+            text.append(f" · ~{eta}", style="grey50")
         text.append("\n/next-step: ", style="white")
         text.append_text(
             _with_tags(_first_line(getattr(session, "next_step", None)) or "—", "white")

@@ -110,6 +110,8 @@ _SESSION_COLUMNS = (
     "aim_met",
     "aim_assessed_at",
     "aim_met_reason",
+    "aim_eta",
+    "aim_eta_set_at",
     "status",
     "done",
     "done_at",
@@ -312,7 +314,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     title_written     TEXT,
     title_generation  INTEGER NOT NULL DEFAULT 0,
     title_written_at  INTEGER NOT NULL DEFAULT 0,
-    name_upgrade_tries INTEGER NOT NULL DEFAULT 0
+    name_upgrade_tries INTEGER NOT NULL DEFAULT 0,
+    aim_eta           TEXT,
+    aim_eta_set_at    INTEGER
 );
 CREATE TABLE IF NOT EXISTS subgoals (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -655,6 +659,11 @@ class Store(AwaitStoreMixin, BridgeStoreMixin):  # pylint: disable=too-many-publ
         # Failed LLM attempts at replacing a provisional ``fallback`` name (bounded, so a
         # broken router is not asked again on every daemon pass).
         "name_upgrade_tries": "INTEGER NOT NULL DEFAULT 0",
+        # The session's estimated time of done (ETA), free text kept BESIDE the AIM (the
+        # AIM stays the one done-condition) and the epoch seconds it was last set. NULL =
+        # no ETA, which is what every row written before the columns existed means.
+        "aim_eta": "TEXT",
+        "aim_eta_set_at": "INTEGER",
     }
     # Same, for the subgoals table (auto-progress marks its rows source='auto').
     _ADDED_SUBGOAL_COLUMNS = {
@@ -1924,6 +1933,21 @@ class Store(AwaitStoreMixin, BridgeStoreMixin):  # pylint: disable=too-many-publ
         if session is None or not session.subgoals_adaptive:
             return False
         return session.subgoals_aim_rev < self.count_aim_history(session_id)
+
+    def set_aim_eta(self, session_id: str, eta: str | None) -> bool:
+        """Store the session's ETA beside its AIM; ``None`` (or blank) clears it.
+
+        Returns False for an unknown session. Deliberately touches only ``aim_eta`` and
+        ``aim_eta_set_at`` — never the AIM, its history, short label or DONE verdict.
+        """
+        value = eta.strip() if eta and eta.strip() else None
+        cur = self.conn.execute(
+            "UPDATE sessions SET aim_eta = ?, aim_eta_set_at = ?, updated_at = ? "
+            "WHERE session_id = ?",
+            (value, int(time.time()) if value else None, now_ms(), session_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
 
     def set_aim(self, session_id: str, aim: str | None) -> bool:
         """Set the AIM through the single chokepoint; return whether it changed.
