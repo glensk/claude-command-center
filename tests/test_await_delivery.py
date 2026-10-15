@@ -330,8 +330,8 @@ def test_fire_await_claims_then_execs_resume(
     code, execs = _fire_await(monkeypatch, env, gid, token)
     assert code == 0
     [(prog, argv, cwd)] = execs
-    assert prog == "claude" and argv[:3] == ["claude", "--resume", SID]
-    assert argv[3].startswith(FRAMING) and "Reply arrived:" in argv[3]
+    assert prog == "claude" and argv[:4] == ["claude", "--resume", SID, "--"]
+    assert argv[4].startswith(FRAMING) and "Reply arrived:" in argv[4]
     assert cwd == str(Path(env["cwd"]).resolve()) or cwd == env["cwd"]
     assert os.environ.get("CCC_NO_CODEX") == "1"
     assert os.environ.get("CLAUDE_CONFIG_DIR") == env["acct"]
@@ -475,9 +475,9 @@ def test_fire_await_fresh_execs_a_new_session(
     assert code == 0
     [(cwd, argv, kw)] = calls
     assert cwd == env["cwd"] and kw == {"strict": True}
-    assert len(argv) == 2 and argv[0] == "claude" and "--resume" not in argv
-    assert argv[1].startswith(f"This is a NEW session started by ccc await group {gid} ")
-    assert f"\n\n{FRAMING}" in argv[1] and "Reply arrived:" in argv[1]
+    assert argv[:2] == ["claude", "--"] and len(argv) == 3 and "--resume" not in argv
+    assert argv[2].startswith(f"This is a NEW session started by ccc await group {gid} ")
+    assert f"\n\n{FRAMING}" in argv[2] and "Reply arrived:" in argv[2]
     assert os.environ.get("CLAUDE_CONFIG_DIR") == env["acct"]
     assert _state(env, gid) == "delivered"
 
@@ -487,5 +487,5 @@ def test_fire_await_resume_argv(env: dict[str, Any], monkeypatch: pytest.MonkeyP
     code, calls = _fire_await_exec_in(monkeypatch, env, gid, token)
     assert code == 0
     [(_cwd, argv, _kw)] = calls
-    assert argv[:3] == ["claude", "--resume", SID] and len(argv) == 4
-    assert argv[3].startswith(FRAMING) and "NEW session" not in argv[3]
+    assert argv[:4] == ["claude", "--resume", SID, "--"] and len(argv) == 5
+    assert argv[4].startswith(FRAMING) and "NEW session" not in argv[4]

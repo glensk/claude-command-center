@@ -100,6 +100,7 @@ def test_builder_shapes() -> None:
         "a b",
         "--resume",
         "s1",
+        "--",
         "go",
     ]
     assert launch_argv.claude_argv(session_id="s1", model="m", effort="high", name="") == [
@@ -133,7 +134,7 @@ def test_command_string_quotes_and_prefixes() -> None:
     argv = launch_argv.claude_argv(resume="sid", name=NAME, prompt="it's")
     line = launch_argv.claude_command(accounts.LaunchTarget(""), argv, cwd="/a b")
     assert line.startswith("unset ") and TITLE_EXPORT in line
-    assert line.endswith("cd '/a b' && claude --name 'voice bridge' --resume sid 'it'\"'\"'s'")
+    assert line.endswith("cd '/a b' && claude --name 'voice bridge' --resume sid -- 'it'\"'\"'s'")
     sub = launch_argv.claude_command(accounts.LaunchTarget(""), argv, cwd="/r", subshell=True)
     assert sub.startswith("cd /r && ( unset ") and sub.endswith(" )")
     assert shlex.split(sub.split("( ", 1)[1].rsplit(" )", 1)[0].rsplit("; ", 1)[1])[:3] == [
@@ -241,7 +242,7 @@ def test_l5_cmd_start_job(
 def test_l6_relaunch_command(spy: list[dict[str, Any]]) -> None:
     line = accounts.relaunch_command(accounts.LaunchTarget(""), "sid", "/repo", "go on")
     assert spy and TITLE_EXPORT in line
-    assert "claude --name 'voice bridge' --resume sid 'go on' )" in line
+    assert "claude --name 'voice bridge' --resume sid -- 'go on' )" in line
 
 
 def test_l7_snapshot_restore(spy: list[dict[str, Any]], tmp_path: Path) -> None:
@@ -280,3 +281,46 @@ def test_no_site_hand_rolls_a_claude_argv() -> None:
             if hand_rolled or "&& claude --resume" in code or "}claude --resume" in code:
                 offenders.append(f"{module.name}:{number}: {line.strip()}")
     assert not offenders, offenders
+
+
+# --------------------------------------------------------------------------- tp#1056
+FRONTMATTER_PROMPT = "---\ncreated: 2026-10-15\n---\nYou are the reviewer."
+DASH_PROMPT = "-dash first line\nrest"
+
+
+def test_builder_puts_a_dash_prompt_behind_the_end_of_options_marker() -> None:
+    """A prompt opening with ``---`` must never be parsed as a claude option (tp#1056)."""
+    argv = launch_argv.claude_argv(session_id="s1", model="m", name="", prompt=DASH_PROMPT)
+    assert argv[-2:] == ["--", DASH_PROMPT] and argv.count("--") == 1
+    argv = launch_argv.claude_argv(resume="s1", name="", prompt=FRONTMATTER_PROMPT)
+    assert argv == ["claude", "--resume", "s1", "--", FRONTMATTER_PROMPT]
+    # Only the prompt sits after the marker: every option comes before it.
+    tail = argv[argv.index("--") + 1 :]
+    assert tail == [FRONTMATTER_PROMPT]
+
+
+def test_builder_without_prompt_adds_no_marker() -> None:
+    assert "--" not in launch_argv.claude_argv(resume="s1", name="")
+    assert "--" not in launch_argv.claude_argv(session_id="s1", model="m", name="")
+
+
+def test_typed_command_line_keeps_a_dash_prompt_after_the_marker() -> None:
+    argv = launch_argv.claude_argv(resume="sid", name="", prompt=FRONTMATTER_PROMPT)
+    line = launch_argv.claude_command(accounts.LaunchTarget(""), argv, cwd="/r")
+    words = shlex.split(line.rsplit("cd /r && ", 1)[1])
+    assert words == ["claude", "--resume", "sid", "--", FRONTMATTER_PROMPT]
+
+
+def test_start_job_with_a_frontmatter_prompt_execs_it_after_the_marker(
+    spy: list[dict[str, Any]], job: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with Store() as store:
+        store.update_fields(job, prompt=FRONTMATTER_PROMPT)
+    monkeypatch.setenv("CCC_START_JOB_HEADLESS", "1")
+    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
+    seen = _capture_exec(monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.cmd_start_job(argparse.Namespace(session_id=job, force=True, auto=False))
+    argv = seen["argv"]
+    assert spy and argv[-2] == "--" and argv[-1].endswith(FRONTMATTER_PROMPT)
+    assert argv.count("--") == 1

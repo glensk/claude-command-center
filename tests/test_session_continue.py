@@ -56,6 +56,7 @@ def test_build_command_resume_with_defaults() -> None:
         "--resume",
         "myid",
         "--dangerously-skip-permissions",
+        "--",
         sc.DEFAULT_PROMPT,
     ]
 

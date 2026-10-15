@@ -581,6 +581,7 @@ def test_start_job_first_launch_when_transcript_only_in_other_project_dir(
         sid,
         "--effort",
         "xhigh",
+        "--",
         "run it",
     ]
 

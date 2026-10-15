@@ -308,7 +308,7 @@ def test_busy_send_recorded_as_a_wrapped_user_record_correlates(
     world = World(tmp_path, status="busy")
     world.write(user("long job"))
     world.on_text = lambda w, text: w.write(*turn_end(), user(_pasted(text)))
-    message = "RELAY (from Albert): wrap up.\n\n(1) start no new work.\n(2) reply DRAINED."
+    message = "RELAY (from the owner): wrap up.\n\n(1) start no new work.\n(2) reply DRAINED."
     code, env, _err = _send(world, monkeypatch, capsys, message)
     assert code == 0 and env is not None and env["data"]["outcome"] == "accepted"
     (d,) = _deliveries(world)

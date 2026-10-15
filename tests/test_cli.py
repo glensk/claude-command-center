@@ -259,6 +259,7 @@ def test_start_job_argv_default_models_no_delegation(
         "job-x",
         "--effort",
         "xhigh",
+        "--",
         "run it",
     ]
 
@@ -276,7 +277,8 @@ def test_start_job_argv_delegates_when_exec_differs(
         "--effort",
         "xhigh",
     ]
-    prompt = argv[7]
+    assert argv[7] == "--"
+    prompt = argv[8]
     assert prompt.startswith("[orchestration] You are the overseer running as opus-5.")
     assert "model 'sonnet'" in prompt  # Agent-tool alias for the executor
     assert prompt.endswith("run it")
@@ -291,8 +293,8 @@ def test_start_job_argv_codex_keeps_model_but_no_delegation(
     # --model still applies (Claude oversees), but a codex job gets no delegation prefix —
     # instead the job_launch_prefix routes it into /codex-implement-task-and-claude-review.
     assert argv[:3] == ["claude", "--model", "claude-opus-5"]
-    assert "[orchestration]" not in argv[7]
-    assert argv[7].startswith("/codex-implement-task-and-claude-review ")
+    assert argv[7] == "--" and "[orchestration]" not in argv[8]
+    assert argv[8].startswith("/codex-implement-task-and-claude-review ")
 
 
 def test_start_job_legacy_fable_row_maps_once_to_opus(

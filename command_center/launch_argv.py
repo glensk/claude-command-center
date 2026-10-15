@@ -75,7 +75,10 @@ def claude_argv(  # pylint: disable=too-many-arguments
     a chosen id), *continue_last* → ``--continue``. *name* ``None`` looks the canonical
     name up by the resumed / chosen id; ``""`` means no name. ``--name`` sits right after
     ``claude``; the positional *prompt* is always LAST (a single argv element — the
-    string renderer quotes it).
+    string renderer quotes it), behind a ``--`` end-of-options marker: a prompt that
+    begins with ``-`` (a role file whose YAML frontmatter opens with ``---``) is otherwise
+    parsed as an unknown option and claude exits at once, and a variadic option in
+    *extra* (``--add-dir <dirs...>``) would otherwise swallow the prompt.
     """
     if name is None:
         name = lookup_name(resume or session_id)
@@ -94,7 +97,7 @@ def claude_argv(  # pylint: disable=too-many-arguments
         argv += ["--effort", effort]
     argv += list(extra)
     if prompt is not None:
-        argv.append(prompt)
+        argv += ["--", prompt]
     return argv
 
 

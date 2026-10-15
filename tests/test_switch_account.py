@@ -1091,7 +1091,7 @@ def test_switch_now_types_the_resume_with_the_prompt_appended(
         f"cd {shlex.quote(env.args.cwd)} && ( unset CLAUDE_SECURESTORAGE_CONFIG_DIR; "
         f"export CLAUDE_CONFIG_DIR={shlex.quote(str(work))}; "
         f"export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; claude --resume {SID} "
-        "'pick up the re-route' )"
+        "-- 'pick up the re-route' )"
     )
     assert env.typed["iterm"] == [(ITERM, expected)]
 
@@ -1378,7 +1378,7 @@ def test_relaunch_command_appends_a_shell_quoted_prompt(
     command = accounts.relaunch_command(
         accounts.LaunchTarget(str(work)), SID, "/repo", "keep going; now"
     )
-    assert command.endswith(f"claude --resume {SID} 'keep going; now' )")
+    assert command.endswith(f"claude --resume {SID} -- 'keep going; now' )")
 
 
 def test_relaunch_command_without_a_prompt_is_byte_identical_to_before(
