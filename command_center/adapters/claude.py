@@ -65,6 +65,12 @@ _HALT_TAIL_BYTES = 65_536
 # which are not snapshot shells. See ``has_background_task`` + ``models.derive_status``.
 _BG_SHELL_SIGNATURE = "shell-snapshots/snapshot-"
 
+# A keep-warm timer: a ``run_in_background`` Bash task running ``~/.claude/hooks/
+# cc-keepwarm.sh`` that only sleeps and re-pings to keep the prompt cache warm. It is
+# disposable — killing it loses nothing, and a relaunched session re-arms its own — so
+# it is never background work that must veto a switch. See ``is_keepwarm_command``.
+_KEEPWARM_MARKER = "cc-keepwarm.sh"
+
 # A ``claude`` process launched by ``ccc start-job`` (or the user) carries an explicit
 # ``--effort <level>`` / ``--effort=<level>`` argument. This parses the level out of the
 # live process's command line (see ``session_effort``); the value is validated against
@@ -709,8 +715,29 @@ def _user_prompt_kind(content: object) -> str:
     return "local" if text.lstrip().startswith(("<command-", "<local-command")) else "prompt"
 
 
+def is_keepwarm_command(command: str) -> bool:
+    """True when *command* runs a keep-warm timer (``_KEEPWARM_MARKER``).
+
+    The ONE predicate both background-work signals use — the transcript side (the
+    launching Bash ``tool_use`` command) and the process side (a Bash-tool shell's argv,
+    which embeds the command as ``eval '<command>'``). A keep-warm timer is disposable:
+    the new process re-arms its own, so it never vetoes a relaunch.
+    """
+    return _KEEPWARM_MARKER in command
+
+
 def pending_background_work(transcript: Path) -> list[str] | None:
     """Ids of background Bash tasks / agents the session started but was never told finished.
+
+    Keep-warm timers (``is_keepwarm_command``) are left out — the full contract is
+    :func:`background_work_split`'s.
+    """
+    split = background_work_split(transcript)
+    return None if split is None else split[0]
+
+
+def background_work_split(transcript: Path) -> tuple[list[str], list[str]] | None:
+    """``(pending, keepwarm)``: in-flight background task ids, keep-warm timers apart.
 
     Claude Code does not expose in-process background work anywhere else on disk, but
     the transcript records both ends of it in STRUCTURED fields: a launch is a record
@@ -719,7 +746,10 @@ def pending_background_work(transcript: Path) -> list[str] | None:
     it ends with a ``TaskStop`` tool call that did not error, or with a
     ``<task-notification>`` naming the id in ``<task-id>…</task-id>`` — in ANY of the
     shapes Claude Code has written one (``_notification_task_ids``). Launched minus
-    ended = still in flight (order kept).
+    ended = still in flight (order kept). An in-flight Bash task whose launching
+    ``tool_use`` command is a keep-warm timer (``is_keepwarm_command``; the launch
+    record's ``tool_result.tool_use_id`` names that ``tool_use``) goes to *keepwarm*
+    instead of *pending*; agents and every other Bash task count as before.
 
     ``None`` means UNKNOWN — the file could not be read, or a record other than the
     (possibly still being written) last line is not JSON — and callers must treat it
@@ -740,6 +770,8 @@ def pending_background_work(transcript: Path) -> list[str] | None:
     launched: list[str] = []
     ended: set[str] = set()
     stops: dict[str, str] = {}  # TaskStop tool_use id -> task id it targets
+    keepwarm_uses: set[str] = set()  # Bash tool_use ids whose command is a keep-warm timer
+    keepwarm: set[str] = set()  # launched task ids that are keep-warm timers
     for index, line in enumerate(lines):
         if not line.strip():
             continue
@@ -754,9 +786,49 @@ def pending_background_work(transcript: Path) -> list[str] | None:
         task_id = _launched_task_id(record)
         if task_id and task_id not in launched:
             launched.append(task_id)
+        if task_id and keepwarm_uses & _tool_result_use_ids(record):
+            keepwarm.add(task_id)
+        keepwarm_uses.update(_keepwarm_tool_use_ids(record))
         ended.update(_notification_task_ids(record))
         _track_task_stops(record, stops, ended)
-    return [task_id for task_id in launched if task_id not in ended]
+    in_flight = [task_id for task_id in launched if task_id not in ended]
+    return (
+        [task_id for task_id in in_flight if task_id not in keepwarm],
+        [task_id for task_id in in_flight if task_id in keepwarm],
+    )
+
+
+def _content_blocks(record: dict[str, object]) -> list[dict[str, object]]:
+    """The dict content blocks of *record*'s ``message`` (``[]`` for any other shape)."""
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [block for block in content if isinstance(block, dict)]
+
+
+def _keepwarm_tool_use_ids(record: dict[str, object]) -> set[str]:
+    """Ids of the Bash ``tool_use`` blocks in *record* that launch a keep-warm timer."""
+    ids: set[str] = set()
+    for block in _content_blocks(record):
+        if block.get("type") != "tool_use" or block.get("name") != "Bash":
+            continue
+        params = block.get("input")
+        command = params.get("command") if isinstance(params, dict) else None
+        use_id = block.get("id")
+        if isinstance(command, str) and isinstance(use_id, str) and is_keepwarm_command(command):
+            ids.add(use_id)
+    return ids
+
+
+def _tool_result_use_ids(record: dict[str, object]) -> set[str]:
+    """The ``tool_use_id`` of every ``tool_result`` block in *record*."""
+    ids: set[str] = set()
+    for block in _content_blocks(record):
+        use_id = block.get("tool_use_id")
+        if block.get("type") == "tool_result" and isinstance(use_id, str):
+            ids.add(use_id)
+    return ids
 
 
 def _notification_task_ids(record: dict[str, object]) -> set[str]:
@@ -1501,7 +1573,13 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         """
         return self._descendant_matches(pid, _is_claude_program, ignore)
 
-    def has_background_task(self, pid: int, ignore: frozenset[int] = frozenset()) -> bool:
+    def has_background_task(
+        self,
+        pid: int,
+        ignore: frozenset[int] = frozenset(),
+        *,
+        skip_keepwarm: bool = False,
+    ) -> bool:
         """Best-effort: True if *pid* has a live descendant Bash-tool shell.
 
         See ``_BG_SHELL_SIGNATURE``. Walks the same cached process tree as
@@ -1511,8 +1589,19 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         process tree each refresh, so it clears the instant the task exits. *ignore*
         as in :meth:`has_subagent` (a ``!``-prefixed command's own Bash-tool shell
         carries the signature too, and must not veto itself).
+
+        *skip_keepwarm* leaves out a shell whose argv runs a keep-warm timer
+        (``is_keepwarm_command`` — the Bash tool embeds the command in the shell's argv as
+        ``eval '<command>'``); the switch-account veto passes it, the status display does
+        not (an idle session holding only a keep-warm timer still reads SNOOZED).
         """
-        return self._descendant_matches(pid, lambda cmd: _BG_SHELL_SIGNATURE in cmd, ignore)
+
+        def matches(cmd: str) -> bool:
+            if _BG_SHELL_SIGNATURE not in cmd:
+                return False
+            return not (skip_keepwarm and is_keepwarm_command(cmd))
+
+        return self._descendant_matches(pid, matches, ignore)
 
     @staticmethod
     def _descendant_matches(

@@ -1629,6 +1629,7 @@ def _background_work(
     ignore: frozenset[int] = frozenset(),
     *,
     active_subagents: int = 0,
+    keepwarm: list[str] | None = None,
 ) -> list[str]:
     """Why the session must NOT be relaunched yet: background work still in flight, by evidence.
 
@@ -1641,8 +1642,11 @@ def _background_work(
     transcript is a reason too — unknown is refused, never assumed clear. Empty ⇒ clear to
     switch. *ignore* is the caller's own process ancestry when it runs inside the session
     (the ``!`` prefix's Bash-tool shell must not veto the very command it is running).
+    Keep-warm timers (``adapters.claude.is_keepwarm_command``) never count — they are
+    disposable and the new process re-arms its own; their transcript ids are appended to
+    *keepwarm* when the caller passes a list.
     """
-    from .adapters.claude import pending_background_work
+    from .adapters.claude import background_work_split
 
     reasons: list[str] = []
     if active_subagents > 0:
@@ -1653,18 +1657,22 @@ def _background_work(
     if live_pid > 0:
         if adapter.has_subagent(live_pid, ignore):
             reasons.append("a child claude process (subagent) is running")
-        if adapter.has_background_task(live_pid, ignore):
+        if adapter.has_background_task(live_pid, ignore, skip_keepwarm=True):
             reasons.append("a background Bash task shell is running")
     if transcript is None:
         reasons.append("the session transcript could not be located — background state unknown")
     else:
-        pending = pending_background_work(transcript)
-        if pending is None:
+        split = background_work_split(transcript)
+        if split is None:
             reasons.append(
                 "the session transcript is unreadable/malformed — background state unknown"
             )
-        elif pending:
-            reasons.append("background task(s) not yet reported back: " + ", ".join(pending))
+        else:
+            pending, timers = split
+            if pending:
+                reasons.append("background task(s) not yet reported back: " + ", ".join(pending))
+            if keepwarm is not None:
+                keepwarm.extend(timers)
     return reasons
 
 
@@ -1890,7 +1898,10 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     own = terminal.pid_ancestry(os.getpid(), terminal.ps_table()) if inside else frozenset()
     with Store() as store:
         in_process = store.active_subagents(session_id)
-    reasons = _background_work(adapter, live.pid, transcript, own, active_subagents=in_process)
+    timers: list[str] = []
+    reasons = _background_work(
+        adapter, live.pid, transcript, own, active_subagents=in_process, keepwarm=timers
+    )
     if reasons and not args.force:
         print(
             "error: background work is still in flight — it would die unreported with this "
@@ -1901,6 +1912,8 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
         return 1
     if reasons:
         print("warning (--force): switching despite " + "; ".join(reasons), file=sys.stderr)
+    if timers:
+        print(f"ccc: ignoring {len(timers)} keep-warm timer(s) (disposable)", file=sys.stderr)
     expected_email = config.claude_account_email_map().get(label)
     if expected_email:
         actual = accounts.account_email(target)

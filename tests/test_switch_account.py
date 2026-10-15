@@ -758,12 +758,95 @@ def test_background_work_reports_the_in_process_subagent_counter(
     monkeypatch.setattr(claude_adapter, "_children_map", lambda: {})
     adapter = claude_adapter.ClaudeAdapter()
     transcript = _jsonl(tmp_path / f"{SID}.jsonl")  # readable, nothing pending
-    assert cli._background_work(adapter, 0, transcript) == []
-    assert cli._background_work(adapter, 0, transcript, active_subagents=0) == []
+    assert not cli._background_work(adapter, 0, transcript)
+    assert not cli._background_work(adapter, 0, transcript, active_subagents=0)
     reasons = cli._background_work(adapter, 0, transcript, active_subagents=2)
     assert reasons == [
         "2 in-process subagent(s) still running (SubagentStart/SubagentStop counter)"
     ]
+
+
+_KEEPWARM_CMD = "~/.claude/hooks/cc-keepwarm.sh 3000 /home/user/.claude/projects/p/s.jsonl"
+
+
+def _bg_bash(use_id: str, task_id: str, command: str) -> list[object]:
+    """The two records of a ``run_in_background`` Bash launch: the tool_use, its result."""
+    return [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": use_id,
+                        "name": "Bash",
+                        "input": {"command": command, "run_in_background": True},
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "toolUseResult": {"backgroundTaskId": task_id},
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": use_id, "content": "ok"}],
+            },
+        },
+    ]
+
+
+def test_background_work_ignores_keepwarm_timers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A keep-warm timer never vetoes a switch — in the transcript or the process tree.
+
+    It only sleeps and re-pings the prompt cache; the relaunched session re-arms its own.
+    A normal background Bash task and a background agent still veto, as before.
+    """
+    snap = "/x/shell-snapshots/snapshot-zsh-1.sh"
+    shell = f"/bin/zsh -c source {snap} 2>/dev/null || true && eval '{_KEEPWARM_CMD}'"
+    monkeypatch.setattr(claude_adapter, "_children_map", lambda: {PID: [(9001, shell)]})
+    adapter = claude_adapter.ClaudeAdapter()
+    only = _jsonl(tmp_path / "only.jsonl", _bg_bash("tu-kw", "bu6hguu1u", _KEEPWARM_CMD))
+    timers: list[str] = []
+    assert not cli._background_work(adapter, PID, only, keepwarm=timers)
+    assert timers == ["bu6hguu1u"]
+
+    agent = {
+        "type": "user",
+        "toolUseResult": {"status": "async_launched", "agentId": "a-1"},
+        "message": {"role": "user", "content": []},
+    }
+    mixed = _jsonl(
+        tmp_path / "mixed.jsonl",
+        [
+            *_bg_bash("tu-kw", "bu6hguu1u", _KEEPWARM_CMD),
+            *_bg_bash("tu-run", "b-run", "pytest -q"),
+            agent,
+        ],
+    )
+    reasons = cli._background_work(adapter, PID, mixed)
+    assert reasons == ["background task(s) not yet reported back: b-run, a-1"]
+
+
+def test_switch_account_reports_ignored_keepwarm_timers(
+    two_accounts: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A switch that skipped keep-warm timers says so in one stderr line."""
+    _prepare_arm(monkeypatch, two_accounts)
+
+    def fake(*_args: object, keepwarm: list[str] | None = None, **_kwargs: object) -> list[str]:
+        if keepwarm is not None:
+            keepwarm.extend(["kw1", "kw2"])
+        return []
+
+    monkeypatch.setattr(cli, "_background_work", fake)
+    assert cli.main(["switch-account", "work", "-s", SID]) == 0
+    assert "ccc: ignoring 2 keep-warm timer(s) (disposable)" in capsys.readouterr().err
 
 
 def test_switch_account_feeds_the_stored_subagent_count_into_the_veto(

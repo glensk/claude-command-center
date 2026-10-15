@@ -1264,3 +1264,94 @@ def test_pending_background_work_taskstop_ends_a_task_and_malformed_is_unknown(
     transcript.write_text("\n".join([records[0], "{not json", records[1]]) + "\n", encoding="utf-8")
     assert pending_background_work(transcript) is None
     assert pending_background_work(tmp_path / "missing.jsonl") is None
+
+
+# --------------------------------------------------------------------------- #
+# keep-warm timers — disposable, never pending background work
+# --------------------------------------------------------------------------- #
+_KEEPWARM_CMD = "~/.claude/hooks/cc-keepwarm.sh 3000 /home/user/.claude/projects/p/s.jsonl"
+
+
+def _bash_use(use_id: str, command: str) -> str:
+    """The assistant record carrying a ``run_in_background`` Bash ``tool_use``."""
+    return _rec(
+        type="assistant",
+        message={
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": use_id,
+                    "name": "Bash",
+                    "input": {
+                        "command": command,
+                        "description": "Re-arm keep-warm until 18:00",
+                        "run_in_background": True,
+                    },
+                }
+            ],
+        },
+    )
+
+
+def test_pending_background_work_skips_a_keepwarm_timer(tmp_path: Path) -> None:
+    """A keep-warm-only transcript has nothing pending; the timer is reported apart."""
+    from command_center.adapters.claude import background_work_split
+
+    transcript = tmp_path / "t.jsonl"
+    records = [_bash_use("tu-kw", _KEEPWARM_CMD), _launch("kw")]
+    transcript.write_text("\n".join(records) + "\n", encoding="utf-8")
+    assert pending_background_work(transcript) == []
+    assert background_work_split(transcript) == ([], ["kw"])
+
+
+def test_pending_background_work_keeps_other_tasks_beside_a_keepwarm_timer(
+    tmp_path: Path,
+) -> None:
+    """Only the keep-warm timer is exempt: a normal Bash task and an agent still count."""
+    from command_center.adapters.claude import background_work_split
+
+    transcript = tmp_path / "t.jsonl"
+    records = [
+        _bash_use("tu-kw", _KEEPWARM_CMD),
+        _launch("kw"),
+        _bash_use("tu-b-run", "pytest -q tests/test_x.py"),
+        _launch("b-run"),
+        _launch("a-agent", agent=True),
+    ]
+    transcript.write_text("\n".join(records) + "\n", encoding="utf-8")
+    assert pending_background_work(transcript) == ["b-run", "a-agent"]
+    assert background_work_split(transcript) == (["b-run", "a-agent"], ["kw"])
+    # A finished keep-warm timer is neither pending nor reported as skipped.
+    records.append(_rec(type="user", message={"role": "user", "content": _notice("kw")}))
+    transcript.write_text("\n".join(records) + "\n", encoding="utf-8")
+    assert background_work_split(transcript) == (["b-run", "a-agent"], [])
+    # Malformed stays unknown.
+    transcript.write_text("\n".join([records[0], "{not json", records[1]]) + "\n", "utf-8")
+    assert background_work_split(transcript) is None
+
+
+def test_has_background_task_skip_keepwarm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Bash-tool shell running only a keep-warm timer does not veto a switch.
+
+    The Bash tool embeds the command in the shell's argv as ``eval '<command>'``. The
+    status display (no ``skip_keepwarm``) still sees it as a background task.
+    """
+    from command_center.adapters import claude as claude_mod
+
+    adapter = ClaudeAdapter()
+    snap = "/home/user/.claude/shell-snapshots/snapshot-zsh-123.sh"
+    shell = f"/bin/zsh -c source {snap} 2>/dev/null || true && eval '{_KEEPWARM_CMD}' < /dev/null"
+    keepwarm_tree = {
+        100: [(101, shell)],
+        101: [(102, "/bin/bash /home/user/.claude/hooks/cc-keepwarm.sh 3000 x")],
+        102: [(103, "sleep 300")],
+    }
+    monkeypatch.setattr(claude_mod, "_children_map", lambda: keepwarm_tree)
+    assert adapter.has_background_task(100, skip_keepwarm=True) is False
+    assert adapter.has_background_task(100) is True
+
+    other = f"/bin/zsh -c source {snap} 2>/dev/null || true && eval 'sleep 90' < /dev/null"
+    mixed_tree = {100: [(101, shell), (201, other)], 201: [(202, "sleep 90")]}
+    monkeypatch.setattr(claude_mod, "_children_map", lambda: mixed_tree)
+    assert adapter.has_background_task(100, skip_keepwarm=True) is True
