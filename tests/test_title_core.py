@@ -63,6 +63,63 @@ def test_push_title_uses_name_then_aim(writes: list[Any]) -> None:
     assert kind == "plain" and cores["w0t0p0:U"].endswith(" voice bridge 🎯 ship X")
 
 
+def test_hand_set_name_drops_the_aim_tail(writes: list[Any]) -> None:
+    session = Session(
+        session_id="s",
+        cwd="/Users/x/repo",
+        aim="answer the open tickets",
+        canonical_name="zoho ticket solver",
+        canonical_name_origin="manual",
+        iterm_session_id="w0t0p0:U",
+    )
+    tabsymbol.push_title(session)
+    [(kind, cores)] = writes
+    assert kind == "plain" and cores["w0t0p0:U"].endswith(" zoho ticket solver")
+    assert "🎯" not in cores["w0t0p0:U"]
+
+
+@pytest.mark.parametrize("origin", ["llm", "fallback", ""])
+def test_generated_or_unnamed_keeps_the_aim_tail(origin: str) -> None:
+    cfg = config.Config(session_names=True, aim_in_tab_title=True)
+    name = "voice bridge" if origin else None
+    session = Session(
+        session_id="s",
+        cwd="/Users/x/repo",
+        aim="ship X",
+        canonical_name=name,
+        canonical_name_origin=origin,
+    )
+    head = name or LEAF
+    assert tabsymbol._session_core(session, "🟧", cfg) == f"🟧 {head} 🎯 ship X"
+
+
+@pytest.mark.parametrize("origin", ["manual", "llm", ""])
+def test_aim_in_tab_title_off_never_shows_the_aim(origin: str) -> None:
+    cfg = config.Config(session_names=True, aim_in_tab_title=False)
+    name = "voice bridge" if origin else None
+    session = Session(
+        session_id="s",
+        cwd="/Users/x/repo",
+        aim="ship X",
+        canonical_name=name,
+        canonical_name_origin=origin,
+    )
+    assert tabsymbol._session_core(session, "🟧", cfg) == f"🟧 {name or LEAF}"
+
+
+def test_manual_name_with_names_off_keeps_leaf_and_aim() -> None:
+    """The name is not shown with ``session_names`` off, so the AIM tail stays."""
+    cfg = config.Config(session_names=False, aim_in_tab_title=True)
+    session = Session(
+        session_id="s",
+        cwd="/Users/x/repo",
+        aim="ship X",
+        canonical_name="zoho ticket solver",
+        canonical_name_origin="manual",
+    )
+    assert tabsymbol._session_core(session, "🟧", cfg) == f"🟧 {LEAF} 🎯 ship X"
+
+
 def test_names_off_keeps_the_leaf(writes: list[Any], monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "load_config", lambda: config.Config(session_names=False))
     session = Session(

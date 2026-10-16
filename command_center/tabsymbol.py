@@ -382,11 +382,18 @@ def title_core(badge: str, cwd: str, aim: str | None = None, *, name: str | None
 
 
 def _session_core(session: Session, badge: str, cfg: Config) -> str:
-    """*session*'s title core under *cfg* (its name when ``session_names``, its AIM if wanted)."""
+    """*session*'s title core under *cfg* (its name when ``session_names``, its AIM if wanted).
+
+    The AIM tail (``aim_in_tab_title``) is dropped when the title shows a name the user
+    set by hand (origin ``manual`` / ``manual-tab``, e.g. a staff agent's ``ccc name``):
+    that name already says what the tab is. Generated names keep the tail.
+    """
     from . import session_names  # lazy
 
-    aim = session.aim if cfg.aim_in_tab_title else None
-    return title_core(badge, session.cwd, aim, name=session_names.title_name(session, cfg))
+    name = session_names.title_name(session, cfg)
+    hand_named = bool(name) and session.canonical_name_origin in session_names.MANUAL_ORIGINS
+    aim = session.aim if cfg.aim_in_tab_title and not hand_named else None
+    return title_core(badge, session.cwd, aim, name=name)
 
 
 def _write_titles(plain: dict[str, str], cas: dict[str, tuple[str, str]], marker: str) -> None:
