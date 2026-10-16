@@ -2198,13 +2198,12 @@ when every session is parked, and over `ccc serve` in the browser:
 > such a 429 persists `oauth_backoff_until` (= now + the server-given wait, capped at 2 h)
 > into the account's usage cache; while that time is in the future `claude_usage_stale`
 > reports the cache fresh, so neither the daemon nor the TUI re-attempts the fetch until it
-> passes (a successful fetch clears the field). Because a backed-off fetch means the number
-> can freeze, the Claude card marks it: when the last *successful* OAuth fetch is more than
-> 1 h old the Fable row is embossed `Fable: stale <age>` (e.g. `Fable: stale 6h 25m`)
-> instead of `Fable: Resets …`, so a stale figure is never shown as if it were live.
+> passes (a successful fetch clears the field). The fetch still records the
+> Fable-scoped `fable_week` window in the cache (`ccc quota` reads it), but the Claude
+> cards no longer render a Fable row — they show only `Session:` and `Week:`.
 >
-> **Session/Week staleness (bare `?%`, no bar).** The same "never show a frozen number
-> as if it were live" rule applies to the two main bars, not just Fable: once
+> **Session/Week staleness (bare `?%`, no bar).** A frozen number is never shown
+> as if it were live: once
 > `now - captured_at` exceeds the window's own lifetime — 5 h for `Session:`, 7 d for
 > `Week:` — that row drops its coloured bar for a bare `Session: ?%` / `Week: ?%`
 > instead, since no session has talked to the API recently enough for the figure to
@@ -2489,8 +2488,8 @@ filenames); malformed entries are skipped.
   account (no `-A`, no account select), the `job_account` config key decides which
   account it bills to: `""` (default) ⇒ the default account (today's behaviour); a
   configured label ⇒ that account (a hard pin); `"auto"` ⇒ the account with the highest
-  **required burn rate** `(100 − used%) ÷ hours-to-reset` over its Fable weekly window
-  (falling back to the plain 7-day window). Routing to the max saturates the allowance
+  **required burn rate** `(100 − used%) ÷ hours-to-reset` over its plain 7-day window
+  (`seven_day`; the Fable-scoped `fable_week` is ignored). Routing to the max saturates the allowance
   that resets *soonest* first and self-balances as it fills (the leader's remaining%
   falls until the other overtakes); a snapshot older than 6h, or an account ≥ 90% used
   while another is usable, is skipped so a routed job never trusts stale data or dies on

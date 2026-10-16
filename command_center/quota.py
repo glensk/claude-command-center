@@ -307,9 +307,9 @@ BAR_HORIZON: dict[str, str] = {
 # The Fable weekly figure is only as fresh as the last successful OAuth fetch
 # (``oauth_fetched_at``): statusline writes refresh ``captured_at`` while PRESERVING a
 # stale Fable value, so judging ``fable_week`` by ``captured_at`` + 7d let a days-old
-# figure govern verdicts as if live. Mirrors the card's own threshold
-# (:data:`usage._FABLE_STALE_AFTER_SEC`).
-_FABLE_EVIDENCE_STALE_SEC = usage._FABLE_STALE_AFTER_SEC  # noqa: SLF001
+# figure govern verdicts as if live: past one hour without a successful fetch it no
+# longer counts as evidence.
+_FABLE_EVIDENCE_STALE_SEC = 3600
 
 _COOLDOWNS_NAME = "cooldowns.json"
 # One line per Codex seat: when a physical attempt was last made on it. Two jobs (plan

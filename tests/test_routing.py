@@ -49,11 +49,9 @@ def _patch_policy(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
 
 
 def _snap(now: int, *, used: float, hours: float, captured_offset: int = 0) -> usage.Usage:
-    """A snapshot whose Fable weekly window is *used*% and resets in *hours* hours."""
+    """A snapshot whose plain 7-day window is *used*% and resets in *hours* hours."""
     win = usage.Window(used_percentage=used, resets_at=now + int(hours * 3600))
-    return usage.Usage(
-        captured_at=now - captured_offset, five_hour=None, seven_day=None, fable_week=win
-    )
+    return usage.Usage(captured_at=now - captured_offset, five_hour=None, seven_day=win)
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +187,7 @@ def test_score_marks_dead_window_unusable(
     _patch_usage(
         monkeypatch,
         {
-            "private": usage.Usage(
-                captured_at=now, five_hour=None, seven_day=None, fable_week=dead
-            ),
+            "private": usage.Usage(captured_at=now, five_hour=None, seven_day=dead),
         },
     )
     private = {s.label: s for s in routing.score_accounts(now=now)}["private"]
@@ -208,7 +204,7 @@ def test_score_marks_missing_snapshot_no_data(
     assert private.note == "no data" and private.urgency is None
 
 
-def test_score_fable_week_none_falls_back_to_seven_day(
+def test_score_uses_seven_day_without_fable_week(
     accounts_env: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With no Fable window the plain 7-day window drives the metric."""
@@ -221,6 +217,36 @@ def test_score_fable_week_none_falls_back_to_seven_day(
     private = {s.label: s for s in routing.score_accounts(now=now)}["private"]
     assert private.note == "ok"
     assert private.urgency == pytest.approx((100.0 - 60.0) / 40.0)  # 1.0 %/h
+
+
+@pytest.mark.usefixtures("accounts_env")
+def test_score_ignores_fable_week_when_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A present ``fable_week`` never drives the metric — ``seven_day`` does."""
+    now = 1_000_000
+    week = usage.Window(used_percentage=60.0, resets_at=now + 40 * 3600)
+    fable = usage.Window(used_percentage=10.0, resets_at=now + 5 * 3600)
+    _patch_usage(
+        monkeypatch,
+        {"private": usage.Usage(captured_at=now, five_hour=None, seven_day=week, fable_week=fable)},
+    )
+    private = {s.label: s for s in routing.score_accounts(now=now)}["private"]
+    assert private.note == "ok"
+    assert private.used_pct == pytest.approx(60.0)
+    assert private.resets_at == week.resets_at
+    assert private.urgency == pytest.approx((100.0 - 60.0) / 40.0)
+
+
+@pytest.mark.usefixtures("accounts_env")
+def test_score_fable_week_alone_is_no_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A snapshot carrying only ``fable_week`` has no usable window for routing."""
+    now = 1_000_000
+    fable = usage.Window(used_percentage=10.0, resets_at=now + 5 * 3600)
+    _patch_usage(
+        monkeypatch,
+        {"private": usage.Usage(captured_at=now, five_hour=None, seven_day=None, fable_week=fable)},
+    )
+    private = {s.label: s for s in routing.score_accounts(now=now)}["private"]
+    assert private.note == "no data" and private.urgency is None
 
 
 # ---------------------------------------------------------------------------

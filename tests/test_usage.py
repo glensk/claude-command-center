@@ -1373,27 +1373,23 @@ def test_claude_usage_stale_keyed_on_oauth_fetched_at(
     assert usage.claude_usage_stale("private", 600, now=_NOW + 602) is True
 
 
-def test_render_shows_fable_row_iff_present() -> None:
+def test_render_never_shows_fable_row() -> None:
+    """A snapshot WITH ``fable_week`` renders only Session + Week — no Fable text."""
     with_fable = usage.Usage(
         captured_at=_NOW,
         five_hour=usage.Window(3, _NOW + 3600),
         seven_day=usage.Window(3, _NOW + 5 * 86400),
         fable_week=usage.Window(42, _NOW + 9 * 86400),
+        oauth_fetched_at=_NOW - 2 * 3600,  # would once have shown "Fable: stale"
     )
     plain = usage.render_usage(with_fable, now=_NOW).plain
-    assert "Fable: Resets in " in plain
-    assert "42%" in plain
+    assert "Fable" not in plain
+    assert "42%" not in plain
+    assert "Session: " in plain and "Week: " in plain
     for line in plain.splitlines():
         assert len(line) == usage._CARD_INNER_WIDTH
-
-    without = usage.Usage(
-        captured_at=_NOW,
-        five_hour=usage.Window(3, _NOW + 3600),
-        seven_day=usage.Window(3, _NOW + 5 * 86400),
-    )
-    assert "Fable:" not in usage.render_usage(without, now=_NOW).plain
-    # The Codex card shares _render_card and must stay two rows.
-    assert "Fable:" not in usage.render_codex_usage(without, now=_NOW).plain
+    # The Codex card shares _render_card and stays two rows too.
+    assert "Fable" not in usage.render_codex_usage(with_fable, now=_NOW).plain
 
 
 def _oauth_hdrs(retry_after: str) -> Message:
@@ -1550,33 +1546,6 @@ def test_write_usage_preserves_backoff(tmp_path: Path, monkeypatch: pytest.Monke
     }
     assert usage.write_usage(statusline, now=_NOW + 5) is True
     assert usage.oauth_backoff_until() == _NOW + 3600  # survived the merge
-
-
-def test_render_fable_stale_marks_label() -> None:
-    """A >1h-old OAuth fetch embosses ``Fable: stale <age>``; a fresh one shows Resets."""
-    stale = usage.Usage(
-        captured_at=_NOW,
-        five_hour=usage.Window(3, _NOW + 3600),
-        seven_day=usage.Window(3, _NOW + 5 * 86400),
-        fable_week=usage.Window(42, _NOW + 9 * 86400),
-        oauth_fetched_at=_NOW - 2 * 3600,  # 2h old
-    )
-    stale_plain = usage.render_usage(stale, now=_NOW).plain
-    assert "Fable: stale" in stale_plain
-    assert "Fable: Resets" not in stale_plain
-    for line in stale_plain.splitlines():
-        assert len(line) == usage._CARD_INNER_WIDTH
-
-    fresh = usage.Usage(
-        captured_at=_NOW,
-        five_hour=usage.Window(3, _NOW + 3600),
-        seven_day=usage.Window(3, _NOW + 5 * 86400),
-        fable_week=usage.Window(42, _NOW + 9 * 86400),
-        oauth_fetched_at=_NOW,  # just fetched
-    )
-    fresh_plain = usage.render_usage(fresh, now=_NOW).plain
-    assert "Fable: Resets" in fresh_plain
-    assert "Fable: stale" not in fresh_plain
 
 
 def test_adaptive_interval_picks_active_only_when_shorter_and_working() -> None:

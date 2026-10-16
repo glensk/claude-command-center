@@ -224,11 +224,6 @@ _OAUTH_AUTHORITY_SEC = 3600
 # fetch for hours. See :func:`fetch_claude_usage` + :func:`claude_usage_stale`.
 _OAUTH_BACKOFF_CAP_SEC = 7200
 
-# After this long without a *successful* OAuth fetch the Fable weekly figure is stale
-# enough that the card marks it (``Fable: stale <age>`` instead of ``Fable: Resets …``) —
-# a frozen number (e.g. a persistent 429 backoff) is then never shown as if it were live.
-_FABLE_STALE_AFTER_SEC = 3600
-
 # Session/Week staleness for the two Claude cards, keyed on ``Usage.captured_at`` (the
 # last time ANY live session under that account talked to the API, or an OAuth fetch
 # ran — whichever is more recent). Past this age the figure predates its own window's
@@ -260,8 +255,8 @@ class Usage:  # pylint: disable=too-many-instance-attributes  # flat snapshot re
     # OAuth fetch, and never on its own without a main window in practice.
     fable_week: Window | None = None
     # Epoch seconds of the last *successful* OAuth fetch that produced this snapshot (0 on
-    # status-line captures and Codex snapshots). Drives the ``Fable: stale <age>`` marker in
-    # the render path — see :data:`_FABLE_STALE_AFTER_SEC` and :func:`_render_card`.
+    # status-line captures and Codex snapshots). :mod:`quota` judges the freshness of
+    # ``fable_week`` by it.
     oauth_fetched_at: int = 0
     # Codex only: non-empty when Codex is REFUSING calls for a reason that is not a
     # window — today `workspace_owner_credits_depleted`. The windows above stay whatever
@@ -1889,7 +1884,7 @@ def _format_age(seconds: int) -> str:
     """Compact elapsed duration (minute precision): ``6h 25m`` / ``2d 3h`` / ``45m``.
 
     Mirrors :func:`format_reset`'s day/hour/minute arithmetic but for an already-elapsed
-    span and with no ``in`` prefix — used for the ``Fable: stale <age>`` marker.
+    span and with no ``in`` prefix — used for ages and renewal spans in the CLI/quota text.
     """
     seconds = max(0, seconds)
     days, rem = divmod(seconds, 86400)
@@ -2141,8 +2136,8 @@ def _section(  # pylint: disable=too-many-arguments
 
     *prefix* names the window inside the bar (``"Session: "`` / ``"Week: "``) — the
     standalone title line above the bar was dropped so each window is just one row. Pass
-    *label* to override the default ``<prefix>Resets …`` emboss (used for the stale-Fable
-    marker), keeping the same bar/percentage rendering. *stale* (see
+    *label* to override the default ``<prefix>Resets …`` emboss (used for the idle-window
+    labels), keeping the same bar/percentage rendering. *stale* (see
     :data:`_SESSION_STALE_AFTER_SEC` / :data:`_WEEK_STALE_AFTER_SEC`) drops the bar
     entirely in favour of a bare ``<prefix>?%`` — a coloured fill would otherwise imply
     a live reading the snapshot is too old to support.
@@ -2176,12 +2171,8 @@ def _render_card(  # pylint: disable=too-many-arguments
 ) -> Text:
     """The two-bar card body (session + week), shared by both providers.
 
-    A third ``Fable:`` row is appended ONLY when :attr:`Usage.fable_week` is set — the
-    Codex card (which shares this renderer) and Claude cards before their first OAuth
-    fetch both stay two rows. ``Fable: `` is shorter than ``Session: ``, so it fits the
-    bar's embossed-label width. When the last successful OAuth fetch is older than
-    :data:`_FABLE_STALE_AFTER_SEC` the Fable row is embossed ``Fable: stale <age>`` instead
-    of ``Fable: Resets …`` so a frozen figure (e.g. under a 429 backoff) is visibly marked.
+    :attr:`Usage.fable_week` is never rendered: the card shows only the Session and
+    Week rows (the snapshot still carries the field for :mod:`quota`).
 
     When *fill_for_pct* is given, each bar's fill is chosen from *its own* usage
     percentage (:func:`_fill_for_pct` for the Claude cards' green/orange/red thresholds);
@@ -2250,20 +2241,6 @@ def _render_card(  # pylint: disable=too-many-arguments
             stale=week_stale,
         )
     )
-    if usage.fable_week is not None:
-        fable_label: str | None = None
-        if usage.oauth_fetched_at > 0 and now - usage.oauth_fetched_at > _FABLE_STALE_AFTER_SEC:
-            fable_label = f"Fable: stale {_format_age(now - usage.oauth_fetched_at)}"
-        text.append_text(
-            _section(
-                "Fable: ",
-                usage.fable_week,
-                now,
-                _fill(usage.fable_week),
-                label_color,
-                label=fable_label,
-            )
-        )
     text.rstrip()
     return text
 
