@@ -517,6 +517,14 @@ def _refresh_claude_usage(
         if usage.claude_usage_stale(label, throttle):
             if usage.fetch_claude_usage(label) is not None:
                 report.claude_refreshed = True
+    if cfg.claude_api_credits and cfg.claude_api_credit_spend:
+        # The API-credit spend estimate (`ccc quota`, the TUI's API bars): self-throttled
+        # to every 30 min inside, best-effort — a failure is recorded in its cache.
+        from . import api_credits  # pylint: disable=import-outside-toplevel
+
+        api_credits.refresh_spend(
+            list(cfg.claude_api_credits), list(cfg.claude_api_credit_spend), int(time.time())
+        )
 
 
 def _refresh_codex_usage(

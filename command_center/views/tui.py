@@ -170,6 +170,17 @@ _CARD_TOGGLE_KEYS: dict[str, str] = {
     "toggle_card_nixos_overseer_tier_a": "card_nixos_overseer_tier_a",
 }
 
+# Toggle action → the card NAME ``usage_cards_hidden`` lists it by (see card_hidden).
+_CARD_NAMES: dict[str, str] = {
+    "toggle_card_private": "claude_private",
+    "toggle_card_work": "claude_work",
+    "toggle_card_codex": "codex",
+    "toggle_card_codex_private": "codex_private",
+    "toggle_card_copilot": "copilot",
+    "toggle_card_nixos_overseer_supervised": "nixos_supervised",
+    "toggle_card_nixos_overseer_tier_a": "nixos_tier_a",
+}
+
 # The two FIXED Codex cards (`t3`/`t5`) → the Codex SEAT label they show, which is the
 # name a ``codex_seat_rota`` entry uses. The `t6`…`t8` cards are their own seat label
 # already (``codex_homes_extra`` is "label=path"), so they need no table.
@@ -203,9 +214,10 @@ _EXTRA_CODEX_CHORDS = tuple(
 def _set_card_expanded(panel: Static, expanded: bool, *, visible: bool = True) -> None:
     """Expand or COLLAPSE one usage card — what its `t…` render gate now does.
 
-    Collapsed is not hidden: the card keeps its border-TOP row — the titled
-    ``╭─ t1:Claude (private) 🏠 ───╮`` line, which is also where the toggle's own
-    chord is advertised — and drops everything below it. The ``.card-collapsed`` class
+    Collapsed is not hidden: the card keeps its border-TOP row — the header line
+    ``t1:Claude (private) 🏠`` (a blank top border carrying the title: the cards draw
+    no box), which is also where the toggle's own chord is advertised — and drops
+    everything below it. The ``.card-collapsed`` class
     does that (``height: 1`` + ``border-bottom: none``).
 
     A collapsed card also **stops paying for its content's width**. The cards sit in an
@@ -228,7 +240,8 @@ def _set_card_expanded(panel: Static, expanded: bool, *, visible: bool = True) -
     squeezed the address as far as it will go, making this at most a cell or two.
 
     *visible* is the separate, harder gate for a card that has nothing to say at all (no
-    ``work`` account): ``display = False`` removes it outright, title line included.
+    ``work`` account) or that ``usage_cards_hidden`` lists: ``display = False`` removes
+    it outright, title line included.
     """
     panel.display = visible
     panel.set_class(not expanded, "card-collapsed")
@@ -239,6 +252,33 @@ def _set_card_expanded(panel: Static, expanded: bool, *, visible: bool = True) -
         return
     panel.update("")
     panel.styles.width = title_cells
+
+
+def card_hidden(hidden: list[str], name: str, *, action: str = "", chord: str = "") -> bool:
+    """True when *hidden* (``usage_cards_hidden``) names this card.
+
+    A card is named by its card name (``copilot``, ``claude_work``, ``codex_<label>``…)
+    or by its chord (``t4``) — whichever the user reads off the panel. *action* resolves
+    the chord through the registry; *chord* gives it directly (the positional extra
+    Codex cards). Case and surrounding spaces are ignored.
+    """
+    wanted = {str(entry).strip().lower() for entry in hidden or []}
+    if not wanted:
+        return False
+    if action and not chord:
+        chord = commands.by_action(action).key
+    return name.lower() in wanted or bool(chord and chord.lower() in wanted)
+
+
+def _with_api_row(card: Text, api_row: Text) -> Text:
+    """A Claude card's body with its API-credit row (when it has one) appended below."""
+    if not api_row.plain:
+        return card
+    out = card.copy()
+    out.append("\n")
+    out.append_text(api_row)
+    out.rstrip()
+    return out
 
 
 # How long a leader stays pending before its timeout. A leader with a standalone action
@@ -2159,44 +2199,28 @@ class CommandCenterApp(App[None]):
     #detail-edit Button:focus { background: $accent 30%; }
     #detail-edit #edit-important { color: white; }
     #usage-col { width: auto; height: auto; }
-    #usage { width: auto; min-width: 38; height: auto; padding: 0 1; border: round $accent; }
-    #usage-work {
-        width: auto; min-width: 38; height: auto; padding: 0 1;
-        border: round #6cb6ff;
+    /* The usage cards are COMPACT: no box. Each card's title is drawn on a blank
+       top border (a header line in the card's colour), its bars below, and one
+       blank line (margin) before the next card — four box rows saved per card.
+       The `#usage…` ids keep their own colour; the extra Codex cards share a class
+       because their ids (#usage-codex-x-<label>) are only known at runtime. */
+    #usage, #usage-work, #usage-codex, #usage-codex-private, .usage-codex-extra,
+    #usage-copilot, #usage-nixos-supervised, #usage-nixos-tier-a {
+        width: auto; min-width: 38; height: auto; padding: 0 1; margin: 0 0 1 0;
+        border: none; border-title-style: bold;
     }
-    #usage-codex {
-        width: auto; min-width: 38; height: auto; padding: 0 1;
-        border: round #19c37d;
+    #usage { border-top: blank $accent; border-title-color: $accent; }
+    #usage-work { border-top: blank #6cb6ff; border-title-color: #6cb6ff; }
+    #usage-codex, #usage-codex-private, .usage-codex-extra {
+        border-top: blank #19c37d; border-title-color: #19c37d;
     }
-    /* The second ChatGPT login's card — same product, so the same green box; the two
-       are told apart by the account e-mail in their border titles. */
-    #usage-codex-private {
-        width: auto; min-width: 38; height: auto; padding: 0 1;
-        border: round #19c37d;
-    }
-    /* …and every THIRD-and-further login (codex_homes_extra). One rule for all of them:
-       their ids (#usage-codex-x-<label>) are only known at runtime, so they carry a
-       class instead — same green box, told apart by the e-mail in the border title. */
-    .usage-codex-extra {
-        width: auto; min-width: 38; height: auto; padding: 0 1;
-        border: round #19c37d;
-    }
-    #usage-copilot {
-        width: auto; min-width: 38; height: auto; padding: 0 1;
-        border: round #a371f7;
-    }
-    #usage-nixos-supervised {
-        width: auto; min-width: 38; height: auto; padding: 0 1;
-        border: round #ff8700;
-    }
-    #usage-nixos-tier-a {
-        width: auto; min-width: 38; height: auto; padding: 0 1;
-        border: round #2bb2b2;
-    }
-    /* A card whose `t…` gate is off (see _set_card_expanded): keep the titled
-       border-top row, drop the rest of the box. `!important` because the per-card
-       `#usage…` id rules out-specify a plain class selector. The WIDTH is pinned
-       inline there (to the title), not here — each card keeps its own min-width. */
+    #usage-copilot { border-top: blank #a371f7; border-title-color: #a371f7; }
+    #usage-nixos-supervised { border-top: blank #ff8700; border-title-color: #ff8700; }
+    #usage-nixos-tier-a { border-top: blank #2bb2b2; border-title-color: #2bb2b2; }
+    /* A card whose `t…` gate is off (see _set_card_expanded): keep the title line,
+       drop the rest. `!important` because the per-card `#usage…` id rules out-specify
+       a plain class selector. The WIDTH is pinned inline there (to the title), not
+       here — each card keeps its own min-width. */
     .card-collapsed { height: 1 !important; border-bottom: none !important; }
     #keyhints { dock: bottom; height: 1; background: $panel; }
     """
@@ -2801,11 +2825,23 @@ class CommandCenterApp(App[None]):
         # empty rather than a stale/wrong-account guess.
         private_label = accounts.resolve_card_label("private")
         work_label = accounts.resolve_card_label("work")
+        # Each Claude card ends with its account's monthly API-credit bar (spent ÷ grant,
+        # an ESTIMATE — see api_credits): cache and local ledger only, never the network.
+        api_grants = self._api_credit_statuses()
         private_panel.update(
-            usage.render_usage(usage.read_usage(private_label) if private_label else None)
+            _with_api_row(
+                usage.render_usage(usage.read_usage(private_label) if private_label else None),
+                usage.render_api_credit_row(api_grants.get(private_label or "")),
+            )
         )
         work_panel.update(
-            usage.render_work_usage(usage.read_usage(work_label) if work_label else None)
+            _with_api_row(
+                usage.render_work_usage(usage.read_usage(work_label) if work_label else None),
+                usage.render_api_credit_row(
+                    api_grants.get(work_label or ""),
+                    accent=usage._CLAUDE_WORK_ACCENT,  # noqa: SLF001
+                ),
+            )
         )
         codex_panel.update(
             usage.render_codex_usage(
@@ -2864,34 +2900,64 @@ class CommandCenterApp(App[None]):
         # _set_card_expanded). The Copilot RENDER gate is `usage_card_copilot` ALONE; its
         # network FETCH stays gated on `copilot_usage` ALONE (below), so the two are
         # independently settable by hand.
-        _set_card_expanded(private_panel, self.cfg.usage_card_private)
+        _set_card_expanded(
+            private_panel,
+            self.cfg.usage_card_private,
+            visible=not self._card_hidden("claude_private", "toggle_card_private"),
+        )
         # A machine with no `work` account configured must not show a permanently empty
         # work card — not even a collapsed title line — so that one is gated on `visible`
         # and disappears entirely. Parsed from the already-loaded Config: no file read.
-        _set_card_expanded(work_panel, self.cfg.usage_card_work, visible=self._has_work_account())
+        _set_card_expanded(
+            work_panel,
+            self.cfg.usage_card_work,
+            visible=self._has_work_account()
+            and not self._card_hidden("claude_work", "toggle_card_work"),
+        )
         # …and a Codex card whose seat is somebody else's this rota week collapses
         # regardless of its own gate (which stays untouched — see _codex_card_expanded).
         _set_card_expanded(
-            codex_panel, self._codex_card_expanded("default", self.cfg.usage_card_codex)
+            codex_panel,
+            self._codex_card_expanded("default", self.cfg.usage_card_codex),
+            visible=not self._card_hidden("codex", "toggle_card_codex"),
         )
         # …and, like the work card, the second Codex card disappears outright (title line
         # included) on a machine with no codex_home_private — there is nothing to show.
         _set_card_expanded(
             codex_private_panel,
             self._codex_card_expanded("private", self.cfg.usage_card_codex_private),
-            visible=self._has_codex_private(),
+            visible=self._has_codex_private()
+            and not self._card_hidden("codex_private", "toggle_card_codex_private"),
         )
         # The extra Codex cards invert the gate: a label LISTED in
         # usage_card_codex_extra_collapsed is collapsed, anything else expanded — so a
         # newly configured login needs no second key to show up. They only exist when
         # configured, so `visible` is never in question here.
         collapsed = set(self.cfg.usage_card_codex_extra_collapsed)
+        extra_chords = dict(zip(self._codex_homes_extra(), _EXTRA_CODEX_CHORDS, strict=False))
         for label, extra_panel in extra_panels.items():
             expanded = self._codex_card_expanded(label, label not in collapsed)
-            _set_card_expanded(extra_panel, expanded, visible=True)
-        _set_card_expanded(copilot_panel, self.cfg.usage_card_copilot)
-        _set_card_expanded(nixos_supervised_panel, self.cfg.card_nixos_overseer_supervised)
-        _set_card_expanded(nixos_tier_a_panel, self.cfg.card_nixos_overseer_tier_a)
+            hidden = self._card_hidden(f"codex_{label}", chord=extra_chords.get(label, ""))
+            _set_card_expanded(extra_panel, expanded, visible=not hidden)
+        # Hidden (usage_cards_hidden, default: the Copilot card) removes a card outright,
+        # title line included — collapsing (its `t…` gate) still keeps the title.
+        _set_card_expanded(
+            copilot_panel,
+            self.cfg.usage_card_copilot,
+            visible=not self._card_hidden("copilot", "toggle_card_copilot"),
+        )
+        _set_card_expanded(
+            nixos_supervised_panel,
+            self.cfg.card_nixos_overseer_supervised,
+            visible=not self._card_hidden(
+                "nixos_supervised", "toggle_card_nixos_overseer_supervised"
+            ),
+        )
+        _set_card_expanded(
+            nixos_tier_a_panel,
+            self.cfg.card_nixos_overseer_tier_a,
+            visible=not self._card_hidden("nixos_tier_a", "toggle_card_nixos_overseer_tier_a"),
+        )
         if self.cfg.copilot_usage:
             # Keep the (network-sourced) figure warm without blocking render: when the
             # cache is stale, fire a detached `ccc copilot-usage` to refresh it for the
@@ -4786,6 +4852,25 @@ class CommandCenterApp(App[None]):
         self._toggle_rota_card(seat, label)
         return True
 
+    def _card_hidden(self, name: str, action: str = "", *, chord: str = "") -> bool:
+        """True when ``usage_cards_hidden`` lists this card by name or by its chord."""
+        return card_hidden(self.cfg.usage_cards_hidden, name, action=action, chord=chord)
+
+    def _api_credit_statuses(self) -> dict[str, dict[str, Any]]:
+        """Account label → its API-credit status with the spend estimate (no network)."""
+        if not self.cfg.claude_api_credits:
+            return {}
+        from datetime import date  # pylint: disable=import-outside-toplevel
+
+        from .. import api_credits  # pylint: disable=import-outside-toplevel
+
+        rows = api_credits.statuses_with_spend(
+            list(self.cfg.claude_api_credits),
+            list(self.cfg.claude_api_credit_spend or []),
+            date.today(),
+        )
+        return {str(row["account"]): row for row in rows}
+
     def _set_claude_card_titles(self) -> None:
         """(Re)build both Claude cards' border titles.
 
@@ -4883,8 +4968,18 @@ class CommandCenterApp(App[None]):
             return f"{label} card {state} again."
 
         self._push_undo(f"{label} card toggle", undo_card)
+        hidden = next(
+            (
+                f" — but it is hidden by usage_cards_hidden ({name})"
+                for action, gate in _CARD_TOGGLE_KEYS.items()
+                if gate == key
+                and (name := _CARD_NAMES.get(action, ""))
+                and self._card_hidden(name, action)
+            ),
+            "",
+        )
         if announce:
-            self.notify(f"{label} card {'expanded' if new_value else 'collapsed'}.")
+            self.notify(f"{label} card {'expanded' if new_value else 'collapsed'}{hidden}.")
 
     def action_toggle_card_private(self) -> None:
         """Expand/collapse the Claude (private) usage card — the `t1` chord."""

@@ -624,7 +624,25 @@ def cmd_claude_usage(args: argparse.Namespace) -> int:
         if label in derived and usage.claude_profile_stale(label):
             created = usage.fetch_claude_profile(label)
             print(f"claude-usage: {label} subscription start {created or '(unavailable)'}")
+    # The API-credit spend estimate rides along (self-throttled to every 30 min; no
+    # `admin_api` source in `claude_api_credit_spend` ⇒ no network call at all).
+    import time  # pylint: disable=import-outside-toplevel
+
+    for line in _refresh_api_credit_spend(int(time.time())):
+        print(f"claude-usage: api credits {line}")
     return 0
+
+
+def _refresh_api_credit_spend(now: int, *, force: bool = False) -> list[str]:
+    """Refresh the cached Admin-API spend behind ``ccc quota``'s API-credit bars."""
+    from . import api_credits  # pylint: disable=import-outside-toplevel
+
+    cfg = config.load_config()
+    if not cfg.claude_api_credits or not cfg.claude_api_credit_spend:
+        return []
+    return api_credits.refresh_spend(
+        list(cfg.claude_api_credits), list(cfg.claude_api_credit_spend), now, force=force
+    )
 
 
 def cmd_record_run(args: argparse.Namespace) -> int:
@@ -4212,6 +4230,7 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
     if args.refresh:
         for label in config.claude_config_dirs():
             usage.fetch_claude_usage(label, now)
+        _refresh_api_credit_spend(now, force=True)
         usage.fetch_copilot_usage(now)
         # Opt-in (a network call per Codex login), so gated exactly like the daemon's pass.
         live_cfg = config.load_config()
@@ -4262,7 +4281,8 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
         + (f" ({prov['command']})" if prov.get("command") else "")
         for prov in snap["providers"]
     }
-    width = max([len("provider"), *(len(n) for n in names.values())])
+    credit_names = [_api_credit_name(row) for row in snap.get("api_credits") or []]
+    width = max([len("provider"), *(len(n) for n in names.values()), *map(len, credit_names)])
     # Both variable-width columns are measured, never guessed: a `marked 20h 20m` age is
     # 14 characters and used to push every column behind it out of alignment on that row
     # alone. Computed here so the ages are formatted once and reused by the loop.
@@ -4348,23 +4368,54 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
             f"  {mark} {shown_name} {shown_state} {ages[prov['id']]:<{age_w}} "
             f"{cells}{shown_renew} {detail}".rstrip()
         )
+    body.extend(
+        _api_credit_lines(
+            snap, now, width=width, age_w=age_w, bars=bars, color=color, colorable=colorable
+        )
+    )
     _print_quota_table(head, body, colorable=colorable)
     if snap["best_claude_account"]:
         best = names.get(snap["best_claude_account"]) or quota.display_id(
             snap["best_claude_account"]
         )
         print(f"best Claude account (spends what resets soonest): {best}")
-    _print_api_credits(snap, now)
     _print_codex_seat_footer(snap, now)
     return 0
 
 
-def _print_api_credits(snap: dict[str, Any], now: int) -> None:
-    """One line per configured monthly API-credit grant (``claude_api_credits``).
+def _api_credit_name(row: dict[str, Any]) -> str:
+    """An API-credit row's name, spelled the way the provider column spells its account."""
+    return str(row.get("display") or row["id"]) + (
+        f" ({row['command']})" if row.get("command") else ""
+    )
 
-    Named the way the provider column names the account, so the line is read against
-    its row. The balance is ``n/a`` by construction: no API exposes it (see
-    ``api_credits``), and the grant is never presented as what is left.
+
+# An Admin-API spend figure older than this draws its bar without colour (stale), like
+# every other row whose evidence has aged past its refresh cadence.
+_API_SPEND_STALE_SEC = 2 * 3600
+
+
+def _api_credit_lines(  # pylint: disable=too-many-arguments,too-many-locals
+    snap: dict[str, Any],
+    now: int,
+    *,
+    width: int,
+    age_w: int,
+    bars: bool,
+    color: bool,
+    colorable: bool,
+) -> list[str]:
+    """The table rows for the monthly API-credit grants (``claude_api_credits``).
+
+    Laid out in the provider table's own columns — blank mark, the account named as its
+    provider row names it, ``api est.`` (or ``api`` without an estimate) in the state
+    column, the spend figure's age, ONE bar across the session + week columns (spent ÷
+    grant, embossed ``API est.``), the grant's expiry in the renew column, then the
+    detail. The bar and the ``≈$X of $Y left`` are an ESTIMATE (``api_credits``): the
+    state word and the bar both say so, and without a spend source the bar reads
+    ``API n/a`` with no percentage — never a 0 % that would claim an untouched grant.
+    A dim header line first says what the credits pay for, because they are a separate
+    pot from every window above them.
     """
     from datetime import datetime  # pylint: disable=import-outside-toplevel
 
@@ -4372,17 +4423,32 @@ def _print_api_credits(snap: dict[str, Any], now: int) -> None:
 
     rows = snap.get("api_credits") or []
     if not rows:
-        return
+        return []
     today = datetime.fromtimestamp(now).date()
-    names = [
-        str(row.get("display") or row["id"])
-        + (f" ({row['command']})" if row.get("command") else "")
-        for row in rows
-    ]
-    width = max(len(name) for name in names)
-    print("API credits (Claude API, Console, Agent SDK — not interactive Claude Code):")
-    for name, row in zip(names, rows, strict=True):
-        print(f"  {name:<{width}}  {api_credits.describe(row, today)}")
+    intro = "API credits (Claude API, Console, Agent SDK — not interactive Claude Code):"
+    lines = [f"  \033[2m{intro}\033[0m" if colorable else f"  {intro}"]
+    for row in rows:
+        pct = row.get("est_used_pct")
+        spend_at = int(row.get("spend_at") or 0)
+        windows: dict[str, Any] = {}
+        if pct is not None:
+            stale = row.get("spend_scope") == "org" and now - spend_at > _API_SPEND_STALE_SEC
+            windows["grant"] = {"used_pct": float(pct), "stale": stale}
+        expires = row.get("expires_on") or row.get("next_grant_on")
+        resets_at = int(datetime.fromisoformat(str(expires)).timestamp()) if expires else 0
+        pseudo = {"kind": "api_credit", "windows": windows, "state": "", "resets_at": resets_at}
+        cells = _quota_bar_cells(pseudo, color=color)[0] if bars else ""
+        renew, _at, renew_color = _quota_renew(pseudo, now)
+        shown_renew = f"{renew:<{_RENEW_WIDTH}}"
+        if colorable and renew_color:
+            shown_renew = f"{renew_color}{shown_renew}\033[0m"
+        age = _quota_age({"captured_at": spend_at}, now)
+        state = "api est." if pct is not None else "api"
+        lines.append(
+            f"  {_pad_cells('', _MARK_WIDTH)} {_api_credit_name(row):<{width}} {state:<10} "
+            f"{age:<{age_w}} {cells}{shown_renew} {api_credits.describe(row, today)}".rstrip()
+        )
+    return lines
 
 
 def _print_quota_table(head: str, body: list[str], *, colorable: bool) -> None:

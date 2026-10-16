@@ -264,13 +264,23 @@ BAR_SLOTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # Keyed on the KIND, not on which windows happen to be present, so a row with no figures
 # at all (blocked by an observed 429 before any meter was read) still draws its one empty
 # bar instead of briefly turning into a two-window provider.
-BAR_SPAN_KINDS: tuple[str, ...] = ("copilot", "agy", "opencode", "muse")
-BAR_SPAN_WINDOWS: tuple[str, ...] = ("credits", "gemini_week", "claudegpt_week", "wallet", "budget")
+# `api_credit` is not a provider: it is the pseudo-row `ccc quota` draws under the table
+# for each monthly API-credit grant (`claude_api_credits`), its `grant` window the
+# estimated share spent (see `api_credits.with_spend`).
+BAR_SPAN_KINDS: tuple[str, ...] = ("copilot", "agy", "opencode", "muse", "api_credit")
+BAR_SPAN_WINDOWS: tuple[str, ...] = (
+    "credits",
+    "gemini_week",
+    "claudegpt_week",
+    "wallet",
+    "budget",
+    "grant",
+)
 # What a SPANNING bar says when the provider has no window to draw at all. Without it
 # such a row shows an empty bar embossed `0%`, which reads as "nothing spent" when the
 # truth is "nothing is measured" — the opposite claim, and the one that would send a
 # reader to a rung believing it was proven idle.
-BAR_SPAN_EMPTY: dict[str, str] = {"opencode": "unmetered"}
+BAR_SPAN_EMPTY: dict[str, str] = {"opencode": "unmetered", "api_credit": "API n/a"}
 
 # The word a window's bar is labelled with: WHAT PERIOD this allowance renews on. A bar
 # without it is a percentage of an unnamed thing — "56 %" reads very differently against a
@@ -285,6 +295,9 @@ BAR_HORIZON: dict[str, str] = {
     # Also not a period: a spending cap the user named, against which every dollar this
     # machine's muse sessions cost is counted. Nothing renews it but a bigger number.
     "budget": "budget",
+    # An API-credit grant's ESTIMATED spend (`api_credits.with_spend`): the pot is the
+    # month's grant, the figure an estimate — both words belong in the bar.
+    "grant": "API est.",
     "seven_day": "weekly",
     "gemini_week": "weekly",
     "claudegpt_week": "weekly",
@@ -2344,11 +2357,12 @@ def snapshot(
     if rota_problems:
         result["codex_seat_rota_errors"] = [asdict(err) for err in rota_problems]
         _warn_rota_errors(rota_problems)
-    # ADDITIVE (2026-10-16, v2 stays v2): the monthly API-credit grants from
-    # `claude_api_credits` — amount and dates as configured, `balance_usd` always null
-    # (no API exposes it). Not a provider row: the credits pay for API calls, not for the
-    # session/week windows the rows rank, so they must not enter any verdict. Absent when
-    # nothing is configured.
+    # ADDITIVE (v2 stays v2): the monthly API-credit grants from `claude_api_credits` —
+    # amount and dates as configured, `balance_usd` always null (no API exposes it), plus
+    # the `est_*` spend estimate when `claude_api_credit_spend` names a source (cache and
+    # local files only, never the network). Not a provider row: the credits pay for API
+    # calls, not for the session/week windows the rows rank, so they must not enter any
+    # verdict. Absent when nothing is configured.
     if credit_rows := _api_credit_rows(now, labels):
         result["api_credits"] = credit_rows
     # Only an ACTIVE pin is reported: a pin that governs nothing (an explicit order under
@@ -2371,10 +2385,16 @@ def _api_credit_rows(now: int, labels: list[str]) -> list[dict[str, Any]]:
 
     from . import api_credits  # pylint: disable=import-outside-toplevel
 
-    entries = list(config.load_config().claude_api_credits or [])
+    cfg = config.load_config()
+    entries = list(cfg.claude_api_credits or [])
     if not entries:
         return []
-    rows = api_credits.statuses(entries, datetime.fromtimestamp(now).date(), order=labels)
+    rows = api_credits.statuses_with_spend(
+        entries,
+        list(cfg.claude_api_credit_spend or []),
+        datetime.fromtimestamp(now).date(),
+        order=labels,
+    )
     for row in rows:
         row["display"] = display_id(row["id"])
         if command := seat_command(row["id"]):

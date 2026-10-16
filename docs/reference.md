@@ -2054,37 +2054,47 @@ used portion, the card's accent colour over the track) so the bar's fill still s
 usage behind it. The percentage sits **immediately after the bar**, flush against the
 card's inner edge: the bar takes the whole row minus the percentage's own width, so
 there is no gap between bar and number (a `100%` bar is therefore one cell shorter than
-a `27%` one). The cards sit flush against each other:
+a `27%` one). The cards are **compact — no box**: each card is a header line (its title,
+bold, in the card's colour: gold/`$accent` Claude private, blue work, green Codex, violet
+Copilot), its bars below, and one blank line before the next card. Each Claude card ends
+with its account's **monthly API-credit bar** when `claude_api_credits` configures a grant
+for it (see *Monthly API credits* under `ccc quota`): the estimated share of the grant spent,
+embossed with what is left and when the grant expires — or a grey `balance n/a` line when
+no spend source is configured:
 
 ```text
-╭──── Claude (private) ───────────────╮
-│ ██Session: Resets in 1h 57m░░░░░░33% │
-│ ██Week: Resets in 3d 11h 36m░░░░░20% │
-╰──────────────────────────────────────╯
-╭──── Codex first…@example.org ───────╮
-│ ██Session: Resets in 2h 11m░░░░░░14% │
-│ ██Week: Resets in 6d 0h 5m░░░░░░░10% │
-╰──────────────────────────────────────╯
-╭──── Copilot gpt-5.4 ────────────────╮
-│ ░Resets in 4d░░░░░░░░░░░░░░░░░░░░░0% │
-╰──────────────────────────────────────╯
+ t1:Claude (private) 🏠
+ ██Session: Resets in 1h 57m░░░░░░33%
+ ██Week: Resets in 3d 11h 36m░░░░░20%
+ API est. ≈$150 left →26.10.░░░░░25%
+
+ t3:Codex first…@example.org
+ ██Session: Resets in 2h 11m░░░░░░14%
+ ██Week: Resets in 6d 0h 5m░░░░░░░10%
 ```
+
+**Hidden cards — `usage_cards_hidden`.** A card listed there is not drawn at all, title
+line included (its fetches are unaffected, so `ccc quota` still reports it). Name it by
+card name — `claude_private`, `claude_work`, `codex`, `codex_private`, `codex_<label>`,
+`copilot`, `nixos_supervised`, `nixos_tier_a` — or by its chord (`t4`). The default is
+`["copilot"]`; set `usage_cards_hidden = []` to bring the Copilot card back. Its `t…` chord
+still flips the gate and says the card is hidden.
 
 **Expand/collapse each card with the persistent `t1`…`t8` / `to` / `ta` chords** (`t1` = Claude
 private, `t2` = Claude work, `t3` = Codex, `t4` = Copilot, `t5` = the second Codex login,
 `t6`/`t7`/`t8` = the first three `codex_homes_extra` logins,
 `to` = nixos overseer supervised,
 `ta` = nixos overseer tier_a; type `t` alone for the menu). **Collapsed is not hidden**: the card
-keeps its titled top border — the line that names its own chord — and drops the rest of the box,
-so a folded-away card stays one keystroke from coming back:
+keeps its header line — the line that names its own chord — and drops its bars, so a
+folded-away card stays one keystroke from coming back:
 
 ```
-╭─ t1:Claude (private) 🏠 ───────────────╮
-╭─ t3:Codex first…@example.org ─────────╮
-╭─ t5:Codex second…@example.com ────────╮
-╭─ t4:Copilot gpt-5.4 ──────────────────╮
-│ ░Resets in 4d░░░░░░░░░░░░░░░░░░░░░░0% │
-╰───────────────────────────────────────╯
+ t1:Claude (private) 🏠
+
+ t3:Codex first…@example.org
+
+ t4:Copilot gpt-5.4
+ ░Resets in 4d░░░░░░░░░░░░░░░░░░░░░░0%
 ```
 
 A collapsed card also gives back its **width**: the cards share one auto-width column
@@ -2101,7 +2111,8 @@ Unlike the view-local `td`/`tf` toggles these **persist** to `config.toml`
 `t2` on a machine with no `work` account explains itself instead of toggling an empty
 box (that card is absent entirely, title line included — as is the `t5` card without a
 `codex_home_private` and a `t6`…`t8` card with no `codex_homes_extra` entry at that
-position; those are the only cards that ever disappear outright).
+position; those, and the cards `usage_cards_hidden` lists, are the only cards that ever
+disappear outright).
 
 **A Codex card whose seat is somebody else's this week collapses by itself.** A login
 shared on a `codex_seat_rota` (docs/codex.md § "Sharing a seat on a weekly rota") is
@@ -2680,23 +2691,52 @@ claude_api_credits = [
 
 `usd` is the grant per cycle, `day` the day of month the cycle turns over (the current grant
 expires and the next one lands; clamped in short months), `from` the optional first grant
-(before it only the next grant is shown). A bad entry is skipped, never the others. The
-report prints one line per account under the table:
+(before it only the next grant is shown). A bad entry is skipped, never the others.
+
+**Spend estimate — `claude_api_credit_spend`.** No API exposes the remaining balance, but the
+spend since the grant landed can be read, so the grant minus that spend is shown as an
+ESTIMATE (labelled `est.` everywhere). One source per account:
+
+```toml
+claude_api_credit_spend = [
+  "work=admin_api:~/secrets/anthropic-admin.env",                 # org Admin API cost_report
+  "private=runs_jsonl:~/.local/state/claude-apikey/runs.jsonl",   # local run ledger
+]
+```
+
+- `admin_api[:<dotenv path>]` — the Console org's Admin API `cost_report`, with the org
+  admin key `ANTHROPIC_ADMIN_API_KEY` read from that dotenv file (or the environment when no
+  path is given). It counts **completed UTC days only** (today's spend lands tomorrow) and
+  everything the org spent, which may be invoiced instead of paid from the grant. It is a
+  network call, so it never runs inside a report: `ccc claude-usage` (spawned by the TUI and
+  the daemon) refreshes it at most every 30 minutes, `ccc quota -r` forces it, and the
+  result is cached in `api_credit_spend.json` (a failed fetch is recorded there and keeps
+  the last good figure for the same grant). The key is never written anywhere.
+- `runs_jsonl:<path>` — the `cost_usd` sum of a local ledger (one JSON object per line with
+  `ts` and `cost_usd`) since the grant date: what THIS machine spent, a lower bound, labelled
+  "this machine only". Read on every report (memoised on the file's identity).
+
+The report draws one row per grant in the table's own columns — `api est.` (or `api`
+without an estimate) in the state column, the spend figure's age, one bar across the
+session + week columns (spent ÷ grant, embossed `API est.`), the grant's expiry in the renew
+column, then the detail:
 
 ```
-API credits (Claude API, Console, Agent SDK — not interactive Claude Code):
-  claude-priv (cpriv)  $200/cycle · granted 9.10. · expires 26.10. (in 10d), next grant then · balance: n/a
-  claude-work (cwork)  $500/cycle · first grant 20.10. (in 4d) · balance: n/a
+  API credits (Claude API, Console, Agent SDK — not interactive Claude Code):
+     claude-priv (cpriv)   api est.   12m      ░░░░░░░░API est.░░░░░░░░░0% renew 9d 6h    ≈$199.99 of $200 left (est.) · $0.01 spent since 9.10. (run ledger, this machine only) · expires 26.10. (in 10d), next grant then
+     claude-work (cwork)   api        —        ░░░░░░░░░░API n/a░░░░░░░░░░ renew 3d 5h    $500/cycle · granted 16.10. · expires 20.10. (in 4d), next grant then · balance: n/a
 ```
 
-**The balance is always `n/a`.** The public Admin API (`/v1/organizations/*`) has no
-credit-balance endpoint — `cost_report` states spend, which may be invoiced instead of
-paid from the grant — and the claude.ai billing page shows only the grant and the next
-credit date. So ccc never subtracts anything from the grant. `-j` carries the same facts
-as a top-level `api_credits` list (`id`, `account`, `usd_per_cycle`, `cycle_day`,
+Without a spend source the bar reads `API n/a` with no percentage (a `0%` would claim an
+untouched grant) and the line ends `balance: n/a`; a configured source with nothing for
+the current grant yet says `spend not read yet (`ccc quota -r`)`. `-j` carries the same
+facts as a top-level `api_credits` list (`id`, `account`, `usd_per_cycle`, `cycle_day`,
 `granted_on`, `expires_on`, `next_grant_on`, `balance_usd: null`, `balance_source: "n/a"`,
-`source: "config"`, `display`, `command`; additive, schema still v2, absent when nothing
-is configured). They are not provider rows: no verdict, ranking or ladder reads them.
+`source: "config"`, `display`, `command`, and with a spend source `est_spent_usd`,
+`est_left_usd`, `est_used_pct`, `spend_source`, `spend_scope` (`org`/`machine`),
+`spend_at`, `spend_pending`, `spend_error`; additive, schema still v2, absent when nothing
+is configured). `balance_usd` stays `null`: an estimate is not a balance. They are not
+provider rows: no verdict, ranking or ladder reads them.
 
 ### The Muse Code row — `muse`
 

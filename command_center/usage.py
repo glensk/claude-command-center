@@ -2294,6 +2294,40 @@ def render_usage(
     )
 
 
+def _api_money(usd: float) -> str:
+    """Card-sized dollars: whole dollars from $100 up, cents below."""
+    return f"${usd:,.0f}" if abs(usd) >= 100 else f"${usd:,.2f}"
+
+
+def render_api_credit_row(status: dict[str, Any] | None, *, accent: str = _CLAUDE_ACCENT) -> Text:
+    """One card row for an account's monthly API-credit grant (``api_credits``).
+
+    With a spend estimate it is a bar like the window rows above it — the estimated
+    share of the grant spent, coloured by :func:`_fill_for_pct` — embossed
+    ``API est. ≈$X left →D.M.`` (what is left, when the grant expires). Without one it
+    is a grey text line, never an empty bar: ``0%`` would claim an untouched grant.
+    ``None`` (no grant configured for the account) renders nothing. *accent* colours
+    the embossed label like the card's reset labels (gold private, blue work).
+    """
+    if not status:
+        return Text()
+    import datetime as _dt  # pylint: disable=import-outside-toplevel
+
+    expires = status.get("expires_on")
+    if not expires:
+        first = _dt.date.fromisoformat(str(status["next_grant_on"]))
+        return Text(f"API: first grant {first.day}.{first.month}.\n", style="grey50")
+    end = _dt.date.fromisoformat(str(expires))
+    pct = status.get("est_used_pct")
+    if pct is None:
+        why = "spend fetch failed" if status.get("spend_error") else "balance n/a"
+        usd = float(status["usd_per_cycle"])
+        return Text(f"API: {_api_money(usd)} →{end.day}.{end.month}. · {why}\n", style="grey50")
+    left = float(status.get("est_left_usd") or 0.0)
+    label = f"API est. ≈{_api_money(left)} left →{end.day}.{end.month}."
+    return _bar_row(float(pct), _fill_for_pct(float(pct)), label=label, label_color=accent)
+
+
 def render_work_usage(usage: Usage | None, now: int | None = None) -> Text:
     """Render the *work* Claude ``/usage`` card (blue accent) — same product, blue reset."""
     return render_usage(usage, now, accent=_CLAUDE_WORK_ACCENT)

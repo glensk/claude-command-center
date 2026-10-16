@@ -288,9 +288,16 @@ DEFAULTS: dict[str, object] = {
     # Claude account label, e.g. ``["private=usd:200,day:26,from:2026-10-09"]``. ``usd`` =
     # grant per cycle, ``day`` = day of month the cycle turns over (the grant expires and
     # the next lands; clamped in short months), ``from`` = first grant (before it only the
-    # next grant is shown). Config-only: no API exposes the remaining balance, so the
-    # report says ``balance: n/a`` and never derives one. Empty (the default) ⇒ no line.
+    # next grant is shown). No API exposes the remaining balance; without a spend source
+    # (below) the report says ``balance: n/a``. Empty (the default) ⇒ no line.
     "claude_api_credits": [],
+    # Where each account's spend since its grant is read from, for the ESTIMATED balance
+    # and the usage bar (labelled "est."): ``"label=admin_api[:<dotenv path>]"`` — the
+    # org's Admin API cost_report, key ANTHROPIC_ADMIN_API_KEY from that file or the env,
+    # fetched out-of-band at most every 30 min and cached — or
+    # ``"label=runs_jsonl:<path>"`` — the cost_usd sum of a local run ledger (this
+    # machine only). Empty (the default) ⇒ no spend read, no network call.
+    "claude_api_credit_spend": [],
     # Which account a NEW job (no explicit -A / account select) bills to: "" = default
     # account, a label = pin, "auto" = saturate-earliest-reset routing (see routing.py).
     "job_account": "",
@@ -304,6 +311,10 @@ DEFAULTS: dict[str, object] = {
     # the booleans above (which are True = expanded) because the extra cards are dynamic:
     # an unlisted label is expanded, so a newly added login needs no second key.
     "usage_card_codex_extra_collapsed": [],
+    # Usage cards the TUI does not draw at all (not even their title line), by card name
+    # (claude_private, claude_work, codex, codex_private, codex_<label>, copilot,
+    # nixos_supervised, nixos_tier_a) or by chord (t1…t8). Their fetches are unaffected.
+    "usage_cards_hidden": ["copilot"],
     # A Codex card whose seat is somebody else's this ``codex_seat_rota`` week collapses
     # by itself, whatever its own gate above says — the seat is BLOCKED for every Codex
     # consumer, so its bars are a week of noise. The gates above are left untouched, so
@@ -1102,6 +1113,8 @@ class Config:
     subscription_ends: list[str] = field(default_factory=list)  # "card=YYYY-MM-DD|auto"
     # "label=usd:N,day:D[,from:YYYY-MM-DD]" per Claude account (API credit grant)
     claude_api_credits: list[str] = field(default_factory=list)
+    # "label=admin_api[:dotenv]" | "label=runs_jsonl:path" (spend source for the estimate)
+    claude_api_credit_spend: list[str] = field(default_factory=list)
     job_account: str = ""  # "" = default account, a label = pin, "auto" = burn-rate routing
     usage_card_private: bool = True
     usage_card_work: bool = True
@@ -1109,6 +1122,7 @@ class Config:
     usage_card_codex_private: bool = True  # render gate for the second Codex card
     # Labels of the codex_homes_extra cards that are COLLAPSED (unlisted = expanded).
     usage_card_codex_extra_collapsed: list[str] = field(default_factory=list)
+    usage_cards_hidden: list[str] = field(default_factory=lambda: ["copilot"])
     # Collapse a Codex card for the week its seat belongs to somebody else (no config
     # write: the card's own gate is left alone and takes over again when the week flips).
     usage_card_codex_rota_collapse: bool = True
