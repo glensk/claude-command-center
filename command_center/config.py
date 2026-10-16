@@ -283,6 +283,14 @@ DEFAULTS: dict[str, object] = {
     # Claude's OAuth profile, or from the ChatGPT id_token's subscription claim. Empty
     # (the default) ⇒ no card carries a date and no profile endpoint is ever called.
     "subscription_ends": [],
+    # Monthly Anthropic API credits a Claude plan grants to a linked Console org, shown by
+    # `ccc quota` under the provider table: ``"label=usd:N,day:D[,from:YYYY-MM-DD]"`` per
+    # Claude account label, e.g. ``["private=usd:200,day:26,from:2026-10-09"]``. ``usd`` =
+    # grant per cycle, ``day`` = day of month the cycle turns over (the grant expires and
+    # the next lands; clamped in short months), ``from`` = first grant (before it only the
+    # next grant is shown). Config-only: no API exposes the remaining balance, so the
+    # report says ``balance: n/a`` and never derives one. Empty (the default) ⇒ no line.
+    "claude_api_credits": [],
     # Which account a NEW job (no explicit -A / account select) bills to: "" = default
     # account, a label = pin, "auto" = saturate-earliest-reset routing (see routing.py).
     "job_account": "",
@@ -1092,6 +1100,8 @@ class Config:
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
     subscription_ends: list[str] = field(default_factory=list)  # "card=YYYY-MM-DD|auto"
+    # "label=usd:N,day:D[,from:YYYY-MM-DD]" per Claude account (API credit grant)
+    claude_api_credits: list[str] = field(default_factory=list)
     job_account: str = ""  # "" = default account, a label = pin, "auto" = burn-rate routing
     usage_card_private: bool = True
     usage_card_work: bool = True

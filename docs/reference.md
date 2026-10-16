@@ -2663,6 +2663,41 @@ free row carries `next_probe_at` and prints `next probe in N min`.
 These rows are **visibility only**: no rung in `ai.py`'s ladder, no `_ORACLE_IDS` entry, no
 TUI usage card.
 
+### Monthly API credits — `claude_api_credits`
+
+A Claude plan can grant API credits to a linked Console org every billing cycle (Max: to
+the linked API org; Team: to the linked Console org). They pay for the Claude API
+(Messages, Batches), the Console Playground, Managed Agents and the Agent SDK — including
+`claude -p` run with a Console API key — but **not** interactive Claude Code or extra
+usage, so they are a separate pot from the windows in the table. Pin each account's grant:
+
+```toml
+claude_api_credits = [
+  "private=usd:200,day:26,from:2026-10-09",
+  "work=usd:500,day:20,from:2026-10-20",
+]
+```
+
+`usd` is the grant per cycle, `day` the day of month the cycle turns over (the current grant
+expires and the next one lands; clamped in short months), `from` the optional first grant
+(before it only the next grant is shown). A bad entry is skipped, never the others. The
+report prints one line per account under the table:
+
+```
+API credits (Claude API, Console, Agent SDK — not interactive Claude Code):
+  claude-priv (cpriv)  $200/cycle · granted 9.10. · expires 26.10. (in 10d), next grant then · balance: n/a
+  claude-work (cwork)  $500/cycle · first grant 20.10. (in 4d) · balance: n/a
+```
+
+**The balance is always `n/a`.** The public Admin API (`/v1/organizations/*`) has no
+credit-balance endpoint — `cost_report` states spend, which may be invoiced instead of
+paid from the grant — and the claude.ai billing page shows only the grant and the next
+credit date. So ccc never subtracts anything from the grant. `-j` carries the same facts
+as a top-level `api_credits` list (`id`, `account`, `usd_per_cycle`, `cycle_day`,
+`granted_on`, `expires_on`, `next_grant_on`, `balance_usd: null`, `balance_source: "n/a"`,
+`source: "config"`, `display`, `command`; additive, schema still v2, absent when nothing
+is configured). They are not provider rows: no verdict, ranking or ladder reads them.
+
 ### The Muse Code row — `muse`
 
 One rung for Meta's Muse Code CLI (`muse`; the name is the command, so the row carries no

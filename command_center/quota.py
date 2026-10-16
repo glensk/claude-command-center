@@ -2344,6 +2344,13 @@ def snapshot(
     if rota_problems:
         result["codex_seat_rota_errors"] = [asdict(err) for err in rota_problems]
         _warn_rota_errors(rota_problems)
+    # ADDITIVE (2026-10-16, v2 stays v2): the monthly API-credit grants from
+    # `claude_api_credits` — amount and dates as configured, `balance_usd` always null
+    # (no API exposes it). Not a provider row: the credits pay for API calls, not for the
+    # session/week windows the rows rank, so they must not enter any verdict. Absent when
+    # nothing is configured.
+    if credit_rows := _api_credit_rows(now, labels):
+        result["api_credits"] = credit_rows
     # Only an ACTIVE pin is reported: a pin that governs nothing (an explicit order under
     # the ``order`` policy, an unregistered path) advertised here would have every
     # consumer render a lie. Under ``fill`` a registered pin DOES govern, so it appears
@@ -2356,6 +2363,23 @@ def snapshot(
             "until": str(codex_in_claude.load_config().get("codex_home_until") or ""),
         }
     return result
+
+
+def _api_credit_rows(now: int, labels: list[str]) -> list[dict[str, Any]]:
+    """The configured API-credit grants on *now*'s LOCAL date, Claude accounts in order."""
+    from datetime import datetime  # pylint: disable=import-outside-toplevel
+
+    from . import api_credits  # pylint: disable=import-outside-toplevel
+
+    entries = list(config.load_config().claude_api_credits or [])
+    if not entries:
+        return []
+    rows = api_credits.statuses(entries, datetime.fromtimestamp(now).date(), order=labels)
+    for row in rows:
+        row["display"] = display_id(row["id"])
+        if command := seat_command(row["id"]):
+            row["command"] = command
+    return rows
 
 
 def _seat_order_rows(

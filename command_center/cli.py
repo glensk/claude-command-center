@@ -4354,8 +4354,35 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
             snap["best_claude_account"]
         )
         print(f"best Claude account (spends what resets soonest): {best}")
+    _print_api_credits(snap, now)
     _print_codex_seat_footer(snap, now)
     return 0
+
+
+def _print_api_credits(snap: dict[str, Any], now: int) -> None:
+    """One line per configured monthly API-credit grant (``claude_api_credits``).
+
+    Named the way the provider column names the account, so the line is read against
+    its row. The balance is ``n/a`` by construction: no API exposes it (see
+    ``api_credits``), and the grant is never presented as what is left.
+    """
+    from datetime import datetime  # pylint: disable=import-outside-toplevel
+
+    from . import api_credits  # pylint: disable=import-outside-toplevel
+
+    rows = snap.get("api_credits") or []
+    if not rows:
+        return
+    today = datetime.fromtimestamp(now).date()
+    names = [
+        str(row.get("display") or row["id"])
+        + (f" ({row['command']})" if row.get("command") else "")
+        for row in rows
+    ]
+    width = max(len(name) for name in names)
+    print("API credits (Claude API, Console, Agent SDK — not interactive Claude Code):")
+    for name, row in zip(names, rows, strict=True):
+        print(f"  {name:<{width}}  {api_credits.describe(row, today)}")
 
 
 def _print_quota_table(head: str, body: list[str], *, colorable: bool) -> None:
