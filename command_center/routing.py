@@ -13,7 +13,7 @@ The ``job_account`` config key chooses the stamp for a NEW job:
 * ``""`` (the default) — the default account, i.e. today's behaviour untouched.
 * a configured label (e.g. ``"work"``) — always that account (a hard pin).
 * ``"auto"`` — pick by **required burn rate** over the plain 7-day window
-  (``seven_day``; the Fable-scoped ``fable_week`` is ignored — Fable is not used).
+  (``seven_day``).
 
 **The metric.** For an account with ``used%`` consumed and ``h`` hours left until its
 window resets, ``urgency = (100 - used%) / h`` is the percentage-points-per-hour you would
@@ -79,12 +79,12 @@ def score_accounts(now: int | None = None) -> list[AccountScore]:
     """Rank every configured account by required burn rate over its weekly window.
 
     Preserves ``config.claude_config_dirs()`` order (so ties break toward the account
-    declared first). Each account is scored on its plain 7-day window (``seven_day``);
-    ``fable_week`` is ignored even when present. An account whose
-    snapshot is missing, stale, or already past its reset is returned with ``urgency`` and
-    ``used_pct`` set to ``None`` (and a ``note`` saying why) so it can be shown but never
-    routed to; a usable account carries its clamped ``used_pct``, the ``resets_at`` it
-    reads from, the ``urgency`` metric, and whether it is at/over :data:`_EXHAUSTED_PCT`.
+    declared first). Each account is scored on its plain 7-day window (``seven_day``). An
+    account whose snapshot is missing, stale, or already past its reset is returned with
+    ``urgency`` and ``used_pct`` set to ``None`` (and a ``note`` saying why) so it can be
+    shown but never routed to; a usable account carries its clamped ``used_pct``, the
+    ``resets_at`` it reads from, the ``urgency`` metric, and whether it is at/over
+    :data:`_EXHAUSTED_PCT`.
     """
     now = int(time.time()) if now is None else now
     scores: list[AccountScore] = []

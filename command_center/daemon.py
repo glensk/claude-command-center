@@ -264,7 +264,7 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
         _refresh_copilot_usage(store, cfg, report, dry_run)
 
         # Keep each Claude account's usage card in step with `claude`'s own /usage via the
-        # OAuth usage endpoint (throttled per account; adds the Fable weekly window).
+        # OAuth usage endpoint (throttled per account).
         _refresh_claude_usage(store, cfg, report, dry_run)
 
         # Same for each configured CODEX_HOME's live ChatGPT usage endpoint, so the Codex
@@ -501,8 +501,8 @@ def _refresh_claude_usage(
     ``claude_usage_refresh_sec`` (or the shorter ``claude_usage_refresh_active_sec`` via
     :func:`usage.adaptive_interval` while any job works), keyed per account on
     ``oauth_fetched_at`` (:func:`usage.claude_usage_stale`). Keeps the cards in step with
-    ``claude``'s own /usage even when no TUI is open; self-heals a rebased window boundary
-    and adds the Fable weekly window. Best-effort: an account with no keychain token simply
+    ``claude``'s own /usage even when no TUI is open and self-heals a rebased window
+    boundary. Best-effort: an account with no keychain token simply
     yields no write and the last cache stands.
     """
     from . import usage
@@ -610,7 +610,7 @@ def _fire_reset_jobs(store: Store, cfg: config.Config, report: DaemonReport, dry
                 store.update_fields(job.session_id, fire_at=postponed)
                 notify(
                     "⏳ parked prompt postponed",
-                    f"{_label(job)} — {job.fire_window} still exhausted; "
+                    f"{_label(job)} — {park.normalize_window(job.fire_window)} still exhausted; "
                     + park.format_fire(postponed, now),
                     cfg.notify,
                 )
@@ -655,7 +655,7 @@ def _deliver_attached_prompts(
                 store.update_fields(job.session_id, fire_at=postponed)
                 notify(
                     "⏳ parked prompt postponed",
-                    f"{_label(job)} — {job.fire_window} still exhausted; "
+                    f"{_label(job)} — {park.normalize_window(job.fire_window)} still exhausted; "
                     + park.format_fire(postponed, now),
                     cfg.notify,
                 )

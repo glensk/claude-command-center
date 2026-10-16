@@ -592,7 +592,7 @@ def cmd_claude_usage(args: argparse.Namespace) -> int:
     Mirrors ``copilot-usage`` as a best-effort out-of-band warmer: for each configured
     account (or the one named by ``-a/--account``) it fetches the OAuth usage endpoint and
     authoritatively replaces that account's usage snapshot (self-healing a rebased window
-    boundary and adding the Fable weekly window the status line never carries). Prints one
+    boundary the status line can lag behind). Prints one
     short line per account. Always exits 0 — a missing/expired token simply skips that
     account. Spawned detached by the TUI/daemon when the snapshot is stale; runnable by hand.
 
@@ -3774,7 +3774,7 @@ def cmd_jobs(args: argparse.Namespace) -> int:
 def cmd_job_account(args: argparse.Namespace) -> int:
     """Show each account's usage urgency and which account a NEW job will bill to.
 
-    One aligned row per configured account — its Fable weekly used%, when that window
+    One aligned row per configured account — its 7-day used%, when that window
     resets, the ``(100-used%)/hours-to-reset`` burn rate the ``"auto"`` policy ranks by,
     and any reason it is unusable (no data / stale / dead / exhausted) — with a ``← pick``
     marker on the row :func:`routing.pick_job_account` currently selects. A trailing line
@@ -4053,8 +4053,8 @@ def _quota_bar_cells(prov: dict[str, Any], *, color: bool) -> tuple[str, set[str
 def _window_renew(win: dict[str, Any], primary_at: int, now: int) -> str:
     """`` (renew 5d 2h)`` for a window the renew field does not speak for, else ``""``.
 
-    A row states one renewal in its own field; a SECOND allowance on the same row
-    (`fable_week` beside `seven_day`) has its own deadline, and without this it would be
+    A row states one renewal in its own field; a SECOND allowance on the same row (a
+    window with no bar slot) has its own deadline, and without this it would be
     the only percentage in the report with no date attached. "Materially different" is an
     hour, so a window that merely rounds differently stays quiet.
     """
@@ -4316,11 +4316,11 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
             if blocked_at and abs(blocked_at - renew_at) > _SAME_RESET_SEC
             else ""
         )
-        # Only the windows NO bar shows (fable_week, Antigravity's second bucket, a
-        # provider whose window has no slot): a row must state each figure once. Such a
-        # window carries its OWN renewal when that differs from the row's primary one —
-        # `fable_week` is a second allowance with a second deadline, and the single renew
-        # field cannot speak for both.
+        # Only the windows NO bar shows (Antigravity's second bucket, a provider whose
+        # window has no slot): a row must state each figure once. Such a window carries
+        # its OWN renewal when that differs from the row's primary one — a second
+        # allowance has a second deadline, and the single renew field cannot speak for
+        # both.
         wins = " ".join(
             f"{name.replace('_', '')} {win['used_pct']:.0f}%"
             f"{'(stale)' if win.get('stale') else ''}"
@@ -6427,7 +6427,7 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_park.add_argument(
         "-w",
         "--window",
-        choices=("five_hour", "seven_day", "fable_week"),  # keep in sync: park.WINDOW_CHOICES
+        choices=("five_hour", "seven_day"),  # keep in sync: park.WINDOW_CHOICES
         default="five_hour",
         help="rate-limit window whose reset fires the launch (default: five_hour)",
     )
@@ -6554,7 +6554,7 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_newjob.add_argument(
         "-W",
         "--fire-window",
-        choices=("five_hour", "seven_day", "fable_week"),  # keep in sync: park.WINDOW_CHOICES
+        choices=("five_hour", "seven_day"),  # keep in sync: park.WINDOW_CHOICES
         default="five_hour",
         help="which window's reset fires an --at-reset job (default: five_hour)",
     )
@@ -6768,7 +6768,7 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "--model",
         default="",
         metavar="NAME",
-        help="scope the Claude windows to the model you intend to call",
+        help="the model you intend to call (echoed in the JSON report)",
     )
     p_quota.add_argument(
         "-r",

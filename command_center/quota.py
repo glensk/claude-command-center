@@ -37,11 +37,6 @@ a sensible *risk* threshold that would, if reused here, throw away a tenth of a 
 subscription. This module reports ``risky`` separately from ``blocked``; only ``blocked``
 removes a rung.
 
-**Model scoping matters.** Claude accounts expose several windows, including a
-Fable-model-scoped weekly one. An account at 100 % on ``fable_week`` is NOT out of tokens
-for an Opus request. :func:`snapshot` therefore takes the model being requested and
-consults only the windows that apply to it — see :data:`_FABLE_MODEL_HINTS`.
-
 Runnable directly (``./command_center/quota.py -h``) as well as through ``ccc quota`` —
 see :mod:`._direct`. :func:`main` forwards to the CLI rather than reimplementing the
 report, so there is exactly one implementation of it.
@@ -172,11 +167,6 @@ _COPILOT_STALE_AFTER_SEC = 24 * 3600
 # could have been made and must not establish exhaustion on its own.
 _AGY_STALE_AFTER_SEC = 24 * 3600
 
-# Models whose usage is governed by the Fable-scoped weekly window. Any other model
-# ignores ``fable_week`` entirely — the bug this mapping exists to prevent is treating a
-# Fable-week-exhausted account as out of tokens for an Opus request.
-_FABLE_MODEL_HINTS = ("fable",)
-
 # Antigravity serves two model families out of two SEPARATE weekly allowances, so it is
 # TWO rungs, not one provider with a model-scoped verdict. Each row owns one bucket:
 #
@@ -247,8 +237,8 @@ _MUSE_STALE_AFTER_SEC = 24 * 3600
 # a row of bars instead of down a row of holes.
 #
 # Windows drawn as a bar are omitted from the report's textual `windows` column, so a row
-# states each figure once. Anything with no slot here (`fable_week`) still shows there,
-# which is what keeps this map from hiding data.
+# states each figure once. Anything with no slot here still shows there, which is what
+# keeps this map from hiding data.
 BAR_SLOTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("session", ("five_hour",)),
     ("week", ("seven_day",)),
@@ -304,13 +294,6 @@ BAR_HORIZON: dict[str, str] = {
     "credits": "monthly",
 }
 
-# The Fable weekly figure is only as fresh as the last successful OAuth fetch
-# (``oauth_fetched_at``): statusline writes refresh ``captured_at`` while PRESERVING a
-# stale Fable value, so judging ``fable_week`` by ``captured_at`` + 7d let a days-old
-# figure govern verdicts as if live: past one hour without a successful fetch it no
-# longer counts as evidence.
-_FABLE_EVIDENCE_STALE_SEC = 3600
-
 _COOLDOWNS_NAME = "cooldowns.json"
 # One line per Codex seat: when a physical attempt was last made on it. Two jobs (plan
 # D2/D7): the deterministic round-robin tiebreak inside a cohort (no new usage evidence
@@ -354,8 +337,7 @@ class WindowState:
 
     ``stale`` is tracked separately from ``used_pct`` because a stale 100 % must NOT
     block: it is a reading from a window that may since have reset. ``evidence_at`` is
-    when the figure itself was measured — for ``fable_week`` that is the OAuth fetch,
-    which can be much older than the snapshot's ``captured_at``.
+    when the figure itself was measured.
     """
 
     name: str
@@ -764,40 +746,22 @@ def _window_state(
     captured_at: int,
     now: int,
     stale_after: int,
-    evidence_at: int | None = None,
 ) -> WindowState | None:
     """Resolve one :class:`usage.Window` to a :class:`WindowState`, or ``None`` if absent.
 
     A window whose ``resets_at`` has already passed is reported stale: the snapshot
     describes a window that no longer exists, so its percentage proves nothing.
-
-    *evidence_at* overrides which timestamp ages the figure. ``fable_week`` needs it:
-    statusline writes refresh ``captured_at`` while carrying the OLD Fable value
-    forward, so aging that window by ``captured_at`` reported a days-stale figure as
-    live — the bug that let a stale Fable reading govern a definitive verdict.
     """
     if win is None:
         return None
-    basis = captured_at if evidence_at is None else evidence_at
-    stale = (basis + stale_after) < now or win.resets_at <= now
+    stale = (captured_at + stale_after) < now or win.resets_at <= now
     return WindowState(
         name=name,
         used_pct=float(win.used_percentage),
         resets_at=int(win.resets_at),
         stale=stale,
-        evidence_at=basis,
+        evidence_at=captured_at,
     )
-
-
-def _windows_for_model(windows: dict[str, WindowState], model: str) -> list[WindowState]:
-    """The windows that actually govern *model*.
-
-    ``fable_week`` applies ONLY to Fable models. Including it for an Opus request is the
-    concrete bug this function prevents: an account at 100 % Fable-week but 83 % on its
-    plain weekly window has ample Opus headroom and must not be reported blocked.
-    """
-    wants_fable = any(hint in model.lower() for hint in _FABLE_MODEL_HINTS)
-    return [win for name, win in windows.items() if name != "fable_week" or wants_fable]
 
 
 def _verdict_from_windows(
@@ -910,24 +874,20 @@ def _cooldown_quota(
 
 
 def _claude_windows(snap: usage.Usage, now: int) -> dict[str, WindowState]:
-    """One Claude snapshot's windows, each aged against the evidence that produced it."""
+    """One Claude snapshot's windows, each aged against the snapshot's capture time."""
     windows: dict[str, WindowState] = {}
-    for name, win, stale_after, evidence_at in (
-        ("five_hour", snap.five_hour, _SESSION_STALE_AFTER_SEC, None),
-        ("seven_day", snap.seven_day, _WEEK_STALE_AFTER_SEC, None),
-        # Fable's figure only changes on a successful OAuth fetch; statusline writes
-        # refresh captured_at while carrying the old value, so the fetch time is the
-        # honest evidence age and the card's 1-hour threshold applies.
-        ("fable_week", snap.fable_week, _FABLE_EVIDENCE_STALE_SEC, snap.oauth_fetched_at),
+    for name, win, stale_after in (
+        ("five_hour", snap.five_hour, _SESSION_STALE_AFTER_SEC),
+        ("seven_day", snap.seven_day, _WEEK_STALE_AFTER_SEC),
     ):
-        state = _window_state(name, win, snap.captured_at, now, stale_after, evidence_at)
+        state = _window_state(name, win, snap.captured_at, now, stale_after)
         if state is not None:
             windows[name] = state
     return windows
 
 
-def _claude_quota(account: str, model: str, now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
-    """Resolve one Claude account against the windows that govern *model*."""
+def _claude_quota(account: str, now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
+    """Resolve one Claude account against its session and weekly windows."""
     pid = f"claude:{account}"
     config_dir = str(config.claude_config_dirs().get(account, ""))
     # Measured BEFORE the cooldown store is consulted, so a blocked row still carries the
@@ -949,7 +909,7 @@ def _claude_quota(account: str, model: str, now: int, cooldowns: dict[str, dict]
             account=account,
             config_dir=config_dir,
         )
-    governing = _windows_for_model(windows, model)
+    governing = list(windows.values())
     verdict, reason, blocked_by, resets_at, risky = _verdict_from_windows(governing)
     quota = ProviderQuota(
         id=pid,
@@ -975,10 +935,10 @@ def _urgency(windows: Iterable[WindowState], now: int) -> float | None:
     The percentage-points-per-hour you would have to burn to exactly exhaust the
     remaining allowance by its reset. Ranking accounts by DESCENDING urgency spends the
     allowance that resets soonest first, so no headroom evaporates unused — this is the
-    same metric :mod:`.routing` uses for job placement, recomputed here over the windows
-    that govern the requested model rather than always over ``fable_week``.
+    same metric :mod:`.routing` uses for job placement, recomputed here from the
+    account's own windows.
     """
-    weekly = [w for w in windows if w.name in ("seven_day", "fable_week") and not w.stale]
+    weekly = [w for w in windows if w.name == "seven_day" and not w.stale]
     if not weekly:
         return None
     win = max(weekly, key=lambda w: w.used_pct)
@@ -2289,8 +2249,8 @@ def snapshot(
 ) -> dict[str, Any]:
     """The full quota picture, cache-only. Never raises, never touches the network.
 
-    *model* scopes which windows govern the Claude rungs (see :func:`_windows_for_model`);
-    pass the model the caller actually intends to invoke. Claude accounts are ordered by
+    *model* is the model the caller intends to invoke; it is echoed in the result (every
+    Claude window governs every model). Claude accounts are ordered by
     DESCENDING urgency so the first usable one is the account whose allowance would
     otherwise expire soonest.
     """
@@ -2298,7 +2258,7 @@ def snapshot(
     cooldowns = read_cooldowns(now)
     labels = accounts if accounts is not None else list(config.claude_config_dirs())
 
-    claude = [_claude_quota(label, model, now, cooldowns) for label in labels]
+    claude = [_claude_quota(label, now, cooldowns) for label in labels]
     # Usable accounts first, then by descending urgency (spend what resets soonest).
     claude.sort(key=lambda q: (q.state != AVAILABLE, -(q.urgency or 0.0)))
 

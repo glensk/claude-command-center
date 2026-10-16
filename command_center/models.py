@@ -568,7 +568,8 @@ class Session:
     start_date: str | None = None
     # Parked-prompt auto-fire (see park.py): epoch SECONDS the armed draft dispatches at
     # (0 = not armed) and the rate-limit window that produced that timestamp
-    # ('five_hour' | 'seven_day' | 'fable_week'; '' = none). Consumed atomically by
+    # ('five_hour' | 'seven_day'; '' = none — a legacy 'fable_week' is read as
+    # 'seven_day' by park.normalize_window). Consumed atomically by
     # Store.claim_draft on launch; not mirrored into the Obsidian job file.
     fire_at: int = 0
     fire_window: str = ""

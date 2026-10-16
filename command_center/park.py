@@ -16,7 +16,7 @@ Scheduling is deterministic: the fire time is the selected window's
 window" is shown to the user but never decides the schedule. Missing or
 unusable usage data is a loud registration error, never treated as "available
 now". At fire time the job's OWN window (and only that window — an exhausted
-Fable-weekly must not hold back a five-hour job) can postpone the launch when a
+weekly window must not hold back a five-hour job) can postpone the launch when a
 FRESH authoritative snapshot still shows it 100% used; that predicate is
 convergent because utilization falls below 100 at the window boundary, unlike
 ``resets_at`` which always lies ahead once any new usage lands.
@@ -56,7 +56,11 @@ from .store import Store
 if TYPE_CHECKING:  # the seam's type only — importing peek eagerly would cost every `ccc`
     from .peek import Frontmost
 
-WINDOW_CHOICES = ("five_hour", "seven_day", "fable_week")
+WINDOW_CHOICES = ("five_hour", "seven_day")
+# Windows ccc no longer tracks, mapped to the one an armed job stored under them now
+# fires on. A job armed before the Fable weekly window was dropped still carries
+# ``fable_week`` in its row; it is read as the plain weekly window.
+_RETIRED_WINDOWS = {"fable_week": "seven_day"}
 DEFAULT_BUFFER_SEC = 90
 # Conservative argv budget: macOS ARG_MAX is ~1 MB including the environment; the
 # prompt travels as ONE argv element of `claude`, so cap well below the ceiling.
@@ -76,7 +80,18 @@ _TICK_SEC = 5.0
 # ---- pure helpers (unit-tested) --------------------------------------------
 
 
+def normalize_window(name: str) -> str:
+    """*name* with a retired window mapped to its replacement (see :data:`_RETIRED_WINDOWS`).
+
+    The one place a STORED window name is read back: a value outside
+    :data:`WINDOW_CHOICES` that is not retired is returned unchanged (and then matches no
+    window, so it can neither fire nor postpone a job).
+    """
+    return _RETIRED_WINDOWS.get(name, name)
+
+
 def _window(snapshot: usage.Usage | None, name: str) -> usage.Window | None:
+    name = normalize_window(name)
     if snapshot is None or name not in WINDOW_CHOICES:
         return None
     win = getattr(snapshot, name, None)
@@ -112,7 +127,7 @@ def postpone_until(
 ) -> int | None:
     """New fire time when the job's OWN window is freshly observed still exhausted.
 
-    Only the job's selected window counts (an exhausted ``fable_week`` never holds a
+    Only the job's selected window counts (an exhausted ``seven_day`` never holds a
     ``five_hour`` job), and only a fresh authoritative snapshot
     (``oauth_fetched_at`` within *min_fresh_sec*) showing >= 100% utilization with a
     future reset postpones. Stale or missing data returns ``None``: fire at the

@@ -204,49 +204,18 @@ def test_score_marks_missing_snapshot_no_data(
     assert private.note == "no data" and private.urgency is None
 
 
-def test_score_uses_seven_day_without_fable_week(
-    accounts_env: dict[str, Path], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With no Fable window the plain 7-day window drives the metric."""
+@pytest.mark.usefixtures("accounts_env")
+def test_score_uses_seven_day_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The plain 7-day window drives the metric."""
     now = 1_000_000
     win = usage.Window(used_percentage=60.0, resets_at=now + 40 * 3600)
     _patch_usage(
         monkeypatch,
-        {"private": usage.Usage(captured_at=now, five_hour=None, seven_day=win, fable_week=None)},
+        {"private": usage.Usage(captured_at=now, five_hour=None, seven_day=win)},
     )
     private = {s.label: s for s in routing.score_accounts(now=now)}["private"]
     assert private.note == "ok"
     assert private.urgency == pytest.approx((100.0 - 60.0) / 40.0)  # 1.0 %/h
-
-
-@pytest.mark.usefixtures("accounts_env")
-def test_score_ignores_fable_week_when_present(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A present ``fable_week`` never drives the metric — ``seven_day`` does."""
-    now = 1_000_000
-    week = usage.Window(used_percentage=60.0, resets_at=now + 40 * 3600)
-    fable = usage.Window(used_percentage=10.0, resets_at=now + 5 * 3600)
-    _patch_usage(
-        monkeypatch,
-        {"private": usage.Usage(captured_at=now, five_hour=None, seven_day=week, fable_week=fable)},
-    )
-    private = {s.label: s for s in routing.score_accounts(now=now)}["private"]
-    assert private.note == "ok"
-    assert private.used_pct == pytest.approx(60.0)
-    assert private.resets_at == week.resets_at
-    assert private.urgency == pytest.approx((100.0 - 60.0) / 40.0)
-
-
-@pytest.mark.usefixtures("accounts_env")
-def test_score_fable_week_alone_is_no_data(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A snapshot carrying only ``fable_week`` has no usable window for routing."""
-    now = 1_000_000
-    fable = usage.Window(used_percentage=10.0, resets_at=now + 5 * 3600)
-    _patch_usage(
-        monkeypatch,
-        {"private": usage.Usage(captured_at=now, five_hour=None, seven_day=None, fable_week=fable)},
-    )
-    private = {s.label: s for s in routing.score_accounts(now=now)}["private"]
-    assert private.note == "no data" and private.urgency is None
 
 
 # ---------------------------------------------------------------------------

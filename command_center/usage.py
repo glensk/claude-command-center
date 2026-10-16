@@ -206,9 +206,9 @@ _WHAM_TIMEOUT_SEC = 15.0
 # file's own mtime and re-runs only when `codex login` rewrites it.
 _codex_email_cache: dict[tuple[str, int], str | None] = {}
 
-# Claude's OAuth usage endpoint — the same numbers `claude` shows in `/usage`, including
-# the Fable-model-scoped weekly window the status-line ``rate_limits`` payload does NOT
-# carry (it only ships ``five_hour`` + ``seven_day``). Fetched out-of-band per account.
+# Claude's OAuth usage endpoint — the same numbers `claude` shows in `/usage`, with
+# authoritative window boundaries the status-line ``rate_limits`` payload can lag behind
+# (see :func:`fetch_claude_usage`). Fetched out-of-band per account.
 _OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 _OAUTH_BETA_HEADER = "oauth-2025-04-20"
 
@@ -250,13 +250,9 @@ class Usage:  # pylint: disable=too-many-instance-attributes  # flat snapshot re
     captured_at: int  # Unix epoch seconds when ccc recorded it
     five_hour: Window | None
     seven_day: Window | None
-    # The Fable-model-scoped weekly window from the OAuth usage endpoint (the status
-    # line never carries it). Defaulted None: it only exists on a snapshot healed by an
-    # OAuth fetch, and never on its own without a main window in practice.
-    fable_week: Window | None = None
     # Epoch seconds of the last *successful* OAuth fetch that produced this snapshot (0 on
-    # status-line captures and Codex snapshots). :mod:`quota` judges the freshness of
-    # ``fable_week`` by it.
+    # status-line captures and Codex snapshots). :mod:`park` judges the freshness of an
+    # exhausted-window verdict by it.
     oauth_fetched_at: int = 0
     # Codex only: non-empty when Codex is REFUSING calls for a reason that is not a
     # window — today `workspace_owner_credits_depleted`. The windows above stay whatever
@@ -476,7 +472,7 @@ def _merge_window(
     - ANY window from a stale payload (*incoming_stale* — the reporting session's own
       5-hour window is dead/absent, i.e. it has not talked to the API for >5h).
 
-    Anthropic can rebase windows at a rollout (seen at Fable-5: the weekly boundary
+    Anthropic can rebase windows at a rollout (seen in July 2026: the weekly boundary
     moved BACKWARD Jul 15 → Jul 11, and the weekly percentage was recalibrated DOWN,
     84% → 3%, at the *same* boundary); a long-idle session then replays its pre-rebase
     ``rate_limits`` every 3s, and the plain "later reset wins" / "same reset, higher
@@ -520,7 +516,7 @@ def write_usage(rate_limits: object, *, account: str = "private", now: int | Non
     can refuse a snapshot left by a different config dir under the same label. Returns
     ``False`` when nothing live survives the merge. Never raises.
 
-    The OAuth-only fields (``fable_week`` + ``oauth_fetched_at`` + ``oauth_backoff_until``)
+    The OAuth-only fields (``oauth_fetched_at`` + ``oauth_backoff_until``)
     are PRESERVED verbatim from the stored snapshot: status-line payloads never carry them,
     so clobbering them to None/0 on every 3-second status-line write would erase what
     :func:`fetch_claude_usage` fetched (or the 429 backoff it recorded). While the stored
@@ -541,7 +537,6 @@ def write_usage(rate_limits: object, *, account: str = "private", now: int | Non
             prev = _read_validated(account)
             prev_five = _window(prev.get("five_hour")) if prev else None
             prev_seven = _window(prev.get("seven_day")) if prev else None
-            prev_fable = _window(prev.get("fable_week")) if prev else None
             prev_oauth = _int_field(prev, "oauth_fetched_at") if prev else 0
             authoritative = 0 < prev_oauth and (now - prev_oauth) < _OAUTH_AUTHORITY_SEC
             # A payload whose own 5-hour window is dead/absent comes from a session that
@@ -571,7 +566,6 @@ def write_usage(rate_limits: object, *, account: str = "private", now: int | Non
                 "five_hour": _window_dict(five),
                 "seven_day": _window_dict(seven),
                 # OAuth-only fields preserved verbatim (status line never carries them).
-                "fable_week": _window_dict(prev_fable),
                 "oauth_fetched_at": prev_oauth,
                 "oauth_backoff_until": _int_field(prev, "oauth_backoff_until") if prev else 0,
             }
@@ -639,7 +633,6 @@ def read_usage(account: str = "private") -> Usage | None:
         captured_at=_int_field(data, "captured_at"),
         five_hour=_window(data.get("five_hour")),
         seven_day=_window(data.get("seven_day")),
-        fable_week=_window(data.get("fable_week")),
         oauth_fetched_at=_int_field(data, "oauth_fetched_at"),
     )
 
@@ -664,12 +657,12 @@ def oauth_backoff_until(account: str = "private") -> int:
     return _int_field(_read_validated(account), "oauth_backoff_until")
 
 
-# --- Claude OAuth usage endpoint (the /usage numbers, incl. the Fable weekly window) ---
+# --- Claude OAuth usage endpoint (the /usage numbers) ---
 #
-# The status-line ``rate_limits`` payload only carries ``five_hour`` + ``seven_day``;
-# Claude Code's ``/usage`` also shows a Fable-model-scoped weekly window. That window (and
-# the authoritative main-window boundaries) come from the account's OAuth usage endpoint,
-# fetched out-of-band per account — the same out-of-band pattern the Copilot card uses.
+# The status-line ``rate_limits`` payload carries ``five_hour`` + ``seven_day`` as each
+# session last saw them; the authoritative window boundaries come from the account's
+# OAuth usage endpoint, fetched out-of-band per account — the same out-of-band pattern
+# the Copilot card uses.
 # The fetch is throttled (:func:`claude_usage_stale`) and run by the daemon and a detached
 # ``ccc claude-usage`` spawn, never on the render path; :func:`read_usage` only reads cache.
 
@@ -693,38 +686,12 @@ def _oauth_window(raw: object) -> Window | None:
         return None
 
 
-def _oauth_fable_window(limits: object) -> Window | None:
-    """The Fable weekly-scoped window from the OAuth ``limits[]`` list, else ``None``.
-
-    Picks the entry with ``group == "weekly"`` whose ``scope.model.display_name`` is
-    ``"Fable"`` and reads its ``percent`` + ISO ``resets_at``. Malformed → ``None``.
-    """
-    if not isinstance(limits, list):
-        return None
-    for item in limits:
-        if not isinstance(item, dict) or item.get("group") != "weekly":
-            continue
-        scope = item.get("scope")
-        model = scope.get("model") if isinstance(scope, dict) else None
-        if not isinstance(model, dict) or model.get("display_name") != "Fable":
-            continue
-        pct = item.get("percent")
-        resets = item.get("resets_at")
-        if pct is None or resets is None:
-            return None
-        try:
-            return Window(used_percentage=float(pct), resets_at=_iso_to_epoch(resets))
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
 def _parse_oauth_usage(data: object, now: int) -> Usage | None:
     """Build a :class:`Usage` from an OAuth ``/usage`` response; ``None`` if unusable.
 
-    Uses the top-level ``five_hour`` / ``seven_day`` for the two main windows and the
-    Fable weekly-scoped ``limits[]`` entry for ``fable_week``. Returns ``None`` when
-    neither main window parses (so a garbage body never overwrites a good cache). Pure —
+    Uses the top-level ``five_hour`` / ``seven_day`` for the two main windows (any
+    model-scoped ``limits[]`` entries are ignored). Returns ``None`` when neither main
+    window parses (so a garbage body never overwrites a good cache). Pure —
     no network — so tests exercise it directly.
     """
     if not isinstance(data, dict):
@@ -737,7 +704,6 @@ def _parse_oauth_usage(data: object, now: int) -> Usage | None:
         captured_at=now,
         five_hour=five,
         seven_day=seven,
-        fable_week=_oauth_fable_window(data.get("limits")),
     )
 
 
@@ -824,7 +790,7 @@ def _persist_oauth_backoff(account: str, until: int) -> None:
 
     Called when a fetch fails with a large-``Retry-After`` 429: it records the server-given
     wake time (see :func:`claude_usage_stale`) while leaving every other stored field
-    verbatim (windows, ``fable_week``, ``captured_at``, ``oauth_fetched_at``,
+    verbatim (windows, ``captured_at``, ``oauth_fetched_at``,
     ``config_dir_hash``). When the cache file does not exist yet a minimal payload (the
     account's ``config_dir_hash`` + the backoff) is written. Runs under the same per-account
     ``flock`` :func:`write_usage` uses; never raises.
@@ -852,7 +818,7 @@ def fetch_claude_usage(account: str, now: int | None = None) -> Usage | None:
     ``captured_at=now`` and ``oauth_fetched_at=now``.
 
     Why REPLACE, not merge: Anthropic can rebase a window boundary BACKWARD (observed at
-    the Fable-5 rollout — the private weekly boundary moved Jul 15 → Jul 11), and
+    a model rollout — the private weekly boundary moved Jul 15 → Jul 11), and
     :func:`_merge_window`'s later-reset-wins rule would pin the stale (further-future)
     boundary forever. This periodic authoritative replace self-heals it; the companion
     re-pin guard in :func:`write_usage` then stops idle status-line writers from
@@ -896,7 +862,6 @@ def fetch_claude_usage(account: str, now: int | None = None) -> Usage | None:
         "config_dir_hash": _account_hash(account),
         "five_hour": _window_dict(snap.five_hour),
         "seven_day": _window_dict(snap.seven_day),
-        "fable_week": _window_dict(snap.fable_week),
         "oauth_fetched_at": now,
     }
     try:
@@ -2170,9 +2135,6 @@ def _render_card(  # pylint: disable=too-many-arguments
     rota: dict[str, Any] | None = None,
 ) -> Text:
     """The two-bar card body (session + week), shared by both providers.
-
-    :attr:`Usage.fable_week` is never rendered: the card shows only the Session and
-    Week rows (the snapshot still carries the field for :mod:`quota`).
 
     When *fill_for_pct* is given, each bar's fill is chosen from *its own* usage
     percentage (:func:`_fill_for_pct` for the Claude cards' green/orange/red thresholds);

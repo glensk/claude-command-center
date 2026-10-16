@@ -931,7 +931,7 @@ def test_resolve_card_label_prefers_own_dir_when_identity_is_duplicated(
     """An accidental ``/login`` can DUPLICATE one identity into both dirs (not swap
     them). The card must then bind to its OWN dir — the duplicate is the drifted copy;
     first-match-in-config-order once bound the work card to the private dir's cache,
-    whose OAuth fetch was in 429 backoff, freezing the Fable figure at a stale value
+    whose OAuth fetch was in 429 backoff, freezing the weekly figure at a stale value
     while the work dir's own cache was fresh."""
     monkeypatch.setenv("HOME", str(tmp_path))
     work_dir = two_accounts["work"]

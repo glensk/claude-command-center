@@ -20,14 +20,12 @@ def _snapshot(
     *,
     five_hour: usage.Window | None = None,
     seven_day: usage.Window | None = None,
-    fable_week: usage.Window | None = None,
     oauth_fetched_at: int = NOW,
 ) -> usage.Usage:
     return usage.Usage(
         captured_at=NOW,
         five_hour=five_hour,
         seven_day=seven_day,
-        fable_week=fable_week,
         oauth_fetched_at=oauth_fetched_at,
     )
 
@@ -65,12 +63,22 @@ def test_postpone_only_on_fresh_exhaustion_of_the_own_window() -> None:
 
 
 def test_postpone_ignores_other_windows() -> None:
-    # An exhausted Fable-weekly must never hold back a five_hour job (debate R2-O1).
+    # An exhausted weekly window must never hold back a five_hour job (debate R2-O1).
     snap = _snapshot(
         five_hour=usage.Window(used_percentage=40.0, resets_at=NOW + 900),
-        fable_week=usage.Window(used_percentage=100.0, resets_at=NOW + 500_000),
+        seven_day=usage.Window(used_percentage=100.0, resets_at=NOW + 500_000),
     )
     assert park.postpone_until(snap, "five_hour", NOW) is None
+
+
+def test_retired_fable_week_window_reads_as_seven_day() -> None:
+    """A job armed on the retired ``fable_week`` window fires and postpones on ``seven_day``."""
+    assert park.normalize_window("fable_week") == "seven_day"
+    assert park.normalize_window("five_hour") == "five_hour"
+    assert "fable_week" not in park.WINDOW_CHOICES
+    snap = _snapshot(seven_day=usage.Window(used_percentage=100.0, resets_at=NOW + 5000))
+    assert park.fire_time(snap, "fable_week", NOW, 90) == NOW + 5090
+    assert park.postpone_until(snap, "fable_week", NOW, buffer_sec=90) == NOW + 5090
 
 
 def test_postpone_requires_fresh_oauth_and_real_exhaustion() -> None:
@@ -648,6 +656,35 @@ def test_fire_reset_jobs_postpones_on_fresh_own_window_exhaustion(
         assert report.reset_postponed == ["p1"] and not launched
         held = store.get("p1")
         assert held is not None and held.fire_at == now + 4000 + park.DEFAULT_BUFFER_SEC
+
+
+def test_fire_reset_jobs_stored_fable_week_window_postpones_on_seven_day(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB row armed on the retired ``fable_week`` window is handled as ``seven_day``."""
+    launched, _ = _daemon_setup(monkeypatch)
+    messages: list[str] = []
+    monkeypatch.setattr(daemon, "notify", lambda title, msg, channels: messages.append(msg))
+    now = int(time.time())
+    snap = usage.Usage(
+        captured_at=now,
+        five_hour=None,
+        seven_day=usage.Window(used_percentage=100.0, resets_at=now + 4000),
+        oauth_fetched_at=now,
+    )
+    monkeypatch.setattr(usage, "read_usage", lambda label: snap)
+    with Store() as store:
+        store.create_draft("f1", "/tmp", "legacy", fire_at=now - 500, fire_window="fable_week")
+        legacy = store.get("f1")
+        assert legacy is not None and legacy.fire_window == "fable_week"  # row loads as stored
+        report = daemon.DaemonReport()
+        daemon._fire_reset_jobs(  # pylint: disable=protected-access
+            store, config.load_config(), report, dry_run=False
+        )
+        assert report.reset_postponed == ["f1"] and not launched
+        held = store.get("f1")
+        assert held is not None and held.fire_at == now + 4000 + park.DEFAULT_BUFFER_SEC
+    assert len(messages) == 1 and "seven_day still exhausted" in messages[0]
 
 
 def test_fire_reset_jobs_dry_run_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:

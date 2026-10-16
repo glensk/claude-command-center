@@ -606,7 +606,7 @@ Jobs stored with the retired `fable-5` choice are resolved to `opus-5` at launch
 on stderr; the retired model is never passed to Claude or offered by a model selector.
 If the **executor** differs, the launch
 prompt tells the overseer to delegate implementation to Agent-tool subagents on the executor's model
-(Fable-5 oversees, Opus executes) while keeping planning, review and integration itself. Both fields
+(e.g. Opus oversees, Sonnet executes) while keeping planning, review and integration itself. Both fields
 round-trip through the mirror file's frontmatter and Meta Bind selects. In the inline editor (`e`)
 the overseer/executor are **clickable dropdowns** (Textual `Select`s) — pick with the mouse or the
 arrow keys; invalid input is impossible. Shortcut: **clicking the `overseer ▸ exec` cell** (the
@@ -953,7 +953,8 @@ it (`fire_window`):
 Scheduling is **deterministic**: the fire time is the selected window's `resets_at`
 plus a small buffer (`-b`, default 90 s) — utilization never decides the schedule, and
 missing/stale usage data is a loud registration error, never "start now". The window
-is `five_hour` by default; `seven_day` / `fable_week` only on explicit selection.
+is `five_hour` by default; `seven_day` only on explicit selection (a job armed on the
+retired `fable_week` window fires on `seven_day`).
 
 Dispatch correctness: the daemon only touches jobs ≥ 2 min past their fire time (a
 live `ccc park` waiter always wins its own tab), re-arms the fire time 15 min forward
@@ -2198,9 +2199,8 @@ when every session is parked, and over `ccc serve` in the browser:
 > such a 429 persists `oauth_backoff_until` (= now + the server-given wait, capped at 2 h)
 > into the account's usage cache; while that time is in the future `claude_usage_stale`
 > reports the cache fresh, so neither the daemon nor the TUI re-attempts the fetch until it
-> passes (a successful fetch clears the field). The fetch still records the
-> Fable-scoped `fable_week` window in the cache (`ccc quota` reads it), but the Claude
-> cards no longer render a Fable row — they show only `Session:` and `Week:`.
+> passes (a successful fetch clears the field). The Claude cards show only `Session:` and
+> `Week:`; model-scoped windows in the endpoint's `limits[]` are not read.
 >
 > **Session/Week staleness (bare `?%`, no bar).** A frozen number is never shown
 > as if it were live: once
@@ -2489,7 +2489,7 @@ filenames); malformed entries are skipped.
   account it bills to: `""` (default) ⇒ the default account (today's behaviour); a
   configured label ⇒ that account (a hard pin); `"auto"` ⇒ the account with the highest
   **required burn rate** `(100 − used%) ÷ hours-to-reset` over its plain 7-day window
-  (`seven_day`; the Fable-scoped `fable_week` is ignored). Routing to the max saturates the allowance
+  (`seven_day`). Routing to the max saturates the allowance
   that resets *soonest* first and self-balances as it fills (the leader's remaining%
   falls until the other overtakes); a snapshot older than 6h, or an account ≥ 90% used
   while another is usable, is skipped so a routed job never trusts stale data or dies on
@@ -2817,7 +2817,7 @@ narrower than before. That is possible because the two were usually the same fac
 window that blocks by being full unblocks exactly when it renews. What is left over is
 kept: a deadline more than an hour from the renewal (a recorded 429, an administrative
 hold, a rota week) is stated in the detail column as `unblocks in 15m`, and a SECOND
-allowance on the same row (`fable_week` beside `seven_day`) carries its own `(renew 5d 2h)`
+allowance on the same row (a window with no bar slot) carries its own `(renew 5d 2h)`
 beside its percentage, because one field cannot speak for two deadlines.
 
 ### The two usage bars
@@ -2856,7 +2856,7 @@ is green below `quota._RISKY_PCT` (90 %), orange while risky, and **red only onc
 window is actually full** (100 %). A test pins the two thresholds to quota's own.
 
 A window drawn as a bar is **not** repeated in the textual `windows` column, so each figure
-appears once; what has no slot (`fable_week`, Antigravity's second bucket) still shows
+appears once; what has no slot (Antigravity's second bucket) still shows
 there. A stale figure keeps its bar but loses its colour — it is the last thing measured,
 not a live reading. The `state` column is painted too: green for `available`, red for
 `blocked`/`disabled`, and deliberately unpainted for `unknown`, which is the fail-open
@@ -2966,12 +2966,6 @@ each provider carries a `windows` map, a `blocked_by` naming the window that blo
 might die mid-run. Reusing it here would throw away a tenth of a paid subscription, so
 this module reports `risky` separately; only `blocked` (≥ 100 %, or a rejection) removes a
 rung.
-
-### Model scoping
-
-Claude accounts expose a Fable-model-scoped weekly window alongside the plain one. An
-account at 100 % on `fable_week` is **not** out of tokens for an Opus request — pass
-`-M <model>` (or `model=` to `quota.snapshot`) so only the governing windows are consulted.
 
 ### A blocked row still carries what the meter measured
 

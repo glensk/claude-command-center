@@ -1117,17 +1117,17 @@ def test_has_active_work_matches_status_enum() -> None:
     assert usage.has_active_work([]) is False
 
 
-# --- Claude OAuth usage endpoint (Fable window + authoritative fetch) -----------
+# --- Claude OAuth usage endpoint (authoritative fetch) --------------------------
 
 # A real OAuth /usage response sample (verified live, private account): top-level
-# five_hour/seven_day carry `utilization` + ISO `resets_at`; the Fable weekly window is
-# the limits[] entry with group=="weekly" and scope.model.display_name=="Fable".
-_OAUTH_FABLE_LIMIT: dict = {
+# five_hour/seven_day carry `utilization` + ISO `resets_at`; a model-scoped weekly
+# limits[] entry is present but not read.
+_OAUTH_SCOPED_LIMIT: dict = {
     "kind": "weekly_scoped",
     "group": "weekly",
     "percent": 42,
     "resets_at": "2026-07-15T14:59:59+00:00",
-    "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+    "scope": {"model": {"id": None, "display_name": "Opus"}, "surface": None},
 }
 _OAUTH_USAGE: dict = {
     "five_hour": {"utilization": 3.0, "resets_at": "2026-07-10T10:49:59.649242+00:00"},
@@ -1145,7 +1145,7 @@ _OAUTH_USAGE: dict = {
             "percent": 3,
             "resets_at": "2026-07-11T14:59:59+00:00",
         },
-        _OAUTH_FABLE_LIMIT,
+        _OAUTH_SCOPED_LIMIT,
     ],
 }
 
@@ -1165,18 +1165,16 @@ def test_parse_oauth_usage_sample() -> None:
     assert snap.captured_at == _NOW
     assert snap.five_hour is not None and snap.five_hour.used_percentage == 3.0
     assert snap.seven_day is not None and snap.seven_day.used_percentage == 3.0
-    assert snap.fable_week is not None
-    assert snap.fable_week.used_percentage == 42.0
-    # ISO resets_at parsed to int epoch (2026-07-15T14:59:59Z).
-    assert snap.fable_week.resets_at == int(
-        datetime(2026, 7, 15, 14, 59, 59, tzinfo=UTC).timestamp()
+    # ISO resets_at parsed to int epoch (2026-07-11T14:59:59.649292Z, fraction dropped).
+    assert snap.seven_day.resets_at == int(
+        datetime(2026, 7, 11, 14, 59, 59, tzinfo=UTC).timestamp()
     )
 
 
 def test_parse_oauth_usage_malformed_is_none() -> None:
     assert usage._parse_oauth_usage("not a dict", _NOW) is None
     assert usage._parse_oauth_usage({"limits": []}, _NOW) is None  # no main window
-    # A body with only a Fable window (no main windows) is still None.
+    # A body with only a model-scoped limits[] entry (no main windows) is still None.
     assert (
         usage._parse_oauth_usage(
             {"limits": [_OAUTH_USAGE["limits"][2]]},
@@ -1186,20 +1184,14 @@ def test_parse_oauth_usage_malformed_is_none() -> None:
     )
 
 
-def test_parse_oauth_usage_no_fable_window() -> None:
-    data = {
-        "five_hour": {"utilization": 5.0, "resets_at": "2026-07-10T10:49:59+00:00"},
-        "seven_day": {"utilization": 6.0, "resets_at": "2026-07-11T14:59:59+00:00"},
-        "limits": [{"kind": "weekly_all", "group": "weekly", "percent": 6, "resets_at": "x"}],
-    }
-    snap = usage._parse_oauth_usage(data, _NOW)
-    assert snap is not None and snap.fable_week is None
-
-
-def test_fable_and_oauth_fetched_at_roundtrip_and_preserve(
+def test_old_snapshot_with_fable_week_loads_and_oauth_fetched_at_is_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A statusline merge write preserves the OAuth-only fable_week + oauth_fetched_at."""
+    """A snapshot written before the retired ``fable_week`` window was dropped still loads.
+
+    The stale key is ignored on read, dropped by the next statusline write, and the
+    OAuth-only ``oauth_fetched_at`` survives that write verbatim.
+    """
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     reset_week = _NOW + 5 * 86400
     _seed_snapshot(
@@ -1212,21 +1204,22 @@ def test_fable_and_oauth_fetched_at_roundtrip_and_preserve(
             "oauth_fetched_at": _NOW,
         },
     )
-    # read_usage exposes fable_week; oauth_fetched_at has its own reader.
     snap = usage.read_usage()
-    assert snap is not None and snap.fable_week is not None
-    assert snap.fable_week.used_percentage == 42
+    assert snap is not None
+    assert snap.seven_day is not None and snap.seven_day.used_percentage == 20
+    assert snap.oauth_fetched_at == _NOW
     assert usage.oauth_fetched_at() == _NOW
 
-    # A statusline write with the SAME windows (higher pct) must NOT drop fable/oauth.
+    # A statusline write with the SAME windows (higher pct) must NOT drop oauth_fetched_at.
     statusline = {
         "five_hour": {"used_percentage": 12, "resets_at": _NOW + 3600},
         "seven_day": {"used_percentage": 25, "resets_at": reset_week},
     }
     assert usage.write_usage(statusline, now=_NOW + 5) is True
     back = usage.read_usage()
-    assert back is not None and back.fable_week is not None
-    assert back.fable_week.used_percentage == 42  # preserved verbatim
+    assert back is not None
+    data = json.loads(usage._usage_path("private").read_text(encoding="utf-8"))
+    assert "fable_week" not in data  # the retired key is not written back
     assert back.seven_day is not None and back.seven_day.used_percentage == 25  # merged up
     assert usage.oauth_fetched_at() == _NOW  # preserved verbatim
 
@@ -1259,7 +1252,7 @@ def test_authority_guard_rejects_stale_payload_same_reset_higher_pct(
 ) -> None:
     """Fresh oauth stamp + a STALE payload (dead own 5h window) → same-reset 84% replay rejected.
 
-    The Fable-5 rollout recalibrated the weekly percentage DOWN at the SAME boundary
+    A model rollout recalibrated the weekly percentage DOWN at the SAME boundary
     (84% → 3%); a >5h-idle session replaying 84% must not beat the fresh OAuth 3%.
     """
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
@@ -1373,25 +1366,6 @@ def test_claude_usage_stale_keyed_on_oauth_fetched_at(
     assert usage.claude_usage_stale("private", 600, now=_NOW + 602) is True
 
 
-def test_render_never_shows_fable_row() -> None:
-    """A snapshot WITH ``fable_week`` renders only Session + Week — no Fable text."""
-    with_fable = usage.Usage(
-        captured_at=_NOW,
-        five_hour=usage.Window(3, _NOW + 3600),
-        seven_day=usage.Window(3, _NOW + 5 * 86400),
-        fable_week=usage.Window(42, _NOW + 9 * 86400),
-        oauth_fetched_at=_NOW - 2 * 3600,  # would once have shown "Fable: stale"
-    )
-    plain = usage.render_usage(with_fable, now=_NOW).plain
-    assert "Fable" not in plain
-    assert "42%" not in plain
-    assert "Session: " in plain and "Week: " in plain
-    for line in plain.splitlines():
-        assert len(line) == usage._CARD_INNER_WIDTH
-    # The Codex card shares _render_card and stays two rows too.
-    assert "Fable" not in usage.render_codex_usage(with_fable, now=_NOW).plain
-
-
 def _oauth_hdrs(retry_after: str) -> Message:
     """A minimal headers object with a ``retry-after`` field (like HTTPError.headers)."""
     hdrs = Message()
@@ -1464,7 +1438,6 @@ def test_fetch_claude_usage_429_backoff_persists_and_preserves(
             "captured_at": _NOW,
             "five_hour": {"used_percentage": 10, "resets_at": _NOW + 3600},
             "seven_day": {"used_percentage": 20, "resets_at": _NOW + 5 * 86400},
-            "fable_week": {"used_percentage": 42, "resets_at": _NOW + 9 * 86400},
             "oauth_fetched_at": _NOW,
         },
     )
@@ -1476,7 +1449,6 @@ def test_fetch_claude_usage_429_backoff_persists_and_preserves(
     assert data["oauth_backoff_until"] == _NOW + 100 + 3357
     assert data["five_hour"]["used_percentage"] == 10
     assert data["seven_day"]["used_percentage"] == 20
-    assert data["fable_week"]["used_percentage"] == 42
     assert data["oauth_fetched_at"] == _NOW
     assert data["captured_at"] == _NOW
     assert usage.oauth_backoff_until() == _NOW + 100 + 3357

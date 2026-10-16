@@ -296,7 +296,7 @@ def resolve_card_label(card_label: str) -> str | None:
       that identity at once (an accidental ``/login`` duplicated one account into
       another dir), the card's OWN dir wins the tie: the duplicate is the drifted
       copy, and first-match-in-config-order once bound the work card to the private
-      dir's cache — whose OAuth fetch was in 429 backoff — showing a stale Fable
+      dir's cache — whose OAuth fetch was in 429 backoff — showing a stale weekly
       figure while the work dir's own cache was fresh.
     * ``None`` when a hard link IS configured but no configured account currently
       matches it (logged out, or the seat lapsed) — callers must render this as "no

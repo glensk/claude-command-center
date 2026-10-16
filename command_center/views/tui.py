@@ -330,7 +330,6 @@ _CACHE_STYLE = {
 _DRAFT_BLUE = "#5fafff"  # FUTURE (draft) jobs: section header, ✎ icon, prompt preview
 # Per-model colours for the draft `<overseer> ▸ <executor>` readout (the /next-step cell).
 _LLM_STYLE: dict[str, str] = {
-    "fable-5": "#ff9f43",  # orange
     "opus-5": "#2ecc71",  # green
     "opus-4.8": "#2ecc71",  # green
     "sonnet-5": "#5fafff",  # blue
@@ -705,7 +704,7 @@ def _models_cell(session: Session, prefix: str = "  ") -> Text:
 
     When overseer and executor match (the common case) a single colour-coded name is shown;
     otherwise the ``<overseer> ▸ <executor>`` pair, each name colour-coded per
-    :data:`_LLM_STYLE` (orange / green / blue) with a dim arrow between. The readout is
+    :data:`_LLM_STYLE` (green / blue) with a dim arrow between. The readout is
     bounded (each name ≤ 8 chars) so it never approaches the column's truncation width —
     the cell renders in full.
     """

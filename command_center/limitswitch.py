@@ -188,15 +188,14 @@ def _authorized_targets(source_label: str, cfg: config.Config) -> list[tuple[str
 
 
 def _quota_rank(label: str, model: str, now: int) -> tuple[bool, float]:
-    """``(available, urgency)`` for one account, from ONE model-scoped quota reading.
+    """``(available, urgency)`` for one account, from ONE quota reading.
 
-    ``quota.provider_state`` evaluates the windows that apply to the requested MODEL, while
-    ``routing.score_accounts`` ranks the Fable weekly window whatever the session runs and
-    falls back to the default account — mixing them would rank a seat by a window the
-    resumed session will never touch (Codex O10). So both the filter and the order come from
-    the same model-scoped verdict: ``urgency`` (headroom per hour until reset) prefers the
-    allowance that expires soonest, and an UNKNOWN seat sorts last but stays eligible for
-    one bounded trial rather than being deleted on a measurement gap.
+    ``quota.provider_state`` gives both the verdict and the urgency for an account, so the
+    filter and the order come from the same reading instead of mixing it with
+    ``routing.score_accounts`` (which falls back to the default account): ``urgency``
+    (headroom per hour until reset) prefers the allowance that expires soonest, and an
+    UNKNOWN seat sorts last but stays eligible for one bounded trial rather than being
+    deleted on a measurement gap.
     """
     state = quota.provider_state(f"claude:{label}", model=model, now=now)
     if state is None:

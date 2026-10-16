@@ -6,7 +6,6 @@ The behaviours worth guarding here are the ones whose failure is SILENT and expe
   that removes a working rung is strictly worse than attempting a doubtful one;
 * windows must not be collapsed — 100 % on the 5-hour window and 49 % on the weekly one
   is BLOCKED, not "49 % healthy";
-* a Fable-exhausted account must stay usable for an Opus request;
 * concurrent writers to the cooldown store must not lose one another's updates, and an
   out-of-order observation must not resurrect a block a later success cleared.
 """
@@ -77,69 +76,6 @@ def test_ninety_percent_is_risky_but_available() -> None:
 def test_window_past_its_reset_is_stale() -> None:
     state = quota._window_state("seven_day", _win(100.0, resets_in=-10), NOW, NOW, 86400)
     assert state is not None and state.stale and not state.exhausted
-
-
-# ── model scoping ────────────────────────────────────────────────────────────────
-
-
-def test_fable_window_ignored_for_non_fable_models() -> None:
-    """The concrete bug: fable_week at 100 % must not block an Opus request."""
-    windows = {
-        "seven_day": quota.WindowState("seven_day", 83.0, NOW + 86400),
-        "fable_week": quota.WindowState("fable_week", 100.0, NOW + 86400),
-    }
-    opus = quota._windows_for_model(windows, "claude-opus-4-6")
-    assert [w.name for w in opus] == ["seven_day"]
-    fable = quota._windows_for_model(windows, "claude-fable-5")
-    assert {w.name for w in fable} == {"seven_day", "fable_week"}
-
-
-def test_claude_account_blocked_for_fable_but_available_for_opus(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    snap = usage.Usage(
-        captured_at=NOW,
-        five_hour=_win(4.0),
-        seven_day=_win(83.0, 86400),
-        fable_week=_win(100.0, 86400),
-        oauth_fetched_at=NOW,  # Fable evidence is only as fresh as the OAuth fetch
-    )
-    monkeypatch.setattr(usage, "read_usage", lambda _a: snap)
-    assert quota._claude_quota("private", "claude-fable-5", NOW, {}).state == quota.BLOCKED
-    assert quota._claude_quota("private", "claude-opus-4-6", NOW, {}).state == quota.AVAILABLE
-
-
-def test_stale_fable_evidence_governs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fresh ``captured_at`` + stale ``oauth_fetched_at`` ⇒ the Fable window is stale.
-
-    Statusline writes refresh ``captured_at`` while CARRYING the old Fable value, so a
-    days-old 100 % Fable figure used to read as live and block Fable routing. The
-    evidence for ``fable_week`` is the OAuth fetch time, with the card's 1 h threshold.
-    """
-    snap = usage.Usage(
-        captured_at=NOW,  # a statusline write seconds ago
-        five_hour=_win(4.0),
-        seven_day=_win(83.0, 86400),
-        fable_week=_win(100.0, 86400),
-        oauth_fetched_at=NOW - 7200,  # ...but no OAuth fetch for 2 h
-    )
-    monkeypatch.setattr(usage, "read_usage", lambda _a: snap)
-    got = quota._claude_quota("private", "claude-fable-5", NOW, {})
-    assert got.state == quota.AVAILABLE  # stale 100 % must not block
-    assert got.windows["fable_week"].stale
-    assert got.windows["fable_week"].evidence_at == NOW - 7200
-
-
-def test_never_fetched_fable_is_stale_not_blocking(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``oauth_fetched_at=0`` (no OAuth fetch ever) can never let Fable block."""
-    snap = usage.Usage(
-        captured_at=NOW,
-        five_hour=_win(4.0),
-        seven_day=_win(83.0, 86400),
-        fable_week=_win(100.0, 86400),
-    )
-    monkeypatch.setattr(usage, "read_usage", lambda _a: snap)
-    assert quota._claude_quota("private", "claude-fable-5", NOW, {}).state == quota.AVAILABLE
 
 
 # ── copilot precedence ───────────────────────────────────────────────────────────
@@ -881,7 +817,7 @@ def test_bar_slots_name_only_windows_providers_really_have() -> None:
     """
     slots = dict(quota.BAR_SLOTS)
     assert slots["session"] == ("five_hour",)
-    known = {*slots["session"], *slots["week"], *quota.BAR_SPAN_WINDOWS, "fable_week"}
+    known = {*slots["session"], *slots["week"], *quota.BAR_SPAN_WINDOWS}
     _agy_snapshot(gemini_pct=5.0, third_party_pct=5.0)
     snap = quota.snapshot(now=NOW)
     for prov in snap["providers"]:
@@ -1056,7 +992,7 @@ def test_blocked_claude_row_still_reports_its_windows() -> None:
     quota.record_block(
         "claude:private", blocked_until=NOW + 7200, reason="rate-limit halt", observed_at=NOW
     )
-    row = quota._claude_quota("private", "", NOW, quota.read_cooldowns(NOW))
+    row = quota._claude_quota("private", NOW, quota.read_cooldowns(NOW))
     assert row.state == quota.BLOCKED
     assert row.source == "cooldown"  # the verdict is still the entry's
     assert row.reason == "rate-limit halt"
@@ -1511,7 +1447,7 @@ def test_a_past_reset_is_a_dash_not_a_countdown_to_yesterday() -> None:
 
 
 def test_a_second_allowance_states_its_own_renewal() -> None:
-    """`fable_week` is a second deadline; the single renew field cannot speak for it."""
+    """A window with no bar has its own deadline; the single renew field cannot speak for it."""
     from command_center import cli
 
     same = {"used_pct": 13.0, "resets_at": NOW + 3 * 86400}
