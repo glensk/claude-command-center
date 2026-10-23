@@ -366,3 +366,64 @@ def test_statusline_first_aim_anchor_not_duplicated(
     cli.cmd_statusline(Namespace(session="s1"))
     out = capsys.readouterr().out
     assert out.count("/aim (1):") == 1
+
+
+# --- tp#1166: the role marker on the /aim row ---------------------------------------------
+
+
+def _bind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sid: str, role: str | None) -> None:
+    """A temp tp cache + staff root; `role` = the binding `tp adopt` would write (None: none)."""
+    cache = tmp_path / "tpcache"
+    staff = tmp_path / "staff"
+    (staff / "email-agent").mkdir(parents=True)
+    (staff / "email-agent" / "agent.yaml").write_text("name: email-agent\n", encoding="utf-8")
+    (cache / "session-role").mkdir(parents=True)
+    if role is not None:
+        (cache / "session-role" / sid).write_text(role + "\n", encoding="utf-8")
+    monkeypatch.setenv("TP_CACHE_DIR", str(cache))
+    monkeypatch.setenv("TP_STAFF_ROOT", str(staff))
+
+
+def _aim_row(out: str) -> str:
+    return next(ln for ln in out.splitlines() if "/aim" in ln)
+
+
+def test_statusline_marks_a_session_that_adopted_a_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed(tmp_path, monkeypatch, todos=None)
+    _bind(tmp_path, monkeypatch, "s1", "email-agent")
+    cli.cmd_statusline(Namespace(session="s1"))
+    row = _aim_row(capsys.readouterr().out)
+    assert f"{cli.ROLE_MARKER} " in row and "all tests pass" in row
+    assert row.index(cli.ROLE_MARKER) < row.index("all tests pass")
+
+
+@pytest.mark.parametrize("role", [None, "Bad Name", "ghost-agent", ""])
+def test_statusline_no_marker_without_a_valid_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    role: str | None,
+) -> None:
+    """No binding, a malformed name, or an agent that no longer exists: no symbol."""
+    _seed(tmp_path, monkeypatch, todos=None)
+    _bind(tmp_path, monkeypatch, "s1", role)
+    cli.cmd_statusline(Namespace(session="s1"))
+    assert cli.ROLE_MARKER not in capsys.readouterr().out
+
+
+def test_statusline_marker_on_the_placeholder_row_of_an_untracked_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed(tmp_path, monkeypatch, todos=None)
+    _bind(tmp_path, monkeypatch, "s9", "email-agent")
+    cli.cmd_statusline(Namespace(session="s9"))
+    assert cli.ROLE_MARKER in _aim_row(capsys.readouterr().out)
+
+
+def test_adopted_role_rejects_path_tricks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _bind(tmp_path, monkeypatch, "s1", "email-agent")
+    assert cli.adopted_role("s1") == "email-agent"
+    assert cli.adopted_role("../session-role/s1") is None
+    assert cli.adopted_role("") is None

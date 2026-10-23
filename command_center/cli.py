@@ -5082,6 +5082,41 @@ def _vlen(text: str) -> int:
     return len(_ANSI_RE.sub("", text))
 
 
+#: The `/aim` row marker of a session that ran `staff adopt -a <agent>` (tp#1166): it acts
+#: in a staff ROLE, not just under a staff-looking name or AIM.
+ROLE_MARKER = "🎭"
+_ROLE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def adopted_role(session_id: str) -> str | None:
+    """The staff role `tp adopt` bound `session_id` to, or None (tp#1166).
+
+    The binding is tp's own record of a real adopt (a dry run writes none):
+    ``$TP_CACHE_DIR/session-role/<sid>`` (default ``~/.cache/tp/session-role/<sid>``), one
+    line holding the agent name. The name must have tp's ``owner_role`` shape and name an
+    agent that still exists (``<staff root>/<name>/agent.yaml``; staff root
+    ``$TP_STAFF_ROOT``, else ``~/obsidian/01-llm/staff`` — tp's rule). One small read and one
+    stat, no subprocess: it runs on every status-line render. Never raises.
+    """
+    if not session_id or "/" in session_id or session_id.startswith("."):
+        return None
+    cache = os.environ.get("TP_CACHE_DIR") or os.path.join(os.path.expanduser("~"), ".cache", "tp")
+    path = os.path.join(os.path.expanduser(cache), "session-role", session_id)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            name = handle.readline(128).strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not _ROLE_NAME_RE.match(name):
+        return None
+    root = os.environ.get("TP_STAFF_ROOT") or os.path.join(
+        os.path.expanduser("~"), "obsidian", "01-llm", "staff"
+    )
+    if not os.path.isfile(os.path.join(os.path.expanduser(root), name, "agent.yaml")):
+        return None
+    return name
+
+
 def _aim_label(index: int) -> str:
     """The ``/aim`` prefix, carrying the AIM's 1-based running index when known.
 
@@ -5126,8 +5161,13 @@ def _aim_statusline_lines(  # pylint: disable=too-many-positional-arguments  # c
     threshold: int,
     colors: tuple[str, str, str, str],
     index: int,
+    role_marker: str = "",
 ) -> list[str]:
     """The ``/aim`` status-line row(s): AIM + running index + progress bar + vague marker.
+
+    ``role_marker`` (``🎭`` when the session adopted a staff role, :func:`adopted_role`) is
+    put right after the current row's ``/aim …:`` label; the ``/aim (1):`` anchor row and the
+    old side of a transition never carry it.
 
     ``index`` is the current AIM's running number in the session's AIM history, so the
     prefix reads ``/aim (N):``. When the AIM changed this turn (``aim_prev`` set) it renders
@@ -5154,8 +5194,9 @@ def _aim_statusline_lines(  # pylint: disable=too-many-positional-arguments  # c
     )
 
     green, dim, reset, red = colors
+    mark = f"{role_marker} " if role_marker else ""
     if not session.aim:
-        return [f"{green}/aim:{reset} {dim}(set one with /aim){reset}"]
+        return [f"{green}/aim:{reset} {mark}{dim}(set one with /aim){reset}"]
     label = _aim_label(index)
     low_score = low_aim_score(session.aim, session.aim_score, threshold)
     chip_color = red if low_score else dim
@@ -5183,10 +5224,10 @@ def _aim_statusline_lines(  # pylint: disable=too-many-positional-arguments  # c
     changed = bool(session.aim_prev) and session.aim_prev != session.aim
     anchor = _first_aim_anchor(session, index, changed, green, dim, reset)
     if not changed:
-        return [*anchor, f"{green}{label}:{reset} {chip}{new_aim}{prog}{tag}"]
+        return [*anchor, f"{green}{label}:{reset} {mark}{chip}{new_aim}{prog}{tag}"]
     bold = "\033[1m"
     old_part = f"{green}{_aim_label(index - 1)}:{reset} {dim}{session.aim_prev}{reset}"
-    arrow = f"{bold}====>{reset} {green}{label}:{reset} "
+    arrow = f"{bold}====>{reset} {green}{label}:{reset} {mark}"
     # Always ONE line — old AIM, arrow, new AIM, bar and marker never split across rows;
     # an over-wide line soft-wraps in the terminal rather than costing three status-line rows.
     return [*anchor, f"{old_part}   {arrow}{chip}{new_aim}{prog}{tag}"]
@@ -5243,8 +5284,10 @@ def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     }
     with Store() as store:
         session = store.get(sid)
+        role_marker = ROLE_MARKER if adopted_role(sid) else ""
         if session is None:
-            print(f"{green}/aim:{reset} {dim}(set one with /aim){reset}")
+            mark = f"{role_marker} " if role_marker else ""
+            print(f"{green}/aim:{reset} {mark}{dim}(set one with /aim){reset}")
             print(f"{dim}Status: untracked   /next-step: —{reset}")
             return 0
         checked, total = store.progress(sid)
@@ -5276,7 +5319,13 @@ def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many
         session = dataclasses.replace(session, aim_prev=None)
         aim_index = 0
     aim_lines = _aim_statusline_lines(
-        session, checked, total, threshold, (green, dim, reset, status_color["failed"]), aim_index
+        session,
+        checked,
+        total,
+        threshold,
+        (green, dim, reset, status_color["failed"]),
+        aim_index,
+        role_marker,
     )
 
     scolor = status_color.get(status_value, dim)

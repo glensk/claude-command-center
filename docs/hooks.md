@@ -142,7 +142,12 @@ lease, and `release-locks` — after it has handled the close/switch claim, so i
   whenever the current revision is no longer the first, so a sharpened AIM never hides your
   original goal;
 - the `/aim (N):` row — the current AIM (or its short label), its running index, the
-  concreteness score chip (red when vague), and a compact progress bar;
+  concreteness score chip (red when vague), and a compact progress bar. A **`🎭`** right after
+  the label (`/aim: 🎭 tp#994, #1114: email-agent`) means the session ran `staff adopt -a
+  <agent>` and works in that staff ROLE (tp#1166): ccc reads tp's adopt binding
+  `$TP_CACHE_DIR/session-role/<sid>` (default `~/.cache/tp/session-role/<sid>`; the named agent
+  must still exist under `$TP_STAFF_ROOT`, default `~/obsidian/01-llm/staff`). A session that is
+  merely named or AIMed after an agent shows no `🎭`;
 - a `Status:` + `/next-step:` row;
 - a blue `●` drift warning when the impartial checker has flagged one;
 - a one-line `done/total` + checkbox strip of the session's live todos.
