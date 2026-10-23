@@ -1234,6 +1234,95 @@ def iterm_session_vars(
         return None
 
 
+#: ``CGEventSourceStateID.hidSystemState`` and ``CGEventType.keyDown`` (CoreGraphics).
+_CG_HID_SYSTEM_STATE = 1
+_CG_KEY_DOWN = 10
+_COREGRAPHICS = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+
+
+def seconds_since_keystroke() -> float | None:
+    """Seconds since the last physical key-down anywhere on this Mac (``None`` = unknown).
+
+    CoreGraphics ``CGEventSourceSecondsSinceLastEventType(hidSystemState, keyDown)``:
+    the HID system's own idle counter for key presses. It needs no Input Monitoring or
+    Accessibility grant (it reports a duration, never a key) and counts only hardware
+    events — text typed by ``async_send_text`` / AppleScript ``write text`` goes to the
+    pty and never resets it. It cannot tell WHICH app received the key; the typing guard
+    pairs it with "iTerm2 is frontmost and the target tab is its focused tab".
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes  # pylint: disable=import-outside-toplevel
+
+        lib = ctypes.CDLL(_COREGRAPHICS)
+        fn = lib.CGEventSourceSecondsSinceLastEventType
+        fn.restype = ctypes.c_double
+        fn.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        value = float(fn(_CG_HID_SYSTEM_STATE, _CG_KEY_DOWN))
+    except (OSError, AttributeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def iterm_frontmost_state() -> bool | None:
+    """Whether iTerm2 is the frontmost macOS app; ``None`` when that cannot be told.
+
+    The same ``lsappinfo`` read as :func:`is_iterm_frontmost` (no Apple event, no
+    Automation grant), but tri-state so a failed probe is not mistaken for "not front".
+    """
+    if not shutil.which("lsappinfo"):
+        return None
+    try:
+        asn = subprocess.run(
+            ["lsappinfo", "front"], capture_output=True, text=True, timeout=3, check=False
+        ).stdout.strip()
+        if not asn:
+            return None
+        info = subprocess.run(
+            ["lsappinfo", "info", "-only", "bundleID", asn],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        ).stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if "=" not in info:
+        return None
+    return "com.googlecode.iterm2" in info
+
+
+def iterm_focused_session() -> str | None:
+    """The UUID of the focused session of iTerm2's key terminal window, read-only.
+
+    ``current_terminal_window.current_tab.current_session`` over a fresh Python-API
+    connection (the same TCC pre-check as :func:`iterm_session_vars`). ``""`` = iTerm has
+    no key terminal window; ``None`` = unreachable. Nothing is selected or activated.
+    """
+    if not _iterm_api_auth_is_tcc_free() and not _iterm_reachable_by_apple_event():
+        return None
+    try:
+        import asyncio  # pylint: disable=import-outside-toplevel
+
+        import iterm2  # pylint: disable=import-outside-toplevel
+
+        async def _go() -> str:
+            iterm2.app.invalidate_app()
+            conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
+            app = await iterm2.async_get_app(conn)
+            if app is None:
+                raise RuntimeError("no iTerm app")
+            window = app.current_terminal_window
+            tab = window.current_tab if window is not None else None
+            session = tab.current_session if tab is not None else None
+            return str(session.session_id) if session is not None else ""
+
+        return asyncio.run(_go())
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+
+
 #: :func:`delivery_channel_health`'s bound on the Python-API connect.
 CHANNEL_PROBE_TIMEOUT = 3.0
 #: What ``python_api_error`` says for a refused / missing API socket.

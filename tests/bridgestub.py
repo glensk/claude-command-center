@@ -180,6 +180,13 @@ class World:  # pylint: disable=too-many-instance-attributes  # one fake machine
     llm_calls: list[str] = field(default_factory=list)
     clock_ms: int = 1_800_000_000_000
     mono: float = 0.0
+    #: Typing-guard probes: iTerm frontmost (None = unknown), seconds since the last key
+    #: (None = unknown), the focused session id ("" = no key window, None = unknown).
+    frontmost: bool | None = False
+    key_idle: float | None = 3600.0
+    focused: str | None = ""
+    guard_sec: float = 30.0
+    focus_reads: int = 0
 
     def __post_init__(self) -> None:
         self.config_dir = self.tmp / "claude"
@@ -276,6 +283,10 @@ class World:  # pylint: disable=too-many-instance-attributes  # one fake machine
     def store(self) -> Store:
         return Store(self.db)
 
+    def focused_tab(self) -> str | None:
+        self.focus_reads += 1
+        return self.focused
+
     def deps(self) -> BridgeDeps:
         return BridgeDeps(
             discover=self.discover,
@@ -292,6 +303,10 @@ class World:  # pylint: disable=too-many-instance-attributes  # one fake machine
             sleep=self.sleep,
             monotonic=self.monotonic,
             now_ms=self.now_ms,
+            iterm_frontmost=lambda: self.frontmost,
+            keystroke_idle=lambda: self.key_idle,
+            focused_tab=self.focused_tab,
+            typing_guard_sec=lambda: self.guard_sec,
         )
 
 

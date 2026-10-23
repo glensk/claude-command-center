@@ -2,18 +2,29 @@
 """``ccc inspect -s ID -j`` — what a session last said and the decision it needs.
 
 data: ``{state, live, last_reply (≤ 1500, tail kept), last_prompt (≤ 500, head kept),
-decision | null}``. The transcript parse is :mod:`command_center.adapters.claude_bridge`
-(the S-INSPECT reference parser); the live registry status overrides the transcript's
-own state when the session is running. ``decision`` is the pending AskUserQuestion
-(source ``ask_user_question``) or, only while idle, the ``You [decision]:`` lines of the
-last reply's ``## To-do list`` (source ``todo_line``); its ``context`` carries the
-session's AIM, a ticket id found in the AIM, and ``recent_summary``.
+decision | null, cwd, config_dir, account, actions, brief}``. The transcript parse is
+:mod:`command_center.adapters.claude_bridge` (the S-INSPECT reference parser); the live
+registry status overrides the transcript's own state when the session is running.
+``decision`` is the pending AskUserQuestion (source ``ask_user_question``) or, only while
+idle, the ``You [decision]:`` lines of the last reply's ``## To-do list`` (source
+``todo_line``); its ``context`` carries the session's AIM, a ticket id found in the AIM,
+and ``recent_summary``.
 
 ``recent_summary`` comes from the ccc LLM purpose ``voice-brief`` (through
 ``llm_custom_command`` only, :data:`BRIEF_TIMEOUT_SEC` budget), cached per transcript
 (inode + size) in ``voice-brief-cache.json`` under ccc's state dir; with no router, a
 failed call or ``--no-llm`` it falls back to the first three sentences of the last reply.
 A transcript that does not parse is ``ok: false, code: transcript_unknown``.
+
+Additive fields (schema_version stays 1; every one is ``null`` / ``[]`` when absent):
+``cwd`` (the session's working dir), ``config_dir`` + ``account`` (the resolved Claude
+account config dir and its configured label, as in ``ccc sessions -j``), ``actions``
+(every ``You [kind]: text`` line of the current turn's ``## To-do list`` as
+``{kind, text, tp_id, brief_ref, brief}``, whatever the state — a relay acts on them only
+while ``state`` is ``idle``) and ``brief`` (the pending picker's ``**Decision brief**``
+block from the assistant text right before the AskUserQuestion call, raw, ≤ 4000 chars,
+head kept). See :mod:`command_center.adapters.claude_bridge` (``todo_actions``,
+``decision_brief``, ``decision_briefs``).
 """
 
 from __future__ import annotations
@@ -173,4 +184,27 @@ def run_inspect(deps: BridgeDeps, session_id: str, *, use_llm: bool = True) -> d
         "last_reply": cb.cap_tail(ins.last_reply, cb.LAST_REPLY_MAX),
         "last_prompt": cb.cap_head(ins.last_prompt, cb.LAST_PROMPT_MAX),
         "decision": decision,
+        "cwd": cwd or None,
+        **account_fields(config_dir),
+        "actions": ins.actions,
+        "brief": ins.brief,
     }
+
+
+def account_fields(config_dir: str) -> dict[str, str | None]:
+    """``{config_dir, account}`` of a session: the resolved account config dir and its
+    configured label (the one ``ccc sessions -j`` shows); both ``None`` when the session's
+    account is unknown (``""``) — never guessed."""
+    if not config_dir:
+        return {"config_dir": None, "account": None}
+    from . import accounts
+
+    try:
+        resolved = str(Path(config_dir).expanduser().resolve())
+    except OSError:
+        resolved = config_dir
+    try:
+        label: str | None = accounts.account_label(config_dir) or None
+    except Exception:  # pylint: disable=broad-exception-caught  # a label is optional
+        label = None
+    return {"config_dir": resolved, "account": label}

@@ -103,6 +103,7 @@ and some are macOS-first (they drive iTerm2 / Karabiner). Honest table:
 | Rate-limit failover           | a halted session relaunches itself on an account that still has quota, same tab              | a second account in `claude_accounts`                              | `auto_switch_on_limit`               |
 | Cross-session file locks      | serializes edits when several sessions share one checkout                                    | Claude Code hooks                                                  | `file_lock_enabled` (default on)     |
 | Codex delegation              | hand implementation to OpenAI Codex; Claude only verifies. Every Codex call bills the ChatGPT login whose weekly allowance resets soonest (`codex_seat_policy = "fill"`; `codex-in-claude policy order` restores the strict `codex-in-claude order`) and falls through at run time when one is held, exhausted or refusing. A login SHARED with a colleague on alternating weeks goes on a weekly rota (`codex-in-claude rota set <seat> -s <monday> alice bob`) and leaves the ranking for their week. A Codex DEBATE starts only on an allowed seat below its five-hour cap (`codex-in-claude debate-seat`; `codex_debate_*` keys, see [docs/codex.md](docs/codex.md)); mid-debate `debate-seat -c <seat> [-p tool\|human] [-x <seat>]` keeps it below `codex_debate_pause_pct` (default 90) or fails over / pauses | `codex` CLI                                                        | `-j codex` jobs / slash command      |
+| Voice-bridge JSON CLI         | agents list, read and answer live sessions (`ccc sessions/inspect/send/answer -j`)           | macOS + iTerm2 Python API                                          | always on                            |
 | Copilot usage card            | month-to-date GitHub Copilot spend in the TUI                                                | `gh` CLI + a Copilot seat                                          | `copilot_usage`                      |
 | Peek + jump *(macOS)*         | float a panel of a tab's prompts/AIM; one-key toggle to/from `ccc`                           | macOS + iTerm2 + Karabiner                                         | Karabiner chords                     |
 
@@ -182,6 +183,15 @@ switch leaves an idle session idle — see docs/reference.md). The same move exi
 editable install), `ccc restart-tui` bounces the running TUI in its **own** terminal tab
 so the new code loads — no manual keystroke; it exits 0 once the TUI is back, 1 if none
 is running.
+
+The voice-bridge commands (`ccc sessions | inspect | send | answer | delivery | events`, all
+`-j`) are the machine interface other agents use: `ccc inspect -j` returns a session's state,
+pending decision, cwd, account, every `You [kind]: …` step of its last to-do list and its
+`**Decision brief**` blocks; `ccc send` / `ccc answer` type into the session's tab without
+ever focusing it, and refuse with `user_active` while you are typing into that tab (it is
+iTerm's focused tab and a key was pressed in the last `bridge_typing_guard_sec`, default
+30 s). Contract and error codes: [docs/reference.md](docs/reference.md) § "The voice-bridge
+JSON CLI".
 
 ccc makes a handful of small LLM calls of its own (AIM scoring, the done-check, sub-goal
 derive/grade, drift, parked-session summaries, the short-AIM label). **`ccc llm-routing`

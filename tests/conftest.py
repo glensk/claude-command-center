@@ -307,7 +307,13 @@ def _isolate_bridge_from_iterm(monkeypatch: pytest.MonkeyPatch) -> None:
         bridge_target,
         "default_deps",
         lambda: bridge_target.BridgeDeps(
-            tab_vars=_refuse, panes=_refuse, send_text=_refuse, send_keys=_refuse
+            tab_vars=_refuse,
+            panes=_refuse,
+            send_text=_refuse,
+            send_keys=_refuse,
+            iterm_frontmost=_refuse,
+            keystroke_idle=_refuse,
+            focused_tab=_refuse,
         ),
     )
 

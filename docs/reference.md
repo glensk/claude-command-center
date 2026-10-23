@@ -3082,6 +3082,11 @@ Reads the session's transcript. `data`:
 | `last_reply`  | the last assistant reply, ≤ 1500 characters, tail kept                  |
 | `last_prompt` | the last user prompt, ≤ 500 characters, head kept                       |
 | `decision`    | the pending decision or `null` (below)                                  |
+| `cwd`         | the session's working directory (`null` when unknown)                   |
+| `config_dir`  | the resolved Claude account config dir (`null` = account unknown)       |
+| `account`     | that dir's configured account label, as in `ccc sessions -j`            |
+| `actions`     | every `You [kind]: …` line of the current turn's to-do list (below)     |
+| `brief`       | the pending picker's `**Decision brief**` block, or `null` (below)      |
 
 `decision = {decision_id, source, questions: [{text, multi_select, options: [{label,
 consequence}]}], recommendation, recommendation_reason, context: {aim, ticket,
@@ -3094,6 +3099,26 @@ to `ccc answer`. `recent_summary` (≤ 800 characters) comes from the ccc LLM pu
 back to the first three sentences of the last reply. Codes: `unknown_session`,
 `transcript_missing`, `transcript_unknown`.
 
+The last five fields are additive (`schema_version` stays 1); absent values are `null` or
+`[]`, never an error.
+
+- `actions[] = {kind, text, tp_id, brief_ref, brief}` — one per `You [kind]: text` line
+  (numbered, bulleted or bare) of the last `## To-do list` of the current turn's reply,
+  `### tp#N …` group headings included. `kind` is the bracket's content lower-cased
+  (`decision`, `sudo`, `login`, `ui`, `secret`, `ui|login` …); `text` is the rest of the line
+  without its `(brief D<n>)` marker; `tp_id` the first `tp#N` on the line, else the one of
+  its group heading; `brief_ref` the `D<n>` of that marker and `brief` the matching
+  `**D<n> …**` entry of the reply's `## Decision briefs` section. `actions` is filled in
+  every state — act on it only while `state` is `idle`.
+- `brief` — for a pending AskUserQuestion: the LAST block that opens with the line
+  `**Decision brief**` in the assistant text written since the previous tool result,
+  i.e. right before the call. The block runs over its labelled lines (`Background:`,
+  `Building:`, `Fit:`, `Recommendation:`) up to a heading, another bold title line or a
+  blank line not followed by a labelled line.
+
+Every `brief` (top-level and per action) is raw markdown, at most 4000 characters, head kept
+(cut with `…`). A `todo_line` decision's question text drops the `(brief D<n>)` marker too.
+
 ### `ccc send` (`-s/--session ID`, `-j/--json`)
 
 Message on stdin: ≤ 4000 characters, no control characters except newline and tab (ESC, NUL
@@ -3105,6 +3130,26 @@ is typed through the iTerm2 Python API (AppleScript fallback) and matched agains
 appended after the anchor (normalised-text sha256, FIFO — no marker is added to the text).
 Never retried.
 
+The last check before the first byte, still inside the lock, is the **typing guard**: the
+command refuses with `user_active` (exit 1, nothing typed, no delivery row) while iTerm2 is
+the frontmost app AND a physical key was pressed in the last `bridge_typing_guard_sec`
+seconds (config, default 30, clamped 0..600; 0 turns the guard off) AND the target is the
+focused session of iTerm's key window. The probes are read-only and run cheapest first:
+`lsappinfo` for the frontmost app (no Apple event), CoreGraphics
+`CGEventSourceSecondsSinceLastEventType(hidSystemState, keyDown)` for the last key press (no
+Input Monitoring grant; text that ccc itself types never resets it), and only then one
+Python-API read of `current_terminal_window.current_tab.current_session`. A probe that cannot
+answer counts as "maybe"; a definite "another app is in front", "no key for the whole
+window" or "another tab is focused" lets the message through. Nothing is ever activated,
+selected or raised. `ccc answer` runs the same guard.
+
+Trade-off: the iTerm2 Python API has no per-session "last keystroke" time — its
+`KeystrokeMonitor` only streams keys to a process that is already listening, and no session
+variable records input time — so the key time is the Mac-wide one. The guard therefore also
+holds a message when a key was pressed in another app or another iTerm tab within the window
+and the user then switched to the target tab; it never lets a message through while the user
+is typing into the focused target tab. Dictation that sends no key events is not seen.
+
 `data = {delivery_id, outcome, channel}` — `outcome` `accepted` (matching record within 8 s),
 `unknown` (typed, no record yet; `ok: false`, code `delivery_unknown`) or `failed` (nothing
 typed; code `delivery_failed`).
@@ -3114,7 +3159,8 @@ typed; code `delivery_failed`).
 stdin: `{"decision_id": "<from ccc inspect>", "answers": [{"question_index": 0,
 "option_indices": [1]} | {"question_index": 1, "other_text": "…"}]}` — one entry per question,
 `other_text` ≤ 500 characters. Only for exactly one pending AskUserQuestion whose recomputed
-`decision_id` matches, with the session `waiting`. The keys go through
+`decision_id` matches, with the session `waiting` and the typing guard clear (`user_active`,
+see `ccc send`). The keys go through
 `terminal.send_keys_via` (Python API only, no focus change); single- and multi-select are
 supported. The answer is verified within 10 s through the call's `tool_use_id` and
 `toolUseResult.answers` — every expected label must match.
@@ -3147,6 +3193,7 @@ details never carry message text. Code: `invalid_cursor` (a negative cursor, exi
 | `not_running` / `background` / `account_conflict`                                                                                                                       | send, answer          | not live / a background session (read-only) / live under two accounts   |
 | `no_tab` / `stale_tab` / `foreground_not_claude` / `iterm_unreachable`                                                                                                  | send, answer          | the tab cannot be proven to be this session's claude                    |
 | `tab_locked`                                                                                                                                                            | send, answer          | another send/answer to this tab is running (3 s wait)                   |
+| `user_active`                                                                                                                                                           | send, answer          | the user is typing into the focused target tab — retry later            |
 | `waiting` / `blocked` / `unknown_status` / `picker_pending`                                                                                                             | send                  | not typed into in this state (`picker_pending`: use `ccc answer`)       |
 | `delivery_failed` / `delivery_unknown`                                                                                                                                  | send                  | nothing reached the tab / typed, but no matching record within 8 s      |
 | `not_waiting` / `decision_changed` / `unsupported_shape` / `invalid_answer`                                                                                             | answer                | no single pending picker matching the `decision_id`, or a bad choice    |

@@ -560,7 +560,9 @@ def _add_transcript_parsers(sub: Any) -> None:
         description=(
             "Reads the session's transcript: state, last reply (tail, <= 1500 chars), last "
             "prompt (head, <= 500) and a pending decision (AskUserQuestion picker, or "
-            "'You [decision]:' to-do lines while idle) with a spoken-briefing summary."
+            "'You [decision]:' to-do lines while idle) with a spoken-briefing summary; "
+            "also cwd, config_dir, account, every 'You [kind]:' to-do line (actions) and "
+            "the '**Decision brief**' blocks (brief)."
         ),
     )
     p.add_argument("-s", "--session", required=True, help="Claude session id")
@@ -574,7 +576,9 @@ def _add_transcript_parsers(sub: Any) -> None:
         description=(
             "Reads the message from stdin (<= 4000 chars, no control characters except "
             "newline/tab), revalidates the tab, types it via the iTerm2 API and matches "
-            "the transcript record. Example: echo 'run the tests' | ccc send -s ID -j"
+            "the transcript record; refuses with user_active while the tab is iTerm's "
+            "focused tab and a key was pressed within bridge_typing_guard_sec (30 s). "
+            "Example: echo 'run the tests' | ccc send -s ID -j"
         ),
     )
     p.add_argument("-s", "--session", required=True, help="Claude session id")
@@ -586,7 +590,8 @@ def _add_transcript_parsers(sub: Any) -> None:
         help="answer a pending AskUserQuestion picker (JSON on stdin)",
         description=(
             'stdin: {"decision_id": "<from ccc inspect>", "answers": [{"question_index": 0, '
-            '"option_indices": [1]}, {"question_index": 1, "other_text": "..."}]}'
+            '"option_indices": [1]}, {"question_index": 1, "other_text": "..."}]}. '
+            "Same typing guard as ccc send (user_active)."
         ),
     )
     p.add_argument("-s", "--session", required=True, help="Claude session id")

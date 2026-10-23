@@ -15,6 +15,10 @@
 3. the raw registry status is read fresh and mapped to the §6 set (``shell`` — a shell
    tool running — is ``busy``; :func:`adapters.claude_agents.contract_status`); the
    caller decides what it allows.
+4. the typing guard (:func:`guard_user_active`, the last check before the first byte):
+   ``user_active`` while the tab is the focused tab of the frontmost iTerm2 window and a
+   key was pressed within ``bridge_typing_guard_sec`` (default 30 s). It never focuses
+   anything.
 
 Every collaborator that touches the machine (registry, ``ps``, iTerm, the clock, the
 sender) is a field of :class:`BridgeDeps`, so tests drive the whole path with fakes.
@@ -120,6 +124,30 @@ def _default_llm(prompt: str, note: str, timeout: float) -> str | None:
     )
 
 
+def _default_iterm_frontmost() -> bool | None:
+    from . import terminal
+
+    return terminal.iterm_frontmost_state()
+
+
+def _default_keystroke_idle() -> float | None:
+    from . import terminal
+
+    return terminal.seconds_since_keystroke()
+
+
+def _default_focused_tab() -> str | None:
+    from . import terminal
+
+    return terminal.iterm_focused_session()
+
+
+def _default_typing_guard_sec() -> float:
+    from .config import load_config
+
+    return float(load_config().bridge_typing_guard_sec)
+
+
 def _default_lock_dir() -> Path:
     from . import config
 
@@ -145,6 +173,10 @@ class BridgeDeps:  # pylint: disable=too-many-instance-attributes  # one seam pe
     store: Callable[[], Store] = _default_store
     llm: Callable[[str, str, float], str | None] = _default_llm
     lock_dir: Callable[[], Path] = _default_lock_dir
+    iterm_frontmost: Callable[[], bool | None] = _default_iterm_frontmost
+    keystroke_idle: Callable[[], float | None] = _default_keystroke_idle
+    focused_tab: Callable[[], str | None] = _default_focused_tab
+    typing_guard_sec: Callable[[], float] = _default_typing_guard_sec
     sleep: Callable[[float], None] = time.sleep
     monotonic: Callable[[], float] = time.monotonic
     now_ms: Callable[[], int] = _now_ms
@@ -265,6 +297,41 @@ def revalidate(deps: BridgeDeps, session_id: str, iterm_session_id: str) -> Targ
 
     raw = str(live.raw_status or "")
     return Target(live, iterm_session_id, have, contract_status(raw), raw or "unknown")
+
+
+def guard_user_active(deps: BridgeDeps, iterm_session_id: str) -> None:
+    """Refuse (``user_active``) while the user may be typing into the target tab.
+
+    Called inside the per-tab mutation lock as the LAST check before the first byte.
+    Refuses when iTerm2 is the frontmost app AND a physical key was pressed within the
+    typing-guard window (config ``bridge_typing_guard_sec``, default 30 s; 0 = off) AND
+    the target is the focused session of iTerm's key window. An unknown answer on any
+    probe counts as "maybe" (fails closed), except that a definite "iTerm is not
+    frontmost", "no key for the whole window" or "another tab is focused" lets the
+    delivery through. Every probe is read-only: nothing is activated, selected or raised.
+    """
+    from . import tab_titles
+
+    window = deps.typing_guard_sec()
+    if window <= 0:
+        return
+    if deps.iterm_frontmost() is False:
+        return
+    idle = deps.keystroke_idle()
+    if idle is not None and idle >= window:
+        return
+    focused = deps.focused_tab()
+    if focused == "":
+        return
+    if focused is not None and tab_titles.uuid_of(focused) != tab_titles.uuid_of(iterm_session_id):
+        return
+    seen = f"a key {idle:.0f} s ago" if idle is not None else "key activity unknown"
+    where = "is iTerm's focused tab" if focused is not None else "may be iTerm's focused tab"
+    raise BridgeError(
+        "user_active",
+        f"the target tab {where} and the user is typing ({seen}, guard {window:g} s)"
+        " — nothing was typed; retry later",
+    )
 
 
 @contextmanager

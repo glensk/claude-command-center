@@ -370,6 +370,10 @@ DEFAULTS: dict[str, object] = {
     "stop_barrier_enabled": True,  # hold file locks past the turn until the Stop chain can finish
     "stop_barrier_wait_sec": 180,  # how long that lease protects them (clamped to 0..900)
     "stop_barrier_settle_sec": 2,  # settle between drain scans before a close-now/switch-now kill
+    # `ccc send` / `ccc answer` refuse with `user_active` while the target tab is the focused
+    # tab of the frontmost iTerm2 window and a key was pressed within this many seconds
+    # (clamped to 0..600; 0 = no typing guard). Read-only probes; nothing is ever focused.
+    "bridge_typing_guard_sec": 30,
     "split_ratio": 0.6,  # TUI: left (table) fraction of the width, 0..1
     "tab_title": "!!!",  # iTerm tab title set when ccc starts ("" = leave alone)
     "tab_color": "red",  # iTerm tab color when ccc starts (name or #rrggbb; "" = none)
@@ -1152,6 +1156,7 @@ class Config:
     stop_barrier_enabled: bool = True
     stop_barrier_wait_sec: int = 180
     stop_barrier_settle_sec: int = 2
+    bridge_typing_guard_sec: int = 30
     split_ratio: float = 0.6
     tab_title: str = "!!!"
     tab_color: str = "red"
@@ -1285,11 +1290,12 @@ def load_config() -> Config:
             loaded_from_disk = False
     cfg = Config(**{key: data[key] for key in DEFAULTS if key in data})  # type: ignore[arg-type]
     cfg.loaded_from_disk = loaded_from_disk
-    # The one range-checked setting: the Stop lease bounds how long a peer can be refused a
+    # Range-checked settings. The Stop lease bounds how long a peer can be refused a
     # file after its holder's turn ended, so a hand-edited 10_000 would strand a contended
     # file for hours. Clamped SILENTLY — this runs in the PreToolUse/Stop hot path, where a
     # printed warning would land in a hook's stdout (a Claude Code protocol channel).
     cfg.stop_barrier_wait_sec = _clamped_int(cfg.stop_barrier_wait_sec, 0, 900, 180)
+    cfg.bridge_typing_guard_sec = _clamped_int(cfg.bridge_typing_guard_sec, 0, 600, 30)
     if loaded_from_disk:
         _CONFIG_MEMO = (memo_key, copy.deepcopy(cfg))
     return cfg

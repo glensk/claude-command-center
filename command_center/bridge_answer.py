@@ -7,7 +7,8 @@ fields are a usage error (exit 2).
 
 Only with exactly ONE pending AskUserQuestion whose recomputed ``decision_id`` (the
 ``ccc inspect`` one) matches — else ``decision_changed``. The same target revalidation as
-``ccc send`` runs inside the per-tab lock; the raw status must be ``waiting``. Keys go
+``ccc send`` runs inside the per-tab lock (typing guard included: ``user_active``); the raw
+status must be ``waiting``. Keys go
 through :func:`terminal.send_keys_via` (iTerm2 Python API only, no focus change); the
 answer is verified through the pending call's ``tool_use_id`` and the top-level
 ``toolUseResult.answers`` (keyed by full question text; multi-select labels joined by
@@ -37,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 from .adapters import claude_bridge as cb
 from .bridge_json import BridgeError, check_fields, control_chars, usage
 from .bridge_send import inspect_transcript, transcript_of
-from .bridge_target import require_live, revalidate, tab_for, tab_lock
+from .bridge_target import guard_user_active, require_live, revalidate, tab_for, tab_lock
 
 if TYPE_CHECKING:
     from .bridge_target import BridgeDeps
@@ -269,6 +270,7 @@ def run_answer(deps: BridgeDeps, session_id: str, raw: Any) -> dict[str, Any]:
                 strict=True,
             )
         )
+        guard_user_active(deps, tab)
         anchor = cb.Anchor.take(path)
         deadline_start = deps.monotonic()
         sent = deps.send_keys(tab, keys)

@@ -60,6 +60,28 @@ RECOMMEND_SENTENCE_RE = re.compile(
     re.IGNORECASE,
 )
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+HEADING_LEVEL_RE = re.compile(r"^\s*(#{1,6})\s")
+#: Every ``You [kind]: text`` line of a to-do list (numbered, bulleted or bare).
+TODO_ACTION_RE = re.compile(
+    r"^\s*(?:\d+[.)]\s*)?(?:[-*]\s*)?You\s*\[(?P<kind>[^\]]+)\](?P<rest>[^:]*):\s*(?P<text>.+?)\s*$"
+)
+#: The ``(brief D<n>)`` reference that ends a ``You [decision]`` line (Decision brief
+#: convention); the ``D<n>`` names an entry of the ``## Decision briefs`` section.
+BRIEF_REF_RE = re.compile(r"\s*\(brief\s+(?P<ref>D\d+)\)\s*[.;,]?\s*$", re.IGNORECASE)
+TP_ID_RE = re.compile(r"\btp#(\d+)\b")
+#: The line that opens the ``**Decision brief**`` block before an AskUserQuestion call.
+DECISION_BRIEF_HEAD_RE = re.compile(r"^\s*\*\*Decision brief\*\*\s*:?\s*$", re.IGNORECASE)
+DECISION_BRIEFS_HEADING_RE = re.compile(r"^\s*#{1,6}\s*Decision briefs\s*$", re.IGNORECASE)
+#: One entry of the ``## Decision briefs`` section: ``**D<n> <short title>**``.
+BRIEF_ENTRY_RE = re.compile(r"^\s*\*\*(?P<ref>D\d+)\b[^*]*\*\*")
+#: A labelled line of a brief (``Background:``, ``Building:``, ``Fit:``, ``Recommendation:``).
+BRIEF_LABEL_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:\*\*)?(?:Background|Building|Fit|Recommendation)(?:\*\*)?\s*:",
+    re.IGNORECASE,
+)
+BOLD_TITLE_RE = re.compile(r"^\s*\*\*[^*]+\*\*\s*$")
+#: Max length of one ``brief`` (head kept — a brief is read from the top).
+BRIEF_MAX = 4000
 
 
 class TranscriptUnknown(ValueError):
@@ -465,6 +487,9 @@ class PendingAsk:
 
     tool_use_id: str
     questions: list[dict[str, Any]]
+    #: The assistant text written since the last tool result before this call (where
+    #: the ``**Decision brief**`` block lives).
+    preceding_text: str = ""
 
 
 @dataclass
@@ -473,6 +498,8 @@ class Scan:
 
     last_prompt: str | None = None
     reply_parts: list[str] = field(default_factory=list)
+    #: Assistant text since the last tool result / human input (``PendingAsk.preceding_text``).
+    recent_parts: list[str] = field(default_factory=list)
     reply_anchor: str | None = None  # uuid of the record holding the latest reply text
     todo_anchor: str | None = None  # uuid of the record holding the to-do list
     turn_open: bool = False
@@ -485,6 +512,7 @@ def _scan_user(s: Scan, record: dict[str, Any], answered: set[str]) -> None:
         if block.get("type") == "tool_result":
             answered.add(str(block.get("tool_use_id")))
             s.turn_open = True
+            s.recent_parts = []
     if is_interrupt(record):
         s.turn_open = False
         s.pending = []
@@ -498,13 +526,16 @@ def _scan_assistant(s: Scan, record: dict[str, Any], answered: set[str]) -> None
         if block.get("type") == "text" and str(block.get("text") or "").strip():
             text = str(block["text"]).strip()
             s.reply_parts.append(text)
+            s.recent_parts.append(text)
             s.reply_anchor = uuid
             if any(TODO_HEADING_RE.match(line) for line in text.splitlines()):
                 s.todo_anchor = uuid
         elif block.get("type") == "tool_use":
             if block.get("name") == ASK_TOOL:
                 questions = (block.get("input") or {}).get("questions") or []
-                s.pending.append(PendingAsk(str(block.get("id")), list(questions)))
+                s.pending.append(
+                    PendingAsk(str(block.get("id")), list(questions), "\n\n".join(s.recent_parts))
+                )
             s.turn_open = True
     message = record.get("message")
     if isinstance(message, dict) and message.get("stop_reason") in END_STOP_REASONS:
@@ -522,6 +553,7 @@ def scan(records: list[dict[str, Any]]) -> Scan:
         if human is not None:
             s.last_prompt = human
             s.reply_parts = []
+            s.recent_parts = []
             s.reply_anchor = s.todo_anchor = None
             s.turn_open = True
             s.pending = []
@@ -680,23 +712,41 @@ def _or_options(question: str) -> list[tuple[str, str | None, bool]]:
     return out
 
 
-def todo_questions(reply: str) -> list[Question]:
-    """Questions from ``You [decision]:`` lines in the last ``## To-do list`` section."""
-    lines = reply.splitlines()
-    starts = [i for i, line in enumerate(lines) if TODO_HEADING_RE.match(line)]
+def _heading_level(line: str) -> int:
+    """The markdown heading level of *line* (0 = not a heading)."""
+    m = HEADING_LEVEL_RE.match(line)
+    return len(m.group(1)) if m else 0
+
+
+def section_lines(text: str, heading: re.Pattern[str]) -> list[str] | None:
+    """The lines under the LAST *heading* line of *text* (``None`` when there is none).
+
+    The section runs to the next heading of the same or a higher level, so the
+    ``### tp#N …`` group headings of a ``## To-do list`` stay inside it.
+    """
+    lines = text.splitlines()
+    starts = [i for i, line in enumerate(lines) if heading.match(line)]
     if not starts:
-        return []
+        return None
+    level = _heading_level(lines[starts[-1]]) or 6
     section: list[str] = []
     for line in lines[starts[-1] + 1 :]:
-        if HEADING_RE.match(line):
+        found = _heading_level(line)
+        if found and found <= level:
             break
         section.append(line)
+    return section
+
+
+def todo_questions(reply: str) -> list[Question]:
+    """Questions from ``You [decision]:`` lines in the last ``## To-do list`` section."""
+    section = section_lines(reply, TODO_HEADING_RE) or []
     out: list[Question] = []
     for line in section:
         m = TODO_DECISION_RE.match(line)
         if not m:
             continue
-        body = m.group(1).strip()
+        body = BRIEF_REF_RE.sub("", m.group(1)).strip()
         rec: str | None = None
         reason: str | None = None
         rm = RECOMMEND_SENTENCE_RE.search(body)
@@ -721,6 +771,102 @@ def todo_questions(reply: str) -> list[Question]:
                 reason=reason,
                 raw_labels=[label for label, _c, _r in opts],
             )
+        )
+    return out
+
+
+def _brief_block(lines: list[str]) -> str | None:
+    """*lines* joined (trailing blanks dropped), capped at :data:`BRIEF_MAX` head-first."""
+    while lines and not lines[-1].strip():
+        lines = lines[:-1]
+    text = "\n".join(lines).strip()
+    return cap_head(text, BRIEF_MAX) if text else None
+
+
+def decision_brief(text: str) -> str | None:
+    """The LAST ``**Decision brief**`` block of *text* (raw, ≤ :data:`BRIEF_MAX`), or None.
+
+    The block is its opening line plus every following line up to a heading, another
+    bold title line, or a blank line whose next non-blank line is not a labelled brief
+    line (``Background:`` / ``Building:`` / ``Fit:`` / ``Recommendation:``) — so a
+    question written after the block is not swallowed.
+    """
+    lines = text.splitlines()
+    starts = [i for i, line in enumerate(lines) if DECISION_BRIEF_HEAD_RE.match(line)]
+    if not starts:
+        return None
+    block = [lines[starts[-1]]]
+    rest = lines[starts[-1] + 1 :]
+    for i, line in enumerate(rest):
+        if HEADING_RE.match(line) or BOLD_TITLE_RE.match(line):
+            break
+        if not line.strip():
+            after = next((x for x in rest[i + 1 :] if x.strip()), "")
+            if not BRIEF_LABEL_RE.match(after):
+                break
+        block.append(line)
+    return _brief_block(block)
+
+
+def decision_briefs(reply: str) -> dict[str, str]:
+    """``{"D1": raw entry, …}`` from the last ``## Decision briefs`` section of *reply*."""
+    section = section_lines(reply, DECISION_BRIEFS_HEADING_RE)
+    if not section:
+        return {}
+    out: dict[str, str] = {}
+    ref: str | None = None
+    entry: list[str] = []
+    for line in [*section, "**D0 end**"]:
+        m = BRIEF_ENTRY_RE.match(line)
+        if m:
+            if ref is not None and ref not in out:
+                block = _brief_block(entry)
+                if block:
+                    out[ref] = block
+            ref, entry = m.group("ref").upper(), [line]
+        elif ref is not None:
+            entry.append(line)
+    return out
+
+
+def todo_actions(reply: str) -> list[dict[str, Any]]:
+    """Every ``You [kind]: text`` line of the last ``## To-do list`` of *reply*.
+
+    One ``{kind, text, tp_id, brief_ref, brief}`` per line, in order: ``kind`` is the
+    bracket's content lower-cased (``decision``, ``sudo``, ``ui|login`` …), ``text`` the
+    line after the colon without its ``(brief D<n>)`` marker, ``tp_id`` the first
+    ``tp#N`` of the line or else of its ``### tp#N …`` group heading, ``brief_ref`` the
+    ``D<n>`` and ``brief`` the matching ``## Decision briefs`` entry (``None`` when absent).
+    """
+    section = section_lines(reply, TODO_HEADING_RE)
+    if section is None:
+        return []
+    briefs = decision_briefs(reply)
+    group_tp: int | None = None
+    out: list[dict[str, Any]] = []
+    for line in section:
+        if HEADING_RE.match(line):
+            tp = TP_ID_RE.search(line)
+            group_tp = int(tp.group(1)) if tp else None
+            continue
+        m = TODO_ACTION_RE.match(line)
+        if not m:
+            continue
+        kind = "|".join(k.strip().lower() for k in m.group("kind").split("|") if k.strip())
+        text = m.group("text").strip()
+        ref_m = BRIEF_REF_RE.search(text)
+        ref = ref_m.group("ref").upper() if ref_m else None
+        if ref_m:
+            text = text[: ref_m.start()].rstrip()
+        tp = TP_ID_RE.search(text)
+        out.append(
+            {
+                "kind": kind,
+                "text": text,
+                "tp_id": int(tp.group(1)) if tp else group_tp,
+                "brief_ref": ref,
+                "brief": briefs.get(ref) if ref else None,
+            }
         )
     return out
 
@@ -764,7 +910,7 @@ def cap_tail(text: str, limit: int) -> str:
 
 
 @dataclass
-class Inspection:
+class Inspection:  # pylint: disable=too-many-instance-attributes  # one field per inspect fact
     """Everything ``ccc inspect`` derives from one transcript."""
 
     transcript_state: str  # idle | busy | waiting
@@ -774,6 +920,10 @@ class Inspection:
     questions: list[Question]
     source: str | None
     anchor: str | None
+    #: ``You [kind]`` lines of the current turn's to-do list (:func:`todo_actions`).
+    actions: list[dict[str, Any]] = field(default_factory=list)
+    #: The pending picker's ``**Decision brief**`` block (:func:`decision_brief`).
+    brief: str | None = None
 
     def decision(self, state: str, summary: str) -> dict[str, Any] | None:
         """The §6 ``decision`` object (``None`` when there is none in *state*)."""
@@ -816,6 +966,8 @@ def inspect(records: list[dict[str, Any]]) -> Inspection:
         questions=questions,
         source=source,
         anchor=anchor,
+        actions=todo_actions(reply) if s.todo_anchor else [],
+        brief=decision_brief(s.pending[0].preceding_text) if len(s.pending) == 1 else None,
     )
 
 

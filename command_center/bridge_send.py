@@ -15,6 +15,9 @@ expectation is recorded; any of the three prompt shapes with the right sha prove
 since the session may turn busy between the check and the paste);
 ``waiting`` / ``blocked`` / any other status, background sessions and a pending picker
 are refused.
+The last check before the first byte is the typing guard
+(:func:`bridge_target.guard_user_active`): ``user_active`` while the tab is the focused
+tab of the frontmost iTerm2 window and a key was pressed within the guard window.
 
 Correlation: the transcript's inode + byte size are taken before sending; only records
 appended after that are scanned (a FRESH session has no transcript until its first
@@ -49,7 +52,7 @@ from .adapters import claude_bridge as cb
 from .bridge_delivery import assign, finish
 from .bridge_json import BridgeError, validate_message
 from .bridge_store import Delivery
-from .bridge_target import require_live, revalidate, tab_for, tab_lock
+from .bridge_target import guard_user_active, require_live, revalidate, tab_for, tab_lock
 
 if TYPE_CHECKING:
     from .bridge_target import BridgeDeps
@@ -154,6 +157,7 @@ def run_send(deps: BridgeDeps, session_id: str, text: str) -> dict[str, Any]:
                 "unknown_status",
                 f"session {session_id} reports status {target.raw_status!r}",
             )
+        guard_user_active(deps, tab)
         anchor = cb.Anchor.take_or_fresh(path)
         now = deps.now_ms()
         d = Delivery(

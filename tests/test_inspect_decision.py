@@ -76,6 +76,13 @@ def test_cli_envelope_matches_the_fixture(
     assert env["schema_version"] == 1 and env["ok"] is True and env["error"] is None
     data = env["data"]
     assert data.pop("live") is True
+    # the additive tp#1173 fields (schema_version stays 1)
+    assert data.pop("cwd") == "/repo"
+    assert data.pop("config_dir") == str(world.config_dir.resolve())
+    assert data.pop("account") == world.config_dir.name  # not a configured account
+    assert data.pop("brief") is None  # no fixture carries a Decision brief
+    kinds = [a["kind"] for a in data.pop("actions")]
+    assert kinds == (["decision", "decision"] if name == "todo_decision" else [])
     assert _normalise(data) == expected
     # the fake router answers nothing, so recent_summary is the 3-sentence fallback
     assert len(world.llm_calls) == (1 if expected["decision"] else 0)
