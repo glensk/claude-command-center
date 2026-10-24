@@ -1,0 +1,5 @@
+// CAPTURED 2026-10-24 (tp#1196): a seat whose refresh token had been spent elsewhere.
+{"type":"thread.started","thread_id":"01a16ee4-cb68-77f2-a2de-569cf2649080"}
+{"type":"turn.started"}
+{"type":"error","message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}
+{"type":"turn.failed","error":{"message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}}

@@ -338,14 +338,30 @@ mentions "rate limit" cannot look like one. When the stream carries no failure e
 all, the last 40 stderr lines are the fallback. Anything unrecognised (e.g.
 `server_overloaded`) is a **task** failure: no hop, no cooldown.
 
-| classified | recorded block                       | hops? |
-| :--------- | :----------------------------------- | :---- |
-| quota      | until the exhausted window resets (else 1 h) | yes |
-| entitlement| 24 h, scope `entitlement`            | yes   |
-| auth       | 24 h, scope `auth`                   | yes   |
-| (none)     | nothing                              | no    |
+| classified  | recorded block                                       | hops? |
+| :---------- | :--------------------------------------------------- | :---- |
+| quota       | until the exhausted window resets (else 1 h)         | yes   |
+| entitlement | 24 h, scope `entitlement`                            | yes   |
+| auth        | until login or success (30 d backstop), scope `auth` | yes   |
+| (none)      | nothing                                              | no    |
 
-A success clears that seat's OBSERVED block (never an administrative hold). **Zero
+A success clears that seat's OBSERVED block (never an administrative hold).
+
+**Dead logins — `needs login` (tp#1196).** `auth` means the seat's Codex login is dead:
+a 401 on the token refresh (`refresh_token_reused`, "Please log out and sign in again"),
+no `auth.json` ("Missing bearer … authentication"), `login_required`. Besides the event
+message, codex's own login-manager lines on stderr (`Failed to refresh token: 401`,
+`refresh_token_reused`) count even when the events say nothing we act on; a tool server's
+401 does not. The run hops to the next seat (with `-S` it fails with
+`error.kind = seat_needs_login`, exit 8), and the seat stays out of every later call until
+a run on it succeeds or `auth.json` is rewritten by a fresh login — then the block lifts
+on the next read, no `ccc quota -c` needed. `order`, `headroom` and `usage` show it as
+`🔑 needs login` with the command that fixes it (`CODEX_HOME=<home> codex login`); the
+`headroom` verdict never comes from such a seat (JSON: `needs_login[]` on `order -j`,
+`headroom -j`, `usage -j`). One push per seat per local day asks for the login through
+`~/.claude/hooks/ntfy-push.sh` (`$CCC_PUSH_HOOK` names another executable; empty
+disables it). An explicit `$CODEX_HOME` on such a seat records `skipped:needs_login`;
+`-Q` still tries it, and a success there clears the block. **Zero
 eligible seats start no process at all** and report `all_seats_unavailable` with the
 earliest reset — a refusal we can predict is not worth a round trip.
 
@@ -582,7 +598,8 @@ the key existed are never hidden. `run -X/--caller NAME` puts `caller` on every 
 (`ai.py:<attempt>`), sanitized like `-N`. `run -S/--seat SEAT` (label `private`, id
 `codex:private` or name `codex-priv`) confines ONE call to that seat: no hop, no pin or
 order change; a seat that is not eligible fails with `error.kind = seat_unavailable`
-(nothing launched, exit 8), one that refuses with `seat_refused` (exit 8), and a name no
+(nothing launched, exit 8), one that refuses with `seat_refused` (exit 8), one whose login
+is dead with `seat_needs_login` (exit 8, the message names the `codex login` command), and a name no
 registered seat answers to with `seat_unknown` (exit 2). A ladder walking several Codex
 seats calls `-S` once per seat, in its own order.
 

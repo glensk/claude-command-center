@@ -1,0 +1,6 @@
+// CAPTURED 2026-10-24 (tp#1196): codex exec on a CODEX_HOME with no auth.json (trimmed).
+{"type":"thread.started","thread_id":"01a16efc-e096-7420-a214-d9d0ce740ee7"}
+{"type":"turn.started"}
+{"type":"error","message":"Reconnecting... 2/5 (unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: wss://api.openai.com/v1/responses, cf-ray: a4fabf749a6d7a85-ZRH)"}
+{"type":"error","message":"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: a4fabfd22e564335-ZRH, request id: req_12092260a4a44823b78b35b802dd7c0f"}
+{"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: a4fabfd22e564335-ZRH, request id: req_12092260a4a44823b78b35b802dd7c0f"}}

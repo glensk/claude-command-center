@@ -842,6 +842,26 @@ def observed_block_superseded(
     return _verdict_from_windows(windows)[0] == AVAILABLE
 
 
+def login_renewed(entry: dict, home: Path) -> bool:
+    """True when *entry* is a needs-login block and the seat logged in again AFTER it.
+
+    A dead Codex login (scope ``auth``, written by the runner on ``refresh_token_reused``
+    and friends) stays until a run on the seat succeeds — or until a person runs
+    ``CODEX_HOME=<home> codex login``, which rewrites ``<home>/auth.json``. An
+    ``auth.json`` written after the refusal was observed therefore lifts the block at
+    once, with no ``ccc quota -c`` needed (tp#1196). Whole seconds on both sides, so an
+    ``auth.json`` written in the same second as the refusal never counts as a new login.
+    Never a hold; no ``auth.json`` (a keyring store) proves nothing.
+    """
+    if entry.get("kind") == KIND_HOLD or entry.get("scope") != "auth":
+        return False
+    try:
+        written = int((home.expanduser() / "auth.json").stat().st_mtime)
+    except OSError:
+        return False
+    return written > int(entry.get("observed_at", 0) or 0)
+
+
 def _cooldown_quota(
     pid: str, kind: str, entry: dict, windows: dict[str, WindowState] | None = None
 ) -> ProviderQuota:
@@ -1068,7 +1088,10 @@ def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-loca
     has_auth = (home.expanduser() / "auth.json").is_file()
     snap, windows, live = _seat_evidence(home, now) if has_auth else (None, {}, None)
     entry = cooldowns.get(pid)
-    superseded = entry is not None and observed_block_superseded(entry, snap, windows.values(), now)
+    renewed = entry is not None and login_renewed(entry, home)
+    superseded = entry is not None and (
+        renewed or observed_block_superseded(entry, snap, windows.values(), now)
+    )
     if entry is not None and not superseded:
         quota = _cooldown_quota(pid, "codex", entry, windows)
         quota.account, quota.email = label, email
@@ -1102,17 +1125,16 @@ def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-loca
         )
     if superseded and entry is not None:
         # Say WHY the row disagrees with a cooldown entry a reader can still see in
-        # cooldowns.json: the refusal is older than the measurement that disproved it.
+        # cooldowns.json: the refusal is older than the measurement (or the fresh
+        # login) that disproved it.
         refusal_age = _compact_duration(now - int(entry.get("observed_at", 0) or 0))
         reading_age = _compact_duration(now - snap.captured_at)
-        note = " · ".join(
-            part
-            for part in (
-                note,
-                f"refusal {refusal_age} old superseded by a reading {reading_age} old",
-            )
-            if part
+        why = (
+            f"needs-login block {refusal_age} old lifted by a fresh login"
+            if renewed
+            else f"refusal {refusal_age} old superseded by a reading {reading_age} old"
         )
+        note = " · ".join(part for part in (note, why) if part)
     if snap.blocked:
         # Codex is refusing calls. ``read_codex_usage`` has already pinned the window
         # that filled to 100%, so name it as the blocker and carry its reset — that is
@@ -2394,6 +2416,8 @@ def _seat_order_rows(
                 "state": row.state,
                 "reason": row.reason,
                 "blocked_by": row.blocked_by,
+                # Additive (tp#1196): ``auth`` = the seat's login is dead ("needs login").
+                "block_scope": row.block_scope,
                 "resets_at": row.resets_at,
                 "windows": {
                     name: {"used_pct": win.used_pct, "resets_at": win.resets_at}

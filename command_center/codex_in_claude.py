@@ -140,7 +140,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
-from . import brokenpipe, codex_launch, codex_ledger, codex_runlog
+from . import brokenpipe, codex_launch, codex_ledger, codex_login, codex_runlog
 
 if TYPE_CHECKING:  # pragma: no cover - runtime import is local: quota imports THIS module
     from . import quota, seat_rota
@@ -1553,7 +1553,13 @@ def cmd_set_model(args: argparse.Namespace) -> int:
 
 
 # Marks for the seat table (same vocabulary as ``ccc quota``'s report).
-_SEAT_MARK = {"available": "✅", "blocked": "⛔", "unknown": "❔", "disabled": "🚫"}
+_SEAT_MARK = {
+    "available": "✅",
+    "blocked": "⛔",
+    "unknown": "❔",
+    "disabled": "🚫",
+    codex_login.NEEDS_LOGIN: "🔑",
+}
 
 
 _POLICY_BLURB = {
@@ -1794,8 +1800,16 @@ def _seat_table_lines(now: int | None = None) -> list[str]:
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return [f"(seat states unavailable: {type(exc).__name__}: {exc})"]
     lines: list[str] = [_POLICY_BLURB.get(policy, _POLICY_BLURB["fill"])]
+    homes = canonical_codex_homes()
     for row in rows:
         state = str(row.get("state") or "unknown")
+        dead_home = (
+            homes.get(str(row.get("label") or ""))
+            if codex_login.is_needs_login(state, str(row.get("block_scope") or ""))
+            else None
+        )
+        if dead_home is not None:
+            state = codex_login.NEEDS_LOGIN  # tp#1196: a dead login, not a quota block
         mark = _SEAT_MARK.get(state, " ")
         windows = " · ".join(
             f"{short} {win['used_pct']:.0f}%"
@@ -1803,7 +1817,9 @@ def _seat_table_lines(now: int | None = None) -> list[str]:
             if (win := (row.get("windows") or {}).get(name)) is not None
         )
         detail = windows
-        if state != "available":
+        if dead_home is not None:
+            detail = f"run `{codex_login.login_command(dead_home)}`"
+        elif state != "available":
             blocker = str(row.get("blocked_by") or "")
             reason = str(row.get("reason") or "")
             unblocks = int(row.get("resets_at") or 0)
@@ -1905,6 +1921,8 @@ def cmd_order(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
                     "next_attempt": candidates[0].pid if candidates else "",
                     "candidates": _candidate_dicts(candidates),
                     "pin": _pin_payload(cfg),
+                    # Additive (tp#1196): seats left out because their login is dead.
+                    "needs_login": needs_login_seats(),
                 }
             )
         )
@@ -3182,7 +3200,11 @@ def seat_headroom(row: quota.ProviderQuota, now: int) -> dict[str, Any]:
 
     windows = _headroom_window_rows(row, now)
     fresh = [win for win in windows if not win["stale"]]
-    if row.state == quota.BLOCKED:
+    if codex_login.is_needs_login(row.state, row.block_scope):
+        # Never chosen by the pool verdict (tp#1196): a dead login is not "blocked
+        # until a reset", and no amount of headroom elsewhere is explained by it.
+        state, reason = "needs_login", f"{codex_login.NEEDS_LOGIN}: {row.reason}"
+    elif row.state == quota.BLOCKED:
         state, reason = "blocked", row.reason or "seat is blocked"
     elif row.malformed:
         state, reason = "unknown", "usage snapshot contains a malformed window"
@@ -3194,7 +3216,7 @@ def seat_headroom(row: quota.ProviderQuota, now: int) -> dict[str, Any]:
         state, reason = "reserve", "at least one live window is inside its reserve"
     else:
         state, reason = "allowed", "every live window has sufficient headroom"
-    if state in ("unknown", "blocked"):
+    if state in ("unknown", "blocked", "needs_login"):
         for win in windows:
             win["verdict"] = state
     return {
@@ -3243,7 +3265,9 @@ def codex_headroom(now: int | None = None) -> dict[str, Any]:
     than six hours and answered ``DENIED (unknown)`` while a whole paid seat sat idle.
 
     The pool verdict is the best seat's: any ``allowed`` allows (and names that seat),
-    else ``reserve``, else ``unknown``, else ``blocked``. Candidates come from
+    else ``reserve``, else ``unknown``, else ``blocked``. A seat whose login is dead
+    (``needs_login``) never decides the verdict; it is listed under ``needs_login``
+    with the command that fixes it (tp#1196). Candidates come from
     :func:`codex_homes_in_order`, so ``$CODEX_HOME`` narrows the question to one seat
     and ``CCC_NO_CODEX`` answers ``blocked`` with no seats at all.
 
@@ -3261,12 +3285,13 @@ def codex_headroom(now: int | None = None) -> dict[str, Any]:
         chosen = next((seat for seat in seats if seat["state"] == wanted), None)
         if chosen is not None:
             break
+    dead = [] if os.environ.get("CCC_NO_CODEX") else needs_login_seats(now_ts)
     if chosen is None:
         state = "blocked"
         reason = (
             "Codex disabled (CCC_NO_CODEX)"
             if os.environ.get("CCC_NO_CODEX")
-            else "no eligible seat"
+            else "no eligible seat" + (f" ({len(dead)} seat(s) need login)" if dead else "")
         )
         label, windows, captured = "", [], None
     else:
@@ -3306,6 +3331,8 @@ def codex_headroom(now: int | None = None) -> dict[str, Any]:
         # Additive (plan D4): which seat the verdict is about, and every seat's own.
         "seat": label,
         "seats": seats,
+        # Additive (tp#1196): seats whose login is dead — ignored by the verdict.
+        "needs_login": dead,
     }
 
 
@@ -3409,6 +3436,7 @@ RUN_EXIT_CODES_HELP = (
     "  4  codex not installed    5  wall timeout / stall / no first model response\n"
     "  6  codex_failed (any other task failure) / seat_refused_midrun\n"
     "  7  bad patch (delegate)   8  no eligible seat / -n budget spent / disabled\n"
+    "     (also -S: seat_unavailable / seat_refused / seat_needs_login)\n"
     "  9  network dead / the machine slept\n"
     "  10 model_capacity: the model is at capacity / overloaded server-side (retry later)\n"
     "  11 codex_usage: codex rejected its argv or its config\n"
@@ -3507,10 +3535,15 @@ def cmd_runs(args: argparse.Namespace) -> int:
 
 
 def cmd_usage(args: argparse.Namespace) -> int:
-    """Print the current Codex rate-limit usage (5h + weekly windows)."""
+    """Print the current Codex rate-limit usage (5h + weekly windows).
+
+    Seats whose login is dead follow, one line each with the command that fixes them
+    (tp#1196) — a usage figure for the seat being read says nothing about them.
+    """
     windows = _codex_usage_windows()
+    dead = needs_login_seats()
     if args.json:
-        payload = {
+        payload: dict[str, Any] = {
             key: (
                 {
                     "used_percent": win[0],
@@ -3525,6 +3558,8 @@ def cmd_usage(args: argparse.Namespace) -> int:
                 ("seven_day", _SEVEN_DAY_MINUTES, windows["seven_day"]),
             )
         }
+        if dead:
+            payload["needs_login"] = dead  # additive, only when a seat needs it
         print(json.dumps(payload))
         return EX_OK
     parts = []
@@ -3536,6 +3571,8 @@ def cmd_usage(args: argparse.Namespace) -> int:
             else f"{label} {win[0]:.0f}% (resets {_format_reset(win[1])})"
         )
     print("codex usage: " + "  ·  ".join(parts))
+    for seat in dead:
+        print(_needs_login_line(seat))
     return EX_OK
 
 
@@ -3553,6 +3590,7 @@ def _headroom_unknown(reason: str) -> dict[str, Any]:
         "windows": [],
         "seat": "",
         "seats": [],
+        "needs_login": [],
     }
 
 
@@ -3600,9 +3638,12 @@ def cmd_headroom(args: argparse.Namespace) -> int:
             print(f"offload: DENIED (reserve zone — {decision['reason']})")
         else:
             print(f"offload: DENIED (unknown — {decision['reason']})")
+        dead_labels = {str(seat.get("label")) for seat in decision.get("needs_login") or []}
         for seat in decision.get("seats") or []:
-            if seat.get("label") != decision.get("seat"):
+            if seat.get("label") != decision.get("seat") and seat.get("label") not in dead_labels:
                 print(f"{seat['label']}: {seat['state']} — {seat['reason']}")
+        for seat in decision.get("needs_login") or []:
+            print(_needs_login_line(seat))
     # "blocked" shares the reserve exit code: the documented contract is 0 = offload
     # allowed, non-zero = keep the work on Claude, and 3 already means "no usable data".
     return {"allowed": 0, "reserve": 1, "blocked": 1, "unknown": 3}[decision["state"]]
@@ -4224,7 +4265,10 @@ class CodexFailure:
 
     ``kind`` is ``"quota"`` / ``"entitlement"`` / ``"auth"``, or ``""`` for a plain
     task failure (or an unrecognised one — same thing for routing purposes: keep the
-    seat, report the error). ``resets_at`` is never available from the ``--json``
+    seat, report the error). ``"auth"`` means the seat's LOGIN is dead (a refresh token
+    already used, a 401 on the token refresh, no ``auth.json``): every surface shows it
+    as ``needs login`` (:mod:`command_center.codex_login`), and only ``codex login`` on
+    that seat heals it. ``resets_at`` is never available from the ``--json``
     stream (the rate-limit block lives in the rollout file, which ``--ephemeral``
     suppresses), so it is ``None`` here and the deadline is derived from the seat's
     own usage by :func:`record_seat_refusal`.
@@ -4244,6 +4288,11 @@ _FAILURE_CODES = {
     "login_required": "auth",
     "invalid_grant": "auth",
     "token_expired": "auth",
+    # The token-refresh endpoint's own codes (tp#1196): the refresh token is spent or
+    # revoked, so the seat stays logged out until `codex login` runs again.
+    "refresh_token_reused": "auth",
+    "refresh_token_expired": "auth",
+    "refresh_token_invalidated": "auth",
 }
 # Allowlists over the server-authored MESSAGE, in priority order. Deliberately narrow:
 # anything not listed is a task failure, which keeps the seat.
@@ -4252,8 +4301,19 @@ _FAILURE_PHRASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("entitlement", ("not included",)),
 )
 _AUTH_RE = re.compile(
-    r"not logged in|unauthori[sz]ed|log in again|token .{0,30}expired|invalid_grant",
+    r"not logged in|unauthori[sz]ed|log in again|token .{0,30}expired|invalid_grant"
+    # 2026-10-24 (tp#1196): "Your access token could not be refreshed because your
+    # refresh token was already used. Please log out and sign in again." matched none
+    # of the above, so 55 calls failed on one dead seat instead of hopping.
+    r"|sign(?:ing)? in again|refresh token (?:was|has) already been used"
+    r"|refresh token was already used|access token could not be refreshed",
     re.IGNORECASE,
+)
+# codex's login manager on STDERR — read even when the failure events named nothing we
+# act on (they may carry only a generic message). Narrow on purpose: a 401 from an MCP
+# server or a transient network error during a refresh must not mark a seat logged out.
+_LOGIN_DEAD_STDERR_RE = re.compile(
+    r"Failed to refresh token: 401\b|\brefresh_token_(?:reused|expired|invalidated)\b"
 )
 _STDERR_CLASSIFY_LINES = 40  # tail read only when there is no failure EVENT at all
 
@@ -4332,7 +4392,10 @@ def classify_codex_failure(returncode: int, events: list[dict], stderr: str) -> 
     Evidence, strictest first: the failure events' ``codex_error_info`` code, then
     their message against the allowlists. Only when there is NO failure event at all
     (a crash before the stream started) does the same matching run over the last
-    ``40`` stderr lines — never over stdout item text, never over the prompt.
+    ``40`` stderr lines — never over stdout item text, never over the prompt. The one
+    exception is codex's own login manager: its ``Failed to refresh token: 401`` /
+    ``refresh_token_reused`` stderr lines mark the seat ``auth`` (needs login) even
+    when the events said nothing we act on.
     """
     if returncode == 0:
         return CodexFailure("", "", None)
@@ -4344,10 +4407,15 @@ def classify_codex_failure(returncode: int, events: list[dict], stderr: str) -> 
         kind, phrase = _classify_text(_event_message(event))
         if kind:
             return CodexFailure(kind, phrase, None)
-    if failures:
-        return CodexFailure("", "", None)  # the server named a failure we do not act on
     tail = "\n".join((stderr or "").splitlines()[-_STDERR_CLASSIFY_LINES:])
+    login = _LOGIN_DEAD_STDERR_RE.search(stderr or "")
+    if failures:
+        if login:
+            return CodexFailure("auth", login.group(0), None)
+        return CodexFailure("", "", None)  # the server named a failure we do not act on
     kind, phrase = _classify_text(tail)
+    if not kind and login:
+        kind, phrase = "auth", login.group(0)
     return CodexFailure(kind, phrase, None)
 
 
@@ -4510,13 +4578,21 @@ def _quota_deadline(home: Path, now: int) -> int:
     return now + 3600
 
 
+# A dead login (scope ``auth``) does not heal by itself: it stands until a run on the seat
+# succeeds or ``auth.json`` is rewritten by a fresh ``codex login``
+# (:func:`command_center.quota.login_renewed`). The deadline is only the backstop that
+# keeps a misread from parking a seat forever (tp#1196).
+_NEEDS_LOGIN_BLOCK_SECONDS = 30 * 86400
+
+
 def record_seat_refusal(cand: SeatCandidate, failure: CodexFailure, now: int | None = None) -> None:
     """Block *cand* in the cooldown store for what its own refusal proves. Never raises.
 
-    Quota → until the exhausted window resets (else one hour). Entitlement and auth →
-    24 h with a scope, because neither heals on a rate-limit boundary: an unpaid or
-    logged-out seat stays unpaid or logged out until a human acts, and re-probing it
-    every hour just burns the caller's time.
+    Quota → until the exhausted window resets (else one hour). Entitlement → 24 h with a
+    scope, because it does not heal on a rate-limit boundary: an unpaid seat stays
+    unpaid until a human acts, and re-probing it every hour just burns the caller's
+    time. Auth (``needs login``) → until the seat logs in again or serves a run, with a
+    30-day backstop: a spent refresh token never comes back on its own (tp#1196).
 
     A candidate with no ``pid`` (an unregistered ``$CODEX_HOME``) records NOTHING —
     there is no row that names that seat, and attributing its refusal to a label it
@@ -4528,6 +4604,9 @@ def record_seat_refusal(cand: SeatCandidate, failure: CodexFailure, now: int | N
     if failure.kind == "quota":
         blocked_until = failure.resets_at or _quota_deadline(cand.home, now_ts)
         scope = "quota"
+    elif failure.kind == "auth":
+        blocked_until = now_ts + _NEEDS_LOGIN_BLOCK_SECONDS
+        scope = codex_login.NEEDS_LOGIN_SCOPE
     else:
         blocked_until = now_ts + 86400
         scope = failure.kind
@@ -4575,7 +4654,8 @@ class RunAttempt:  # pylint: disable=too-many-instance-attributes  # flat attemp
     elapsed_s: float
     # "ok" | "refused:<kind>" | "failed" | "timeout" | "stalled" | "network" | "slept" |
     # "startup_timeout" | "skipped:rota" (somebody else's week — not waivable by -Q) |
-    # "skipped:exhausted" | "skipped:unmeasured" (write run, no weekly
+    # "skipped:exhausted" | "skipped:needs_login" (the seat's login is dead — tp#1196) |
+    # "skipped:unmeasured" (write run, no weekly
     # reading) | "skipped:below-floor" (-F/--min-remaining) | "skipped:reserve" /
     # "skipped:unknown" (-H/--headroom)
     outcome: str
@@ -4708,8 +4788,18 @@ def seat_status_report(now: int | None = None) -> tuple[list[str], int | None]:
         return ([], None)
     lines: list[str] = []
     resets: list[int] = []
+    homes = canonical_codex_homes()
     for row in rows:
         bits: list[str] = []
+        dead_home = homes.get(str(row.get("label") or ""))
+        if dead_home is not None and codex_login.is_needs_login(
+            str(row.get("state") or ""), str(row.get("block_scope") or "")
+        ):
+            lines.append(
+                f"{row.get('label', '?')}: {codex_login.NEEDS_LOGIN} "
+                f"(run `{codex_login.login_command(dead_home)}`)"
+            )
+            continue
         if row.get("reason"):
             reason = str(row["reason"])
             if row.get("blocked_by") == "rota" and not reason.startswith("rota:"):
@@ -5012,6 +5102,11 @@ def _skip_reason(  # pylint: disable=too-many-return-statements  # one per skip 
     if row.block_scope == "rota":
         return "skipped:rota"
     if not ignore_quota and row.state == quota.BLOCKED:
+        # A dead login is its own typed skip (tp#1196): "exhausted" would send the
+        # reader to wait for a reset that never fixes it. ``-Q`` still waives it — the
+        # explicit "try it anyway" that lets a success clear a stale block.
+        if codex_login.is_needs_login(row.state, row.block_scope):
+            return "skipped:needs_login"
         return "skipped:exhausted"
     if write and min_remaining_pct > 0 and quota._measured_week(row) is None:  # noqa: SLF001
         # A write run on a seat with no weekly reading may refuse mid-edit, and the
@@ -5027,6 +5122,65 @@ def _skip_reason(  # pylint: disable=too-many-return-statements  # one per skip 
         if state != "allowed":
             return f"skipped:{state}"
     return ""
+
+
+def needs_login_seats(now: int | None = None) -> list[dict[str, Any]]:
+    """Every registered seat whose login is dead right now (tp#1196), in registry order.
+
+    One dict per seat: ``label``, ``id``, ``home``, ``email``, ``since`` (when the dead
+    login was observed), ``reason`` and ``login_command`` — the exact command that fixes
+    it. Read from the same quota rows the ranking uses, so a fresh login (a newer
+    ``auth.json``) or a successful run drops the seat from this list at once. ``[]`` on
+    any failure: it is display data, never a routing input.
+    """
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    now_ts = int(time.time()) if now is None else int(now)
+    homes = canonical_codex_homes()
+    try:
+        rows = quota._codex_quotas(now_ts, quota.read_cooldowns(now_ts))  # noqa: SLF001
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return []
+    seats: list[dict[str, Any]] = []
+    for row in rows:
+        home = homes.get(row.account)
+        if home is None or not codex_login.is_needs_login(row.state, row.block_scope):
+            continue
+        seats.append(
+            {
+                "label": row.account,
+                "id": row.id,
+                "home": str(home),
+                "email": row.email,
+                "since": row.captured_at or None,
+                "reason": row.reason,
+                "login_command": codex_login.login_command(home),
+            }
+        )
+    return seats
+
+
+def _needs_login_line(seat: dict[str, Any]) -> str:
+    """``default: needs login (team@example.org) — run `CODEX_HOME=… codex login``` ."""
+    email = f" ({seat['email']})" if seat.get("email") else ""
+    return f"{seat['label']}: {codex_login.NEEDS_LOGIN}{email} — run `{seat['login_command']}`"
+
+
+def _announce_needs_login(cand: SeatCandidate, detail: str, nxt: str | None = None) -> None:
+    """Say on stderr that *cand* needs login (and where the call goes next); push once a day.
+
+    *nxt* is the next seat's label, ``""`` when none is left, ``None`` when the call does
+    not hop at all (``-S``).
+    """
+    tail = ""
+    if nxt is not None:
+        tail = f"; falling back to {nxt}" if nxt else "; no seat left to try"
+    print(
+        f"seat {cand.label} needs login ({detail}) — run "
+        f"`{codex_login.login_command(cand.home)}`{tail}",
+        file=sys.stderr,
+    )
+    codex_login.notify_needs_login(cand.label, cand.pid, cand.home, email=cand.email, detail=detail)
 
 
 def _no_seat_result(result: RunResult, now: int | None = None) -> RunResult:
@@ -5096,16 +5250,41 @@ def _confined(pending: list[SeatCandidate], seat: str) -> list[SeatCandidate]:
 def _seat_result(result: RunResult, seat: str) -> RunResult:
     """Fill *result* in for a ``run -S`` seat that did not serve: never a hop, one kind.
 
-    ``seat_unknown`` = no registered seat answers to *seat*; ``seat_refused`` = it was
-    launched and refused; ``seat_unavailable`` = it was not eligible (held, blocked, a
-    skip reason, the rota, or the ``$CODEX_HOME`` override names another home).
+    ``seat_unknown`` = no registered seat answers to *seat*; ``seat_needs_login`` = its
+    login is dead (it refused with ``auth`` now, or a recorded needs-login block kept it
+    out — tp#1196); ``seat_refused`` = it was launched and refused; ``seat_unavailable``
+    = it was not eligible (held, blocked, a skip reason, the rota, or the
+    ``$CODEX_HOME`` override names another home).
     """
     known = any(seat in _seat_names(label, "") for label in canonical_codex_homes())
     mine = [a for a in result.attempts if seat in _seat_names(a.seat, "")]
     last = mine[-1].outcome if mine else ""
+    login_home = ""
+    if last in ("refused:auth", "skipped:needs_login"):
+        login_home = mine[-1].home
+    elif known and not mine:
+        # Never launched: the ranking already dropped a seat with a recorded dead login.
+        dead = next(
+            (e for e in needs_login_seats() if seat in _seat_names(e["label"], e["id"])), None
+        )
+        if dead is not None:
+            login_home = str(dead["home"])
+            codex_login.notify_needs_login(
+                str(dead["label"]),
+                str(dead["id"]),
+                login_home,
+                email=str(dead["email"] or ""),
+                detail="recorded dead login",
+            )
     if not known and not mine:
         result.error_kind = "seat_unknown"
         result.error_message = f"no registered Codex seat is called {seat!r}"
+    elif login_home:
+        result.error_kind = "seat_needs_login"
+        result.error_message = (
+            f"seat {seat} needs login — run `{codex_login.login_command(login_home)}` "
+            "(-S never hops)"
+        )
     elif last.startswith("refused:"):
         result.error_kind = "seat_refused"
         result.error_message = (
@@ -5284,6 +5463,8 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
         )
         if skip:
             result.attempts.append(RunAttempt(cand.label, str(cand.home), 0.0, skip))
+            if skip == "skipped:needs_login":
+                _announce_needs_login(cand, "recorded dead login")
             continue
         if cand.probe and not _claim_probe(cand):
             # Another runner took today's probe of this unmeasured seat: re-rank WITHOUT
@@ -5446,7 +5627,12 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
                 f"refused:{failure.kind}",
                 failure.kind,
                 cause,
-                f"seat {cand.label} refused ({failure.kind}: {failure.detail})",
+                (
+                    f"seat {cand.label} needs login ({failure.detail}) — run "
+                    f"`{codex_login.login_command(cand.home)}`"
+                    if failure.kind == "auth"
+                    else f"seat {cand.label} refused ({failure.kind}: {failure.detail})"
+                ),
             )
         )
         if write:
@@ -5478,6 +5664,9 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
             ),
             "",
         )
+        if failure.kind == "auth":
+            _announce_needs_login(cand, failure.detail, None if seat else nxt)
+            continue
         print(
             f"seat {cand.label} refused: {failure.kind} ({failure.detail}) — "
             + (f"falling back to {nxt}" if nxt else "no seat left to try"),
@@ -5627,6 +5816,7 @@ _KIND_EXIT = {
     "disabled": EX_QUOTA,
     "seat_unavailable": EX_QUOTA,
     "seat_refused": EX_QUOTA,
+    "seat_needs_login": EX_QUOTA,
     "seat_unknown": EX_USAGE,
     "no_codex": EX_NO_CODEX,
     "timeout": EX_TIMEOUT,
