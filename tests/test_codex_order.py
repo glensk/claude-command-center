@@ -326,7 +326,7 @@ def test_order_show_lists_every_seat_ranked(
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
     assert lines[0].startswith("policy: fill —")  # the ranking rule, before the table
     assert lines[1].startswith("1  private")
-    assert "⛔ blocked" in lines[1] and "hold: private held" in lines[1] and "unblocks" in lines[1]
+    assert "⛔ blocked" in lines[1] and "hold: private held · until " in lines[1]
     assert lines[2].startswith("2  de") and "← next attempt" in lines[2]
     assert "unmeasured" in lines[2] or "cohort" in lines[2]  # the rank_reason column
     assert lines[3].startswith("3  default")

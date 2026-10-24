@@ -134,11 +134,12 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import brokenpipe, codex_launch, codex_ledger, codex_login, codex_runlog
 
@@ -1782,6 +1783,119 @@ def cmd_home(  # pylint: disable=too-many-branches,too-many-return-statements,to
     return EX_OK
 
 
+# Unblock times are shown to a person in Switzerland: Swiss local time, whatever zone the
+# process happens to run in (a launchd job, a container, a CI runner).
+_SWISS_ZONE = "Europe/Zurich"
+
+
+def until_local(ts: int, now: int | None = None) -> str:
+    """*ts* in Swiss local time: ``00:56`` within 24 h, else ``Mon 26.10. 09:00``."""
+    now_ts = int(time.time()) if now is None else int(now)
+    try:
+        moment = datetime.fromtimestamp(int(ts), ZoneInfo(_SWISS_ZONE))
+    except (ZoneInfoNotFoundError, ValueError, OSError):  # pragma: no cover - no tzdata
+        moment = datetime.fromtimestamp(int(ts))
+    if int(ts) - now_ts < 86400:
+        return moment.strftime("%H:%M")
+    return moment.strftime("%a %d.%m. %H:%M")
+
+
+def _row_fields(row: quota.ProviderQuota) -> dict[str, Any]:
+    """The :func:`seat_block` fields of a quota row (the ``codex_seat_order`` dict keys)."""
+    return {
+        "label": row.account,
+        "id": row.id,
+        "email": row.email,
+        "state": row.state,
+        "reason": row.reason,
+        "blocked_by": row.blocked_by,
+        "block_scope": row.block_scope,
+        "resets_at": row.resets_at,
+    }
+
+
+def seat_block(row: Mapping[str, Any], now: int | None = None) -> dict[str, Any] | None:
+    """Why this seat cannot run right now, or ``None`` when nothing blocks it (tp#1202).
+
+    *row* is one ``codex_seat_order`` dict (or :func:`_row_fields` of a quota row) — the
+    SAME resolved row the runner's ranking skips a seat on, so a seat the runner refuses
+    is never shown as available. Covers every BLOCKED row: a usage-limit refusal (the
+    runner's live fetch or a rollout), an observed refusal in the cooldown store, an
+    administrative hold, a rota week. A dead login (``needs login``) is not a block that
+    lifts at a time and keeps its own surface, so it answers ``None`` here.
+
+    Returns ``label``, ``id``, ``email``, ``kind`` (what blocks it: a window name,
+    ``refusal``, ``observed-rejection``, ``hold``, ``rota``), ``reason`` (compact),
+    ``until`` (epoch seconds, ``None`` when unknown), ``until_local`` (Swiss local
+    time) and ``text`` — ``usage limit reached · until 00:56``, what every surface prints.
+    """
+    now_ts = int(time.time()) if now is None else int(now)
+    state = str(row.get("state") or "")
+    scope = str(row.get("block_scope") or "")
+    if state != "blocked" or codex_login.is_needs_login(state, scope):
+        return None
+    blocker = str(row.get("blocked_by") or "")
+    reason = str(row.get("reason") or "").strip()
+    if blocker in ("rota", "hold", "observed-rejection"):
+        # A fail-closed rota reason already starts with "rota:" — never "rota: rota:".
+        if not reason.startswith(f"{blocker}:"):
+            reason = f"{blocker}: {reason}" if reason else blocker
+    else:
+        # A window or a refusal: the card-sized label ("usage limit reached") says it all.
+        reason = short_refusal_label(reason) or "blocked"
+    until = int(row.get("resets_at") or 0)
+    until_at = until if until > now_ts else None
+    when = until_local(until, now_ts) if until_at is not None else None
+    return {
+        "label": str(row.get("label") or ""),
+        "id": str(row.get("id") or ""),
+        "email": str(row.get("email") or ""),
+        "kind": blocker or scope or "blocked",
+        "reason": reason,
+        "until": until_at,
+        "until_local": when,
+        "text": f"{reason} · until {when}" if when else reason,
+    }
+
+
+def blocked_seats(now: int | None = None) -> list[dict[str, Any]]:
+    """Every registered seat that cannot run right now (:func:`seat_block`), registry order.
+
+    Read from the same quota rows the runner ranks, so this list and the runner can never
+    disagree about a seat. Dead logins are left to :func:`needs_login_seats`. ``[]`` on
+    any failure: display data, never a routing input.
+    """
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    now_ts = int(time.time()) if now is None else int(now)
+    try:
+        rows = quota._codex_quotas(now_ts, quota.read_cooldowns(now_ts))  # noqa: SLF001
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return []
+    return [block for row in rows if (block := seat_block(_row_fields(row), now_ts)) is not None]
+
+
+def _blocked_line(block: Mapping[str, Any]) -> str:
+    """``default: ⛔ blocked — usage limit reached · until 00:56``."""
+    return f"{block['label']}: ⛔ blocked — {block['text']}"
+
+
+def refresh_seat_readings(*, probe: bool = True) -> None:
+    """Re-measure every candidate seat whose reading is stale — the runner's own step.
+
+    The runner fetches live usage for each candidate with an old reading right before it
+    ranks (:func:`_pre_selection_refresh`); ``order``, ``headroom`` and ``usage`` call
+    THIS so they judge the seats on the same evidence (tp#1202: ``order`` showed a seat
+    available from a 2-hour-old 94 % reading while ``run -S`` fetched, found the usage
+    limit reached and refused it). Only with ``codex_usage`` on, inside the same 20 s
+    budget, every failure swallowed: a failed fetch leaves the last reading in place.
+    """
+    if not _usage_feedback_on():
+        return
+    with contextlib.suppress(Exception):
+        _pre_selection_refresh(codex_homes_in_order(probe=probe), _REFRESH_BUDGET_SEC)
+
+
 def _seat_table_lines(now: int | None = None) -> list[str]:
     """The ranked seat table ``order`` prints — one line per configured seat.
 
@@ -1817,8 +1931,11 @@ def _seat_table_lines(now: int | None = None) -> list[str]:
             if (win := (row.get("windows") or {}).get(name)) is not None
         )
         detail = windows
+        block = seat_block(row, now_ts)
         if dead_home is not None:
             detail = f"run `{codex_login.login_command(dead_home)}`"
+        elif block is not None:
+            detail = block["text"]  # tp#1202: the runner's block, until when (Swiss time)
         elif state != "available":
             blocker = str(row.get("blocked_by") or "")
             reason = str(row.get("reason") or "")
@@ -1906,6 +2023,8 @@ def cmd_order(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
         noun = "codex seat tiebreak order" if _seat_policy() == "fill" else "codex seat order"
         print(f"{noun}: " + (" → ".join(labels) if labels else "(canonical: default → …)"))
 
+    if not getattr(args, "no_refresh", False):
+        refresh_seat_readings()  # tp#1202: the runner's evidence, not an older reading
     configured, order, unknown = _seat_order_state()
     candidates = codex_homes_in_order()
     cfg = load_config()
@@ -1923,6 +2042,9 @@ def cmd_order(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
                     "pin": _pin_payload(cfg),
                     # Additive (tp#1196): seats left out because their login is dead.
                     "needs_login": needs_login_seats(),
+                    # Additive (tp#1202): seats left out because something blocks them
+                    # (usage limit, refusal, hold, rota) and until when.
+                    "blocked": blocked_seats(),
                 }
             )
         )
@@ -3200,12 +3322,14 @@ def seat_headroom(row: quota.ProviderQuota, now: int) -> dict[str, Any]:
 
     windows = _headroom_window_rows(row, now)
     fresh = [win for win in windows if not win["stale"]]
+    block = seat_block(_row_fields(row), now)
     if codex_login.is_needs_login(row.state, row.block_scope):
         # Never chosen by the pool verdict (tp#1196): a dead login is not "blocked
         # until a reset", and no amount of headroom elsewhere is explained by it.
         state, reason = "needs_login", f"{codex_login.NEEDS_LOGIN}: {row.reason}"
     elif row.state == quota.BLOCKED:
-        state, reason = "blocked", row.reason or "seat is blocked"
+        # tp#1202: the same compact reason + Swiss unblock time `order` shows.
+        state, reason = "blocked", (block["text"] if block else "") or "seat is blocked"
     elif row.malformed:
         state, reason = "unknown", "usage snapshot contains a malformed window"
     elif not fresh:
@@ -3227,6 +3351,9 @@ def seat_headroom(row: quota.ProviderQuota, now: int) -> dict[str, Any]:
         "reason": reason,
         "captured_at": row.captured_at or None,
         "windows": windows,
+        # Additive (tp#1202): when a blocked seat can run again (None = unknown / not blocked).
+        "until": block["until"] if block else None,
+        "until_local": block["until_local"] if block else None,
     }
 
 
@@ -3267,7 +3394,9 @@ def codex_headroom(now: int | None = None) -> dict[str, Any]:
     The pool verdict is the best seat's: any ``allowed`` allows (and names that seat),
     else ``reserve``, else ``unknown``, else ``blocked``. A seat whose login is dead
     (``needs_login``) never decides the verdict; it is listed under ``needs_login``
-    with the command that fixes it (tp#1196). Candidates come from
+    with the command that fixes it (tp#1196). A registered seat the ranking left out
+    because something blocks it is listed under ``blocked`` (:func:`seat_block`) and
+    never decides it either (tp#1202). Candidates come from
     :func:`codex_homes_in_order`, so ``$CODEX_HOME`` narrows the question to one seat
     and ``CCC_NO_CODEX`` answers ``blocked`` with no seats at all.
 
@@ -3286,6 +3415,15 @@ def codex_headroom(now: int | None = None) -> dict[str, Any]:
         if chosen is not None:
             break
     dead = [] if os.environ.get("CCC_NO_CODEX") else needs_login_seats(now_ts)
+    # tp#1202: registered seats the ranking left out because something blocks them —
+    # listed with the reason and until when, never a verdict input. An explicit
+    # $CODEX_HOME narrows the question to that one seat, so it lists none.
+    shown = {str(seat["label"]) for seat in seats}
+    held = (
+        []
+        if os.environ.get("CCC_NO_CODEX") or os.environ.get("CODEX_HOME")
+        else [block for block in blocked_seats(now_ts) if block["label"] not in shown]
+    )
     if chosen is None:
         state = "blocked"
         reason = (
@@ -3333,6 +3471,8 @@ def codex_headroom(now: int | None = None) -> dict[str, Any]:
         "seats": seats,
         # Additive (tp#1196): seats whose login is dead — ignored by the verdict.
         "needs_login": dead,
+        # Additive (tp#1202): blocked seats outside the candidates — ignored by the verdict.
+        "blocked": held,
     }
 
 
@@ -3538,10 +3678,14 @@ def cmd_usage(args: argparse.Namespace) -> int:
     """Print the current Codex rate-limit usage (5h + weekly windows).
 
     Seats whose login is dead follow, one line each with the command that fixes them
-    (tp#1196) — a usage figure for the seat being read says nothing about them.
+    (tp#1196) — a usage figure for the seat being read says nothing about them. Blocked
+    seats come first, each with its reason and Swiss unblock time (tp#1202).
     """
+    if not getattr(args, "no_refresh", False):
+        refresh_seat_readings()  # tp#1202: the runner's evidence, not an older reading
     windows = _codex_usage_windows()
     dead = needs_login_seats()
+    held = blocked_seats()
     if args.json:
         payload: dict[str, Any] = {
             key: (
@@ -3560,6 +3704,8 @@ def cmd_usage(args: argparse.Namespace) -> int:
         }
         if dead:
             payload["needs_login"] = dead  # additive, only when a seat needs it
+        if held:
+            payload["blocked"] = held  # additive (tp#1202), only when a seat is blocked
         print(json.dumps(payload))
         return EX_OK
     parts = []
@@ -3571,6 +3717,8 @@ def cmd_usage(args: argparse.Namespace) -> int:
             else f"{label} {win[0]:.0f}% (resets {_format_reset(win[1])})"
         )
     print("codex usage: " + "  ·  ".join(parts))
+    for block in held:
+        print(_blocked_line(block))
     for seat in dead:
         print(_needs_login_line(seat))
     return EX_OK
@@ -3591,7 +3739,21 @@ def _headroom_unknown(reason: str) -> dict[str, Any]:
         "seat": "",
         "seats": [],
         "needs_login": [],
+        "blocked": [],
     }
+
+
+def _headroom_other_seat_lines(decision: dict[str, Any]) -> list[str]:
+    """One line per seat the verdict is NOT about: candidates, blocked seats, dead logins."""
+    dead_labels = {str(seat.get("label")) for seat in decision.get("needs_login") or []}
+    lines: list[str] = []
+    for seat in decision.get("seats") or []:
+        if seat.get("label") != decision.get("seat") and seat.get("label") not in dead_labels:
+            mark = "⛔ " if seat.get("state") == "blocked" else ""
+            lines.append(f"{seat['label']}: {mark}{seat['state']} — {seat['reason']}")
+    lines.extend(_blocked_line(block) for block in decision.get("blocked") or [])
+    lines.extend(_needs_login_line(seat) for seat in decision.get("needs_login") or [])
+    return lines
 
 
 def cmd_headroom(args: argparse.Namespace) -> int:
@@ -3606,6 +3768,8 @@ def cmd_headroom(args: argparse.Namespace) -> int:
     which callers read as "reserve zone".
     """
     try:
+        if not getattr(args, "no_refresh", False):
+            refresh_seat_readings()  # tp#1202: judge on the runner's evidence
         decision = codex_headroom()
     except Exception as exc:  # pylint: disable=broad-exception-caught  # any crash = unknown
         decision = _headroom_unknown(f"unknown: {type(exc).__name__}: {exc}")
@@ -3638,12 +3802,8 @@ def cmd_headroom(args: argparse.Namespace) -> int:
             print(f"offload: DENIED (reserve zone — {decision['reason']})")
         else:
             print(f"offload: DENIED (unknown — {decision['reason']})")
-        dead_labels = {str(seat.get("label")) for seat in decision.get("needs_login") or []}
-        for seat in decision.get("seats") or []:
-            if seat.get("label") != decision.get("seat") and seat.get("label") not in dead_labels:
-                print(f"{seat['label']}: {seat['state']} — {seat['reason']}")
-        for seat in decision.get("needs_login") or []:
-            print(_needs_login_line(seat))
+        for line in _headroom_other_seat_lines(decision):
+            print(line)
     # "blocked" shares the reserve exit code: the documented contract is 0 = offload
     # allowed, non-zero = keep the work on Claude, and 3 already means "no usable data".
     return {"allowed": 0, "reserve": 1, "blocked": 1, "unknown": 3}[decision["state"]]
@@ -4800,12 +4960,21 @@ def seat_status_report(now: int | None = None) -> tuple[list[str], int | None]:
                 f"(run `{codex_login.login_command(dead_home)}`)"
             )
             continue
+        resets_at = int(row.get("resets_at") or 0)
+        block = seat_block(row, now_ts)
+        if block is not None:
+            # tp#1202: the very wording `order` / `headroom` / `usage` print.
+            bits.append(str(block["text"]))
+            if block["until"] is not None:
+                resets.append(int(block["until"]))
+                bits.append(f"unblocks {_format_reset(resets_at, now_ts)}")
+            lines.append(f"{row.get('label', '?')}: {row.get('state', '?')} ({', '.join(bits)})")
+            continue
         if row.get("reason"):
             reason = str(row["reason"])
             if row.get("blocked_by") == "rota" and not reason.startswith("rota:"):
                 reason = f"rota: {reason}"  # a fail-closed reason already says it
             bits.append(reason)
-        resets_at = int(row.get("resets_at") or 0)
         if resets_at > now_ts:
             resets.append(resets_at)
             bits.append(f"unblocks {_format_reset(resets_at, now_ts)}")
@@ -5435,9 +5604,7 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
     if resume_home is not None:
         pending = [_seat_candidate_for(resume_home)]
     else:
-        if _usage_feedback_on():
-            with contextlib.suppress(Exception):
-                _pre_selection_refresh(codex_homes_in_order(probe=probe_ok), _REFRESH_BUDGET_SEC)
+        refresh_seat_readings(probe=probe_ok)
         pending = codex_homes_in_order(probe=probe_ok)
     pending = _confined(pending, seat)
     if not pending:
@@ -6624,6 +6791,13 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
 
     p_usage = sub.add_parser("usage", help="show current Codex rate-limit usage (5h + weekly)")
     p_usage.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")
+    p_usage.add_argument(
+        "-n",
+        "--no-refresh",
+        action="store_true",
+        help="judge on the cached readings; skip the runner's live re-measure of stale "
+        "seats (only with codex_usage on, at most 20 s)",
+    )
     p_usage.set_defaults(func=cmd_usage)
 
     p_headroom = sub.add_parser(
@@ -6636,6 +6810,13 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         ),
     )
     p_headroom.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")
+    p_headroom.add_argument(
+        "-n",
+        "--no-refresh",
+        action="store_true",
+        help="judge on the cached readings; skip the runner's live re-measure of stale "
+        "seats (only with codex_usage on, at most 20 s)",
+    )
     p_headroom.set_defaults(func=cmd_headroom)
 
     p_debate = sub.add_parser(
@@ -6739,7 +6920,15 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         "-j",
         "--json",
         action="store_true",
-        help="machine-readable: {configured, order, unknown, next_attempt, candidates, pin}",
+        help="machine-readable: {configured, order, unknown, next_attempt, candidates, pin, "
+        "needs_login, blocked}",
+    )
+    p_order.add_argument(
+        "-n",
+        "--no-refresh",
+        action="store_true",
+        help="judge on the cached readings; skip the runner's live re-measure of stale "
+        "seats (only with codex_usage on, at most 20 s)",
     )
     p_order.set_defaults(func=cmd_order)
 

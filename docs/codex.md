@@ -121,7 +121,8 @@ codex-in-claude policy order                 # switch to the strict order (fill 
 codex-in-claude order                        # the ranked table + next attempt + reasons
 codex-in-claude order private de default     # set the order/tiebreak (also CLEARS the pin)
 codex-in-claude order -c                     # back to the canonical default → private → extras
-codex-in-claude order -j                     # {configured, order, unknown, policy, next_attempt, candidates, pin}
+codex-in-claude order -j                     # {configured, order, unknown, policy, next_attempt, candidates, pin, needs_login, blocked}
+codex-in-claude order -n                     # judge on the cached readings (skip the live re-measure)
 ai set codex-policy fill                     # the front door (delegates to `policy`)
 ai set codex-order private de default        # the front door (delegates to `order`)
 ai routing                                   # shows the policy, the order and the next attempt
@@ -131,7 +132,7 @@ ai routing                                   # shows the policy, the order and t
 policy: fill — spend the seat whose weekly allowance resets soonest; codex_seat_order is the tiebreak
 1  private   ✅ available  5h 0% · wk 60%   you@example.org  ·  cohort 1: weekly resets in 1d 4h · 60% used  ← next attempt
 2  de        ✅ available  5h 12% · wk 3%   you.second@example.org  ·  cohort 2: weekly resets in 5d 12h · 3% used
-3  default   ⛔ blocked    hold: team seat reserved (unblocks in 2d 7h)
+3  default   ⛔ blocked    hold: team seat reserved · until Thu 01.10. 09:00
 pin: de until 2026-09-30
 ```
 
@@ -361,7 +362,21 @@ on the next read, no `ccc quota -c` needed. `order`, `headroom` and `usage` show
 `headroom -j`, `usage -j`). One push per seat per local day asks for the login through
 `~/.claude/hooks/ntfy-push.sh` (`$CCC_PUSH_HOOK` names another executable; empty
 disables it). An explicit `$CODEX_HOME` on such a seat records `skipped:needs_login`;
-`-Q` still tries it, and a success there clears the block. **Zero
+`-Q` still tries it, and a success there clears the block.
+
+**Blocked seats — `⛔ blocked … · until HH:MM` (tp#1202).** A seat the runner would not
+start (a usage limit reached — `workspace_owner_credits_depleted`, "out of credits" — a
+recorded refusal, a hold, somebody else's rota week) shows in `order`, `headroom` and
+`usage` as `⛔ blocked — usage limit reached · until 00:56`: the reason and the moment it
+can run again in Swiss local time (`Mon 26.10. 09:00` when more than a day away). The
+`headroom` verdict never comes from such a seat; JSON: `blocked[]` on `order -j`,
+`headroom -j` and `usage -j` (`label`, `id`, `kind`, `reason`, `until` epoch,
+`until_local`, `text`). Before they read the seats, the three commands run the runner's own
+pre-selection re-measure (live usage for every candidate whose reading is older than
+`codex_usage_refresh_sec`, 20 s budget, only with `codex_usage` on), so an hours-old
+healthy reading can no longer show a seat available that `run` is about to refuse; `-n`
+skips it. The runner's `seat_unavailable` / `all_seats_unavailable` evidence uses the
+same wording. **Zero
 eligible seats start no process at all** and report `all_seats_unavailable` with the
 earliest reset — a refusal we can predict is not worth a round trip.
 
