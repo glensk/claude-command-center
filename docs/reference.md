@@ -2028,6 +2028,15 @@ only when the badge↔tab mapping actually moves) — so tabs heal **while you w
 them in the TUI**, even with no daemon loaded. All are marker-preserving and
 idempotent.
 
+Every write after a tab's first is compare-and-swap against the title ccc recorded
+(`title_written`), so a title typed by hand is never replaced. Title writes are detached
+and recorded before they land, so a lost write could leave the record naming a title the
+tab never showed — and every later swap refused, freezing the tab on an old badge and
+AIM (tp#1292). The sync therefore swaps from what the tab really shows when that is
+ccc's own shape: it starts with a known badge or agent symbol and its cleaned text is
+the session's name, folder leaf or last recorded name (`drifted_ccc_body`; after the
+same 5 s grace as hand-set detection). Any other title keeps the recorded baseline.
+
 The **status-line wrapper** (`statusline-command.sh`) reads the same
 `~/.cache/iterm-tab-symbol/<id>` cache to **prepend the badge as the first
 character of status-line line 1**, and ends that line with a compact

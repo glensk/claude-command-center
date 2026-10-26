@@ -447,6 +447,85 @@ def test_sync_writes_name_then_compare_and_swap(
     assert writes and writes[0][0] == "cas" and writes[0][1]["w0t0p0:U1"][0] == core
 
 
+# tp#1292: a recorded title write that never landed left the zoho tab on an old ccc title
+# (its old badge ⚫ and an old AIM); every later compare-and-swap expected the recorded title
+# and refused for good.
+_ZOHO_STALE = "⚫ zoho-api automater 🎯 tp#1035, #1175, #1177, #1236, #1023: zo…"
+_ZOHO_RECORDED = "🎫 zoho-api automater 🎯 tp#1035, #1175, #1177, #1236: zoho tick…"
+
+
+def _zoho(store: Store, monkeypatch: pytest.MonkeyPatch, age_ms: int = 60_000) -> None:
+    from command_center import staffrole
+
+    monkeypatch.setattr(staffrole, "agent_symbols", lambda: frozenset({"🎫"}))
+    monkeypatch.setattr(staffrole, "session_symbol", lambda sid: "🎫" if sid == "z1" else None)
+    _row(
+        store,
+        "z1",
+        cwd="/r/zoho-api",
+        canonical_name="zoho-api automater",
+        iterm_session_id="w0t9p0:UZ",
+    )
+    _written(store, "z1", _ZOHO_RECORDED, age_ms=age_ms)
+
+
+def test_drifted_ccc_body_spots_a_stale_ccc_title(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _zoho(store, monkeypatch)
+    session = store.get("z1")
+    assert session is not None
+    now = int(time.time() * 1000)
+    assert tabsymbol.drifted_ccc_body(session, _ZOHO_STALE, now) == _ZOHO_STALE
+    # the wait marker is not part of the body the swap compares
+    assert tabsymbol.drifted_ccc_body(session, "🔴 " + _ZOHO_STALE, now) == _ZOHO_STALE
+    # an agent symbol in front counts as a badge too
+    assert tabsymbol.drifted_ccc_body(session, "🎫 zoho-api automater", now) == (
+        "🎫 zoho-api automater"
+    )
+    # in sync, hand-typed, unbadged or unknown → keep the recorded baseline
+    assert tabsymbol.drifted_ccc_body(session, _ZOHO_RECORDED, now) is None
+    assert tabsymbol.drifted_ccc_body(session, "⚫ sauna talk", now) is None
+    assert tabsymbol.drifted_ccc_body(session, "zoho-api automater", now) is None
+    assert tabsymbol.drifted_ccc_body(session, None, now) is None
+
+
+def test_drifted_ccc_body_waits_out_the_grace(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _zoho(store, monkeypatch, age_ms=1000)
+    session = store.get("z1")
+    assert session is not None
+    now = int(time.time() * 1000)
+    assert tabsymbol.drifted_ccc_body(session, _ZOHO_STALE, now) is None  # may be landing
+    assert tabsymbol.drifted_ccc_body(session, _ZOHO_STALE, now + 5000) == _ZOHO_STALE
+
+
+def test_sync_heals_a_tab_stuck_on_a_stale_ccc_title(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _zoho(store, monkeypatch)
+    writes = _sync_env(monkeypatch, tmp_path, {"UZ": "🔴 " + _ZOHO_STALE})
+    tabsymbol.sync_live(store)
+    got = store.get("z1")
+    assert got is not None and got.canonical_name == "zoho-api automater"  # not adopted
+    assert got.canonical_name_origin != "manual-tab"
+    kind, entries = writes[0]
+    expected, core = entries["w0t9p0:UZ"]
+    assert kind == "cas" and expected == _ZOHO_STALE  # swapped from what the tab shows
+    assert core == "🎫 zoho-api automater" and got.title_written == core
+
+
+def test_sync_keeps_the_recorded_baseline_for_a_hand_set_title(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _zoho(store, monkeypatch, age_ms=1000)  # in grace: not adopted yet, still protected
+    writes = _sync_env(monkeypatch, tmp_path, {"UZ": "⚫ sauna talk"})
+    tabsymbol.sync_live(store)
+    kind, entries = writes[0]
+    assert kind == "cas" and entries["w0t9p0:UZ"][0] == _ZOHO_RECORDED
+
+
 def test_watcher_override_becomes_the_name(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "load_config", lambda: config.Config(session_names=True))
     _row(store, "s1", cwd="/r/voice", canonical_name="voice bridge", iterm_session_id="w0t0p0:U1")

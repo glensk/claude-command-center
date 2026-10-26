@@ -513,14 +513,19 @@ def _plan_write(
     plain: dict[str, str],
     cas: dict[str, tuple[str, str]],
     writes: list[tuple[str, str]],
+    *,
+    expected: str | None = None,
 ) -> None:
     """File *session*'s *core* as an unconditional first write or a compare-and-swap.
 
     Once ccc has written a title (``title_written``) every later write is conditional on
     the tab still showing it — a title the user typed meanwhile is never replaced.
+    *expected*: the body the tab really shows (:func:`drifted_ccc_body`, tp#1292).
     """
     iid = session.iterm_session_id or ""
-    if session.title_written:
+    if expected:
+        cas[iid] = (expected, core)
+    elif session.title_written:
         cas[iid] = (session.title_written, core)
     else:
         plain[iid] = core
@@ -597,6 +602,34 @@ def manual_title_candidate(
     if cleaned in ccc_title_shapes(session, marker):
         return None
     return cleaned
+
+
+def drifted_ccc_body(
+    session: Session, live_title: str | None, now_ms: int, marker: str | None = None
+) -> str | None:
+    """The live title body when it is ccc's own shape but not ``title_written`` (pure).
+
+    Writes are detached and recorded before they land, so a lost write left the record
+    naming a title the tab never showed and every later swap refused (tp#1292). A body
+    led by a known badge whose cleaned text is one of :func:`ccc_title_shapes` is ccc's
+    own, so it may serve as the swap's baseline. ``None`` inside the write grace, when
+    in sync, or for any other (hand-set) title.
+    """
+    from . import session_names  # lazy
+
+    if live_title is None or not session.title_written:
+        return None
+    if now_ms - session.title_written_at < session_names.MANUAL_GRACE_MS:
+        return None
+    wait = _wait_marker(marker)
+    body = live_title[len(wait) :] if wait and live_title.startswith(wait) else live_title
+    if not body or body == session.title_written:
+        return None
+    if not any(body.startswith(f"{badge} ") for badge in known_badges()):
+        return None
+    if clean_title(body, wait) not in ccc_title_shapes(session, wait):
+        return None
+    return body
 
 
 def push_title(session: Session, *, marker: str | None = None) -> None:
@@ -716,7 +749,8 @@ def sync_live(store: Store, *, marker: str | None = None) -> list[str]:
     With ``session_names`` on it is also where a title the user typed by hand is noticed
     (one ``osascript`` read of the live titles, only when some tab has a ccc baseline):
     it becomes the session's name and that tab is never written again. Every write after
-    the first is compare-and-swap. Returns the session ids that were badged.
+    the first is compare-and-swap, from what the tab shows when that is an older ccc
+    title (:func:`drifted_ccc_body`). Returns the session ids that were badged.
     """
     import time  # pylint: disable=import-outside-toplevel
 
@@ -738,9 +772,9 @@ def sync_live(store: Store, *, marker: str | None = None) -> list[str]:
     badged: list[str] = []
     for session in owners:
         iid = session.iterm_session_id or ""
-        if live is not None and getattr(store, "conn", None) is not None:
-            uuid = iid.split(":")[-1].strip().upper()
-            hand = manual_title_candidate(session, live.get(uuid), now, wait_marker)
+        live_title = live.get(iid.split(":")[-1].strip().upper()) if live else None
+        if live_title is not None and getattr(store, "conn", None) is not None:
+            hand = manual_title_candidate(session, live_title, now, wait_marker)
             if hand and not session_names.already_named(session, hand):
                 session_names.adopt_manual_title(store, session.session_id, hand)
                 continue
@@ -749,7 +783,9 @@ def sync_live(store: Store, *, marker: str | None = None) -> list[str]:
         badge = badge_for(session)
         if not badge:
             continue
-        _plan_write(session, _session_core(session, badge, cfg), plain, cas, writes)
+        drift = drifted_ccc_body(session, live_title, now, wait_marker)
+        core = _session_core(session, badge, cfg)
+        _plan_write(session, core, plain, cas, writes, expected=drift)
         badged.append(session.session_id)
     _write_titles(plain, cas, wait_marker)
     _record_writes(store, writes)
