@@ -1,10 +1,11 @@
+#!/usr/bin/env python3
 """The shared-memory attestation token every ccc-started Claude / Codex child carries.
 
-The shared LLM memory service (``mem``, mydotfiles ``bin/``) trusts a write only when the
-writer's environment holds a token a trusted launcher minted: ``MEM_TOKEN=<token>`` plus
-``MEM_LAUNCHER=<launcher>``. ccc stamps it on the Claude sessions it starts
-(``MEM_LAUNCHER=ccc``) and ``codex-in-claude`` on every ``codex exec`` it runs
-(``MEM_LAUNCHER=codex-in-claude``). :func:`mem_env` is the ONE place both mint it.
+The shared LLM memory service (``mem``, in the user's dotfiles ``bin/``) trusts a write
+only when the writer's environment holds a token a trusted launcher minted:
+``MEM_TOKEN=<token>`` plus ``MEM_LAUNCHER=<launcher>``. ccc stamps it on the Claude
+sessions it starts (``MEM_LAUNCHER=ccc``) and ``codex-in-claude`` on every ``codex exec``
+it runs (``MEM_LAUNCHER=codex-in-claude``). :func:`mem_env` is the ONE place both mint it.
 
 Rules (tp#1249 L1):
 
@@ -23,6 +24,17 @@ The ``mem`` CLI resolves through :data:`command_center.external_deps.EXTERNAL_DE
 
 from __future__ import annotations
 
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
+
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import os
 import re
 from collections.abc import Mapping

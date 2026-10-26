@@ -123,9 +123,9 @@ EXTERNAL_DEPS: dict[str, Dep] = {
             "after `staff lease -r` left a released-lease marker for a guarded agent."
         ),
     ),
-    # The shared LLM memory CLI (mydotfiles `bin/mem`). ccc asks it ONE thing per launch:
-    # `mem token -l <launcher> -t`, the attestation token a ccc-started Claude session or
-    # codex-in-claude run carries as MEM_TOKEN (mem_token.py). `resolve`, never
+    # The shared LLM memory CLI (`bin/mem` in the user's dotfiles). ccc asks it ONE thing
+    # per launch: `mem token -l <launcher> -t`, the attestation token a ccc-started Claude
+    # session or codex-in-claude run carries as MEM_TOKEN (mem_token.py). `resolve`, never
     # `require`: without `mem` the child launches without the token and the memory
     # service files its writes as proposals.
     "mem": Dep(
@@ -133,9 +133,10 @@ EXTERNAL_DEPS: dict[str, Dep] = {
         command="mem",
         env="MEM_BIN",
         install_hint=(
-            "Put the shared-memory CLI `mem` (mydotfiles bin/) on $PATH, or set MEM_BIN to "
-            "its absolute path. Without it ccc-started sessions and codex-in-claude runs "
-            "carry no MEM_TOKEN, so their memory writes land as proposals."
+            "Put the shared-memory CLI `mem` (the user's dotfiles bin/) on $PATH, or set "
+            "MEM_BIN to its absolute path. Without it ccc-started sessions and "
+            "codex-in-claude runs carry no MEM_TOKEN, so their memory writes land as "
+            "proposals."
         ),
     ),
 }
