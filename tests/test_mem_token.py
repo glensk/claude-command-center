@@ -164,6 +164,148 @@ def test_typed_launch_prefix_never_carries_the_token(tmp_path: Path) -> None:
     assert _calls(tmp_path) == []
 
 
+# ── typed launch lines: the shell mints through `ccc mem-token` (tp#1290) ─────────
+
+
+def _typed_bin(tmp_path: Path) -> tuple[Path, Path]:
+    """A PATH dir with a ``ccc`` running THIS checkout's cli and a ``claude`` env recorder."""
+    import sys
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    out = tmp_path / "claude-env.txt"
+    ccc = bindir / "ccc"
+    ccc.write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" -c '
+        '"import sys; from command_center.cli import main; sys.exit(main())" "$@"\n',
+        encoding="utf-8",
+    )
+    claude = bindir / "claude"
+    claude.write_text(
+        f'#!/bin/sh\nprintf "%s|%s|%s\\n" "$MEM_TOKEN" "$MEM_LAUNCHER" "$PWD" > "{out}"\n',
+        encoding="utf-8",
+    )
+    ccc.chmod(0o755)
+    claude.chmod(0o755)
+    return bindir, out
+
+
+def _typed_resume_line(monkeypatch: pytest.MonkeyPatch, cwd: Path) -> str:
+    """The exact text ``terminal.resume_in_new_tab`` types into a new iTerm tab."""
+    from command_center import config, terminal
+
+    monkeypatch.setattr(config, "load_config", lambda: config.Config(launcher="iterm"))
+    typed: list[str] = []
+
+    def _fake_iterm(command: str) -> bool:
+        typed.append(command)
+        return True
+
+    monkeypatch.setattr(terminal, "_iterm", _fake_iterm)
+    assert terminal.resume_in_new_tab(str(cwd), "sid-typed") is True
+    assert len(typed) == 1
+    return typed[0]
+
+
+def _run_typed(line: str, shell: str, bindir: Path, out: Path) -> list[str]:
+    """Run *line* the way the tab's shell would; what the fake claude saw."""
+    import shutil
+    import subprocess
+
+    exe = shutil.which(shell)
+    if exe is None:
+        pytest.skip(f"{shell} not installed")
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
+    argv = [exe, "-f", "-c", line] if shell == "zsh" else [exe, "-c", line]
+    subprocess.run(argv, env=env, check=True, timeout=60)
+    return out.read_text(encoding="utf-8").strip().split("|")
+
+
+@pytest.mark.parametrize("shell", ["sh", "zsh"])
+@pytest.mark.usefixtures("good_mem")
+def test_typed_resume_line_has_no_token_but_its_claude_gets_one(
+    shell: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cwd = tmp_path / "re po"
+    cwd.mkdir()
+    line = _typed_resume_line(monkeypatch, cwd)
+    assert _TOKEN not in line  # nothing secret in the typed text (shell history, screen)
+    assert mem_token.TYPED_SNIPPET in line
+    assert _calls(tmp_path) == []  # building the line minted nothing in-process
+    bindir, out = _typed_bin(tmp_path)
+    token, launcher, pwd = _run_typed(line, shell, bindir, out)
+    assert (token, launcher) == (_TOKEN, "ccc")  # MEM_TOKEN reached the claude child env
+    assert Path(pwd).resolve() == cwd.resolve()
+    assert _calls(tmp_path) == ["token -l ccc -t|3"]
+
+
+@pytest.mark.usefixtures("down_mem")
+def test_typed_resume_line_still_launches_when_the_mint_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    bindir, out = _typed_bin(tmp_path)
+    assert _run_typed(_typed_resume_line(monkeypatch, cwd), "sh", bindir, out)[:2] == ["", ""]
+
+
+@pytest.mark.usefixtures("good_mem")
+def test_typed_resume_line_keeps_an_ambient_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    line = _typed_resume_line(monkeypatch, cwd)
+    bindir, out = _typed_bin(tmp_path)
+    monkeypatch.setenv("MEM_TOKEN", "inherited-token")
+    monkeypatch.setenv("MEM_LAUNCHER", "claude-wrapper")
+    assert _run_typed(line, "sh", bindir, out)[:2] == ["inherited-token", "claude-wrapper"]
+    assert _calls(tmp_path) == []
+
+
+@pytest.mark.usefixtures("good_mem")
+def test_relaunch_and_snapshot_lines_carry_the_snippet_not_a_token(tmp_path: Path) -> None:
+    from command_center import accounts, snapshot
+
+    relaunch = accounts.relaunch_command(accounts.LaunchTarget(""), "sid", "/repo", "go")
+    assert mem_token.TYPED_SNIPPET in relaunch and relaunch.endswith(" )")
+    pane = snapshot.SnapPane(kind="claude", cwd=str(tmp_path), session_id="sid")
+    command = snapshot._claude_action(pane, lambda *_: []).command  # noqa: SLF001
+    assert command is not None and mem_token.TYPED_SNIPPET in command
+    assert _TOKEN not in relaunch + command
+    assert _calls(tmp_path) == []
+
+
+@pytest.mark.usefixtures("good_mem")
+def test_mem_token_command_prints_only_into_a_pipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sys
+
+    from command_center import cli
+
+    assert cli.main(["mem-token"]) == 0
+    assert capsys.readouterr().out == f"{_TOKEN}\n"
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    assert cli.main(["mem-token"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and "never to a terminal" in captured.err
+    assert _calls(tmp_path) == ["token -l ccc -t|3"]  # the refusal minted nothing
+
+
+@pytest.mark.usefixtures("good_mem")
+def test_mem_token_command_keeps_an_ambient_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import cli
+
+    monkeypatch.setenv("MEM_TOKEN", "inherited")
+    assert cli.main(["mem-token"]) == 1
+    assert capsys.readouterr().out == ""
+    assert _calls(tmp_path) == []
+
+
 # ── a Codex launch path: the one runner ──────────────────────────────────────────
 
 

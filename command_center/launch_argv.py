@@ -106,14 +106,21 @@ def claude_command(
 ) -> str:
     """The shell STRING form of *argv*, with the session's env pin in front.
 
-    ``<env prefix>[cd <cwd> && ]claude …`` — or, with *subshell* (the relaunch typed into
-    the user's own shell), ``[cd <cwd> && ]( <env prefix>claude … )`` so the exports do not
-    persist in that shell. Every argument is shell-quoted; the caller owns rejecting
-    control characters (a newline in a TYPED line submits it early).
+    ``<env prefix><mem token>[cd <cwd> && ]claude …`` — or, with *subshell* (the relaunch
+    typed into the user's own shell), ``[cd <cwd> && ]( <env prefix><mem token>claude … )``
+    so the exports do not persist in that shell. ``<mem token>`` is
+    :data:`command_center.mem_token.TYPED_SNIPPET`: the shell mints ``MEM_TOKEN`` through
+    ``ccc mem-token`` itself, so the token is never part of the typed text. Every argument
+    is shell-quoted; the caller owns rejecting control characters (a newline in a TYPED
+    line submits it early).
     """
     from .accounts import session_launch_env_prefix
+    from .mem_token import TYPED_SNIPPET
 
-    prefix = session_launch_env_prefix(target)
+    # The shared-memory token is minted by the shell at run time (TYPED_SNIPPET), never
+    # written into this line: a typed line lands in the shell's history. It sits before
+    # the ``cd … &&`` so a failed ``cd`` still skips claude.
+    prefix = session_launch_env_prefix(target) + TYPED_SNIPPET
     cd = f"cd {shlex.quote(cwd)} && " if cwd else ""
     command = shlex.join(argv)
     if subshell:

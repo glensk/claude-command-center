@@ -5862,8 +5862,34 @@ def _add_tab_symbol(sub: Any) -> None:
 #: The subcommands `build_parser(only=...)` can build on their own — the ONLY thing
 #: that decides who gets the short path. Adding a high-frequency spawn here is the
 #: whole fix; `ccc doctor`'s "Spawn fast path" section reports what misses it.
+def cmd_mem_token(args: argparse.Namespace) -> int:
+    """``ccc mem-token`` — a fresh shared-memory token for a typed launch line (tp#1290)."""
+    from . import mem_token
+
+    return mem_token.print_for_shell()
+
+
+def _add_mem_token(sub: Any) -> None:
+    """`ccc mem-token` — run by every typed ``claude`` launch line, so kept on the hot path."""
+    p_mem = sub.add_parser(
+        "mem-token",
+        help="print a trusted shared-memory token (MEM_LAUNCHER=ccc) for a $(…) substitution",
+        description=(
+            "Mints `mem token -l ccc -t` and prints the token, for the command substitution "
+            "every claude line ccc TYPES into a tab carries "
+            '(`_ccc_mt=$(ccc mem-token) && export MEM_TOKEN="$_ccc_mt" MEM_LAUNCHER=ccc`), '
+            "so the token reaches claude's env without ever being part of the typed text "
+            "or the shell history. Exit 0 = printed; 1 = nothing printed (an inherited "
+            "MEM_TOKEN is kept, or the mint failed); 2 = refused because stdout is a "
+            "terminal (the token is never shown on screen)."
+        ),
+    )
+    p_mem.set_defaults(func=cmd_mem_token)
+
+
 _HOT_SUBCOMMANDS: dict[str, Callable[[Any], None]] = {
     "statusline": _add_statusline,
+    "mem-token": _add_mem_token,
     "aim": _add_aim,
     "hook": _add_hook,
     "tab-symbol": _add_tab_symbol,
@@ -7238,6 +7264,7 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_ap.set_defaults(func=cmd_autoprogress)
 
     _add_tab_symbol(sub)
+    _add_mem_token(sub)
 
     p_peek = sub.add_parser(
         "peek",

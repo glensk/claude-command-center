@@ -570,8 +570,10 @@ def _mem_env(base: Mapping[str, str]) -> dict[str, str]:
 
     Only the in-process renderings (an env ``dict`` or ``os.environ`` before an exec) add
     it — never :func:`session_launch_env_prefix`, whose string is TYPED into a shell and so
-    lands in its history and on screen. ``{}`` when *base* already carries a token or the
-    mint fails (:func:`command_center.mem_token.mem_env`).
+    lands in its history and on screen. A typed ``claude`` line gets its token from the
+    shell instead (:data:`command_center.mem_token.TYPED_SNIPPET`, added by
+    :func:`command_center.launch_argv.claude_command`). ``{}`` when *base* already carries
+    a token or the mint fails (:func:`command_center.mem_token.mem_env`).
     """
     from . import mem_token  # pylint: disable=import-outside-toplevel
 

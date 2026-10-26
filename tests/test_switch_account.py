@@ -29,6 +29,7 @@ import pytest
 
 from command_center import accounts, cli, config, hooks, terminal
 from command_center.adapters import claude as claude_adapter
+from command_center.mem_token import TYPED_SNIPPET
 from command_center.models import CloseClaim, LiveSession, SwitchClaim, now_ms
 from command_center.snapshot import PsRow
 from command_center.store import Store
@@ -1153,7 +1154,7 @@ def test_switch_now_types_the_exact_relaunch_into_the_iterm_tab(
     expected = (
         f"cd {shlex.quote(env.args.cwd)} && ( unset CLAUDE_SECURESTORAGE_CONFIG_DIR; "
         f"export CLAUDE_CONFIG_DIR={shlex.quote(str(work))}; "
-        f"export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; claude --resume {SID} )"
+        f"export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; {TYPED_SNIPPET}claude --resume {SID} )"
     )
     assert env.kill.signals == [(PID, signal.SIGTERM)]
     assert env.typed == {"iterm": [(ITERM, expected)], "tmux": []}
@@ -1173,7 +1174,7 @@ def test_switch_now_types_the_resume_with_the_prompt_appended(
     expected = (
         f"cd {shlex.quote(env.args.cwd)} && ( unset CLAUDE_SECURESTORAGE_CONFIG_DIR; "
         f"export CLAUDE_CONFIG_DIR={shlex.quote(str(work))}; "
-        f"export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; claude --resume {SID} "
+        f"export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; {TYPED_SNIPPET}claude --resume {SID} "
         "-- 'pick up the re-route' )"
     )
     assert env.typed["iterm"] == [(ITERM, expected)]
@@ -1427,7 +1428,7 @@ def test_relaunch_command_pins_a_non_default_account(
     assert accounts.relaunch_command(accounts.LaunchTarget(str(work)), SID, "/repo") == (
         f"cd /repo && ( unset CLAUDE_SECURESTORAGE_CONFIG_DIR; "
         f"export CLAUDE_CONFIG_DIR={shlex.quote(str(work))}; "
-        f"export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; claude --resume {SID} )"
+        f"export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; {TYPED_SNIPPET}claude --resume {SID} )"
     )
 
 
@@ -1438,7 +1439,7 @@ def test_relaunch_command_unsets_both_vars_for_the_default_account(
     private, _work = two_accounts
     assert accounts.relaunch_command(accounts.LaunchTarget(str(private)), SID, "/repo") == (
         f"cd /repo && ( unset CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CONFIG_DIR; "
-        f"export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; claude --resume {SID} )"
+        f"export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; {TYPED_SNIPPET}claude --resume {SID} )"
     )
 
 

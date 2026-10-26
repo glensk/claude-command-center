@@ -91,3 +91,39 @@ def mem_env(launcher: str, base: Mapping[str, str] | None = None) -> dict[str, s
     if not token:
         return {}
     return {TOKEN_VAR: token, LAUNCHER_VAR: launcher}
+
+
+# The shell snippet a TYPED launch line carries (tp#1290). A command line ccc types into a
+# tab lands in that shell's history and on screen, so it can never hold the token itself.
+# Instead the shell mints it at run time through `ccc mem-token` (the same :func:`mem_env`
+# policy, run in its own process) and exports it from a command substitution: the value
+# only ever travels through a pipe into the shell's variable, never through argv, typed text
+# or a log. A failed mint (or an ambient MEM_TOKEN, which `ccc mem-token` leaves alone)
+# exports nothing, so the launch goes ahead exactly as before. POSIX sh and zsh.
+TYPED_SNIPPET = (
+    '_ccc_mt=$(ccc mem-token 2>/dev/null) && export MEM_TOKEN="$_ccc_mt" '
+    f"{LAUNCHER_VAR}={LAUNCHER_CCC}; unset _ccc_mt; "
+)
+
+
+def print_for_shell() -> int:
+    """``ccc mem-token``: print a fresh ``ccc`` token for :data:`TYPED_SNIPPET`'s ``$(…)``.
+
+    Exit 0 with the token on stdout; 1 (nothing printed) when an ambient ``MEM_TOKEN`` is
+    kept or the mint failed (:func:`mem_env`); 2 when stdout is a terminal — the token is
+    only ever handed to a command substitution, never shown on a screen.
+    """
+    import sys  # pylint: disable=import-outside-toplevel
+
+    if sys.stdout.isatty():
+        print(
+            "ccc mem-token: prints a secret — only for a $(…) command substitution, "
+            "never to a terminal",
+            file=sys.stderr,
+        )
+        return 2
+    token = mem_env(LAUNCHER_CCC).get(TOKEN_VAR, "")
+    if not token:
+        return 1
+    sys.stdout.write(token + "\n")
+    return 0

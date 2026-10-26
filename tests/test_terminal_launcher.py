@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from command_center import config, terminal
+from command_center.mem_token import TYPED_SNIPPET
 
 _BOTH_TOOLS: dict[str, str | None] = {
     "tmux": "/usr/bin/tmux",
@@ -19,6 +20,8 @@ _BOTH_TOOLS: dict[str, str | None] = {
 _PIN = "unset CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CONFIG_DIR; "
 # Every ccc launch keeps Claude Code off the tab title (accounts.session_env_flags).
 _PIN += "export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1; "
+# A typed claude line also mints its shared-memory token in the shell (tp#1290).
+_CLAUDE_PIN = _PIN + TYPED_SNIPPET
 
 
 def _cfg(launcher: str) -> config.Config:
@@ -67,7 +70,7 @@ def test_launcher_tmux_resume_builds_new_window(
     assert new_window[:3] == ["/usr/bin/tmux", "new-window", "-t"]
     assert terminal._tmux_session() in new_window
     assert ["-c", "/tmp/repo"] == new_window[4:6]
-    assert new_window[-1] == f"{_PIN}claude --resume abc-123"
+    assert new_window[-1] == f"{_CLAUDE_PIN}claude --resume abc-123"
 
 
 def test_launcher_tmux_creates_session_when_absent(
@@ -113,7 +116,7 @@ def test_default_iterm_path_unchanged_on_macos(monkeypatch: pytest.MonkeyPatch) 
     )
 
     assert terminal.resume_in_new_tab("/tmp/re po", "abc") is True
-    assert seen == [f"{_PIN}cd '/tmp/re po' && claude --resume abc"]
+    assert seen == [f"{_CLAUDE_PIN}cd '/tmp/re po' && claude --resume abc"]
 
 
 def test_tmux_missing_returns_false(monkeypatch: pytest.MonkeyPatch, no_applescript: None) -> None:
