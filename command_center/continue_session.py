@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """``ccc continue-session`` — hand a session's work to a NEW session (tp#1300).
 
 The handoff is the cheap alternative to ``switch-account`` (``/…-cache-write-hit``): the
@@ -16,6 +17,17 @@ The transfer itself (``start`` / ``accept`` / ``status``) runs the state machine
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 
 import argparse
 import json
@@ -541,6 +553,30 @@ def _drive(store: Store, transfer: Any, src: Source, text: str, args: Any) -> in
     return 0
 
 
+def _fail(args: argparse.Namespace, sid: str, message: str) -> int:
+    """Print *message*; a detached ``--capped`` run also logs and notifies (exit 1)."""
+    print(f"error: {message}", file=sys.stderr)
+    if getattr(args, "capped", False):
+        from . import handoff_capped
+
+        fallback = handoff_capped.cache_write_hit_for(args.account, "")
+        handoff_capped.log_event(sid, f"capped handoff failed: {message}")
+        handoff_capped.notify_failure(f"handoff did not start: {message[:160]} — use {fallback}")
+    return 1
+
+
+def _capped_text(adapter: ClaudeAdapter, store: Store, src: Source) -> bytes | None:
+    """The router-written handoff for a capped seat, or None (router unset / failed)."""
+    from . import handoff_capped, handoff_doc
+
+    data = state(adapter, store, src)
+    prompt = handoff_capped.summary_prompt(
+        handoff_capped.digest(data, src.transcript), handoff_doc.template()
+    )
+    text = handoff_capped.summarize(prompt)
+    return None if text is None else text.encode("utf-8")
+
+
 def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
     """``continue-session start``: hand this session's work to a NEW session."""
     from . import handoff_doc
@@ -557,17 +593,25 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
             return _drive(store, active, src, "", args)
         session = store.get(src.session_id)
         if session is not None and session.handed_off_to:
-            print(f"error: {src.session_id} was already handed off", file=sys.stderr)
-            return 1
-        try:
-            raw = Path(args.file).read_bytes()
-        except OSError as exc:
-            print(f"error: cannot read the handoff file: {exc}", file=sys.stderr)
-            return 1
+            return _fail(args, src.session_id, f"{src.session_id} was already handed off")
+        if args.capped:
+            raw = _capped_text(adapter, store, src)
+            if raw is None:
+                return _fail(
+                    args,
+                    src.session_id,
+                    "the handoff-summary router (llm_custom_command) is unset or failed",
+                )
+        elif not args.file:
+            return _fail(args, src.session_id, "give -f/--file HANDOFF (or --capped)")
+        else:
+            try:
+                raw = Path(args.file).read_bytes()
+            except OSError as exc:
+                return _fail(args, src.session_id, f"cannot read the handoff file: {exc}")
         doc = handoff_doc.validate(raw)
         if not doc.ok:
-            print("error: handoff rejected — " + "; ".join(doc.errors), file=sys.stderr)
-            return 1
+            return _fail(args, src.session_id, "handoff rejected — " + "; ".join(doc.errors))
         try:
             target_dir = _preflight(adapter, store, src, args.account)
             candidate = _candidate(store, src, target_dir, args.account, args, doc.sha256)
@@ -578,9 +622,11 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
                 return _dry_run(candidate, src, doc.text, args.json)
             transfer = _reuse_or_create(store, candidate, now_ms())
         except StartRefused as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
-        return _drive(store, transfer, src, doc.text, args)
+            return _fail(args, src.session_id, str(exc))
+        code = _drive(store, transfer, src, doc.text, args)
+        if code not in (0, EXIT_WAITING):
+            return _fail(args, src.session_id, f"transfer {transfer.transfer_id} did not open")
+        return code
 
 
 # ------------------------------------------------------------------ accept / status
@@ -800,7 +846,7 @@ _VERBS = {
 }
 
 
-def main(args: argparse.Namespace) -> int:
+def dispatch(args: argparse.Namespace) -> int:
     """Dispatch ``ccc continue-session <verb>``."""
     verb = getattr(args, "cs_command", None)
     handler = _VERBS.get(verb or "")
@@ -829,7 +875,7 @@ def add_parser(sub: Any) -> None:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.set_defaults(func=main, cs_parser=parser)
+    parser.set_defaults(func=dispatch, cs_parser=parser)
     verbs = parser.add_subparsers(dest="cs_command")
 
     p_state = verbs.add_parser("state", help="what a handoff of this session would carry")
@@ -863,7 +909,14 @@ def add_parser(sub: Any) -> None:
     p_start.add_argument(
         "-A", "--account", required=True, help="target account label (see claude_accounts)"
     )
-    p_start.add_argument("-f", "--file", required=True, help="the filled handoff document")
+    p_start.add_argument("-f", "--file", help="the filled handoff document")
+    p_start.add_argument(
+        "-C",
+        "--capped",
+        action="store_true",
+        help="capped seat: the router writes the handoff (llm_custom_command, "
+        "purpose handoff-summary); spawned by the UserPromptSubmit intercept",
+    )
     p_start.add_argument("-s", "--session", help="the source session id (default: this session)")
     p_start.add_argument("-O", "--overseer", help="model of the new session (default: observed)")
     p_start.add_argument("-E", "--executor", help="executor model for delegated work")

@@ -26,6 +26,8 @@ import json
 import os
 import sys
 
+from .handoff_capped import HANDOFF_COMMANDS as _HANDOFF_COMMANDS
+
 # Seat-switch slash commands → the `claude_accounts` label they move the session to.
 _SWITCH_COMMANDS = {
     "/cwork-to-cpriv-cache-write-hit": "private",
@@ -77,9 +79,18 @@ def _run_switch(sid: str, label: str, extra: list[str]) -> None:
 
 
 def intercept(sid: str, prompt: str) -> bool:
-    """Run the switch and block the prompt when *prompt* is a seat-switch command."""
+    """Run the switch and block the prompt when *prompt* is a seat-switch command.
+
+    The four handoff names (``_HANDOFF_COMMANDS``) are handled only on a CAPPED seat
+    (:func:`command_center.handoff_capped.intercept`); otherwise they reach the model.
+    """
     parsed = switch_command_args(prompt)
     if parsed is None:
+        head = prompt.strip().split(maxsplit=1)
+        if head and head[0] in _HANDOFF_COMMANDS:
+            from .handoff_capped import intercept as handoff_intercept
+
+            return handoff_intercept(sid, prompt)
         return False
     _run_switch(sid, *parsed)
     return True

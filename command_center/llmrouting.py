@@ -77,6 +77,7 @@ PURPOSES: tuple[str, ...] = (
     "short-aim",
     "session-name",
     "voice-brief",
+    "handoff-summary",
 )
 
 
@@ -267,6 +268,13 @@ def rows(
             "voice briefing (ccc inspect)",
             "voice-brief",
             dispatch("voice-brief"),
+            "llm_custom_command",
+            bool(cfg.llm_custom_command.strip()),
+        ),
+        (
+            "capped-seat handoff (continue-session --capped)",
+            "handoff-summary",
+            dispatch("handoff-summary"),
             "llm_custom_command",
             bool(cfg.llm_custom_command.strip()),
         ),

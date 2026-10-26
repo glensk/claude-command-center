@@ -473,3 +473,122 @@ def test_status_names_the_recovery_step(
     out = capsys.readouterr().out
     assert tid in out and "next:" in out
     assert cli.main(["continue-session", "status", "t-missing"]) == 1
+
+
+# ------------------------------------------------------------------ capped path
+
+
+def _capture_spawn(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    from command_center import spawn  # pylint: disable=import-outside-toplevel
+
+    calls: list[list[str]] = []
+
+    def fake(args: list[str], *, internal: bool = True) -> bool:
+        del internal
+        calls.append(args)
+        return True
+
+    monkeypatch.setattr(spawn, "spawn_ccc", fake)
+    return calls
+
+
+@pytest.mark.usefixtures("fixture_session")
+def test_handoff_command_reaches_the_model_on_a_seat_with_quota(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import handoff_capped, switch_intercept  # pylint: disable=C0415
+
+    calls = _capture_spawn(monkeypatch)
+    monkeypatch.setattr(handoff_capped, "is_capped", lambda *_a: (False, ""))
+    for command in handoff_capped.HANDOFF_COMMANDS:
+        assert switch_intercept.intercept(SID, command) is False
+    assert not calls and capsys.readouterr().out == ""
+
+
+@pytest.mark.usefixtures("fixture_session")
+def test_capped_with_work_in_flight_refuses_and_names_the_cache_write_hit(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import switch_intercept  # pylint: disable=import-outside-toplevel
+
+    calls = _capture_spawn(monkeypatch)
+    monkeypatch.setenv("CCC_HANDOFF_ASSUME_CAPPED", "1")
+    assert switch_intercept.intercept(SID, "/cwork-to-cpriv") is True
+    out = json.loads(capsys.readouterr().out)
+    assert out["decision"] == "block"
+    assert "/cwork-to-cpriv-cache-write-hit" in out["reason"] and "in flight" in out["reason"]
+    assert not calls
+
+
+def test_capped_and_clear_spawns_the_detached_start(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import switch_intercept  # pylint: disable=import-outside-toplevel
+
+    del harness
+    calls = _capture_spawn(monkeypatch)
+    monkeypatch.setenv("CCC_HANDOFF_ASSUME_CAPPED", "1")
+    capsys.readouterr()
+    assert switch_intercept.intercept(SID, "/cwork-to-cpriv") is True
+    assert calls == [["continue-session", "start", "--capped", "-A", "private", "-s", SID]]
+    assert "a NEW session opens on private" in json.loads(capsys.readouterr().out)["reason"]
+    # the same account as the capped seat: refused, pointing to the other seat
+    assert switch_intercept.intercept(SID, "/cwork-continue-in-new-session") is True
+    assert "/cwork-to-cpriv-cache-write-hit" in json.loads(capsys.readouterr().out)["reason"]
+    assert len(calls) == 1
+
+
+def _router(monkeypatch: pytest.MonkeyPatch, command: str) -> None:
+    from command_center import config  # pylint: disable=import-outside-toplevel
+
+    cfg = config.Config(llm_custom_command=command)
+    monkeypatch.setattr(config, "load_config", lambda: cfg)
+
+
+def test_capped_start_writes_the_handoff_through_the_router(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    purpose = tmp_path / "purpose.txt"
+    _router(monkeypatch, f"printenv CCC_LLM_PURPOSE > {purpose}; cat {harness.file}")
+    argv = ["continue-session", "start", "--capped", "-A", "private", "-s", SID]
+    assert cli.main(argv) == 0
+    assert purpose.read_text(encoding="utf-8").strip() == "handoff-summary"
+    with Store() as store:
+        (transfer,) = store.transfers_of(SID)
+        assert transfer.capped and transfer.state == "finalized"
+        job = store.get(transfer.target_session)
+        source = store.get(SID)
+    assert job is not None and job.no_codex
+    assert source is not None and source.handed_off_to == transfer.target_session
+    assert not source.close_requested_at  # a capped tab has no Stop chain to close it
+
+
+@pytest.mark.parametrize(
+    ("command", "why"),
+    [("exec sleep 5", "router"), ("echo hello", "handoff rejected"), ("", "router")],
+)
+def test_capped_start_failures_are_logged_and_change_nothing(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, command: str, why: str
+) -> None:
+    from command_center import config, handoff_capped  # pylint: disable=C0415
+
+    monkeypatch.setattr(handoff_capped, "SUMMARY_TIMEOUT_SEC", 1)
+    notes: list[str] = []
+    monkeypatch.setattr(handoff_capped, "notify_failure", notes.append)
+    _router(monkeypatch, command)
+    argv = ["continue-session", "start", "--capped", "-A", "private", "-s", SID]
+    assert cli.main(argv) == 1
+    log = (config.app_home() / "events.log").read_text(encoding="utf-8")
+    assert "capped handoff failed" in log and why in log
+    assert notes and "cache-write-hit" in notes[0]
+    assert harness.launches == []
+    with Store() as store:
+        assert store.transfers_of(SID) == []
+
+
+def test_llm_routing_lists_the_handoff_summary_purpose() -> None:
+    from command_center import config, llmrouting  # pylint: disable=import-outside-toplevel
+
+    assert "handoff-summary" in llmrouting.PURPOSES
+    rows = llmrouting.rows(config.Config(llm_custom_command="ai prompt"))
+    assert any(row.purpose == "handoff-summary" and row.enabled for row in rows)

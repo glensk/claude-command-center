@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """The handoff document of ``ccc continue-session`` (tp#1300): template and validation.
 
 The source session fills :func:`template` (package data
@@ -19,6 +20,17 @@ nothing has been written yet when validation runs.
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 
 import hashlib
 import re

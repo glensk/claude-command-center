@@ -408,3 +408,18 @@ def test_continue_session_successor_carries_the_flag(tmp_path: Path) -> None:
         assert job is not None and job.no_codex is True
         env = accounts.session_launch_env(accounts.LaunchTarget(job.config_dir, job.no_codex))
         assert env.get("CCC_NO_CODEX") == "1"
+
+
+def test_continue_session_capped_snapshot_carries_the_flag(tmp_path: Path) -> None:
+    """tp#1300: the capped handoff path snapshots no_codex like the model-written one."""
+    from command_center import continue_session  # pylint: disable=import-outside-toplevel
+
+    with Store(tmp_path / "c.db") as store:
+        store.ensure("src", cwd="/repo/a")
+        store.update_fields("src", no_codex=True)
+        src = continue_session.Source(session_id="src", cwd="/repo/a", config_dir="/cfg/w")
+        args = argparse.Namespace(capped=True, overseer=None, executor=None)
+        snap = continue_session._candidate(  # noqa: SLF001
+            store, src, "/cfg/p", "private", args, "ab" * 32
+        )
+    assert snap.no_codex is True and snap.capped is True
