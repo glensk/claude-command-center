@@ -379,6 +379,47 @@ def role_symbol(session_id: str | None) -> str | None:
     return symbol if symbol and symbol not in PALETTE else None
 
 
+def role_mark_dir() -> Path:
+    """One ``<claude session id>`` file per adopted session (env-overridable for tests)."""
+    env = os.environ.get("CCC_ROLE_MARK_DIR")
+    return Path(env) if env else Path.home() / ".cache" / "ccc-role-mark"
+
+
+def sync_role_mark(session_id: str | None) -> str | None:
+    """Keep ``role_mark_dir()/<session_id>`` = the adopted agent's terminal-font mark (tp#1288).
+
+    The mark is the agent's Nerd Font ``glyph:``, else its ``symbol:`` (never a palette
+    badge). The Claude Code status-line script reads this file instead of the tab's badge
+    file (``statusline-command.sh``), so it needs no agent.yaml parsing of its own; ``ccc
+    statusline`` refreshes it on every render. Not adopted → the file is removed. Writes
+    only on a change (temp file + rename). Returns the mark; never raises.
+    """
+    from . import staffrole  # lazy
+
+    if not session_id or "/" in session_id or session_id.startswith("."):
+        return None
+    mark = staffrole.session_glyph(session_id)
+    if mark in PALETTE:
+        mark = None
+    path = role_mark_dir() / session_id
+    try:
+        if not mark:
+            path.unlink(missing_ok=True)
+            return None
+        try:
+            if path.read_text(encoding="utf-8").strip() == mark:
+                return mark
+        except OSError:
+            pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{session_id}.tmp")
+        tmp.write_text(mark + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        return mark
+    return mark
+
+
 def badge_for(session: Session, iterm_session_id: str | None = None) -> str | None:
     """The symbol *session*'s tab title leads with: its agent's symbol, else the tab badge.
 

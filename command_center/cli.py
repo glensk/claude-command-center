@@ -5262,9 +5262,10 @@ def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     }
     with Store() as store:
         session = store.get(sid)
-        from . import staffrole  # lazy
+        from . import staffrole, tabsymbol  # lazy
 
         role_marker = staffrole.role_marker(sid)
+        tabsymbol.sync_role_mark(sid)  # tp#1288: the shell status line's leading badge
         if session is None:
             mark = f"{role_marker} " if role_marker else ""
             print(f"{green}/aim:{reset} {mark}{dim}(set one with /aim){reset}")

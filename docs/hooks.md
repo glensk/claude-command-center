@@ -155,7 +155,10 @@ lease, and `release-locks` — after it has handled the close/switch claim, so i
 - a blue `●` drift warning when the impartial checker has flagged one;
 - a one-line `done/total` + checkbox strip of the session's live todos.
 
-The main status line also opens with the tab's coloured **badge** and closes with a
+The main status line also opens with the tab's coloured **badge** (for an adopted staff
+session: its agent's mark — `ccc statusline` keeps `~/.cache/ccc-role-mark/<sid>` holding the
+`glyph:` or `symbol:`, and the status-line script prefers that file over the tab's badge file,
+tp#1288) and closes with a
 compact AIM-progress bar (`ccc aim --format bar`), so it shows *which tab* and *how far
 along* at a glance.
 

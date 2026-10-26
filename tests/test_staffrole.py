@@ -184,3 +184,21 @@ def test_glyph_is_a_private_use_codepoint_and_wins_in_the_terminal_font(
     assert staffrole.session_glyph("s1") == "\uf198"  # TUI row
     assert staffrole.session_glyph("s2") == "📧"  # no glyph: the symbol
     assert tabsymbol.role_symbol("s1") == "💬"  # the tab title keeps the emoji
+
+
+def test_role_mark_file_follows_the_adoption(
+    _staff: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1288: the shell status line reads the adopted agent's mark from this file."""
+    marks = tmp_path / "marks"
+    monkeypatch.setenv("CCC_ROLE_MARK_DIR", str(marks))
+    _agent(_staff, "chat-agent", 'symbol: "💬"\nglyph: "\\uf198"\n')
+    assert tabsymbol.sync_role_mark("s1") is None and not (marks / "s1").exists()
+    _adopt(tmp_path, "s1", "email-agent")
+    assert tabsymbol.sync_role_mark("s1") == "📧"
+    assert (marks / "s1").read_text(encoding="utf-8") == "📧\n"
+    _adopt(tmp_path, "s1", "chat-agent")
+    assert tabsymbol.sync_role_mark("s1") == "\uf198"  # terminal font: the Nerd glyph
+    (tmp_path / "tp-cache" / "session-role" / "s1").unlink()
+    assert tabsymbol.sync_role_mark("s1") is None and not (marks / "s1").exists()
+    assert tabsymbol.sync_role_mark("../x") is None
