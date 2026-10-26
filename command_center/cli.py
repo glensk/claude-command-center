@@ -6183,6 +6183,10 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_closenow.add_argument("-B", "--bound", default="", help=argparse.SUPPRESS)
     p_closenow.set_defaults(func=cmd_close_now)
 
+    from . import continue_session  # stdlib-only at import: cheap to register
+
+    continue_session.add_parser(sub)
+
     p_switch = sub.add_parser(
         "switch-account",
         help="relaunch this session under another Claude account in the same tab "
