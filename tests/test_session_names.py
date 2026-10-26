@@ -578,3 +578,135 @@ def test_reconcile_never_clobbers_the_canonical_name(store: Store) -> None:
 )
 def test_aim_without_substance_is_not_sent_to_the_llm(aim: str, ok: bool) -> None:
     assert session_names.aim_has_substance(aim) is ok
+
+
+# --------------------------------------------------------------------------- shell titles (tp#1297)
+# The zsh chpwd hook `_repo_tab_color_hook` titles a tab "<symbol> ${PWD:t}", then
+# "<symbol> <repo folder>" (or a "~/…" custom path). ccc adopted those as hand-set names
+# and froze the tabs: obsidian (be5bdd74, cwd ~/obsidian/01-llm/staff/email-agent) was one.
+def _vault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    from command_center import repos
+
+    vault = tmp_path / "obsidian"
+    (vault / ".git").mkdir(parents=True)
+    (vault / "01-llm" / "staff" / "email-agent").mkdir(parents=True)
+    nixos = vault / "repos" / "infra" / "macbook2014-nixos"
+    (nixos / "docs").mkdir(parents=True)
+    (nixos / ".git").write_text("gitdir: x\n", encoding="utf-8")  # a submodule
+    monkeypatch.setattr(repos, "repo_root", lambda cfg=None: str(vault / "repos"))
+    return vault
+
+
+def test_shell_hook_titles_mirror_the_zsh_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = _vault(tmp_path, monkeypatch)
+    agent = str(vault / "01-llm" / "staff" / "email-agent")
+    assert {"email-agent", "obsidian"} <= session_names.shell_hook_titles(agent)
+    docs = str(vault / "repos" / "infra" / "macbook2014-nixos" / "docs")
+    assert {"docs", "macbook2014-nixos"} <= session_names.shell_hook_titles(docs)
+    assert session_names.shell_hook_titles("") == set()
+
+
+def test_real_manual_tab_names_hook_output_rejected_hand_typed_kept(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = _vault(tmp_path, monkeypatch)
+    agent = str(vault / "01-llm" / "staff" / "email-agent")
+    nixos = str(vault / "repos" / "infra" / "macbook2014-nixos")
+    _row(store, "be5bdd74", cwd=agent)
+    _row(store, "b96ea33f", cwd=nixos)
+    hook = store.get("be5bdd74")
+    nix = store.get("b96ea33f")
+    assert hook is not None and nix is not None
+    reject = session_names.rejected_manual_title
+    assert reject(hook, "obsidian") == "shell hook title"  # the hook's repo folder
+    assert reject(hook, "Email-Agent") == "shell hook title"  # ${PWD:t}, casefolded
+    assert reject(hook, "\\~") == "backslash"  # tp#1296's literal "\~"
+    assert reject(hook, "~") == "home path" and reject(hook, "~/scratch") == "home path"
+    assert reject(nix, "macbook2014-nixos") == "shell hook title"
+    # names the user really typed stay adoptable
+    for kept in ("LED strip WZ", "movies", "claud's memory", "use mac lab", "~tilde"):
+        assert reject(nix, kept) is None and reject(hook, kept) is None
+
+
+def test_auto_and_runtime_names_are_not_hand_set(store: Store) -> None:
+    _row(store, "s1", cwd="/r/voice", canonical_name="voice bridge", canonical_name_origin="llm")
+    store.update_fields("s1", observed_runtime_name="claude chat")
+    got = store.get("s1")
+    assert got is not None
+    assert session_names.rejected_manual_title(got, "Voice Bridge") == "auto name"
+    assert session_names.rejected_manual_title(got, "claude chat") == "runtime name"
+    # a manual name is not "auto": re-checking a stored manual-tab name keeps it
+    store.update_fields("s1", canonical_name="sauna talk", canonical_name_origin="manual-tab")
+    got = store.get("s1")
+    assert got is not None and session_names.rejected_manual_title(got, "sauna talk") is None
+
+
+def test_sync_does_not_adopt_the_hook_title_and_swaps_from_it(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = _vault(tmp_path, monkeypatch)
+    agent = str(vault / "01-llm" / "staff" / "email-agent")
+    _row(store, "s1", cwd=agent, canonical_name="carl", iterm_session_id="w0t0p0:U1")
+    _written(store, "s1", "🟧 carl", age_ms=60_000)
+    writes = _sync_env(monkeypatch, tmp_path, {"U1": "🔴 🟧 obsidian"})
+    tabsymbol.sync_live(store)
+    got = store.get("s1")
+    assert got is not None and got.canonical_name == "carl"
+    assert got.canonical_name_origin != "manual-tab" and not session_names.titles_frozen(got)
+    kind, entries = writes[0]
+    expected, core = entries["w0t0p0:U1"]
+    assert kind == "cas" and expected == "🟧 obsidian"  # swapped from the shell's title
+    assert core.endswith(" carl")
+
+
+def test_watcher_override_from_the_hook_is_not_adopted(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = _vault(tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "load_config", lambda: config.Config(session_names=True))
+    agent = str(vault / "01-llm" / "staff" / "email-agent")
+    _row(store, "s1", cwd=agent, canonical_name="carl", iterm_session_id="w0t0p0:U1")
+    assert tabsymbol.adopt_overrides([("🔺 email-agent", ["U1"])], store=store) == 0
+    assert tabsymbol.adopt_overrides([("🔺 \\~", ["U1"])], store=store) == 0
+    got = store.get("s1")
+    assert got is not None and got.canonical_name == "carl"
+
+
+# --------------------------------------------------------------------------- ccc name --reset
+def test_reset_returns_a_manual_tab_name_to_the_namer(store: Store) -> None:
+    _row(store, "s1", cwd="/r/voice", aim="build the parser")
+    session_names.adopt_manual_title(store, "s1", "obsidian")
+    _written(store, "s1", "🟧 voice parser", age_ms=60_000)
+    before = store.get("s1")
+    assert before is not None and session_names.titles_frozen(before)
+    name = session_names.reset_name(store, "s1", cfg=_cfg())
+    got = store.get("s1")
+    assert got is not None and name == got.canonical_name == "voice parser"
+    assert got.canonical_name_origin == "fallback" and not session_names.titles_frozen(got)
+    assert got.title_written is None and got.name_upgrade_tries == 0
+    # an automatic name is left as it is
+    assert session_names.reset_name(store, "s1", cfg=_cfg()) == "voice parser"
+    with pytest.raises(ValueError):
+        session_names.reset_name(store, "nope", cfg=_cfg())
+
+
+def test_ccc_name_reset_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import cli
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))
+    monkeypatch.setattr(config, "load_config", _cfg)
+    with Store() as db:
+        _row(db, "s1-full-id", cwd="/r/voice", aim="build the parser")
+        session_names.adopt_manual_title(db, "s1-full-id", "obsidian")
+    assert cli.main(["name", "-s", "s1", "-R", "-j"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["data"]["name"] == "voice parser" and out["data"]["name_origin"] == "fallback"
+    assert out["data"]["changed"] is True
+    assert cli.main(["name", "-s", "s1", "--reset"]) == 0
+    assert "nothing to reset" in capsys.readouterr().out
+    assert cli.main(["name", "-s", "s1", "-R", "x", "-j"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "usage"

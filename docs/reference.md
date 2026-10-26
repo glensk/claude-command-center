@@ -2037,6 +2037,20 @@ ccc's own shape: it starts with a known badge or agent symbol and its cleaned te
 the session's name, folder leaf or last recorded name (`drifted_ccc_body`; after the
 same 5 s grace as hand-set detection). Any other title keeps the recorded baseline.
 
+With `session_names` on, a title that differs from ccc's last write is taken as one you
+typed: its cleaned text becomes the session's name (origin `manual-tab`) and ccc never
+writes that tab again. The shell's own titles are not names you typed, so they are never
+adopted (tp#1297; `session_names.rejected_manual_title`, used by the sync, the `--watch` /
+`--heal` override adoption and `adopt_manual_title` itself): a title containing `\`, a
+home path (`~`, `~/…`), what the zsh `chpwd` hook prints for the session's cwd (the
+folder's basename, its repo folder under `$GIT_BASE` or the base's parent, ccc's folder
+leaf, the enclosing git work tree's name), or the session's automatic or Claude Code
+runtime name. A tab showing such a shell title is swapped from it like a stale ccc title.
+`ccc name -s ID -R` (`--reset`) undoes a wrong adoption: it drops the `manual` /
+`manual-tab` name, gives the session a provisional `fallback` name (the namer may upgrade
+it once), and clears `title_written` so the next `ccc tab-symbol --sync` writes the tab
+again.
+
 The **status-line wrapper** (`statusline-command.sh`) reads the same
 `~/.cache/iterm-tab-symbol/<id>` cache to **prepend the badge as the first
 character of status-line line 1**, and ends that line with a compact
@@ -3096,9 +3110,11 @@ background jobs from `claude agents --json` too. Headless `claude -p` runs (regi
 | `tab.iterm_session_id` | the iTerm session of the tab (null for a background job)                                           |
 | `tab.validated`        | the registry pid's controlling tty is the tab's tty                                                |
 
-`ccc name -s ID "x y"` (`-s/--session`, `-A/--auto`, `-j/--json`) shows or sets the name;
-data `{session_id, name, name_origin, changed, rename_command}`; codes `name_taken`,
-`invalid_name`, `not_found`, `ambiguous_session`.
+`ccc name -s ID "x y"` (`-s/--session`, `-A/--auto`, `-R/--reset`, `-j/--json`) shows or
+sets the name; `-R` drops a hand-set name and hands the session back to the automatic namer
+(e.g. `ccc name -s 1a2b -R`); data `{session_id, name, name_origin, changed,
+rename_command}`; codes `name_taken`, `invalid_name`, `not_found`, `ambiguous_session`,
+`usage` (`-R` with a name or `-A`).
 
 ### `ccc inspect` (`-s/--session ID`, `-N/--no-llm`, `-j/--json`)
 

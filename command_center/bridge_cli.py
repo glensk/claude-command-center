@@ -23,7 +23,9 @@ S-IDENT); a stored tab id that is missing or wrong is resolved by that tty
 
 ``ccc name -s ID "x y"`` renames a session (a name another active session holds is
 refused, exit 1) and prints the ``/rename <name>`` line to type into the running Claude
-Code — ccc never renames a running process itself.
+Code — ccc never renames a running process itself. ``ccc name -s ID -R`` drops a hand-set
+(``manual`` / ``manual-tab``) name, hands the session back to the automatic namer and
+unfreezes its tab title (tp#1297).
 
 ``inspect`` / ``send`` / ``answer`` / ``delivery`` / ``events`` read a session's
 transcript, type into its tab and follow deliveries up (``bridge_inspect`` …
@@ -371,7 +373,17 @@ def name_command(args: argparse.Namespace, store: Store | None = None) -> dict[s
     db = store if store is not None else _Store()
     try:
         sid = _resolve_id(db, args.session)
-        if args.auto:
+        if getattr(args, "reset", False):
+            if args.auto or args.name is not None:
+                raise BridgeError("usage", "-R/--reset takes no name and no -A", EXIT_USAGE)
+            before = db.get(sid)
+            previous = before.canonical_name if before is not None else None
+            try:
+                name = session_names.reset_name(db, sid)
+            except ValueError as exc:
+                raise BridgeError("not_found", str(exc)) from exc
+            changed = name != previous
+        elif args.auto:
             from . import config
 
             before = db.get(sid)
@@ -406,7 +418,7 @@ def name_command(args: argparse.Namespace, store: Store | None = None) -> dict[s
 
 
 def cmd_name(args: argparse.Namespace) -> int:
-    """``ccc name [-s ID] ["x y"] [-A] [-j]`` — show, set or auto-generate a session's name."""
+    """``ccc name [-s ID] ["x y"] [-A] [-R] [-j]`` — show, set, auto-generate or reset a name."""
     if getattr(args, "json", False):
         return run_json(lambda: name_command(args))
     try:
@@ -416,6 +428,9 @@ def cmd_name(args: argparse.Namespace) -> int:
         return exc.exit_code
     if not data["name"]:
         print(f"{data['session_id'][:8]}: no name yet")
+        return EXIT_OK
+    if getattr(args, "reset", False) and not data["changed"]:
+        print(f"{data['session_id'][:8]}: {data['name']!r} is not hand-set — nothing to reset")
         return EXIT_OK
     if data["changed"]:
         print(f"✅ {data['session_id'][:8]} is now named {data['name']!r}")
@@ -520,7 +535,8 @@ def add_parsers(sub: Any) -> None:
         help="show / set a session's memorable name (prints /rename for the running session)",
         description=(
             'Show or set a session\'s name. Examples: ccc name -s 1a2b "voice bridge"; '
-            "ccc name -s 1a2b -j"
+            "ccc name -s 1a2b -j; ccc name -s 1a2b -R (drop a hand-set name); "
+            "ccc name -s 1a2b -A"
         ),
     )
     p_name.add_argument("name", nargs="*", default=None, help="the new name (1-2 words)")
@@ -530,6 +546,15 @@ def add_parsers(sub: Any) -> None:
         "--auto",
         action="store_true",
         help="internal: generate the name once if the session has none (LLM, 10 s)",
+    )
+    p_name.add_argument(
+        "-R",
+        "--reset",
+        action="store_true",
+        help=(
+            "drop a hand-set (manual / manual-tab) name: back to the automatic namer, "
+            "and ccc writes the tab title again"
+        ),
     )
     p_name.add_argument(
         "-j", "--json", action="store_true", help="print the versioned JSON envelope"

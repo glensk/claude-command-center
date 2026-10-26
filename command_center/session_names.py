@@ -25,6 +25,10 @@ address it. The rules (PLAN_claude-bridge.md §7.1, decisions D2/D3):
   from the one ccc last wrote — after a 5 s grace so a detached ccc write can land, and
   when it is none of the titles ccc itself could have produced — its cleaned text
   becomes the name (origin ``manual-tab``) and ccc never writes that tab's title again.
+  A title that is the shell's or ccc's own text is never adopted
+  (:func:`rejected_manual_title`: the zsh hook's folder title, a home path, a backslash,
+  the automatic or runtime name — tp#1297); ``ccc name -s ID --reset`` drops a hand-set
+  name and unfreezes the tab.
 
 Import-light: the store, config and LLM layers are imported lazily where used.
 """
@@ -557,10 +561,15 @@ def adopt_manual_title(store: Store, session_id: str, cleaned: str) -> str | Non
     """Make the hand-set title *cleaned* the session's name (origin ``manual-tab``).
 
     A clash with another active session's name gets the usual suffix (account label, then
-    a short id word) — names stay unique; the tab keeps showing what the user typed.
+    a short id word) — names stay unique; the tab keeps showing what the user typed. A
+    title that is the shell's or ccc's own text (:func:`rejected_manual_title`, tp#1297)
+    is refused (``None``).
     """
     cleaned = clean_manual(cleaned)
     if not cleaned:
+        return None
+    session = store.get(session_id)
+    if session is not None and rejected_manual_title(session, cleaned):
         return None
     return _write_name(
         store,
@@ -589,6 +598,101 @@ def title_name(session: Session, cfg: Config) -> str | None:
     if not getattr(cfg, "session_names", False):
         return None
     return session.canonical_name or None
+
+
+# rejected_manual_title() reasons that mark a title as the shell's own text (as opposed to
+# ccc's or Claude Code's name): a tab showing one may be overwritten by ccc.
+SHELL_TITLE_REASONS = frozenset({"backslash", "home path", "shell hook title"})
+
+
+def shell_hook_titles(cwd: str) -> set[str]:
+    """Every title body the zsh ``chpwd`` hook ``_repo_tab_color_hook`` writes for *cwd*.
+
+    The hook (the user's ``.zshrc``) titles a tab ``<symbol> ${PWD:t}``, then — when a
+    repo folder resolves — ``<symbol> <repo folder>``: under ``$GIT_BASE``
+    (``<base>/<category>/<repo>/…``) the repo segment, at or inside the base's parent
+    (``~/obsidian``) that parent's name. ccc's own mapping of the same layout is
+    :func:`colors.folder_split` (its leaf, and the leaf's first segment for a
+    sub-folder); :func:`repo_folder` adds the enclosing git work tree's name. A custom
+    colour path prints a home path (``~/x``), which :func:`rejected_manual_title`
+    refuses on its own. Casefolded.
+    """
+    import os
+
+    if not cwd:
+        return set()
+    path = os.path.expanduser(cwd).rstrip("/") or "/"
+    shapes = {os.path.basename(path), repo_folder(path)}
+    try:
+        from . import colors, repos  # lazy: config read
+
+        root = repos.repo_root()
+        leaf = colors.folder_split(path, root)[1]
+        shapes.update({leaf, leaf.split("/", 1)[0]})
+        if root:
+            parent = os.path.dirname(os.path.expanduser(root).rstrip("/"))
+            if parent and (path == parent or path.startswith(parent + "/")):
+                shapes.add(os.path.basename(parent))
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        pass  # the basename / git work tree still cover the common case
+    return {_key(s) for s in shapes if s}
+
+
+def rejected_manual_title(session: Session, cleaned: str) -> str | None:
+    """Why the cleaned tab title *cleaned* is NOT a name the user typed, or ``None`` (tp#1297).
+
+    A title is ccc's or the shell's own, never adopted as ``manual-tab``, when it:
+    contains ``\\`` (an escaping leftover, tp#1296); is a home path (``~`` / ``~/…``);
+    equals what the zsh hook prints for the session's cwd (:func:`shell_hook_titles`);
+    or equals the session's automatic (``llm`` / ``fallback``) name or the runtime name
+    Claude Code reports (Claude Code titles the tab with it). Pure apart from a
+    filesystem probe for the git work tree.
+    """
+    text = (cleaned or "").strip()
+    if "\\" in text:
+        return "backslash"
+    if text == "~" or text.startswith("~/"):
+        return "home path"
+    key = _key(text)
+    if key in shell_hook_titles(session.cwd):
+        return "shell hook title"
+    auto = session.canonical_name if session.canonical_name_origin not in MANUAL_ORIGINS else ""
+    if auto and _key(auto) == key:
+        return "auto name"
+    runtime = session.observed_runtime_name or ""
+    if runtime and _key(clean_manual(runtime)) == key:
+        return "runtime name"
+    return None
+
+
+def is_shell_title(session: Session, cleaned: str) -> bool:
+    """True when *cleaned* is the shell's own tab title for *session* (ccc may replace it)."""
+    return bool(cleaned) and rejected_manual_title(session, cleaned) in SHELL_TITLE_REASONS
+
+
+def reset_name(store: Store, session_id: str, cfg: Config | None = None) -> str | None:
+    """``ccc name --reset``: drop a hand-set name and hand the session back to the namer.
+
+    Only a ``manual`` / ``manual-tab`` name is dropped (an automatic one is returned as
+    it is). The row loses its name, origin, source AIM and upgrade count, and
+    ``title_written`` is cleared so the next title sync writes the tab unconditionally
+    (the tab is no longer frozen). A provisional ``fallback`` name is generated right
+    away, without an LLM call; the namer may upgrade it once as usual. Raises
+    ``ValueError`` for an unknown session.
+    """
+    session = store.get(session_id)
+    if session is None:
+        raise ValueError(f"no session {session_id}")
+    if session.canonical_name_origin not in MANUAL_ORIGINS:
+        return session.canonical_name or None
+    store.conn.execute(
+        "UPDATE sessions SET canonical_name = NULL, canonical_name_origin = '', "
+        "name_source_aim = NULL, name_upgrade_tries = 0, title_written = NULL, "
+        "updated_at = ? WHERE session_id = ? AND canonical_name_origin = ?",
+        (int(time.time() * 1000), session_id, session.canonical_name_origin),
+    )
+    store.conn.commit()
+    return ensure_name(store, session_id, use_llm=False, cfg=cfg)
 
 
 def titles_frozen(session: Session) -> bool:

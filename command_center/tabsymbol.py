@@ -583,10 +583,9 @@ def manual_title_candidate(
 ) -> str | None:
     """The hand-set name *live_title* carries for *session*, or ``None`` (pure).
 
-    ``None`` when: ccc never wrote this tab's title (no baseline to differ from), the
-    last write is younger than ``session_names.MANUAL_GRACE_MS`` (it may still be
-    landing), the cleaned title is empty or too long, it is one of ccc's own shapes, or
-    it already is the name.
+    ``None`` when: ccc never wrote this tab's title (no baseline), the last write is
+    inside ``session_names.MANUAL_GRACE_MS``, the cleaned title is empty, too long, the
+    name, ccc's own shape or the shell's text (``session_names.rejected_manual_title``).
     """
     from . import session_names  # lazy
 
@@ -597,9 +596,11 @@ def manual_title_candidate(
     cleaned = clean_title(live_title, marker)
     if not cleaned or len(cleaned) > session_names.MAX_MANUAL_CHARS:
         return None
-    if session_names.already_named(session, cleaned):
-        return None
-    if cleaned in ccc_title_shapes(session, marker):
+    if (
+        session_names.already_named(session, cleaned)
+        or cleaned in ccc_title_shapes(session, marker)
+        or session_names.rejected_manual_title(session, cleaned)  # tp#1297
+    ):
         return None
     return cleaned
 
@@ -612,8 +613,9 @@ def drifted_ccc_body(
     Writes are detached and recorded before they land, so a lost write left the record
     naming a title the tab never showed and every later swap refused (tp#1292). A body
     led by a known badge whose cleaned text is one of :func:`ccc_title_shapes` is ccc's
-    own, so it may serve as the swap's baseline. ``None`` inside the write grace, when
-    in sync, or for any other (hand-set) title.
+    own, so it may serve as the swap's baseline — as may the zsh hook's own title, badge
+    or not (tp#1297). ``None`` inside the write grace, when in sync, or for any other
+    (hand-set) title.
     """
     from . import session_names  # lazy
 
@@ -625,11 +627,11 @@ def drifted_ccc_body(
     body = live_title[len(wait) :] if wait and live_title.startswith(wait) else live_title
     if not body or body == session.title_written:
         return None
-    if not any(body.startswith(f"{badge} ") for badge in known_badges()):
-        return None
-    if clean_title(body, wait) not in ccc_title_shapes(session, wait):
-        return None
-    return body
+    cleaned = clean_title(body, wait)
+    if session_names.is_shell_title(session, cleaned):
+        return body  # the zsh hook's own title (tp#1297): ccc may replace it
+    badged = any(body.startswith(f"{badge} ") for badge in known_badges())
+    return body if badged and cleaned in ccc_title_shapes(session, wait) else None
 
 
 def push_title(session: Session, *, marker: str | None = None) -> None:
