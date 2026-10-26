@@ -1984,6 +1984,12 @@ that equals a palette badge, keeps the ordinary badge. The title parsers (`--hea
 hand-set-name detection) treat agent symbols like palette badges: one never stacks on the
 other, and `📧 email-agent` is never mistaken for a name you typed.
 
+An agent may also carry a `glyph:` — one Nerd Font codepoint (slack-agent: `"\uf198"`,
+nf-fa-slack). It replaces the symbol only where ccc draws in the terminal font: the TUI
+badge cell (padded to two cells) and the status-line marker (`🎭`). The iTerm tab bar draws
+titles in the macOS system font, whose fallback for Private Use Area codepoints is the
+LastResort font (a boxed "?"), so the tab title keeps the emoji `symbol:`.
+
 A tab renamed via iTerm's *Edit Tab Title* shows its title override instead of the
 session name ccc sets, so the badge would vanish. `--heal`/`--watch` read each tab's
 `titleOverride` over the iTerm2 Python API and put the tab's badge in front of it

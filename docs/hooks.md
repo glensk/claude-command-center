@@ -149,7 +149,8 @@ lease, and `release-locks` — after it has handled the close/switch claim, so i
   must still exist under `$TP_STAFF_ROOT`, default `~/obsidian/01-llm/staff`). A session that is
   merely named or AIMed after an agent shows no `🎭`. The agent's own `symbol:` (its
   `agent.yaml`, tp#1288) follows the `🎭` — `🎭📧` for the email-agent — the same symbol
-  that replaces the badge in its iTerm tab title and command-center row;
+  that replaces the badge in its iTerm tab title and command-center row; an agent with a
+  Nerd Font `glyph:` shows that instead (slack-agent: the Slack logo glyph);
 - a `Status:` + `/next-step:` row;
 - a blue `●` drift warning when the impartial checker has flagged one;
 - a one-line `done/total` + checkbox strip of the session's live todos.

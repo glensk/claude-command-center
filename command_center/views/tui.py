@@ -81,6 +81,7 @@ from .. import (
     repos,
     resume,
     routing,
+    staffrole,
     tabcolor,
     tabsymbol,
     tags,
@@ -579,7 +580,14 @@ def _id_badge(session: Session, *, live: bool, root: str | None = None) -> str:
     *root* is the repo-tree root the caller already resolved (``_apply_rows`` does it once
     per render); omitting it makes the deterministic symbol resolve the root — and with it
     the config — once per ROW.
+
+    A session that adopted a staff role shows its agent's mark (tp#1288): the Nerd Font
+    ``glyph:`` when it has one (the TUI is drawn in the terminal font; a one-cell glyph is
+    padded to the emoji's two cells), else its ``symbol:``.
     """
+    mark = staffrole.session_glyph(session.session_id)
+    if mark and mark not in tabsymbol.PALETTE:
+        return mark if cell_len(mark) >= 2 else f"{mark} "
     return (
         tabsymbol.cell_for(
             session.iterm_session_id,

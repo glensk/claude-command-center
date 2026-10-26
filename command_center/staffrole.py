@@ -32,11 +32,18 @@ import re
 #: tp's ``owner_role`` shape: the only agent names a binding may carry.
 _ROLE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 #: The top-level ``symbol:`` line of an agent.yaml (quoted or bare, optional comment).
-_SYMBOL_LINE_RE = re.compile(r"""^symbol:[ \t]*(?:"([^"\n]*)"|'([^'\n]*)'|([^#\s]+))""", re.M)
+#: A top-level ``<key>:`` line of an agent.yaml (quoted or bare, optional comment).
+_LINE_RE = r"""^{key}:[ \t]*(?:"([^"\n]*)"|'([^'\n]*)'|([^#\s]+))"""
+_SYMBOL_LINE_RE = re.compile(_LINE_RE.format(key="symbol"), re.M)
+_GLYPH_LINE_RE = re.compile(_LINE_RE.format(key="glyph"), re.M)
+#: YAML double-quoted escapes a glyph is usually written with (``"\uf198"``).
+_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
+#: Nerd Font glyphs live in the Private Use Areas.
+_PUA = ((0xE000, 0xF8FF), (0xF0000, 0xFFFFD))
 #: VS16, ZWJ and the skin-tone modifiers make a glyph wider than its two terminal cells.
 _WIDENERS = frozenset({0xFE0F, 0x200D, *range(0x1F3FB, 0x1F400)})
 
-_symbol_cache: dict[str, tuple[int, str | None]] = {}
+_symbol_cache: dict[str, tuple[int, str | None, str | None]] = {}
 
 #: The status-line `/aim` marker of a session that adopted a staff role (tp#1166); the
 #: agent's own symbol follows it (`🎭📧`, tp#1288).
@@ -98,12 +105,49 @@ def valid_symbol(value: str) -> bool:
     return len(value) == 1 and ord(value) > 0x7F and ord(value) not in _WIDENERS
 
 
-def _parse_symbol(text: str) -> str | None:
-    match = _SYMBOL_LINE_RE.search(text)
+def _value(regex: re.Pattern[str], text: str) -> str | None:
+    match = regex.search(text)
     if not match:
         return None
-    value = next((g for g in match.groups() if g is not None), "").strip()
-    return value if valid_symbol(value) else None
+    quoted, single, bare = match.groups()
+    value = (quoted if quoted is not None else single if single is not None else bare).strip()
+    if quoted is not None:
+        value = _ESCAPE_RE.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), value)
+    return value
+
+
+def _parse_symbol(text: str) -> str | None:
+    value = _value(_SYMBOL_LINE_RE, text)
+    return value if value and valid_symbol(value) else None
+
+
+def _parse_glyph(text: str) -> str | None:
+    value = _value(_GLYPH_LINE_RE, text)
+    if not value or len(value) != 1 or not any(lo <= ord(value) <= hi for lo, hi in _PUA):
+        return None
+    return value
+
+
+def _manifest(name: str | None) -> tuple[str | None, str | None]:
+    """``(symbol, glyph)`` of agent *name*'s agent.yaml, cached per file mtime."""
+    if not name or not _ROLE_NAME_RE.match(name):
+        return None, None
+    path = _agent_yaml(name)
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        return None, None
+    cached = _symbol_cache.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1], cached[2]
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read(65536)
+    except (OSError, UnicodeDecodeError):
+        text = ""
+    symbol, glyph = _parse_symbol(text), _parse_glyph(text)
+    _symbol_cache[path] = (mtime, symbol, glyph)
+    return symbol, glyph
 
 
 def agent_symbol(name: str | None) -> str | None:
@@ -112,23 +156,25 @@ def agent_symbol(name: str | None) -> str | None:
     Cached per file mtime. ``tabsymbol.role_symbol`` additionally refuses a symbol equal to
     a per-tab badge, which would make an adopted tab look like an ordinary one.
     """
-    if not name or not _ROLE_NAME_RE.match(name):
+    return _manifest(name)[0]
+
+
+def agent_glyph(name: str | None) -> str | None:
+    """The ``glyph:`` (one Nerd Font codepoint) of agent *name*, or None (tp#1288).
+
+    Only for text drawn in the terminal font — the status line and the TUI row; the iTerm
+    tab title is drawn in the system font, which has no Nerd glyphs (it shows tofu).
+    """
+    return _manifest(name)[1]
+
+
+def session_glyph(session_id: str | None) -> str | None:
+    """The terminal-font mark of *session_id*'s adopted agent: its glyph, else its symbol."""
+    role = adopted_role(session_id) if session_id else None
+    if not role:
         return None
-    path = _agent_yaml(name)
-    try:
-        mtime = os.stat(path).st_mtime_ns
-    except OSError:
-        return None
-    cached = _symbol_cache.get(path)
-    if cached is not None and cached[0] == mtime:
-        return cached[1]
-    try:
-        with open(path, encoding="utf-8") as handle:
-            symbol = _parse_symbol(handle.read(65536))
-    except (OSError, UnicodeDecodeError):
-        symbol = None
-    _symbol_cache[path] = (mtime, symbol)
-    return symbol
+    symbol, glyph = _manifest(role)
+    return glyph or symbol
 
 
 def session_symbol(session_id: str | None) -> str | None:
@@ -149,8 +195,12 @@ def agent_symbols() -> frozenset[str]:
 
 
 def role_marker(session_id: str) -> str:
-    """``🎭<agent symbol>`` for an adopted session (bare ``🎭`` without a symbol), else ``""``."""
+    """``🎭<glyph or symbol>`` for an adopted session (bare ``🎭`` without one), else ``""``.
+
+    The status line is drawn in the terminal font, so a Nerd Font ``glyph:`` wins there.
+    """
     role = adopted_role(session_id)
     if not role:
         return ""
-    return ROLE_MARKER + (agent_symbol(role) or "")
+    symbol, glyph = _manifest(role)
+    return ROLE_MARKER + (glyph or symbol or "")

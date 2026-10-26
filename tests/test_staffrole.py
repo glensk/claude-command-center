@@ -169,3 +169,18 @@ def test_role_lookup_by_tab_skips_the_store_without_bindings(
     monkeypatch.setattr("command_center.store.Store", _boom)
     tabsymbol._role_by_uuid.clear()  # pylint: disable=protected-access
     assert tabsymbol._role_symbol_for_uuid("UUID") is None  # pylint: disable=protected-access
+
+
+def test_glyph_is_a_private_use_codepoint_and_wins_in_the_terminal_font(
+    _staff: Path, tmp_path: Path
+) -> None:
+    _agent(_staff, "chat-agent", 'symbol: "💬"\nglyph: "\\uf198"   # nf-fa-slack\n')
+    _agent(_staff, "odd-agent", 'symbol: "💬"\nglyph: "A"\n')
+    assert staffrole.agent_glyph("chat-agent") == "\uf198"
+    assert staffrole.agent_glyph("odd-agent") is None  # not a Nerd Font codepoint
+    _adopt(tmp_path, "s1", "chat-agent")
+    _adopt(tmp_path, "s2", "email-agent")
+    assert staffrole.role_marker("s1") == f"{staffrole.ROLE_MARKER}\uf198"  # status line
+    assert staffrole.session_glyph("s1") == "\uf198"  # TUI row
+    assert staffrole.session_glyph("s2") == "📧"  # no glyph: the symbol
+    assert tabsymbol.role_symbol("s1") == "💬"  # the tab title keeps the emoji

@@ -7,7 +7,12 @@ refresh so they stay in lock-step even with no daemon — but only when the badg
 mapping actually moved, so it does not spawn AppleScript every 5 s for no reason.
 """
 
+# pytest fixtures are passed as same-named arguments.
+# pylint: disable=redefined-outer-name
+
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +20,7 @@ from command_center import tabsymbol
 from command_center.core import Row
 from command_center.models import Session, Status
 from command_center.store import Store
+from command_center.views import tui
 from command_center.views.tui import CommandCenterApp
 
 # The stubbed sync_live never dereferences the store, so a sentinel suffices.
@@ -81,7 +87,7 @@ def test_disabled_by_config(monkeypatch: pytest.MonkeyPatch, app: CommandCenterA
     calls = _count_calls(monkeypatch)
     app.cfg.sync_tab_titles = False
     app._sync_tab_badges([_row("a", "w0t0p0:AA")], _STORE)
-    assert calls == []
+    assert not calls
 
 
 def test_refresh_worker_noop_without_store(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -93,4 +99,47 @@ def test_refresh_worker_noop_without_store(monkeypatch: pytest.MonkeyPatch) -> N
     instance.store = None
     instance.cfg.sync_tab_titles = True
     instance._refresh_worker()
-    assert calls == []
+    assert not calls
+
+
+def _adopted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sid: str, extra: str) -> None:
+    """tp#1288: `sid` adopted `slack-agent`, whose agent.yaml carries *extra*."""
+    staff = tmp_path / "staff" / "slack-agent"
+    staff.mkdir(parents=True, exist_ok=True)
+    (staff / "agent.yaml").write_text(f"name: slack-agent\n{extra}", encoding="utf-8")
+    roles = tmp_path / "tp-cache" / "session-role"
+    roles.mkdir(parents=True, exist_ok=True)
+    (roles / sid).write_text("slack-agent\n", encoding="utf-8")
+    monkeypatch.setenv("TP_STAFF_ROOT", str(tmp_path / "staff"))
+    monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path / "tp-cache"))
+
+
+def test_adopting_a_role_moves_the_signature(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, app: CommandCenterApp
+) -> None:
+    calls = _count_calls(monkeypatch)
+    monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path / "tp-cache"))
+    rows = [_row("a", "w0t0p0:AA")]
+    app._sync_tab_badges(rows, _STORE)
+    assert len(calls) == 1
+    _adopted(tmp_path, monkeypatch, "a", 'symbol: "💬"\n')  # the tab title must change
+    app._sync_tab_badges(rows, _STORE)
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ('symbol: "💬"\nglyph: "\\uf198"\n', "\uf198 "),  # Nerd glyph, padded to two cells
+        ('symbol: "💬"\n', "💬"),
+    ],
+)
+def test_row_badge_of_an_adopted_session_is_its_agent_mark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: str, expected: str
+) -> None:
+    monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))
+    _adopted(tmp_path, monkeypatch, "s1", extra)
+    session = Session("s1", cwd="/Users/x/s1", iterm_session_id="w0t1p0:AA")
+    assert tui._id_badge(session, live=True) == expected  # pylint: disable=protected-access
+    other = Session("s2", cwd="/Users/x/s2", iterm_session_id="w0t2p0:BB")
+    assert tui._id_badge(other, live=False) in tabsymbol.PALETTE  # pylint: disable=protected-access
