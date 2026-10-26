@@ -381,3 +381,30 @@ def test_jobs_list_marks_a_no_codex_job(
     lines = {line.split()[0]: line for line in capsys.readouterr().out.splitlines() if line.strip()}
     assert any("[no-codex]" in line for key, line in lines.items() if "banned" in line)
     assert all("[no-codex]" not in line for line in lines.values() if "normal" in line)
+
+
+def test_continue_session_successor_carries_the_flag(tmp_path: Path) -> None:
+    """tp#1300: the handoff's successor job keeps the source's no_codex (a launch surface)."""
+    from command_center import continue_session  # pylint: disable=import-outside-toplevel
+    from command_center.transfer_store import Transfer  # pylint: disable=import-outside-toplevel
+
+    with Store(tmp_path / "c.db") as store:
+        store.ensure("src", cwd="/repo/a")
+        transfer = Transfer(
+            transfer_id="t1",
+            source_session="src",
+            target_session="dst",
+            target_config_dir=str(tmp_path / "work"),
+            cwd="/repo/a",
+            source_aim="aim",
+            no_codex=True,
+            llm_overseer="opus-5",
+            llm_exec="opus-5",
+            handoff_path=str(tmp_path / "t1.md"),
+        )
+        src = continue_session.Source(session_id="src", cwd="/repo/a")
+        continue_session._create_successor(store, transfer, src, "text")  # noqa: SLF001
+        job = store.get("dst")
+        assert job is not None and job.no_codex is True
+        env = accounts.session_launch_env(accounts.LaunchTarget(job.config_dir, job.no_codex))
+        assert env.get("CCC_NO_CODEX") == "1"
