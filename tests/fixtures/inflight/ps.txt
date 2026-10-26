@@ -1,0 +1,5 @@
+4242 1 claude --resume sess-0001
+5001 4242 /bin/zsh -c source /home/user/.claude/shell-snapshots/snapshot-zsh-1793054409760-ll01h1.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && eval 'uv run pytest -q tests/test_x.py' < /dev/null && pwd -P >| /tmp/claude-9314-cwd
+5002 4242 /bin/zsh -c source /home/user/.claude/shell-snapshots/snapshot-zsh-1793054409760-ll01h1.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && eval '~/.claude/hooks/cc-keepwarm.sh 3000 /home/user/.claude/projects/proj/sess-0001.jsonl' < /dev/null && pwd -P >| /tmp/claude-9314-cwd
+5003 4242 /bin/zsh -c source /home/user/.claude/shell-snapshots/snapshot-zsh-1793054409760-ll01h1.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && eval 'echo '\''it'\'''\''s'\'' && grep -n "x" y' < /dev/null && pwd -P >| /tmp/claude-9314-cwd
+5004 4242 claude -p --model opus build

@@ -1,0 +1,2 @@
+{"sessionId": "sess-0001", "cwd": "/repo", "timestamp": "2026-10-26T21:00:00.000Z", "isSidechain": false, "type": "user", "uuid": "h0", "message": {"role": "user", "content": "go"}}
+{"sessionId": "sess-0001", "cwd": "/repo", "timestamp": "2026-10-26T21:00:00.000Z", "isSidechain": false, "type": "assistant", "uuid": "halt-2", "isApiErrorMessage": true, "message": {"role": "assistant", "content": [{"type": "text", "text": "You've hit your rate limit · Server is temporarily limiting requests (not your usage limit)"}]}}

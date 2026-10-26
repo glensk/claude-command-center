@@ -1,0 +1,2 @@
+{"isSidechain": true, "agentId": "a1", "sessionId": "sess-0001", "cwd": "/repo", "timestamp": "2026-10-26T21:00:01.000Z", "parentUuid": null, "type": "user", "message": {"role": "user", "content": "Build part one of the thing."}}
+{"isSidechain": true, "agentId": "a1", "sessionId": "sess-0001", "cwd": "/repo", "timestamp": "2026-10-26T21:00:01.000Z", "type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_S1", "name": "Read", "input": {"file_path": "/repo/x.py"}}]}}
