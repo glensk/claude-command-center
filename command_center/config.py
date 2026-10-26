@@ -102,7 +102,7 @@ DEFAULTS: dict[str, object] = {
     # While any job is WORKING/SNOOZED the Copilot fetch throttle drops to this shorter
     # "active" interval so the card tracks reality more closely; 0 or ≥ idle disables it.
     "copilot_usage_refresh_active_sec": 300,  # active-work gh billing throttle (~1/3 of idle)
-    "copilot_model": "gpt-5.4",  # default model for /copilot delegation + Copilot card title
+    "copilot_model": "gpt-5.6-terra",  # default model for /copilot delegation + Copilot card title
     "copilot_card_title": "Copilot",  # Copilot usage-card title prefix (before the model)
     # Monthly AI-Credit budget the card's bar is drawn against once the seat is on
     # usage-based (AI Credits) billing — premium requests were retired 2026-06, so
@@ -1068,7 +1068,7 @@ class Config:
     copilot_usage: bool = False
     copilot_usage_refresh_sec: int = 900
     copilot_usage_refresh_active_sec: int = 300
-    copilot_model: str = "gpt-5.4"
+    copilot_model: str = "gpt-5.6-terra"
     copilot_card_title: str = "Copilot"
     # Fallback only: the seat's real AI-Credit entitlement is read live from
     # `/copilot_internal/user` (usage._fetch_copilot_quota) and wins whenever it answers.

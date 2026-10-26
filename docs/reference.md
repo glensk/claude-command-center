@@ -2086,7 +2086,7 @@ as **stacked, border-titled cards** so the providers are never confused —
 (green border, green bars — the second one only when `codex_home_private` is set, further
 ones per `codex_homes_extra` entry), and
 `<copilot_card_title> <copilot_model>` (violet border) below — the Copilot title
-shows the default delegation model from the `copilot_model` config (e.g. `gpt-5.4`).
+shows the default delegation model from the `copilot_model` config (e.g. `gpt-5.6-terra`).
 Each Codex card names its own account in the title (`t3:Codex first…@example.org`,
 read from that home's `auth.json`), so two logins are never mistaken for one another.
 The titles drop the vendor prefix and the word "usage", and the bars drop "used", to keep
@@ -2137,7 +2137,7 @@ folded-away card stays one keystroke from coming back:
 
  t3:Codex first…@example.org
 
- t4:Copilot gpt-5.4
+ t4:Copilot gpt-5.6-terra
  ░Resets in 4d░░░░░░░░░░░░░░░░░░░░░░0%
 ```
 
