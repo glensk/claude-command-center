@@ -98,7 +98,14 @@ def _log(argv: list[str], stdin_text: str) -> None:
         "pgid": os.getpgid(0),
         "env": {
             key: os.environ.get(key, "")
-            for key in ("CCC_NO_CODEX", "CCC_INTERNAL", "AI_NO_AUTOCOMMIT", "CODEX_HOME")
+            for key in (
+                "CCC_NO_CODEX",
+                "CCC_INTERNAL",
+                "AI_NO_AUTOCOMMIT",
+                "CODEX_HOME",
+                "MEM_TOKEN",
+                "MEM_LAUNCHER",
+            )
         },
     }
     with open(path, "a", encoding="utf-8") as handle:

@@ -427,6 +427,23 @@ def _isolate_llm_staff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_mem_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep every launch path off the real shared-memory service.
+
+    The Claude launch renderings (``accounts.session_apply_to_environ`` & co.) and the Codex
+    runner mint ``mem token -l <launcher> -t`` (:mod:`command_center.mem_token`). Point
+    ``MEM_BIN`` at a path that does not exist, so no test runs the real ``mem``, and clear
+    an ambient ``MEM_TOKEN`` / ``MEM_LAUNCHER`` (a suite run inside a ccc session has them)
+    — set-then-delete, so a value a launch path writes into ``os.environ`` is undone too.
+    ``tests/test_mem_token.py`` re-points ``MEM_BIN`` at a fake.
+    """
+    monkeypatch.setenv("MEM_BIN", str(tmp_path / "no-such-mem"))
+    for name in ("MEM_TOKEN", "MEM_LAUNCHER"):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
+@pytest.fixture(autouse=True)
 def _allow_headless_start_job(monkeypatch: pytest.MonkeyPatch) -> None:
     """Let the exec-path tests run without a pseudo-terminal.
 

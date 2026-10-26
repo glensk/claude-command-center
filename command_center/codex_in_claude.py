@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import brokenpipe, codex_launch, codex_ledger, codex_login, codex_runlog
+from . import brokenpipe, codex_launch, codex_ledger, codex_login, codex_runlog, mem_token
 
 if TYPE_CHECKING:  # pragma: no cover - runtime import is local: quota imports THIS module
     from . import quota, seat_rota
@@ -5036,6 +5036,9 @@ def _attempt_codex(  # pylint: disable=too-many-locals
     env["CCC_NO_CODEX"] = "1"  # never let a nested run re-trigger the codex automation
     env["CCC_INTERNAL"] = "1"
     env["AI_NO_AUTOCOMMIT"] = "1"  # never let a nested run auto-commit
+    # The shared-memory attestation (MEM_TOKEN + MEM_LAUNCHER=codex-in-claude); an
+    # inherited MEM_TOKEN is kept, a failed mint adds nothing (mem_token.mem_env).
+    env.update(mem_token.mem_env(mem_token.LAUNCHER_CODEX, env))
     before = _git_status(workdir) if write else None
     cost_before = codex_cost_snapshot(cand.home)
     try:

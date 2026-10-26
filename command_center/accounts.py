@@ -44,6 +44,7 @@ import os
 import shlex
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -560,13 +561,28 @@ def session_launch_env(
     """Child env for launching/resuming *session*: the account pin plus its own flags."""
     env = launch_env(session.config_dir, base)
     env.update(session_env_flags(session))
+    env.update(_mem_env(env))
     return env
+
+
+def _mem_env(base: Mapping[str, str]) -> dict[str, str]:
+    """The shared-memory attestation for a Claude child (``MEM_TOKEN`` + ``MEM_LAUNCHER``).
+
+    Only the in-process renderings (an env ``dict`` or ``os.environ`` before an exec) add
+    it — never :func:`session_launch_env_prefix`, whose string is TYPED into a shell and so
+    lands in its history and on screen. ``{}`` when *base* already carries a token or the
+    mint fails (:func:`command_center.mem_token.mem_env`).
+    """
+    from . import mem_token  # pylint: disable=import-outside-toplevel
+
+    return mem_token.mem_env(mem_token.LAUNCHER_CCC, base)
 
 
 def session_apply_to_environ(session: SessionLaunch) -> None:
     """The :func:`apply_to_environ` rendering: pin IN PLACE for an ``os.execvp``."""
     apply_to_environ(session.config_dir)
     os.environ.update(session_env_flags(session))
+    os.environ.update(_mem_env(os.environ))
 
 
 def session_launch_env_prefix(session: SessionLaunch) -> str:
@@ -594,6 +610,7 @@ def pin_environ(config_dir: str, no_codex: bool) -> None:
     else:
         os.environ[_CONFIG_VAR] = _export_value(config_dir)
     os.environ.update(session_env_flags(LaunchTarget(config_dir, no_codex)))
+    os.environ.update(_mem_env(os.environ))
 
 
 def relaunch_command(session: SessionLaunch, session_id: str, cwd: str, prompt: str = "") -> str:

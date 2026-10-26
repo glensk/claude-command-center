@@ -573,8 +573,20 @@ def _main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-bra
     # flush=True: execvp replaces the process without flushing Python's stdio buffers,
     # which would lose this and earlier output when stdout is a file.
     print(f"🚀 {datetime.now():%Y-%m-%d %H:%M:%S} resuming session ...", flush=True)
-    os.execvp(cmd[0], cmd)
+    _exec_attested(cmd)
     return 1  # execvp does not return
+
+
+def _exec_attested(cmd: list[str]) -> None:
+    """``os.execvp`` *cmd* carrying the shared-memory attestation (``MEM_TOKEN``).
+
+    Minted here, at exec time, not in the tab's typed command line (which a shell keeps in
+    its history); a failed mint launches without it (:func:`command_center.mem_token.mem_env`).
+    """
+    from . import mem_token  # pylint: disable=import-outside-toplevel
+
+    os.environ.update(mem_token.mem_env(mem_token.LAUNCHER_CCC))
+    os.execvp(cmd[0], cmd)
 
 
 def main(argv: list[str] | None = None) -> int:
