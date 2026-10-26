@@ -144,7 +144,11 @@ def _render_row(
     # *root* comes pre-resolved from render(): without it every row re-resolves the repo
     # tree through a fresh config read (629 of them on a big listing).
     badge_cell = tabsymbol.cell_for(
-        session.iterm_session_id, session.cwd or "", live=row.is_open, root=root
+        session.iterm_session_id,
+        session.cwd or "",
+        live=row.is_open,
+        root=root,
+        session_id=session.session_id,
     )
 
     fraction = effective_progress(session.manual_progress, row.checked, row.total)

@@ -581,7 +581,13 @@ def _id_badge(session: Session, *, live: bool, root: str | None = None) -> str:
     the config — once per ROW.
     """
     return (
-        tabsymbol.cell_for(session.iterm_session_id, session.cwd, live=live, root=root).strip()
+        tabsymbol.cell_for(
+            session.iterm_session_id,
+            session.cwd,
+            live=live,
+            root=root,
+            session_id=session.session_id,
+        ).strip()
         or "  "
     )
 
@@ -2279,7 +2285,7 @@ class CommandCenterApp(App[None]):
         self._edit_depends_pending: str | None = None
         # Last pushed (iterm_session_id, badge) mapping, so _sync_tab_badges only
         # spawns AppleScript when the badge↔tab mapping actually moves (not every 5 s).
-        self._last_badge_sig: tuple[tuple[str, str | None], ...] | None = None
+        self._last_badge_sig: tuple[tuple[str, str | None, str | None], ...] | None = None
         # Warm iTerm2 API link backing the resident f+j toggle (see iterm_api). Created
         # unconditionally so attribute access is always safe; only *pre-warmed* (a real
         # websocket) under iTerm — on_mount gates the connect on $ITERM_SESSION_ID.
@@ -2764,7 +2770,11 @@ class CommandCenterApp(App[None]):
         if not self.cfg.sync_tab_titles:
             return
         sig = tuple(
-            (r.session.iterm_session_id, tabsymbol.read(r.session.iterm_session_id))
+            (
+                r.session.iterm_session_id,
+                tabsymbol.read(r.session.iterm_session_id),
+                tabsymbol.role_symbol(r.session.session_id),  # tp#1288: adopt changes it
+            )
             for r in rows
             if r.session.iterm_session_id and not r.session.done
         )

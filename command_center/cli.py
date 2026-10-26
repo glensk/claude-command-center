@@ -5083,38 +5083,16 @@ def _vlen(text: str) -> int:
 
 
 #: The `/aim` row marker of a session that ran `staff adopt -a <agent>` (tp#1166): it acts
-#: in a staff ROLE, not just under a staff-looking name or AIM.
+#: in a staff ROLE, not just under a staff-looking name or AIM. The agent's own `symbol:`
+#: (agent.yaml, tp#1288) follows it: `🎭📧` (:func:`staffrole.role_marker`).
 ROLE_MARKER = "🎭"
-_ROLE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 
 def adopted_role(session_id: str) -> str | None:
-    """The staff role `tp adopt` bound `session_id` to, or None (tp#1166).
+    """The staff role `tp adopt` bound `session_id` to, or None — see :mod:`.staffrole`."""
+    from . import staffrole  # lazy: keep the parser import light
 
-    The binding is tp's own record of a real adopt (a dry run writes none):
-    ``$TP_CACHE_DIR/session-role/<sid>`` (default ``~/.cache/tp/session-role/<sid>``), one
-    line holding the agent name. The name must have tp's ``owner_role`` shape and name an
-    agent that still exists (``<staff root>/<name>/agent.yaml``; staff root
-    ``$TP_STAFF_ROOT``, else ``~/obsidian/01-llm/staff`` — tp's rule). One small read and one
-    stat, no subprocess: it runs on every status-line render. Never raises.
-    """
-    if not session_id or "/" in session_id or session_id.startswith("."):
-        return None
-    cache = os.environ.get("TP_CACHE_DIR") or os.path.join(os.path.expanduser("~"), ".cache", "tp")
-    path = os.path.join(os.path.expanduser(cache), "session-role", session_id)
-    try:
-        with open(path, encoding="utf-8") as handle:
-            name = handle.readline(128).strip()
-    except (OSError, UnicodeDecodeError):
-        return None
-    if not _ROLE_NAME_RE.match(name):
-        return None
-    root = os.environ.get("TP_STAFF_ROOT") or os.path.join(
-        os.path.expanduser("~"), "obsidian", "01-llm", "staff"
-    )
-    if not os.path.isfile(os.path.join(os.path.expanduser(root), name, "agent.yaml")):
-        return None
-    return name
+    return staffrole.adopted_role(session_id)
 
 
 def _aim_label(index: int) -> str:
@@ -5165,9 +5143,9 @@ def _aim_statusline_lines(  # pylint: disable=too-many-positional-arguments  # c
 ) -> list[str]:
     """The ``/aim`` status-line row(s): AIM + running index + progress bar + vague marker.
 
-    ``role_marker`` (``🎭`` when the session adopted a staff role, :func:`adopted_role`) is
-    put right after the current row's ``/aim …:`` label; the ``/aim (1):`` anchor row and the
-    old side of a transition never carry it.
+    ``role_marker`` (``🎭`` + the agent's symbol when the session adopted a staff role,
+    :func:`staffrole.role_marker`) is put right after the current row's ``/aim …:`` label; the
+    ``/aim (1):`` anchor row and the old side of a transition never carry it.
 
     ``index`` is the current AIM's running number in the session's AIM history, so the
     prefix reads ``/aim (N):``. When the AIM changed this turn (``aim_prev`` set) it renders
@@ -5284,7 +5262,9 @@ def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     }
     with Store() as store:
         session = store.get(sid)
-        role_marker = ROLE_MARKER if adopted_role(sid) else ""
+        from . import staffrole  # lazy
+
+        role_marker = staffrole.role_marker(sid)
         if session is None:
             mark = f"{role_marker} " if role_marker else ""
             print(f"{green}/aim:{reset} {mark}{dim}(set one with /aim){reset}")
@@ -5711,12 +5691,18 @@ def cmd_tab_symbol(args: argparse.Namespace) -> int:
       iTerm tab via AppleScript (badge tabs already open before the hook landed).
     * ``--heal`` / ``--watch`` — prefix the badge onto tab titles renamed in iTerm (whose
       title override hides the session name ccc sets); once, or every 2 s.
+    * ``--palette`` — print the per-tab badge pool, space-separated (llm-staff's lint keeps
+      agent symbols out of it, tp#1288).
     * default — claim (or ``--read``) this iTerm tab's unique badge keyed by
       ``$ITERM_SESSION_ID`` and print it (the macOS zsh ``chpwd`` hook path).
 
     With nothing to key on it prints nothing and exits 0.
     """
     from . import tabsymbol
+
+    if getattr(args, "palette", False):
+        print(" ".join(tabsymbol.PALETTE))
+        return 0
 
     if getattr(args, "print_only", False):
         path = args.path or os.getcwd()
@@ -5862,6 +5848,12 @@ def _add_tab_symbol(sub: Any) -> None:
         "--watch",
         action="store_true",
         help="run --heal every 2 s until killed (the ccc-tab-watch launchd agent)",
+    )
+    p_sym.add_argument(
+        "-P",
+        "--palette",
+        action="store_true",
+        help="print the per-tab badge pool, space-separated (staff agent symbols must avoid it)",
     )
     p_sym.set_defaults(func=cmd_tab_symbol)
 

@@ -1968,7 +1968,21 @@ ccc tab-symbol --read     # print the existing badge only, never assign
 ccc tab-symbol --sync     # ensure every tracked live tab has a badge AND its title shows it
 ccc tab-symbol --heal     # prefix the badge onto every tab title renamed in iTerm (one pass)
 ccc tab-symbol --watch    # --heal every 2 s until killed (the <prefix>.ccc-tab-watch agent)
+ccc tab-symbol --palette  # print the badge pool (llm-staff's lint keeps agent symbols out of it)
 ```
+
+**Staff agents wear their own symbol** (tp#1288). A session that ran `staff adopt -a
+<agent>` (tp's binding `~/.cache/tp/session-role/<sid>`, the same one behind the status
+line's `🎭`) shows its agent's `symbol:` from `<staff root>/<agent>/agent.yaml` (staff root
+`$TP_STAFF_ROOT`, else `~/obsidian/01-llm/staff`) **instead of** the tab badge: in the tab
+title (`📧 email-agent`), in its TUI / `ccc ls` badge cell (live or not — the role belongs
+to the session), in the peek header, and after the `🎭` on its status-line `/aim` row
+(`🎭📧`). The tab keeps its palette badge claimed underneath, so the title falls back to it
+once the binding is gone. An agent without a symbol, or with one that is not a single
+non-ASCII codepoint (VS16/ZWJ/skin-tone sequences are refused: wider than two cells) or
+that equals a palette badge, keeps the ordinary badge. The title parsers (`--heal`, the
+hand-set-name detection) treat agent symbols like palette badges: one never stacks on the
+other, and `📧 email-agent` is never mistaken for a name you typed.
 
 A tab renamed via iTerm's *Edit Tab Title* shows its title override instead of the
 session name ccc sets, so the badge would vanish. `--heal`/`--watch` read each tab's
@@ -3212,6 +3226,7 @@ command_center/
   store.py         SQLite store (WAL) — single source of truth
   usage.py         account usage snapshots (Claude + Codex bars; Copilot month-to-date via gh)
   tabsymbol.py     per-iTerm-tab colored badge (claim/read), shared by shell + TUI
+  staffrole.py     adopted staff role of a session + its agent.yaml symbol (tp#1288)
   links.py         OSC 8 clickable links (vendored from new-repo.py / list_repos.py)
   core.py          reconcile(live registry → store), build_rows()
   adapters/        claude.py = the ONLY reader of Claude Code internals

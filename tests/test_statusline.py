@@ -399,6 +399,18 @@ def test_statusline_marks_a_session_that_adopted_a_role(
     assert row.index(cli.ROLE_MARKER) < row.index("all tests pass")
 
 
+def test_statusline_puts_the_agent_symbol_after_the_role_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#1288: the adopted agent's agent.yaml `symbol:` follows the 🎭."""
+    _seed(tmp_path, monkeypatch, todos=None)
+    _bind(tmp_path, monkeypatch, "s1", "email-agent")
+    yaml = tmp_path / "staff" / "email-agent" / "agent.yaml"
+    yaml.write_text(yaml.read_text(encoding="utf-8") + 'symbol: "📧"\n', encoding="utf-8")
+    cli.cmd_statusline(Namespace(session="s1"))
+    assert f"{cli.ROLE_MARKER}📧 " in _aim_row(capsys.readouterr().out)
+
+
 @pytest.mark.parametrize("role", [None, "Bad Name", "ghost-agent", ""])
 def test_statusline_no_marker_without_a_valid_binding(
     tmp_path: Path,

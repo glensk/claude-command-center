@@ -29,6 +29,13 @@ tab title. :func:`seed_title` (called from the ``SessionStart`` hook) and
 Colored emoji are used (not ANSI-styled glyphs) so the *exact same character*
 renders identically in the terminal table and the iTerm tab title — no separate
 color channel to keep in sync.
+
+A session that adopted an llm-staff role (``staff adopt -a <agent>``, tp#1288) shows its
+agent's ``symbol:`` (agent.yaml, :mod:`command_center.staffrole`) INSTEAD of the tab's
+badge — in the tab title and in its row alike (:func:`badge_for`, :func:`cell_for`). The tab
+keeps its palette badge claimed underneath, so the title falls back to it when the binding
+goes. :func:`known_badges` (palette + agent symbols) is what the title parsers strip, so an
+agent symbol is never stacked on a badge nor mistaken for part of a hand-set name.
 """
 
 from __future__ import annotations
@@ -191,7 +198,12 @@ def symbol_for_repo(cwd_or_repo: str, root: str | None = None) -> str:
 
 
 def cell_for(
-    iterm_session_id: str | None, cwd: str, *, live: bool = True, root: str | None = None
+    iterm_session_id: str | None,
+    cwd: str,
+    *,
+    live: bool = True,
+    root: str | None = None,
+    session_id: str | None = None,
 ) -> str:
     """Fixed-width ``"<emoji> "`` badge cell for a row: live tab cache, else deterministic.
 
@@ -204,8 +216,15 @@ def cell_for(
     This is the per-ROW entry point, so *root* matters here: the TUI and ``ccc ls``
     resolve :func:`command_center.repos.repo_root` once per listing and pass it down
     rather than paying a config read (and, before the memo, a TOML parse) per row.
+
+    With *session_id*, a session that adopted a staff role shows its agent's symbol
+    first (tp#1288) — live or not: the role is a property of the session, not the tab.
     """
-    badge = (read(iterm_session_id) if live else None) or symbol_for_repo(cwd, root)
+    badge = (
+        role_symbol(session_id)
+        or (read(iterm_session_id) if live else None)
+        or symbol_for_repo(cwd, root)
+    )
     return f"{badge} " if badge else _CELL_PAD
 
 
@@ -352,6 +371,34 @@ def assign(iterm_session_id: str | None, folder: str = "") -> str | None:
         return chosen
 
 
+def role_symbol(session_id: str | None) -> str | None:
+    """The agent symbol of *session_id*'s adopted staff role, unless it is a palette badge."""
+    from . import staffrole  # lazy
+
+    symbol = staffrole.session_symbol(session_id)
+    return symbol if symbol and symbol not in PALETTE else None
+
+
+def badge_for(session: Session, iterm_session_id: str | None = None) -> str | None:
+    """The symbol *session*'s tab title leads with: its agent's symbol, else the tab badge.
+
+    The tab's palette badge is claimed either way (:func:`assign`), so an adopted tab keeps
+    its slot and falls back to it once the role binding is gone (tp#1288).
+    """
+    iid = iterm_session_id or session.iterm_session_id
+    badge = assign(iid, folder=session.cwd)
+    if not badge:
+        return None
+    return role_symbol(session.session_id) or badge
+
+
+def known_badges() -> tuple[str, ...]:
+    """Every symbol ccc may put at the front of a tab title: the palette, then agent symbols."""
+    from . import staffrole  # lazy
+
+    return PALETTE + tuple(sorted(staffrole.agent_symbols() - set(PALETTE)))
+
+
 def _wait_marker(marker: str | None) -> str:
     """Resolve the wait marker to preserve (caller arg → env → default)."""
     if marker is not None:
@@ -446,14 +493,18 @@ _TITLE_WS_RE = re.compile(r"\s+")
 
 
 def clean_title(title: str, marker: str | None = None) -> str:
-    """The name a user meant by a tab *title*: wait marker, badge, AIM tail, controls stripped."""
+    """The name a user meant by a tab *title*: wait marker, badge, AIM tail, controls stripped.
+
+    A staff agent's symbol counts as a badge (:func:`known_badges`).
+    """
     text = _TITLE_CONTROL_RE.sub("", title or "")
     marker = _DEFAULT_WAIT_MARKER if marker is None else marker
+    badges = known_badges()
     for _ in range(2):  # marker before the badge, and a stray second marker
         if marker and text.startswith(marker):
             text = text[len(marker) :]
         stripped = text.lstrip()
-        for badge in PALETTE:
+        for badge in badges:
             if stripped.startswith(badge):
                 stripped = stripped[len(badge) :]
                 break
@@ -519,7 +570,7 @@ def push_title(session: Session, *, marker: str | None = None) -> None:
 
     if session_names.titles_frozen(session):
         return
-    badge = assign(iid, folder=session.cwd)
+    badge = badge_for(session)
     if not badge:
         return
     core = _session_core(session, badge, config.load_config())
@@ -568,7 +619,8 @@ def seed_title(
         return badge
     cfg = config.load_config()
     name = session_names.title_name(session, cfg)
-    core = title_core(badge, cwd or session.cwd, name=name)
+    shown = role_symbol(session.session_id) or badge  # tp#1288
+    core = title_core(shown, cwd or session.cwd, name=name)
     plain: dict[str, str] = {}
     cas: dict[str, tuple[str, str]] = {}
     writes: list[tuple[str, str]] = []
@@ -653,7 +705,7 @@ def sync_live(store: Store, *, marker: str | None = None) -> list[str]:
                 continue
         if session_names.titles_frozen(session):
             continue
-        badge = assign(iid, folder=session.cwd)
+        badge = badge_for(session)
         if not badge:
             continue
         _plan_write(session, _session_core(session, badge, cfg), plain, cas, writes)
@@ -686,22 +738,61 @@ def badge_for_uuid(uuid: str) -> str | None:
 def healed_title(title: str, badge: str | None) -> str | None:
     """*title* with *badge* in front, or None when it already starts with it.
 
-    A different palette badge already leading the title (the tab's badge was recycled
-    since the rename) is replaced rather than stacked.
+    A different palette badge or agent symbol already leading the title (the tab's badge
+    was recycled since the rename, or its session adopted or left a staff role) is
+    replaced rather than stacked.
     """
     if not badge or title.startswith(badge):
         return None
     rest = title
-    for other in PALETTE:
+    for other in known_badges():
         if rest.startswith(f"{other} "):
             rest = rest[len(other) + 1 :]
             break
     return f"{badge} {rest}"
 
 
+_ROLE_TTL_SEC = 10.0
+_role_by_uuid: dict[str, tuple[float, str | None]] = {}
+
+
+def _role_symbol_for_uuid(uuid: str) -> str | None:
+    """The agent symbol of the session owning the iTerm tab *uuid*, if it adopted a role.
+
+    The heal watcher asks every 2 s per renamed tab, so the answer is cached for 10 s, and
+    no store is opened at all while no session has a role binding.
+    """
+    import time  # pylint: disable=import-outside-toplevel
+
+    from . import staffrole  # lazy
+
+    now = time.monotonic()
+    hit = _role_by_uuid.get(uuid)
+    if hit is not None and hit[0] > now:
+        return hit[1]
+    symbol: str | None = None
+    if staffrole.has_bindings():
+        try:
+            from .store import Store as _Store  # lazy
+
+            with _Store() as store:
+                session = store.session_for_tab_uuid(uuid)
+            if session is not None and not session.done:
+                symbol = role_symbol(session.session_id)
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            symbol = None
+    _role_by_uuid[uuid] = (now + _ROLE_TTL_SEC, symbol)
+    return symbol
+
+
 def _rename_with_badge(override: str, uuids: list[str]) -> str | None:
-    """``ItermLink.retitle_overridden_tabs`` callback: badge of the tab's first badged session."""
-    badge = next((b for b in map(badge_for_uuid, uuids) if b), None)
+    """``ItermLink.retitle_overridden_tabs`` callback: the tab's agent symbol, else its badge.
+
+    The agent symbol of the current session (*uuids[0]*) wins when it adopted a staff role
+    (tp#1288); otherwise the badge of the tab's first badged session.
+    """
+    role = _role_symbol_for_uuid(uuids[0]) if uuids else None
+    badge = role or next((b for b in map(badge_for_uuid, uuids) if b), None)
     return healed_title(override, badge)
 
 

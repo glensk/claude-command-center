@@ -295,16 +295,17 @@ def _leaf(cwd: str) -> str:
     return leaf or os.path.basename(cwd.rstrip("/"))
 
 
-def _tab_badge(iterm_session_id: str | None) -> str:
+def _tab_badge(iterm_session_id: str | None, session_id: str | None = None) -> str:
     """The tab's coloured emoji badge (💙 / 🔵 / …) for the header, or ``""``.
 
     Reads the same per-tab cache the status line and TUI share (``ccc tab-symbol``),
     keyed by the session's stored ``$ITERM_SESSION_ID`` — so the panel shows the exact
-    glyph the user sees in the iTerm tab title and the Claude Code status line.
+    glyph the user sees in the iTerm tab title and the Claude Code status line. A session
+    that adopted a staff role shows its agent's symbol instead, as its tab does (tp#1288).
     """
     from . import tabsymbol  # lazy: keep module import cheap
 
-    return tabsymbol.read(iterm_session_id) or ""
+    return tabsymbol.role_symbol(session_id) or tabsymbol.read(iterm_session_id) or ""
 
 
 def _id_rgb(iterm_session_id: str | None, cwd: str) -> tuple[int, int, int] | None:
@@ -387,7 +388,7 @@ def _peek_for_session(
         resolved=True,
         session_id=session.session_id,
         cwd=session.cwd,
-        badge=_tab_badge(session.iterm_session_id),
+        badge=_tab_badge(session.iterm_session_id, session.session_id),
         id_rgb=_id_rgb(session.iterm_session_id, session.cwd),
         cache_state=cache_state,
     )

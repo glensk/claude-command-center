@@ -147,7 +147,9 @@ lease, and `release-locks` — after it has handled the close/switch claim, so i
   <agent>` and works in that staff ROLE (tp#1166): ccc reads tp's adopt binding
   `$TP_CACHE_DIR/session-role/<sid>` (default `~/.cache/tp/session-role/<sid>`; the named agent
   must still exist under `$TP_STAFF_ROOT`, default `~/obsidian/01-llm/staff`). A session that is
-  merely named or AIMed after an agent shows no `🎭`;
+  merely named or AIMed after an agent shows no `🎭`. The agent's own `symbol:` (its
+  `agent.yaml`, tp#1288) follows the `🎭` — `🎭📧` for the email-agent — the same symbol
+  that replaces the badge in its iTerm tab title and command-center row;
 - a `Status:` + `/next-step:` row;
 - a blue `●` drift warning when the impartial checker has flagged one;
 - a one-line `done/total` + checkbox strip of the session's live todos.
