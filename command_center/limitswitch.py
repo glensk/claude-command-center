@@ -5,7 +5,8 @@ When a Claude account hits its 5-hour session limit (or its weekly one) mid-turn
 session stalls: its last main-chain assistant record is an ``isApiErrorMessage`` reading
 "You've hit your session limit · resets 6:40pm". ``ccc switch-account <label> -N`` already
 relaunches such a session under the other account IN THE SAME TAB with the conversation
-intact (that is what the ``/cwork-to-cpriv`` slash command does); this module decides when
+intact (that is what the ``/cwork-to-cpriv-cache-write-hit`` slash command does); this
+module decides when
 to do that by itself, so the halt costs seconds of idling instead of "until someone
 notices the stalled tab".
 

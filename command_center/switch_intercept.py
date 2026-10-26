@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""Seat-switch slash commands (``/cwork-to-cpriv`` & co.) run from ``UserPromptSubmit``.
+"""Seat-switch slash commands (``/cwork-to-cpriv-cache-write-hit`` & co.) from ``UserPromptSubmit``.
 
 The hook runs before any model request, so the switch works on a seat that hit its limit.
+The ``*-cache-write-hit`` names are the zero-token, same-session relaunch (``claude
+--resume`` on the other seat — its first turn re-writes the whole conversation into the
+new organization's prompt cache). The plain ``/cwork-to-cpriv`` / ``/cpriv-to-cwork`` names
+are the handoff to a NEW session (``ccc continue-session``, tp#1300) and are NOT switch
+commands here.
 """
 
 from __future__ import annotations
@@ -22,11 +27,14 @@ import os
 import sys
 
 # Seat-switch slash commands → the `claude_accounts` label they move the session to.
-_SWITCH_COMMANDS = {"/cwork-to-cpriv": "private", "/cpriv-to-cwork": "work"}
+_SWITCH_COMMANDS = {
+    "/cwork-to-cpriv-cache-write-hit": "private",
+    "/cpriv-to-cwork-cache-write-hit": "work",
+}
 
 
 def switch_command_args(prompt: str) -> tuple[str, list[str]] | None:
-    """``(label, extra argv)`` for a typed ``/cwork-to-cpriv [args]`` style prompt, else None.
+    """``(label, extra argv)`` for a typed ``/cwork-to-cpriv-cache-write-hit [args]``, else None.
 
     Unparseable arguments (an unbalanced quote) come back as one ``--invalid`` token, so
     ``switch-account`` refuses them loudly instead of the prompt reaching the model.

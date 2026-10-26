@@ -940,7 +940,7 @@ def test_switch_account_now_spawns_the_relauncher_without_arming_a_turn(
 def test_switch_account_now_spawns_the_relauncher_with_the_continue_prompt(
     two_accounts: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The quota escape hatch (`/cwork-to-cpriv`) hands the prompt straight to switch-now."""
+    """The quota escape hatch (`/cwork-to-cpriv-cache-write-hit`) hands the prompt to switch-now."""
     private, _work = two_accounts
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -987,9 +987,9 @@ def test_switch_account_now_refuses_a_busy_session_unless_it_is_rate_limit_halte
         assert "mid-turn" in capsys.readouterr().err
 
 
-# The state test behind `-K` (`/cwork-to-cpriv`): a switch must not turn an idle session
-# into a running one (2026-09-09): a long-idle session moved to the other seat relaunched
-# and started working, because the slash command hard-coded `-p`.
+# The state test behind `-K` (`/cwork-to-cpriv-cache-write-hit`): a switch must not turn an
+# idle session into a running one (2026-09-09): a long-idle session moved to the other seat
+# relaunched and started working, because the slash command hard-coded `-p`.
 _HALT_TEXT = "You've hit your session limit \u00b7 resets 6:40pm"
 _OVERLOAD_TEXT = "Server is temporarily limiting requests (not your usage limit) \u00b7 retrying"
 

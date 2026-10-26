@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """``/switch`` for the Codex TUI: move a live thread to another seat, same tab.
 
-The Codex twin of ``ccc switch-account -N`` (``/cpriv-to-cwork``). Codex has no notion of
+The Codex twin of ``ccc switch-account -N`` (``/cpriv-to-cwork-cache-write-hit``). Codex has
+no notion of
 an account beyond ``$CODEX_HOME/auth.json``, so "switch the seat" means: quit this TUI,
 port the thread's rollout into the target ``CODEX_HOME`` and relaunch
 ``codex … resume <thread>`` under that home in the very same iTerm tab / tmux pane. The

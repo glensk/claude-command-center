@@ -771,13 +771,19 @@ def test_user_prompt_aim_is_set_without_a_model_turn(capsys: pytest.CaptureFixtu
 @pytest.mark.parametrize(
     ("prompt", "expected"),
     [
-        ("/cwork-to-cpriv", ("private", [])),
-        ("/cpriv-to-cwork -f", ("work", ["-f"])),
-        ('/cwork-to-cpriv -p "go on" ', ("private", ["-p", "go on"])),
-        ("/cwork-to-cpriv\n-C", ("private", ["-C"])),
-        ("/cwork-to-cpriv 'x", ("private", ["--invalid"])),
-        ("/cwork-to-cprivx", None),
-        ("please /cwork-to-cpriv", None),
+        ("/cwork-to-cpriv-cache-write-hit", ("private", [])),
+        ("/cpriv-to-cwork-cache-write-hit -f", ("work", ["-f"])),
+        ('/cwork-to-cpriv-cache-write-hit -p "go on" ', ("private", ["-p", "go on"])),
+        ("/cwork-to-cpriv-cache-write-hit\n-C", ("private", ["-C"])),
+        ("/cwork-to-cpriv-cache-write-hit 'x", ("private", ["--invalid"])),
+        ("/cwork-to-cpriv-cache-write-hitx", None),
+        ("please /cwork-to-cpriv-cache-write-hit", None),
+        # The old names are the handoff now (tp#1300), never the same-session switch …
+        ("/cwork-to-cpriv", None),
+        ("/cpriv-to-cwork -f", None),
+        # … and the whole first token is matched: no prefix match either way.
+        ("/cwork-to-cpriv-cache-write", None),
+        ("/cwork-to-cpriv-cache-write-hit-x", None),
         ("/aim x", None),
     ],
 )
@@ -800,7 +806,9 @@ def test_user_prompt_switch_runs_without_a_model_turn(
         return subprocess.CompletedProcess(cmd, 0, "relaunching now", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": "/cwork-to-cpriv -f"})
+    hooks.handle_user_prompt(
+        {"session_id": "s1", "cwd": "/repo", "prompt": "/cwork-to-cpriv-cache-write-hit -f"}
+    )
     out = capsys.readouterr().out
     assert '"decision": "block"' in out and "relaunching now" in out
     assert len(calls) == 1
@@ -816,7 +824,9 @@ def test_user_prompt_switch_intercept_off_passes_through(
     _set_cfg(switch_intercept=False)
     Store().ensure("s1", cwd="/repo")
     capsys.readouterr()
-    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": "/cpriv-to-cwork"})
+    hooks.handle_user_prompt(
+        {"session_id": "s1", "cwd": "/repo", "prompt": "/cpriv-to-cwork-cache-write-hit"}
+    )
     assert '"decision"' not in capsys.readouterr().out
 
 

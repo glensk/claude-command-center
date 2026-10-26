@@ -115,7 +115,8 @@ _SWITCH_READY_WAIT_SEC = 10.0
 # `switch-account -p` with no text: the prompt the relaunched session submits by itself.
 # A resume alone parks at an idle composer — the conversation survived the seat change,
 # but nobody is driving it, so the work the switch was made FOR stalls until the user
-# types. This is that one word. `/cwork-to-cpriv` & co. no longer hard-code it: they send
+# types. This is that one word. `/cwork-to-cpriv-cache-write-hit` & co. no longer hard-code
+# it: they send
 # `-K`, which submits it only when the session's work was really interrupted (a usage-limit
 # halt or a -f'd live turn), so switching seats never turns an idle session into a running
 # one (2026-09-09 ruling: the state is the session's, not the switch's, to decide).
@@ -6220,7 +6221,7 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "--no-continue",
         action="store_true",
         help="relaunch WITHOUT a prompt — overrides -p whatever the order (the way to "
-        "opt a single `/cwork-to-cpriv` call out of the auto-continue)",
+        "opt a single `/cwork-to-cpriv-cache-write-hit` call out of the auto-continue)",
     )
     p_switch.add_argument(
         "-K",
@@ -6229,7 +6230,8 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         help=f"send {SWITCH_CONTINUE_PROMPT!r} ONLY if the session's work was actually "
         "interrupted — its turn died on this account's usage limit, or -f cut a live turn "
         "off. An idle session stays idle, so the switch never changes what the session was "
-        "doing (this is what `/cwork-to-cpriv` sends; -p/-C still decide it outright)",
+        "doing (this is what `/cwork-to-cpriv-cache-write-hit` sends; -p/-C still decide it "
+        "outright)",
     )
     p_switch.add_argument("-q", "--quiet", action="store_true", help="suppress the summary print")
     p_switch.add_argument(
