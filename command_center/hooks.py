@@ -38,8 +38,8 @@ from . import config, switch_intercept
 from .models import (
     CloseClaim,
     Session,
-    Status,
     SwitchClaim,
+    closed_status,
     drift_unresolved,
     dumps_todos,
     now_ms,
@@ -948,9 +948,7 @@ def handle_session_end(payload: dict[str, Any]) -> int:
             and _run_done_check(session.done_check_cmd, session.cwd)
         ):
             fields["done"] = True
-        fields["status"] = (
-            Status.DONE.value if fields.get("done") or session.done else Status.PARKED.value
-        )
+        fields["status"] = closed_status(session, bool(fields.get("done"))).value
         store.update_fields(sid, **fields)
     return 0
 

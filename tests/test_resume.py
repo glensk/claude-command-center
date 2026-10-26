@@ -738,3 +738,18 @@ def test_will_auto_resume_refuses_done_and_draft(tmp_path: Path) -> None:
         session = store.get(sid)
         assert session is not None
         assert not will_auto_resume(session, adapter, on)  # type: ignore[arg-type]
+
+
+def test_is_resumable_refuses_a_handed_off_session(tmp_path: Path) -> None:
+    """tp#1300: the daemon never revives a session whose work moved to a successor."""
+    from command_center.models import Session  # pylint: disable=import-outside-toplevel
+    from command_center.resume import is_resumable  # pylint: disable=import-outside-toplevel
+
+    class _Adapter:
+        def transcript_path(self, *_a: object) -> Path:
+            return tmp_path
+
+    base = {"session_id": "old", "cwd": str(tmp_path), "config_dir": str(tmp_path)}
+    handed = Session(**base, handed_off_to="new")  # type: ignore[arg-type]
+    assert not is_resumable(handed, _Adapter())  # type: ignore[arg-type]
+    assert is_resumable(Session(**base), _Adapter())  # type: ignore[arg-type]

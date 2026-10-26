@@ -213,6 +213,7 @@ def decide(  # pylint: disable=too-many-return-statements
     model: str = "",
     now: int | None = None,
     successes_today: int = 0,
+    handed_off: bool = False,
 ) -> Decision:
     """Pure policy: should this halt move seats, and to which account?
 
@@ -221,6 +222,9 @@ def decide(  # pylint: disable=too-many-return-statements
     minute while one whose every seat is capped waits a quarter of an hour.
     """
     now = int(time.time()) if now is None else now
+    if handed_off:
+        # tp#1300: the work moved to a new session; relaunching the old one would run two.
+        return Decision(False, "session was handed off to a new session — never relaunched")
     if not cfg.auto_switch_on_limit:
         return Decision(False, "auto_switch_on_limit is off")
     if not obs.usage_limit:
@@ -383,7 +387,14 @@ def _run(  # pylint: disable=too-many-locals,too-many-return-statements,too-many
                 False,
                 f"backing off until {time.strftime('%H:%M:%S', time.localtime(retry_at / 1000))}",
             )
-        decision = decide(obs, cfg, model=model, now=int(time.time()), successes_today=successes)
+        decision = decide(
+            obs,
+            cfg,
+            model=model,
+            now=int(time.time()),
+            successes_today=successes,
+            handed_off=bool(row is not None and getattr(row, "handed_off_to", None)),
+        )
         if dry_run:
             return decision.switch, f"[dry-run] {decision.reason}"
         if not decision.switch:

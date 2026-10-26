@@ -61,6 +61,7 @@ from .models import (
     now_ms,
     short_id,
 )
+from .transfer_store import TRANSFER_SCHEMA, TransferStoreMixin
 
 _JOB_TYPES = frozenset(JOB_TYPES)
 _LLM_CHOICES = frozenset(LLM_CHOICES)
@@ -190,6 +191,9 @@ _SESSION_COLUMNS = (
     "title_generation",
     "title_written_at",
     "name_upgrade_tries",
+    "handed_off_to",
+    "handed_off_from",
+    "handed_off_at",
 )
 _BOOL_COLUMNS = frozenset(
     {
@@ -316,7 +320,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     title_written_at  INTEGER NOT NULL DEFAULT 0,
     name_upgrade_tries INTEGER NOT NULL DEFAULT 0,
     aim_eta           TEXT,
-    aim_eta_set_at    INTEGER
+    aim_eta_set_at    INTEGER,
+    handed_off_to     TEXT,
+    handed_off_from   TEXT,
+    handed_off_at     INTEGER
 );
 CREATE TABLE IF NOT EXISTS subgoals (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -519,7 +526,7 @@ _WAL_RETRY_SLEEP = 0.03
 _LIMIT_SWITCH_TERMINAL: tuple[str, ...] = ("started", "failed", "refused", "abandoned")
 
 
-class Store(AwaitStoreMixin, BridgeStoreMixin):  # pylint: disable=too-many-public-methods
+class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: disable=too-many-public-methods
     """Thin wrapper over the SQLite database."""
 
     def __init__(self, path: Path | None = None, *, check_same_thread: bool = True) -> None:
@@ -532,7 +539,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin):  # pylint: disable=too-many-publ
         self.conn.execute("PRAGMA busy_timeout=3000")
         self._enable_wal()
         self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.executescript(_SCHEMA + AWAIT_SCHEMA + BRIDGE_SCHEMA)
+        self.conn.executescript(_SCHEMA + AWAIT_SCHEMA + BRIDGE_SCHEMA + TRANSFER_SCHEMA)
         self.conn.commit()
         self._ensure_columns()
 
@@ -664,6 +671,10 @@ class Store(AwaitStoreMixin, BridgeStoreMixin):  # pylint: disable=too-many-publ
         # no ETA, which is what every row written before the columns existed means.
         "aim_eta": "TEXT",
         "aim_eta_set_at": "INTEGER",
+        # Handoff lineage (``ccc continue-session``, tp#1300). NULL = never handed off.
+        "handed_off_to": "TEXT",
+        "handed_off_from": "TEXT",
+        "handed_off_at": "INTEGER",
     }
     # Same, for the subgoals table (auto-progress marks its rows source='auto').
     _ADDED_SUBGOAL_COLUMNS = {

@@ -268,10 +268,11 @@ def is_resumable(session: Session, adapter: ClaudeAdapter) -> bool:
     :func:`will_auto_resume` (what the ``||▶`` icon promises), so the icon can never
     advertise a revival the watcher would not perform.
 
-    Excludes done / draft / archived; requires a real cwd, an attributable account and
-    a transcript on disk (``claude --resume`` needs a recorded conversation).
+    Excludes done / draft / archived / handed off (its work lives on in a successor
+    session, tp#1300); requires a real cwd, an attributable account and a transcript on
+    disk (``claude --resume`` needs a recorded conversation).
     """
-    if session.done or session.draft or session.archived:
+    if session.done or session.draft or session.archived or session.handed_off_to:
         return False
     if account_key(session.config_dir) == UNATTRIBUTED:
         return False
@@ -819,6 +820,9 @@ def apply_actions(
         # of any destructive step, so a revoked flag refuses instead of killing first and
         # refusing at launch time.
         session_row = store.get(action.session_id)
+        if session_row is not None and session_row.handed_off_to:
+            _log("refuse", action.session_id, "handed off to " + session_row.handed_off_to)
+            continue
         if session_row is not None and limitswitch.hold_active(session_row):
             _log("skip", action.session_id, "a rate-limit failover owns this session")
             continue

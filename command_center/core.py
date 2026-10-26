@@ -493,7 +493,14 @@ def reconcile_pass(  # pylint: disable=too-many-locals,too-many-branches,too-man
         model, _ = _transcript_facts(adapter, session, scans, dirty)
         if model and model != (session.model or ""):
             updates["model"] = model
-        if session.done:
+        if session.handed_off_to and not session.done:
+            # Terminal (tp#1300): a handed-off session stays HANDED_OFF once its process is
+            # gone; closed_at is stamped on the first pass that sees it gone.
+            if session.status != Status.HANDED_OFF.value:
+                updates["status"] = Status.HANDED_OFF.value
+            if not session.closed_at:
+                updates["closed_at"] = now_ms()
+        elif session.done:
             # Self-heal: done always wins. A done-then-closed session can carry a
             # stale PARKED stamp (a pre-fix close wrote it); restore DONE so the
             # row sinks to FINISHED instead of lingering in the active list.

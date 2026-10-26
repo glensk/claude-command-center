@@ -97,6 +97,7 @@ from ..models import (
     DEP_MARKER,
     HALTED_RESUME_HELP,
     HALTED_RESUME_ICON,
+    HANDOFF_MARKER_WIDTH,
     JOB_TYPE_LABELS,
     LLM_ARROW,
     LLM_CHOICES,
@@ -106,6 +107,7 @@ from ..models import (
     Status,
     aim_column_first,
     aim_score_pct,
+    closed_status,
     days_until_start,
     display_aim,
     done_bar_parts,
@@ -113,6 +115,7 @@ from ..models import (
     effective_progress,
     empty_track_tint,
     expand_llm_choice,
+    handoff_marker,
     humanize_age,
     importance_marks,
     iso_date,
@@ -309,6 +312,7 @@ _STATUS_STYLE: dict[Status, str] = {
     Status.IDLE: "bold #ffaf00",  # amber ❯ — waiting for you; not green (vs running ▶ / done ✓)
     Status.SNOOZED: "bold green",  # background task running while the session itself is idle
     Status.PARKED: "grey62",
+    Status.HANDED_OFF: "grey62",
     Status.DONE: "green3",
     Status.FAILED: "bold red",
 }
@@ -362,6 +366,7 @@ _GROUP_LABEL: dict[Status, str] = {
     Status.IDLE: "ACTIVE TABS",
     Status.SNOOZED: "SNOOZED (BACKGROUND TASK)",
     Status.PARKED: "PARKED",
+    Status.HANDED_OFF: "HANDED OFF",
     Status.DONE: "done",
     Status.FAILED: "FAILED",
 }
@@ -3341,7 +3346,14 @@ class CommandCenterApp(App[None]):
                 if row.status is Status.WAITING_CODEX and row.codex_reset_hint
                 else _first_line(session.next_step)
             )
-            nxt = _with_tags("  " + (next_value or "—")[:48], base)
+            if marker := handoff_marker(session):
+                # Handed off (tp#1300): the successor id leads the cell at a fixed width.
+                nxt = Text("  " + marker + " ", style="grey62")
+                nxt.append_text(
+                    _with_tags((next_value or "—")[: 48 - HANDOFF_MARKER_WIDTH - 1], base)
+                )
+            else:
+                nxt = _with_tags("  " + (next_value or "—")[:48], base)
         if marked and sched is not None:
             # A marked SCHEDULED draft can't span the importance+ver cells (the marker
             # owns them), so its compact start date rides the tags/notes column instead,
@@ -3960,7 +3972,7 @@ class CommandCenterApp(App[None]):
         # and the whole tab if Claude was the only pane (the single process) in it.
         # A done session keeps DONE (never demoted to PARKED) so closing it sinks
         # the row to the FINISHED section instead of leaving it in the active list.
-        store.update_fields(sid, status=Status.DONE.value if session.done else Status.PARKED.value)
+        store.update_fields(sid, status=closed_status(session).value)
         label = colors.short_folder(session.cwd)
         verb = "Finished" if session.done else "Parked"
         self.refresh_data()  # the status flip repaints immediately

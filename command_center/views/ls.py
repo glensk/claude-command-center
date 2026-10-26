@@ -31,6 +31,7 @@ from ..models import (
     drift_unresolved,
     effective_progress,
     empty_track_tint,
+    handoff_marker,
     humanize_age,
     low_aim_score,
     model_effort_cell,
@@ -51,6 +52,7 @@ _STATUS_COLOR: dict[Status, int] = {
     Status.IDLE: 214,  # amber ❯ — waiting for your input, matches TUI #ffaf00
     Status.SNOOZED: 40,  # background task running while the session itself is idle
     Status.PARKED: 244,
+    Status.HANDED_OFF: 244,
     Status.DONE: 35,
     Status.FAILED: 196,
 }
@@ -269,6 +271,8 @@ def _render_row(
         osc8_link(f"openterm://{_quote(session.cwd)}", resume_cmd) if session.cwd else resume_cmd
     )
     extras = [f"↳ {resume}"]
+    if marker := handoff_marker(session):
+        extras.append(f"{marker} handed off")
     if session.blocked_on:
         extras.append(f"blocked: {session.blocked_on}")
     if row.status is Status.WAITING_CODEX and row.codex_reset_hint:

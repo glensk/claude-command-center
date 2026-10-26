@@ -530,3 +530,13 @@ def test_uncollapsed_registry_sees_one_id_live_under_two_accounts(
     assert len(adapter.discover_raw(SESSION)) == 2  # both registry files, uncollapsed
     collapsed = [e for e in adapter.discover() if e.session_id == SESSION]
     assert len(collapsed) == 1 and collapsed[0].conflict  # what the old guard could see
+
+
+def test_decide_refuses_a_handed_off_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """tp#1300: a session whose work moved to a successor is never relaunched."""
+    private, _ = _accounts(monkeypatch, tmp_path)
+    decision = limitswitch.decide(_obs(private), _cfg(), handed_off=True)
+    assert not decision.switch and "handed off" in decision.reason
+    assert limitswitch.decide(_obs(private), _cfg()).switch

@@ -40,6 +40,9 @@ class Status(str, Enum):
     IDLE = "idle"
     SNOOZED = "snoozed"  # alive & idle, but a background task it spawned is still running
     PARKED = "parked"
+    # Terminal: the work moved to a NEW session (`ccc continue-session`, tp#1300). Not
+    # done — the transferred work goes on in the successor (`Session.handed_off_to`).
+    HANDED_OFF = "handed_off"
     DONE = "done"
     FAILED = "failed"
 
@@ -52,6 +55,7 @@ STATUS_ICON: dict[Status, str] = {
     Status.IDLE: "❯",  # amber prompt chevron — turn done, awaiting YOUR input (not running ▶)
     Status.SNOOZED: "💤",  # background task still running while the session itself is idle
     Status.PARKED: "☾",
+    Status.HANDED_OFF: "⇢",
     Status.DONE: "✓",
     Status.FAILED: "✗",
 }
@@ -65,6 +69,7 @@ STATUS_ORDER: dict[Status, int] = {
     Status.IDLE: 4,
     Status.SNOOZED: 5,  # alive but quietly busy in the background — low attention, below idle
     Status.PARKED: 6,
+    Status.HANDED_OFF: 6,  # closed like PARKED; its work lives on in the successor row
     Status.DONE: 7,
     Status.FAILED: 8,
 }
@@ -81,6 +86,7 @@ STATUS_HELP: dict[Status, str] = {
     Status.IDLE: "live — idle, waiting for your input",
     Status.SNOOZED: "live — idle, waiting on a background task to finish",
     Status.PARKED: "closed — process gone; resume with r",
+    Status.HANDED_OFF: "handed off — the work continues in a new session (⇢ <its id>)",
     Status.DONE: "AIM marked achieved (done)",
     Status.FAILED: "ended in failure",
 }
@@ -614,6 +620,13 @@ class Session:
     archived: bool = False
     created_at: int = 0
     updated_at: int = 0
+    # --- handoff lineage (``ccc continue-session``, tp#1300) ---------------------------
+    # The successor this session's work moved to (set when its transfer is finalized;
+    # makes the status HANDED_OFF), the predecessor it took over from, and the epoch ms
+    # of that hand-over. NULL = never handed off (every row written before the columns).
+    handed_off_to: str | None = None
+    handed_off_from: str | None = None
+    handed_off_at: int | None = None
     # --- session names (session_names.py) ---------------------------------------------
     # The memorable 1-2 word name the user, the voice bridge and other agents address the
     # session by. Generated ONCE (origin "llm" / "fallback"), set by `ccc name` ("manual")
@@ -1142,6 +1155,26 @@ def synthesize_aim_revision(session: Session) -> AimRevision:
     )
 
 
+def closed_status(session: Session, done: bool = False) -> Status:
+    """The status of a session whose process is gone: DONE, HANDED_OFF (tp#1300) or PARKED."""
+    if done or session.done:
+        return Status.DONE
+    return Status.HANDED_OFF if session.handed_off_to else Status.PARKED
+
+
+HANDOFF_MARKER_WIDTH = 10  # "⇢ " + 8-char id: the same width on every row
+
+
+def handoff_marker(session: Session) -> str:
+    """``"⇢ <8-char successor id>"`` for a handed-off session, else ``""`` (tp#1300).
+
+    Always :data:`HANDOFF_MARKER_WIDTH` cells when set (the arrow is one cell), so a
+    view that puts it in front of a column shifts every handed-off row by the same amount.
+    """
+    target = (session.handed_off_to or "").strip()
+    return f"⇢ {target[:8]:<8}" if target else ""
+
+
 def derive_status(
     live: LiveSession | None,
     stored: Session | None,
@@ -1172,8 +1205,13 @@ def derive_status(
     live background task exists; otherwise an idle Codex-workflow session whose quota
     is exhausted becomes WAITING_CODEX until the reset window passes.
     """
+    busy = live is not None and live.alive and (live.raw_status or "").lower() in BUSY_RAW_STATUSES
+    if stored is not None and stored.handed_off_to:
+        # Terminal like done (tp#1300): the work moved to the successor. Only a turn that is
+        # literally still running (the finalize message being written) reads WORKING.
+        return Status.WORKING if busy else Status.HANDED_OFF
     if stored is not None and stored.done:
-        if live is not None and live.alive and (live.raw_status or "").lower() in BUSY_RAW_STATUSES:
+        if busy:
             return Status.WORKING  # done, but still mid-turn — ✓ waits for the turn to end
         return Status.DONE
     if live is None or not live.alive:
