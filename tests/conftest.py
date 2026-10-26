@@ -438,7 +438,7 @@ def _isolate_mem_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ``tests/test_mem_token.py`` re-points ``MEM_BIN`` at a fake.
     """
     monkeypatch.setenv("MEM_BIN", str(tmp_path / "no-such-mem"))
-    for name in ("MEM_TOKEN", "MEM_LAUNCHER"):
+    for name in ("MEM_TOKEN", "MEM_LAUNCHER", "STAFF_AGENT"):
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
 

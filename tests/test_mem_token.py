@@ -68,6 +68,20 @@ def test_mem_env_mints_with_the_launcher_and_client_timeout(tmp_path: Path) -> N
 
 
 @pytest.mark.usefixtures("good_mem")
+def test_staff_session_mints_untrusted_staff_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A staff agent reads untrusted mail/Slack: its token is untrusted, launcher staff-<agent>."""
+    monkeypatch.setenv("STAFF_AGENT", "Zoho_Agent")
+    assert mem_token.mem_env("ccc") == {"MEM_TOKEN": _TOKEN, "MEM_LAUNCHER": "staff-zoho-agent"}
+    assert _calls(tmp_path) == ["token -l staff-zoho-agent -u|3"]
+    assert (
+        mem_token.mem_env("codex-in-claude", {"STAFF_AGENT": "mac-overseer"})["MEM_LAUNCHER"]
+        == "staff-mac-overseer"
+    )
+
+
+@pytest.mark.usefixtures("good_mem")
 def test_ambient_token_is_kept_and_nothing_is_minted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

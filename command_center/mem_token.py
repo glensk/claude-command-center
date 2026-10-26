@@ -44,8 +44,18 @@ CLIENT_TIMEOUT_S = "3"
 _TOKEN_SHAPE = re.compile(r"[\x21-\x7e]{8,4096}")
 
 
-def mint(launcher: str) -> str | None:
-    """A fresh token for *launcher* from ``mem token -l <launcher> -t``, or ``None``.
+def staff_launcher(base: Mapping[str, str]) -> str | None:
+    """``staff-<agent>`` when *base* is a staff session (``STAFF_AGENT`` set), else ``None``.
+
+    Staff agents read untrusted mail and Slack, so their sessions get an UNTRUSTED token
+    (tp#1249): every memory they submit lands proposed and goes through the checker.
+    """
+    agent = re.sub(r"[^a-z0-9-]", "-", (base.get("STAFF_AGENT") or "").strip().lower()).strip("-")
+    return f"staff-{agent}"[:41] if agent else None
+
+
+def mint(launcher: str, trusted: bool = True) -> str | None:
+    """A fresh token for *launcher* from ``mem token -l <launcher> -t|-u``, or ``None``.
 
     Never raises and never logs the token: every failure is a silent ``None``.
     """
@@ -65,7 +75,7 @@ def mint(launcher: str) -> str | None:
     env = dict(os.environ)
     env["MEM_CLIENT_TIMEOUT"] = CLIENT_TIMEOUT_S
     result = run_structured(
-        [exe, "token", "-l", launcher, "-t"],
+        [exe, "token", "-l", launcher, "-t" if trusted else "-u"],
         timeout=MINT_TIMEOUT_S,
         max_bytes=8192,
         env=env,
@@ -87,7 +97,10 @@ def mem_env(launcher: str, base: Mapping[str, str] | None = None) -> dict[str, s
     current = os.environ if base is None else base
     if current.get(TOKEN_VAR):
         return {}
-    token = mint(launcher)
+    staff = staff_launcher(current)
+    if staff:
+        launcher = staff
+    token = mint(launcher, trusted=staff is None)
     if not token:
         return {}
     return {TOKEN_VAR: token, LAUNCHER_VAR: launcher}
