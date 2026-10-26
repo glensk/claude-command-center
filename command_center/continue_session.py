@@ -323,7 +323,9 @@ def _target_dir(label: str) -> str:
     return target
 
 
-def _preflight(adapter: ClaudeAdapter, store: Store, src: Source, label: str) -> str:
+def _preflight(
+    adapter: ClaudeAdapter, store: Store, src: Source, label: str, *, dry_run: bool = False
+) -> str:
     """Fail-closed checks before anything is written; returns the target config dir."""
     from . import accounts
 
@@ -337,8 +339,12 @@ def _preflight(adapter: ClaudeAdapter, store: Store, src: Source, label: str) ->
     if not src.config_dir:
         raise StartRefused("could not tell which account this session bills")
     target = _target_dir(label)
-    accounts.ensure_trusted(target, src.cwd)  # the successor must not park on the dialog
-    if not accounts.is_trusted(target, src.cwd):
+    if dry_run:  # writes nothing: report what the real run would establish
+        if not accounts.is_trusted(target, src.cwd):
+            print(f"[dry-run] would trust {src.cwd} for the {label!r} account", file=sys.stderr)
+    else:
+        accounts.ensure_trusted(target, src.cwd)  # the successor must not park on the dialog
+    if not dry_run and not accounts.is_trusted(target, src.cwd):
         raise StartRefused(f"could not confirm {src.cwd} is trusted for the {label!r} account")
     inv = inventory(adapter, store, src)
     if not inv.clear:
@@ -613,7 +619,7 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
         if not doc.ok:
             return _fail(args, src.session_id, "handoff rejected — " + "; ".join(doc.errors))
         try:
-            target_dir = _preflight(adapter, store, src, args.account)
+            target_dir = _preflight(adapter, store, src, args.account, dry_run=args.dry_run)
             candidate = _candidate(store, src, target_dir, args.account, args, doc.sha256)
             print(_account_change_note(src, candidate), file=sys.stderr)
             if args.dry_run:

@@ -592,3 +592,13 @@ def test_llm_routing_lists_the_handoff_summary_purpose() -> None:
     assert "handoff-summary" in llmrouting.PURPOSES
     rows = llmrouting.rows(config.Config(llm_custom_command="ai prompt"))
     assert any(row.purpose == "handoff-summary" and row.enabled for row in rows)
+
+
+def test_dry_run_never_writes_trust(harness: _Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    from command_center import accounts  # pylint: disable=import-outside-toplevel
+
+    def boom(*_a: object) -> bool:
+        raise AssertionError("dry run must not write the trust flag")
+
+    monkeypatch.setattr(accounts, "ensure_trusted", boom)
+    assert harness.start("-n") == 0
