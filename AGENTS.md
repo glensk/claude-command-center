@@ -139,7 +139,8 @@ account **SET** to its configured spelling; `CLAUDE_SECURESTORAGE_CONFIG_DIR` is
 stripped. Use `launch_env` / `apply_to_environ` / `launch_env_prefix` — three renderings of
 that one rule. `accounts.relaunch_command` is the single renderer of the line `switch-now`
 TYPES into a tab — including `switch-account -p/--prompt`'s positional prompt (bare `-p` =
-`cli.SWITCH_CONTINUE_PROMPT`; `/cwork-to-cpriv` sends `-K`, which submits that word only
+`cli.SWITCH_CONTINUE_PROMPT`; `/cwork-to-cpriv-cache-write-hit` sends `-K`, which submits
+that word only
 when the session's work was really interrupted — a usage-limit halt per
 `limitswitch.observe`, or a `-f`'d live turn — so a seat change never turns an idle session
 into a running one): shell-quote there, and reject control characters at BOTH
@@ -244,13 +245,36 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
 7. **The process GROUP is swept on every exit**, leader alive or not, and the heartbeat carries
    `codex_pgid` + `runner_pid` so a consumer's last-resort timeout can kill the group directly.
 
+## The session handoff — `ccc continue-session` (do not regress)
+
+`continue_session.py` + `transfer_store.py` + `handoff_doc.py` + `inflight.py` +
+`handoff_capped.py` (tp#1300; docs/reference.md § "Hand a session to a new one"). Invariants:
+
+- **One in-flight detector.** `inflight.background_work` IS `cli._background_work` (the
+  `switch-account` veto); `inflight.inventory` classifies the same evidence for the handoff.
+  Unknown is never clear.
+- **The successor is NEW**: a draft with a fresh UUID launched through `start-job`
+  (`--session-id`), never `--resume`; `-n` writes nothing (not even the trust flag).
+- **Ownership moves only on `accept`**, from the recorded target session under the recorded
+  account, after EVERY `handoff_hooks` entry succeeded (argv-only, bounded, JSON `"ok":
+  true`); the source is retired only after `accepted` (`finalize`: idempotent session
+  writes first, the `accepted → finalized` CAS last). A `handed_off` session is terminal and
+  refused by `limitswitch`, `resume.py` and the daemon's auto-resume.
+- **The capped-seat summary goes through `llm_custom_command`** (`CCC_LLM_PURPOSE=
+  handoff-summary`, a `llmrouting.PURPOSES` row) — never a provider of ccc's own — and its
+  text passes the same `handoff_doc.validate` (scrub fail-closed) as a model-written one.
+- **ccc stays tracker-free**: ticket ownership moves through the generic, inert
+  `handoff_hooks` key only (public mirror).
+
 ## The `no_codex` job flag (do not regress)
 
 `no_codex` on a session row is a promise that NOTHING in that session reaches the Codex seat.
 `accounts.session_launch_env` (+ `session_apply_to_environ` / `session_launch_env_prefix`) is the
 single place that renders it as `CCC_NO_CODEX=1`; **every** ccc-owned launch/resume surface must
 use one of the three — `start-job`, `resume`, `resume-job`, the TUI `r` + undo-close, `jump`,
-`fire-attached`, the halted-session auto-resume, and snapshot restore. A surface that calls the
+`fire-attached`, the halted-session auto-resume, snapshot restore, and the handoff successor
+of `continue-session start` (its draft carries the source's `no_codex` into `start-job`, on
+the model-written and the `--capped` path alike). A surface that calls the
 bare `accounts.launch_env*` functions silently drops the flag; `tests/test_no_codex.py`
 enumerates them. The flag is never *cleared* — an ambient `CCC_NO_CODEX` is preserved. It is
 mutually exclusive with a `codex`/`codex-write` job type (`models.no_codex_conflict`), refused at
