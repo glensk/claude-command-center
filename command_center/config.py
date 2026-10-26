@@ -354,6 +354,10 @@ DEFAULTS: dict[str, object] = {
     # Cap on SUCCESSFUL automatic switches per session per day (refusals do not count —
     # they carry their own reason-specific backoff).
     "auto_switch_max_per_day": 4,
+    # `ccc continue-session accept` (tp#1300): commands run, argv-only (no shell), when the
+    # successor accepts a handoff; every one must exit 0 with a JSON object on stdout or the
+    # transfer stays `opened`. Placeholders {old} {new} {label} {transfer}. [] = none.
+    "handoff_hooks": [],
     "resume_stagger_sec": 120,  # min seconds between resumes across different repos (anti-herd)
     "resume_poll_sec": 30,  # resume-halted watcher poll interval
     "resume_max_attempts": 3,  # give up auto-resuming a session after this many failed tries
@@ -489,6 +493,7 @@ INERT_DEFAULT_KEYS: tuple[str, ...] = (
     "summarize",  # no summary / next-step LLM regeneration
     "autoprogress",  # no sub-goal auto-derive / auto-check LLM passes
     "verify_subgoals_llm",  # no per-sub-goal LLM verification (already off; kept for the contract)
+    "handoff_hooks",  # no command runs on a continue-session accept ([] = falsy)
 )
 
 
@@ -1144,6 +1149,7 @@ class Config:
     auto_switch_targets: list[str] = field(default_factory=list)
     auto_switch_prompt: str = "continue"
     auto_switch_max_per_day: int = 4
+    handoff_hooks: list[list[str]] = field(default_factory=list)  # continue-session accept
     resume_stagger_sec: int = 120
     resume_poll_sec: int = 30
     resume_max_attempts: int = 3

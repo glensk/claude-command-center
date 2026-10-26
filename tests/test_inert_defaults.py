@@ -5,8 +5,8 @@ A bare ``ccc`` install must spend ZERO LLM tokens, spawn NO external tools
 write ONLY under ``CLAUDE_HOME`` — until the user opts in (a future ``ccc init``
 wizard). This module pins that contract:
 
-* every :data:`config.INERT_DEFAULT_KEYS` member is ``False`` in ``DEFAULTS`` (and the
-  set is exactly the expected one),
+* every :data:`config.INERT_DEFAULT_KEYS` member is falsy (``False`` / ``[]``) in
+  ``DEFAULTS`` (and the set is exactly the expected one),
 * with the default config and a temp ``CLAUDE_HOME``, the hook entry points and one
   daemon pass spawn NOTHING and write nowhere outside ``CLAUDE_HOME``,
 """
@@ -26,37 +26,43 @@ from command_center.store import Store
 
 # The exact inert set, spelled out independently of the module so a drift in either
 # direction (a key added/removed, or a value flipped back to True) fails loudly.
-_EXPECTED_INERT_KEYS = {
-    "future_files",
-    "mirror_running",
-    "mirror_done",
-    "mirror_sessions",
-    "copilot_usage",
+_EXPECTED_INERT_KEYS = {  # alphabetical, unlike config's grouped tuple
+    "agy_usage",
+    "aim_score_on_set",
+    "assess_aim_on_turn",
+    "auto_switch_on_limit",
+    "autoprogress",
     "claude_usage",
     "codex_usage",
-    "agy_usage",
-    "resume_halted",
-    "auto_switch_on_limit",
-    "reap",
-    "short_aim",
-    "aim_score_on_set",
-    "grade_on_turn",
-    "assess_aim_on_turn",
+    "copilot_usage",
     "drift_check",
+    "future_files",
+    "grade_on_turn",
+    "handoff_hooks",
+    "mirror_done",
+    "mirror_running",
+    "mirror_sessions",
+    "reap",
+    "resume_halted",
+    "short_aim",
     "summarize",
-    "autoprogress",
     "verify_subgoals_llm",
 }
 
 
 def test_inert_default_keys_match_and_are_all_false() -> None:
-    """INERT_DEFAULT_KEYS is exactly the expected set and every member defaults False."""
+    """INERT_DEFAULT_KEYS is exactly the expected set and every member defaults OFF.
+
+    OFF is falsy: ``False`` for a switch, ``[]`` for a list of commands (``handoff_hooks``,
+    tp#1300) — either way the fresh install runs nothing.
+    """
     assert set(config.INERT_DEFAULT_KEYS) == _EXPECTED_INERT_KEYS
     assert len(config.INERT_DEFAULT_KEYS) == len(_EXPECTED_INERT_KEYS)  # no dupes
     default_cfg = config.Config()
     for key in config.INERT_DEFAULT_KEYS:
-        assert config.DEFAULTS[key] is False, f"{key} must be False in DEFAULTS (inert contract)"
-        assert getattr(default_cfg, key) is False, f"Config().{key} must default False"
+        assert not config.DEFAULTS[key], f"{key} must be falsy in DEFAULTS (inert contract)"
+        assert not getattr(default_cfg, key), f"Config().{key} must default falsy"
+        assert config.DEFAULTS[key] in (False, []), f"{key}: False or [] only"
 
 
 def _files_outside(root: Path, exclude: Path) -> dict[str, bytes]:

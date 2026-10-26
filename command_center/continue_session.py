@@ -583,7 +583,221 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
         return _drive(store, transfer, src, doc.text, args)
 
 
-_VERBS = {"state": cmd_state, "template": cmd_template, "drain": cmd_drain, "start": cmd_start}
+# ------------------------------------------------------------------ accept / status
+
+
+HOOK_TIMEOUT_SEC = 60
+HOOK_OUTPUT_CAP = 64 * 1024
+_PLACEHOLDERS = ("{old}", "{new}", "{label}", "{transfer}")
+
+
+class HookFailed(Exception):
+    """One ``handoff_hooks`` entry did not succeed; the message says why (no output dump)."""
+
+
+def _render_hook(template: object, transfer: Any) -> list[str]:
+    """Substitute the placeholders into one argv template (plain replace, no format())."""
+    if (
+        not isinstance(template, list)
+        or not template
+        or not all(isinstance(part, str) for part in template)
+    ):
+        raise HookFailed(f"handoff_hooks entry is not a non-empty list of strings: {template!r}")
+    values = {
+        "{old}": transfer.source_session,
+        "{new}": transfer.target_session,
+        "{label}": transfer.target_label,
+        "{transfer}": transfer.transfer_id,
+    }
+    argv = []
+    for part in template:
+        for key in _PLACEHOLDERS:
+            part = part.replace(key, values[key])
+        argv.append(part)
+    return argv
+
+
+def run_hook(template: object, transfer: Any) -> dict[str, Any]:
+    """Run one hook argv-only (no shell), bounded; its parsed JSON object, or HookFailed."""
+    import subprocess
+
+    argv = _render_hook(template, transfer)
+    name = os.path.basename(argv[0])
+    import signal
+
+    try:
+        with subprocess.Popen(  # noqa: S603 - argv from the user's own config, no shell
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,  # its own group: a timeout kills grandchildren too
+        ) as proc:
+            try:
+                stdout, stderr = proc.communicate(timeout=HOOK_TIMEOUT_SEC)
+            except subprocess.TimeoutExpired as exc:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.communicate()
+                raise HookFailed(f"{name}: timed out after {HOOK_TIMEOUT_SEC}s") from exc
+            returncode = proc.returncode
+    except OSError as exc:
+        raise HookFailed(f"{name}: could not run ({exc.strerror or exc})") from exc
+    if len(stdout) > HOOK_OUTPUT_CAP:
+        raise HookFailed(f"{name}: stdout exceeds {HOOK_OUTPUT_CAP} bytes")
+    detail = stderr.decode("utf-8", "replace").strip().splitlines()
+    if returncode != 0:
+        tail = f": {detail[-1][:300]}" if detail else ""
+        raise HookFailed(f"{name}: exit {returncode}{tail}")
+    try:
+        data = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HookFailed(f"{name}: stdout is not JSON") from exc
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        raise HookFailed(f'{name}: JSON is not an object with "ok": true')
+    steps = data.get("next_steps", [])
+    if not isinstance(steps, list) or not all(isinstance(s, str) for s in steps):
+        raise HookFailed(f'{name}: "next_steps" is not a list of strings')
+    if not isinstance(data.get("items", []), list):
+        raise HookFailed(f'{name}: "items" is not a list')
+    return data
+
+
+def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
+    """``continue-session accept``: the successor takes the work over (hooks, then CAS)."""
+    from . import accounts, config
+    from .models import now_ms
+    from .store import Store
+    from .transfer_store import ACCEPTED, FINALIZED, OPENED, PREPARED
+
+    with Store() as store:
+        transfer = store.get_transfer(args.transfer)
+        if transfer is None:
+            print(f"error: no such transfer {args.transfer}", file=sys.stderr)
+            return 1
+        caller = _env_session()
+        if caller != transfer.target_session:
+            print(
+                f"error: accept must run inside the successor session "
+                f"{transfer.target_session}, not {caller or 'an outside shell'}",
+                file=sys.stderr,
+            )
+            return 1
+        if not accounts.same_config_dir(accounts.env_config_dir(), transfer.target_config_dir):
+            print(
+                f"error: this session does not bill the {transfer.target_label!r} account the "
+                "transfer was made for — refusing",
+                file=sys.stderr,
+            )
+            return 1
+        if transfer.state in (ACCEPTED, FINALIZED):
+            print(f"already accepted: transfer {transfer.transfer_id} ({transfer.state})")
+            return 0
+        if transfer.state not in (PREPARED, OPENED):
+            print(
+                f"error: transfer {transfer.transfer_id} is {transfer.state}: "
+                f"{transfer.failure or 'no longer acceptable'}",
+                file=sys.stderr,
+            )
+            return 1
+        steps: list[str] = []
+        try:
+            for template in config.load_config().handoff_hooks:
+                steps += run_hook(template, transfer).get("next_steps", [])
+        except HookFailed as exc:
+            store.note_transfer(transfer.transfer_id, now_ms(), failure=f"hook: {exc}")
+            print(
+                f"error: handoff hook failed — {exc}. The transfer stays {transfer.state} and "
+                "ownership is unchanged; fix the cause and run accept again.",
+                file=sys.stderr,
+            )
+            return 1
+        now = now_ms()
+        store.transition_transfer(transfer.transfer_id, OPENED, now)  # a launcher race
+        if not store.transition_transfer(transfer.transfer_id, ACCEPTED, now):
+            current = store.get_transfer(transfer.transfer_id)
+            if current is None or current.state not in (ACCEPTED, FINALIZED):
+                print(
+                    f"error: transfer {transfer.transfer_id} changed state",
+                    file=sys.stderr,
+                )
+                return 1
+        store.note_transfer(transfer.transfer_id, now, failure="")
+    if args.json:
+        print(json.dumps({"ok": True, "transfer": transfer.transfer_id, "next_steps": steps}))
+    else:
+        print(
+            f"accepted: transfer {transfer.transfer_id} — you now own the work of "
+            f"{transfer.source_session}. Relaunch the subagents and restart the shells the "
+            "handoff lists, then follow its First steps."
+        )
+        for step in steps:
+            print(f"next: {step}")
+    return 0
+
+
+def recovery_step(transfer: Any, target_is_draft: bool) -> str:
+    """The exact next step for *transfer* in its current state."""
+    tid = transfer.transfer_id
+    return {
+        "prepared": "re-run the same `ccc continue-session start` in the source session",
+        "opened": (
+            "re-run the same `ccc continue-session start` in the source session (the "
+            "successor never started; it relaunches it)"
+            if target_is_draft
+            else f"in the successor run `ccc continue-session accept {tid}`; if its tab is "
+            f"gone: `ccc resume {transfer.target_session}` and accept there"
+        ),
+        "accepted": "re-run the same `ccc continue-session start` in the source (it finalizes)",
+        "finalized": "nothing — the handoff is complete",
+        "failed": f"fix the cause ({transfer.failure or '?'}) and start a new transfer",
+    }.get(transfer.state, "?")
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """``continue-session status``: state, snapshot and the recovery step."""
+    from .store import Store
+
+    with Store() as store:
+        if args.transfer:
+            found = store.get_transfer(args.transfer)
+            transfers = [found] if found is not None else []
+        else:
+            sid = args.session or _env_session()
+            transfers = store.transfers_of(sid) if sid else []
+        if not transfers:
+            print("no transfer found", file=sys.stderr)
+            return 1
+        rows = []
+        for transfer in transfers:
+            target = store.get(transfer.target_session)
+            step = recovery_step(transfer, bool(target is not None and target.draft))
+            rows.append({**transfer.to_dict(), "recovery": step})
+    if args.json:
+        print(json.dumps(rows if not args.transfer else rows[0], indent=2))
+        return 0
+    for row in rows:
+        print(
+            f"{row['transfer_id']}  {row['state']:<9}  {row['source_session'][:8]} → "
+            f"{row['target_session'][:8]} ({row['target_label']})"
+        )
+        if row["failure"]:
+            print(f"  last failure: {row['failure']}")
+        print(f"  handoff: {row['handoff_path']}")
+        print(f"  next:    {row['recovery']}")
+    return 0
+
+
+_VERBS = {
+    "state": cmd_state,
+    "template": cmd_template,
+    "drain": cmd_drain,
+    "start": cmd_start,
+    "accept": cmd_accept,
+    "status": cmd_status,
+}
 
 
 def main(args: argparse.Namespace) -> int:
@@ -664,3 +878,14 @@ def add_parser(sub: Any) -> None:
         "-n", "--dry-run", action="store_true", help="print prompt and argv; launch nothing"
     )
     p_start.add_argument("-j", "--json", action="store_true", help="JSON output (dry run)")
+
+    p_accept = verbs.add_parser(
+        "accept", help="(in the successor) take the handed-off work over; runs handoff_hooks"
+    )
+    p_accept.add_argument("transfer", help="the transfer id from the handoff preamble")
+    p_accept.add_argument("-j", "--json", action="store_true", help="JSON output")
+
+    p_status = verbs.add_parser("status", help="a transfer's state and its recovery step")
+    p_status.add_argument("transfer", nargs="?", help="transfer id (default: this session's)")
+    p_status.add_argument("-s", "--session", help="list the transfers of this session id")
+    p_status.add_argument("-j", "--json", action="store_true", help="JSON output")

@@ -340,3 +340,136 @@ def test_start_refuses_an_invalid_handoff(
     assert harness.start() == 1
     assert "missing section" in capsys.readouterr().err
     assert harness.launches == []
+
+
+# ------------------------------------------------------------------ accept / status
+
+
+def _opened_transfer(harness: _Harness) -> str:
+    harness.accept_on_sleep = False
+    assert harness.start("-w", "0") == continue_session.EXIT_WAITING
+    with Store() as store:
+        (transfer,) = store.transfers_of(SID)
+    return transfer.transfer_id
+
+
+def _as_successor(monkeypatch: pytest.MonkeyPatch, harness: _Harness, tid: str) -> str:
+    from command_center import accounts  # pylint: disable=import-outside-toplevel
+
+    with Store() as store:
+        transfer = store.get_transfer(tid)
+    assert transfer is not None
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", transfer.target_session)
+    monkeypatch.setattr(accounts, "env_config_dir", lambda: str(harness.private))
+    return transfer.target_session
+
+
+def _hooks(monkeypatch: pytest.MonkeyPatch, *hooks: list[str]) -> None:
+    from command_center import config  # pylint: disable=import-outside-toplevel
+
+    cfg = config.Config(handoff_hooks=[list(h) for h in hooks])
+    monkeypatch.setattr(config, "load_config", lambda: cfg)
+
+
+def _script(tmp_path: Path, name: str, body: str) -> str:
+    path = tmp_path / name
+    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+    return str(path)
+
+
+def _state(tid: str) -> str:
+    with Store() as store:
+        transfer = store.get_transfer(tid)
+    assert transfer is not None
+    return transfer.state
+
+
+def test_accept_runs_hooks_with_placeholders_then_accepts(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tid = _opened_transfer(harness)
+    new = _as_successor(monkeypatch, harness, tid)
+    log = tmp_path / "argv.log"
+    hook = _script(
+        tmp_path,
+        "hook.sh",
+        f'echo "$@" > {log}\necho \'{{"ok": true, "items": [], "next_steps": ["tp show 1"]}}\'\n',
+    )
+    _hooks(monkeypatch, [hook, "-S", "{old}", "--to", "{new}", "{label}", "{transfer}"])
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    assert log.read_text(encoding="utf-8").split() == ["-S", SID, "--to", new, "private", tid]
+    assert "next: tp show 1" in capsys.readouterr().out
+    assert _state(tid) == "accepted"
+    assert cli.main(["continue-session", "accept", tid]) == 0  # duplicate: idempotent
+    assert _state(tid) == "accepted"
+
+
+@pytest.mark.parametrize(
+    ("body", "why"),
+    [
+        ("exit 3\n", "exit 3"),
+        ("echo not json\n", "not JSON"),
+        ("echo '{\"ok\": false}'\n", '"ok": true'),
+        ("head -c 70000 /dev/zero | tr '\\0' x\n", "exceeds"),
+        ("sleep 5\n", "timed out"),
+    ],
+)
+def test_a_failing_hook_leaves_the_transfer_opened(  # pylint: disable=too-many-positional-arguments
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    body: str,
+    why: str,
+) -> None:
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    monkeypatch.setattr(continue_session, "HOOK_TIMEOUT_SEC", 1)
+    _hooks(monkeypatch, [_script(tmp_path, "bad.sh", body)])
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    assert why in capsys.readouterr().err
+    assert _state(tid) == "opened"
+    with Store() as store:
+        transfer = store.get_transfer(tid)
+        source = store.get(SID)
+    assert transfer is not None and why in transfer.failure
+    assert source is not None and not source.handed_off_to
+
+
+def test_accept_refuses_the_wrong_session_and_the_wrong_account(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from command_center import accounts  # pylint: disable=import-outside-toplevel
+
+    tid = _opened_transfer(harness)
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 1  # still the SOURCE session
+    assert "must run inside the successor" in capsys.readouterr().err
+    _as_successor(monkeypatch, harness, tid)
+    monkeypatch.setattr(accounts, "env_config_dir", lambda: str(harness.work))
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    assert "does not bill" in capsys.readouterr().err
+    assert _state(tid) == "opened"
+    assert cli.main(["continue-session", "accept", "t-missing"]) == 1
+
+
+def test_status_names_the_recovery_step(
+    harness: _Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tid = _opened_transfer(harness)
+    capsys.readouterr()
+    assert cli.main(["continue-session", "status", tid, "-j"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["state"] == "opened" and "relaunches it" in data["recovery"]
+    assert cli.main(["continue-session", "status", "-s", SID]) == 0
+    out = capsys.readouterr().out
+    assert tid in out and "next:" in out
+    assert cli.main(["continue-session", "status", "t-missing"]) == 1

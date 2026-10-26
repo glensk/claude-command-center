@@ -88,6 +88,7 @@ UNMAPPED_INERT: tuple[str, ...] = (
     "codex_usage",
     "agy_usage",
     "auto_switch_on_limit",
+    "handoff_hooks",
 )
 
 #: Anchor keys always written when the user supplies a vault (even if == default).
