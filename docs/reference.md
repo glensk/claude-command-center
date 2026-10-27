@@ -1827,7 +1827,9 @@ names the recovery step for every state.
 shell, 60 s timeout (process group killed), stdout ≤ 64 KB and a JSON object with `"ok":
 true` (`"next_steps"` printed); placeholders `{old}`, `{new}`, `{label}`, `{transfer}`.
 ccc keeps no tracker dependency; a ticket tracker plugs in here, e.g.
-`handoff_hooks = [["tp", "handoff", "-S", "{old}", "--to", "{new}", "-j"]]`.
+`handoff_hooks = [["/path/to/tp.py", "handoff", "-S", "{old}", "--to", "{new}", "-j"]]`.
+argv[0] must be an executable on `PATH` or an absolute path: no shell runs, so a shell
+alias (such as a `tp` alias) is not found and `accept` fails with "could not run".
 
 **A capped seat** cannot run a model turn. The `UserPromptSubmit` intercept
 (`switch_intercept._HANDOFF_COMMANDS` → `handoff_capped.py`) lets a handoff command reach
