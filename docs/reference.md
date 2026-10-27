@@ -385,13 +385,29 @@ three `vim`s and an `htop` spread across four iTerm windows. `ccc snapshot` writ
 *shape* of that desk to a JSON file; after the reboot `ccc restore-snapshot` rebuilds it.
 
 **What is captured.** Every iTerm2 window (its frame and which tab was selected), every
-tab, and each tab's **split topology** — read from `tab.root`'s splitter tree, so pane
+tab with the **title iTerm displays for it** (the shell's/ccc's OSC 1 title, or a tab-level
+"Edit Tab Title" override, flagged as such — not the pane's profile-derived name), and each
+tab's **split topology** — read from `tab.root`'s splitter tree, so pane
 *order* is preserved (`tab.sessions` is unordered and is never used for layout). Per pane
 one of three things:
 
-- **a Claude session** — matched to ccc's own records by the pane UUID first (the
-  `iterm_session_id` ccc already stores), by the live process's tty as a fallback. Stored
-  as its session id **plus the account** (`config_dir`) it was running under.
+- **a Claude session** — matched to Claude Code's live session registry by the pane UUID
+  first (the `iterm_session_id` ccc already stores), then by the live process's tty, then
+  by a registry pid on the pane's foreground process chain — accepted only when that
+  process runs the Claude CLI and its argv names no OTHER session (a registry file can
+  outlive its process, and the pid be reused). When the registry yields
+  nothing (2026-10-27: every Claude pane of two captures was recorded as a plain command,
+  tp#1317), a foreground **`claude`** process is still recorded as a Claude session: its id
+  comes from the exact argv (`--session-id X`, `--resume X`, `-r X`, `=` forms; only before
+  a bare `--`; never with `--fork-session`), else from the open (not done, not archived)
+  ccc store row whose `last_seen_pid` is that process **and** whose tab is this pane — a
+  pid alone is reused and a tab outlives its sessions, so one fact alone names nothing.
+  Stored as its session id **plus the account** (`config_dir`) it
+  was running under and its `no_codex` pin — taken from the row of THAT id only, never
+  from another session's row. `matched` records which join fired (`uuid`, `tty`, `pid`,
+  `argv`, `store`; diagnostic only), and the file's `registry_live` how
+  many live sessions the registry reported. A `claude` with no recoverable id stays a
+  command (restore prints a note).
 - **a command** — the foreground program's **exact `argv`**, read straight out of the
   kernel (`sysctl KERN_PROCARGS2`), never re-parsed from a display string. An **ancestor
   rule** walks up from the foreground process toward the login shell and keeps the
@@ -405,7 +421,8 @@ written `mkstemp` + `os.replace` so a file is never half-written) as
 `<YYYYmmdd-HHMMSS>.json`, with `-2`, `-3` … on a same-second collision. There is no
 `latest.json`: "latest" is resolved as the newest file at restore time. `ccc snapshot -l`
 lists what you have (name, age, window/tab/pane counts, how many are Claude sessions);
-`ccc snapshot -n` prints the capture and its per-pane classification without writing.
+`ccc snapshot -n` prints the capture — tab titles and per-pane classification, with the
+`via <join>` of each Claude pane and the registry's live count — without writing.
 
 **What restore does.** `ccc restore-snapshot` (no argument = the newest snapshot; a bare
 name resolves in the snapshots dir with or without `.json`; anything containing `/` is
@@ -416,6 +433,8 @@ used as a path) prints the snapshot's age, then plans every pane:
 | Claude session, already live | left alone — `already running — skipped` |
 | Claude session, resume blocked | **error** pane: only `cd <cwd>`, with the reason |
 | Claude session, clean | `cd <cwd> && claude --resume <id>`, prefixed with the account pin |
+| legacy `command` pane running `claude` with an id (`--session-id`/`--resume`/`-r`) | upgraded in memory to a Claude session (account + `no_codex` from the ccc store row of that id, else the account of that id's own registry entry unless it is a D9 conflict, else blank) and planned by the three Claude rows above; the file is not rewritten |
+| `claude` with no recoverable id | `cd <cwd>` + a printed note — never re-run, even if `claude` is allowlisted |
 | command on the allowlist | `cd <cwd> && <argv re-quoted element by element>` |
 | command not on the allowlist | `cd <cwd>` + a printed `[ccc-restore] was running: …` note |
 | shell / unreadable argv | `cd <cwd>` (+ the note when we know what ran) |
@@ -429,7 +448,15 @@ or no transcript on disk. So a restore can never bill the wrong seat or exec a d
 Execution is **two-phase**: first the *whole* empty layout is built (windows in order,
 frames best-effort, tabs, then each tab's splits rebuilt recursively — child 0 keeps the
 pane it was handed, each later child is split off the previous one), then every pane
-receives its command and non-Claude panes get their recorded title back. A failure
+receives its command and its title back: a tab-level override is re-applied to the tab
+(`async_set_title` with the override's own interpolated expression,
+`titleOverrideFormat`), any other recorded tab title is written into the tab's first pane
+as OSC 1 (the escape `iterm-set-tabtitle.py` and ccc use, so ccc's later badge updates
+still replace it; C0/C1 control characters stripped) once the typed program has taken
+the foreground — so the shell's own `cd` title hook cannot overwrite it — and a snapshot
+without tab titles falls back to each pane's name, Claude panes included (they run with
+`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`). A title that cannot be set is a `warning:` on
+stderr, never a failed restore. A failure
 half-way therefore leaves a usable, if bare, desk rather than a half-typed one; per-pane
 failures are collected and reported — including a tab iTerm hands back without a
 session, which counts as a failure for each of its panes rather than a silent skip.

@@ -51,15 +51,17 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import argparse
 import asyncio
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 import tempfile
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -142,6 +144,9 @@ class SnapPane:  # pylint: disable=too-many-instance-attributes
     no_codex: bool = False
     argv: list[str] = field(default_factory=list)
     display: str = ""
+    #: How a ``claude`` pane was matched (``uuid``/``tty``/``pid``/``argv``/``store``) —
+    #: a diagnostic only, never used by restore.
+    matched: str = ""
 
 
 @dataclass
@@ -154,9 +159,21 @@ class SnapNode:
 
 @dataclass
 class SnapTab:
-    """One tab — a single pane, or a splitter tree of them."""
+    """One tab — a single pane, or a splitter tree of them.
+
+    ``title`` is the tab's own title as iTerm displayed it (empty in snapshots taken
+    before tp#1317, which then fall back to the pane names); ``title_override`` says it
+    was a tab-level override (iTerm's "Edit Tab Title" / ``tab.async_set_title``), which
+    restore re-applies at tab level — otherwise it came from the shell's OSC 1 title and
+    is restored the same way.
+    """
 
     tree: SnapNode | SnapPane
+    title: str = ""
+    title_override: bool = False
+    #: The override exactly as iTerm stores it (an interpolated string, e.g.
+    #: ``\(session.name)``), so restore sets the same EXPRESSION, not its old value.
+    title_format: str = ""
 
 
 @dataclass
@@ -177,6 +194,23 @@ class PsRow(NamedTuple):
     command: str
 
 
+class StoreRow(NamedTuple):
+    """The ccc store facts about one session that snapshot/restore can use.
+
+    Registry-INDEPENDENT on purpose: ``last_seen_pid`` is written by ccc's own hooks on
+    every turn, so a pane can still be tied to its session when Claude Code's
+    ``sessions/<pid>.json`` registry yields nothing for it (tp#1317).
+    """
+
+    session_id: str
+    config_dir: str = ""
+    no_codex: bool = False
+    iterm_uuid: str = ""  # the UUID tail of ``iterm_session_id``, upper-cased
+    last_seen_pid: int = 0
+    updated_at: int = 0
+    closed: bool = False  # done or archived at capture time
+
+
 ProcArgs = Callable[[int], list[str] | None]
 
 
@@ -186,7 +220,7 @@ ProcArgs = Callable[[int], list[str] | None]
 def pane_to_json(pane: SnapPane) -> dict[str, Any]:
     """Serialize a pane, omitting every empty field (``kind`` is always present)."""
     out: dict[str, Any] = {"kind": pane.kind}
-    for key in ("cwd", "title", "session_id", "config_dir", "display"):
+    for key in ("cwd", "title", "session_id", "config_dir", "display", "matched"):
         value = getattr(pane, key)
         if value:
             out[key] = value
@@ -204,6 +238,18 @@ def node_to_json(node: SnapNode | SnapPane) -> dict[str, Any]:
     return {"split": node.split, "children": [node_to_json(c) for c in node.children]}
 
 
+def tab_to_json(tab: SnapTab) -> dict[str, Any]:
+    """Serialize a tab; ``title``/``title_override`` only when set (old files unchanged)."""
+    out: dict[str, Any] = {"tree": node_to_json(tab.tree)}
+    if tab.title:
+        out["title"] = tab.title
+    if tab.title_override:
+        out["title_override"] = True
+    if tab.title_format:
+        out["title_format"] = tab.title_format
+    return out
+
+
 def windows_to_json(windows: Sequence[SnapWindow], created_at: str) -> dict[str, Any]:
     """The full on-disk document for *windows* (schema v1)."""
     return {
@@ -213,7 +259,7 @@ def windows_to_json(windows: Sequence[SnapWindow], created_at: str) -> dict[str,
             {
                 "frame": list(win.frame) if win.frame else None,
                 "selected_tab": win.selected_tab,
-                "tabs": [{"tree": node_to_json(tab.tree)} for tab in win.tabs],
+                "tabs": [tab_to_json(tab) for tab in win.tabs],
             }
             for win in windows
         ],
@@ -232,6 +278,7 @@ def pane_from_json(data: dict[str, Any]) -> SnapPane:
         no_codex=bool(data.get("no_codex")),
         argv=[str(a) for a in argv],
         display=str(data.get("display") or ""),
+        matched=str(data.get("matched") or ""),
     )
 
 
@@ -259,7 +306,15 @@ def windows_from_json(data: dict[str, Any]) -> list[SnapWindow]:
                 int(frame_raw[2]),
                 int(frame_raw[3]),
             )
-        tabs = [SnapTab(node_from_json(t.get("tree") or {})) for t in raw.get("tabs") or []]
+        tabs = [
+            SnapTab(
+                node_from_json(t.get("tree") or {}),
+                title=str(t.get("title") or ""),
+                title_override=bool(t.get("title_override")),
+                title_format=str(t.get("title_format") or ""),
+            )
+            for t in raw.get("tabs") or []
+        ]
         windows.append(
             SnapWindow(frame=frame, selected_tab=int(raw.get("selected_tab") or 0), tabs=tabs)
         )
@@ -530,6 +585,78 @@ def effective_name(parts: Sequence[str]) -> str:
     return name
 
 
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
+
+#: argv flags that name the session a ``claude`` process runs (``-r`` is ``--resume``).
+_CLAUDE_ID_FLAGS = frozenset({"--session-id", "--resume", "-r"})
+
+
+def is_claude_argv(argv: Sequence[str]) -> bool:
+    """True when *argv* is a Claude Code CLI process.
+
+    Either its effective name is ``claude`` (the PATH launcher) or argv0 is one of the
+    versioned binaries under ``…/claude/versions/<version>``.
+    """
+    if not argv:
+        return False
+    if effective_name(argv) == "claude":
+        return True
+    parent = os.path.dirname(argv[0])
+    return (
+        os.path.basename(parent) == "versions"
+        and os.path.basename(os.path.dirname(parent)) == "claude"
+    )
+
+
+def claude_argv_session_id(argv: Sequence[str]) -> str:
+    """The session id a ``claude`` argv names, or ``""``.
+
+    ``--session-id X`` / ``--resume X`` / ``-r X`` (and their ``=`` forms), read only
+    before a bare ``--`` (everything after it is the prompt) and only when X is
+    UUID-shaped — a bare ``--resume`` opens the picker. ``--fork-session`` makes the
+    named id the PARENT of a new session, so it yields ``""``.
+    """
+    if not is_claude_argv(argv):
+        return ""
+    found = ""
+    args = list(argv[1:])
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if arg == "--fork-session":
+            return ""
+        key, eq, value = arg.partition("=")
+        if key in _CLAUDE_ID_FLAGS:
+            if not eq:
+                value = args[index + 1] if index + 1 < len(args) else ""
+                if _UUID_RE.match(value):
+                    index += 1
+            if _UUID_RE.match(value):
+                found = value
+        index += 1
+    return found
+
+
+def iterm_uuid(value: str | None) -> str:
+    """The pane UUID of an ``iterm_session_id`` (``w0t2p0:UUID`` → ``UUID``), upper-cased."""
+    return (value or "").split(":")[-1].strip().upper()
+
+
+def store_row(session: Any) -> StoreRow:
+    """A :class:`StoreRow` from a ccc store ``Session`` (duck-typed, defaults when absent)."""
+    return StoreRow(
+        session_id=str(getattr(session, "session_id", "") or ""),
+        config_dir=str(getattr(session, "config_dir", "") or ""),
+        no_codex=bool(getattr(session, "no_codex", False)),
+        iterm_uuid=iterm_uuid(getattr(session, "iterm_session_id", "")),
+        last_seen_pid=int(getattr(session, "last_seen_pid", 0) or 0),
+        updated_at=int(getattr(session, "updated_at", 0) or 0),
+        closed=bool(getattr(session, "done", False) or getattr(session, "archived", False)),
+    )
+
+
 def ancestors(ps_rows: dict[int, PsRow], pid: int) -> list[int]:
     """*pid*'s ancestor pids, parent first, stopping at pid 1 / a cycle / an unknown pid."""
     out: list[int] = []
@@ -639,48 +766,164 @@ def allowlisted_ancestor(
     return best
 
 
-def _live_pane_index(
-    live: Sequence[LiveSession], store_rows: dict[str, str], ps_rows: dict[int, PsRow]
-) -> tuple[dict[str, LiveSession], dict[str, LiveSession]]:
-    """Two lookup tables for Claude panes: by iTerm pane uuid, and by tty."""
-    by_uuid: dict[str, LiveSession] = {}
-    by_tty: dict[str, LiveSession] = {}
+@dataclass
+class PaneIndex:  # pylint: disable=too-many-instance-attributes
+    """Every lookup table that ties an iTerm pane to a Claude session.
+
+    The ``live`` tables come from Claude Code's own ``sessions/<pid>.json`` registry;
+    the ``store`` tables come from ccc's store and do NOT depend on that registry
+    (tp#1317: on 2026-10-27 every Claude pane missed the registry joins and was recorded
+    as a plain command).
+    """
+
+    by_uuid: dict[str, LiveSession] = field(default_factory=dict)
+    by_tty: dict[str, LiveSession] = field(default_factory=dict)
+    by_pid: dict[int, LiveSession] = field(default_factory=dict)
+    by_id: dict[str, LiveSession] = field(default_factory=dict)
+    store_by_id: dict[str, StoreRow] = field(default_factory=dict)
+    #: Open (not done/archived) rows by ``(last_seen_pid, pane uuid)`` — two current facts.
+    store_by_pid_uuid: dict[tuple[int, str], StoreRow] = field(default_factory=dict)
+
+
+def _newest(table: dict[Any, StoreRow], key: Any, row: StoreRow) -> None:
+    """Keep the most recently updated *row* for *key* in *table*."""
+    current = table.get(key)
+    if current is None or row.updated_at > current.updated_at:
+        table[key] = row
+
+
+def pane_index(
+    live: Sequence[LiveSession],
+    store_rows: dict[str, str],
+    ps_rows: dict[int, PsRow],
+    store_info: Sequence[StoreRow] | None = None,
+) -> PaneIndex:
+    """Build the :class:`PaneIndex` for one capture.
+
+    Live tables: by pane uuid (via the store's ``iterm_session_id``), by the registry
+    pid's tty, by the registry pid itself and by session id. Store tables: every row by
+    id, and the rows that are neither done nor archived by ``(last_seen_pid, pane uuid)``
+    — a pid alone is reused once its session ends and a pane outlives its sessions, so
+    only both together name the session running there now (newest wins a tie).
+    """
+    index = PaneIndex()
     for session in live:
         if not session.alive:
             continue
-        uuid = (store_rows.get(session.session_id) or "").split(":")[-1].strip().upper()
+        uuid = iterm_uuid(store_rows.get(session.session_id))
         if uuid:
-            by_uuid.setdefault(uuid, session)
+            index.by_uuid.setdefault(uuid, session)
+        if session.pid > 0:
+            index.by_pid.setdefault(session.pid, session)
+        index.by_id.setdefault(session.session_id, session)
         row = ps_rows.get(session.pid)
         if row is not None and row.tty:
-            by_tty.setdefault(row.tty, session)
-    return by_uuid, by_tty
+            index.by_tty.setdefault(row.tty, session)
+    for info in store_info or ():
+        if not info.session_id:
+            continue
+        index.store_by_id[info.session_id] = info
+        if info.closed:
+            continue
+        if info.last_seen_pid > 0 and info.iterm_uuid:
+            _newest(index.store_by_pid_uuid, (info.last_seen_pid, info.iterm_uuid), info)
+    return index
+
+
+def _live_claude_pane(session: LiveSession, index: PaneIndex, title: str, matched: str) -> SnapPane:
+    """A ``claude`` pane from a live registry session.
+
+    The registry carries no Codex opt-out, so ``no_codex`` comes from the session's own
+    store row — a restored pane must come back with the ``CCC_NO_CODEX`` pin it had.
+    """
+    info = index.store_by_id.get(session.session_id)
+    return SnapPane(
+        kind="claude",
+        cwd=session.cwd,
+        title=title,
+        session_id=session.session_id,
+        config_dir=session.config_dir,
+        no_codex=info.no_codex if info else bool(getattr(session, "no_codex", False)),
+        matched=matched,
+    )
+
+
+def _pane_chain(ps_rows: dict[int, PsRow], pid: int, shell_pid: int | None) -> list[int]:
+    """*pid* and its ancestors up to (not including) the pane's login shell."""
+    chain: list[int] = []
+    for candidate in [pid, *ancestors(ps_rows, pid)]:
+        row = ps_rows.get(candidate)
+        if candidate == shell_pid or row is None or is_shell_command(row.command):
+            break
+        chain.append(candidate)
+    return chain
+
+
+def _claude_from_argv(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    chain: Sequence[int],
+    args_of: ProcArgs,
+    index: PaneIndex,
+    uuid: str,
+    title: str,
+    cwd_of: Callable[[int], str],
+) -> SnapPane | None:
+    """A ``claude`` pane for a pane whose foreground chain runs the Claude CLI, if an id
+    can be recovered without the registry: argv, else the open store row whose
+    ``last_seen_pid`` IS this claude process AND whose tab is this pane. ``None`` = no
+    claude, or no trustworthy id. Account and Codex opt-out always come from the row of
+    the RECOVERED id (or its live registry entry), never from another session's row.
+    """
+    claude_pid = 0
+    argv: list[str] = []
+    for pid in chain:
+        argv = args_of(pid) or []
+        if is_claude_argv(argv):
+            claude_pid = pid
+            break
+    if not claude_pid:
+        return None
+    session_id, matched = claude_argv_session_id(argv), "argv"
+    if not session_id and (claude_pid, uuid) in index.store_by_pid_uuid:
+        session_id, matched = index.store_by_pid_uuid[(claude_pid, uuid)].session_id, "store"
+    if not session_id:
+        return None
+    live = index.by_id.get(session_id)
+    if live is not None:
+        return _live_claude_pane(live, index, title, matched)
+    info = index.store_by_id.get(session_id)
+    return SnapPane(
+        kind="claude",
+        cwd=cwd_of(claude_pid),
+        title=title,
+        session_id=session_id,
+        config_dir=info.config_dir if info else "",
+        no_codex=info.no_codex if info else False,
+        matched=matched,
+    )
 
 
 def _classify_pane(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
     raw: dict[str, Any],
-    by_uuid: dict[str, LiveSession],
-    by_tty: dict[str, LiveSession],
+    index: PaneIndex,
     ps_rows: dict[int, PsRow],
     args_of: ProcArgs,
     cwds: dict[int, str],
     excluded: set[int],
     allowlist: Sequence[str],
 ) -> SnapPane:
-    """Turn one RAW pane dict into a :class:`SnapPane` (see the module docstring)."""
+    """Turn one RAW pane dict into a :class:`SnapPane` (see the module docstring).
+
+    Claude match order: registry session by pane uuid, by tty, by a registry pid on the
+    pane's foreground chain; then — registry-independent — a ``claude`` foreground whose
+    id comes from its argv or the ccc store (:func:`_claude_from_argv`).
+    """
     title = str(raw.get("name") or "")
     tty = normalize_tty(raw.get("tty"))
     uuid = str(raw.get("uuid") or "").strip().upper()
-    session = by_uuid.get(uuid) or (by_tty.get(tty) if tty else None)
-    if session is not None:
-        return SnapPane(
-            kind="claude",
-            cwd=session.cwd,
-            title=title,
-            session_id=session.session_id,
-            config_dir=session.config_dir,
-            no_codex=bool(getattr(session, "no_codex", False)),
-        )
+    if uuid in index.by_uuid:
+        return _live_claude_pane(index.by_uuid[uuid], index, title, "uuid")
+    if tty and tty in index.by_tty:
+        return _live_claude_pane(index.by_tty[tty], index, title, "tty")
 
     shell_pid = shell_pid_for_tty(ps_rows, tty) if tty else None
     job_pid = raw.get("job_pid")
@@ -694,6 +937,28 @@ def _classify_pane(  # pylint: disable=too-many-arguments,too-many-positional-ar
     if row is None or is_shell_command(row.command):
         cwd = cwds.get(candidate, "") or shell_cwd or fallback_cwd
         return SnapPane(kind="shell", cwd=cwd, title=title)
+
+    chain = _pane_chain(ps_rows, candidate, shell_pid)
+    for pid in chain:
+        session = index.by_pid.get(pid)
+        if session is None:
+            continue
+        # A registry file can outlive its process and the pid be reused: only a Claude
+        # CLI process whose argv does not name ANOTHER session may claim the entry.
+        pid_argv = args_of(pid) or []
+        named = claude_argv_session_id(pid_argv)
+        if is_claude_argv(pid_argv) and named in ("", session.session_id):
+            return _live_claude_pane(session, index, title, "pid")
+    claude = _claude_from_argv(
+        chain,
+        args_of,
+        index,
+        uuid,
+        title,
+        lambda pid: cwds.get(pid, "") or shell_cwd or fallback_cwd,
+    )
+    if claude is not None:
+        return claude
 
     chosen = allowlisted_ancestor(ps_rows, candidate, shell_pid, allowlist)
     chosen_row = ps_rows.get(chosen) or row
@@ -722,6 +987,19 @@ def _classify_tree(
     )
 
 
+def _override_format(raw_tab: dict[str, Any]) -> str:
+    r"""The interpolated-string form of a RAW tab's title override (``""`` without one).
+
+    iTerm keeps the expression in ``titleOverrideFormat``; when only the evaluated
+    ``titleOverride`` is known it is escaped into a literal (``\`` → ``\\``).
+    """
+    raw = str(raw_tab.get("title_format") or "")
+    if raw:
+        return raw
+    value = str(raw_tab.get("title_override") or "")
+    return value.replace("\\", "\\\\")
+
+
 def build_snapshot(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     raw_windows: Sequence[dict[str, Any]],
     live: Sequence[LiveSession],
@@ -732,20 +1010,22 @@ def build_snapshot(  # pylint: disable=too-many-arguments,too-many-positional-ar
     own_pid: int,
     allowlist: Sequence[str] | None = None,
     created_at: str | None = None,
+    store_info: Sequence[StoreRow] | None = None,
 ) -> dict[str, Any]:
     """Classify a RAW iTerm layout walk into the on-disk snapshot document (schema v1).
 
     Pure: every OS fact arrives as an argument — the raw tree from the iTerm collector,
     the live Claude registry (*live* + *store_rows*, ``session_id → iterm_session_id``),
     one ``ps`` pass, an ``argv`` reader, the batched ``lsof`` cwds, and this process's own
-    pid so its own pane is not recorded as running ``ccc snapshot``.
+    pid so its own pane is not recorded as running ``ccc snapshot``. *store_info* (the ccc
+    store's rows, :class:`StoreRow`) adds the registry-independent ``claude`` joins.
     """
     names = list(allowlist) if allowlist is not None else list(DEFAULT_RESTORE_COMMANDS)
-    by_uuid, by_tty = _live_pane_index(live, store_rows, ps_rows)
+    index = pane_index(live, store_rows, ps_rows, store_info)
     excluded = own_subtree(ps_rows, own_pid)
 
     def classify(raw: dict[str, Any]) -> SnapPane:
-        return _classify_pane(raw, by_uuid, by_tty, ps_rows, args_of, cwds, excluded, names)
+        return _classify_pane(raw, index, ps_rows, args_of, cwds, excluded, names)
 
     windows: list[SnapWindow] = []
     for raw_window in raw_windows:
@@ -759,7 +1039,12 @@ def build_snapshot(  # pylint: disable=too-many-arguments,too-many-positional-ar
                 int(frame_raw[3]),
             )
         tabs = [
-            SnapTab(_classify_tree(tab.get("tree") or {}, classify))
+            SnapTab(
+                _classify_tree(tab.get("tree") or {}, classify),
+                title=str(tab.get("title") or tab.get("title_override") or ""),
+                title_override=bool(tab.get("title_override") or tab.get("title_format")),
+                title_format=_override_format(tab),
+            )
             for tab in raw_window.get("tabs") or []
         ]
         windows.append(
@@ -920,7 +1205,7 @@ def load_snapshot(path: Path) -> dict[str, Any]:
 # Restore planning (pure)
 # --------------------------------------------------------------------------- #
 @dataclass
-class PaneAction:
+class PaneAction:  # pylint: disable=too-many-instance-attributes
     """What restore will do to one rebuilt pane.
 
     ``command`` is the single shell line typed into the fresh pane (``None`` = nothing
@@ -936,6 +1221,14 @@ class PaneAction:
     kind: str = ""
     title: str = ""
     cwd: str = ""
+    #: Set on the FIRST pane of a tab whose snapshot recorded the tab's own title;
+    #: ``tab_title_format`` is the override expression to set back (override tabs only).
+    tab_title: str = ""
+    tab_title_override: bool = False
+    tab_title_format: str = ""
+    #: The live iTerm tab, attached by :func:`_build_window` to that first pane (runtime
+    #: only — never part of the pure plan's equality or repr).
+    tab: Any = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -951,6 +1244,8 @@ class TabPlan:
     """One tab of the restore plan."""
 
     tree: PlanNode | PaneAction
+    title: str = ""
+    title_override: bool = False
 
 
 @dataclass
@@ -1034,7 +1329,9 @@ def _pane_action(  # pylint: disable=too-many-return-statements
     if pane.kind == "command" and pane.argv:
         # effective_name sees through a `#!`-script's interpreter (python3 …/bin/ccc ->
         # "ccc"); what gets re-run is still the FULL exact argv, quoted element by element.
-        if effective_name(pane.argv) in set(allowlist):
+        # A Claude CLI argv is NEVER re-run, allowlisted or not: re-running it would start
+        # a new session (or re-send a launch prompt) — only a recovered id resumes.
+        if effective_name(pane.argv) in set(allowlist) and not is_claude_argv(pane.argv):
             return _action(pane, cd + " && " + " ".join(shlex.quote(a) for a in pane.argv))
         was = pane.display or " ".join(pane.argv)
         printf = f"printf '%s\\n' {shlex.quote(RESTORE_NOTE_PREFIX + was)}"
@@ -1046,11 +1343,50 @@ def _pane_action(  # pylint: disable=too-many-return-statements
     return _action(pane, cd)
 
 
+def upgrade_legacy_pane(pane: SnapPane, store: Mapping[str, StoreRow]) -> SnapPane:
+    """Plan a ``command`` pane that ran the Claude CLI with a session id as that session.
+
+    Snapshots taken before tp#1317 recorded live Claude panes whose registry join failed
+    as plain commands (``claude --session-id <id> -- …``, ``claude --resume <id>``).
+    Their argv still names the session, so restore resumes it; the account and Codex
+    opt-out come from the ccc store row (*store*), else stay blank — and a blank account
+    with several configured is refused by :func:`core.resume_blockers` as usual. A claude
+    argv without an id is left alone (it restores as a note).
+    """
+    if pane.kind != "command" or not pane.argv:
+        return pane
+    session_id = claude_argv_session_id(pane.argv)
+    if not session_id:
+        return pane
+    info = store.get(session_id)
+    return SnapPane(
+        kind="claude",
+        cwd=pane.cwd,
+        title=pane.title,
+        session_id=session_id,
+        config_dir=info.config_dir if info else "",
+        no_codex=info.no_codex if info else False,
+        matched="argv",
+    )
+
+
+def _tab_plan(tree: PlanNode | PaneAction, tab: SnapTab) -> TabPlan:
+    """A :class:`TabPlan` whose first pane carries the tab's recorded title (if any)."""
+    if tab.title:
+        first = iter_actions(tree)[0]
+        first.tab_title = tab.title
+        first.tab_title_override = tab.title_override
+        first.tab_title_format = tab.title_format or tab.title.replace("\\", "\\\\")
+    return TabPlan(tree, title=tab.title, title_override=tab.title_override)
+
+
 def build_plan(
     snapshot: dict[str, Any],
     live_ids: set[str],
     blockers: Blockers,
     allowlist: Sequence[str],
+    *,
+    store: Mapping[str, StoreRow] | None = None,
 ) -> list[WindowPlan]:
     """Turn a loaded snapshot into per-window/tab/pane actions. Pure except ``isdir``.
 
@@ -1059,13 +1395,16 @@ def build_plan(
     an error); a Claude session with :func:`core.resume_blockers` reasons becomes an
     **error** pane that only ``cd``s; a clean Claude session is resumed on its own
     account; an allowlisted command is re-run from its exact argv; anything else prints
-    a ``[ccc-restore] was running: …`` note into a shell at the cwd.
+    a ``[ccc-restore] was running: …`` note into a shell at the cwd. A legacy ``command``
+    pane that ran ``claude`` with a session id is first upgraded to a Claude pane
+    (:func:`upgrade_legacy_pane`, account from *store*).
     """
     names = list(allowlist)
+    rows = store or {}
 
     def convert(node: SnapNode | SnapPane) -> PlanNode | PaneAction:
         if isinstance(node, SnapPane):
-            return _pane_action(node, live_ids, blockers, names)
+            return _pane_action(upgrade_legacy_pane(node, rows), live_ids, blockers, names)
         return PlanNode(split=node.split, children=[convert(c) for c in node.children])
 
     plan: list[WindowPlan] = []
@@ -1074,7 +1413,7 @@ def build_plan(
             WindowPlan(
                 frame=window.frame,
                 selected_tab=window.selected_tab,
-                tabs=[TabPlan(convert(tab.tree)) for tab in window.tabs],
+                tabs=[_tab_plan(convert(tab.tree), tab) for tab in window.tabs],
             )
         )
     return plan
@@ -1126,6 +1465,28 @@ async def _read_tree(node: Any) -> dict[str, Any]:
     }
 
 
+async def _read_tab(tab: Any) -> dict[str, Any]:
+    """RAW facts for one tab: its splitter tree plus the title iTerm displays for it.
+
+    ``title`` is the tab's displayed title (what the user sees — usually the shell's or
+    ccc's OSC 1 title, NOT the pane's profile-derived ``name``); ``title_override`` is
+    set only when the tab was renamed at tab level.
+    """
+
+    async def var(name: str) -> str:
+        try:
+            return str(await tab.async_get_variable(name) or "")
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            return ""
+
+    return {
+        "tree": await _read_tree(tab.root),
+        "title": await var("title"),
+        "title_override": await var("titleOverride"),
+        "title_format": await var("titleOverrideFormat"),
+    }
+
+
 async def _read_window(window: Any) -> dict[str, Any]:
     """RAW facts for one iTerm window: frame, selected-tab index and its tab trees."""
     frame: list[int] | None = None
@@ -1149,7 +1510,7 @@ async def _read_window(window: Any) -> dict[str, Any]:
     return {
         "frame": frame,
         "selected_tab": selected,
-        "tabs": [{"tree": await _read_tree(tab.root)} for tab in tabs],
+        "tabs": [await _read_tab(tab) for tab in tabs],
     }
 
 
@@ -1254,7 +1615,10 @@ async def _build_window(
                         f"session for tab {index + 1}"
                     )
             continue
-        leaves.extend(await layout_tree(tab_plan.tree, session, _split_pane))
+        tab_leaves = await layout_tree(tab_plan.tree, session, _split_pane)
+        if tab_leaves:
+            tab_leaves[0][0].tab = tab  # the tab-title setter needs the live tab
+        leaves.extend(tab_leaves)
     return window, leaves, failures
 
 
@@ -1264,6 +1628,7 @@ _SHELL_NAMES = frozenset({"zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh", "c
 _SHELL_POLL_SECONDS = 0.25
 _SHELL_STABLE_POLLS = 3
 _SHELL_WAIT_TIMEOUT = 20.0
+_TITLE_WAIT_TIMEOUT = 10.0
 
 
 def is_shell_job(job_name: str | None) -> bool:
@@ -1298,8 +1663,70 @@ async def _await_shell(session: Any, timeout: float | None = None) -> bool:
     return False
 
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # C0, DEL and C1 (incl. ST)
+
+
+def osc_title(title: str) -> bytes:
+    """The OSC 1 (tab/icon title) sequence for *title*, control characters stripped.
+
+    The same escape ``iterm-set-tabtitle.py`` and ccc's own title push write, so a
+    restored title is set the way the original was and ccc's later badge updates still
+    replace it normally.
+    """
+    return f"\033]1;{_CONTROL_CHARS.sub('', title)}\007".encode()
+
+
+async def _restore_title(action: PaneAction, session: Any) -> None:
+    """Re-apply a pane's title (cosmetic — any failure is swallowed by the caller).
+
+    A recorded tab title wins: a tab-level override goes back on the tab
+    (``async_set_title``, backslashes escaped because iTerm interpolates it), any other
+    tab title is injected as OSC 1 into the tab's first pane. A snapshot without tab
+    titles falls back to the pane's own name — for Claude panes too, which launch with
+    ``CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`` and so never overwrite it.
+    """
+    if action.tab_title and action.tab_title_override and action.tab is not None:
+        await action.tab.async_set_title(action.tab_title_format)
+    elif action.tab_title:
+        await session.async_inject(osc_title(action.tab_title))
+    elif action.title:
+        await session.async_set_name(action.title)
+
+
+async def _await_program(session: Any, timeout: float | None = None) -> bool:
+    """Wait until the typed command has taken the foreground (``jobName`` not a shell).
+
+    The shell's own title hooks run while it processes ``cd … &&``; an OSC title
+    injected before the program starts would be overwritten by them. A pane whose
+    command never leaves the shell (a bare ``cd``) times out and is titled anyway.
+    """
+    limit = _TITLE_WAIT_TIMEOUT if timeout is None else timeout
+    waited = 0.0
+    while waited < limit:
+        try:
+            job = await session.async_get_variable("jobName")
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            return False
+        if job and not is_shell_job(job):
+            return True
+        await asyncio.sleep(_SHELL_POLL_SECONDS)
+        waited += _SHELL_POLL_SECONDS
+    return False
+
+
+async def _title_pane(action: PaneAction, session: Any) -> str:
+    """Restore one pane's title once its command runs; ``""`` or a warning line."""
+    if action.command and action.tab_title and not action.tab_title_override:
+        await _await_program(session, 0.0 if action.kind == "shell" else None)
+    try:
+        await _restore_title(action, session)
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return f"title of the {action.kind} pane in {action.cwd or '?'} not restored: {exc}"
+    return ""
+
+
 async def _deliver(leaves: Sequence[tuple[PaneAction, Any]]) -> list[str]:
-    """Phase 2: type each pane's command, restore non-claude names; collect failures.
+    """Phase 2: type each pane's command, restore its title; collect failures.
 
     Every pane that gets a command is first awaited to a quiet shell — concurrently, so
     a window of many tabs waits for its slowest startup once, not per tab.
@@ -1313,11 +1740,11 @@ async def _deliver(leaves: Sequence[tuple[PaneAction, Any]]) -> list[str]:
             except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
                 failures.append(f"{action.kind} pane in {action.cwd or '?'}: {exc}")
                 continue
-        if action.title and action.kind != "claude":
-            try:
-                await session.async_set_name(action.title)
-            except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-                pass  # a pane title is cosmetic — never fail a restore over it
+    # Titles last, concurrently: each waits for its own pane's program to start. A title is
+    # cosmetic, so a failure is a warning on stderr — never a failed restore.
+    for warning in await asyncio.gather(*(_title_pane(a, s) for a, s in leaves)):
+        if warning:
+            print(f"warning: {warning}", file=sys.stderr)
     return failures
 
 
@@ -1385,11 +1812,19 @@ def _connect(coro_factory: Callable[[Any], Awaitable[Any]]) -> Any:
 def pane_summary(pane: SnapPane) -> str:
     """One-line description of a captured pane (``snapshot -n`` / ``--list``)."""
     if pane.kind == "claude":
-        return f"claude   {pane.session_id[:8]}  {pane.cwd or '?'}"
+        via = f"  (via {pane.matched})" if pane.matched else ""
+        return f"claude   {pane.session_id[:8]}  {pane.cwd or '?'}{via}"
     if pane.kind == "command":
         return f"command  {' '.join(pane.argv)}  [{pane.cwd or '?'}]"
     extra = f"  (was: {pane.display})" if pane.display else ""
     return f"shell    {pane.cwd or '?'}{extra}"
+
+
+def _title_suffix(title: str, override: bool) -> str:
+    """`  "<title>"` (+ ` [tab override]`) for a tab line, or ``""`` without a title."""
+    if not title:
+        return ""
+    return f'  "{title}"' + ("  [tab override]" if override else "")
 
 
 def describe_snapshot(data: dict[str, Any]) -> list[str]:
@@ -1400,7 +1835,10 @@ def describe_snapshot(data: dict[str, Any]) -> list[str]:
         lines.append(f"window {windex}  frame [{frame}]  selected tab {window.selected_tab + 1}")
         for tindex, tab in enumerate(window.tabs, start=1):
             panes = iter_panes(tab.tree)
-            lines.append(f"  tab {tindex}  ({len(panes)} pane{'s' if len(panes) != 1 else ''})")
+            lines.append(
+                f"  tab {tindex}  ({len(panes)} pane{'s' if len(panes) != 1 else ''})"
+                + _title_suffix(tab.title, tab.title_override)
+            )
             for pane in panes:
                 lines.append(f"    {pane_summary(pane)}")
     return lines
@@ -1414,7 +1852,10 @@ def describe_plan(plan: Sequence[WindowPlan]) -> list[str]:
         lines.append(f"window {windex}  frame [{frame}]  selected tab {window.selected_tab + 1}")
         for tindex, tab in enumerate(window.tabs, start=1):
             actions = iter_actions(tab.tree)
-            lines.append(f"  tab {tindex}  ({len(actions)} pane{'s' if len(actions) != 1 else ''})")
+            lines.append(
+                f"  tab {tindex}  ({len(actions)} pane{'s' if len(actions) != 1 else ''})"
+                + _title_suffix(tab.title, tab.title_override)
+            )
             for action in actions:
                 mark = "!" if action.error else ("-" if action.skipped else "+")
                 lines.append(f"    {mark} {action.command or '(nothing to run)'}")
@@ -1424,11 +1865,15 @@ def describe_plan(plan: Sequence[WindowPlan]) -> list[str]:
 
 
 def snapshot_counts(data: dict[str, Any]) -> tuple[int, int, int, int]:
-    """``(windows, tabs, panes, claude panes)`` of a snapshot document."""
+    """``(windows, tabs, panes, claude panes)`` of a snapshot document.
+
+    A legacy ``command`` pane that restore upgrades to a Claude resume
+    (:func:`upgrade_legacy_pane`) counts as a Claude pane too.
+    """
     windows = windows_from_json(data)
     tabs = sum(len(w.tabs) for w in windows)
     panes = [p for w in windows for t in w.tabs for p in iter_panes(t.tree)]
-    claude = sum(1 for p in panes if p.kind == "claude")
+    claude = sum(1 for p in panes if upgrade_legacy_pane(p, {}).kind == "claude")
     return (len(windows), tabs, len(panes), claude)
 
 
@@ -1460,7 +1905,8 @@ def _capture() -> dict[str, Any]:
     raw_windows = _connect(collect_raw)
     live = [s for s in ClaudeAdapter().discover() if s.alive]
     with Store() as store:
-        store_rows = {s.session_id: (s.iterm_session_id or "") for s in store.list_sessions(True)}
+        sessions = store.list_sessions(True)
+    store_rows = {s.session_id: (s.iterm_session_id or "") for s in sessions}
     ps_rows = read_ps()
     # One lsof for every pid, unless the machine is busy enough that the argv list would
     # get unwieldy — then only the processes attached to a terminal can matter anyway.
@@ -1469,7 +1915,7 @@ def _capture() -> dict[str, Any]:
     else:
         pids = {pid for pid, row in ps_rows.items() if row.tty}
     cwds = read_cwds(sorted(pids))
-    return build_snapshot(
+    data = build_snapshot(
         raw_windows,
         live,
         store_rows,
@@ -1478,7 +1924,12 @@ def _capture() -> dict[str, Any]:
         cwds,
         os.getpid(),
         allowlist=restore_commands(config.load_config()),
+        store_info=[store_row(s) for s in sessions],
     )
+    # Diagnostic only (restore ignores it): how many live sessions Claude Code's registry
+    # reported, so a capture that matched no Claude pane shows whether it was empty.
+    data["registry_live"] = len(live)
+    return data
 
 
 def _list_snapshots() -> int:
@@ -1522,11 +1973,17 @@ def run_snapshot(args: argparse.Namespace) -> int:
     if getattr(args, "dry_run", False):
         for line in describe_snapshot(data):
             print(line)
-        print(f"dry run — {windows} window(s), {tabs} tab(s), {panes} pane(s), {claude} claude")
+        print(
+            f"dry run — {windows} window(s), {tabs} tab(s), {panes} pane(s), {claude} claude "
+            f"(registry: {data.get('registry_live', '?')} live)"
+        )
         return 0
     path = write_snapshot(data)
     print(local_link(path))
-    print(f"saved {windows} window(s), {tabs} tab(s), {panes} pane(s), {claude} claude session(s)")
+    print(
+        f"saved {windows} window(s), {tabs} tab(s), {panes} pane(s), {claude} claude "
+        f"session(s) (registry: {data.get('registry_live', '?')} live)"
+    )
     return 0
 
 
@@ -1585,8 +2042,18 @@ def run_restore(args: argparse.Namespace) -> int:
     if loaded is None:
         return 1
     _print_restore_header(*loaded)
-    live_ids = {s.session_id for s in ClaudeAdapter().discover() if s.alive}
-    plan = build_plan(loaded[1], live_ids, core.resume_blockers, restore_commands(cfg))
+    from .store import Store  # pylint: disable=import-outside-toplevel
+
+    discovered = ClaudeAdapter().discover()
+    live_ids = {s.session_id for s in discovered if s.alive}
+    with Store() as store:
+        rows = {s.session_id: store_row(s) for s in store.list_sessions(True)}
+    # A session ccc never stored can still name its account through its OWN registry
+    # entry (dead or alive) — never a D9 conflict, never another id's.
+    for entry in discovered:
+        if entry.session_id not in rows and entry.config_dir and not entry.conflict:
+            rows[entry.session_id] = StoreRow(entry.session_id, config_dir=entry.config_dir)
+    plan = build_plan(loaded[1], live_ids, core.resume_blockers, restore_commands(cfg), store=rows)
     actions = plan_actions(plan)
     if getattr(args, "dry_run", False):
         for line in describe_plan(plan):

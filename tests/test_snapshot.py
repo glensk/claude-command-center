@@ -252,6 +252,162 @@ def test_dead_live_entries_are_not_matched() -> None:
     assert _panes(data)[0].kind != "claude"
 
 
+# The 2026-10-27 shapes (tp#1317): every Claude pane below is LIVE, but Claude Code's
+# registry yields nothing for it — the capture must still record it as a claude pane.
+_SID_NEW = "3249fd97-06b2-4c9c-a47a-5934c4afad8d"
+_SID_RES = "e3b6fd23-1a46-45f2-9cdc-d4048e926d71"
+_SID_BARE = "7b659c27-d812-4e21-93b0-fe78346f9f0d"
+_PS_1317 = """\
+    1     0 ??       Ss   /sbin/launchd
+ 7057     1 ttys007  Ss   /usr/bin/login -fqpl user
+ 7058  7057 ttys007  S    -zsh
+ 7100  7058 ttys007  S+   claude --model claude-opus-5-5 --session-id 3249fd97 -- go
+ 8057     1 ttys008  Ss   /usr/bin/login -fqpl user
+ 8058  8057 ttys008  S    -zsh
+ 8100  8058 ttys008  S+   claude --dangerously-skip-permissions --resume e3b6fd23
+ 9057     1 ttys009  Ss   /usr/bin/login -fqpl user
+ 9058  9057 ttys009  S    -zsh
+ 9100  9058 ttys009  S+   claude --dangerously-skip-permissions
+"""
+_ARGV_1317 = {
+    7100: ["claude", "--model", "claude-opus-5-5", "--session-id", _SID_NEW, "--", "go"],
+    8100: ["claude", "--dangerously-skip-permissions", "--resume", _SID_RES],
+    9100: ["claude", "--dangerously-skip-permissions"],
+}
+_CWDS_1317 = {7100: "/repo/dot", 8100: "/repo/tp", 9100: "/repo/tp", 9058: "/home/user"}
+
+
+def _build_1317(
+    raw_panes: list[dict],
+    live: list[LiveSession] | None = None,
+    store_info: list[snapshot.StoreRow] | None = None,
+    argv: dict[int, list[str]] | None = None,
+) -> list[snapshot.SnapPane]:
+    """Capture *raw_panes* (one tab each) over the tp#1317 process fixture."""
+    data = snapshot.build_snapshot(
+        [_window(*({"pane": p} for p in raw_panes))],
+        live or [],
+        {},
+        snapshot.parse_ps(_PS_1317),
+        (argv or _ARGV_1317).get,
+        dict(_CWDS_1317),
+        own_pid=0,  # no own subtree (pid 1's would be every process)
+        created_at="2026-10-27T10:10:35+01:00",
+        store_info=store_info,
+    )
+    return _panes(data)
+
+
+def test_claude_argv_session_id_parses_every_launch_shape() -> None:
+    sid = _SID_NEW
+    assert snapshot.claude_argv_session_id(["claude", "--session-id", sid, "--", "x"]) == sid
+    assert snapshot.claude_argv_session_id(["claude", f"--session-id={sid}"]) == sid
+    assert snapshot.claude_argv_session_id(["claude", "--resume", sid]) == sid
+    assert snapshot.claude_argv_session_id(["claude", "-r", sid]) == sid
+    assert snapshot.claude_argv_session_id(["/x/claude/versions/2.1.311", "-r", sid]) == sid
+    # no id / the prompt after `--` / the picker / a fork / not claude at all
+    assert snapshot.claude_argv_session_id(["claude", "--dangerously-skip-permissions"]) == ""
+    assert snapshot.claude_argv_session_id(["claude", "--", "--resume", sid]) == ""
+    assert snapshot.claude_argv_session_id(["claude", "--resume", "--model", "x"]) == ""
+    assert snapshot.claude_argv_session_id(["claude", "--resume", sid, "--fork-session"]) == ""
+    assert snapshot.claude_argv_session_id(["vim", "--resume", sid]) == ""
+
+
+def test_registry_miss_still_records_session_id_argv_as_claude() -> None:
+    """A `ccc new-job` launch (`--session-id`) with NO registry entry is a claude pane,
+    on the account its store row names (the 10:10 capture recorded it as a command)."""
+    row = snapshot.StoreRow(_SID_NEW, config_dir="/acct/private", no_codex=True)
+    (pane,) = _build_1317([_pane("U7", "/dev/ttys007", 7100)], store_info=[row])
+    assert (pane.kind, pane.session_id, pane.cwd) == ("claude", _SID_NEW, "/repo/dot")
+    assert (pane.config_dir, pane.no_codex, pane.matched) == ("/acct/private", True, "argv")
+
+
+def test_registry_miss_still_records_resume_argv_as_claude() -> None:
+    (pane,) = _build_1317([_pane("U8", "/dev/ttys008", 8100)])
+    assert (pane.kind, pane.session_id, pane.config_dir) == ("claude", _SID_RES, "")
+
+
+def test_argv_id_that_is_live_takes_the_registry_account() -> None:
+    live = [_live(_SID_RES, pid=4242, cwd="/repo/tp", config_dir="/acct/work")]
+    (pane,) = _build_1317([_pane("U8", "/dev/ttys008", 8100)], live=live)
+    assert (pane.kind, pane.config_dir, pane.matched) == ("claude", "/acct/work", "argv")
+
+
+def test_bare_claude_takes_its_id_from_the_open_row_with_its_pid_and_pane() -> None:
+    rows = [
+        snapshot.StoreRow(
+            _SID_BARE, config_dir="/acct/work", iterm_uuid="U9", last_seen_pid=9100, updated_at=5
+        ),
+        # a finished session that once had the same pid in the same tab is never chosen
+        snapshot.StoreRow("old", iterm_uuid="U9", last_seen_pid=9100, updated_at=9, closed=True),
+    ]
+    (pane,) = _build_1317([_pane("u9", "/dev/ttys009", 9100)], store_info=rows)
+    assert (pane.kind, pane.session_id, pane.config_dir) == ("claude", _SID_BARE, "/acct/work")
+    assert pane.matched == "store"
+
+
+def test_bare_claude_needs_both_the_pid_and_the_pane_to_agree() -> None:
+    """A reused pid in ANOTHER tab, or this tab's row of another pid, names nothing."""
+    rows = [
+        snapshot.StoreRow("other-tab", iterm_uuid="UX", last_seen_pid=9100),
+        snapshot.StoreRow("other-pid", iterm_uuid="U9", last_seen_pid=4242),
+    ]
+    (pane,) = _build_1317([_pane("U9", "/dev/ttys009", 9100)], store_info=rows)
+    assert pane.kind == "command"
+
+
+def test_argv_id_never_borrows_another_rows_account() -> None:
+    rows = [
+        snapshot.StoreRow("stale", config_dir="/acct/other", iterm_uuid="U8", last_seen_pid=8100)
+    ]
+    (pane,) = _build_1317([_pane("U8", "/dev/ttys008", 8100)], store_info=rows)
+    assert (pane.session_id, pane.config_dir, pane.matched) == (_SID_RES, "", "argv")
+
+
+def test_a_stale_registry_pid_reused_by_another_program_is_not_claude() -> None:
+    """The registry file outlived its process and the pid now runs vim."""
+    live = [_live("stale", pid=9100, cwd="/repo/tp")]
+    (pane,) = _build_1317(
+        [_pane("U9", "/dev/ttys099", 9100)], live=live, argv={9100: ["vim", "notes.md"]}
+    )
+    assert pane.kind == "command"
+
+
+def test_registry_pid_join_refuses_a_claude_whose_argv_names_another_session() -> None:
+    live = [_live("someone-else", pid=8100, cwd="/repo/tp")]
+    (pane,) = _build_1317([_pane("U8", "/dev/ttys099", 8100)], live=live)
+    assert (pane.session_id, pane.matched) == (_SID_RES, "argv")
+
+
+def test_live_match_takes_no_codex_from_the_store_row() -> None:
+    """The registry has no Codex opt-out; the restored pane must keep its pin."""
+    live = [_live(_SID_RES, pid=8100, cwd="/repo/tp")]
+    rows = [snapshot.StoreRow(_SID_RES, no_codex=True)]
+    (pane,) = _build_1317([_pane("U8", "/dev/ttys008", 8100)], live=live, store_info=rows)
+    assert (pane.kind, pane.matched, pane.no_codex) == ("claude", "tty", True)
+
+
+def test_bare_claude_with_no_recoverable_id_stays_a_command() -> None:
+    (pane,) = _build_1317([_pane("U9", "/dev/ttys009", 9100)])
+    assert (pane.kind, pane.argv) == ("command", ["claude", "--dangerously-skip-permissions"])
+
+
+def test_registry_pid_on_the_foreground_chain_matches_when_the_tty_join_misses() -> None:
+    """The registry pid IS the pane's (bare) claude even though its ps tty is not the pane's."""
+    live = [_live("sess-pid", pid=9100, cwd="/repo/tp", config_dir="/acct/work")]
+    (pane,) = _build_1317([_pane("U9", "/dev/ttys099", 9100)], live=live)
+    assert (pane.kind, pane.session_id, pane.matched) == ("claude", "sess-pid", "pid")
+
+
+def test_matched_is_persisted_for_diagnosis_and_read_back() -> None:
+    (pane,) = _build_1317([_pane("U8", "/dev/ttys008", 8100)])
+    doc = snapshot.windows_to_json(
+        [snapshot.SnapWindow(tabs=[snapshot.SnapTab(pane)])], "2026-10-27T10:10:35+01:00"
+    )
+    assert snapshot.windows_from_json(doc)[0].tabs[0].tree == pane
+    assert "via argv" in snapshot.pane_summary(pane)
+
+
 # --------------------------------------------------------------------------- #
 # Classifier — other panes
 # --------------------------------------------------------------------------- #
@@ -501,6 +657,148 @@ def test_plan_default_account_unsets_the_config_var(tmp_path: Path) -> None:
     assert command.startswith("unset CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CONFIG_DIR; ")
 
 
+def _legacy(tmp_path: Path, argv: list[str]) -> snapshot.SnapPane:
+    """A pre-tp#1317 snapshot pane: a live Claude session recorded as a plain command."""
+    return snapshot.SnapPane(kind="command", cwd=str(tmp_path), argv=argv, display=" ".join(argv))
+
+
+def test_plan_upgrades_a_legacy_session_id_command_pane_to_a_resume(tmp_path: Path) -> None:
+    sid = "3249fd97-06b2-4c9c-a47a-5934c4afad8d"
+    pane = _legacy(tmp_path, ["claude", "--model", "m", "--session-id", sid, "--", "go"])
+    store = {sid: snapshot.StoreRow(sid, config_dir=str(tmp_path / "work"))}
+    plan = snapshot.build_plan(_snapshot_of(pane), set(), _NO_BLOCKERS, [], store=store)
+    action = snapshot.plan_actions(plan)[0]
+    assert action.kind == "claude"
+    assert (action.command or "").startswith(
+        "unset CLAUDE_SECURESTORAGE_CONFIG_DIR; export CLAUDE_CONFIG_DIR="
+    )
+    assert (action.command or "").endswith(f"cd {tmp_path} && claude --resume {sid}")
+    assert "printf" not in (action.command or "")
+
+
+def test_plan_legacy_upgrade_skips_a_live_session_and_keeps_blockers(tmp_path: Path) -> None:
+    sid = "e3b6fd23-1a46-45f2-9cdc-d4048e926d71"
+    pane = _legacy(tmp_path, ["claude", "--dangerously-skip-permissions", "--resume", sid])
+    live = snapshot.plan_actions(snapshot.build_plan(_snapshot_of(pane), {sid}, _NO_BLOCKERS, []))
+    assert live[0].skipped is True
+    seen: list[tuple[str, str]] = []
+
+    def blockers(session_id: str, _cwd: str, config_dir: str) -> list[str]:
+        seen.append((session_id, config_dir))
+        return ["no recorded Claude account"]
+
+    blocked = snapshot.plan_actions(snapshot.build_plan(_snapshot_of(pane), set(), blockers, []))
+    assert seen == [(sid, "")]  # no store row: the account stays blank for the pre-flight
+    assert (blocked[0].error, blocked[0].command) == (True, f"cd {tmp_path}")
+
+
+def test_plan_legacy_claude_without_an_id_stays_a_note(tmp_path: Path) -> None:
+    pane = _legacy(tmp_path, ["claude", "--dangerously-skip-permissions"])
+    action = snapshot.plan_actions(
+        snapshot.build_plan(_snapshot_of(pane), set(), _NO_BLOCKERS, [])
+    )[0]
+    assert action.kind == "command"
+    assert snapshot.RESTORE_NOTE_PREFIX in (action.command or "")
+
+
+def test_plan_never_reruns_a_claude_argv_even_when_allowlisted(tmp_path: Path) -> None:
+    pane = _legacy(tmp_path, ["claude", "--dangerously-skip-permissions"])
+    plan = snapshot.build_plan(_snapshot_of(pane), set(), _NO_BLOCKERS, ["claude"])
+    assert snapshot.RESTORE_NOTE_PREFIX in (snapshot.plan_actions(plan)[0].command or "")
+
+
+def test_restore_dry_run_upgrades_an_on_disk_legacy_snapshot(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """`ccc restore-snapshot -n` over a pre-tp#1317 file plans a resume on the account
+    of the store row, and leaves the file byte-for-byte untouched."""
+    import argparse
+
+    from command_center import core, store
+    from command_center.adapters import ClaudeAdapter
+
+    sid = "3249fd97-06b2-4c9c-a47a-5934c4afad8d"
+    pane = _legacy(tmp_path, ["claude", "--model", "m", "--session-id", sid, "--", "go"])
+    path = snapshot.write_snapshot(_snapshot_of(pane))
+    before = path.read_bytes()
+
+    class _Row:
+        session_id, config_dir, no_codex = sid, str(tmp_path / "work"), True
+
+    class _Store:
+        def __enter__(self) -> object:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def list_sessions(self, _archived: bool = False) -> list[_Row]:
+            return [_Row()]
+
+    monkeypatch.setattr(store, "Store", _Store)
+    monkeypatch.setattr(ClaudeAdapter, "discover", lambda _self: [])
+    monkeypatch.setattr(core, "resume_blockers", lambda *_a: [])
+    args = argparse.Namespace(name=path.name, dry_run=True, yes=False)
+    assert snapshot.run_restore(args) == 0
+    out = capsys.readouterr().out
+    assert f"claude --resume {sid}" in out and "CCC_NO_CODEX" in out
+    assert snapshot.RESTORE_NOTE_PREFIX not in out
+    assert "1 claude session(s)" in out
+    assert path.read_bytes() == before
+
+
+def test_restore_dry_run_takes_a_storeless_account_from_its_own_registry_entry(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    import argparse
+
+    from command_center import core, store
+    from command_center.adapters import ClaudeAdapter
+
+    sid = "e3b6fd23-1a46-45f2-9cdc-d4048e926d71"
+    pane = _legacy(tmp_path, ["claude", "--resume", sid])
+    path = snapshot.write_snapshot(_snapshot_of(pane))
+    work = str(tmp_path / "work")
+    entries = [
+        LiveSession(pid=1, session_id=sid, cwd=str(tmp_path), alive=False, config_dir=work),
+        # a D9 conflict never lends its (blank) account; another id never lends its own
+        LiveSession(pid=2, session_id="other", cwd="/", alive=False, config_dir="/acct/x"),
+    ]
+
+    class _Store:
+        def __enter__(self) -> object:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def list_sessions(self, _archived: bool = False) -> list[object]:
+            return []
+
+    monkeypatch.setattr(store, "Store", _Store)
+    monkeypatch.setattr(ClaudeAdapter, "discover", lambda _self: entries)
+    seen: list[str] = []
+
+    def blockers(_sid: str, _cwd: str, config_dir: str) -> list[str]:
+        seen.append(config_dir)
+        return []
+
+    monkeypatch.setattr(core, "resume_blockers", blockers)
+    args = argparse.Namespace(name=path.name, dry_run=True, yes=False)
+    assert snapshot.run_restore(args) == 0
+    assert seen == [work]
+    assert f"claude --resume {sid}" in capsys.readouterr().out
+
+
+def test_snapshot_counts_include_legacy_claude_panes(tmp_path: Path) -> None:
+    sid = "3249fd97-06b2-4c9c-a47a-5934c4afad8d"
+    doc = _snapshot_of(
+        _legacy(tmp_path, ["claude", "--session-id", sid]),
+        _legacy(tmp_path, ["claude"]),
+    )
+    assert snapshot.snapshot_counts(doc) == (1, 1, 2, 1)
+
+
 def test_plan_reruns_an_allowlisted_command_with_per_element_quoting(tmp_path: Path) -> None:
     cwd = tmp_path / "my notes"
     cwd.mkdir()
@@ -595,6 +893,7 @@ class FakeSession:
         self.log = log
         self.sent: list[str] = []
         self.renamed: str | None = None
+        self.injected: list[bytes] = []
         self.fail_send = fail_send
         self._splits = 0
 
@@ -610,10 +909,15 @@ class FakeSession:
         self.sent.append(text)
 
     async def async_get_variable(self, name: str) -> str:
-        return "zsh"  # an idle shell: _await_shell settles at once
+        # An idle shell until text is typed (_await_shell settles at once); then the
+        # typed program owns the foreground (_await_program returns at once).
+        return "prog" if self.sent else "zsh"
 
     async def async_set_name(self, name: str) -> None:
         self.renamed = name
+
+    async def async_inject(self, data: bytes) -> None:
+        self.injected.append(data)
 
 
 async def _split(session: object, vertical: bool) -> object:
@@ -654,7 +958,9 @@ def test_layout_tree_of_a_single_pane_never_splits() -> None:
     assert log == [] and [s.name for _, s in leaves] == ["root"]
 
 
-def test_deliver_types_commands_and_renames_only_non_claude_panes() -> None:
+def test_deliver_types_commands_and_falls_back_to_pane_names_for_every_kind() -> None:
+    """A snapshot without tab titles renames each pane — Claude panes too (tp#1317):
+    they launch with CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1, so nothing overwrites it."""
     log: list[str] = []
     shell, claude = FakeSession("s", log), FakeSession("c", log)
     actions = [
@@ -664,7 +970,137 @@ def test_deliver_types_commands_and_renames_only_non_claude_panes() -> None:
     failures = asyncio.run(snapshot._deliver([(actions[0], shell), (actions[1], claude)]))
     assert failures == []
     assert shell.sent == ["cd /x\n"] and shell.renamed == "notes"
-    assert claude.sent == ["claude --resume z\n"] and claude.renamed is None
+    assert claude.sent == ["claude --resume z\n"] and claude.renamed == "app"
+
+
+class TitledTab:
+    """A live tab that records ``async_set_title``."""
+
+    def __init__(self) -> None:
+        self.title: str | None = None
+
+    async def async_set_title(self, title: str) -> None:
+        self.title = title
+
+
+def test_deliver_restores_a_tab_title_the_way_it_was_set() -> None:
+    log: list[str] = []
+    auto, override = FakeSession("a", log), FakeSession("o", log)
+    tab = TitledTab()
+    actions = [
+        snapshot.PaneAction(
+            command="claude --resume z", kind="claude", title="solarized", tab_title="🟤 dot"
+        ),
+        snapshot.PaneAction(
+            command="cd /x",
+            kind="shell",
+            title="tp",
+            tab_title="💠 a\\b",
+            tab_title_override=True,
+            tab_title_format="💠 a\\\\b",
+            tab=tab,
+        ),
+    ]
+    assert asyncio.run(snapshot._deliver([(actions[0], auto), (actions[1], override)])) == []
+    # OSC 1 into the pane (never the profile-derived pane name), like iterm-set-tabtitle.py
+    assert auto.injected == ["\033]1;🟤 dot\007".encode()] and auto.renamed is None
+    # a tab-level override goes back on the tab, backslash-escaped for interpolation
+    assert tab.title == "💠 a\\\\b" and not override.injected and override.renamed is None
+
+
+def test_deliver_titles_a_claude_pane_only_after_its_program_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Injected before `cd … && claude` ran, the shell's own title hook would win."""
+    monkeypatch.setattr(snapshot, "_TITLE_WAIT_TIMEOUT", 1.0)
+    log: list[str] = []
+    calls: list[str] = []
+
+    class Pane(FakeSession):
+        async def async_get_variable(self, name: str) -> str:
+            job = "prog" if self.sent else "zsh"
+            calls.append(job)
+            return job
+
+        async def async_inject(self, data: bytes) -> None:
+            calls.append("inject")
+            await super().async_inject(data)
+
+    pane = Pane("p", log)
+    action = snapshot.PaneAction(command="claude --resume z", kind="claude", tab_title="T")
+    assert asyncio.run(snapshot._deliver([(action, pane)])) == []
+    assert calls[-2:] == ["prog", "inject"]
+
+
+def test_a_failed_title_is_a_warning_not_a_failed_restore(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Broken(FakeSession):
+        async def async_inject(self, data: bytes) -> None:
+            raise RuntimeError("gone")
+
+    action = snapshot.PaneAction(command="cd /x", kind="shell", cwd="/x", tab_title="T")
+    assert asyncio.run(snapshot._deliver([(action, Broken("b", []))])) == []
+    assert "warning: title of the shell pane in /x not restored: gone" in capsys.readouterr().err
+
+
+def test_an_interpolated_tab_override_round_trips_as_its_expression(tmp_path: Path) -> None:
+    raw = _window({"pane": _pane("P1", "/dev/ttys002", None)})
+    raw["tabs"][0].update(
+        title="shown now", title_override="shown now", title_format="\\(session.name)"
+    )
+    (tab,) = snapshot.windows_from_json(_build([raw]))[0].tabs
+    assert (tab.title, tab.title_override, tab.title_format) == (
+        "shown now",
+        True,
+        "\\(session.name)",
+    )
+    tab.tree = snapshot.SnapPane(kind="shell", cwd=str(tmp_path))
+    doc = snapshot.windows_to_json([snapshot.SnapWindow(tabs=[tab])], "2026-10-27T10:10:35+01:00")
+    (action,) = snapshot.plan_actions(snapshot.build_plan(doc, set(), _NO_BLOCKERS, []))
+    assert action.tab_title_format == "\\(session.name)"  # set back as-is, not escaped
+
+
+def test_osc_title_strips_control_characters() -> None:
+    assert snapshot.osc_title("a\x07b\nc\x1b\x9cd") == b"\x1b]1;abcd\x07"
+
+
+def test_capture_records_the_tab_title_and_prefers_it_in_dry_run() -> None:
+    raw = _window({"pane": _pane("P1", "/dev/ttys002", None, name="solarized")})
+    raw["tabs"][0].update(title="🟤 dotfiles", title_override="")
+    raw2 = _window({"pane": _pane("P2", "/dev/ttys002", None)})
+    raw2["tabs"][0].update(title="💠 mac work", title_override="💠 mac work")
+    data = _build([raw, raw2])
+    tabs = [t for w in snapshot.windows_from_json(data) for t in w.tabs]
+    assert [(t.title, t.title_override) for t in tabs] == [
+        ("🟤 dotfiles", False),
+        ("💠 mac work", True),
+    ]
+    lines = "\n".join(snapshot.describe_snapshot(data))
+    assert '"🟤 dotfiles"' in lines and '"💠 mac work"  [tab override]' in lines
+
+
+def test_old_snapshot_tabs_without_titles_still_load_and_plan_pane_names(
+    tmp_path: Path,
+) -> None:
+    pane = snapshot.SnapPane(kind="shell", cwd=str(tmp_path), title="notes")
+    doc = _snapshot_of(pane)
+    assert "title" not in doc["windows"][0]["tabs"][0]  # serialisation unchanged
+    action = snapshot.plan_actions(snapshot.build_plan(doc, set(), _NO_BLOCKERS, []))[0]
+    assert (action.tab_title, action.title) == ("", "notes")
+
+
+def test_plan_puts_the_tab_title_on_the_first_pane_only(tmp_path: Path) -> None:
+    left = snapshot.SnapPane(kind="shell", cwd=str(tmp_path), title="l")
+    right = snapshot.SnapPane(kind="shell", cwd=str(tmp_path), title="r")
+    tab = snapshot.SnapTab(
+        snapshot.SnapNode("vertical", [left, right]), title="T", title_override=True
+    )
+    doc = snapshot.windows_to_json([snapshot.SnapWindow(tabs=[tab])], "2026-10-27T10:10:35+01:00")
+    plan = snapshot.build_plan(doc, set(), _NO_BLOCKERS, [])
+    first, second = snapshot.plan_actions(plan)
+    assert (first.tab_title, first.tab_title_override, second.tab_title) == ("T", True, "")
+    assert '"T"  [tab override]' in "\n".join(snapshot.describe_plan(plan))
 
 
 def test_deliver_collects_per_pane_failures_without_aborting() -> None:
@@ -697,6 +1133,7 @@ class SettlingSession(FakeSession):
 @pytest.fixture(autouse=True)
 def _fast_shell_polls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(snapshot, "_SHELL_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(snapshot, "_TITLE_WAIT_TIMEOUT", 0.0)
 
 
 def test_is_shell_job_recognises_login_shells_and_paths() -> None:
