@@ -109,8 +109,39 @@ def test_both_accounts_kinds_status_and_names(store: Store) -> None:
         "status",
         "status_at",
         "aim_short",
+        "display_name",
+        "staff_agent",
         "tab",
     }
+    assert out["a1"]["display_name"] == "parser" and out["a1"]["staff_agent"] is None
+    assert out["b2"]["display_name"] == out["b2"]["name"]  # no AIM: the name
+    assert out["c3"]["display_name"] is None
+
+
+def test_display_name_is_the_staff_agent_name_or_the_aim(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1366: a staff session is named after its agent (tab_name), any other by its AIM."""
+    staff = tmp_path / "staff" / "zoho-solver"
+    staff.mkdir(parents=True)
+    (staff / "agent.yaml").write_text('name: zoho-solver\ntab_name: "zoho-agent"\n')
+    roles = tmp_path / "tp" / "session-role"
+    roles.mkdir(parents=True)
+    (roles / "z1").write_text("zoho-solver\n")
+    monkeypatch.setenv("TP_STAFF_ROOT", str(tmp_path / "staff"))
+    monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path / "tp"))
+    store.ensure("z1", cwd="/r/voice")
+    store.set_aim("z1", "answer tickets: tp#1236")
+    store.ensure("d1", cwd="/r/voice")
+    store.set_aim("d1", "fix decide: tp#1363, #1364")
+    out = {
+        e["session_id"]: e for e in _collect(store, [_live("z1", 11), _live("d1", 22)], {}, None)
+    }
+    assert (out["z1"]["display_name"], out["z1"]["staff_agent"]) == ("zoho-agent", "zoho-solver")
+    assert (out["d1"]["display_name"], out["d1"]["staff_agent"]) == (
+        "fix decide: tp#1363, #1364",
+        None,
+    )
 
 
 def test_sdk_cli_and_dead_entries_are_excluded(store: Store) -> None:

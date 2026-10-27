@@ -142,6 +142,24 @@ def _aim_short(session: Session | None) -> str | None:
     return line if len(line) <= _AIM_SHORT_MAX else line[: _AIM_SHORT_MAX - 1] + "…"
 
 
+def display_name(session_id: str, row: Session | None) -> tuple[str | None, str | None]:
+    """``(display_name, staff_agent)`` of a session for ``ccc sessions -j`` (tp#1366).
+
+    A session that adopted a staff role is named after its agent: its ``tab_name``
+    (:func:`staffrole.session_tab_name`) and the agent id. Any other session is named by
+    its AIM (first line, ``<few words>: tp#N`` included); with no AIM, its canonical name.
+    """
+    from . import staffrole
+
+    agent = staffrole.adopted_role(session_id)
+    if agent:
+        return staffrole.agent_tab_name(agent) or agent, agent
+    aim = (row.aim or "").strip() if row else ""
+    if aim:
+        return aim.splitlines()[0].strip(), None
+    return ((row.canonical_name or None) if row else None), None
+
+
 def session_entry(
     live: LiveSession,
     row: Session | None,
@@ -152,10 +170,13 @@ def session_entry(
     """One ``sessions[]`` item of the §6 contract (*status* defaults to the registry's)."""
     from .adapters.claude_agents import contract_status
 
+    shown, staff_agent = display_name(live.session_id, row)
     return {
         "session_id": live.session_id,
         "name": (row.canonical_name or None) if row else None,
         "name_origin": (row.canonical_name_origin or None) if row and row.canonical_name else None,
+        "display_name": shown,
+        "staff_agent": staff_agent,
         "account": account_label(live.config_dir) if live.config_dir else None,
         "account_conflict": bool(live.conflict),
         "pid": live.pid or None,

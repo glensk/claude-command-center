@@ -78,7 +78,7 @@ DEFAULTS: dict[str, object] = {
     # UserPromptSubmit runs /cwork-to-cpriv-cache-write-hit & co itself: no model turn
     "switch_intercept": True,
     "aim_on_main_line": False,  # `ccc aim --format bar` prefixes "🎯 <aim>" (status-line row 1)
-    "aim_in_tab_title": False,  # iTerm tab title "<badge> <leaf> 🎯 <aim>"
+    "aim_in_tab_title": False,  # iTerm tab title "<badge> <AIM words>" (no tp#N run)
     # Memorable 1-2 word session names (`ccc name`, `ccc sessions -j`, tab titles,
     # `claude --name` on ccc launches). Generated once per session: through
     # llm_custom_command when one is set, else a deterministic repo-folder name — so

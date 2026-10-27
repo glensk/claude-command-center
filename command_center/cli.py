@@ -228,12 +228,6 @@ def _paint_done_word(
 _MAIN_LINE_AIM_W = 60  # chars of the AIM shown on status-line row 1
 
 
-def _clip(text: str, width: int) -> str:
-    """First line of *text*, cut to *width* chars with a trailing ``…``."""
-    line = text.splitlines()[0] if text else ""
-    return line if len(line) <= width else line[: width - 1] + "…"
-
-
 def cmd_aim(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branches  # one branch per display mode
     """Fast, LLM-free lookup for the status line. Must stay well under ~10 ms."""
     from .models import done_bar_parts, effective_progress, progress_bar
@@ -256,7 +250,9 @@ def cmd_aim(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branch
         checked, total = store.progress(session_id)
         fraction = effective_progress(session.manual_progress, checked, total)
         if args.format == "bar" and config.load_config().aim_on_main_line:
-            print(f"\033[38;5;220m🎯 {_clip(session.aim, _MAIN_LINE_AIM_W)}\033[0m ", end="")
+            from . import aimtext  # lazy: the item run is kept whole (tp#1366)
+
+            print(f"\033[38;5;220m🎯 {aimtext.clip(session.aim, _MAIN_LINE_AIM_W)}\033[0m ", end="")
         if args.format == "bar":
             # Compact, colored progress bar for the main status line (line 1). Filled
             # cells green, empty dim; ``progress_bar`` stays the single glyph source.
@@ -5088,12 +5084,18 @@ def _aim_statusline_lines(  # pylint: disable=too-many-positional-arguments  # c
     colors: tuple[str, str, str, str],
     index: int,
     role_marker: str = "",
+    staff_name: str = "",
 ) -> list[str]:
     """The ``/aim`` status-line row(s): AIM + running index + progress bar + vague marker.
 
     ``role_marker`` (``🎭`` + the agent's symbol when the session adopted a staff role,
     :func:`staffrole.role_marker`) is put right after the current row's ``/aim …:`` label; the
     ``/aim (1):`` anchor row and the old side of a transition never carry it.
+
+    ``staff_name`` (the adopted agent's ``tab_name``, :func:`staffrole.session_tab_name`)
+    replaces the AIM text: a staff session is named after its agent, so its row reads
+    ``/aim: 🎭<symbol> <agent name> #123, #456`` — the name first, then the ids of the AIM's
+    work-item run (:mod:`.aimtext`, tp#1366).
 
     ``index`` is the current AIM's running number in the session's AIM history, so the
     prefix reads ``/aim (N):``. When the AIM changed this turn (``aim_prev`` set) it renders
@@ -5122,6 +5124,8 @@ def _aim_statusline_lines(  # pylint: disable=too-many-positional-arguments  # c
     green, dim, reset, red = colors
     mark = f"{role_marker} " if role_marker else ""
     if not session.aim:
+        if staff_name:
+            return [f"{green}/aim:{reset} {mark}{staff_name}"]
         return [f"{green}/aim:{reset} {mark}{dim}(set one with /aim){reset}"]
     label = _aim_label(index)
     low_score = low_aim_score(session.aim, session.aim_score, threshold)
@@ -5147,6 +5151,12 @@ def _aim_statusline_lines(  # pylint: disable=too-many-positional-arguments  # c
     else:
         prog = ""
     tag = f"  {dim}⚠ vague — sharpen it{reset}" if low_score else ""
+    if staff_name:  # the agent's name, then the item ids: no AIM text, score or history
+        from . import aimtext  # lazy
+
+        ids = aimtext.ids_text(aimtext.split(session.aim).ids)
+        body = f"{staff_name} {ids}" if ids else staff_name
+        return [f"{green}{label}:{reset} {mark}{body}{prog}"]
     changed = bool(session.aim_prev) and session.aim_prev != session.aim
     anchor = _first_aim_anchor(session, index, changed, green, dim, reset)
     if not changed:
@@ -5213,10 +5223,14 @@ def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many
         from . import staffrole, tabsymbol  # lazy
 
         role_marker = staffrole.role_marker(sid)
+        staff_name = (staffrole.session_tab_name(sid) or "") if role_marker else ""
         tabsymbol.sync_role_mark(sid)  # tp#1288: the shell status line's leading badge
         if session is None:
             mark = f"{role_marker} " if role_marker else ""
-            print(f"{green}/aim:{reset} {mark}{dim}(set one with /aim){reset}")
+            if staff_name:
+                print(f"{green}/aim:{reset} {mark}{staff_name}")
+            else:
+                print(f"{green}/aim:{reset} {mark}{dim}(set one with /aim){reset}")
             print(f"{dim}Status: untracked   /next-step: —{reset}")
             return 0
         checked, total = store.progress(sid)
@@ -5255,6 +5269,7 @@ def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many
         (green, dim, reset, status_color["failed"]),
         aim_index,
         role_marker,
+        staff_name,
     )
 
     scolor = status_color.get(status_value, dim)

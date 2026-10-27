@@ -7,7 +7,8 @@ one line holding the agent name. Each agent's ``agent.yaml`` (``<staff root>/<ag
 staff root ``$TP_STAFF_ROOT`` else ``~/obsidian/01-llm/staff`` — tp's rule) may carry a
 ``symbol:`` — one emoji that stands for the agent. ccc shows it instead of the per-tab colour
 badge on an adopted session's iTerm tab and command-center row, and after the ``🎭`` on its
-status-line ``/aim`` row.
+status-line ``/aim`` row. Since tp#1366 a staff session is also NAMED after its agent: the
+agent.yaml ``tab_name`` (:func:`session_tab_name`) is its tab title and leads its ``/aim`` row.
 
 Every function here runs on hot paths (status line every second, every TUI row), so they do a
 few small reads and stats, never a subprocess or a YAML import, and never raise.
@@ -36,6 +37,9 @@ _ROLE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _LINE_RE = r"""^{key}:[ \t]*(?:"([^"\n]*)"|'([^'\n]*)'|([^#\s]+))"""
 _SYMBOL_LINE_RE = re.compile(_LINE_RE.format(key="symbol"), re.M)
 _GLYPH_LINE_RE = re.compile(_LINE_RE.format(key="glyph"), re.M)
+_TAB_NAME_LINE_RE = re.compile(_LINE_RE.format(key="tab_name"), re.M)
+#: llm-staff's `tab_name` shape: letters, digits, space . _ - (starts alphanumeric), ≤ 48.
+_TAB_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,47}$")
 #: YAML double-quoted escapes a glyph is usually written with (``"\uf198"``).
 _ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
 #: Nerd Font glyphs live in the Private Use Areas.
@@ -43,7 +47,7 @@ _PUA = ((0xE000, 0xF8FF), (0xF0000, 0xFFFFD))
 #: VS16, ZWJ and the skin-tone modifiers make a glyph wider than its two terminal cells.
 _WIDENERS = frozenset({0xFE0F, 0x200D, *range(0x1F3FB, 0x1F400)})
 
-_symbol_cache: dict[str, tuple[int, str | None, str | None]] = {}
+_symbol_cache: dict[str, tuple[int, str | None, str | None, str | None]] = {}
 
 #: The status-line `/aim` marker of a session that adopted a staff role (tp#1166); the
 #: agent's own symbol follows it (`🎭📧`, tp#1288).
@@ -128,26 +132,58 @@ def _parse_glyph(text: str) -> str | None:
     return value
 
 
-def _manifest(name: str | None) -> tuple[str | None, str | None]:
-    """``(symbol, glyph)`` of agent *name*'s agent.yaml, cached per file mtime."""
+def _parse_tab_name(text: str) -> str | None:
+    value = _value(_TAB_NAME_LINE_RE, text)
+    return value if value and _TAB_NAME_RE.match(value) else None
+
+
+def _manifest_entry(name: str | None) -> tuple[str | None, str | None, str | None]:
+    """``(symbol, glyph, tab_name)`` of agent *name*'s agent.yaml, cached per file mtime."""
     if not name or not _ROLE_NAME_RE.match(name):
-        return None, None
+        return None, None, None
     path = _agent_yaml(name)
     try:
         mtime = os.stat(path).st_mtime_ns
     except OSError:
-        return None, None
+        return None, None, None
     cached = _symbol_cache.get(path)
     if cached is not None and cached[0] == mtime:
-        return cached[1], cached[2]
+        return cached[1], cached[2], cached[3]
     try:
         with open(path, encoding="utf-8") as handle:
             text = handle.read(65536)
     except (OSError, UnicodeDecodeError):
         text = ""
-    symbol, glyph = _parse_symbol(text), _parse_glyph(text)
-    _symbol_cache[path] = (mtime, symbol, glyph)
+    symbol, glyph, tab_name = _parse_symbol(text), _parse_glyph(text), _parse_tab_name(text)
+    _symbol_cache[path] = (mtime, symbol, glyph, tab_name)
+    return symbol, glyph, tab_name
+
+
+def _manifest(name: str | None) -> tuple[str | None, str | None]:
+    """``(symbol, glyph)`` of agent *name*'s agent.yaml, cached per file mtime."""
+    symbol, glyph, _tab = _manifest_entry(name)
     return symbol, glyph
+
+
+def agent_tab_name(name: str | None) -> str | None:
+    """Agent *name*'s display name: its agent.yaml ``tab_name``, else the agent id (tp#1366).
+
+    llm-staff's rule (``registry.tab_title``). ``None`` when *name* is no agent.
+    """
+    if not name or not _ROLE_NAME_RE.match(name) or not os.path.isfile(_agent_yaml(name)):
+        return None
+    return _manifest_entry(name)[2] or name
+
+
+def session_tab_name(session_id: str | None) -> str | None:
+    """The display name of the agent *session_id* adopted, or None (not a staff session).
+
+    A staff session is named after its agent (tp#1366): its iTerm tab title is exactly
+    this, its ``/aim`` row leads with it and ``ccc sessions -j`` reports it.
+    """
+    if not session_id:
+        return None
+    return agent_tab_name(adopted_role(session_id))
 
 
 def agent_symbol(name: str | None) -> str | None:

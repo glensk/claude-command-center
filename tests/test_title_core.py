@@ -1,7 +1,8 @@
-"""Tab-title precedence (badge → name → AIM) and the hand-set-title freeze."""
+"""Tab-title precedence (staff name; badge → AIM words → name) and the hand-set-title freeze."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +51,7 @@ def writes_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[Any]
     return seen
 
 
-def test_push_title_uses_name_then_aim(writes: list[Any]) -> None:
+def test_push_title_shows_the_aim_words(writes: list[Any]) -> None:
     session = Session(
         session_id="s",
         cwd="/Users/x/repo",
@@ -60,7 +61,8 @@ def test_push_title_uses_name_then_aim(writes: list[Any]) -> None:
     )
     tabsymbol.push_title(session)
     [(kind, cores)] = writes
-    assert kind == "plain" and cores["w0t0p0:U"].endswith(" voice bridge 🎯 ship X")
+    assert kind == "plain" and cores["w0t0p0:U"].endswith(" ship X")
+    assert "voice bridge" not in cores["w0t0p0:U"] and "🎯" not in cores["w0t0p0:U"]
 
 
 def test_hand_set_name_drops_the_aim_tail(writes: list[Any]) -> None:
@@ -79,7 +81,7 @@ def test_hand_set_name_drops_the_aim_tail(writes: list[Any]) -> None:
 
 
 @pytest.mark.parametrize("origin", ["llm", "fallback", ""])
-def test_generated_or_unnamed_keeps_the_aim_tail(origin: str) -> None:
+def test_generated_or_unnamed_shows_the_aim_words(origin: str) -> None:
     cfg = config.Config(session_names=True, aim_in_tab_title=True)
     name = "voice bridge" if origin else None
     session = Session(
@@ -89,8 +91,7 @@ def test_generated_or_unnamed_keeps_the_aim_tail(origin: str) -> None:
         canonical_name=name,
         canonical_name_origin=origin,
     )
-    head = name or LEAF
-    assert tabsymbol._session_core(session, "🟧", cfg) == f"🟧 {head} 🎯 ship X"
+    assert tabsymbol._session_core(session, "🟧", cfg) == "🟧 ship X"
 
 
 @pytest.mark.parametrize("origin", ["manual", "llm", ""])
@@ -107,8 +108,8 @@ def test_aim_in_tab_title_off_never_shows_the_aim(origin: str) -> None:
     assert tabsymbol._session_core(session, "🟧", cfg) == f"🟧 {name or LEAF}"
 
 
-def test_manual_name_with_names_off_keeps_leaf_and_aim() -> None:
-    """The name is not shown with ``session_names`` off, so the AIM tail stays."""
+def test_manual_name_with_names_off_shows_the_aim_words() -> None:
+    """The name is not shown with ``session_names`` off, so the AIM words show."""
     cfg = config.Config(session_names=False, aim_in_tab_title=True)
     session = Session(
         session_id="s",
@@ -117,7 +118,7 @@ def test_manual_name_with_names_off_keeps_leaf_and_aim() -> None:
         canonical_name="zoho ticket solver",
         canonical_name_origin="manual",
     )
-    assert tabsymbol._session_core(session, "🟧", cfg) == f"🟧 {LEAF} 🎯 ship X"
+    assert tabsymbol._session_core(session, "🟧", cfg) == "🟧 ship X"
 
 
 def test_names_off_keeps_the_leaf(writes: list[Any], monkeypatch: pytest.MonkeyPatch) -> None:
@@ -192,3 +193,46 @@ def test_one_owner_per_tab_prefers_the_live_pid(monkeypatch: pytest.MonkeyPatch)
         session_id="live", iterm_session_id="w1t2p0:u", last_seen_pid=42, last_response_at=1
     )
     assert [s.session_id for s in tabsymbol.tab_owners([dead_recent, live_old])] == ["live"]
+
+
+@pytest.mark.parametrize(
+    ("aim", "title"),
+    [
+        ("fix decide: tp#1363, #1364", "🟧 fix decide"),
+        ("tp#1363, #1364: fix decide", "🟧 fix decide"),
+        ("review the hook of tp#5: tp#9", "🟧 review the hook of tp#5"),
+        ("tp#1363", f"🟧 {LEAF}"),
+    ],
+)
+def test_the_tab_shows_the_aim_words_without_the_item_run(aim: str, title: str) -> None:
+    """tp#1366: `<few words>: tp#N` titles the tab `<badge> <few words>`."""
+    cfg = config.Config(session_names=True, aim_in_tab_title=True)
+    session = Session(session_id="s", cwd="/Users/x/repo", aim=aim)
+    assert tabsymbol._session_core(session, "🟧", cfg) == title
+
+
+def test_a_staff_session_title_is_exactly_its_agent_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """tp#1366: no badge, no AIM — the agent.yaml tab_name and nothing else."""
+    staff = tmp_path / "staff" / "zoho-solver"
+    staff.mkdir(parents=True)
+    (staff / "agent.yaml").write_text('name: zoho-solver\ntab_name: "zoho-agent"\nsymbol: "🎫"\n')
+    roles = tmp_path / "tp" / "session-role"
+    roles.mkdir(parents=True)
+    (roles / "s").write_text("zoho-solver\n")
+    monkeypatch.setenv("TP_STAFF_ROOT", str(tmp_path / "staff"))
+    monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path / "tp"))
+    cfg = config.Config(session_names=True, aim_in_tab_title=True)
+    session = Session(
+        session_id="s",
+        cwd="/Users/x/repo",
+        aim="answer tickets: tp#1236, #1177",
+        canonical_name="zoho overseer",
+        canonical_name_origin="llm",
+    )
+    assert tabsymbol._session_core(session, "🎫", cfg) == "zoho-agent"
+    assert tabsymbol._session_core(session, "🎫", config.Config()) == "zoho-agent"
+    (staff / "agent.yaml").write_text("name: zoho-solver\n")  # no tab_name: the agent id
+    os.utime(staff / "agent.yaml", ns=(1, 1))  # a new mtime: the manifest cache re-reads
+    assert tabsymbol._session_core(session, "🎫", cfg) == "zoho-solver"

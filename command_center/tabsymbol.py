@@ -51,6 +51,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 
 # pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
+# pylint: disable=too-many-lines  # badges, titles, title sync and the heal watcher of one tab
 import contextlib
 import dataclasses
 import fcntl
@@ -469,19 +470,42 @@ def title_core(badge: str, cwd: str, aim: str | None = None, *, name: str | None
     return f"{badge} {head} 🎯 {line}"
 
 
-def _session_core(session: Session, badge: str, cfg: Config) -> str:
-    """*session*'s title core under *cfg* (its name when ``session_names``, its AIM if wanted).
+def staff_title(session: Session) -> str | None:
+    """A staff session's whole tab title: its agent's ``tab_name`` (tp#1366), else None."""
+    from . import staffrole  # lazy
 
-    The AIM tail (``aim_in_tab_title``) is dropped when the title shows a name the user
-    set by hand (origin ``manual`` / ``manual-tab``, e.g. a staff agent's ``ccc name``):
-    that name already says what the tab is. Generated names keep the tail.
+    return staffrole.session_tab_name(session.session_id)
+
+
+def aim_title_words(aim: str | None) -> str:
+    """The AIM words a tab title shows (``fix decide: tp#1363`` → ``fix decide``, tp#1366)."""
+    from . import aimtext  # lazy
+
+    return aimtext.title_words(aim, _TAB_AIM_W)
+
+
+def _session_core(session: Session, badge: str, cfg: Config) -> str:
+    """*session*'s title core under *cfg* (tp#1366).
+
+    A staff session's title is exactly its agent's ``tab_name`` (:func:`staff_title`).
+    Otherwise, with ``aim_in_tab_title``, ``"<badge> <AIM words>"`` — the AIM without its
+    work-item ids (:func:`aim_title_words`) — unless the session carries a name the user
+    set by hand (origin ``manual`` / ``manual-tab``, e.g. ``ccc name``): that name already
+    says what the tab is. Else ``"<badge> <name>"`` (``session_names``; the folder leaf
+    when it has none).
     """
     from . import session_names  # lazy
 
+    staff = staff_title(session)
+    if staff:
+        return staff
     name = session_names.title_name(session, cfg)
     hand_named = bool(name) and session.canonical_name_origin in session_names.MANUAL_ORIGINS
-    aim = session.aim if cfg.aim_in_tab_title and not hand_named else None
-    return title_core(badge, session.cwd, aim, name=name)
+    if cfg.aim_in_tab_title and not hand_named:
+        words = aim_title_words(session.aim)
+        if words:
+            return title_core(badge, session.cwd, name=words)
+    return title_core(badge, session.cwd, name=name)
 
 
 def _write_titles(plain: dict[str, str], cas: dict[str, tuple[str, str]], marker: str) -> None:
@@ -574,6 +598,13 @@ def ccc_title_shapes(session: Session, marker: str | None = None) -> set[str]:
     }
     if session.canonical_name:
         shapes.add(clean_title(session.canonical_name, marker))
+    staff = staff_title(session)
+    if staff:
+        shapes.add(clean_title(staff, marker))
+    for aim in (session.aim, session.aim_prev, session.first_aim):  # tp#1366 AIM-word titles
+        words = aim_title_words(aim)
+        if words:
+            shapes.add(clean_title(words, marker))
     shapes.discard("")
     return shapes
 
@@ -631,7 +662,9 @@ def drifted_ccc_body(
     if session_names.is_shell_title(session, cleaned):
         return body  # the zsh hook's own title (tp#1297): ccc may replace it
     badged = any(body.startswith(f"{badge} ") for badge in known_badges())
-    return body if badged and cleaned in ccc_title_shapes(session, wait) else None
+    # A staff session's title carries no badge (tp#1366): its own shapes count bare.
+    bare_ok = staff_title(session) is not None
+    return body if (badged or bare_ok) and cleaned in ccc_title_shapes(session, wait) else None
 
 
 def push_title(session: Session, *, marker: str | None = None) -> None:
@@ -694,9 +727,9 @@ def seed_title(
     if session_names.titles_frozen(session):
         return badge
     cfg = config.load_config()
-    name = session_names.title_name(session, cfg)
     shown = role_symbol(session.session_id) or badge  # tp#1288
-    core = title_core(shown, cwd or session.cwd, name=name)
+    titled = session if not cwd or cwd == session.cwd else dataclasses.replace(session, cwd=cwd)
+    core = _session_core(titled, shown, cfg)  # tp#1366: a staff tab_name, the AIM words, the name
     plain: dict[str, str] = {}
     cas: dict[str, tuple[str, str]] = {}
     writes: list[tuple[str, str]] = []

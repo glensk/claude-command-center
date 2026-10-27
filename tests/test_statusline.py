@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 from argparse import Namespace
 from pathlib import Path
 
@@ -11,6 +12,8 @@ import pytest
 from command_center import accounts, cli, config
 from command_center.models import dumps_todos
 from command_center.store import Store
+
+_ANSI = re.compile(r"\033\[[0-9;]*m")
 
 
 def _seed(
@@ -395,8 +398,27 @@ def test_statusline_marks_a_session_that_adopted_a_role(
     _bind(tmp_path, monkeypatch, "s1", "email-agent")
     cli.cmd_statusline(Namespace(session="s1"))
     row = _aim_row(capsys.readouterr().out)
-    assert f"{cli.ROLE_MARKER} " in row and "all tests pass" in row
-    assert row.index(cli.ROLE_MARKER) < row.index("all tests pass")
+    # tp#1366: a staff session is named after its agent — the name replaces the AIM text.
+    assert f"{cli.ROLE_MARKER} email-agent" in row and "all tests pass" not in row
+
+
+def test_statusline_staff_row_is_the_agent_name_then_the_item_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#1366: `/aim: 🎭<symbol> <tab_name> #123, #456` — the name first, then the ids."""
+    _seed(tmp_path, monkeypatch, todos=None)
+    _bind(tmp_path, monkeypatch, "s1", "email-agent")
+    yaml = tmp_path / "staff" / "email-agent" / "agent.yaml"
+    yaml.write_text(
+        yaml.read_text(encoding="utf-8") + 'symbol: "📧"\ntab_name: "mail desk"\n',
+        encoding="utf-8",
+    )
+    with Store() as store:
+        store.update_fields("s1", aim="triage mail: tp#123, #456")
+    cli.cmd_statusline(Namespace(session="s1"))
+    row = _ANSI.sub("", _aim_row(capsys.readouterr().out))
+    assert f"{cli.ROLE_MARKER}📧 mail desk #123, #456" in row
+    assert "triage mail" not in row
 
 
 def test_statusline_puts_the_agent_symbol_after_the_role_marker(

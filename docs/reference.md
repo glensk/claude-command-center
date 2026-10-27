@@ -1497,11 +1497,18 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   mode: `!aim <text>` with a tiny `aim` shell script on PATH that calls `ccc set-aim`.
   `ccc set-aim` re-titles the tab too when `aim_in_tab_title` is on.
 - **`aim_on_main_line = true`** prefixes `ccc aim --format bar` (status-line row 1) with
-  `🎯 <aim>` (60 chars); **`aim_in_tab_title = true`** makes the iTerm tab title
-  `<badge> <leaf> 🎯 <aim>` (40 chars) — pushed at once by the `/aim` intercept, and kept
-  converged by the daemon / TUI title sync. A session whose name was set by hand (`ccc name`,
-  or a hand-typed tab title; shown with `session_names` on) keeps a bare `<badge> <name>` —
-  no AIM tail; generated names keep it.
+  `🎯 <aim>` (60 chars; an AIM ending in a work-item run, `<few words>: tp#N, #M`, has its
+  words clipped so the run stays whole); **`aim_in_tab_title = true`** makes the iTerm tab
+  title `<badge> <AIM words>` — the AIM without that run (`fix decide: tp#7` → `fix decide`,
+  40 chars; the older `tp#N: <words>` form reads the same) — pushed at once by the `/aim`
+  intercept, and kept converged by the daemon / TUI title sync. A session whose name was set
+  by hand (`ccc name`, or a hand-typed tab title; shown with `session_names` on) keeps a bare
+  `<badge> <name>`; an AIM of ids only falls back to `<badge> <name>` too.
+- **Staff sessions are named after their agent.** A session bound to an llm-staff role
+  (`staff adopt -a <agent>`: tp's `session-role/<sid>` binding) gets the agent.yaml
+  `tab_name` (default: the agent id) as its WHOLE tab title — no badge, no AIM — and its
+  `/aim` row reads `/aim: 🎭<symbol> <tab_name> #123, #456` (the ids of the AIM's run).
+  `ccc sessions -j` reports it as `display_name` with the agent id in `staff_agent`.
 - **Agent-driven sharpening with an independent checker.** While the AIM is vague, the
   `UserPromptSubmit` hook nudges the running session **every turn** (`sharpen_every_n_turns`)
   to rewrite it — *keeping your goal intact, only making it concrete* — grounded in what the
@@ -3227,6 +3234,8 @@ background jobs from `claude agents --json` too. Headless `claude -p` runs (regi
 | :--------------------- | :------------------------------------------------------------------------------------------------- |
 | `session_id`           | the Claude session id                                                                              |
 | `name` / `name_origin` | the memorable canonical name and where it came from (`llm` / `fallback` / `manual` / `manual-tab`) |
+| `display_name`         | what to call it: a staff session's agent `tab_name`, else its AIM (`fix decide: tp#7`), else `name`|
+| `staff_agent`          | the staff agent id the session adopted (`staff adopt`), else null                                  |
 | `account`              | the account label of the session's config dir                                                      |
 | `account_conflict`     | the id is live under two accounts at once (never messaged)                                         |
 | `pid`                  | the claude process                                                                                 |
