@@ -1834,8 +1834,8 @@ alias (such as a `tp` alias) is not found and `accept` fails with "could not run
 **A capped seat** cannot run a model turn. The `UserPromptSubmit` intercept
 (`switch_intercept._HANDOFF_COMMANDS` → `handoff_capped.py`) lets a handoff command reach
 the model while the seat has quota; when it is capped (a usage-limit halt per
-`limitswitch.observe`, the quota snapshot showing the seat BLOCKED, or
-`CCC_HANDOFF_ASSUME_CAPPED=1`) it refuses at once while work is in flight (naming the
+`limitswitch.observe`, the quota snapshot showing the seat BLOCKED with no turn on that
+seat succeeding since the window first read full, or `CCC_HANDOFF_ASSUME_CAPPED=1`) it refuses at once while work is in flight (naming the
 `*-cache-write-hit` command), refuses a handoff to the capped account itself, and otherwise
 spawns a detached `ccc continue-session start --capped` and blocks the prompt with a status
 line. `--capped` builds a bounded digest (state, the last main-chain messages) and gets the
@@ -1843,6 +1843,13 @@ handoff from `llm_custom_command` with `CCC_LLM_PURPOSE=handoff-summary` (`ccc l
 lists it); the text passes the same validation and transfer path. A router that is unset or
 fails is logged to `events.log` (`handoff`), notified, and names the `*-cache-write-hit`
 command. A capped source has no Stop chain, so its tab stays open, idle and `handed_off`.
+A BLOCKED reading alone is not a cap (tp#1327): a seat on extra usage reads 100 % and still
+runs turns. The usage cache records `full_since` per window (the first capture that read it
+full; `captured_at` is bumped every few seconds by the status line and cannot date it), and
+`is_capped` compares it with the newest successful main-chain turn of the source and every
+live session on the same account; a usage-limit halt newer than that turn caps again, and an
+unknown `full_since` stays capped. `ccc continue-session state` prints the verdict (`seat:`;
+`capped` in `-j`).
 
 ### Rate-limit failover — switch seats instead of waiting (`auto_switch_on_limit`)
 

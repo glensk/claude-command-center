@@ -21,6 +21,10 @@ logged failure (``events.log``), a desktop notification and a pointer to the
 ``*-cache-write-hit`` command. The summary passes the same validation as a model-written
 handoff and the same transfer path. ``CCC_HANDOFF_ASSUME_CAPPED=1`` forces the capped
 verdict (canaries never manufacture a quota exhaustion).
+
+A BLOCKED quota reading alone is not a cap (tp#1327): a seat whose snapshot reads a full
+window but still runs turns (extra usage) is not capped. :func:`is_capped` counts it capped
+only while no turn on that seat succeeded since the reading began.
 """
 
 from __future__ import annotations
@@ -45,6 +49,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .adapters.claude import ClaudeAdapter
     from .continue_session import Source
+    from .quota import ProviderQuota
 
 # Handoff command → the account label it hands off TO (the account named last).
 HANDOFF_COMMANDS = {
@@ -80,8 +85,83 @@ def cache_write_hit_for(label: str, source_label: str) -> str:
     return CACHE_WRITE_HIT.get(other, "/cwork-to-cpriv-cache-write-hit")
 
 
+def _record_ms(record: dict[str, Any]) -> int:
+    """Epoch-ms of a transcript record's own ``timestamp`` (0 when absent/unparseable)."""
+    from .limitswitch import _record_ms as record_ms  # one timestamp parser
+
+    return record_ms(record)
+
+
+def _turn_outcomes(adapter: ClaudeAdapter, path: Path | None) -> tuple[int, int]:
+    """``(newest successful turn, newest usage-limit halt)`` in one transcript, epoch-ms.
+
+    A successful turn is a main-chain assistant record the API produced: no
+    ``isApiErrorMessage`` flag and not Claude Code's ``<synthetic>`` filler (written on an
+    interrupt, never a model call). A halt is an API error that reads "hit your … limit".
+    """
+    from .adapters.claude import _RATE_LIMIT_RE, _assistant_text
+
+    if path is None:
+        return 0, 0
+    ok = halt = 0
+    for record in adapter._tail_records(path):  # pylint: disable=protected-access
+        if record.get("isSidechain") or record.get("type") != "assistant":
+            continue
+        stamp = _record_ms(record)
+        message = record.get("message")
+        if record.get("isApiErrorMessage"):
+            if _RATE_LIMIT_RE.search(_assistant_text(record)):
+                halt = max(halt, stamp)
+        elif not (isinstance(message, dict) and message.get("model") == "<synthetic>"):
+            ok = max(ok, stamp)
+    return ok, halt
+
+
+def seat_turns(adapter: ClaudeAdapter, src: Source) -> tuple[int, int]:
+    """``(newest successful turn, newest usage-limit halt)`` on *src*'s seat, epoch-ms.
+
+    Read from the source transcript and every live session on the same account — the
+    transcripts ccc already reads; ``projects/`` is shared between the config dirs, so
+    the account comes from each live session's own config dir, never from the path.
+    """
+    from . import accounts
+
+    paths: dict[str, Path | None] = {src.session_id: src.transcript}
+    for live in adapter.discover():
+        if not live.alive or live.session_id in paths or not live.config_dir:
+            continue
+        if accounts.account_label(live.config_dir) != src.label:
+            continue
+        paths[live.session_id] = adapter.transcript_path(live.cwd, live.session_id, live.config_dir)
+    ok = halt = 0
+    for path in paths.values():
+        one_ok, one_halt = _turn_outcomes(adapter, path)
+        ok, halt = max(ok, one_ok), max(halt, one_halt)
+    return ok, halt
+
+
+def _blocked_since(label: str, state: ProviderQuota) -> int:
+    """Epoch seconds from which the BLOCKED reading is known to hold (0 = unknown).
+
+    A window verdict dates from the first capture that read that window full
+    (:func:`usage.full_since`); ``captured_at`` would not do, the status line bumps it
+    every few seconds. A cooldown entry dates from the refusal it observed.
+    """
+    from . import usage
+
+    if state.source == "windows":
+        return usage.full_since(label, state.blocked_by)
+    return int(state.captured_at or 0)
+
+
 def is_capped(adapter: ClaudeAdapter, src: Source) -> tuple[bool, str]:
-    """``(capped, why)`` for the source seat: forced, a usage-limit halt, or BLOCKED quota."""
+    """``(capped, why)`` for the source seat (tp#1327).
+
+    Capped = forced (:data:`ASSUME_CAPPED_ENV`), this session's last turn hit the usage
+    limit, or the quota snapshot reads BLOCKED and no turn on that seat succeeded since
+    the reading began (:func:`_blocked_since`) — a halt newer than that success counts
+    again. A BLOCKED reading whose start is unknown stays capped.
+    """
     if os.environ.get(ASSUME_CAPPED_ENV) == "1":
         return True, f"{ASSUME_CAPPED_ENV}=1"
     from . import limitswitch, quota
@@ -91,11 +171,18 @@ def is_capped(adapter: ClaudeAdapter, src: Source) -> tuple[bool, str]:
     )
     if obs is not None and obs.usage_limit:
         return True, "this session's last turn hit the account's usage limit"
-    if src.label:
-        state = quota.provider_state(f"claude:{src.label}")
-        if state is not None and state.state == quota.BLOCKED:
-            return True, f"the {src.label} seat is blocked ({state.reason or 'quota'})"
-    return False, ""
+    if not src.label:
+        return False, ""
+    state = quota.provider_state(f"claude:{src.label}")
+    if state is None or state.state != quota.BLOCKED:
+        return False, ""
+    blocked = f"the {src.label} seat is blocked ({state.reason or 'quota'})"
+    since = _blocked_since(src.label, state)
+    ok_ms, halt_ms = seat_turns(adapter, src)
+    if since and ok_ms > since * 1000 and ok_ms > halt_ms:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ok_ms / 1000))
+        return False, f"{blocked}, but a turn succeeded on it at {when}"
+    return True, blocked
 
 
 def log_event(session_id: str, detail: str) -> None:

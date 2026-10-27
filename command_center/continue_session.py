@@ -148,7 +148,16 @@ def state(adapter: ClaudeAdapter, store: Store, src: Source) -> dict[str, Any]:
         "handed_off_to": (session.handed_off_to if session else None) or "",
         "active_transfer": active.to_dict() if active else None,
         "inflight": inventory(adapter, store, src).to_dict(),
+        "capped": _capped(adapter, src),
     }
+
+
+def _capped(adapter: ClaudeAdapter, src: Source) -> dict[str, Any]:
+    """The capped-seat verdict a typed handoff would act on (tp#1327)."""
+    from . import handoff_capped
+
+    capped, why = handoff_capped.is_capped(adapter, src)
+    return {"capped": capped, "why": why}
 
 
 def _render_state(data: dict[str, Any]) -> str:
@@ -169,6 +178,9 @@ def _render_state(data: dict[str, Any]) -> str:
     if data["active_transfer"]:
         t = data["active_transfer"]
         lines.append(f"transfer:  {t['transfer_id']} {t['state']} → {t['target_session']}")
+    capped = data.get("capped") or {}
+    verdict = "CAPPED" if capped.get("capped") else "not capped"
+    lines.append(f"seat:      {verdict}" + (f" — {capped['why']}" if capped.get("why") else ""))
     lines.append(_render_inflight(data["inflight"]))
     return "\n".join(lines)
 

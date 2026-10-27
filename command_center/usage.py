@@ -500,6 +500,49 @@ def _window_dict(win: Window | None) -> dict | None:
     return {"used_percentage": win.used_percentage, "resets_at": win.resets_at}
 
 
+# A window counts as full at this percentage. ``full_since`` (tp#1327) records, per window,
+# the FIRST capture that read it full for the window's current boundary. ``captured_at``
+# cannot date that: the status line bumps it every few seconds, so a turn is never newer
+# than it. The handoff's capped check asks "did a turn succeed on the seat after it filled?"
+# and needs the earliest moment the window was known full.
+_FULL_PCT = 100.0
+# Two readings of one window may name boundaries a few seconds apart (OAuth ISO vs the
+# status line's epoch); a genuine new window of the same name is hours away.
+_SAME_WINDOW_SLACK_SEC = 3600
+
+
+def _full_since(prev: dict | None, windows: dict[str, Window | None], now: int) -> dict[str, int]:
+    """``{window: epoch}`` of the first capture that read each window full (tp#1327).
+
+    A window full in *prev* with a still-live boundary within
+    :data:`_SAME_WINDOW_SLACK_SEC` of the new one keeps its stored time; a window that
+    became full now starts at *now*; one below :data:`_FULL_PCT` drops out.
+    """
+    stored = prev.get("full_since") if prev else None
+    stored = stored if isinstance(stored, dict) else {}
+    out: dict[str, int] = {}
+    for name, win in windows.items():
+        if win is None or win.used_percentage < _FULL_PCT:
+            continue
+        old = _window(prev.get(name)) if prev else None
+        since = _int_field(stored, name)
+        same = (
+            old is not None
+            and old.used_percentage >= _FULL_PCT
+            and old.resets_at > now
+            and abs(old.resets_at - win.resets_at) < _SAME_WINDOW_SLACK_SEC
+        )
+        out[name] = since if same and 0 < since <= now else now
+    return out
+
+
+def full_since(account: str, window: str) -> int:
+    """Epoch seconds since which *account*'s *window* has read full (0 = unknown/not full)."""
+    data = _read_validated(account)
+    stored = data.get("full_since") if data else None
+    return _int_field(stored if isinstance(stored, dict) else None, window)
+
+
 def write_usage(rate_limits: object, *, account: str = "private", now: int | None = None) -> bool:
     """Merge a ``rate_limits`` snapshot into *account*'s cache; ``True`` if written.
 
@@ -565,6 +608,7 @@ def write_usage(rate_limits: object, *, account: str = "private", now: int | Non
                 "config_dir_hash": _account_hash(account),
                 "five_hour": _window_dict(five),
                 "seven_day": _window_dict(seven),
+                "full_since": _full_since(prev, {"five_hour": five, "seven_day": seven}, now),
                 # OAuth-only fields preserved verbatim (status line never carries them).
                 "oauth_fetched_at": prev_oauth,
                 "oauth_backoff_until": _int_field(prev, "oauth_backoff_until") if prev else 0,
@@ -857,16 +901,18 @@ def fetch_claude_usage(account: str, now: int | None = None) -> Usage | None:
     path = _usage_path(account)
     # Authoritative replace: a fresh payload with NO ``oauth_backoff_until`` key, which
     # clears any backoff a prior 429 recorded (the fetch just succeeded).
-    payload = {
-        "captured_at": now,
-        "config_dir_hash": _account_hash(account),
-        "five_hour": _window_dict(snap.five_hour),
-        "seven_day": _window_dict(snap.seven_day),
-        "oauth_fetched_at": now,
-    }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with _flock(path.with_name(path.name + ".lock")):
+            windows = {"five_hour": snap.five_hour, "seven_day": snap.seven_day}
+            payload = {
+                "captured_at": now,
+                "config_dir_hash": _account_hash(account),
+                "five_hour": _window_dict(snap.five_hour),
+                "seven_day": _window_dict(snap.seven_day),
+                "full_since": _full_since(_read_validated(account), windows, now),
+                "oauth_fetched_at": now,
+            }
             _atomic_write_json(path, payload)
     except OSError:
         return None
