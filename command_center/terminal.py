@@ -30,6 +30,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+# Same marker as ``adapters.claude._KEEPWARM_MARKER`` (kept here to avoid an import cycle).
+_KEEPWARM_MARKER = "cc-keepwarm.sh"
+
 # Named tab colors → RGB (iTerm2 tab background). Hex "#rrggbb" is also accepted.
 _TAB_COLORS: dict[str, tuple[int, int, int]] = {
     "red": (255, 0, 0),
@@ -1751,7 +1754,9 @@ def drain_state(
     managed-settings file appear in no file ccc reads, so they are covered only by the
     ``hook`` over-match, and a foreign wrapper naming neither can be missed. The two
     callers therefore treat anything but ``DRAIN_DRAINED`` as "do not kill"; the files
-    themselves are protected by the Stop lease, not by this predicate.
+    themselves are protected by the Stop lease, not by this predicate. A keep-warm timer
+    (a Bash-tool shell whose argv names ``cc-keepwarm.sh``) and its whole subtree are
+    skipped: it is disposable and would otherwise read as a hook for up to an hour.
     """
     if not table or pid <= 0 or pid not in table or not pid_is_claude(pid, table):
         return DRAIN_UNKNOWN, []
@@ -1768,6 +1773,10 @@ def drain_state(
         seen.add(current)
         row = table.get(current)
         if row is None:
+            continue
+        if _KEEPWARM_MARKER in row.command:
+            # A keep-warm timer (and its guard child) is disposable and sleeps for up to
+            # an hour: never a Stop hook, so neither it nor its subtree blocks a drain.
             continue
         stack.extend(children.get(current, []))
         if current in exclude:

@@ -271,6 +271,21 @@ def test_drain_state_is_drained_when_only_unrelated_children_remain() -> None:
     assert terminal.drain_state(CLAUDE_PID, table, set(), set()) == (terminal.DRAIN_DRAINED, [])
 
 
+def test_drain_state_skips_a_keepwarm_timer_and_its_guard() -> None:
+    """A keep-warm timer shell (and its keep-warm-guard child) never blocks a drain."""
+    shell = (
+        "/bin/zsh -c source snap.sh && eval '~/.claude/hooks/cc-keepwarm.sh 3000 /x/s.jsonl'"
+        " < /dev/null && pwd -P >| /tmp/claude-bc68-cwd"
+    )
+    table = _tree(pid5001=shell)
+    table[5002] = _row(5001, "Python /Users/me/.claude/hooks/keep-warm-guard.py -T 3000 /x/s.jsonl")
+    assert terminal.drain_state(CLAUDE_PID, table, set(), set()) == (terminal.DRAIN_DRAINED, [])
+    table[5003] = _row(CLAUDE_PID, "/bin/sh /Users/me/.claude/hooks/auto-commit.sh")
+    state, running = terminal.drain_state(CLAUDE_PID, table, set(), set())
+    assert state == terminal.DRAIN_RUNNING
+    assert running == ["/bin/sh /Users/me/.claude/hooks/auto-commit.sh"]
+
+
 def test_drain_state_unknown_on_a_failed_observation() -> None:
     """`snapshot.read_ps` returns {} on ANY failure — an empty table is never proof of quiet."""
     assert terminal.drain_state(CLAUDE_PID, {}, set(), set()) == (terminal.DRAIN_UNKNOWN, [])
