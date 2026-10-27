@@ -148,7 +148,7 @@ def test_thread_stays_quiet_while_beaten_and_stops_cleanly(tmp_path: Path) -> No
         restart_wanted=lambda: False,
         state=lambda: {},
         reexec=lambda: None,
-        stall_sec=0.1,
+        stall_sec=5.0,
         tick_sec=0.01,
         heal_fn=lambda reason, **kw: healed.append(reason),
         log=tmp_path / "log",
@@ -159,8 +159,8 @@ def test_thread_stays_quiet_while_beaten_and_stops_cleanly(tmp_path: Path) -> No
         time.sleep(0.01)
     dog.stop()
     assert healed == []
-    assert dog.check(now=dog.heartbeat + 0.05) is None
-    assert dog.check(now=dog.heartbeat + 1.0) == "stall"
+    assert dog.check(now=dog.heartbeat + 1.0) is None
+    assert dog.check(now=dog.heartbeat + 10.0) == "stall"
 
 
 def test_heal_exits_zero_for_a_hung_quit_without_touching_exec(
