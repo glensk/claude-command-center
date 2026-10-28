@@ -100,7 +100,7 @@ not an automatic expiry.
 
 ## The staff close guard (llm-staff agents)
 
-An llm-staff agent such as `mac-overseer` ends its episode with `staff lease -r` and then
+An llm-staff agent such as `mac-automator` ends its episode with `staff lease -r` and then
 `ccc mark-done --close`. When it forgets the close, its idle `claude` keeps counting as a live
 agent and blocks every later launch. `staff lease -r` therefore writes a pending-close marker
 `$STAFF_STATE/released/<agent>/<session_id>.json` (`{agent, owner, generation, nonce,
@@ -110,7 +110,7 @@ lease, and `release-locks` — after it has handled the close/switch claim, so i
 (`command_center/staff_close_guard.py`):
 
 - **No marker → one `lstat()` per guarded agent**, nothing else (no subprocess, no store
-  write). Guarded agents: `CC_STAFF_CLOSE_GUARD_AGENTS` (comma list, default `mac-overseer`).
+  write). Guarded agents: `CC_STAFF_CLOSE_GUARD_AGENTS` (comma list, default `mac-automator`).
   Agent and session ids must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; the marker is read
   with `O_NOFOLLOW` and must be a regular file owned by you, in a directory owned by you,
   naming this agent and session. An untrusted marker never blocks.

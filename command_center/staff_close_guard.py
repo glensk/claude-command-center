@@ -9,7 +9,7 @@ every later launch. llm-staff makes the release itself write a pending-close mar
 released_at_iso}``), BEFORE it frees the lease row. This module is the ccc half: the
 ``release-locks`` Stop hook calls :func:`run` after it claimed the after-turn action.
 
-Per guarded agent (``CC_STAFF_CLOSE_GUARD_AGENTS``, comma list, default ``mac-overseer``):
+Per guarded agent (``CC_STAFF_CLOSE_GUARD_AGENTS``, comma list, default ``mac-automator``):
 
 * no marker → one ``lstat()`` and nothing else (no subprocess, no store work);
 * marker + a claimed :class:`~command_center.models.CloseClaim`, or a session the store
@@ -63,7 +63,7 @@ if TYPE_CHECKING:
 KILL_SWITCH_ENV = "CC_NO_STAFF_CLOSE_GUARD"
 #: Comma list of the llm-staff agents whose released lease must be followed by a close.
 AGENTS_ENV = "CC_STAFF_CLOSE_GUARD_AGENTS"
-DEFAULT_AGENTS: tuple[str, ...] = ("mac-overseer",)
+DEFAULT_AGENTS: tuple[str, ...] = ("mac-automator",)
 #: llm-staff's private state directory — the same override and default it uses itself.
 STAFF_STATE_ENV = "STAFF_STATE"
 DEFAULT_STAFF_STATE = "~/.local/state/llm-staff"

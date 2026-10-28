@@ -332,7 +332,7 @@ close guard". Invariants:
   can never keep `close-now` from firing; `staff_close_guard.guard` swallows every exception
   (fail open = no block).
 - **No marker = one `lstat()` per guarded agent** (`CC_STAFF_CLOSE_GUARD_AGENTS`, default
-  `mac-overseer`) — no subprocess, no store write. Only a marker hit may run the read-only
+  `mac-automator`) — no subprocess, no store write. Only a marker hit may run the read-only
   probe `staff lease -s -j` (2 s, `STAFF_BIN` → `$PATH` via `external_deps`). ccc never reads
   llm-staff's SQLite: that subprocess contract is the only coupling.
 - **Pass** only on a claimed `CloseClaim`, a done session, or a probe that PROVES

@@ -25,7 +25,7 @@ from command_center.store import Store
 
 ROOT = Path(__file__).resolve().parents[1]
 SID = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"
-AGENT = "mac-overseer"
+AGENT = "mac-automator"
 NONCE = "8d3f0a1b2c4e4f6a9b7c5d3e1f0a2b4c"
 
 _FAKE_STAFF = """#!{python}
@@ -495,7 +495,7 @@ def test_the_allowlist_env_replaces_the_default(
 ) -> None:
     monkeypatch.setenv("CC_STAFF_CLOSE_GUARD_AGENTS", " nixos-overseer , ../evil,")
     _session()
-    _write_marker()  # mac-overseer is no longer guarded
+    _write_marker()  # mac-automator is no longer guarded
     assert _stop(capsys) is None
     assert _calls(staff) == []
     _write_marker(agent="nixos-overseer")
