@@ -236,3 +236,34 @@ def test_a_staff_session_title_is_exactly_its_agent_name(
     (staff / "agent.yaml").write_text("name: zoho-solver\n")  # no tab_name: the agent id
     os.utime(staff / "agent.yaml", ns=(1, 1))  # a new mtime: the manifest cache re-reads
     assert tabsymbol._session_core(session, "🎫", cfg) == "zoho-solver"
+
+
+def test_a_staff_tab_is_written_whole_so_no_wait_marker_survives(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """tp#1366: a staff tab is forced to its tab_name (dropping `🔴 `); others keep the marker."""
+    staff = tmp_path / "staff" / "zoho-solver"
+    staff.mkdir(parents=True)
+    (staff / "agent.yaml").write_text('name: zoho-solver\ntab_name: "zoho-agent"\n')
+    roles = tmp_path / "tp" / "session-role"
+    roles.mkdir(parents=True)
+    (roles / "staff-sid").write_text("zoho-solver\n")
+    monkeypatch.setenv("TP_STAFF_ROOT", str(tmp_path / "staff"))
+    monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path / "tp"))
+    forced: list[dict[str, str]] = []
+    preserved: list[dict[str, str]] = []
+    monkeypatch.setattr(terminal, "set_session_titles", forced.append)
+    monkeypatch.setattr(
+        terminal, "set_session_titles_preserving", lambda cores, marker="": preserved.append(cores)
+    )
+    plain: dict[str, str] = {}
+    cas: dict[str, tuple[str, str]] = {}
+    writes: list[tuple[str, str]] = []
+    bare: dict[str, str] = {}
+    for sid, iid in (("staff-sid", "w0t0p0:AAA"), ("other", "w0t1p0:BBB")):
+        session = Session(session_id=sid, cwd="/Users/x/repo", iterm_session_id=iid)
+        core = tabsymbol._session_core(session, "🟧", config.Config())
+        tabsymbol._plan_write(session, core, plain, cas, writes, bare=bare)
+    tabsymbol._write_titles(plain, cas, "🔴 ", bare)
+    assert forced == [{"w0t0p0:AAA": "zoho-agent"}]
+    assert list(preserved[0]) == ["w0t1p0:BBB"] and len(preserved) == 1

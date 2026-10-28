@@ -110,8 +110,13 @@ def test_sync_live_titles_an_adopted_tab_with_its_agent_name(
     captured: dict[str, dict[str, str]] = {}
     monkeypatch.setattr(
         terminal,
+        "set_session_titles",  # tp#1366: a staff tab is written whole, no wait marker
+        lambda cores: captured.setdefault("cores", {}).update(cores),
+    )
+    monkeypatch.setattr(
+        terminal,
         "set_session_titles_preserving",
-        lambda cores, marker="🔴 ": captured.update(cores=cores),
+        lambda cores, marker="🔴 ": captured.setdefault("cores", {}).update(cores),
     )
     _adopt(tmp_path, "a", "email-agent")
     store = _FakeStore(
@@ -133,8 +138,8 @@ def test_seed_title_uses_the_agent_name(tmp_path: Path, monkeypatch: pytest.Monk
     captured: dict[str, dict[str, str]] = {}
     monkeypatch.setattr(
         terminal,
-        "set_session_titles_preserving",
-        lambda cores, marker="🔴 ": captured.update(cores=cores),
+        "set_session_titles",  # tp#1366: a staff tab is written whole, no wait marker
+        lambda cores: captured.update(cores=cores),
     )
     _adopt(tmp_path, "a", "email-agent")
     session = Session("a", cwd="/Users/x/ra", iterm_session_id="w0t1p0:AA")

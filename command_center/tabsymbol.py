@@ -508,10 +508,21 @@ def _session_core(session: Session, badge: str, cfg: Config) -> str:
     return title_core(badge, session.cwd, name=name)
 
 
-def _write_titles(plain: dict[str, str], cas: dict[str, tuple[str, str]], marker: str) -> None:
-    """Dispatch one batch of title writes: unconditional *plain* cores, compare-and-swap *cas*."""
+def _write_titles(
+    plain: dict[str, str],
+    cas: dict[str, tuple[str, str]],
+    marker: str,
+    bare: dict[str, str] | None = None,
+) -> None:
+    """Dispatch one batch of title writes: unconditional *plain* cores, compare-and-swap *cas*.
+
+    *bare* holds staff tabs (tp#1366): their whole title is forced to the agent's
+    ``tab_name``, which also drops the red wait *marker* the hooks put in front.
+    """
     from . import tab_titles, terminal  # lazy: AppleScript layer, not needed on the read path
 
+    if bare:
+        terminal.set_session_titles(bare)
     if plain:
         terminal.set_session_titles_preserving(plain, marker=marker)
     if cas:
@@ -539,15 +550,20 @@ def _plan_write(
     writes: list[tuple[str, str]],
     *,
     expected: str | None = None,
+    bare: dict[str, str] | None = None,
 ) -> None:
     """File *session*'s *core* as an unconditional first write or a compare-and-swap.
 
     Once ccc has written a title (``title_written``) every later write is conditional on
     the tab still showing it — a title the user typed meanwhile is never replaced.
     *expected*: the body the tab really shows (:func:`drifted_ccc_body`, tp#1292).
+    *bare*: when given, a staff session's core (exactly its ``tab_name``) goes there instead
+    — written whole, wait marker included, so a staff tab never shows one (tp#1366).
     """
     iid = session.iterm_session_id or ""
-    if expected:
+    if bare is not None and core == staff_title(session):
+        bare[iid] = core
+    elif expected:
         cas[iid] = (expected, core)
     elif session.title_written:
         cas[iid] = (session.title_written, core)
@@ -686,8 +702,9 @@ def push_title(session: Session, *, marker: str | None = None) -> None:
     plain: dict[str, str] = {}
     cas: dict[str, tuple[str, str]] = {}
     writes: list[tuple[str, str]] = []
-    _plan_write(session, core, plain, cas, writes)
-    _write_titles(plain, cas, _wait_marker(marker))
+    bare: dict[str, str] = {}
+    _plan_write(session, core, plain, cas, writes, bare=bare)
+    _write_titles(plain, cas, _wait_marker(marker), bare)
     if writes:
         from .store import Store  # lazy: the hook / CLI callers hold no store here
 
@@ -738,8 +755,9 @@ def seed_title(
         if session.iterm_session_id == iterm_session_id
         else dataclasses.replace(session, iterm_session_id=iterm_session_id)
     )
-    _plan_write(seeded, core, plain, cas, writes)
-    _write_titles(plain, cas, _wait_marker(marker))
+    bare: dict[str, str] = {}
+    _plan_write(seeded, core, plain, cas, writes, bare=bare)
+    _write_titles(plain, cas, _wait_marker(marker), bare)
     if store is not None:
         _record_writes(store, writes)
     return badge
@@ -804,6 +822,7 @@ def sync_live(store: Store, *, marker: str | None = None) -> list[str]:
     plain: dict[str, str] = {}
     cas: dict[str, tuple[str, str]] = {}
     writes: list[tuple[str, str]] = []
+    bare: dict[str, str] = {}
     badged: list[str] = []
     for session in owners:
         iid = session.iterm_session_id or ""
@@ -820,9 +839,9 @@ def sync_live(store: Store, *, marker: str | None = None) -> list[str]:
             continue
         drift = drifted_ccc_body(session, live_title, now, wait_marker)
         core = _session_core(session, badge, cfg)
-        _plan_write(session, core, plain, cas, writes, expected=drift)
+        _plan_write(session, core, plain, cas, writes, expected=drift, bare=bare)
         badged.append(session.session_id)
-    _write_titles(plain, cas, wait_marker)
+    _write_titles(plain, cas, wait_marker, bare)
     _record_writes(store, writes)
     return badged
 

@@ -2136,6 +2136,9 @@ rewrites only the `<emoji> repo` *core* of a tab title, so a tab flagged
 "waiting" by `set-iterm-wait-marker.sh` stays `🔴 <emoji> repo` rather than being
 reset to `<emoji> repo`.
 
+A staff-bound tab is the exception (tp#1366): its title is always exactly the agent's
+`tab_name`, so the sync writes it whole and drops a `🔴` the hooks put in front.
+
 `ccc tab-symbol` owns the palette and guarantees uniqueness across live tabs
 (recycling the oldest when the palette is exhausted). State is one tiny file per
 tab under `~/.cache/iterm-tab-symbol/<ITERM_SESSION_ID>` — mirroring the sibling
