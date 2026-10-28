@@ -127,7 +127,7 @@ def test_sync_live_titles_an_adopted_tab_with_its_agent_name(
     )
     assert set(tabsymbol.sync_live(store)) == {"a", "b"}  # type: ignore[arg-type]
     cores = captured["cores"]
-    assert cores["w0t1p0:AA"] == "email-agent"  # tp#1366: exactly the agent's tab_name
+    assert cores["w0t1p0:AA"] == "📧 email-agent"  # tp#1366: symbol + tab_name
     assert tabsymbol.read("w0t1p0:AA") in tabsymbol.PALETTE  # the tab keeps its slot
     badge_b = tabsymbol.read("w0t2p0:BB")
     assert badge_b in tabsymbol.PALETTE
@@ -145,7 +145,7 @@ def test_seed_title_uses_the_agent_name(tmp_path: Path, monkeypatch: pytest.Monk
     session = Session("a", cwd="/Users/x/ra", iterm_session_id="w0t1p0:AA")
     badge = tabsymbol.seed_title("w0t1p0:AA", "/Users/x/ra", session=session)
     assert badge in tabsymbol.PALETTE
-    assert captured["cores"]["w0t1p0:AA"] == "email-agent"  # tp#1366
+    assert captured["cores"]["w0t1p0:AA"] == "📧 email-agent"  # tp#1366: symbol + tab_name
 
 
 def test_title_parsers_treat_an_agent_symbol_as_a_badge() -> None:

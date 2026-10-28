@@ -1506,7 +1506,7 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   `<badge> <name>`; an AIM of ids only falls back to `<badge> <name>` too.
 - **Staff sessions are named after their agent.** A session bound to an llm-staff role
   (`staff adopt -a <agent>`: tp's `session-role/<sid>` binding) gets the agent.yaml
-  `tab_name` (default: the agent id) as its WHOLE tab title — no badge, no AIM — and its
+  `tab_name` (default: the agent id) as its WHOLE tab title, prefixed by its `symbol` (`<symbol> <tab_name>`, no badge, no AIM); its
   `/aim` row reads `/aim: 🎭<symbol> <tab_name> #123, #456` (the ids of the AIM's run).
   `ccc sessions -j` reports it as `display_name` with the agent id in `staff_agent`.
 - **Agent-driven sharpening with an independent checker.** While the AIM is vague, the
@@ -2136,8 +2136,8 @@ rewrites only the `<emoji> repo` *core* of a tab title, so a tab flagged
 "waiting" by `set-iterm-wait-marker.sh` stays `🔴 <emoji> repo` rather than being
 reset to `<emoji> repo`.
 
-A staff-bound tab is the exception (tp#1366): its title is always exactly the agent's
-`tab_name`, so the sync writes it whole and drops a `🔴` the hooks put in front.
+A staff-bound tab is the exception (tp#1366): its title is always `<symbol> <tab_name>` of the agent,
+so the sync writes it whole and drops a `🔴` the hooks put in front.
 
 `ccc tab-symbol` owns the palette and guarantees uniqueness across live tabs
 (recycling the oldest when the palette is exhausted). State is one tiny file per

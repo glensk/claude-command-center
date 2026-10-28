@@ -211,10 +211,10 @@ def test_the_tab_shows_the_aim_words_without_the_item_run(aim: str, title: str) 
     assert tabsymbol._session_core(session, "🟧", cfg) == title
 
 
-def test_a_staff_session_title_is_exactly_its_agent_name(
+def test_a_staff_session_title_is_its_agent_symbol_and_name(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """tp#1366: no badge, no AIM — the agent.yaml tab_name and nothing else."""
+    """tp#1366: no badge, no AIM — the agent.yaml symbol and tab_name and nothing else."""
     staff = tmp_path / "staff" / "zoho-solver"
     staff.mkdir(parents=True)
     (staff / "agent.yaml").write_text('name: zoho-solver\ntab_name: "zoho-agent"\nsymbol: "🎫"\n')
@@ -231,8 +231,8 @@ def test_a_staff_session_title_is_exactly_its_agent_name(
         canonical_name="zoho overseer",
         canonical_name_origin="llm",
     )
-    assert tabsymbol._session_core(session, "🎫", cfg) == "zoho-agent"
-    assert tabsymbol._session_core(session, "🎫", config.Config()) == "zoho-agent"
+    assert tabsymbol._session_core(session, "🎫", cfg) == "🎫 zoho-agent"
+    assert tabsymbol._session_core(session, "🎫", config.Config()) == "🎫 zoho-agent"
     (staff / "agent.yaml").write_text("name: zoho-solver\n")  # no tab_name: the agent id
     os.utime(staff / "agent.yaml", ns=(1, 1))  # a new mtime: the manifest cache re-reads
     assert tabsymbol._session_core(session, "🎫", cfg) == "zoho-solver"
