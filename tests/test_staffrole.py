@@ -207,3 +207,60 @@ def test_role_mark_file_follows_the_adoption(
     (tmp_path / "tp-cache" / "session-role" / "s1").unlink()
     assert tabsymbol.sync_role_mark("s1") is None and not (marks / "s1").exists()
     assert tabsymbol.sync_role_mark("../x") is None
+
+
+def _aliases(staff: Path, payload: str) -> Path:
+    (staff / "_shared").mkdir(parents=True, exist_ok=True)
+    path = staff / "_shared" / "agent-id-aliases.json"
+    path.write_text(payload, encoding="utf-8")
+    return path
+
+
+def test_a_legacy_binding_resolves_to_the_renamed_agent(_staff: Path, tmp_path: Path) -> None:
+    """tp#1383: only the NEW dir exists; the binding names OLD and the alias maps it."""
+    _agent(_staff, "mail-automator", 'symbol: "✉"\ntab_name: "Mail Automator"\nglyph: "\\uf0e0"\n')
+    _aliases(_staff, '{"schema_version": 1, "aliases": {"mail-agent": "mail-automator"}}')
+    _adopt(tmp_path, "s-old", "mail-agent")
+    assert staffrole.canonical_id("mail-agent") == "mail-automator"
+    assert staffrole.canonical_id("slack-agent") == "slack-agent"
+    assert staffrole.adopted_role("s-old") == "mail-automator"
+    assert staffrole.session_symbol("s-old") == "✉"
+    assert staffrole.session_tab_name("s-old") == "Mail Automator"
+    assert staffrole.session_glyph("s-old") == "\uf0e0"
+    assert staffrole.role_marker("s-old") == "🎭\uf0e0"
+    assert staffrole.agent_symbol("mail-agent") == "✉"
+    assert staffrole.agent_tab_name("mail-agent") == "Mail Automator"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,  # no file
+        "{not json",
+        '{"schema_version": 2, "aliases": {"mail-agent": "mail-automator"}}',
+        '{"schema_version": 1, "aliases": ["mail-agent"]}',
+        '{"schema_version": 1, "aliases": {"Mail Agent": "mail-automator"}}',
+    ],
+)
+def test_a_missing_or_bad_alias_file_means_no_aliasing(
+    _staff: Path, tmp_path: Path, payload: str | None
+) -> None:
+    _agent(_staff, "mail-automator", 'symbol: "✉"\n')
+    if payload is not None:
+        _aliases(_staff, payload)
+    _adopt(tmp_path, "s-old", "mail-agent")
+    assert staffrole.canonical_id("mail-agent") == "mail-agent"
+    assert staffrole.adopted_role("s-old") is None
+    assert staffrole.session_symbol("s-old") is None
+
+
+def test_the_alias_cache_follows_the_file(_staff: Path) -> None:
+    _agent(_staff, "mail-automator", 'symbol: "✉"\n')
+    path = _aliases(_staff, '{"schema_version": 1, "aliases": {}}')
+    assert staffrole.canonical_id("mail-agent") == "mail-agent"
+    path.write_text(
+        '{"schema_version": 1, "aliases": {"mail-agent": "mail-automator"}}', encoding="utf-8"
+    )  # a different size, so the (mtime_ns, size) key changes
+    assert staffrole.canonical_id("mail-agent") == "mail-automator"
+    path.unlink()
+    assert staffrole.canonical_id("mail-agent") == "mail-agent"

@@ -618,3 +618,21 @@ def test_valid_ids() -> None:
     assert staff_close_guard.valid_id(SID)
     assert staff_close_guard.valid_id("mac-overseer")
     assert staff_close_guard.valid_id("x" * 128)
+
+
+def test_guarded_agents_compare_canonically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1383: the legacy name in the env and the renamed agent are one guarded agent."""
+    staff_root = tmp_path / "staff-root"
+    (staff_root / "_shared").mkdir(parents=True)
+    (staff_root / "_shared" / "agent-id-aliases.json").write_text(
+        '{"schema_version": 1, "aliases": {"mac-overseer": "mac-automator"}}', encoding="utf-8"
+    )
+    monkeypatch.setenv("TP_STAFF_ROOT", str(staff_root))
+    monkeypatch.delenv(staff_close_guard.AGENTS_ENV, raising=False)
+    assert staff_close_guard.guarded_agents() == ["mac-automator"]
+    monkeypatch.setenv(staff_close_guard.AGENTS_ENV, "mac-overseer, mac-automator,other-agent")
+    assert staff_close_guard.guarded_agents() == ["mac-automator", "other-agent"]
+    monkeypatch.setenv("TP_STAFF_ROOT", str(tmp_path / "no-staff"))
+    assert staff_close_guard.guarded_agents() == ["mac-overseer", "mac-automator", "other-agent"]

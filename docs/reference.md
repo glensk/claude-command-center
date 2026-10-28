@@ -3395,7 +3395,7 @@ command_center/
   store.py         SQLite store (WAL) — single source of truth
   usage.py         account usage snapshots (Claude + Codex bars; Copilot month-to-date via gh)
   tabsymbol.py     per-iTerm-tab colored badge (claim/read), shared by shell + TUI
-  staffrole.py     adopted staff role of a session + its agent.yaml symbol (tp#1288)
+  staffrole.py     adopted staff role of a session + its agent.yaml symbol (tp#1288); legacy agent ids resolve through <staff root>/_shared/agent-id-aliases.json (tp#1383, stdlib json cached by mtime_ns+size, missing/bad file = no aliasing)
   links.py         OSC 8 clickable links (vendored from new-repo.py / list_repos.py)
   core.py          reconcile(live registry → store), build_rows()
   adapters/        claude.py = the ONLY reader of Claude Code internals

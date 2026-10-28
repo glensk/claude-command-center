@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import staffrole
 from .models import CloseClaim, SwitchClaim
 
 if TYPE_CHECKING:
@@ -114,7 +115,9 @@ def guarded_agents() -> list[str]:
     """The allowlisted agents, in order, invalid names dropped (unset → the default)."""
     raw = os.environ.get(AGENTS_ENV)
     names = DEFAULT_AGENTS if raw is None else tuple(part.strip() for part in raw.split(","))
-    return [name for name in dict.fromkeys(names) if valid_id(name)]
+    valid = (name for name in names if valid_id(name))
+    # Canonical ids (tp#1383): a legacy name in the env and its renamed agent are ONE agent.
+    return list(dict.fromkeys(staffrole.canonical_id(name) or name for name in valid))
 
 
 def staff_state_dir() -> Path:

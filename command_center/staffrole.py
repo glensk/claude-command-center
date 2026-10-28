@@ -27,6 +27,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 
 # pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
+import json
 import os
 import re
 
@@ -62,8 +63,61 @@ def staff_root() -> str:
     return os.path.expanduser(root)
 
 
+#: llm-staff's alias-map key/value shape (``_shared/agent-id-aliases.json``, tp#1383).
+_ALIAS_ID_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$")
+#: path -> (mtime_ns, size, aliases); a missing or bad file caches as an empty map.
+_alias_cache: dict[str, tuple[int, int, dict[str, str]]] = {}
+
+
+def _alias_map() -> dict[str, str]:
+    """The legacy-id -> current-id map of ``<staff root>/_shared/agent-id-aliases.json``.
+
+    Stdlib ``json``, cached by the file's ``(mtime_ns, size)``, no subprocess. A missing,
+    unreadable or malformed file (bad JSON, ``schema_version`` != 1, non-object ``aliases``)
+    is an EMPTY map; entries whose key or value break the id shape are dropped. Never raises.
+    """
+    path = os.path.join(staff_root(), "_shared", "agent-id-aliases.json")
+    try:
+        st = os.stat(path)
+    except OSError:
+        _alias_cache.pop(path, None)
+        return {}
+    cached = _alias_cache.get(path)
+    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        return cached[2]
+    aliases: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        raw = (
+            data.get("aliases")
+            if isinstance(data, dict) and data.get("schema_version") == 1
+            else None
+        )
+        if isinstance(raw, dict):
+            aliases = {
+                k: v
+                for k, v in raw.items()
+                if isinstance(k, str)
+                and isinstance(v, str)
+                and _ALIAS_ID_RE.match(k)
+                and _ALIAS_ID_RE.match(v)
+            }
+    except (OSError, UnicodeDecodeError, ValueError):
+        aliases = {}
+    _alias_cache[path] = (st.st_mtime_ns, st.st_size, aliases)
+    return aliases
+
+
+def canonical_id(name: str | None) -> str | None:
+    """A legacy agent id -> its current id (one hop), else *name* unchanged (tp#1383)."""
+    if not name:
+        return name
+    return _alias_map().get(name, name)
+
+
 def _agent_yaml(name: str) -> str:
-    return os.path.join(staff_root(), name, "agent.yaml")
+    return os.path.join(staff_root(), canonical_id(name) or name, "agent.yaml")
 
 
 def _role_dir() -> str:
@@ -101,7 +155,7 @@ def adopted_role(session_id: str) -> str | None:
         return None
     if not os.path.isfile(_agent_yaml(name)):
         return None
-    return name
+    return canonical_id(name)
 
 
 def valid_symbol(value: str) -> bool:
@@ -139,6 +193,7 @@ def _parse_tab_name(text: str) -> str | None:
 
 def _manifest_entry(name: str | None) -> tuple[str | None, str | None, str | None]:
     """``(symbol, glyph, tab_name)`` of agent *name*'s agent.yaml, cached per file mtime."""
+    name = canonical_id(name)
     if not name or not _ROLE_NAME_RE.match(name):
         return None, None, None
     path = _agent_yaml(name)
@@ -170,6 +225,7 @@ def agent_tab_name(name: str | None) -> str | None:
 
     llm-staff's rule (``registry.tab_title``). ``None`` when *name* is no agent.
     """
+    name = canonical_id(name)
     if not name or not _ROLE_NAME_RE.match(name) or not os.path.isfile(_agent_yaml(name)):
         return None
     return _manifest_entry(name)[2] or name
