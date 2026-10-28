@@ -143,14 +143,14 @@ lease, and `release-locks` — after it has handled the close/switch claim, so i
   original goal;
 - the `/aim (N):` row — the current AIM (or its short label), its running index, the
   concreteness score chip (red when vague), and a compact progress bar. A **`🎭`** right after
-  the label (`/aim: 🎭 tp#994, #1114: email-agent`) means the session ran `staff adopt -a
+  the label (`/aim: 🎭 tp#994, #1114: email-automator`) means the session ran `staff adopt -a
   <agent>` and works in that staff ROLE (tp#1166): ccc reads tp's adopt binding
   `$TP_CACHE_DIR/session-role/<sid>` (default `~/.cache/tp/session-role/<sid>`; the named agent
   must still exist under `$TP_STAFF_ROOT`, default `~/obsidian/01-llm/staff`). A session that is
   merely named or AIMed after an agent shows no `🎭`. The agent's own `symbol:` (its
-  `agent.yaml`, tp#1288) follows the `🎭` — `🎭📧` for the email-agent — the same symbol
+  `agent.yaml`, tp#1288) follows the `🎭` — `🎭✉` for the email-automator — the same symbol
   that replaces the badge in its iTerm tab title and command-center row; an agent with a
-  Nerd Font `glyph:` shows that instead (slack-agent: the Slack logo glyph);
+  Nerd Font `glyph:` shows that instead (slack-automator: the Slack logo glyph);
 - a `Status:` + `/next-step:` row;
 - a blue `●` drift warning when the impartial checker has flagged one;
 - a one-line `done/total` + checkbox strip of the session's live todos.

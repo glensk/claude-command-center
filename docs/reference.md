@@ -2108,16 +2108,16 @@ ccc tab-symbol --palette  # print the badge pool (llm-staff's lint keeps agent s
 <agent>` (tp's binding `~/.cache/tp/session-role/<sid>`, the same one behind the status
 line's `🎭`) shows its agent's `symbol:` from `<staff root>/<agent>/agent.yaml` (staff root
 `$TP_STAFF_ROOT`, else `~/obsidian/01-llm/staff`) **instead of** the tab badge: in the tab
-title (`📧 email-agent`), in its TUI / `ccc ls` badge cell (live or not — the role belongs
+title (`✉ email-automator`), in its TUI / `ccc ls` badge cell (live or not — the role belongs
 to the session), in the peek header, and after the `🎭` on its status-line `/aim` row
 (`🎭📧`). The tab keeps its palette badge claimed underneath, so the title falls back to it
 once the binding is gone. An agent without a symbol, or with one that is not a single
 non-ASCII codepoint (VS16/ZWJ/skin-tone sequences are refused: wider than two cells) or
 that equals a palette badge, keeps the ordinary badge. The title parsers (`--heal`, the
 hand-set-name detection) treat agent symbols like palette badges: one never stacks on the
-other, and `📧 email-agent` is never mistaken for a name you typed.
+other, and `✉ email-automator` is never mistaken for a name you typed.
 
-An agent may also carry a `glyph:` — one Nerd Font codepoint (slack-agent: `"\uf198"`,
+An agent may also carry a `glyph:` — one Nerd Font codepoint (slack-automator: `"\uf198"`,
 nf-fa-slack). It replaces the symbol only where ccc draws in the terminal font: the TUI
 badge cell (padded to two cells) and the status-line marker (`🎭`). The iTerm tab bar draws
 titles in the macOS system font, whose fallback for Private Use Area codepoints is the
