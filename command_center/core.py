@@ -149,6 +149,28 @@ def headless_leak_ids(store: Store, adapter: Adapter, live_ids: set[str]) -> set
     return hits
 
 
+def spare_background_agents(victims: list[Session]) -> list[Session]:
+    """*victims* minus the rows of jobs the CLI's ``claude agents`` roster still lists.
+
+    ``ccc sessions -j`` (the bridge) gives every roster background job without a row one
+    (``bridge_cli._named_row``); such a row has no registry entry, no transcript signal and
+    no AIM, so the contentless guards of :meth:`Store.prunable_sessions` read it as junk and
+    the daemon deleted it every pass — recreated by the bridge seconds later, forever
+    (``pruned=1`` on every daemon run, tp#1427). The roster is read only when there is
+    something to prune (it is a ~2.5 s subprocess per account) and a failed read spares
+    nothing, as before.
+    """
+    if not victims:
+        return victims
+    from .adapters import claude_agents  # pylint: disable=import-outside-toplevel
+
+    try:
+        roster = {entry.session_id for entry in claude_agents.list_account_agents()}
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return victims
+    return [session for session in victims if session.session_id not in roster]
+
+
 def orphan_launched_ids(store: Store, adapter: Adapter, live_ids: set[str]) -> set[str]:
     """Ids of *dead launched* rows: a future job that was started but never had a turn.
 

@@ -98,10 +98,17 @@ The invariants that keep it under a few seconds:
   `_refresh_pending` and `on_worker_state_changed` runs the single follow-up. The first
   worker run paints `build_rows(reconcile_first=False)` (stored rows + persisted facts)
   before the full reconcile, so rows appear within ~1 s of launch. The Codex usage
-  snapshots are read in that worker too (`read_codex_usage` globs+stats every rollout file
-  of a `CODEX_HOME`, ~0.3 s cold) and travel with the rows in ONE
+  snapshots are read in that worker too (`read_codex_usage` stats every rollout file
+  of a `CODEX_HOME`; the directory listing is cached per home by directory mtime, so only
+  the per-file stats remain — ~25 ms warm for ~1900 files vs 60-90 ms for the old glob) and travel with the rows in ONE
   `call_from_thread(_apply_rows, rows, snapshots)`; `_update_usage` renders
   `self._codex_usage` and never reads.
+- **Idle jump poll = three `stat`s.** `_poll_jump_request` (0.1 s) returns after
+  `jumpstate.any_pending()` (restart/toggle/request file existence) when nothing is
+  pending; only a present file goes through the `peek_*` readers.
+- **`Session(**data)` needs interned keywords.** `store._session_columns` interns the
+  column names: sqlite returns fresh `str` objects and CPython matches ~100 keywords by
+  string comparison instead of identity otherwise (290 µs → 33 µs per row).
 - **Hot spawns build one subparser.** `cli.main` passes `argv[0]` to `build_parser(only=…)`
   when it is in `cli._HOT_SUBCOMMANDS` (`statusline`, `aim`, `hook`, `tab-symbol`: the
   status line spawns three ccc processes per render per live session every 3 s, every hook

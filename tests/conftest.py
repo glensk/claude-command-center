@@ -171,6 +171,14 @@ def _guard_real_trust_writes(
 
 
 @pytest.fixture(autouse=True)
+def _stub_agents_roster(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never spawn the real ``claude agents --json`` from a prune pass (empty roster)."""
+    from command_center.adapters import claude_agents
+
+    monkeypatch.setattr(claude_agents, "list_account_agents", lambda: [])
+
+
+@pytest.fixture(autouse=True)
 def _stub_channel_probe(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     """Never let a test probe the developer's real iTerm2 for delivery-channel health.
 

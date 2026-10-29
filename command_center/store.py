@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -463,7 +464,10 @@ def _session_columns(row: sqlite3.Row) -> list[tuple[str, int]]:
     A property of the SELECT, not of the row, so one call per result set is enough (see
     :func:`_row_to_session`).
     """
-    return [(name, i) for i, name in enumerate(row.keys()) if name in _SESSION_FIELDS]
+    # The names are interned: sqlite hands back fresh str objects, and ``Session(**data)``
+    # matches each of its ~100 keywords against the signature by identity first and by
+    # string comparison only as a slow fallback (290 µs/row measured vs 33 µs interned).
+    return [(sys.intern(name), i) for i, name in enumerate(row.keys()) if name in _SESSION_FIELDS]
 
 
 def _row_to_session(row: sqlite3.Row, columns: list[tuple[str, int]] | None = None) -> Session:

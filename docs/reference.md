@@ -222,8 +222,8 @@ Coordination with the live TUI is a handful of tiny files under
 (`jump_selected`) and its own identity (`jump_tui`, `pid|iterm_session_id`, enabling the
 fast path), and consumes a cursor-move request (`jump_request`), the whole-toggle verb
 (`jump_toggle`), or the restart verb (`jump_restart`, see `ccc restart-tui` below). They
-are polled every **0.1 s**, so the jump feels instant — a ~0.1 ms
-file read at 10 Hz is free, and that cadence (not a slow osascript walk) now bounds the
+are polled every **0.1 s** (an idle tick is three `stat` calls; a file is read only once it
+exists), so the jump feels instant — and that cadence (not a slow osascript walk) now bounds the
 perceived f+j latency. The frontmost-app check uses `lsappinfo` (no Accessibility
 prompt).
 

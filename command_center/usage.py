@@ -1744,16 +1744,61 @@ def codex_usage_stale(home: Path, refresh_sec: float, now: int | None = None) ->
     return (now - int(mtime)) >= refresh_sec
 
 
+# Per-home directory listing of ``sessions/**``: ``{dir: (dir mtime_ns, subdirs, rollout files)}``.
+# A directory's mtime moves only when an entry is created, removed or renamed in it, so an
+# unchanged day directory reuses its listing instead of being re-read (the ~1900-file glob
+# cost 60-90 ms on every TUI build). A rollout's OWN mtime moves on every append without
+# touching its directory, so the files are still stat'ed on each call (that is the sort key).
+_rollout_listing: dict[str, dict[str, tuple[int, list[str], list[str]]]] = {}
+
+
+def _list_rollout_dir(
+    path: str, cache: dict[str, tuple[int, list[str], list[str]]], seen: set[str]
+) -> list[str]:
+    """Rollout files under *path* (recursively), re-reading only directories whose mtime moved."""
+    seen.add(path)
+    mtime_ns = os.stat(path).st_mtime_ns
+    entry = cache.get(path)
+    if entry is None or entry[0] != mtime_ns:
+        subdirs: list[str] = []
+        files: list[str] = []
+        with os.scandir(path) as it:
+            for item in it:
+                if item.is_dir(follow_symlinks=False):
+                    subdirs.append(item.path)
+                elif item.name.startswith("rollout-") and item.name.endswith(".jsonl"):
+                    files.append(item.path)
+        entry = (mtime_ns, subdirs, files)
+        cache[path] = entry
+    found = list(entry[2])
+    for sub in entry[1]:
+        try:
+            found.extend(_list_rollout_dir(sub, cache, seen))
+        except OSError:  # removed since its parent was listed; the parent's mtime moved too
+            cache.pop(sub, None)
+    return found
+
+
 def _codex_rollout_files(home: Path) -> list[Path]:
     """*home*'s session rollout files, newest mtime first ( ``[]`` when there are none)."""
+    root = str(home / "sessions")
+    cache = _rollout_listing.setdefault(root, {})
+    seen: set[str] = set()
     try:
-        return sorted(
-            (home / "sessions").glob("**/rollout-*.jsonl"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
+        names = _list_rollout_dir(root, cache, seen)
     except OSError:
+        cache.clear()
         return []
+    for stale in set(cache) - seen:  # directories that vanished since the last call
+        del cache[stale]
+    stamped: list[tuple[float, str]] = []
+    for name in names:
+        try:
+            stamped.append((os.stat(name).st_mtime, name))
+        except OSError:  # a rollout deleted between the listing and the stat
+            continue
+    stamped.sort(key=lambda item: item[0], reverse=True)
+    return [Path(name) for _, name in stamped]
 
 
 def _path_key(path: Path | None) -> tuple[str, int]:

@@ -2405,7 +2405,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
     ``ai.py``'s commit-message generation) that inherited the launching session's
     AIM. ``--dry-run`` lists them without deleting.
     """
-    from .core import headless_leak_ids, orphan_launched_ids
+    from .core import headless_leak_ids, orphan_launched_ids, spare_background_agents
     from .models import humanize_age, short_id
 
     adapter = _adapter()
@@ -2413,8 +2413,10 @@ def cmd_prune(args: argparse.Namespace) -> int:
     with Store() as store:
         headless_ids = headless_leak_ids(store, adapter, live_ids)
         orphan_ids = orphan_launched_ids(store, adapter, live_ids)
-        victims = store.prunable_sessions(
-            protect_ids=live_ids, headless_ids=headless_ids, orphan_ids=orphan_ids
+        victims = spare_background_agents(
+            store.prunable_sessions(
+                protect_ids=live_ids, headless_ids=headless_ids, orphan_ids=orphan_ids
+            )
         )
         if not victims:
             print("nothing to prune — no leftover sessions")

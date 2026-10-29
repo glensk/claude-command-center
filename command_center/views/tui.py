@@ -3608,6 +3608,8 @@ class CommandCenterApp(App[None]):
         flag the app and exit cleanly; run() re-execs the process in place (same tab).
         """
         self._watchdog.beat()  # this timer firing IS the liveness proof (see watchdog.py)
+        if not jumpstate.any_pending():  # idle tick: stat only, no file opened or read
+            return
         if jumpstate.peek_restart():
             jumpstate.clear_restart()
             self.restart_requested = True
@@ -4025,7 +4027,7 @@ class CommandCenterApp(App[None]):
         """
         if (store := self.store) is None or (session := store.get(sid)) is None:
             return
-        from .. import cli, mirrors  # pylint: disable=import-outside-toplevel
+        from .. import cli, mirrors  # pylint: disable=import-outside-toplevel,cyclic-import
 
         label = colors.short_folder(session.cwd)
         allow_restore = bool(session.future_file) or (

@@ -65,6 +65,22 @@ def _write(name: str, value: str | None) -> None:
         pass
 
 
+def any_pending() -> bool:
+    """True if a request, toggle or restart file exists — three ``stat`` calls, no read.
+
+    The TUI's 0.1 s poll gates on this so an idle tick opens and reads nothing; only a
+    present file (rare, and consumed at once) goes through the ``peek_*`` readers.
+    """
+    home = config.app_home()
+    for name in (_RESTART, _TOGGLE, _REQUEST):
+        try:
+            (home / name).stat()
+        except OSError:
+            continue
+        return True
+    return False
+
+
 def set_selected(session_id: str | None) -> None:
     """Record the session id currently under the TUI cursor (TUI → ``ccc jump``)."""
     _write(_SELECTED, session_id)

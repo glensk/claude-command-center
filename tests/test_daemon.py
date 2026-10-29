@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import types
 from datetime import date
 from pathlib import Path
 
@@ -196,6 +197,25 @@ def test_daemon_prunes_headless_junk(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     with Store() as store:
         assert {s.session_id for s in store.list_sessions()} == {"live"}
+
+
+def test_daemon_spares_background_agent_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `ccc sessions -j` gives a roster background job a contentless row; the prune pass
+    # must not delete it (it was deleted and recreated on every daemon run).
+    from command_center.adapters import claude_agents
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    (tmp_path / "sessions").mkdir(parents=True)
+    with Store() as store:
+        store.ensure("bgjob", cwd="/Users/x")
+        store.ensure("junk", cwd="/")
+    roster = [types.SimpleNamespace(session_id="bgjob")]
+    monkeypatch.setattr(claude_agents, "list_account_agents", lambda: roster)
+
+    report = run_once(do_reap=False, do_summary=False, do_progress=False, do_alerts=False)
+    assert report.pruned == ["junk"]
 
 
 def test_daemon_backfills_unscored_aim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
