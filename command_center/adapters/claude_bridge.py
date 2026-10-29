@@ -47,9 +47,10 @@ END_SYSTEM_SUBTYPES = frozenset({"stop_hook_summary", "turn_duration"})
 TASK_NOTIFICATION_PREFIX = "<task-notification>"
 ASK_TOOL = "AskUserQuestion"
 
-TODO_HEADING_RE = re.compile(r"^\s*#{1,6}\s*To-do list\s*$", re.IGNORECASE)
+# Heading and `You` lines may be wrapped in one backtick pair (inline-code color, 2026-10-29).
+TODO_HEADING_RE = re.compile(r"^\s*#{1,6}\s*`?To-do list`?\s*$", re.IGNORECASE)
 HEADING_RE = re.compile(r"^\s*#{1,6}\s")
-TODO_DECISION_RE = re.compile(r"^\s*\d+\.\s+You \[decision\]:\s*(.+)$")
+TODO_DECISION_RE = re.compile(r"^\s*\d+\.\s+`?You \[decision\]:\s*(.+?)`?\s*$")
 OPTION_MARKER_RE = re.compile(r"(?:(?<=\s)|^)([a-z])\)\s+")
 RECOMMENDED_RE = re.compile(r"\s*\(recommended\)", re.IGNORECASE)
 CONSEQUENCE_SPLIT_RE = re.compile(r"\s+(?:—|–|--?)\s+")
@@ -63,7 +64,8 @@ SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 HEADING_LEVEL_RE = re.compile(r"^\s*(#{1,6})\s")
 #: Every ``You [kind]: text`` line of a to-do list (numbered, bulleted or bare).
 TODO_ACTION_RE = re.compile(
-    r"^\s*(?:\d+[.)]\s*)?(?:[-*]\s*)?You\s*\[(?P<kind>[^\]]+)\](?P<rest>[^:]*):\s*(?P<text>.+?)\s*$"
+    r"^\s*(?:\d+[.)]\s*)?(?:[-*]\s*)?`?You\s*\[(?P<kind>[^\]]+)\]"
+    r"(?P<rest>[^:]*):\s*(?P<text>.+?)`?\s*$"
 )
 #: The ``(brief D<n>)`` reference that ends a ``You [decision]`` line (Decision brief
 #: convention); the ``D<n>`` names an entry of the ``## Decision briefs`` section.

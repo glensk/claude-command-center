@@ -156,3 +156,10 @@ def test_cli_exposes_actions_for_an_idle_todo_list(
     assert [a["kind"] for a in data["actions"]] == ["decision", "sudo", "decision", "ui|login"]
     assert data["actions"][0]["brief_ref"] == "D1"
     assert len(data["decision"]["questions"]) == 2
+
+
+def test_backticked_heading_and_decision_line_parse() -> None:
+    reply = "## `To-do list`\n1. `You [decision]: A or B? (brief D9)`\n"
+    assert cb.todo_actions(reply) == [
+        {"kind": "decision", "text": "A or B?", "tp_id": None, "brief_ref": "D9", "brief": None}
+    ]
