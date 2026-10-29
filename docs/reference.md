@@ -2251,8 +2251,10 @@ with its account's **monthly API-credit bar** when `claude_api_credits` configur
 for it (see *Monthly API credits* under `ccc quota`): the share of the promotional grant
 used, embossed `API PROMO: $X left →D.M.` (a fresh measured balance, `balance_json`) or
 `API PROMO: ≈$X left →D.M.` (the estimate) — or a grey `balance n/a` line when no source
-is configured. A measured reading that also carries the org's monthly spend limit adds a
-second bar, `API cap: $S of $L →D.M.` (spent ÷ limit, when it resets) — only when that
+is configured. A measured reading that also carries a one-time Claude Code
+**cloud-session credit** (`cloud_credit`, fresh and not expired) adds a bar right under it,
+`CLOUD: $X left →D.M.` (used ÷ granted) — none for an account without such a credit. A
+measured reading that also carries the org's monthly spend limit adds another bar, `API cap: $S of $L →D.M.` (spent ÷ limit, when it resets) — only when that
 cap binds first, i.e. its room (limit − spent) is smaller than the money left (promo
 remaining + purchased balance):
 
@@ -2920,7 +2922,8 @@ The file (schema 1; times as epoch seconds or ISO-8601, amounts in USD):
 row shows the REAL remaining balance (summed over the unexpired promo rows), the real grant
 and the real expiry and grant dates (UTC; the row that expires first) instead of the
 configured cycle, labelled `measured`, never `est.`; a failed latest attempt is said
-(`last read failed: logged_out`). `cap` is the org's monthly spend limit — a ceiling the
+(`last read failed: logged_out`). `cloud_credit` (optional, `null` = none) is `{remaining_usd, granted_usd, expires_at,
+measured_at}` of the one-time Claude Code cloud-session credit. `cap` is the org's monthly spend limit — a ceiling the
 provider enforces, not money — and gets its own row ONLY when it binds first: `cap_binds`
 is true when `limit − spent` is smaller than promo remaining + purchased balance (the cap
 would stop the org before the money runs out); otherwise the money is the limit and the
@@ -2971,6 +2974,11 @@ With a fresh measured balance the row reads `api` in the state column, the bar i
 · purchased $0`; a reading whose `cap` binds first adds a row `<name> cap` (`api cap`, bar `API cap` =
 spent ÷ limit, the renew column its reset, detail `$153.89 of $500 monthly spend limit
 (Console, measured 12m ago) · resets 1.11. (in 3d) · a usage ceiling, not a balance`).
+A reading with a `cloud_credit` adds a row `<name> cloud` (`api cloud`, bar `CLOUD` = used ÷
+granted, the renew column its expiry, detail `$118.40 of $250 left (claude.ai, measured 12m
+ago) · expires 5.11. (in 7d) · one-time Claude Code cloud-session credit`) before the cap
+row; the credit has its own freshness (its `measured_at`, same 3 h rule) and drops out
+when expired.
 
 Without a spend source the bar reads `API n/a` with no percentage (a `0%` would claim an
 untouched grant) and the line ends `balance: n/a`; a configured source with nothing for
@@ -2983,7 +2991,8 @@ facts as a top-level `api_credits` list (`id`, `account`, `usd_per_cycle`, `cycl
 `balance_usd`, `balance_grant_usd`, `balance_used_pct`, `balance_source: "measured"`,
 `balance_at`, `balance_age_sec`, `balance_rows`, `purchased_usd`, `balance_error`,
 `balance_note`, `cap_spent_usd`, `cap_limit_usd`, `cap_used_pct`, `cap_resets_on`,
-`cap_room_usd`, `cap_binds`;
+`cap_room_usd`, `cap_binds`, and with a fresh `cloud_credit` `cloud_left_usd`,
+`cloud_granted_usd`, `cloud_used_pct`, `cloud_expires_on`, `cloud_at`, `cloud_age_sec`;
 additive, schema still v2, absent when nothing is configured). `balance_usd` is `null`
 unless a fresh measured reading exists: an estimate is not a balance. They are not
 provider rows: no verdict, ranking or ladder reads them.

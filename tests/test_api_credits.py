@@ -16,7 +16,7 @@ import datetime as dt
 import json
 import sys
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 import pytest
 
@@ -704,3 +704,91 @@ def test_report_draws_measured_and_cap_rows(
     _balance_file(path)
     assert cli.cmd_quota(_quota_args(no_bars=False)) == 0
     assert "apipriv cap" not in capsys.readouterr().out
+
+
+CLOUD = {
+    "remaining_usd": 118.4,
+    "granted_usd": 250.0,
+    "expires_at": "2026-11-05T07:59:00Z",
+    "measured_at": MEASURED,
+}
+
+
+def _cloud_row(tmp_path: Path, **over: object) -> dict[str, Any]:
+    path = _balance_file(tmp_path / "c.json", **over)
+    return api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=balance_json:{path}"], TODAY, now=NOW
+    )[0]
+
+
+def test_cloud_credit_present_absent_stale_expired(tmp_path: Path) -> None:
+    row = _cloud_row(tmp_path, cloud_credit=CLOUD)
+    assert row["cloud_left_usd"] == 118.4 and row["cloud_granted_usd"] == 250.0
+    assert round(row["cloud_used_pct"], 1) == 52.6 and row["cloud_expires_on"] == "2026-11-05"
+    assert row["cloud_age_sec"] == 12 * 60
+    text = api_credits.describe_cloud(row, TODAY)
+    assert text.startswith("$118.40 of $250 left (claude.ai, measured 12m ago)")
+    assert "expires 5.11. (in 20d)" in text
+    # No credit (null, or the key of an older writer missing): no cloud_* field at all.
+    for over in ({"cloud_credit": None}, {}):
+        assert not [k for k in _cloud_row(tmp_path, **over) if k.startswith("cloud_")]
+    # Its own reading aged out (the claude.ai read kept failing), or the credit expired.
+    old = dict(CLOUD, measured_at=NOW - 4 * 3600)
+    assert "cloud_left_usd" not in _cloud_row(tmp_path, cloud_credit=old)
+    gone = dict(CLOUD, expires_at="2026-10-01T00:00:00Z")
+    assert "cloud_left_usd" not in _cloud_row(tmp_path, cloud_credit=gone)
+    # Unusable figures are dropped, never half-drawn.
+    for bad in (dict(CLOUD, granted_usd=0), dict(CLOUD, remaining_usd="x"), "x"):
+        assert "cloud_left_usd" not in _cloud_row(tmp_path, cloud_credit=bad)
+    # A stale Console reading shows no cloud row either (the same freshness rule).
+    assert "cloud_left_usd" not in _cloud_row(
+        tmp_path, cloud_credit=CLOUD, measured_at=NOW - 7 * 3600
+    )
+
+
+def test_card_draws_the_cloud_bar_under_the_promo_bar(tmp_path: Path) -> None:
+    from command_center import usage
+
+    row = _cloud_row(tmp_path, cloud_credit=CLOUD)
+    promo, cloud = usage.render_api_credit_row(row).plain.splitlines()
+    assert promo.startswith("API PROMO: $186 left →26.11.")
+    assert cloud.startswith("CLOUD: $118 left →5.11.") and cloud.endswith("53%")
+    assert len(promo) == len(cloud) == usage._CARD_INNER_WIDTH  # noqa: SLF001
+    # Order with a binding cap: promo, cloud, cap.
+    binding = _cloud_row(tmp_path, cloud_credit=CLOUD, cap=BINDING_CAP)
+    lines = usage.render_api_credit_row(binding).plain.splitlines()
+    assert [ln.split(":")[0] for ln in lines] == ["API PROMO", "CLOUD", "API cap"]
+    # Without the credit the card is the old one.
+    assert len(usage.render_api_credit_row(_cloud_row(tmp_path)).plain.splitlines()) == 1
+
+
+def test_report_draws_the_cloud_row(
+    _pin_home: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from command_center import cli
+
+    path = _balance_file(tmp_path / "p.json", cloud_credit=CLOUD)
+    (_pin_home / "config.toml").write_text(
+        'claude_accounts = ["private=/tmp/x-private", "work=/tmp/x-work"]\n'
+        f'claude_api_credits = ["{PRIVATE},name:apipriv", {json.dumps(WORK)}]\n'
+        f'claude_api_credit_spend = ["private=balance_json:{path}"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    monkeypatch.setattr("time.time", lambda: float(NOW))
+    assert cli.cmd_quota(_quota_args(no_bars=False)) == 0
+    lines = capsys.readouterr().out.splitlines()
+    promo = next(line for line in lines if line.lstrip().startswith("apipriv ") and " api " in line)
+    cloud = next(line for line in lines if "apipriv cloud" in line)
+    assert "api cloud" in cloud and "CLOUD" in cloud and "53%" in cloud
+    assert "$118.40 of $250 left (claude.ai, measured 12m ago)" in cloud
+    assert promo.index("apipriv") == cloud.index("apipriv")
+    # No credit → no row.
+    _balance_file(path)
+    assert cli.cmd_quota(_quota_args(no_bars=False)) == 0
+    assert "apipriv cloud" not in capsys.readouterr().out
+    snap = json.loads(json.dumps(quota.snapshot(now=NOW)))
+    assert "api_credits" in snap

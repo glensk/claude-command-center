@@ -268,6 +268,23 @@ def _describe_measured(status: dict[str, Any], today: _dt.date) -> str:
     return " · ".join(parts)
 
 
+def describe_cloud(status: dict[str, Any], today: _dt.date) -> str:
+    """The detail of an account's cloud-session credit row (``cloud_*`` from
+    :func:`with_balance`): ``$X of $Y left (claude.ai, measured 12m ago) · expires D.M.
+    (in Nd) · one-time Claude Code cloud-session credit``."""
+    left, grant = float(status["cloud_left_usd"]), float(status["cloud_granted_usd"])
+    parts = [
+        f"{_money(round(left, 2))} of {_money(round(grant, 2))} left "
+        f"(claude.ai, measured {_age(int(status.get('cloud_age_sec') or 0))} ago)"
+    ]
+    if status.get("cloud_expires_on"):
+        parts.append(
+            f"expires {_short(_dt.date.fromisoformat(str(status['cloud_expires_on'])), today)}"
+        )
+    parts.append("one-time Claude Code cloud-session credit")
+    return " · ".join(parts)
+
+
 def describe_cap(status: dict[str, Any], today: _dt.date) -> str:
     """The detail of an account's spend-cap row (``cap_*`` from :func:`with_balance`).
 
@@ -720,7 +737,10 @@ def read_balance(path: Path) -> dict[str, Any] | None:
                     "expires_at": "2026-11-22T00:00:00Z",
                     "granted_at": "2026-10-19T13:43:08Z", "name": "API credit"}],
          "cap": {"spent_usd": 153.89, "limit_usd": 500.0,
-                 "resets_at": "2026-11-01T00:00:00Z"}}       # optional
+                 "resets_at": "2026-11-01T00:00:00Z"},       # optional
+         "cloud_credit": {"remaining_usd": 118.4, "granted_usd": 250.0,
+                          "expires_at": "2026-11-05T07:59:00Z",
+                          "measured_at": 1793270400}}        # optional, null = none
 
     ``cap`` is the org's MONTHLY SPEND LIMIT (a usage ceiling the provider enforces, not
     money): what was spent this month against it and when it resets.
@@ -729,7 +749,8 @@ def read_balance(path: Path) -> dict[str, Any] | None:
     ``status`` (e.g. ``logged_out``) — so a reading stays usable until it ages out. The
     result carries ``measured_at`` (``None`` without a good reading), ``status``,
     ``error``, ``purchased_usd``, the valid ``promo`` rows (bad rows are dropped) and
-    ``cap`` (``None`` when absent or unusable).
+    ``cap`` and ``cloud`` (the one-time Claude Code cloud-session credit; ``None`` when
+    absent, ``null`` or unusable) — both optional, so an older writer's file still reads.
     """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -747,6 +768,23 @@ def read_balance(path: Path) -> dict[str, Any] | None:
         "purchased_usd": _usd(data.get("purchased_usd")),
         "promo": promo,
         "cap": _cap(data.get("cap")),
+        "cloud": _cloud(data.get("cloud_credit")),
+    }
+
+
+def _cloud(raw: Any) -> dict[str, Any] | None:
+    """The file's ``cloud_credit`` object, validated; ``None`` when absent or unusable."""
+    if not isinstance(raw, dict):
+        return None
+    remaining, granted = _usd(raw.get("remaining_usd")), _usd(raw.get("granted_usd"))
+    expires, measured = _epoch(raw.get("expires_at")), _epoch(raw.get("measured_at"))
+    if remaining is None or granted is None or not granted or expires is None or measured is None:
+        return None
+    return {
+        "remaining_usd": min(remaining, granted),
+        "granted_usd": granted,
+        "expires_at": expires,
+        "measured_at": measured,
     }
 
 
@@ -778,7 +816,9 @@ def with_balance(status: dict[str, Any], source: BalanceSource | None, now: int)
     ``cap_limit_usd`` / ``cap_used_pct`` / ``cap_resets_on`` / ``cap_room_usd`` and
     ``cap_binds`` (the org's monthly spend limit — a ceiling, not a balance; it binds when
     its room is smaller than the money left, see :func:`_cap_binds`); a stale one adds
-    none. Otherwise nothing is
+    none. A fresh, unexpired ``cloud_credit`` adds ``cloud_left_usd`` / ``cloud_granted_usd``
+    / ``cloud_used_pct`` / ``cloud_expires_on`` / ``cloud_at`` / ``cloud_age_sec``
+    (:func:`_with_cloud`). Otherwise nothing is
     replaced and ``balance_note`` says why (missing file, failed read, stale reading with
     its age). Never touches the network.
     """
@@ -805,6 +845,7 @@ def with_balance(status: dict[str, Any], source: BalanceSource | None, now: int)
         out["balance_note"] = f"Console reading {_age(age)} old{why}"
         return out
     out["purchased_usd"] = reading["purchased_usd"]
+    _with_cloud(out, reading, now)
     cap = reading["cap"]
     if cap is not None and reading["currency"] == "USD":
         out["cap_spent_usd"] = round(cap["spent_usd"], 4)
@@ -837,6 +878,27 @@ def with_balance(status: dict[str, Any], source: BalanceSource | None, now: int)
         out["balance_error"] = reading["status"]
     _cap_binds(out, left)
     return out
+
+
+def _with_cloud(out: dict[str, Any], reading: dict[str, Any], now: int) -> None:
+    """Add the cloud-session credit's ``cloud_*`` fields: only a USD credit that has not
+    expired and whose OWN reading is fresh (a failed claude.ai read keeps the old figure
+    and its ``measured_at``, so it ages out like the balance does)."""
+    cloud = reading["cloud"]
+    if cloud is None or reading["currency"] != "USD" or cloud["expires_at"] <= now:
+        return
+    age = max(0, now - cloud["measured_at"])
+    if age > BALANCE_FRESH_SEC:
+        return
+    out["cloud_left_usd"] = round(cloud["remaining_usd"], 4)
+    out["cloud_granted_usd"] = round(cloud["granted_usd"], 4)
+    out["cloud_used_pct"] = max(
+        0.0,
+        min(100.0, (cloud["granted_usd"] - cloud["remaining_usd"]) / cloud["granted_usd"] * 100.0),
+    )
+    out["cloud_expires_on"] = _utc_date(cloud["expires_at"])
+    out["cloud_at"] = cloud["measured_at"]
+    out["cloud_age_sec"] = age
 
 
 def _cap_binds(out: dict[str, Any], promo_left: float) -> None:

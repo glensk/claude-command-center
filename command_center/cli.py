@@ -4227,11 +4227,19 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
         + (f" ({prov['command']})" if prov.get("command") else "")
         for prov in snap["providers"]
     }
-    credit_names = [_api_credit_name(row) for row in snap.get("api_credits") or []] + [
-        _api_cap_name(row)
-        for row in snap.get("api_credits") or []
-        if row.get("cap_binds") and row.get("cap_used_pct") is not None
-    ]
+    credit_names = (
+        [_api_credit_name(row) for row in snap.get("api_credits") or []]
+        + [
+            _api_cloud_name(row)
+            for row in snap.get("api_credits") or []
+            if row.get("cloud_used_pct") is not None
+        ]
+        + [
+            _api_cap_name(row)
+            for row in snap.get("api_credits") or []
+            if row.get("cap_binds") and row.get("cap_used_pct") is not None
+        ]
+    )
     width = max([len("provider"), *(len(n) for n in names.values()), *map(len, credit_names)])
     # Both variable-width columns are measured, never guessed: a `marked 20h 20m` age is
     # 14 characters and used to push every column behind it out of alignment on that row
@@ -4343,6 +4351,12 @@ def _api_credit_name(row: dict[str, Any]) -> str:
     )
 
 
+def _api_cloud_name(row: dict[str, Any]) -> str:
+    """The name of an account's cloud-session credit row: its API-credit row's name plus
+    ``cloud``."""
+    return f"{_api_credit_name(row)} cloud"
+
+
 def _api_cap_name(row: dict[str, Any]) -> str:
     """The name of an account's spend-cap row: its API-credit row's name plus ``cap``."""
     return f"{_api_credit_name(row)} cap"
@@ -4429,6 +4443,20 @@ def _api_credit_lines(  # pylint: disable=too-many-arguments,too-many-locals
                 text=api_credits.describe(row, today),
             )
         )
+        if row.get("cloud_used_pct") is not None:
+            cloud_windows = {
+                "api_cloud": {"used_pct": float(row["cloud_used_pct"]), "stale": False}
+            }
+            lines.append(
+                line(
+                    _api_cloud_name(row),
+                    "api cloud",
+                    windows=cloud_windows,
+                    day=row.get("cloud_expires_on"),
+                    at=int(row.get("cloud_at") or 0),
+                    text=api_credits.describe_cloud(row, today),
+                )
+            )
         if row.get("cap_binds") and row.get("cap_used_pct") is not None:
             cap_windows = {"api_cap": {"used_pct": float(row["cap_used_pct"]), "stale": False}}
             lines.append(

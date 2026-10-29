@@ -2332,6 +2332,7 @@ def _api_money(usd: float) -> str:
 # The card's promo-credit row label when the grant configures none (``label:``).
 API_PROMO_LABEL = "API PROMO"
 API_CAP_LABEL = "API cap"
+API_CLOUD_LABEL = "CLOUD"
 
 
 def render_api_credit_row(status: dict[str, Any] | None, *, accent: str = _CLAUDE_ACCENT) -> Text:
@@ -2345,7 +2346,11 @@ def render_api_credit_row(status: dict[str, Any] | None, *, accent: str = _CLAUD
     text line, never an empty bar: ``0%`` would claim an untouched grant. The leading
     words are the grant's ``label:`` (default :data:`API_PROMO_LABEL`).
 
-    Under it, when the fresh reading carries the org's monthly spend cap AND that cap
+    Right under it, when the account holds a one-time Claude Code cloud-session credit
+    (a fresh, unexpired ``cloud_credit`` reading), a second bar of its share used,
+    embossed ``CLOUD: $X left →D.M.`` (:func:`_api_cloud_row`); none without the credit.
+
+    Under those, when the fresh reading carries the org's monthly spend cap AND that cap
     binds first (``cap_binds``: limit − spent < promo left + purchased), a second bar —
     spent ÷ limit — embossed ``API cap: $S of $L →D.M.`` (when it resets). That cap is
     a usage ceiling, not money, so it never reads as a balance. ``None`` (no grant
@@ -2354,7 +2359,24 @@ def render_api_credit_row(status: dict[str, Any] | None, *, accent: str = _CLAUD
     """
     if not status:
         return Text()
-    return _api_promo_row(status, accent) + _api_cap_row(status, accent)
+    return (
+        _api_promo_row(status, accent)
+        + _api_cloud_row(status, accent)
+        + _api_cap_row(status, accent)
+    )
+
+
+def _api_cloud_row(status: dict[str, Any], accent: str) -> Text:
+    """:func:`render_api_credit_row`'s cloud-session credit row; empty without one."""
+    import datetime as _dt  # pylint: disable=import-outside-toplevel
+
+    pct = status.get("cloud_used_pct")
+    if pct is None or not status.get("cloud_expires_on"):
+        return Text()
+    end = _dt.date.fromisoformat(str(status["cloud_expires_on"]))
+    left = float(status.get("cloud_left_usd") or 0.0)
+    label = f"{API_CLOUD_LABEL}: {_api_money(left)} left →{end.day}.{end.month}."
+    return _bar_row(float(pct), _fill_for_pct(float(pct)), label=label, label_color=accent)
 
 
 def _api_promo_row(status: dict[str, Any], accent: str) -> Text:

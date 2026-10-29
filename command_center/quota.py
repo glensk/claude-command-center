@@ -267,6 +267,7 @@ BAR_SPAN_WINDOWS: tuple[str, ...] = (
     "budget",
     "grant",
     "api_balance",
+    "api_cloud",
     "api_cap",
 )
 # What a SPANNING bar says when the provider has no window to draw at all. Without it
@@ -293,6 +294,8 @@ BAR_HORIZON: dict[str, str] = {
     "grant": "API PROMO ≈",
     # The same pot MEASURED (`api_credits.with_balance`, a fresh `balance_json` reading).
     "api_balance": "API PROMO",
+    # The one-time Claude Code cloud-session credit (`balance_json`'s `cloud_credit`).
+    "api_cloud": "CLOUD",
     # The Console org's monthly spend LIMIT (a ceiling, not money): spent ÷ limit.
     "api_cap": "API cap",
     "seven_day": "weekly",
