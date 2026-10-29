@@ -289,13 +289,18 @@ DEFAULTS: dict[str, object] = {
     # Claude account label, e.g. ``["private=usd:200,day:26,from:2026-10-09"]``. ``usd`` =
     # grant per cycle, ``day`` = day of month the cycle turns over (the grant expires and
     # the next lands; clamped in short months), ``from`` = first grant (before it only the
-    # next grant is shown). No API exposes the remaining balance; without a spend source
-    # (below) the report says ``balance: n/a``. Empty (the default) ⇒ no line.
+    # next grant is shown). Optional ``name:<word>`` names the row in `ccc quota`,
+    # ``label:<words>`` starts the TUI card's bar (default "API PROMO"). No API exposes
+    # the remaining balance; without a source (below) the report says ``balance: n/a``.
+    # Empty (the default) ⇒ no line.
     "claude_api_credits": [],
-    # Where each account's spend since its grant is read from, for the ESTIMATED balance
-    # and the usage bar (labelled "est."): ``"label=admin_api[:<dotenv path>]"`` — the
-    # org's Admin API cost_report, key ANTHROPIC_ADMIN_API_KEY from that file or the env,
-    # fetched out-of-band at most every 30 min and cached — or
+    # Where each account's balance or spend is read from. ``"label=balance_json:<path>"``
+    # — a MEASURED balance: a JSON file the user's own scraper writes from the Console
+    # billing page (remaining promo credit, grant, expiry, purchased balance and the org's
+    # monthly spend limit); used while under 3 h old, read only (no network). Plus, as
+    # the fallback, one ESTIMATE source (labelled "≈"): ``"label=admin_api[:<dotenv
+    # path>]"`` — the org's Admin API cost_report, key ANTHROPIC_ADMIN_API_KEY from that
+    # file or the env, fetched out-of-band at most every 30 min and cached — or
     # ``"label=runs_jsonl:<path>"`` — the cost_usd sum of a local run ledger (this
     # machine only). Empty (the default) ⇒ no spend read, no network call.
     "claude_api_credit_spend": [],

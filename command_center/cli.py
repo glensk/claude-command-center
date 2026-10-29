@@ -4225,7 +4225,11 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
         + (f" ({prov['command']})" if prov.get("command") else "")
         for prov in snap["providers"]
     }
-    credit_names = [_api_credit_name(row) for row in snap.get("api_credits") or []]
+    credit_names = [_api_credit_name(row) for row in snap.get("api_credits") or []] + [
+        _api_cap_name(row)
+        for row in snap.get("api_credits") or []
+        if row.get("cap_binds") and row.get("cap_used_pct") is not None
+    ]
     width = max([len("provider"), *(len(n) for n in names.values()), *map(len, credit_names)])
     # Both variable-width columns are measured, never guessed: a `marked 20h 20m` age is
     # 14 characters and used to push every column behind it out of alignment on that row
@@ -4328,10 +4332,18 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
 
 
 def _api_credit_name(row: dict[str, Any]) -> str:
-    """An API-credit row's name, spelled the way the provider column spells its account."""
+    """An API-credit row's name: its configured ``name:`` when set, else spelled the way
+    the provider column spells its account."""
+    if row.get("name"):
+        return str(row["name"])
     return str(row.get("display") or row["id"]) + (
         f" ({row['command']})" if row.get("command") else ""
     )
+
+
+def _api_cap_name(row: dict[str, Any]) -> str:
+    """The name of an account's spend-cap row: its API-credit row's name plus ``cap``."""
+    return f"{_api_credit_name(row)} cap"
 
 
 # An Admin-API spend figure older than this draws its bar without colour (stale), like
@@ -4352,12 +4364,16 @@ def _api_credit_lines(  # pylint: disable=too-many-arguments,too-many-locals
     """The table rows for the monthly API-credit grants (``claude_api_credits``).
 
     Laid out in the provider table's own columns — blank mark, the account named as its
-    provider row names it, ``api est.`` (or ``api`` without an estimate) in the state
-    column, the spend figure's age, ONE bar across the session + week columns (spent ÷
-    grant, embossed ``API est.``), the grant's expiry in the renew column, then the
-    detail. The bar and the ``≈$X of $Y left`` are an ESTIMATE (``api_credits``): the
-    state word and the bar both say so, and without a spend source the bar reads
-    ``API n/a`` with no percentage — never a 0 % that would claim an untouched grant.
+    provider row names it (or its configured ``name:``), ``api est.`` (or ``api`` with a
+    measured balance or without an estimate) in the state column, the figure's age, ONE
+    bar across the session + week columns (used ÷ grant, embossed ``API measured`` or
+    ``API est.``), the grant's expiry in the renew column, then the detail. A MEASURED
+    balance (``balance_json``, fresh) wins; otherwise the bar and the ``≈$X of $Y left``
+    are an ESTIMATE (``api_credits``): the state word and the bar both say so, and
+    without a spend source the bar reads ``API n/a`` with no percentage — never a 0 %
+    that would claim an untouched grant. A second row, ``<name> cap``, shows the org's
+    monthly spend limit (spent ÷ limit) — only when it binds first (``cap_binds``: its
+    room is smaller than the money left).
     A dim header line first says what the credits pay for, because they are a separate
     pot from every window above them.
     """
@@ -4371,27 +4387,58 @@ def _api_credit_lines(  # pylint: disable=too-many-arguments,too-many-locals
     today = datetime.fromtimestamp(now).date()
     intro = "API credits (Claude API, Console, Agent SDK — not interactive Claude Code):"
     lines = [f"  \033[2m{intro}\033[0m" if colorable else f"  {intro}"]
-    for row in rows:
-        pct = row.get("est_used_pct")
-        spend_at = int(row.get("spend_at") or 0)
-        windows: dict[str, Any] = {}
-        if pct is not None:
-            stale = row.get("spend_scope") == "org" and now - spend_at > _API_SPEND_STALE_SEC
-            windows["grant"] = {"used_pct": float(pct), "stale": stale}
-        expires = row.get("expires_on") or row.get("next_grant_on")
-        resets_at = int(datetime.fromisoformat(str(expires)).timestamp()) if expires else 0
+
+    def line(
+        name: str, state: str, *, windows: dict[str, Any], day: Any, at: int, text: str
+    ) -> str:
+        resets_at = int(datetime.fromisoformat(str(day)).timestamp()) if day else 0
         pseudo = {"kind": "api_credit", "windows": windows, "state": "", "resets_at": resets_at}
         cells = _quota_bar_cells(pseudo, color=color)[0] if bars else ""
         renew, _at, renew_color = _quota_renew(pseudo, now)
         shown_renew = f"{renew:<{_RENEW_WIDTH}}"
         if colorable and renew_color:
             shown_renew = f"{renew_color}{shown_renew}\033[0m"
-        age = _quota_age({"captured_at": spend_at}, now)
-        state = "api est." if pct is not None else "api"
-        lines.append(
-            f"  {_pad_cells('', _MARK_WIDTH)} {_api_credit_name(row):<{width}} {state:<10} "
-            f"{age:<{age_w}} {cells}{shown_renew} {api_credits.describe(row, today)}".rstrip()
+        age = _quota_age({"captured_at": at}, now)
+        return (
+            f"  {_pad_cells('', _MARK_WIDTH)} {name:<{width}} {state:<10} "
+            f"{age:<{age_w}} {cells}{shown_renew} {text}".rstrip()
         )
+
+    for row in rows:
+        measured = row.get("balance_source") == "measured"
+        pct = row.get("balance_used_pct") if measured else row.get("est_used_pct")
+        spend_at = int(row.get("balance_at" if measured else "spend_at") or 0)
+        windows: dict[str, Any] = {}
+        if pct is not None and measured:
+            # Fresh by construction (api_credits.with_balance drops a stale reading).
+            windows["api_balance"] = {"used_pct": float(pct), "stale": False}
+        elif pct is not None:
+            stale = row.get("spend_scope") == "org" and now - spend_at > _API_SPEND_STALE_SEC
+            windows["grant"] = {"used_pct": float(pct), "stale": stale}
+        state = "api" if measured or pct is None else "api est."
+        expires = row.get("expires_on") or row.get("next_grant_on")
+        lines.append(
+            line(
+                _api_credit_name(row),
+                state,
+                windows=windows,
+                day=expires,
+                at=spend_at,
+                text=api_credits.describe(row, today),
+            )
+        )
+        if row.get("cap_binds") and row.get("cap_used_pct") is not None:
+            cap_windows = {"api_cap": {"used_pct": float(row["cap_used_pct"]), "stale": False}}
+            lines.append(
+                line(
+                    _api_cap_name(row),
+                    "api cap",
+                    windows=cap_windows,
+                    day=row.get("cap_resets_on"),
+                    at=int(row.get("balance_at") or 0),
+                    text=api_credits.describe_cap(row, today),
+                )
+            )
     return lines
 
 

@@ -2238,15 +2238,19 @@ a `27%` one). The cards are **compact — no box**: each card is a header line (
 bold, in the card's colour: gold/`$accent` Claude private, blue work, green Codex, violet
 Copilot), its bars below, and one blank line before the next card. Each Claude card ends
 with its account's **monthly API-credit bar** when `claude_api_credits` configures a grant
-for it (see *Monthly API credits* under `ccc quota`): the estimated share of the grant spent,
-embossed with what is left and when the grant expires — or a grey `balance n/a` line when
-no spend source is configured:
+for it (see *Monthly API credits* under `ccc quota`): the share of the promotional grant
+used, embossed `API PROMO: $X left →D.M.` (a fresh measured balance, `balance_json`) or
+`API PROMO: ≈$X left →D.M.` (the estimate) — or a grey `balance n/a` line when no source
+is configured. A measured reading that also carries the org's monthly spend limit adds a
+second bar, `API cap: $S of $L →D.M.` (spent ÷ limit, when it resets) — only when that
+cap binds first, i.e. its room (limit − spent) is smaller than the money left (promo
+remaining + purchased balance):
 
 ```text
  t1:Claude (private) 🏠
  ██Session: Resets in 1h 57m░░░░░░33%
  ██Week: Resets in 3d 11h 36m░░░░░20%
- API est. ≈$150 left →26.10.░░░░░25%
+ API PROMO: ≈$150 left →26.10.░░25%
 
  t3:Codex first…@example.org
  ██Session: Resets in 2h 11m░░░░░░14%
@@ -2869,11 +2873,54 @@ claude_api_credits = [
 
 `usd` is the grant per cycle, `day` the day of month the cycle turns over (the current grant
 expires and the next one lands; clamped in short months), `from` the optional first grant
-(before it only the next grant is shown). A bad entry is skipped, never the others.
+(before it only the next grant is shown). Two optional display fields: `name:<word>`
+(letters, digits, `_.-`, ≤ 24) replaces the account name on the `ccc quota` rows (e.g.
+`name:api-team` → rows `api-team` and `api-team cap`), `label:<words>` (≤ 12 characters,
+spaces allowed) replaces `API PROMO` on the TUI card's bar. A bad entry is skipped, never
+the others.
+
+**Measured balance — `balance_json:<path>`.** No API ccc could call exposes the balance,
+but the Console billing page shows it, so a tool of your own that reads that page (in a
+browser you are logged into) can write it to a JSON file, and ccc reads that file — no
+browser, no network, no credentials in ccc. Add it to `claude_api_credit_spend` next to
+(not instead of) the estimate source:
+
+```toml
+claude_api_credit_spend = [
+  "work=balance_json:~/.local/state/console-balance/work.json",
+  "work=admin_api:~/secrets/anthropic-admin.env",   # the fallback estimate
+]
+```
+
+The file (schema 1; times as epoch seconds or ISO-8601, amounts in USD):
+
+```json
+{"schema": 1, "status": "ok", "error": "",
+ "measured_at": 1793270400, "checked_at": 1793270400,
+ "currency": "USD", "purchased_usd": 100.0,
+ "promo": [{"remaining_usd": 498.03, "granted_usd": 500.0,
+            "expires_at": "2026-11-22T00:00:00Z", "granted_at": "2026-10-19T13:43:08Z",
+            "name": "API credit (Team)"}],
+ "cap": {"spent_usd": 1.97, "limit_usd": 500.0, "resets_at": "2026-11-01T00:00:00Z"}}
+```
+
+`measured_at` is the last GOOD reading; a failed attempt keeps those figures and sets
+`status` (e.g. `logged_out`) and `checked_at`. While the reading is under 3 hours old the
+row shows the REAL remaining balance (summed over the unexpired promo rows), the real grant
+and the real expiry and grant dates (UTC; the row that expires first) instead of the
+configured cycle, labelled `measured`, never `est.`; a failed latest attempt is said
+(`last read failed: logged_out`). `cap` is the org's monthly spend limit — a ceiling the
+provider enforces, not money — and gets its own row ONLY when it binds first: `cap_binds`
+is true when `limit − spent` is smaller than promo remaining + purchased balance (the cap
+would stop the org before the money runs out); otherwise the money is the limit and the
+cap row would say nothing. A missing, never-good or stale file
+falls back to the estimate below, and the line says why (`no Console reading`,
+`Console read failed: logged_out`, `Console reading 7h old`); a stale cap draws no row.
 
 **Spend estimate — `claude_api_credit_spend`.** No API exposes the remaining balance, but the
 spend since the grant landed can be read, so the grant minus that spend is shown as an
-ESTIMATE (labelled `est.` everywhere). One source per account:
+ESTIMATE (labelled `est.` / `≈` everywhere). One estimate source per account (plus, optionally,
+the `balance_json` file above):
 
 ```toml
 claude_api_credit_spend = [
@@ -2907,6 +2954,13 @@ column, then the detail:
      claude-work (cwork)   api        —        ░░░░░░░░░░API n/a░░░░░░░░░░ renew 3d 5h    $500/cycle · granted 16.10. · expires 20.10. (in 4d), next grant then · balance: n/a
 ```
 
+With a fresh measured balance the row reads `api` in the state column, the bar is embossed
+`API measured` (used ÷ grant), the age column is the reading's age and the detail reads
+`$185.88 of $200 left (Console, measured 12m ago) · granted 23.10. · expires 26.11. (in 28d)
+· purchased $0`; a reading whose `cap` binds first adds a row `<name> cap` (`api cap`, bar `API cap` =
+spent ÷ limit, the renew column its reset, detail `$153.89 of $500 monthly spend limit
+(Console, measured 12m ago) · resets 1.11. (in 3d) · a usage ceiling, not a balance`).
+
 Without a spend source the bar reads `API n/a` with no percentage (a `0%` would claim an
 untouched grant) and the line ends `balance: n/a`; a configured source with nothing for
 the current grant yet says `spend not read yet (`ccc quota -r`)`. `-j` carries the same
@@ -2914,8 +2968,13 @@ facts as a top-level `api_credits` list (`id`, `account`, `usd_per_cycle`, `cycl
 `granted_on`, `expires_on`, `next_grant_on`, `balance_usd: null`, `balance_source: "n/a"`,
 `source: "config"`, `display`, `command`, and with a spend source `est_spent_usd`,
 `est_left_usd`, `est_used_pct`, `spend_source`, `spend_scope` (`org`/`machine`),
-`spend_at`, `spend_pending`, `spend_error`; additive, schema still v2, absent when nothing
-is configured). `balance_usd` stays `null`: an estimate is not a balance. They are not
+`spend_at`, `spend_pending`, `spend_error`; `name`, `label`; with a `balance_json` source
+`balance_usd`, `balance_grant_usd`, `balance_used_pct`, `balance_source: "measured"`,
+`balance_at`, `balance_age_sec`, `balance_rows`, `purchased_usd`, `balance_error`,
+`balance_note`, `cap_spent_usd`, `cap_limit_usd`, `cap_used_pct`, `cap_resets_on`,
+`cap_room_usd`, `cap_binds`;
+additive, schema still v2, absent when nothing is configured). `balance_usd` is `null`
+unless a fresh measured reading exists: an estimate is not a balance. They are not
 provider rows: no verdict, ranking or ladder reads them.
 
 ### The Muse Code row — `muse`

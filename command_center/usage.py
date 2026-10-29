@@ -2284,32 +2284,82 @@ def _api_money(usd: float) -> str:
     return f"${usd:,.0f}" if abs(usd) >= 100 else f"${usd:,.2f}"
 
 
-def render_api_credit_row(status: dict[str, Any] | None, *, accent: str = _CLAUDE_ACCENT) -> Text:
-    """One card row for an account's monthly API-credit grant (``api_credits``).
+# The card's promo-credit row label when the grant configures none (``label:``).
+API_PROMO_LABEL = "API PROMO"
+API_CAP_LABEL = "API cap"
 
-    With a spend estimate it is a bar like the window rows above it — the estimated
-    share of the grant spent, coloured by :func:`_fill_for_pct` — embossed
-    ``API est. ≈$X left →D.M.`` (what is left, when the grant expires). Without one it
-    is a grey text line, never an empty bar: ``0%`` would claim an untouched grant.
-    ``None`` (no grant configured for the account) renders nothing. *accent* colours
-    the embossed label like the card's reset labels (gold private, blue work).
+
+def render_api_credit_row(status: dict[str, Any] | None, *, accent: str = _CLAUDE_ACCENT) -> Text:
+    """The card rows for an account's API credits (``api_credits``).
+
+    The promo-credit row: with a MEASURED balance (a fresh ``balance_json`` reading) a bar
+    of the share of the grant used, embossed ``API PROMO: $X left →D.M.`` — no ``≈``: the
+    figure and the date are the Console's own. With a spend estimate the same bar reads
+    ``API PROMO: ≈$X left →D.M.``, and when a balance file is configured but not usable a
+    grey line under it says why (``Console reading 7h old``). Without either it is a grey
+    text line, never an empty bar: ``0%`` would claim an untouched grant. The leading
+    words are the grant's ``label:`` (default :data:`API_PROMO_LABEL`).
+
+    Under it, when the fresh reading carries the org's monthly spend cap AND that cap
+    binds first (``cap_binds``: limit − spent < promo left + purchased), a second bar —
+    spent ÷ limit — embossed ``API cap: $S of $L →D.M.`` (when it resets). That cap is
+    a usage ceiling, not money, so it never reads as a balance. ``None`` (no grant
+    configured for the account) renders nothing. *accent* colours the embossed labels
+    like the card's reset labels (gold private, blue work).
     """
     if not status:
         return Text()
+    return _api_promo_row(status, accent) + _api_cap_row(status, accent)
+
+
+def _api_promo_row(status: dict[str, Any], accent: str) -> Text:
+    """:func:`render_api_credit_row`'s promo-credit row (plus its grey note)."""
     import datetime as _dt  # pylint: disable=import-outside-toplevel
 
+    prefix = str(status.get("label") or API_PROMO_LABEL)
+    note = (
+        Text(f"{status['balance_note']}\n", style="grey50")
+        if status.get("balance_note")
+        else Text()
+    )
     expires = status.get("expires_on")
     if not expires:
         first = _dt.date.fromisoformat(str(status["next_grant_on"]))
-        return Text(f"API: first grant {first.day}.{first.month}.\n", style="grey50")
+        return Text(f"{prefix}: first grant {first.day}.{first.month}.\n", style="grey50") + note
     end = _dt.date.fromisoformat(str(expires))
-    pct = status.get("est_used_pct")
-    if pct is None:
+    measured_pct = status.get("balance_used_pct")
+    if status.get("balance_source") == "measured" and measured_pct is not None:
+        left = float(status.get("balance_usd") or 0.0)
+        label = f"{prefix}: {_api_money(left)} left →{end.day}.{end.month}."
+        pct = float(measured_pct)
+        return _bar_row(pct, _fill_for_pct(pct), label=label, label_color=accent)
+    est_pct = status.get("est_used_pct")
+    if est_pct is None:
         why = "spend fetch failed" if status.get("spend_error") else "balance n/a"
         usd = float(status["usd_per_cycle"])
-        return Text(f"API: {_api_money(usd)} →{end.day}.{end.month}. · {why}\n", style="grey50")
+        line = Text(
+            f"{prefix}: {_api_money(usd)} →{end.day}.{end.month}. · {why}\n", style="grey50"
+        )
+        return line + note
     left = float(status.get("est_left_usd") or 0.0)
-    label = f"API est. ≈{_api_money(left)} left →{end.day}.{end.month}."
+    label = f"{prefix}: ≈{_api_money(left)} left →{end.day}.{end.month}."
+    pct = float(est_pct)
+    # _bar_row ends its row with a newline, so the note lands on the line below.
+    return _bar_row(pct, _fill_for_pct(pct), label=label, label_color=accent) + note
+
+
+def _api_cap_row(status: dict[str, Any], accent: str) -> Text:
+    """:func:`render_api_credit_row`'s spend-cap row; empty without a fresh cap reading."""
+    import datetime as _dt  # pylint: disable=import-outside-toplevel
+
+    pct = status.get("cap_used_pct")
+    if not status.get("cap_binds") or pct is None or status.get("cap_limit_usd") is None:
+        return Text()
+    spent, limit = float(status.get("cap_spent_usd") or 0.0), float(status["cap_limit_usd"])
+    label = f"{API_CAP_LABEL}: {_api_money(spent)} of {_api_money(limit)}"
+    if status.get("cap_resets_on"):
+        resets = _dt.date.fromisoformat(str(status["cap_resets_on"]))
+        label += f" →{resets.day}.{resets.month}."
     return _bar_row(float(pct), _fill_for_pct(float(pct)), label=label, label_color=accent)
 
 

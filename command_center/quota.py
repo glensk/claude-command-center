@@ -256,7 +256,8 @@ BAR_SLOTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 # bar instead of briefly turning into a two-window provider.
 # `api_credit` is not a provider: it is the pseudo-row `ccc quota` draws under the table
 # for each monthly API-credit grant (`claude_api_credits`), its `grant` window the
-# estimated share spent (see `api_credits.with_spend`).
+# estimated share spent (see `api_credits.with_spend`) or its `api_balance` window the
+# measured share used (`api_credits.with_balance`).
 BAR_SPAN_KINDS: tuple[str, ...] = ("copilot", "agy", "opencode", "muse", "api_credit")
 BAR_SPAN_WINDOWS: tuple[str, ...] = (
     "credits",
@@ -265,6 +266,8 @@ BAR_SPAN_WINDOWS: tuple[str, ...] = (
     "wallet",
     "budget",
     "grant",
+    "api_balance",
+    "api_cap",
 )
 # What a SPANNING bar says when the provider has no window to draw at all. Without it
 # such a row shows an empty bar embossed `0%`, which reads as "nothing spent" when the
@@ -288,6 +291,10 @@ BAR_HORIZON: dict[str, str] = {
     # An API-credit grant's ESTIMATED spend (`api_credits.with_spend`): the pot is the
     # month's grant, the figure an estimate — both words belong in the bar.
     "grant": "API est.",
+    # The same pot MEASURED (`api_credits.with_balance`, a fresh `balance_json` reading).
+    "api_balance": "API measured",
+    # The Console org's monthly spend LIMIT (a ceiling, not money): spent ÷ limit.
+    "api_cap": "API cap",
     "seven_day": "weekly",
     "gemini_week": "weekly",
     "claudegpt_week": "weekly",

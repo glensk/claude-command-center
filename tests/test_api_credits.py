@@ -462,11 +462,11 @@ def test_card_row_is_a_bar_with_an_estimate(tmp_path: Path) -> None:
         status, api_credits.SpendSource("private", "runs_jsonl", str(ledger))
     )
     text = usage.render_api_credit_row(row).plain
-    assert text.startswith("API est. ≈$150 left →26.10.") and text.rstrip().endswith("25%")
+    assert text.startswith("API PROMO: ≈$150 left →26.10.") and text.rstrip().endswith("25%")
     assert len(text.rstrip("\n")) == usage._CARD_INNER_WIDTH  # noqa: SLF001
-    assert usage.render_api_credit_row(status).plain == "API: $200 →26.10. · balance n/a\n"
+    assert usage.render_api_credit_row(status).plain == "API PROMO: $200 →26.10. · balance n/a\n"
     work = api_credits.credit_status(api_credits.parse_api_credits([WORK])["work"], TODAY)
-    assert usage.render_api_credit_row(work).plain == "API: first grant 20.10.\n"
+    assert usage.render_api_credit_row(work).plain == "API PROMO: first grant 20.10.\n"
     assert usage.render_api_credit_row(None).plain == ""
 
 
@@ -490,3 +490,216 @@ def test_api_row_is_appended_below_the_card() -> None:
     card = Text("Session\nWeek")  # the card renderers rstrip their body
     assert tui._with_api_row(card, Text("")).plain == "Session\nWeek"  # noqa: SLF001
     assert tui._with_api_row(card, Text("API\n")).plain == "Session\nWeek\nAPI"  # noqa: SLF001
+
+
+# ── measured balance (balance_json) ───────────────────────────────────────────
+
+# The reading: 2026-10-16 11:48 local, 12 minutes before NOW.
+MEASURED = NOW - 12 * 60
+
+
+def _balance_file(path: Path, **over: object) -> Path:
+    """A ``balance_json`` file shaped like the Console scraper's output."""
+    data: dict[str, object] = {
+        "schema": 1,
+        "status": "ok",
+        "error": "",
+        "measured_at": MEASURED,
+        "checked_at": MEASURED,
+        "currency": "USD",
+        "purchased_usd": 0.0,
+        "promo": [
+            {
+                "remaining_usd": 185.88,
+                "granted_usd": 200.0,
+                "expires_at": "2026-11-26T00:00:00Z",
+                "granted_at": "2026-10-23T09:12:00Z",
+                "name": "API credit (Max)",
+            }
+        ],
+        "cap": {"spent_usd": 153.89, "limit_usd": 500.0, "resets_at": "2026-11-01T00:00:00Z"},
+    }
+    data.update(over)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def test_parse_keeps_balance_and_spend_sources_apart() -> None:
+    entries = [
+        "work=balance_json:~/state/work.json",
+        "work=admin_api:~/a.env",
+        "private=balance_json:",  # no path: skipped
+        "Bad=balance_json:/x.json",
+    ]
+    balances = api_credits.parse_balance_sources(entries)
+    assert balances == {"work": api_credits.BalanceSource("work", "~/state/work.json")}
+    # The balance file never counts as a spend source, so the estimate stays available.
+    assert api_credits.parse_spend_sources(entries)["work"].kind == "admin_api"
+
+
+def test_parse_reads_name_and_card_label() -> None:
+    parsed = api_credits.parse_api_credits(
+        ["work=usd:500,day:20,name:apiwork,label:API TEAM", "x=usd:1,day:1,name:has space"]
+    )
+    assert parsed["work"].name == "apiwork" and parsed["work"].label == "API TEAM"
+    assert "x" not in parsed  # a name with a space is skipped
+    status = api_credits.credit_status(parsed["work"], TODAY)
+    assert status["name"] == "apiwork" and status["label"] == "API TEAM"
+
+
+def test_fresh_reading_replaces_the_estimate_and_the_dates(tmp_path: Path) -> None:
+    path = _balance_file(tmp_path / "private.json")
+    rows = api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=balance_json:{path}"], TODAY, now=NOW
+    )
+    row = rows[0]
+    assert row["balance_source"] == "measured" and row["balance_usd"] == 185.88
+    assert row["balance_grant_usd"] == 200.0 and round(row["balance_used_pct"], 2) == 7.06
+    # The Console's own dates win over the configured day-of-month cycle.
+    assert row["expires_on"] == "2026-11-26" and row["granted_on"] == "2026-10-23"
+    assert row["cap_spent_usd"] == 153.89 and row["cap_limit_usd"] == 500.0
+    assert row["cap_resets_on"] == "2026-11-01" and round(row["cap_used_pct"]) == 31
+    # $346.11 of room under the cap > $185.88 of money left: the money runs out first.
+    assert row["cap_room_usd"] == 346.11 and row["cap_binds"] is False
+    text = api_credits.describe(row, TODAY)
+    assert text.startswith("$185.88 of $200 left (Console, measured 12m ago)")
+    assert "expires 26.11. (in 41d)" in text and "est." not in text
+    cap = api_credits.describe_cap(row, TODAY)
+    assert cap.startswith("$153.89 of $500 monthly spend limit") and "not a balance" in cap
+
+
+def test_stale_or_failed_reading_falls_back_to_the_estimate(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path / "runs.jsonl", [{"ts": "2026-10-10T10:00:00+02:00", "cost_usd": 50}])
+    spend = [f"private=runs_jsonl:{ledger}"]
+    stale = _balance_file(tmp_path / "stale.json", measured_at=NOW - 7 * 3600)
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [*spend, f"private=balance_json:{stale}"], TODAY, now=NOW
+    )[0]
+    assert row.get("balance_source") == "n/a" and row["balance_usd"] is None
+    assert row["est_left_usd"] == 150 and "cap_used_pct" not in row
+    assert row["balance_note"] == "Console reading 7h old"
+    assert api_credits.describe(row, TODAY).endswith("· Console reading 7h old")
+    # Never read: the status says so, nothing is invented.
+    never = _balance_file(tmp_path / "never.json", measured_at=None, status="logged_out")
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [*spend, f"private=balance_json:{never}"], TODAY, now=NOW
+    )[0]
+    assert row["balance_note"] == "Console read failed: logged_out"
+    missing = api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=balance_json:{tmp_path / 'nope.json'}"], TODAY, now=NOW
+    )[0]
+    assert missing["balance_note"] == "no Console reading" and missing["balance_usd"] is None
+
+
+def test_failed_latest_attempt_keeps_a_fresh_reading(tmp_path: Path) -> None:
+    path = _balance_file(tmp_path / "p.json", status="logged_out")
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=balance_json:{path}"], TODAY, now=NOW
+    )[0]
+    assert row["balance_source"] == "measured" and row["balance_error"] == "logged_out"
+    assert "last read failed: logged_out" in api_credits.describe(row, TODAY)
+
+
+def test_expired_or_malformed_rows_are_dropped(tmp_path: Path) -> None:
+    path = _balance_file(
+        tmp_path / "p.json",
+        promo=[
+            {"remaining_usd": 5, "granted_usd": 10, "expires_at": "2026-10-01T00:00:00Z"},
+            {"remaining_usd": "x", "granted_usd": 10, "expires_at": "2026-12-01T00:00:00Z"},
+        ],
+        cap={"spent_usd": 1, "limit_usd": 0},
+    )
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=balance_json:{path}"], TODAY, now=NOW
+    )[0]
+    assert row["balance_usd"] is None and "cap_used_pct" not in row
+    assert row["balance_note"] == "Console shows no current promotional credit"
+
+
+# Spent $153.89 of a $300 limit: $146.11 of room < $185.88 + $10 of money — the cap binds.
+BINDING_CAP = {"spent_usd": 153.89, "limit_usd": 300.0, "resets_at": "2026-11-01T00:00:00Z"}
+
+
+def test_cap_binds_only_when_its_room_is_smaller_than_the_money(tmp_path: Path) -> None:
+    path = _balance_file(tmp_path / "p.json", cap=BINDING_CAP, purchased_usd=10.0)
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=balance_json:{path}"], TODAY, now=NOW
+    )[0]
+    assert row["cap_room_usd"] == 146.11 and row["cap_binds"] is True
+    # Purchased credit counts as money too: with $400 bought the cap binds even at $500.
+    rich = _balance_file(tmp_path / "r.json", purchased_usd=400.0)
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=balance_json:{rich}"], TODAY, now=NOW
+    )[0]
+    assert row["cap_binds"] is True
+
+
+def test_card_rows_with_a_measured_balance_and_cap(tmp_path: Path) -> None:
+    from command_center import usage
+
+    path = _balance_file(tmp_path / "p.json")
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=balance_json:{path}"], TODAY, now=NOW
+    )[0]
+    # The cap does not bind ($346 of room > $186 of money): no cap row.
+    (promo,) = usage.render_api_credit_row(row).plain.splitlines()
+    assert promo.startswith("API PROMO: $186 left →26.11.") and promo.endswith("7%")
+    labelled = dict(row, label="API MAX")
+    assert usage.render_api_credit_row(labelled).plain.startswith("API MAX: $186 left")
+    binding = _balance_file(tmp_path / "b.json", cap=BINDING_CAP)
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=balance_json:{binding}"], TODAY, now=NOW
+    )[0]
+    promo, cap = usage.render_api_credit_row(row).plain.splitlines()
+    assert cap.startswith("API cap: $154 of $300 →1.11.") and cap.endswith("51%")
+    assert len(promo) == len(cap) == usage._CARD_INNER_WIDTH  # noqa: SLF001
+
+
+def test_card_row_says_why_the_reading_is_not_used(tmp_path: Path) -> None:
+    from command_center import usage
+
+    ledger = _ledger(tmp_path / "runs.jsonl", [{"ts": "2026-10-10T10:00:00+02:00", "cost_usd": 50}])
+    stale = _balance_file(tmp_path / "s.json", measured_at=NOW - 7 * 3600)
+    row = api_credits.statuses_with_spend(
+        [PRIVATE],
+        [f"private=runs_jsonl:{ledger}", f"private=balance_json:{stale}"],
+        TODAY,
+        now=NOW,
+    )[0]
+    promo, note = usage.render_api_credit_row(row).plain.splitlines()
+    assert promo.startswith("API PROMO: ≈$150 left →26.10.") and note == "Console reading 7h old"
+
+
+def test_report_draws_measured_and_cap_rows(
+    _pin_home: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from command_center import cli
+
+    path = _balance_file(tmp_path / "p.json", cap=BINDING_CAP)
+    (_pin_home / "config.toml").write_text(
+        'claude_accounts = ["private=/tmp/x-private", "work=/tmp/x-work"]\n'
+        f'claude_api_credits = ["{PRIVATE},name:apipriv", {json.dumps(WORK)}]\n'
+        f'claude_api_credit_spend = ["private=balance_json:{path}"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    monkeypatch.setattr("time.time", lambda: float(NOW))
+    assert cli.cmd_quota(_quota_args(no_bars=False)) == 0
+    lines = capsys.readouterr().out.splitlines()
+    promo = next(line for line in lines if line.lstrip().startswith("apipriv ") and " api " in line)
+    assert "API measured" in promo and "$185.88 of $200 left (Console, measured 12m ago)" in promo
+    assert "12m" in promo
+    cap = next(line for line in lines if "apipriv cap" in line)
+    assert "api cap" in cap and "API cap" in cap and "51%" in cap
+    # Both rows start their name in the same column.
+    assert promo.index("apipriv") == cap.index("apipriv")
+    snap = json.loads(json.dumps(quota.snapshot(now=NOW)))
+    row = snap["api_credits"][0]
+    assert row["balance_usd"] == 185.88 and row["name"] == "apipriv"
+    # A cap that does not bind draws no row.
+    _balance_file(path)
+    assert cli.cmd_quota(_quota_args(no_bars=False)) == 0
+    assert "apipriv cap" not in capsys.readouterr().out
