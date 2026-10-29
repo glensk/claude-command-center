@@ -480,7 +480,12 @@ def focus_tmux_window(session_id: str) -> bool:  # pylint: disable=too-many-retu
 
 
 def resume_in_new_tab(
-    cwd: str, session_id: str, config_dir: str = "", *, no_codex: bool = False
+    cwd: str,
+    session_id: str,
+    config_dir: str = "",
+    *,
+    no_codex: bool = False,
+    launch_profile: str = "",
 ) -> bool:
     """Open a new terminal tab (or tmux window) in *cwd* running ``claude --resume <id>``.
 
@@ -490,17 +495,43 @@ def resume_in_new_tab(
     session's OWN account (the default account unsets ``CLAUDE_CONFIG_DIR``; any other
     sets it) and inherits ``CCC_NO_CODEX=1`` when the row demands it — a fresh tab's
     ambient env can never silently bill the wrong account or re-enable Codex.
+
+    *launch_profile* starts the resume through that profile's executable and exports
+    ``CCC_LAUNCH_PROFILE``; a profile that no longer resolves returns ``False`` before
+    anything is opened or trusted — it never falls back to the bare ``claude``.
     """
     from . import launch_argv
     from .accounts import LaunchTarget, ensure_trusted
+    from .config import LaunchProfileError
 
-    ensure_trusted(config_dir, cwd)  # the tab's claude must not park on the trust dialog
-    target = LaunchTarget(config_dir, no_codex)
+    target = LaunchTarget(config_dir, no_codex, launch_profile)
     argv = launch_argv.claude_argv(resume=session_id)
+    try:
+        launch_argv.claude_command(target, argv)  # resolves the profile: refuse BEFORE trust
+    except LaunchProfileError:
+        return False
+    ensure_trusted(config_dir, cwd)  # the tab's claude must not park on the trust dialog
     if _launcher_mode() == "tmux":
         return _tmux_window(launch_argv.claude_command(target, argv), cwd=cwd)
     command = launch_argv.claude_command(target, argv, cwd=cwd)
     return bool(_open_tab(command, tmux_fallback=False))
+
+
+def resume_session_in_new_tab(session: Any) -> bool:
+    """:func:`resume_in_new_tab` for a session ROW: its cwd, account, ``no_codex`` and profile.
+
+    The one place the row-based surfaces (the TUI resume key and undo-close, the jump chord,
+    the resume-job command) read those four fields, so none of them can drop the profile.
+    """
+    from .accounts import session_launch_profile
+
+    return resume_in_new_tab(
+        session.cwd,
+        session.session_id,
+        session.config_dir,
+        no_codex=bool(session.no_codex),
+        launch_profile=session_launch_profile(session),
+    )
 
 
 def resume_halted_in_new_tab(
@@ -511,6 +542,7 @@ def resume_halted_in_new_tab(
     *,
     no_codex: bool = False,
     require_trust: bool = False,
+    launch_profile: str = "",
 ) -> bool:
     """Open a new terminal tab that resumes a rate-limit-halted session.
 
@@ -530,6 +562,8 @@ def resume_halted_in_new_tab(
 
     if not cwd or not os.path.isdir(cwd) or not script_path:
         return False
+    if launch_profile:
+        return False  # the continue script starts a bare claude: refuse, never bill another route
     if require_trust:
         # AUTOMATIC recovery never establishes trust — it requires it. Writing
         # `hasTrustDialogAccepted` on a machine decision grants a seat permission to execute

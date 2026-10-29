@@ -305,6 +305,30 @@ enumerates them. The flag is never *cleared* — an ambient `CCC_NO_CODEX` is pr
 mutually exclusive with a `codex`/`codex-write` job type (`models.no_codex_conflict`), refused at
 creation AND again at launch.
 
+## Launch profiles (`launch_profile`) — billing route, fail closed (do not regress)
+
+A `launch_profile` on a session row is an opaque label (config `claude_launch_profiles`,
+`["<label>=<one executable>"]`, default `[]`) that replaces the bare `claude` in every
+interactive launch of that session. It is billing-relevant identity, so a surface either
+**propagates it or refuses before any state change — never a bare `claude`**:
+
+- `launch_argv.profile_argv` / `claude_argv(launch_profile=)` / `claude_command` swap argv[0] for
+  `config.resolve_launch_profile(label)` (re-resolved at EVERY launch; raises `LaunchProfileError`);
+  `accounts.session_env_flags` exports ONLY `CCC_LAUNCH_PROFILE=<label>`, and the three env
+  renderings unset an ambient label for a profile-less session. `LaunchTarget` / `SnapPane` /
+  `StoreRow` carry it like `no_codex`.
+- **Propagate:** `start-job` (resolves BEFORE `claim_draft`), `resume`, `resume-job`, TUI `r` +
+  undo-close, `jump` (all via `terminal.resume_in_new_tab(launch_profile=)`, which resolves
+  before trust or a tab), `fire-attached` (before the claim), snapshot restore.
+- **Refuse:** `switch-account` / `switch-now` / `limitswitch` (an account switch does not
+  change the billing route), the halted-session auto-resume (before the reap),
+  `resume_halted_in_new_tab`, `ccc await` arm and `fire-await`, `continue-session start`.
+- The store is the authority: the job file carries `launch_profile` but a file edit never
+  re-routes an existing job. Machine contracts (`new-job -J`, `jobs -j`, `sessions -j`,
+  `inspect -j`) and the `-K` conflict check include it. ccc stays public: labels are opaque,
+  no personal executable or vault item is ever named in this tree. `tests/test_launch_profile.py`
+  enumerates the surfaces; a new launch surface must join it.
+
 ## `ccc await` — event-triggered resume (do not regress)
 
 `await_store.py` (schema + every transition, a `Store` mixin), `await_probes.py`,

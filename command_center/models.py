@@ -596,6 +596,11 @@ class Session:
     # exclusive with a 'codex'/'codex-write' job_type (a job that IS codex work cannot ban
     # codex) — refused at the domain boundary and again at launch.
     no_codex: bool = False
+    # Opaque label of a configured launch profile (config ``claude_launch_profiles``): the
+    # session's interactive claude starts through that profile's executable and the env
+    # carries ``CCC_LAUNCH_PROFILE=<label>``. ``None`` = the bare ``claude``. Immutable
+    # identity: every launch/resume surface propagates it or refuses (never bare claude).
+    launch_profile: str | None = None
     # Which models a future job runs on. The session runs ON the overseer's model
     # (`claude --model LLM_MODEL_IDS[llm_overseer]`); when llm_exec differs, the launch
     # prompt tells the overseer to delegate implementation to Agent-tool subagents on the

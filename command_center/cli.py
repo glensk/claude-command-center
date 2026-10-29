@@ -55,6 +55,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import __version__, brokenpipe, config, hookspec, launch_argv
 from .adapters import ClaudeAdapter
+from .config import LaunchProfileError
 from .inflight import background_work as _background_work
 from .models import (
     BUSY_RAW_STATUSES,
@@ -1841,6 +1842,11 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
         return 1
     if not inside:
         cwd = live.cwd or cwd  # the session's own directory, not the caller's
+    with Store() as store:
+        profiled = store.get(session_id)
+    if profiled is not None and accounts.session_launch_profile(profiled):
+        print(_PROFILE_SWITCH_REFUSAL.format(sid=session_id), file=sys.stderr)
+        return 1
     if _has_control_chars(cwd):
         print(
             "error: the session's working directory contains control characters — refusing",
@@ -2137,6 +2143,11 @@ def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many
         print("switch-now: --prompt contains control characters — refusing", file=sys.stderr)
         return 1
     label = accounts.account_label(target)
+    with Store() as store:
+        profiled = store.get(session_id)
+    if profiled is not None and accounts.session_launch_profile(profiled):
+        print(_PROFILE_SWITCH_REFUSAL.format(sid=session_id), file=sys.stderr)
+        return 1
     no_codex = bool(getattr(args, "no_codex", False))
     force = bool(getattr(args, "force", False))
     manual = accounts.relaunch_command(
@@ -2439,6 +2450,29 @@ def cmd_prune(args: argparse.Namespace) -> int:
     return 0
 
 
+_PROFILE_SWITCH_REFUSAL = (
+    "error: {sid} runs under a launch profile — its billing route is the profile, not a "
+    "Claude account, so an account switch is refused"
+)
+
+
+def _profile_argv(session: object, **kwargs: Any) -> list[str] | None:
+    """``claude_argv(**kwargs)`` for *session*'s launch profile, or ``None`` after a refusal.
+
+    The caller returns 1 on ``None`` BEFORE any state change: a profile that no longer
+    resolves must never fall back to the bare ``claude`` (that would bill another route).
+    """
+    from . import accounts
+
+    try:
+        return launch_argv.claude_argv(
+            launch_profile=accounts.session_launch_profile(session), **kwargs
+        )
+    except LaunchProfileError as exc:
+        print(f"error: {exc} — refusing to launch", file=sys.stderr)
+        return None
+
+
 def _exec_in(cwd: str, argv: list[str], *, strict: bool = False) -> None:
     """``os.execvp(argv)`` from inside *cwd*, leaving this process's cwd untouched if it returns.
 
@@ -2475,11 +2509,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
     config_dir = session.config_dir if session else ""
     cwd = session.cwd if session else ""
     no_codex = bool(session.no_codex) if session else False
+    profile = accounts.session_launch_profile(session)
     # The three fail-closed checks (unknown account in multi-account mode, D9 conflict,
     # missing transcript) live in core so `ccc restore-snapshot` refuses identically.
     blockers = core.resume_blockers(args.session_id, cwd, config_dir, _adapter())
     if blockers:
         print(f"error: {blockers[0]}", file=sys.stderr)
+        return 1
+    resume_argv = _profile_argv(session, resume=args.session_id)
+    if resume_argv is None:  # the profile no longer resolves: refuse, never bare claude
         return 1
     # Terminal guard (same trap as `start-job`): this execs claude IN PLACE, so with no
     # TTY the resumed session would run headless for a single turn and exit instead of
@@ -2487,7 +2525,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if not has_terminal():
         from . import terminal
 
-        if terminal.resume_in_new_tab(cwd, args.session_id, config_dir, no_codex=no_codex):
+        if terminal.resume_in_new_tab(
+            cwd, args.session_id, config_dir, no_codex=no_codex, launch_profile=profile
+        ):
             print(f"no terminal here — resumed {args.session_id} in a new tab instead")
             return 0
         print(
@@ -2498,8 +2538,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
         return 1
     # Pin the session's account AND its own env flags (CCC_NO_CODEX) into os.environ,
     # then exec (D8) — os.execvp inherits the mutated environment.
-    accounts.session_apply_to_environ(accounts.LaunchTarget(config_dir, no_codex))
-    _exec_in(cwd, launch_argv.claude_argv(resume=args.session_id))  # replaces this process
+    accounts.session_apply_to_environ(accounts.LaunchTarget(config_dir, no_codex, profile))
+    _exec_in(cwd, resume_argv)  # replaces this process
     return 0  # unreachable on success (execvp replaced the process)
 
 
@@ -2555,6 +2595,13 @@ def cmd_fire_attached(args: argparse.Namespace) -> int:
         if session is None or not (session.prompt or "").strip():
             print(f"error: no parked prompt on session {args.session_id}", file=sys.stderr)
             return 1
+        prompt = (session.prompt or "").strip()
+        profile = accounts.session_launch_profile(session)
+        # Resolved BEFORE the claim: an unresolvable profile refuses with no state change.
+        fire_argv = _profile_argv(session, resume=args.session_id, prompt=prompt)
+        if fire_argv is None:
+            store.update_fields(args.session_id, fire_at=0)  # no tab-opening retry loop
+            return 1
         if not store.claim_fire(args.session_id):
             print(
                 f"error: parked prompt for {args.session_id} was already delivered "
@@ -2562,12 +2609,11 @@ def cmd_fire_attached(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        prompt = (session.prompt or "").strip()
         cwd = session.cwd
-        launch = accounts.LaunchTarget(session.config_dir, bool(session.no_codex))
+        launch = accounts.LaunchTarget(session.config_dir, bool(session.no_codex), profile)
     accounts.session_apply_to_environ(launch)
     try:
-        _exec_in(cwd, launch_argv.claude_argv(resume=args.session_id, prompt=prompt))
+        _exec_in(cwd, fire_argv)
     except OSError as exc:
         with Store() as store:  # undo the claim: re-arm so the daemon retries
             store.update_fields(args.session_id, fire_at=int(_time.time()) + 900)
@@ -2610,6 +2656,17 @@ def cmd_fire_await(args: argparse.Namespace) -> int:
             )
             print(
                 "error: fire-await needs a terminal (it execs an interactive claude)",
+                file=sys.stderr,
+            )
+            return 1
+        owner = store.get(group.session_id)
+        if owner is not None and accounts.session_launch_profile(owner):
+            store.revert_delivery(
+                group.id, args.token, now, max_attempts=1, reason="session has a launch profile"
+            )
+            print(
+                f"error: {group.session_id} runs under a launch profile — an await delivery "
+                "would start a bare claude, so it is refused",
                 file=sys.stderr,
             )
             return 1
@@ -2697,11 +2754,14 @@ def _new_job_json(session: Session, created: bool) -> str:
             "created": created,
             "account": accounts.effective_account_label(session.config_dir or ""),
             "no_codex": bool(session.no_codex),
+            "launch_profile": session.launch_profile or "",
         }
     )
 
 
-def _idempotency_conflict(existing: Session, cwd: str, aim: str, no_codex: bool) -> str:
+def _idempotency_conflict(
+    existing: Session, cwd: str, aim: str, no_codex: bool, launch_profile: str = ""
+) -> str:
     """Why *existing* is not the job the caller just described, or ``""``.
 
     A key is a promise that the SAME request maps to the same job; a caller that reuses
@@ -2716,6 +2776,8 @@ def _idempotency_conflict(existing: Session, cwd: str, aim: str, no_codex: bool)
         diffs.append(f"aim {existing.aim!r} != {aim!r}")
     if bool(existing.no_codex) != no_codex:
         diffs.append(f"no_codex {bool(existing.no_codex)} != {no_codex}")
+    if (existing.launch_profile or "") != launch_profile:
+        diffs.append(f"launch_profile {existing.launch_profile or ''!r} != {launch_profile!r}")
     return "; ".join(diffs)
 
 
@@ -2758,6 +2820,13 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
             file=sys.stderr,
         )
         return 1
+    launch_profile = (getattr(args, "launch_profile", None) or "").strip()
+    if launch_profile:
+        try:
+            config.resolve_launch_profile(launch_profile)
+        except LaunchProfileError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     config_dir, err = _account_config_dir(getattr(args, "account", None))
     if err:
         print(err, file=sys.stderr)
@@ -2822,12 +2891,12 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
             # Claimed HERE, after every pre-flight check has passed, so a rejected
             # registration never leaves a half-built row owning the key.
             session_id, created = store.claim_idempotency_key(
-                idempotency_key, session_id, cwd, no_codex=no_codex
+                idempotency_key, session_id, cwd, no_codex=no_codex, launch_profile=launch_profile
             )
             if not created:
                 existing = store.get(session_id)
                 assert existing is not None  # the key's owner row always exists
-                mismatch = _idempotency_conflict(existing, cwd, aim, no_codex)
+                mismatch = _idempotency_conflict(existing, cwd, aim, no_codex, launch_profile)
                 if mismatch:
                     print(
                         f"error: idempotency key {idempotency_key!r} already names job "
@@ -2852,6 +2921,7 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
             depends_on=depends_on,
             job_type=job_type,
             no_codex=no_codex,
+            launch_profile=launch_profile,
             llm_overseer=getattr(args, "overseer", None) or NEW_JOB_DEFAULT_LLM,
             llm_exec=getattr(args, "executor", None) or NEW_JOB_DEFAULT_LLM,
             config_dir=config_dir,
@@ -3183,6 +3253,17 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
                 store.update_fields(args.session_id, fire_at=0)  # disarm, keep the draft
             print(f"error: job {args.session_id}: {conflict}", file=sys.stderr)
             return 1
+        profile = accounts.session_launch_profile(session)
+        if profile:
+            # Resolved BEFORE claim_draft, so a profile that vanished since registration
+            # refuses with the job still a draft — never launched as the bare claude.
+            try:
+                config.resolve_launch_profile(profile)
+            except LaunchProfileError as exc:
+                if getattr(args, "auto", False):
+                    store.update_fields(args.session_id, fire_at=0)  # disarm, keep the draft
+                print(f"error: job {args.session_id}: {exc} — refusing to launch", file=sys.stderr)
+                return 1
         overseer, retired_overseer = resolve_job_llm(session.llm_overseer)
         executor, retired_executor = resolve_job_llm(session.llm_exec)
         if retired_overseer or retired_executor:
@@ -3242,13 +3323,14 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
         model=LLM_MODEL_IDS[overseer],
         effort=effort,
         prompt=launch_prompt,
+        launch_profile=profile,
     )
     _spawn_sync_mirrors(cfg)  # (BEFORE execvp: the success path replaces this process)
     # Pin the job's OWN Claude account (D8) into os.environ before exec — the default
     # account unsets CLAUDE_CONFIG_DIR, any other sets it — so an ambient value in this
     # tab can never bill the wrong seat — plus its own flags (CCC_NO_CODEX for a
     # -N/--no-codex job). os.execvp inherits the mutated environment.
-    accounts.session_apply_to_environ(accounts.LaunchTarget(config_dir, no_codex))
+    accounts.session_apply_to_environ(accounts.LaunchTarget(config_dir, no_codex, profile))
     try:
         _exec_in(cwd, argv)  # replaces this process on success
     except OSError as exc:  # (d) launch failed — undo the promotion so the job survives
@@ -3691,6 +3773,7 @@ def cmd_jobs(args: argparse.Namespace) -> int:
                             "created_at": s.created_at,
                             "account": accounts.account_label(s.config_dir or ""),
                             "no_codex": bool(s.no_codex),
+                            "launch_profile": s.launch_profile or None,
                             "idempotency_key": s.idempotency_key or None,
                         }
                         for s in drafts
@@ -3707,6 +3790,8 @@ def cmd_jobs(args: argparse.Namespace) -> int:
         tag = "" if session.job_type == "claude" else f"  [{session.job_type}]"
         if session.no_codex:  # the per-job Codex ban (CCC_NO_CODEX=1 at launch)
             tag += "  [no-codex]"
+        if session.launch_profile:  # the billing route: a configured launch profile
+            tag += f"  [profile: {session.launch_profile}]"
         # In multi-account mode, tag a non-default account (e.g. [work]) like the codex tag.
         if multi and not accounts.is_default_config_dir(session.config_dir or ""):
             tag += f"  [{accounts.account_label(session.config_dir or '')}]"
@@ -4778,15 +4863,15 @@ def cmd_resume_job(args: argparse.Namespace) -> int:  # pylint: disable=too-many
             file=sys.stderr,
         )
         return 1
-    if terminal.resume_in_new_tab(
-        session.cwd, args.session_id, session.config_dir, no_codex=bool(session.no_codex)
-    ):
+    if terminal.resume_session_in_new_tab(session):
         print(f"resuming in a new tab: {args.session_id}")
         return 0
-    print(
-        f"error: could not open a new tab — run `claude --resume {args.session_id}` manually",
-        file=sys.stderr,
+    manual = (
+        "its launch profile may no longer resolve"
+        if accounts.session_launch_profile(session)
+        else f"run `claude --resume {args.session_id}` manually"
     )
+    print(f"error: could not open a new tab — {manual}", file=sys.stderr)
     return 1
 
 
@@ -6642,21 +6727,30 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "refused together with -j codex / -j codex-write",
     )
     p_newjob.add_argument(
+        "-L",
+        "--launch-profile",
+        default=None,
+        metavar="LABEL",
+        help="start the job's interactive claude through the configured launch profile "
+        "LABEL (config claude_launch_profiles); refused when LABEL is not configured or "
+        "its executable does not resolve",
+    )
+    p_newjob.add_argument(
         "-K",
         "--idempotency-key",
         default=None,
         metavar="KEY",
         help="create-or-retrieve key: re-running with the same KEY returns the SAME job "
         "instead of registering a second one (a KEY reused for different cwd/aim/"
-        "--no-codex exits 2)",
+        "--no-codex/--launch-profile exits 2)",
     )
     p_newjob.add_argument(
         # -j is --job-type here, so the JSON switch takes the capital (short forms stay unique).
         "-J",
         "--json",
         action="store_true",
-        help="print one machine-readable JSON line (session_id/created/account/no_codex) "
-        "and nothing else",
+        help="print one machine-readable JSON line "
+        "(session_id/created/account/no_codex/launch_profile) and nothing else",
     )
     p_newjob.add_argument(
         "-R",

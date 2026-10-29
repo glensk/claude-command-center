@@ -170,6 +170,11 @@ class ParsedJob:  # pylint: disable=too-many-instance-attributes
     # A bare-bool frontmatter key, emitted ONLY when true so every existing job file
     # stays byte-identical; refused together with a codex/codex-write job type.
     no_codex: bool = False
+    # Opaque launch-profile label (config ``claude_launch_profiles``) the job's claude
+    # starts through ("" = the bare claude). Emitted only when set. The STORE is the
+    # authority for an existing job (a file edit never re-routes billing); the key only
+    # seeds a job created from a file, where validate() requires it to resolve.
+    launch_profile: str = ""
     # ISO date the job was moved to the delete/ trash ("" = not deleted).
     deleted: str = ""
     # Claude account LABEL the job launches (bills) under ("" = the default account).
@@ -264,6 +269,7 @@ def parse_job_file(text: str) -> ParsedJob:
         created=data.get("created", ""),
         deleted=data.get("deleted", ""),
         no_codex=_truthy(data.get("no_codex", "")),
+        launch_profile=str(data.get("launch_profile", "") or "").strip(),
         account=data.get("account", ""),
         aim=_extract_section(body, _AIM_HEADING),
         prompt=prompt_text or None,
@@ -337,6 +343,11 @@ def validate(job: ParsedJob, git_base: Path) -> list[str]:
     conflict = models.no_codex_conflict(job.job_type, job.no_codex)
     if conflict:
         errors.append(conflict)
+    if job.launch_profile:
+        try:
+            config.resolve_launch_profile(job.launch_profile)
+        except config.LaunchProfileError as exc:
+            errors.append(str(exc))
     return errors
 
 
@@ -512,6 +523,7 @@ def serialize(  # pylint: disable=too-many-arguments
     created: str = "",
     deleted: str = "",
     no_codex: bool = False,
+    launch_profile: str = "",
     account: str = "",
     prompt: str | None = None,
     repo_options: list[str] | None = None,
@@ -553,6 +565,8 @@ def serialize(  # pylint: disable=too-many-arguments
     # without the opt-out keeps its exact current bytes.
     if no_codex:
         keys.append("no_codex: true")
+    if launch_profile.strip():  # emitted only when set, like no_codex (byte-stable otherwise)
+        keys.append(f"launch_profile: {_yaml_str(launch_profile.strip())}")
     # In multi-account mode the label is always emitted (the caller passes the
     # concrete default account's label there, so the Obsidian select always shows a
     # value); on single-account machines it stays "" and no key is written, keeping

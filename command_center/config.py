@@ -26,6 +26,7 @@ import copy
 import datetime
 import os
 import re
+import shutil
 import sys
 import tempfile
 import tomllib
@@ -268,6 +269,13 @@ DEFAULTS: dict[str, object] = {
     # (the default) ⇒ a single ``{"private": claude_home()}`` account, i.e. today's
     # behaviour. Labels are validated ``^[a-z0-9][a-z0-9_-]*$``.
     "claude_accounts": [],
+    # Launch profiles: ``"label=executable"`` entries (list[str]). A job created with
+    # ``ccc new-job -L <label>`` starts its interactive ``claude`` through that ONE
+    # executable (a PATH name or an absolute path; no args, no env, no shell) instead of
+    # the bare ``claude`` — e.g. a billing wrapper. Labels are ``[a-z0-9-]{1,32}``. Empty
+    # (the default) ⇒ no profile exists and ``-L`` is refused. Fail closed: a label that
+    # no longer resolves at launch REFUSES the launch, it never falls back to ``claude``.
+    "claude_launch_profiles": [],
     # Identity hard-link for the usage cards: ``"label=email"`` entries, same shape as
     # ``claude_accounts``. WHICH config dir a label points at is a path; WHICH Claude
     # account is actually logged into that dir can drift (a bare `/login` in the wrong
@@ -847,6 +855,64 @@ def parse_claude_accounts(entries: list[str]) -> dict[str, Path]:
     return dirs or {"private": claude_home()}
 
 
+_LAUNCH_PROFILE_RE = re.compile(r"^[a-z0-9-]{1,32}$")
+
+
+class LaunchProfileError(ValueError):
+    """A launch profile label is unknown, malformed or no longer resolves to an executable."""
+
+
+def valid_launch_profile_label(label: str) -> bool:
+    """Whether *label* has the ``[a-z0-9-]{1,32}`` shape of a launch-profile label."""
+    return bool(_LAUNCH_PROFILE_RE.match(label))
+
+
+def parse_launch_profiles(entries: object) -> dict[str, str]:
+    """Pure ``"label=executable"`` parser behind :func:`resolve_launch_profile`.
+
+    Malformed entries are skipped (never raised): a label outside ``[a-z0-9-]{1,32}``, a
+    missing ``=``, an executable that is empty, holds whitespace (more than one token,
+    i.e. arguments or a shell line) or any control character.
+    """
+    profiles: dict[str, str] = {}
+    if not isinstance(entries, list):
+        return profiles
+    for entry in entries:
+        if not isinstance(entry, str):
+            continue
+        label, sep, exe = entry.partition("=")
+        label, exe = label.strip(), exe.strip()
+        if not sep or not valid_launch_profile_label(label) or not exe:
+            continue
+        if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in exe):
+            continue
+        profiles[label] = exe
+    return profiles
+
+
+def resolve_launch_profile(label: str, cfg: Config | None = None) -> str:
+    """The absolute executable of launch profile *label*, or :class:`LaunchProfileError`.
+
+    Resolved at registration AND at every launch: the configured token must be an
+    existing executable file (an absolute or ``~`` path) or a name found on ``PATH``.
+    """
+    label = (label or "").strip()
+    if not valid_launch_profile_label(label):
+        raise LaunchProfileError(f"launch profile {label!r} is not a valid label")
+    exe = parse_launch_profiles((cfg or load_config()).claude_launch_profiles).get(label)
+    if exe is None:
+        raise LaunchProfileError(
+            f"launch profile {label!r} is not configured (claude_launch_profiles)"
+        )
+    expanded = os.path.expanduser(exe)
+    found = expanded if os.sep in expanded else shutil.which(expanded)
+    if not found or not os.path.isfile(found) or not os.access(found, os.X_OK):
+        raise LaunchProfileError(
+            f"launch profile {label!r}: executable {exe!r} was not found or is not executable"
+        )
+    return os.path.abspath(found)
+
+
 # The only value that turns the automatic relaunch's trust check into a trust WRITE.
 _TRUST_ENSURE = "ensure"
 
@@ -1125,6 +1191,7 @@ class Config:
     codex_debate_pause_pct: float = 90  # mid-debate pause point (tp#620)
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
+    claude_launch_profiles: list[str] = field(default_factory=list)  # "label=executable"
     subscription_ends: list[str] = field(default_factory=list)  # "card=YYYY-MM-DD|auto"
     # "label=usd:N,day:D[,from:YYYY-MM-DD]" per Claude account (API credit grant)
     claude_api_credits: list[str] = field(default_factory=list)

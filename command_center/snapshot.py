@@ -68,6 +68,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from . import config
+from .config import LaunchProfileError
 from .links import local_link
 from .models import LiveSession
 
@@ -133,7 +134,8 @@ class SnapPane:  # pylint: disable=too-many-instance-attributes
     whose exact ``argv`` we captured) or ``"shell"`` (nothing but the shell, or a
     program whose argv could not be read — ``display`` then names it for the note).
     ``no_codex`` mirrors the session row's Codex opt-out so a restored pane comes back
-    with the same ``CCC_NO_CODEX`` pin it had.
+    with the same ``CCC_NO_CODEX`` pin it had; ``launch_profile`` likewise carries the
+    session's launch-profile label (restore propagates it or refuses, never bare claude).
     """
 
     kind: str
@@ -142,6 +144,7 @@ class SnapPane:  # pylint: disable=too-many-instance-attributes
     session_id: str = ""
     config_dir: str = ""
     no_codex: bool = False
+    launch_profile: str = ""
     argv: list[str] = field(default_factory=list)
     display: str = ""
     #: How a ``claude`` pane was matched (``uuid``/``tty``/``pid``/``argv``/``store``) —
@@ -205,6 +208,7 @@ class StoreRow(NamedTuple):
     session_id: str
     config_dir: str = ""
     no_codex: bool = False
+    launch_profile: str = ""
     iterm_uuid: str = ""  # the UUID tail of ``iterm_session_id``, upper-cased
     last_seen_pid: int = 0
     updated_at: int = 0
@@ -228,6 +232,8 @@ def pane_to_json(pane: SnapPane) -> dict[str, Any]:
         out["argv"] = list(pane.argv)
     if pane.no_codex:  # omitted when false, so existing snapshot files stay byte-identical
         out["no_codex"] = True
+    if pane.launch_profile:  # likewise omitted when empty
+        out["launch_profile"] = pane.launch_profile
     return out
 
 
@@ -276,6 +282,7 @@ def pane_from_json(data: dict[str, Any]) -> SnapPane:
         session_id=str(data.get("session_id") or ""),
         config_dir=str(data.get("config_dir") or ""),
         no_codex=bool(data.get("no_codex")),
+        launch_profile=str(data.get("launch_profile") or ""),
         argv=[str(a) for a in argv],
         display=str(data.get("display") or ""),
         matched=str(data.get("matched") or ""),
@@ -650,6 +657,7 @@ def store_row(session: Any) -> StoreRow:
         session_id=str(getattr(session, "session_id", "") or ""),
         config_dir=str(getattr(session, "config_dir", "") or ""),
         no_codex=bool(getattr(session, "no_codex", False)),
+        launch_profile=str(getattr(session, "launch_profile", "") or ""),
         iterm_uuid=iterm_uuid(getattr(session, "iterm_session_id", "")),
         last_seen_pid=int(getattr(session, "last_seen_pid", 0) or 0),
         updated_at=int(getattr(session, "updated_at", 0) or 0),
@@ -844,6 +852,7 @@ def _live_claude_pane(session: LiveSession, index: PaneIndex, title: str, matche
         session_id=session.session_id,
         config_dir=session.config_dir,
         no_codex=info.no_codex if info else bool(getattr(session, "no_codex", False)),
+        launch_profile=info.launch_profile if info else "",
         matched=matched,
     )
 
@@ -898,6 +907,7 @@ def _claude_from_argv(  # pylint: disable=too-many-arguments,too-many-positional
         session_id=session_id,
         config_dir=info.config_dir if info else "",
         no_codex=info.no_codex if info else False,
+        launch_profile=info.launch_profile if info else "",
         matched=matched,
     )
 
@@ -1308,7 +1318,11 @@ def _claude_action(pane: SnapPane, blockers: Blockers) -> PaneAction:
             error=True,
         )
     argv = launch_argv.claude_argv(resume=pane.session_id)
-    return _action(pane, launch_argv.claude_command(pane, argv, cwd=pane.cwd))
+    try:
+        command = launch_argv.claude_command(pane, argv, cwd=pane.cwd)
+    except LaunchProfileError as exc:  # never restore a profile pane as a bare claude
+        return _action(pane, f"cd {shlex.quote(pane.cwd)}", f"cannot resume: {exc}", error=True)
+    return _action(pane, command)
 
 
 def _pane_action(  # pylint: disable=too-many-return-statements
@@ -1366,6 +1380,7 @@ def upgrade_legacy_pane(pane: SnapPane, store: Mapping[str, StoreRow]) -> SnapPa
         session_id=session_id,
         config_dir=info.config_dir if info else "",
         no_codex=info.no_codex if info else False,
+        launch_profile=info.launch_profile if info else "",
         matched="argv",
     )
 

@@ -179,6 +179,7 @@ def session_entry(
         "staff_agent": staff_agent,
         "account": account_label(live.config_dir) if live.config_dir else None,
         "account_conflict": bool(live.conflict),
+        "launch_profile": (row.launch_profile or None) if row else None,
         "pid": live.pid or None,
         "kind": "interactive" if live.kind == "interactive" else "background",
         "status": status if status is not None else contract_status(live.raw_status),

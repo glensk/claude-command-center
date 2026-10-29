@@ -360,6 +360,12 @@ def _run(  # pylint: disable=too-many-locals,too-many-return-statements,too-many
     source = live.config_dir
     if not source:
         return False, "the registry does not record which account this session bills"
+    with Store() as store:
+        profiled = store.get(session_id)
+    if profiled is not None and profiled.launch_profile:
+        # Billed through its launch profile, not an account seat: a seat failover would
+        # relaunch it as a bare claude on another route (and block-list an unrelated seat).
+        return False, "session runs under a launch profile — no account failover"
     obs = observe(
         adapter,
         session_id,

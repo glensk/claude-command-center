@@ -104,6 +104,7 @@ def test_both_accounts_kinds_status_and_names(store: Store) -> None:
         "name_origin",
         "account",
         "account_conflict",
+        "launch_profile",
         "pid",
         "kind",
         "status",

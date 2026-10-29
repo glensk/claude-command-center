@@ -522,7 +522,7 @@ then reads `(fn adds one)`), so `tf` always has at least this one line to toggle
 `claude --session-id <id> "<prompt>"` in the repo, with the AIM already set — the draft simply
 becomes the live session (it reuses the pre-assigned id, so the AIM carries over). Everything
 is also scriptable: `ccc new-job -a "…" [-p "…"] [-c REPO] [-w "during holidays"]
-[-s YYYY-MM-DD] [-O overseer] [-E executor] [-N] [-K KEY] [-J]`, `ccc jobs [-j]`,
+[-s YYYY-MM-DD] [-O overseer] [-E executor] [-N] [-L LABEL] [-K KEY] [-J]`, `ccc jobs [-j]`,
 `ccc start-job <id>`. Future jobs are
 inert until launched — the daemon never reaps, grades, or alerts on them.
 
@@ -546,13 +546,60 @@ banning Codex would make it unrunnable. The refusal fires at the domain boundary
 callout) **and** again at launch, where `ccc start-job` refuses a row that somehow carries both,
 before it claims the draft — so nothing is lost.
 
+#### Launch profiles
+
+`ccc new-job -L/--launch-profile`: a billing route that is not an account. A **launch profile** routes ONE job's interactive `claude` through a configured executable
+(for example a wrapper that bills the session to an API key instead of a subscription seat).
+ccc only knows an opaque label and the one executable it maps to; what the executable does is
+its own business. Configure profiles as `"label=executable"` entries — default `[]`, so
+nothing changes until you add one:
+
+```toml
+claude_launch_profiles = ["billing=/opt/tools/claude-billing-wrapper"]
+```
+
+A label matches `[a-z0-9-]{1,32}`; the executable is exactly one token — a name found on
+`PATH` or an absolute / `~` path — with no arguments, env assignments or shell, and no control
+characters (a malformed entry is skipped). It is resolved at registration **and** at every
+launch.
+
+`ccc new-job -L billing …` stores the label on the job (the nullable `launch_profile` column;
+immutable identity, like `no_codex`). Every launch and resume then starts
+`<resolved executable> <the usual claude arguments>` and exports exactly one extra variable,
+`CCC_LAUNCH_PROFILE=<label>`. A session **without** a profile unsets that variable, so a label
+never leaks from a parent shell into another launch.
+
+**Fail closed.** A profile never falls back to the bare `claude`: an unknown label, or an
+executable that vanished, REFUSES the launch before any state changes (the draft stays a
+draft, a parked prompt stays parked, no trust is granted, no tab opens, nothing is reaped).
+Surfaces that propagate the profile: `start-job`, `resume`, `resume-job`, the TUI `r` and its
+undo-close, `ccc jump`, `fire-attached`, and snapshot restore (the typed tab command carries
+the export). Surfaces that **refuse** a profile session because their relaunch would be a bare
+`claude` on another route: account switching (`switch-account`, `switch-now`, the automatic
+rate-limit failover), the halted-session auto-resume, `ccc await` arming and delivery, and
+`continue-session start`.
+
+**Account vs billing profile.** The account (`-A`, `claude_accounts`) pins WHICH Claude config
+dir and subscription seat a session uses; the profile pins HOW the process is started and
+billed. They are independent and both are kept: the account still names the config dir
+(transcripts, trust), the profile replaces the launcher. Because the profile, not the account,
+decides the billing, the account-switch features above do not apply to a profile session.
+
+The job file carries it as `launch_profile: "<label>"` (emitted only when set, so existing
+files stay byte-identical). The store stays the authority: a hand edit of that key never
+re-routes an existing job, and a file that names an unresolvable label is refused at import.
+The label also appears as `launch_profile` in `new-job -J`, `jobs -j`, `sessions -j` and
+`inspect -j` (`null` / `""` when absent), as a `[profile: <label>]` tag in `ccc jobs`, and as
+the `/profile` readout in the TUI detail pane. A `-K` key reused with a different
+`--launch-profile` is a caller bug (exit 2), like a different `--no-codex`.
+
 #### Idempotent registration + JSON output (for automations)
 
 `ccc new-job -K/--idempotency-key KEY` makes registration **create-or-retrieve**: the first call
 registers the job, every later call with the same KEY returns that same job instead of a second
 one. The claim is a single `BEGIN IMMEDIATE` transaction against a partial UNIQUE index, so even
 concurrent creators collapse onto one row. A KEY reused with a **different** `cwd`/`aim`/
-`--no-codex` is a caller bug: exit 2 naming the differences, rather than silently handing back
+`--no-codex`/`--launch-profile` is a caller bug: exit 2 naming the differences, rather than silently handing back
 the wrong job. Keyless jobs are never deduplicated (their key is `NULL`).
 
 Two machine-readable outputs, both a single line, schema `version: 1` (additive fields keep
@@ -560,12 +607,13 @@ version 1 — read by key):
 
 ```commands
 ccc new-job -a "…" -c <repo> -K deploy-42 -J
-# {"version":1,"session_id":"…","created":true,"account":"private","no_codex":false}
+# {"version":1,"session_id":"…","created":true,"account":"private","no_codex":false,
+#  "launch_profile":""}
 
 ccc jobs -j
 # {"version":1,"jobs":[{"session_id":"…","cwd":"…","aim":"…","draft":true,"archived":false,
 #                      "created_at":1756…,"account":"private","no_codex":false,
-#                      "idempotency_key":null}]}
+#                      "launch_profile":null,"idempotency_key":null}]}
 ```
 
 `--json` suppresses every human line on stdout (warnings still go to stderr). Note the short

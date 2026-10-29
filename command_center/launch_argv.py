@@ -58,6 +58,22 @@ def lookup_name(session_id: str) -> str:
     return (session.canonical_name or "") if session is not None else ""
 
 
+def profile_argv(argv: Sequence[str], launch_profile: str) -> list[str]:
+    """*argv* with its leading ``claude`` swapped for the profile's resolved executable.
+
+    ``[resolved executable] + argv[1:]`` — nothing else changes. An empty profile, or an
+    *argv* that no longer starts with ``claude`` (already swapped), is returned as is.
+    Raises :class:`command_center.config.LaunchProfileError` when the label is unknown or
+    its executable is gone: the caller REFUSES the launch, it never runs bare ``claude``.
+    """
+    out = list(argv)
+    if launch_profile and out and out[0] == CLAUDE:
+        from .config import resolve_launch_profile
+
+        out[0] = resolve_launch_profile(launch_profile)
+    return out
+
+
 def claude_argv(  # pylint: disable=too-many-arguments
     *,
     resume: str = "",
@@ -68,6 +84,7 @@ def claude_argv(  # pylint: disable=too-many-arguments
     name: str | None = None,
     extra: Sequence[str] = (),
     prompt: str | None = None,
+    launch_profile: str = "",
 ) -> list[str]:
     """``claude [--name N] [--resume|--continue] [--model] [--session-id] [--effort] … [prompt]``.
 
@@ -79,6 +96,7 @@ def claude_argv(  # pylint: disable=too-many-arguments
     begins with ``-`` (a role file whose YAML frontmatter opens with ``---``) is otherwise
     parsed as an unknown option and claude exits at once, and a variadic option in
     *extra* (``--add-dir <dirs...>``) would otherwise swallow the prompt.
+    A *launch_profile* swaps ``claude`` for that profile's executable (:func:`profile_argv`).
     """
     if name is None:
         name = lookup_name(resume or session_id)
@@ -98,7 +116,7 @@ def claude_argv(  # pylint: disable=too-many-arguments
     argv += list(extra)
     if prompt is not None:
         argv += ["--", prompt]
-    return argv
+    return profile_argv(argv, launch_profile)
 
 
 def claude_command(
@@ -114,7 +132,7 @@ def claude_command(
     is shell-quoted; the caller owns rejecting control characters (a newline in a TYPED
     line submits it early).
     """
-    from .accounts import session_launch_env_prefix
+    from .accounts import session_launch_env_prefix, session_launch_profile
     from .mem_token import TYPED_SNIPPET
 
     # The shared-memory token is minted by the shell at run time (TYPED_SNIPPET), never
@@ -122,7 +140,7 @@ def claude_command(
     # the ``cd … &&`` so a failed ``cd`` still skips claude.
     prefix = session_launch_env_prefix(target) + TYPED_SNIPPET
     cd = f"cd {shlex.quote(cwd)} && " if cwd else ""
-    command = shlex.join(argv)
+    command = shlex.join(profile_argv(argv, session_launch_profile(target)))
     if subshell:
         return f"{cd}( {prefix}{command} )"
     return f"{prefix}{cd}{command}"

@@ -3720,6 +3720,11 @@ class CommandCenterApp(App[None]):
             # under, a live one bills right now.
             text.append("   /account: ", style="bold")
             text.append(accounts.account_label(session.config_dir or ""), style="white")
+        if session.launch_profile and not editing:
+            # The billing ROUTE of a profile session (distinct from its account): shown for
+            # every row kind so a worker billed outside the plan is never mistaken for one.
+            text.append("   /profile: ", style="bold")
+            text.append(session.launch_profile, style="white")
         # Manual override (set via `e` or Enter on the progress column) wins over the
         # sub-goal ratio and is labelled so its origin is never ambiguous.
         head_frac = effective_progress(session.manual_progress, checked, total_subs)
@@ -3986,12 +3991,15 @@ class CommandCenterApp(App[None]):
         if self.adapter.transcript_path(session.cwd, sid, session.config_dir) is None:
             self._offer_archive_orphan(sid)
             return
-        if terminal.resume_in_new_tab(
-            session.cwd, sid, session.config_dir, no_codex=bool(session.no_codex)
-        ):
+        if terminal.resume_session_in_new_tab(session):
             self.notify(f"Resuming in a new tab: {colors.short_folder(session.cwd)}")
         else:
-            self.notify(f"Run: c --resume {sid}", severity="warning", timeout=10)
+            hint = (
+                "its launch profile does not resolve"
+                if accounts.session_launch_profile(session)
+                else f"Run: c --resume {sid}"
+            )
+            self.notify(hint, severity="warning", timeout=10)
 
     async def _focus_session_task(self, iterm_session_id: str, session_id: str, label: str) -> None:
         """Bring a live session's iTerm tab forward off the UI loop.
@@ -4103,9 +4111,7 @@ class CommandCenterApp(App[None]):
             return "Can't undo — session no longer exists."
         if self.adapter.transcript_path(session.cwd, sid, session.config_dir) is None:
             return f"Undid close: {label} restored (no conversation on disk to reopen)."
-        if terminal.resume_in_new_tab(
-            session.cwd, sid, session.config_dir, no_codex=bool(session.no_codex)
-        ):
+        if terminal.resume_session_in_new_tab(session):
             return f"Undid close: resuming {label} in a new tab."
         return f"Undid close: {label} restored — reopen it with r."
 

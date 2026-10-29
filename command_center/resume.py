@@ -823,6 +823,20 @@ def apply_actions(
         if session_row is not None and session_row.handed_off_to:
             _log("refuse", action.session_id, "handed off to " + session_row.handed_off_to)
             continue
+        if (
+            session_row is not None
+            and session_row.launch_profile
+            and action.kind in ("reap", "launch_resume")
+        ):
+            # Refused BEFORE the reap kills the live process: the halted-session continue
+            # script starts a bare claude, which would revive a profile session on another
+            # billing route.
+            entry = state.entries.get(action.session_id)
+            if entry is not None:
+                entry.state = "failed"
+                entry.fail_reason = "session has a launch profile"
+            _log("refuse", action.session_id, "session has a launch profile")
+            continue
         if session_row is not None and limitswitch.hold_active(session_row):
             _log("skip", action.session_id, "a rate-limit failover owns this session")
             continue

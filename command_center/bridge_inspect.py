@@ -186,6 +186,7 @@ def run_inspect(deps: BridgeDeps, session_id: str, *, use_llm: bool = True) -> d
         "decision": decision,
         "cwd": cwd or None,
         **account_fields(config_dir),
+        "launch_profile": (row.launch_profile or None) if row is not None else None,
         "actions": ins.actions,
         "brief": ins.brief,
     }

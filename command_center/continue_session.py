@@ -612,6 +612,13 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
         session = store.get(src.session_id)
         if session is not None and session.handed_off_to:
             return _fail(args, src.session_id, f"{src.session_id} was already handed off")
+        if session is not None and session.launch_profile:
+            return _fail(
+                args,
+                src.session_id,
+                f"{src.session_id} runs under a launch profile — a handoff successor would "
+                "start a bare claude on another billing route, so it is refused",
+            )
         if args.capped:
             raw = _capped_text(adapter, store, src)
             if raw is None:

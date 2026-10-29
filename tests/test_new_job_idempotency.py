@@ -166,7 +166,14 @@ def test_new_job_json_is_one_line_with_exactly_the_agreed_keys(
     out = capsys.readouterr().out
     assert out.count("\n") == 1  # nothing else on stdout
     doc = json.loads(out)
-    assert set(doc) == {"version", "session_id", "created", "account", "no_codex"}
+    assert set(doc) == {
+        "version",
+        "session_id",
+        "created",
+        "account",
+        "no_codex",
+        "launch_profile",
+    }
     assert doc["version"] == 1 and doc["created"] is True and doc["no_codex"] is True
     assert isinstance(doc["account"], str) and doc["account"]
 
@@ -208,6 +215,7 @@ def test_jobs_json_lists_every_draft_with_the_agreed_fields(
         "created_at",
         "account",
         "no_codex",
+        "launch_profile",
         "idempotency_key",
     }
     assert by_id["j-nc"]["no_codex"] is True and by_id["j-nc"]["idempotency_key"] == "key-1"

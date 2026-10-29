@@ -2437,6 +2437,38 @@ def test_inline_edit_account_restamps_parked_session_with_transcript(
     assert parked is not None and accounts.same_config_dir(parked.config_dir, str(tmp_path))
 
 
+def test_detail_head_shows_the_launch_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A profile session's Status head names its billing route; a plain one shows none."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.ensure("profiled", cwd="/Users/x/profiled")
+    store.update_fields("profiled", launch_profile="apiwork", aim="route me")
+    store.ensure("plain", cwd="/Users/x/plain")
+    store.update_fields("plain", aim="no route")
+    store.close()
+
+    from command_center.models import Status
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert app.store is not None
+            profiled, plain = app.store.get("profiled"), app.store.get("plain")
+            assert profiled is not None and plain is not None
+            shown = app._head_text(profiled, Status.PARKED, 0, 0, editing=False).plain
+            assert "/profile: apiwork" in shown
+            assert "/profile" not in app._head_text(plain, Status.PARKED, 0, 0, editing=False).plain
+            assert (
+                "/profile" not in app._head_text(profiled, Status.PARKED, 0, 0, editing=True).plain
+            )
+
+    asyncio.run(scenario())
+
+
 def test_inline_edit_account_refuses_parked_without_transcript(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

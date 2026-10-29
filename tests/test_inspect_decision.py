@@ -80,6 +80,7 @@ def test_cli_envelope_matches_the_fixture(
     assert data.pop("cwd") == "/repo"
     assert data.pop("config_dir") == str(world.config_dir.resolve())
     assert data.pop("account") == world.config_dir.name  # not a configured account
+    assert data.pop("launch_profile") is None  # a plain session has no profile
     assert data.pop("brief") is None  # no fixture carries a Decision brief
     kinds = [a["kind"] for a in data.pop("actions")]
     assert kinds == (["decision", "decision"] if name == "todo_decision" else [])

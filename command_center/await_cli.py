@@ -467,6 +467,11 @@ def _arm(args: argparse.Namespace, runner: Any) -> int:
         session = store.get(sid)
         if session is None:
             raise AwaitError(f"unknown session {sid}", EXIT_USAGE)
+        if session.launch_profile:
+            raise AwaitError(
+                f"session {sid} runs under a launch profile — a delivery to a closed session "
+                "would start a bare claude on another billing route, so arming is refused"
+            )
         if args.close:
             _check_close(session, sid)
         config_dir, cwd = _snapshot(session, sid)

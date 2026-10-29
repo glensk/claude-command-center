@@ -514,10 +514,11 @@ class LaunchTarget:
 
     config_dir: str = ""
     no_codex: bool = False
+    launch_profile: str = ""
 
 
 class SessionLaunch(Protocol):
-    """The two fields a launch surface needs off a session row (structural).
+    """The three fields a launch surface needs off a session row (structural).
 
     A :class:`command_center.models.Session` satisfies it, and so does any small stand-in
     (``snapshot.SnapPane``, :class:`LaunchTarget`) — the helpers below never need the whole
@@ -531,6 +532,10 @@ class SessionLaunch(Protocol):
     @property
     def no_codex(self) -> bool:
         """Whether this launch must ban every Codex integration."""
+
+    @property
+    def launch_profile(self) -> str | None:
+        """Opaque launch-profile label ("" / ``None`` = the bare ``claude``)."""
 
 
 def session_env_flags(session: SessionLaunch) -> dict[str, str]:
@@ -548,7 +553,19 @@ def session_env_flags(session: SessionLaunch) -> dict[str, str]:
     flags = {TITLE_VAR: "1"}
     if getattr(session, "no_codex", False):
         flags["CCC_NO_CODEX"] = "1"
+    profile = session_launch_profile(session)
+    if profile:
+        flags[PROFILE_VAR] = profile
     return flags
+
+
+# The only env a launch profile adds: its opaque label (the profile's executable reads it).
+PROFILE_VAR = "CCC_LAUNCH_PROFILE"
+
+
+def session_launch_profile(session: object) -> str:
+    """The launch-profile label of *session* (a row, ``LaunchTarget``, ``SnapPane``) or ``""``."""
+    return str(getattr(session, "launch_profile", "") or "").strip()
 
 
 # Claude Code's switch that keeps it from setting the terminal (tab) title.
@@ -560,6 +577,7 @@ def session_launch_env(
 ) -> dict[str, str]:
     """Child env for launching/resuming *session*: the account pin plus its own flags."""
     env = launch_env(session.config_dir, base)
+    env.pop(PROFILE_VAR, None)  # an ambient label never leaks into another launch
     env.update(session_env_flags(session))
     env.update(_mem_env(env))
     return env
@@ -583,6 +601,7 @@ def _mem_env(base: Mapping[str, str]) -> dict[str, str]:
 def session_apply_to_environ(session: SessionLaunch) -> None:
     """The :func:`apply_to_environ` rendering: pin IN PLACE for an ``os.execvp``."""
     apply_to_environ(session.config_dir)
+    os.environ.pop(PROFILE_VAR, None)
     os.environ.update(session_env_flags(session))
     os.environ.update(_mem_env(os.environ))
 
@@ -597,7 +616,7 @@ def session_launch_env_prefix(session: SessionLaunch) -> str:
     return prefix + exports
 
 
-def pin_environ(config_dir: str, no_codex: bool) -> None:
+def pin_environ(config_dir: str, no_codex: bool, launch_profile: str = "") -> None:
     """Pin an account + the session flags into ``os.environ`` WITHOUT granting trust.
 
     The :func:`session_apply_to_environ` rendering for AUTOMATIC recovery surfaces
@@ -611,7 +630,8 @@ def pin_environ(config_dir: str, no_codex: bool) -> None:
         os.environ.pop(_CONFIG_VAR, None)
     else:
         os.environ[_CONFIG_VAR] = _export_value(config_dir)
-    os.environ.update(session_env_flags(LaunchTarget(config_dir, no_codex)))
+    os.environ.pop(PROFILE_VAR, None)
+    os.environ.update(session_env_flags(LaunchTarget(config_dir, no_codex, launch_profile)))
     os.environ.update(_mem_env(os.environ))
 
 

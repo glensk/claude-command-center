@@ -140,9 +140,7 @@ def _resume_selected() -> int:
             file=sys.stderr,
         )
         return 1
-    resumed = terminal.resume_in_new_tab(
-        session.cwd, sid, session.config_dir, no_codex=bool(session.no_codex)
-    )
+    resumed = terminal.resume_session_in_new_tab(session)
     return 0 if resumed else 1
 
 

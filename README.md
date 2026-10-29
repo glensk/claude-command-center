@@ -45,6 +45,13 @@ visible, hoists directly under it in the TUI and `ccc ls`; every launch path (CL
 the Obsidian `launch: true` toggle) warns before starting a still-blocked job. See
 [Dependent jobs](docs/reference.md#dependent-jobs) for the full behaviour.
 
+A job can also start its interactive `claude` through a configured **launch profile**
+(`ccc new-job -L <label>`, labels from the `claude_launch_profiles` config key, default
+`[]`): one executable per label replaces the bare `claude`, the env carries only
+`CCC_LAUNCH_PROFILE=<label>`, and every launch surface either propagates it or refuses —
+never a bare `claude` on another billing route. See
+[Launch profiles](docs/reference.md#launch-profiles).
+
 Everything else — the progress bars, the drift checker, the vault mirrors, auto-resume
 — falls out of taking those two ideas seriously.
 

@@ -171,6 +171,7 @@ _SESSION_COLUMNS = (
     "depends_on",
     "job_type",
     "no_codex",
+    "launch_profile",
     "llm_overseer",
     "llm_exec",
     "model",
@@ -299,6 +300,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     depends_on        TEXT,
     job_type          TEXT    NOT NULL DEFAULT 'claude',
     no_codex          INTEGER NOT NULL DEFAULT 0,
+    launch_profile    TEXT,
     llm_overseer      TEXT    NOT NULL DEFAULT 'opus-5',
     llm_exec          TEXT    NOT NULL DEFAULT 'opus-5',
     model             TEXT    NOT NULL DEFAULT '',
@@ -597,6 +599,9 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         "job_type": "TEXT NOT NULL DEFAULT 'claude'",
         # Per-session Codex opt-out: CCC_NO_CODEX=1 in every launch/resume env.
         "no_codex": "INTEGER NOT NULL DEFAULT 0",
+        # Opaque launch-profile label (config ``claude_launch_profiles``): the session's
+        # interactive claude starts through that profile's executable; NULL = bare claude.
+        "launch_profile": "TEXT",
         "llm_overseer": "TEXT NOT NULL DEFAULT 'opus-5'",
         "llm_exec": "TEXT NOT NULL DEFAULT 'opus-5'",
         # OBSERVED runtime values (distinct from the llm_overseer/llm_exec job config):
@@ -1039,7 +1044,13 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         return got
 
     def claim_idempotency_key(
-        self, key: str, session_id: str, cwd: str, *, no_codex: bool = False
+        self,
+        key: str,
+        session_id: str,
+        cwd: str,
+        *,
+        no_codex: bool = False,
+        launch_profile: str = "",
     ) -> tuple[str, bool]:
         """Atomically reserve *key* for a new draft; return ``(owning id, created)``.
 
@@ -1060,13 +1071,14 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         try:
             self.conn.execute(
                 "INSERT INTO sessions (session_id, cwd, agent, draft, status, no_codex, "
-                "llm_overseer, llm_exec, idempotency_key, created_at, updated_at) "
-                "VALUES (?, ?, 'claude', 1, ?, ?, ?, ?, ?, ?, ?)",
+                "launch_profile, llm_overseer, llm_exec, idempotency_key, created_at, "
+                "updated_at) VALUES (?, ?, 'claude', 1, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     cwd,
                     Status.PARKED.value,
                     int(bool(no_codex)),
+                    launch_profile or None,
                     DEFAULT_LLM,
                     DEFAULT_LLM,
                     key,
@@ -1097,6 +1109,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         depends_on: str | None = None,
         job_type: str = "claude",
         no_codex: bool = False,
+        launch_profile: str = "",
         llm_overseer: str = DEFAULT_LLM,
         llm_exec: str = DEFAULT_LLM,
         config_dir: str = "",
@@ -1124,6 +1137,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         job dispatches at and the rate-limit window that produced it (see park.py).
         *no_codex* bans every Codex integration for the launched session (``CCC_NO_CODEX=1``
         in its env); it is REFUSED on a codex job type — see :func:`no_codex_conflict`.
+        *launch_profile* is the opaque label of a configured launch profile ("" = bare
+        ``claude``); it is immutable identity — launch surfaces propagate or refuse it.
         *idempotency_key* records the caller-supplied create-or-retrieve key ("" = none);
         the atomic claim itself is :meth:`claim_idempotency_key`.
         """
@@ -1143,6 +1158,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             depends_on=(depends_on.strip() if depends_on and depends_on.strip() else None),
             job_type=job_type,
             no_codex=bool(no_codex),
+            launch_profile=(launch_profile.strip() or None),
             llm_overseer=_llm_or_default(llm_overseer),
             llm_exec=_llm_or_default(llm_exec),
             fire_at=max(0, int(fire_at)),
