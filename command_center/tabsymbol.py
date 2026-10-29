@@ -473,7 +473,7 @@ def title_core(badge: str, cwd: str, aim: str | None = None, *, name: str | None
 def staff_title(session: Session) -> str | None:
     """A staff session's whole tab title: its agent's ``"<symbol> <tab_name>"``, else None.
 
-    The ``tab_name`` (tp#1366) always carries the agent's ``symbol`` (Albert, 2026-10-28);
+    The ``tab_name`` (tp#1366) always carries the agent's ``symbol`` (2026-10-28);
     an agent without one shows the bare name.
     """
     from . import staffrole  # lazy
