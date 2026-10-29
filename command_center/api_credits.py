@@ -23,7 +23,9 @@ since the current grant landed, from a source the user names in
   cached; a report only ever reads the cache.
 * ``runs_jsonl:<path>`` — the ``cost_usd`` sum of a local run ledger (one JSON object
   per line with ``ts`` and ``cost_usd``), i.e. what THIS machine spent with the key: a
-  lower bound, stated as "this machine only".
+  lower bound, stated as "this machine only". A ledger shared by several keys is
+  narrowed with ``runs_jsonl:<path>#<item>`` — only rows whose ``item`` field equals
+  ``<item>`` count (split on the LAST ``#``).
 
 Config (``claude_api_credits``, one entry per Claude account label)::
 
@@ -40,7 +42,7 @@ Spend sources (``claude_api_credit_spend``, optional, one per label)::
 
     claude_api_credit_spend = [
       "work=admin_api:~/secrets/anthropic-admin.env",
-      "private=runs_jsonl:~/.local/state/claude-apikey/runs.jsonl",
+      "private=runs_jsonl:~/.local/state/claude-apikey/runs.jsonl#anthropic-api-private",
     ]
 """
 
@@ -272,13 +274,15 @@ class SpendSource:
     account: str
     kind: str
     path: str = ""
+    item: str = ""
 
 
 def parse_spend_sources(entries: list[str]) -> dict[str, SpendSource]:
     """``["work=admin_api:<dotenv>", "private=runs_jsonl:<path>"]`` → per label.
 
-    An entry with a bad label, an unknown kind, or ``runs_jsonl`` without a path is
-    skipped (same tolerance as :func:`parse_api_credits`); a repeated label keeps its last.
+    An entry with a bad label, an unknown kind, or ``runs_jsonl`` without a path (or with an
+    empty ``#item``) is skipped (same tolerance as :func:`parse_api_credits`); a repeated
+    label keeps its last.
     """
     out: dict[str, SpendSource] = {}
     for entry in entries:
@@ -288,9 +292,15 @@ def parse_spend_sources(entries: list[str]) -> dict[str, SpendSource]:
             continue
         kind, _, path = raw.strip().partition(":")
         kind, path = kind.strip(), path.strip()
+        item = ""
+        if kind == "runs_jsonl" and "#" in path:
+            path, _, item = path.rpartition("#")
+            path, item = path.strip(), item.strip()
+            if not item:
+                continue
         if kind not in _SPEND_KINDS or (kind == "runs_jsonl" and not path):
             continue
-        out[label] = SpendSource(account=label, kind=kind, path=path)
+        out[label] = SpendSource(account=label, kind=kind, path=path, item=item)
     return out
 
 
@@ -303,21 +313,22 @@ def used_pct(status: dict[str, Any]) -> float | None:
     return max(0.0, min(100.0, float(spent) / usd * 100.0))
 
 
-_RUNS_MEMO: dict[tuple[str, int, int, _dt.date], tuple[float, int]] = {}
+_RUNS_MEMO: dict[tuple[str, int, int, _dt.date, str], tuple[float, int]] = {}
 
 
-def runs_spend(path: Path, since: _dt.date) -> tuple[float, int] | None:
+def runs_spend(path: Path, since: _dt.date, item: str = "") -> tuple[float, int] | None:
     """``(sum of cost_usd, file mtime)`` of ledger rows on or after *since* (local date).
 
     ``None`` when the file cannot be read. A row without a parseable ``ts`` or a numeric
     ``cost_usd`` is skipped — it cannot be placed in the cycle, and guessing would move
-    the estimate in an unknown direction.
+    the estimate in an unknown direction. A non-empty *item* counts only rows whose
+    ``item`` field equals it (a ledger shared by several API keys).
     """
     try:
         stat = path.stat()
     except OSError:
         return None
-    key = (str(path), stat.st_mtime_ns, stat.st_size, since)
+    key = (str(path), stat.st_mtime_ns, stat.st_size, since, item)
     if key in _RUNS_MEMO:
         return _RUNS_MEMO[key]
     try:
@@ -331,6 +342,8 @@ def runs_spend(path: Path, since: _dt.date) -> tuple[float, int] | None:
             row = json.loads(line)
             stamp = _dt.datetime.fromisoformat(str(row["ts"]))
             cost = float(row["cost_usd"])
+            if item and row.get("item") != item:
+                continue
         except (ValueError, KeyError, TypeError):
             continue
         local = stamp.astimezone() if stamp.tzinfo else stamp
@@ -499,10 +512,14 @@ def with_spend(
     if source is None or not granted:
         return out
     out["spend_source"] = _SOURCE_LABEL[source.kind]
+    if source.item:
+        out["spend_source"] += f" ({source.item})"
     spent: float | None = None
     if source.kind == "runs_jsonl":
         out["spend_scope"] = "machine"
-        read = runs_spend(Path(os.path.expanduser(source.path)), _dt.date.fromisoformat(granted))
+        read = runs_spend(
+            Path(os.path.expanduser(source.path)), _dt.date.fromisoformat(granted), source.item
+        )
         if read is not None:
             spent, out["spend_at"] = read
     else:

@@ -2878,7 +2878,7 @@ ESTIMATE (labelled `est.` everywhere). One source per account:
 ```toml
 claude_api_credit_spend = [
   "work=admin_api:~/secrets/anthropic-admin.env",                 # org Admin API cost_report
-  "private=runs_jsonl:~/.local/state/claude-apikey/runs.jsonl",   # local run ledger
+  "private=runs_jsonl:~/.local/state/claude-apikey/runs.jsonl#anthropic-api-private",   # local run ledger, one key
 ]
 ```
 
@@ -2892,7 +2892,9 @@ claude_api_credit_spend = [
   the last good figure for the same grant). The key is never written anywhere.
 - `runs_jsonl:<path>` — the `cost_usd` sum of a local ledger (one JSON object per line with
   `ts` and `cost_usd`) since the grant date: what THIS machine spent, a lower bound, labelled
-  "this machine only". Read on every report (memoised on the file's identity).
+  "this machine only". `runs_jsonl:<path>#<item>` (split on the last `#`; an empty item
+  skips the entry) counts only rows whose `item` field equals `<item>`, for a ledger
+  shared by several API keys. Read on every report (memoised on the file's identity).
 
 The report draws one row per grant in the table's own columns — `api est.` (or `api`
 without an estimate) in the state column, the spend figure's age, one bar across the

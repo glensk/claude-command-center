@@ -254,6 +254,57 @@ def test_runs_spend_sums_the_current_grant_only(tmp_path: Path) -> None:
     assert api_credits.runs_spend(tmp_path / "missing.jsonl", TODAY) is None
 
 
+def test_parse_spend_sources_item_filter() -> None:
+    parsed = api_credits.parse_spend_sources(
+        [
+            "private=runs_jsonl:/tmp/a#b.jsonl#anthropic-api-private",
+            "work=runs_jsonl:/tmp/runs.jsonl",
+            "bad=runs_jsonl:/tmp/runs.jsonl#",  # empty item
+            "bad2=runs_jsonl:#x",  # no path
+        ]
+    )
+    assert parsed["private"] == api_credits.SpendSource(
+        "private", "runs_jsonl", "/tmp/a#b.jsonl", "anthropic-api-private"
+    )
+    assert parsed["work"].item == "" and parsed["work"].path == "/tmp/runs.jsonl"
+    assert set(parsed) == {"private", "work"}
+
+
+def _mixed_ledger(tmp_path: Path) -> Path:
+    return _ledger(
+        tmp_path / "mixed.jsonl",
+        [
+            {"ts": "2026-10-10T08:00:00+02:00", "cost_usd": 1.0, "item": "anthropic-api-private"},
+            {"ts": "2026-10-11T08:00:00+02:00", "cost_usd": 10.0, "item": "anthropic-api-sdsc"},
+            {"ts": "2026-10-12T08:00:00+02:00", "cost_usd": 100.0},
+        ],
+    )
+
+
+def test_runs_spend_filters_by_item(tmp_path: Path) -> None:
+    ledger = _mixed_ledger(tmp_path)
+    since = dt.date(2026, 10, 9)
+    assert (api_credits.runs_spend(ledger, since) or (0,))[0] == pytest.approx(111.0)
+    assert (api_credits.runs_spend(ledger, since, "anthropic-api-private") or (0,))[
+        0
+    ] == pytest.approx(1.0)
+    assert (api_credits.runs_spend(ledger, since, "anthropic-api-sdsc") or (0,))[
+        0
+    ] == pytest.approx(10.0)
+    assert (api_credits.runs_spend(ledger, since, "nobody") or (1,))[0] == 0.0
+
+
+def test_with_spend_item_filter_end_to_end(tmp_path: Path) -> None:
+    ledger = _mixed_ledger(tmp_path)
+    status = api_credits.credit_status(api_credits.parse_api_credits([PRIVATE])["private"], TODAY)
+    source = api_credits.parse_spend_sources([f"private=runs_jsonl:{ledger}#anthropic-api-sdsc"])[
+        "private"
+    ]
+    row = api_credits.with_spend(status, source)
+    assert row["est_spent_usd"] == pytest.approx(10.0)
+    assert row["spend_source"] == "run ledger (anthropic-api-sdsc)"
+
+
 def test_with_spend_from_the_ledger_is_an_estimate(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path / "runs.jsonl", [{"ts": "2026-10-10T10:00:00+02:00", "cost_usd": 50}])
     status = api_credits.credit_status(api_credits.parse_api_credits([PRIVATE])["private"], TODAY)
