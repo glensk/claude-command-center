@@ -1013,6 +1013,14 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
                     groups.setdefault(live.session_id, []).append(live)
         return [_resolve_registry_group(entries) for entries in groups.values()]
 
+    def registry_dirs(self) -> list[Path]:
+        """The ``sessions/`` directories :meth:`discover` reads, one per account home.
+
+        What the TUI's change check stats (see :mod:`refreshgate`) — the cheap proxy for
+        "did the live-session registry move", without parsing any entry.
+        """
+        return [home / "sessions" for home in self.homes.values()]
+
     def discover_raw(self, session_id: str = "") -> list[LiveSession]:
         """Every live registry entry, UNCOLLAPSED — one per ``sessions/<pid>.json``.
 

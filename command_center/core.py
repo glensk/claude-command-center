@@ -18,7 +18,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterable  # pylint: disable=wrong-import-position
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -380,6 +380,31 @@ def _settings_effort_cached(config_dir: str, cache: dict[str, str]) -> str:
 
 
 @dataclass(frozen=True)
+class Relevance:
+    """Which stored sessions a caller can show — the restriction of a TUI tick (tp#1427).
+
+    Passed to :func:`reconcile_pass` / :func:`build_rows`, it limits the per-session work to
+    the rows :meth:`Store.list_relevant_sessions` selects in SQL: not-done rows, drafts, every
+    live session, and (``include_done``) done rows inside ``done_max_age_days``. The default
+    (``None`` at the call sites) keeps the full pass every other caller relies on.
+    """
+
+    include_done: bool = True
+    done_max_age_days: int = 0
+
+
+def _relevant_sessions(
+    store: Store, live_ids: Iterable[str], relevance: Relevance
+) -> list[Session]:
+    cutoff = 0
+    if relevance.include_done and relevance.done_max_age_days > 0:
+        cutoff = max(1, now_ms() - relevance.done_max_age_days * _DAY_MS)
+    return store.list_relevant_sessions(
+        live_ids, include_done=relevance.include_done, done_cutoff_ms=cutoff
+    )
+
+
+@dataclass(frozen=True)
 class ReconcilePass:
     """Everything one :func:`reconcile_pass` learned, so a build reads each source ONCE."""
 
@@ -401,7 +426,10 @@ class ReconcilePass:
 
 
 def reconcile_pass(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
-    store: Store, adapter: Adapter, codex_usage: Any = _UNSET
+    store: Store,
+    adapter: Adapter,
+    codex_usage: Any = _UNSET,
+    relevance: Relevance | None = None,
 ) -> ReconcilePass:
     """Sync the store with the live registry; park sessions that are no longer live.
 
@@ -410,6 +438,10 @@ def reconcile_pass(  # pylint: disable=too-many-locals,too-many-branches,too-man
     read. :func:`reconcile` is the thin scans-only wrapper every other caller uses.
     *codex_usage* lets a caller that already read the Codex snapshot pass it in rather
     than have it read twice per build; unset means read it here.
+
+    *relevance* restricts the session read (and so the parking loop and the transcript
+    facts) to the rows a TUI tick can show; ``None`` is the full pass. Rows outside it keep
+    their persisted facts — the daemon's full pass keeps them current.
     """
     snapshot = usage.read_codex_usage() if codex_usage is _UNSET else codex_usage
     codex_block = usage.codex_exhausted_window(snapshot)
@@ -478,7 +510,11 @@ def reconcile_pass(  # pylint: disable=too-many-locals,too-many-branches,too-man
     # The pass's ONE session read, taken HERE — after the live loop, so every write it
     # just made (upsert_from_live, status, model, effort, config_dir, version) is already
     # in it. See ReconcilePass.sessions for the consistency boundary this pins.
-    session_snapshot = store.list_sessions()
+    session_snapshot = (
+        store.list_sessions()
+        if relevance is None
+        else _relevant_sessions(store, live_by_id, relevance)
+    )
     touched: set[str] = set()
     # Anything tracked but no longer in the live registry is parked (unless done or a
     # draft future job, which has no process and owns its own status until launched).
@@ -676,6 +712,7 @@ def build_rows(
     include_future: bool = True,
     reconcile_first: bool = True,
     codex_usage: Any = _UNSET,
+    restrict: bool = False,
 ) -> list[Row]:
     """Reconcile, then return display rows grouped strictly by repo category.
 
@@ -696,11 +733,17 @@ def build_rows(
     :class:`ReconcilePass` it just made (``discover()`` + the post-live-loop session
     snapshot with the parked rows refreshed) rather than repeating both. *codex_usage*
     lets the TUI worker hand in a snapshot it already read; unset means read it here.
+
+    ``restrict=True`` (the TUI worker) loads and reconciles only the sessions this build can
+    show — see :class:`Relevance`; the rows it returns are identical to the unrestricted
+    build's, it just skips history (done rows outside the window) that would be filtered out
+    below anyway. ``ccc ls``, the daemon and every other caller keep the full pass.
     """
+    relevance = Relevance(include_done, done_max_age_days) if restrict else None
     if reconcile_first:
         # Read the Codex snapshot ONCE and hand it to the pass (it needs the same one).
         codex_usage = usage.read_codex_usage() if codex_usage is _UNSET else codex_usage
-        pass_ = reconcile_pass(store, adapter, codex_usage=codex_usage)
+        pass_ = reconcile_pass(store, adapter, codex_usage=codex_usage, relevance=relevance)
         scans = pass_.scans
         live_by_id = pass_.live_by_id
         sessions = pass_.sessions
@@ -709,7 +752,11 @@ def build_rows(
         scans = store.transcript_scans()
         codex_block = None
         live_by_id = {ls.session_id: ls for ls in adapter.discover()}
-        sessions = store.list_sessions()
+        sessions = (
+            store.list_sessions()
+            if relevance is None
+            else _relevant_sessions(store, live_by_id, relevance)
+        )
     codex_label = codex_block[0] if codex_block else None
     codex_reset_at = codex_block[1].resets_at if codex_block else None
     now = now_ms()

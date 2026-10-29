@@ -2339,7 +2339,8 @@ over the last 7 days (capped at 10 with a `… +N more` tail).
 
 The Claude/Codex cards show a 5-hour (`Session:`) and a weekly (`Week:`) window with
 **relative** reset times (`Session: Resets in 1h 57m`), recomputed on every re-read
-(`usage_refresh_sec`, default 5 s — this drives the whole TUI's refresh timer). The
+(`usage_refresh_sec`, default 5 s — the cards repaint on that cadence; the row rebuild has its
+own change-driven cadence, see "TUI refresh cadence" below). The
 Copilot card is a single bar too: once the seat is on usage-based **AI Credits**
 billing (the case since 2026-06) the bar is credits used ÷ the seat's credit
 entitlement, embossing the reset **and** both figures (`Resets in 3d · 1505/1500cr`);
@@ -3475,3 +3476,34 @@ command_center/
   views/ls.py      the flat clickable list
   cli.py           the `ccc` entry point
 ```
+
+## TUI refresh cadence
+
+The TUI no longer rebuilds its rows on a fixed timer (tp#1427). A cheap check runs every
+second on the UI thread (`CommandCenterApp._tick`, under 1 ms on a real store) and
+`refreshgate.RefreshGate` decides whether a build starts:
+
+- **Never back to back.** A build may start only `max(3 s, 2 × the last build's duration)`
+  after the previous one *ended*, so a build that is slow under load is never followed
+  straight away by another. Explicit user actions call `refresh_data()` directly and rebuild
+  at once (still one build at a time, one coalesced follow-up).
+- **On a change.** `PRAGMA data_version` of a long-lived UI-thread connection (moves when any
+  other connection commits), the live-session registry directory entries
+  (`ClaudeAdapter.registry_dirs`, `(path, mtime_ns, size)`), or the `(mtime_ns, size)` of the
+  transcripts of the live rows. The build's own commits are not a change: the data-version
+  baseline is taken when the build ends, and a commit by another process *during* the build is
+  caught by the worker's own connection (its `data_version` ignores its own commits).
+- **Or after `usage_refresh_sec × 6` (30 s)** with no signal, for relative ages and
+  background facts that have no signal.
+- The usage cards still repaint every `usage_refresh_sec`, build or not.
+
+A tick builds with `build_rows(..., restrict=True)`: only the sessions it can show are
+loaded and reconciled (not-done and draft rows, every live session, and — with finished rows
+shown — done rows inside `done_max_age_days`), selected in SQL by
+`Store.list_relevant_sessions`. Done rows outside that set keep their persisted facts; the
+daemon's full pass keeps them current. `ccc ls` and the daemon keep the full pass.
+
+`_apply_rows` collects the rows it would draw into a plan and diffs it against the plan drawn
+last time: with the same row keys in the same order only the changed cells are updated
+(`DataTable.update_cell`), leaving cursor and scroll alone; any other shape clears and
+re-adds the table.

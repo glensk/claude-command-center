@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -32,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 from time import time as _epoch_now
-from typing import Any
+from typing import Any, Protocol
 
 from rich.cells import cell_len
 from rich.color import Color
@@ -78,6 +79,7 @@ from .. import (
     launchd,
     nixos_overseer,
     quota,
+    refreshgate,
     repos,
     resume,
     routing,
@@ -1949,6 +1951,43 @@ class HelpScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+def _same_cell(new: Any, old: Any) -> bool:
+    """Whether two planned cells render identically.
+
+    ``rich.text.Text.__eq__`` compares the plain text and the spans only — NOT the base
+    ``style`` the row helpers pass (``Text("12m", style=base)``), so a status colour change
+    would read as "same". Compare the base style too.
+    """
+    if isinstance(new, Text) and isinstance(old, Text):
+        return new == old and str(new.style) == str(old.style) and new.justify == old.justify
+    return bool(new == old)
+
+
+class _RowSink(Protocol):
+    """What the ``_add_*`` row helpers need of a table: ``add_row`` and nothing else."""
+
+    def add_row(self, *cells: Any, key: str) -> Any: ...
+
+
+class _RowPlan:
+    """The rows one :meth:`CommandCenterApp._apply_rows` would add, collected in order.
+
+    The helpers write into this instead of the ``DataTable``, so the render can compare the
+    plan with what the table holds and touch only the cells that differ (tp#1427) — or fall
+    back to a full rebuild when the shape moved.
+    """
+
+    def __init__(self) -> None:
+        self.rows: list[tuple[str, tuple[Any, ...]]] = []
+
+    def add_row(self, *cells: Any, key: str) -> None:
+        self.rows.append((key, cells))
+
+    @property
+    def keys(self) -> list[str]:
+        return [key for key, _ in self.rows]
+
+
 class SessionTable(DataTable):
     """The session list, with two navigation modes.
 
@@ -2241,6 +2280,14 @@ class CommandCenterApp(App[None]):
     #keyhints { dock: bottom; height: 1; background: $panel; }
     """
     BINDINGS = _build_bindings()
+    # Refresh cadence (tp#1427): how often the cheap change check runs, the quiet floor after
+    # a build ends (the real gap is max(floor, 2 × the build's duration)), and the multiple of
+    # usage_refresh_sec after which a build runs even though nothing signalled a change.
+    # The floor is 3 s, not 1 s: while agents run, hooks commit every second, so data_version
+    # moves on nearly every check and the floor IS the cadence (~0.2 s build per 3 s).
+    _CHECK_INTERVAL_S = 1.0
+    _BUILD_FLOOR_S = 3.0
+    _FORCE_REBUILD_FACTOR = 6
 
     def __init__(self) -> None:
         super().__init__()
@@ -2310,6 +2357,16 @@ class CommandCenterApp(App[None]):
         # while a build is still running sets the pending flag instead of starting a second
         # build; the flag is drained when that worker reports done.
         self._refresh_pending = False
+        # Change-driven cadence (tp#1427, see refreshgate): created in on_mount once the
+        # config is final; None until then (and in tests that never mount).
+        self._gate: refreshgate.RefreshGate | None = None
+        # A commit by another process landed while the build ran (set by the worker thread,
+        # read by on_worker_state_changed — a plain bool, one writer, one reader).
+        self._build_foreign_write = False
+        self._last_usage_paint = 0.0  # monotonic stamp of the last usage-card render
+        # The plan last drawn into the table (keys + the cells planned for them): the next
+        # _apply_rows diffs against it. Empty = the table holds nothing of ours.
+        self._drawn: list[tuple[str, tuple[Any, ...]]] = []
         # False until the first (stale-while-revalidate) paint has been applied, so the
         # worker knows whether to serve stored rows before the full build.
         self._first_paint_done = False
@@ -2435,8 +2492,14 @@ class CommandCenterApp(App[None]):
             "#usage-nixos-tier-a", Static
         ).border_title = f"{_NIXOS_TIER_A_CHORD}:nixos overseer tier_a"
         self._apply_split()
+        self._gate = refreshgate.RefreshGate(
+            force_after_s=self.cfg.usage_refresh_sec * self._FORCE_REBUILD_FACTOR,
+            floor_s=self._BUILD_FLOOR_S,
+        )
         self.refresh_data()
-        self.set_interval(self.cfg.usage_refresh_sec, self._tick)
+        # A cheap change check, not a rebuild: _tick decides (see refreshgate) and repaints the
+        # usage cards every usage_refresh_sec; a shorter configured cadence still wins.
+        self.set_interval(min(self._CHECK_INTERVAL_S, self.cfg.usage_refresh_sec), self._tick)
         # Publish this TUI's identity so `ccc jump` hands us the whole f+j toggle (the
         # fast path — see jump / iterm_api). Clear any stale toggle first: one left by a
         # dead TUI must not fire on startup.
@@ -2499,40 +2562,76 @@ class CommandCenterApp(App[None]):
 
     # ---- data -----------------------------------------------------------
     def _tick(self) -> None:
-        """The ``usage_refresh_sec`` timer: rebuild the rows, or at least re-render usage.
+        """The change check (``_CHECK_INTERVAL_S``): rebuild only when something moved.
 
-        :meth:`refresh_data` declines to start a build while one is still running, and a
-        cold build can outlast several ticks. The usage cards render RELATIVE reset times,
-        so they must keep counting down through those skipped ticks — otherwise a long
-        build freezes "resets in 2h 14m" on screen. They are normally repainted at the end
-        of :meth:`_apply_rows`, so re-render them here whenever no build was started (and
-        the first paint has landed, i.e. the widgets hold real content).
+        :class:`refreshgate.RefreshGate` decides — a change signal (``PRAGMA data_version``,
+        the live registry, the live rows' transcripts) or ``usage_refresh_sec`` × 6 without
+        one, and never sooner than ``max(3 s, 2 × the last build)`` after the previous build
+        ended. A build still running is not queued here: the check that follows it sees any
+        change made meanwhile. The usage cards render RELATIVE reset times, so when no build
+        started they are re-rendered here every ``usage_refresh_sec`` (a build repaints them
+        at the end of :meth:`_apply_rows`) once the first paint has landed.
         """
-        started = self.refresh_data()
-        if not started and self._first_paint_done:
+        started = False
+        if self._gate is not None and not self._editing and not self._build_in_flight():
+            if self._gate.due(self._files_signature(), self._db_version()):
+                started = self.refresh_data()
+        if (
+            not started
+            and self._first_paint_done
+            and monotonic() - self._last_usage_paint >= self.cfg.usage_refresh_sec
+        ):
             self._update_usage()
+
+    def _build_in_flight(self) -> bool:
+        return any(w.group == "data-refresh" and not w.is_finished for w in self.workers)
+
+    def _db_version(self) -> int:
+        """``PRAGMA data_version`` of the UI thread's long-lived connection (see refreshgate)."""
+        if self.store is None:
+            return -1
+        try:
+            return refreshgate.data_version(self.store.conn)
+        except sqlite3.Error:
+            return -1  # unreadable counts as "moved": the next gap-clear check rebuilds
+
+    def _files_signature(self) -> refreshgate.FilesSignature:
+        """Registry entries + the live rows' transcripts, stat'ed on the UI thread (< 5 ms)."""
+        transcripts: list[Path] = []
+        for row in self._rows.values():
+            if row.is_open:
+                path = self.adapter.transcript_path(
+                    row.session.cwd, row.session.session_id, row.session.config_dir or None
+                )
+                if path is not None:
+                    transcripts.append(path)
+        return refreshgate.files_signature(self.adapter.registry_dirs(), transcripts)
 
     def refresh_data(self) -> bool:
         """Schedule an off-loop rebuild of the session rows; True when one was started.
 
         build_rows() (reconcile + transcript scans) can take tens of SECONDS on a cold
         cache, so it runs in a thread worker; the widget updates land back on the UI
-        thread via _apply_rows.
+        thread via _apply_rows. Explicit user actions call this directly and rebuild at once;
+        only the timer's :meth:`_tick` goes through the change gate.
 
         Strictly one build at a time. This used to rely on ``exclusive=True``, which is a
         no-op for a THREAD worker: Textual cannot interrupt a thread, so the "cancelled"
         predecessor kept running and a 30-45 s cold build accumulated up to nine
         concurrent workers all doing the same work — each one making the others slower.
-        Now a tick that arrives mid-build only raises ``_refresh_pending``, and
+        Now a call that arrives mid-build only raises ``_refresh_pending``, and
         :meth:`on_worker_state_changed` starts the single follow-up build when the
         in-flight one reports done. The follow-up cannot be scheduled from inside the
         worker: the worker is still RUNNING there, so this guard would defer forever.
         """
         if self._editing:
             return False
-        if any(w.group == "data-refresh" and not w.is_finished for w in self.workers):
+        if self._build_in_flight():
             self._refresh_pending = True
             return False
+        if self._gate is not None:
+            self._build_foreign_write = False
+            self._gate.begin(self._files_signature())
         self.run_worker(
             self._refresh_worker,
             thread=True,
@@ -2542,15 +2641,18 @@ class CommandCenterApp(App[None]):
         return True
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
-        """Drain a deferred refresh once the in-flight build finishes (any outcome).
+        """Close the build's books, then drain a deferred refresh (any outcome).
 
-        The coalescing counterpart to :meth:`refresh_data`: at most one build is queued
-        behind the running one, however many ticks were skipped while it ran.
+        The gate's data-version baseline is read HERE, after the rows were applied, so the
+        build's own commits are not mistaken for a change; the coalescing counterpart to
+        :meth:`refresh_data` then starts at most one follow-up behind the running build.
         """
         if event.worker.group != "data-refresh":
             return
         if event.state not in (WorkerState.SUCCESS, WorkerState.ERROR, WorkerState.CANCELLED):
             return
+        if self._gate is not None:
+            self._gate.end(self._db_version(), self._build_foreign_write)
         if self._refresh_pending:
             self._refresh_pending = False
             self.refresh_data()
@@ -2588,6 +2690,7 @@ class CommandCenterApp(App[None]):
                     folder_order=tuple(self.cfg.folder_order),
                     include_future=self._show_future,
                     reconcile_first=False,
+                    restrict=True,
                 )
                 quick_awaits = _read_awaits(store)
                 quick_channels = await_view.read_channel_health(store)
@@ -2607,6 +2710,9 @@ class CommandCenterApp(App[None]):
             except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
                 snapshots[label] = None
         with Store() as store:
+            # This connection's own data_version does not move for its own commits, so a
+            # difference after the build is a commit by ANOTHER process (see refreshgate).
+            version_before = refreshgate.data_version(store.conn)
             rows = build_rows(
                 store,
                 self.adapter,
@@ -2616,10 +2722,14 @@ class CommandCenterApp(App[None]):
                 include_future=self._show_future,
                 # Hand the default home's snapshot in so the build does not read it again.
                 codex_usage=snapshots.get("default"),
+                # Only what this tick can show (tp#1427); the daemon's pass keeps the rest.
+                restrict=True,
             )
             self._sync_tab_badges(rows, store)  # AppleScript spawn — belongs off-loop too
             awaits = _read_awaits(store)
             channels = await_view.read_channel_health(store)
+            if refreshgate.data_version(store.conn) != version_before:
+                self._build_foreign_write = True
         if get_current_worker().is_cancelled:
             return  # superseded by a newer refresh — let that one repaint
         # Rows AND snapshots in ONE handoff: a build that raises publishes neither.
@@ -2646,7 +2756,7 @@ class CommandCenterApp(App[None]):
             self._channel_health = channels
         table = self.query_one("#sessions", DataTable)
         previous = self._current
-        table.clear()
+        plan = _RowPlan()  # the rows to draw; _draw_plan diffs them against the table
         # Resolve the repo-tree root ONCE per render and hand it to every row (the badge and
         # the folder label both key off it). Resolved per row it was a config read per row.
         self._root = repos.repo_root(self.cfg)
@@ -2688,7 +2798,7 @@ class CommandCenterApp(App[None]):
             nonlocal awaiting_added
             if not awaiting_added:
                 awaiting_added = True
-                self._add_awaiting_section(table)
+                self._add_awaiting_section(plan)
 
         current_category: str | None = None
         finished_started = False
@@ -2701,7 +2811,7 @@ class CommandCenterApp(App[None]):
                 # (already-emitted) parent opened — BEFORE the draft/finished/scheduled/
                 # category branches, so a hoisted FUTURE draft never triggers the FUTURE
                 # separator mid-active-section (nor a stray category splitter).
-                self._add_session_row(table, row, indent_repo=not (row.is_draft or row.is_finished))
+                self._add_session_row(plan, row, indent_repo=not (row.is_draft or row.is_finished))
                 continue
             if row.is_draft or row.is_finished:
                 add_awaiting()
@@ -2711,50 +2821,54 @@ class CommandCenterApp(App[None]):
                 # `tf` toggle always has its line even with zero undated drafts.
                 if self._show_future and not future_started:
                     future_started = True
-                    self._add_future_separator(table, has_jobs=has_future)
+                    self._add_future_separator(plan, has_jobs=has_future)
                 if not scheduled_started:
                     scheduled_started = True
-                    self._add_scheduled_separator(table)
-                self._add_session_row(table, row, indent_repo=False)
+                    self._add_scheduled_separator(plan)
+                self._add_session_row(plan, row, indent_repo=False)
                 continue
             if row.is_finished:  # done AND closed — only these sink to FINISHED
                 # The FUTURE divider always precedes FINISHED while future is toggled
                 # on, even with zero future jobs, so `tf` always has a line to toggle.
                 if self._show_future and not future_started:
                     future_started = True
-                    self._add_future_separator(table, has_jobs=has_future)
+                    self._add_future_separator(plan, has_jobs=has_future)
                 if not finished_started:
                     finished_started = True
-                    self._add_finished_separator(table)
-                self._add_session_row(table, row, indent_repo=False)
+                    self._add_finished_separator(plan)
+                self._add_session_row(plan, row, indent_repo=False)
                 continue
             if row.is_draft:  # not-yet-started future jobs — their own FUTURE block
                 if not future_started:
                     future_started = True
-                    self._add_future_separator(table, has_jobs=True)
-                self._add_session_row(table, row, indent_repo=False)
+                    self._add_future_separator(plan, has_jobs=True)
+                self._add_session_row(plan, row, indent_repo=False)
                 continue
             # One header per repo category; rows are sorted so a category is one
             # contiguous block (AIM-first within it), so it can never recur.
             category, _leaf = colors.folder_split(row.session.cwd, self._root)
             if category != current_category:
                 current_category = category
-                self._add_category_splitter(table, category)
-            self._add_session_row(table, row, indent_repo=True)
+                self._add_category_splitter(plan, category)
+            self._add_session_row(plan, row, indent_repo=True)
         # No drafts and no FINISHED block above to anchor it → still surface an empty
         # FUTURE line at the bottom so `tf` always toggles at least this one line.
         add_awaiting()
         if self._show_future and not future_started:
-            self._add_future_separator(table, has_jobs=has_future)
-        # Keep selection if possible, else land on the first real session.
-        target = (
-            previous if previous in self._rows else (rows[0].session.session_id if rows else None)
-        )
-        if target:
-            try:
-                table.move_cursor(row=table.get_row_index(target))
-            except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-                pass
+            self._add_future_separator(plan, has_jobs=has_future)
+        if not self._draw_plan(table, plan):
+            # Full rebuild (the shape moved): keep selection if possible, else land on the
+            # first real session. A diffed update leaves cursor and scroll exactly as they are.
+            target = (
+                previous
+                if previous in self._rows
+                else (rows[0].session.session_id if rows else None)
+            )
+            if target:
+                try:
+                    table.move_cursor(row=table.get_row_index(target))
+                except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                    pass
         self.update_detail()
         self._update_usage()
         # Re-stretch /aim now that column content widths are known (deferred until the
@@ -2764,6 +2878,39 @@ class CommandCenterApp(App[None]):
             # Paint the category dividers as full-width blue rules now that the per-
             # column render widths are settled (same deferral as fit_aim_column).
             table.call_after_refresh(self._fit_rule_separators)
+
+    def _draw_plan(self, table: DataTable, plan: _RowPlan) -> bool:
+        """Put *plan* into *table*; True when it was a diff, False after a full rebuild.
+
+        When the row keys and their order (which fix the separator / group structure — each
+        ``__sep__N`` key is issued in render order) equal what was drawn last time, only the
+        cells whose planned value changed are updated (``update_cell``), so the cursor, the
+        scroll offset and every unchanged cell stay untouched and a quiet tick costs a
+        compare, not a clear + ~40 ``add_row``. Cells are compared against the previous PLAN,
+        not the table: the post-layout passes repaint some cells (rule separators, the stretched
+        ``/aim`` width) and must not be mistaken for content. Any other shape clears and
+        re-adds, as before. Every cell is still the fixed-width text the ``_add_*`` helpers
+        produce, so alignment cannot differ between the two paths.
+        """
+        drawn = self._drawn
+        same_shape = (
+            bool(drawn)
+            and plan.keys == [key for key, _ in drawn]
+            and table.row_count == len(drawn)
+            and all(len(c) == len(d) for (_, c), (_, d) in zip(plan.rows, drawn, strict=True))
+        )
+        if same_shape:
+            columns = list(table.columns.keys())
+            for (key, cells), (_, old) in zip(plan.rows, drawn, strict=True):
+                for column_key, new_cell, old_cell in zip(columns, cells, old, strict=True):
+                    if not _same_cell(new_cell, old_cell):
+                        table.update_cell(key, column_key, new_cell, update_width=True)
+        else:
+            table.clear()
+            for key, cells in plan.rows:
+                table.add_row(*cells, key=key)
+        self._drawn = plan.rows
+        return same_shape
 
     def _sync_tab_badges(self, rows: list[Row], store: Store) -> None:
         """Re-push each live tab's iTerm title so its badge matches the row we just drew.
@@ -2824,6 +2971,7 @@ class CommandCenterApp(App[None]):
         countdown still ticks. The ``codex_usage_stale`` FETCH gate below is one stat per
         home and stays on this thread.
         """
+        self._last_usage_paint = monotonic()  # _tick repaints only every usage_refresh_sec
         try:
             private_panel = self.query_one("#usage", Static)
             work_panel = self.query_one("#usage-work", Static)
@@ -3048,7 +3196,7 @@ class CommandCenterApp(App[None]):
         self._sep_seq += 1
         return f"__sep__{self._sep_seq}"
 
-    def _add_finished_separator(self, table: DataTable) -> None:
+    def _add_finished_separator(self, table: _RowSink) -> None:
         """The single ``── done ──`` header (the ``d`` gilded gold) above the done block.
 
         Hosted in the ``folder`` column (like ``_add_category_splitter``), NOT the narrow
@@ -3064,7 +3212,7 @@ class CommandCenterApp(App[None]):
         cells[_FOLDER_COL] = label
         table.add_row(*cells, key=self._next_sep_key())
 
-    def _add_future_separator(self, table: DataTable, has_jobs: bool = True) -> None:
+    def _add_future_separator(self, table: _RowSink, has_jobs: bool = True) -> None:
         """The single ``FUTURE`` header above the flat not-yet-started job block.
 
         In the ``folder`` column (see ``_add_finished_separator``) so it aligns with the
@@ -3085,7 +3233,7 @@ class CommandCenterApp(App[None]):
         self._rule_seps[key] = f"{_FUTURE_LABEL}  {hint}"
         table.add_row(*cells, key=key)
 
-    def _add_scheduled_separator(self, table: DataTable) -> None:
+    def _add_scheduled_separator(self, table: _RowSink) -> None:
         """The ``SCHEDULED`` header above future jobs with a FIXED start date.
 
         The very bottom block (these drafts sort below FINISHED). Rendered as a
@@ -3100,7 +3248,7 @@ class CommandCenterApp(App[None]):
         self._rule_seps[key] = f"{_SCHEDULED_LABEL}  (fixed start date · r / Enter asks first)"
         table.add_row(*cells, key=key)
 
-    def _add_awaiting_section(self, table: DataTable) -> None:
+    def _add_awaiting_section(self, table: _RowSink) -> None:
         """The ``AWAITING`` rule plus one row per active ``ccc await`` group.
 
         Read-only: renders the snapshot the refresh worker read (:func:`_read_awaits`) —
@@ -3124,7 +3272,7 @@ class CommandCenterApp(App[None]):
             self._await_entries[key] = entry
             table.add_row(*_await_row_cells(entry, now, self._root), key=key)
 
-    def _add_category_splitter(self, table: DataTable, category: str) -> None:
+    def _add_category_splitter(self, table: _RowSink, category: str) -> None:
         """A full-line header naming one repo category; its repos nest beneath it.
 
         The header's row key is recorded in ``_sep_category`` so the ``fn`` (new_job)
@@ -3177,7 +3325,9 @@ class CommandCenterApp(App[None]):
                     Coordinate(row, col), Text(piece, style=style), update_width=False
                 )
 
-    def _add_session_row(self, table: DataTable, row: Row, indent_repo: bool = True) -> None:
+    def _add_session_row(  # pylint: disable=too-many-branches,too-many-statements
+        self, table: _RowSink, row: Row, indent_repo: bool = True
+    ) -> None:
         session = row.session
         root = self._root  # resolved once per render in _apply_rows, our only caller
         done = row.status is Status.DONE

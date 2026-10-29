@@ -839,6 +839,41 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         columns = _session_columns(rows[0])
         return [_row_to_session(r, columns) for r in rows]
 
+    def list_relevant_sessions(
+        self,
+        live_ids: Iterable[str] = (),
+        include_done: bool = True,
+        done_cutoff_ms: int = 0,
+    ) -> list[Session]:
+        """The un-archived rows a TUI tick can show, selected in SQL (tp#1427).
+
+        A row is relevant when it is not done (``done`` flag and ``status`` both clear), a draft
+        (future job), one of *live_ids* (a resumed done session must still be picked up), or —
+        only with *include_done* — a done row whose finish stamp (``done_at``, else
+        ``last_response_at``) is not older than *done_cutoff_ms* (``0`` = every done row, and a
+        row with no stamp at all always qualifies, as in :func:`core.build_rows`). The rest is
+        history the daemon's full pass keeps current; loading it cost ~0.25 ms per row per tick.
+        """
+        ids = sorted({sid for sid in live_ids if sid})
+        clauses = ["s.done = 0 AND s.status != 'done'", "s.draft = 1"]
+        params: list[Any] = []
+        if ids:
+            clauses.append(f"s.session_id IN ({', '.join('?' * len(ids))})")
+            params.extend(ids)
+        if include_done:
+            if done_cutoff_ms > 0:
+                stamp = "CASE WHEN s.done_at != 0 THEN s.done_at ELSE s.last_response_at END"
+                clauses.append(f"({stamp} = 0 OR {stamp} >= ?)")
+                params.append(done_cutoff_ms)
+            else:
+                clauses.append("1 = 1")
+        sql = _SESSION_SELECT + f" WHERE s.archived = 0 AND ({' OR '.join(clauses)})"
+        rows = self.conn.execute(sql, params).fetchall()
+        if not rows:
+            return []
+        columns = _session_columns(rows[0])
+        return [_row_to_session(r, columns) for r in rows]
+
     def _tab_uuid_candidates(self, tab_uuid: str) -> list[Session]:
         """Rows whose ``iterm_session_id`` CONTAINS *tab_uuid* — a superset of the tab owners.
 

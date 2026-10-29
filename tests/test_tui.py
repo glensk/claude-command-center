@@ -4308,28 +4308,31 @@ def test_refresh_never_runs_two_builds_at_once(
             running += 1
             calls += 1
             peak = max(peak, running)
-        time.sleep(0.3)
+        time.sleep(0.1)
         with lock:
             running -= 1
         return []
 
     monkeypatch.setattr(tui_mod, "build_rows", slow_build)
+    # tp#1427: ticks only rebuild on a change or after 6 × usage_refresh_sec, and never inside
+    # max(floor, 2 × the last build) — shrink the floor and the cadence so the timer keeps
+    # firing builds into the still-running one.
+    monkeypatch.setattr(CommandCenterApp, "_BUILD_FLOOR_S", 0.0)
 
     async def scenario() -> None:
         app = CommandCenterApp()
-        app.cfg.usage_refresh_sec = 0.05  # read by on_mount's set_interval
+        app.cfg.usage_refresh_sec = 0.02  # read by on_mount's set_interval + the force age
         async with app.run_test() as pilot:
-            deadline = time.monotonic() + 0.7
-            while time.monotonic() < deadline:
-                await pilot.pause()
-                await asyncio.sleep(0.02)
+            # Condition wait, not a fixed window: a loaded machine can spend the first
+            # second just mounting.
+            await wait_for(pilot, lambda: calls >= 3, timeout=15.0)
             app._editing = True  # stop new builds so teardown can drain
             await settle(pilot)
 
     asyncio.run(scenario())
 
     assert peak == 1  # never two builds in flight, however many ticks were skipped
-    assert calls >= 2  # …and the loop did keep rebuilding
+    assert calls >= 3  # …and the loop did keep rebuilding (quick + full + a timer build)
 
 
 def test_a_refresh_deferred_mid_build_runs_exactly_once_afterwards(

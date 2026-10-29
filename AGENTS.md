@@ -74,9 +74,27 @@ The invariants that keep it under a few seconds:
 - **`config.load_config()` is memoized** on the file's `(path, mtime_ns, size)` and returns
   a deep copy; every writer of `config.toml` goes through `save_config` (which invalidates).
   Hot per-row paths pass the resolved `root` down (`tabsymbol.cell_for(..., root=)`).
+- **Restricted reconcile for the TUI.** `build_rows(..., restrict=True)` (the TUI worker only;
+  `ccc ls`, the daemon and every other caller keep the full pass) loads and reconciles only
+  the sessions a tick can show — `Store.list_relevant_sessions` selects them in SQL:
+  not-done, drafts, every session `discover()` reports live, and (with finished rows shown)
+  done rows inside `done_max_age_days`. 1.4k done rows were ~0.25 ms each per tick; done rows
+  outside the set keep their persisted facts and the daemon's pass keeps them current.
+- **Rebuild on change, never back to back** (`refreshgate.py`). The 1 s `_tick` is a change
+  check, not a rebuild: `PRAGMA data_version` of the UI connection, the live registry entries
+  and the live rows' transcript `(mtime_ns, size)`, or 6 × `usage_refresh_sec` without a
+  signal. A build starts no sooner than `max(3 s, 2 × the last build)` after the previous one
+  ended. The data-version baseline is taken when a build ends (its own commits are not a
+  change); a foreign commit during a build is caught by the worker's own connection. Explicit
+  actions still call `refresh_data()` and rebuild at once. The usage cards repaint every
+  `usage_refresh_sec` regardless.
+- **The table is diffed, not cleared.** `_apply_rows` collects rows into a `_RowPlan`
+  (the `_add_*` helpers write into it) and `_draw_plan` updates only changed cells when the
+  keys and their order equal the last plan (cells compared by plain text, spans AND base
+  style — `Text.__eq__` ignores the base style); any other shape clears and re-adds.
 - **One build at a time in the TUI.** `refresh_data` refuses to start a second
   `data-refresh` thread worker (Textual cannot interrupt a thread — `exclusive=True` only
-  produced cancelled-but-running duplicates); a tick that lands mid-build sets
+  produced cancelled-but-running duplicates); an explicit call that lands mid-build sets
   `_refresh_pending` and `on_worker_state_changed` runs the single follow-up. The first
   worker run paints `build_rows(reconcile_first=False)` (stored rows + persisted facts)
   before the full reconcile, so rows appear within ~1 s of launch. The Codex usage
