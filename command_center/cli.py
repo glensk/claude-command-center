@@ -4366,8 +4366,8 @@ def _api_credit_lines(  # pylint: disable=too-many-arguments,too-many-locals
     Laid out in the provider table's own columns — blank mark, the account named as its
     provider row names it (or its configured ``name:``), ``api est.`` (or ``api`` with a
     measured balance or without an estimate) in the state column, the figure's age, ONE
-    bar across the session + week columns (used ÷ grant, embossed ``API measured`` or
-    ``API est.``), the grant's expiry in the renew column, then the detail. A MEASURED
+    bar across the session + week columns (used ÷ grant, embossed ``API PROMO`` measured or
+    ``API PROMO ≈`` estimated), the grant's expiry in the renew column, then the detail. A MEASURED
     balance (``balance_json``, fresh) wins; otherwise the bar and the ``≈$X of $Y left``
     are an ESTIMATE (``api_credits``): the state word and the bar both say so, and
     without a spend source the bar reads ``API n/a`` with no percentage — never a 0 %

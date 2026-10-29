@@ -2945,17 +2945,17 @@ claude_api_credit_spend = [
 
 The report draws one row per grant in the table's own columns — `api est.` (or `api`
 without an estimate) in the state column, the spend figure's age, one bar across the
-session + week columns (spent ÷ grant, embossed `API est.`), the grant's expiry in the renew
+session + week columns (spent ÷ grant, embossed `API PROMO ≈`), the grant's expiry in the renew
 column, then the detail:
 
 ```
   API credits (Claude API, Console, Agent SDK — not interactive Claude Code):
-     claude-priv (cpriv)   api est.   12m      ░░░░░░░░API est.░░░░░░░░░0% renew 9d 6h    ≈$199.99 of $200 left (est.) · $0.01 spent since 9.10. (run ledger, this machine only) · expires 26.10. (in 10d), next grant then
+     claude-priv (cpriv)   api est.   12m      ░░░░░░API PROMO ≈░░░░░░░0% renew 9d 6h    ≈$199.99 of $200 left (est.) · $0.01 spent since 9.10. (run ledger, this machine only) · expires 26.10. (in 10d), next grant then
      claude-work (cwork)   api        —        ░░░░░░░░░░API n/a░░░░░░░░░░ renew 3d 5h    $500/cycle · granted 16.10. · expires 20.10. (in 4d), next grant then · balance: n/a
 ```
 
 With a fresh measured balance the row reads `api` in the state column, the bar is embossed
-`API measured` (used ÷ grant), the age column is the reading's age and the detail reads
+`API PROMO` without the `≈` (used ÷ grant), the age column is the reading's age and the detail reads
 `$185.88 of $200 left (Console, measured 12m ago) · granted 23.10. · expires 26.11. (in 28d)
 · purchased $0`; a reading whose `cap` binds first adds a row `<name> cap` (`api cap`, bar `API cap` =
 spent ÷ limit, the renew column its reset, detail `$153.89 of $500 monthly spend limit

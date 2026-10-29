@@ -289,10 +289,10 @@ BAR_HORIZON: dict[str, str] = {
     # machine's muse sessions cost is counted. Nothing renews it but a bigger number.
     "budget": "budget",
     # An API-credit grant's ESTIMATED spend (`api_credits.with_spend`): the pot is the
-    # month's grant, the figure an estimate — both words belong in the bar.
-    "grant": "API est.",
+    # promotional grant, the figure an estimate — the `≈` says so (the card's wording).
+    "grant": "API PROMO ≈",
     # The same pot MEASURED (`api_credits.with_balance`, a fresh `balance_json` reading).
-    "api_balance": "API measured",
+    "api_balance": "API PROMO",
     # The Console org's monthly spend LIMIT (a ceiling, not money): spent ÷ limit.
     "api_cap": "API cap",
     "seven_day": "weekly",

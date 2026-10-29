@@ -443,7 +443,7 @@ def test_report_draws_an_estimate_bar(
     assert cli.cmd_quota(_quota_args(no_bars=False)) == 0
     lines = capsys.readouterr().out.splitlines()
     priv = next(line for line in lines if "claude-priv (cpriv)   api est." in line)
-    assert "API est." in priv and "25%" in priv
+    assert "API PROMO ≈" in priv and "25%" in priv
     assert "≈$150 of $200 left (est.)" in priv
     work = next(line for line in lines if "claude-work (cwork)   api " in line)
     # No spend source for work: the bar says n/a and claims no percentage.
@@ -690,7 +690,8 @@ def test_report_draws_measured_and_cap_rows(
     assert cli.cmd_quota(_quota_args(no_bars=False)) == 0
     lines = capsys.readouterr().out.splitlines()
     promo = next(line for line in lines if line.lstrip().startswith("apipriv ") and " api " in line)
-    assert "API measured" in promo and "$185.88 of $200 left (Console, measured 12m ago)" in promo
+    assert "API PROMO" in promo and "≈" not in promo
+    assert "$185.88 of $200 left (Console, measured 12m ago)" in promo
     assert "12m" in promo
     cap = next(line for line in lines if "apipriv cap" in line)
     assert "api cap" in cap and "API cap" in cap and "51%" in cap
