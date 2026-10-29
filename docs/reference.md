@@ -835,6 +835,16 @@ therefore costs **no scrubber calls at all**: a card is re-scrubbed only when it
 when its file changes, or when `mirror_scrub_cmd` changes, and is re-vouched after 24 h. One
 daemon pass spends at most 120 s on required scrubs and 20 s on re-vouching; whatever does not fit
 is reported as `deferred` and simply keeps its previous, stale-but-safe file.
+
+**An unchanged card is not even rendered.** Each vouch row also records `src_fp`, a hash of the
+card's *inputs* (the source of the modules that shape a card, the session row minus `updated_at`,
+AIM history, sub-goals, the transcript's path + mtime + size, the observed model). A pass computes
+that fingerprint for every card without opening a transcript; when it equals the row's `src_fp`,
+the policy matches and the file still hashes to the vouched bytes, the card is skipped (fresh) or —
+past the 24 h TTL — rendered once and re-vouched only if its content moved. Anything else (a legacy
+row without `src_fp`, an edited or deleted file, a code change) renders and scrubs exactly as
+before. A frozen DONE transcript therefore costs one `stat()` per pass, not two JSON walks, and a
+card that is rendered reads its transcript once for both the prompts and the session body.
 `ccc sync-mirrors -F/--full` lifts both budgets (the one-off migration pass), and
 `ccc sync-mirrors -R/--rescrub` drops every stored vouch first — what you run after changing the
 scrubber's rule set or its inventory. `mirror_scrub_cmd = ""` means *no scrubber*, and therefore

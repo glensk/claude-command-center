@@ -407,7 +407,8 @@ CREATE TABLE IF NOT EXISTS mirror_vouch (
     raw_sha     TEXT    NOT NULL,
     out_sha     TEXT    NOT NULL,
     policy      TEXT    NOT NULL,
-    vouched_at  INTEGER NOT NULL
+    vouched_at  INTEGER NOT NULL,
+    src_fp      TEXT
 );
 -- Counters of the LAST mirror pass (single row, id = 1) so `ccc doctor` can report a
 -- withheld write without re-running the pass.
@@ -709,6 +710,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
     # Same, for the await_groups table. '' / '[]' / 0 = no purpose / no related items /
     # resume delivery, which is what every group armed before ``ccc await -P`` / ``-T`` /
     # ``-F`` existed correctly means.
+    _ADDED_MIRROR_VOUCH_COLUMNS = {"src_fp": "TEXT"}
+
     _ADDED_AWAIT_GROUP_COLUMNS = {
         "purpose": "TEXT NOT NULL DEFAULT ''",
         "items": "TEXT NOT NULL DEFAULT '[]'",
@@ -762,6 +765,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         for column, decl in self._ADDED_FILE_LOCK_COLUMNS.items():
             if column not in fl_existing:
                 self._add_column("file_locks", column, decl)
+        self._ensure_table_columns("mirror_vouch", self._ADDED_MIRROR_VOUCH_COLUMNS)
         self._ensure_table_columns("await_sources", self._ADDED_AWAIT_SOURCE_COLUMNS)
         self._ensure_table_columns("await_groups", self._ADDED_AWAIT_GROUP_COLUMNS)
         self._ensure_table_columns("deliveries", ADDED_DELIVERY_COLUMNS)  # voice bridge
@@ -1670,6 +1674,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
                 out_sha=str(row["out_sha"]),
                 policy=str(row["policy"]),
                 vouched_at=int(row["vouched_at"]),
+                src_fp=str(row["src_fp"] or ""),
             )
             for row in rows
         }
@@ -1686,17 +1691,26 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         ``DO UPDATE SET`` touches only the columns this build owns.
         """
         payload = [
-            (row.path, row.session_id, row.raw_sha, row.out_sha, row.policy, int(row.vouched_at))
+            (
+                row.path,
+                row.session_id,
+                row.raw_sha,
+                row.out_sha,
+                row.policy,
+                int(row.vouched_at),
+                row.src_fp or None,
+            )
             for row in rows
         ]
         if not payload:
             return
         self.conn.executemany(
-            "INSERT INTO mirror_vouch (path, session_id, raw_sha, out_sha, policy, vouched_at) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
+            "INSERT INTO mirror_vouch "
+            "(path, session_id, raw_sha, out_sha, policy, vouched_at, src_fp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(path) DO UPDATE SET session_id=excluded.session_id, "
             "raw_sha=excluded.raw_sha, out_sha=excluded.out_sha, policy=excluded.policy, "
-            "vouched_at=excluded.vouched_at",
+            "vouched_at=excluded.vouched_at, src_fp=excluded.src_fp",
             payload,
         )
         self.conn.commit()

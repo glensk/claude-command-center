@@ -52,11 +52,23 @@ Design invariants (do not regress; see ``PLAN_running-done-mirrors.md``):
   ``mirror_scrub_cmd`` or an expired row (:data:`VOUCH_TTL_MS`) costs a call. The
   per-pass budgets keep a cold cache from monopolising a daemon pass — the cards
   that do not fit are ``report.deferred`` and keep their current file.
+* **Unchanged cards are never rendered.** Every card carries ``fp`` — a hash of its
+  INPUTS (code fingerprint, session row, AIM history, sub-goals, transcript
+  ``(path, mtime_ns, size)``, observed model; see :func:`_card_fp`) computed without
+  reading the transcript — and renders lazily (:attr:`_Card.raw`). A card whose vouch
+  row holds the same ``src_fp``/policy and whose file still hashes to ``out_sha`` is
+  vouched WITHOUT a render: fresh → skipped; past the TTL → rendered, and the scrubber
+  is called only when the regenerated document no longer hashes to ``raw_sha``. Any
+  other case (legacy row without ``src_fp``, missing/edited file, changed policy)
+  renders and follows the full scrub logic. A stale ``src_fp`` can therefore only cost a
+  render, never let an unscrubbed document through: the fast path vouches only bytes a
+  scrubber already returned (``out_sha``).
 * **Own flock singleton.** ``app_home()/mirror_sync.lock`` serialises concurrent
   runs (the daemon backstop + the detached ``ccc sync-mirrors`` lifecycle spawns).
 """
 
 # pylint: disable=too-many-lines  # the scrubber gate doubled the module; one concern, one file
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 
 from __future__ import annotations
 
@@ -72,19 +84,23 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 import contextlib
 import fcntl
+import hashlib
+import json
 import os
 import re
 import sys
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from typing import IO
 
 import yaml
 
-from . import config, repos, scrub
+from . import config, repos, scrub, transcript_cache
 from .adapters import ClaudeAdapter
 from .future_files import (
     cwd_to_repo,
@@ -104,9 +120,9 @@ from .models import (
     now_ms,
     synthesize_aim_revision,
 )
-from .peek import session_prompts
-from .sessionmd import escape_fences, render_for
+from .sessionmd import escape_fences
 from .store import Store
+from .transcript_cache import TranscriptView
 
 # The three mirror kinds — the ``ccc_mirror`` frontmatter value AND the folder role.
 RUNNING = "running"
@@ -129,13 +145,30 @@ _FM_RE = re.compile(r"^---\r?\n(.*?)\r?\n---[ \t]*\r?\n", re.DOTALL)
 _PROMPTS_MAX = 200
 _PROMPTS_MAX_BYTES = 256 * 1024
 
-# Per-session prompt cache: session id → (transcript mtime, prompts). Walking a transcript
-# (JSON-parse every line) is the one expensive part of a mirror pass, and the DONE set is
-# ~100 *frozen* transcripts — re-reading each every 300 s pass is pure waste. The long-lived
-# daemon process persists this across passes, so an unchanged transcript (mtime unmoved) is
-# read at most once; a growing RUNNING transcript (or any real edit) re-reads. Byte-stable:
-# the same mtime yields the same prompts, hence the same bytes.
-_PROMPT_CACHE: dict[str, tuple[float, list[str]]] = {}
+# Per-session transcript view cache: session id → ((mtime_ns, size), view). One pass over a
+# transcript yields BOTH the prompts and the session-tab segments (see
+# :func:`_view_for`); the session's SESSION card and its RUNNING/DONE card share it, and a
+# long-lived process (a test, ``ccc sync-mirrors`` in a loop) re-reads only a transcript
+# whose identity moved. The daemon is a one-shot launchd job, so the cross-pass saving
+# comes from skipping unchanged cards (``_Card.fp``), not from this cache.
+_VIEW_CACHE: dict[str, tuple[tuple[int, int], TranscriptView]] = {}
+
+# Modules whose source shapes a card's bytes: any edit re-renders every card once.
+_CODE_MODULES = (
+    "mirrors.py",
+    "sessionmd.py",
+    "transcript_cache.py",
+    "peek.py",
+    "models.py",
+    "future_files.py",
+    "adapters/claude.py",
+)
+_CODE_FP: list[str] = []  # memo, filled on first use (one element once known)
+# Session fields left OUT of the card fingerprint: volatile and never rendered (the module
+# docstring's byte-stability contract: "never ``updated_at``"). A 60 s probe of the live
+# store (1461 sessions) found ``updated_at`` the only churning field no card shows; DONE
+# sessions did not change at all. Everything else is in.
+_FP_SKIP_FIELDS: frozenset[str] = frozenset({"updated_at"})
 
 # How long one scrubber verdict speaks for a card. The vouch already pins the document,
 # the bytes on disk and the policy, so the TTL only bounds how long a RULE-SET change the
@@ -304,27 +337,29 @@ def _read_disk(path: str) -> str | None:
 # ---------------------------------------------------------------------------
 # prompts + AIM history sections (shared source, byte-stable)
 # ---------------------------------------------------------------------------
-def _prompts_for(adapter: ClaudeAdapter, session: Session) -> list[str]:
-    """The session's prompts (:func:`command_center.peek.session_prompts`), mtime-cached.
+def _view_for(adapter: ClaudeAdapter, session: Session) -> TranscriptView:
+    """The session's transcript view (prompts + session segments) from ONE pass over the file.
 
-    Reads the transcript only when it is new to this process or its mtime moved since the
-    last read (see :data:`_PROMPT_CACHE`) — so a RUNNING transcript that grows every turn
-    re-reads, while a frozen DONE transcript is read once. Returns the exact list the
-    ``ccc peek`` panel shows (same helper), so the panel and the mirror never diverge.
+    Resolves the transcript once and reads it with
+    :func:`command_center.transcript_cache.read_view` (parity-tested against the two walks
+    ``ccc peek`` used to make), cached per process on ``(mtime_ns, size)`` — so a RUNNING
+    transcript that grows re-reads while a frozen one is read once. A missing or
+    unreadable transcript is the empty view: no prompts and the empty-body note.
     """
     tpath = adapter.transcript_path(session.cwd, session.session_id)
     if tpath is None:
-        return []
+        return transcript_cache.empty_view()
     try:
-        mtime = tpath.stat().st_mtime
+        st = tpath.stat()
     except OSError:
-        return []
-    cached = _PROMPT_CACHE.get(session.session_id)
-    if cached is not None and cached[0] == mtime:
+        return transcript_cache.empty_view()
+    ident = (st.st_mtime_ns, st.st_size)
+    cached = _VIEW_CACHE.get(session.session_id)
+    if cached is not None and cached[0] == ident:
         return cached[1]
-    prompts = session_prompts(adapter, session)
-    _PROMPT_CACHE[session.session_id] = (mtime, prompts)
-    return prompts
+    view = transcript_cache.read_view(tpath)
+    _VIEW_CACHE[session.session_id] = (ident, view)
+    return view
 
 
 def _numbered_item(index: int, text: str, *, tag: str = "") -> list[str]:
@@ -446,7 +481,7 @@ def _serialize_session(
     if session.depends_on:
         fm_lines.append(f"depends_on: {_q(session.depends_on)}")
     fm_lines.append("---")
-    body = render_for(adapter, session).rstrip("\n")
+    body = "".join(text for text, _tag in _view_for(adapter, session).segments).rstrip("\n")
     frontmatter = "\n".join(fm_lines)
     return f"{frontmatter}\n\n{_BANNER}\n\n{body}\n"
 
@@ -534,7 +569,7 @@ def _serialize(  # noqa: PLR0913  # pylint: disable=too-many-locals,too-many-arg
     )
 
     aim_history_body = _render_aim_history(history)
-    prompts_body = _render_prompts(_prompts_for(adapter, session))
+    prompts_body = _render_prompts(_view_for(adapter, session).prompts)
 
     transcript_body = f"`{transcript}`\n\nResume: `c --resume {session.session_id}`"
     if session_link:
@@ -594,13 +629,24 @@ class _Card:
     """One desired mirror document: where it belongs and what it should say.
 
     ``raw`` is the regenerated (UNSCRUBBED) content — it never reaches the disk until a
-    scrubber vouches for it (or ``mirror_allow_unscrubbed`` is set).
+    scrubber vouches for it (or ``mirror_allow_unscrubbed`` is set). It is rendered on
+    FIRST ACCESS only (``render``): ``fp`` is the cheap input fingerprint (see
+    :func:`_card_fp`) the vouch fast path compares before any transcript is read.
     """
 
     path: str  # absolute target path
     session_id: str
     kind: str  # RUNNING | DONE | SESSION (the ``ccc_mirror`` frontmatter value)
-    raw: str
+    fp: str  # sha256 over the card's inputs (no transcript content read)
+    render: Callable[[], str]
+    _raw: str | None = field(default=None, repr=False)
+
+    @property
+    def raw(self) -> str:
+        """The regenerated document (rendered once, on first access)."""
+        if self._raw is None:
+            self._raw = self.render()
+        return self._raw
 
 
 @dataclass
@@ -756,25 +802,95 @@ def _desired_paths(
     return _target_paths(sessions, root, git_base, first_aim)
 
 
+def _code_fp() -> str:
+    """sha256 over the source of the modules that shape a card (computed once per process)."""
+    if not _CODE_FP:
+        digest = hashlib.sha256()
+        base = Path(__file__).resolve().parent
+        for name in _CODE_MODULES:
+            digest.update(name.encode())
+            try:
+                digest.update((base / name).read_bytes())
+            except OSError:
+                digest.update(b"\0unreadable")
+        _CODE_FP.append(digest.hexdigest())
+    return _CODE_FP[0]
+
+
+def _card_fp(  # noqa: PLR0913  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    ctx: _Ctx,
+    session: Session,
+    kind: str,
+    path_str: str,
+    revisions: list[AimRevision],
+    session_link: str,
+    scan: TranscriptScan | None,
+) -> str:
+    """sha256 of every INPUT of one card, computed WITHOUT reading the transcript's content.
+
+    It must change whenever the rendered bytes could: the code (:func:`_code_fp`), the
+    kind/target path/``git_base``/``claude_home``, every :class:`Session` field except
+    :data:`_FP_SKIP_FIELDS`, the AIM history, the session wikilink, the checklist
+    (RUNNING/DONE) and the transcript identity ``(path, mtime_ns, size)`` plus the scan's
+    observed model. Mirrors what :func:`_serialize` / :func:`_serialize_session` read.
+    """
+    tpath = ctx.adapter.transcript_path(session.cwd, session.session_id)
+    ident: list[object] = [str(tpath) if tpath is not None else None, None, None]
+    if tpath is not None:
+        try:
+            st = tpath.stat()
+        except OSError:
+            pass
+        else:
+            ident[1], ident[2] = st.st_mtime_ns, st.st_size
+    fields = {k: v for k, v in asdict(session).items() if k not in _FP_SKIP_FIELDS}
+    payload: dict[str, object] = {
+        "code": _code_fp(),
+        "kind": kind,
+        "path": path_str,
+        "git_base": str(ctx.git_base),
+        "claude_home": str(config.claude_home()),
+        "session": fields,
+        "revisions": [[r.aim, r.score, r.short_aim] for r in revisions],
+        "link": session_link,
+        "transcript": ident,
+        "scan": None if scan is None else scan.model,
+    }
+    if kind != SESSION:
+        payload["progress"] = ctx.store.progress(session.session_id)
+        payload["subgoals"] = [
+            [sg.text, sg.checked] for sg in ctx.store.list_subgoals(session.session_id)
+        ]
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def _cards_for(ctx: _Ctx, desired: dict[str, Session], kind: str) -> list[_Card]:
-    """Serialise every desired card of one root (byte-stable, still UNSCRUBBED)."""
+    """Plan every desired card of one root: fingerprint now, render lazily (UNSCRUBBED)."""
     cards: list[_Card] = []
     for path_str, session in desired.items():
         scan = _scan_for(ctx.adapter, session, ctx.scans, ctx.dirty)
+        revisions = ctx.hist_map[session.session_id]
+        link = ctx.link_map.get(session.session_id, "")
+        render: Callable[[], str]
         if kind == SESSION:
-            content = _serialize_session(session, ctx.git_base, ctx.adapter, scan)
+            render = partial(_serialize_session, session, ctx.git_base, ctx.adapter, scan)
         else:
-            content = _serialize(
+            render = partial(
+                _serialize,
                 ctx.store,
                 session,
                 kind,
                 ctx.git_base,
                 ctx.adapter,
-                ctx.hist_map[session.session_id],
-                ctx.link_map.get(session.session_id, ""),
+                revisions,
+                link,
                 scan,
             )
-        cards.append(_Card(path=path_str, session_id=session.session_id, kind=kind, raw=content))
+        fp = _card_fp(ctx, session, kind, path_str, revisions, link, scan)
+        cards.append(
+            _Card(path=path_str, session_id=session.session_id, kind=kind, fp=fp, render=render)
+        )
     return cards
 
 
@@ -904,6 +1020,7 @@ class _ScrubPass:  # pylint: disable=too-few-public-methods  # one entry point: 
                 out_sha=scrub.sha256(out),
                 policy=self.policy,
                 vouched_at=self.now,
+                src_fp=card.fp,
             )
         )
 
@@ -948,6 +1065,23 @@ def _vouched_by(row: MirrorVouch, pending: _Pending, policy: str) -> bool:
     )
 
 
+def _fast_vouched(row: MirrorVouch | None, card: _Card, disk: str | None, policy: str) -> bool:
+    """Whether *row* vouches for *card* WITHOUT rendering it (input fingerprint match).
+
+    The bytes on disk must still be exactly the ones a scrubber returned (``out_sha``)
+    under the same policy, and the card's inputs must hash to the fingerprint recorded
+    with that verdict. A legacy row (no ``src_fp``) never takes this path.
+    """
+    return (
+        row is not None
+        and bool(row.src_fp)
+        and row.src_fp == card.fp
+        and row.policy == policy
+        and disk is not None
+        and row.out_sha == scrub.sha256(disk)
+    )
+
+
 def _classify(
     store: Store, cfg: config.Config, plan: _Plan, report: MirrorReport, *, full: bool
 ) -> _Verdict:
@@ -972,13 +1106,28 @@ def _classify(
     required: list[_Pending] = []
     revouch: list[_Pending] = []
     for card in plan.cards:
-        pending = _Pending(card=card, raw_sha=scrub.sha256(card.raw), disk=_read_disk(card.path))
         row = vouches.get(card.path)
+        disk = _read_disk(card.path)
+        if _fast_vouched(row, card, disk, policy):
+            assert row is not None and disk is not None
+            if now - row.vouched_at < VOUCH_TTL_MS:
+                continue  # vouched, same inputs, fresh — no render, no call, no write
+            pending = _Pending(card=card, raw_sha=scrub.sha256(card.raw), disk=disk)
+            if pending.raw_sha != row.raw_sha:
+                required.append(pending)  # the regenerated document moved: must be scrubbed
+                continue
+            pending.since = row.vouched_at
+            revouch.append(pending)
+            continue
+        pending = _Pending(card=card, raw_sha=scrub.sha256(card.raw), disk=disk)
         if row is None or not _vouched_by(row, pending, policy):
             required.append(pending)
             continue
         if now - row.vouched_at < VOUCH_TTL_MS:
-            continue  # vouched and fresh — the whole point: no call, no write
+            # Same document, bytes and policy, but a receipt without (or with another)
+            # input fingerprint: adopt the fingerprint, keep the verdict's own age.
+            verdict.vouches.append(replace(row, src_fp=card.fp))
+            continue
         pending.since = row.vouched_at
         revouch.append(pending)
     revouch.sort(key=lambda pending: pending.since)  # oldest vouch first

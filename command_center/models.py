@@ -300,6 +300,9 @@ class MirrorVouch:
     out_sha: str  # sha256 of the VOUCHED document written to disk
     policy: str  # the mirror_scrub_cmd string that produced it
     vouched_at: int  # epoch ms (see :func:`now_ms`)
+    # sha256 of the card's INPUTS when it was vouched ("" = a legacy row): lets the next
+    # pass recognise an unchanged card without rendering it (see ``mirrors._card_fp``).
+    src_fp: str = ""
 
 
 @dataclass(frozen=True)

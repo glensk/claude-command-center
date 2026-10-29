@@ -79,7 +79,7 @@ def _clear_prompt_cache() -> Iterator[None]:
     from command_center.adapters import claude as claude_mod
 
     def _reset() -> None:
-        mirrors._PROMPT_CACHE.clear()  # pylint: disable=protected-access
+        mirrors._VIEW_CACHE.clear()  # pylint: disable=protected-access
         sessionmd._RENDER_CACHE.clear()  # pylint: disable=protected-access
         claude_mod._OBSERVED_MODEL_CACHE.clear()  # pylint: disable=protected-access
 
@@ -1504,3 +1504,223 @@ def test_sync_mirrors_parser_flags() -> None:
 
     args = build_parser().parse_args(["sync-mirrors", "-F", "-R", "-v"])
     assert args.full and args.rescrub and args.verbose
+
+
+# ---------------------------------------------------------------------------
+# input fingerprint: unchanged cards are never rendered (tp#1427)
+# ---------------------------------------------------------------------------
+# pylint: disable=redefined-outer-name,use-implicit-booleaness-not-comparison  # pytest fixtures; `== []` names the expected value
+@pytest.fixture(name="reads")
+def _reads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Paths :func:`transcript_cache.read_view` is asked to read (one entry per render)."""
+    from command_center import transcript_cache
+
+    seen: list[str] = []
+    real = transcript_cache.read_view
+
+    def counting(path: object) -> transcript_cache.TranscriptView:
+        seen.append(str(path))
+        return real(path)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(transcript_cache, "read_view", counting)
+    return seen
+
+
+def _two_sessions(env: Env) -> tuple[str, str]:
+    cwd = str(env.git_base / "home" / "ccc")
+    one, two = _running_session(env, "First one"), _running_session(env, "Second one")
+    _write_transcript(env, cwd, one, ["hello one"])
+    _write_transcript(env, cwd, two, ["hello two"])
+    return one, two
+
+
+def test_unchanged_second_pass_renders_nothing_and_writes_nothing(
+    env: Env, reads: list[str]
+) -> None:
+    _two_sessions(env)
+    mirrors.run_mirrors(env.store, env.cfg)
+    assert len(reads) == 2  # one transcript pass per session, shared by both its cards
+    reads.clear()
+    calls = len(env.scrubber.calls)
+    mtimes = {p: p.stat().st_mtime_ns for p in env.running.parent.rglob("*.md")}
+    mirrors._VIEW_CACHE.clear()  # pylint: disable=protected-access
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert reads == []
+    assert report.written == [] and report.vouched == [] and report.withheld == []
+    assert len(env.scrubber.calls) == calls
+    assert mtimes == {p: p.stat().st_mtime_ns for p in env.running.parent.rglob("*.md")}
+
+
+def test_changed_session_field_renders_only_that_session(env: Env, reads: list[str]) -> None:
+    one, two = _two_sessions(env)
+    mirrors.run_mirrors(env.store, env.cfg)
+    reads.clear()
+    mirrors._VIEW_CACHE.clear()  # pylint: disable=protected-access
+    env.store.update_fields(one, next_step="a brand new step")
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert len(reads) == 1 and one in reads[0] and two not in reads[0]
+    assert report.written == [one]
+    assert "a brand new step" in _rpath(env, "First one", one).read_text(encoding="utf-8")
+
+
+def test_appended_transcript_rerenders_that_session(env: Env, reads: list[str]) -> None:
+    one, _two = _two_sessions(env)
+    mirrors.run_mirrors(env.store, env.cfg)
+    reads.clear()
+    mirrors._VIEW_CACHE.clear()  # pylint: disable=protected-access
+    tpath = _write_transcript(env, str(env.git_base / "home" / "ccc"), one, ["hello one"])
+    with tpath.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps({"type": "user", "message": {"role": "user", "content": "more"}}) + "\n"
+        )
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert len(reads) == 1 and one in reads[0]
+    assert report.written == [one, one]  # its SESSION and RUNNING cards
+    assert "more" in _rpath(env, "First one", one).read_text(encoding="utf-8")
+
+
+def test_legacy_vouch_without_src_fp_renders_and_is_upgraded(env: Env, reads: list[str]) -> None:
+    _two_sessions(env)
+    mirrors.run_mirrors(env.store, env.cfg)
+    env.store.conn.execute("UPDATE mirror_vouch SET src_fp = NULL")
+    env.store.conn.commit()
+    assert all(row.src_fp == "" for row in env.store.mirror_vouches().values())
+    reads.clear()
+    mirrors._VIEW_CACHE.clear()  # pylint: disable=protected-access
+    calls = len(env.scrubber.calls)
+    stamped = {p: row.vouched_at for p, row in env.store.mirror_vouches().items()}
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert len(reads) == 2  # rendered once to compare
+    assert report.written == [] and len(env.scrubber.calls) == calls  # no scrub, no write
+    upgraded = env.store.mirror_vouches()
+    assert all(row.src_fp for row in upgraded.values())
+    assert {p: row.vouched_at for p, row in upgraded.items()} == stamped  # verdict age kept
+    reads.clear()
+    mirrors.run_mirrors(env.store, env.cfg)
+    assert reads == []
+
+
+def test_deleted_mirror_file_is_rescrubbed_despite_matching_fingerprint(env: Env) -> None:
+    sid = _running_session(env, "Gone")
+    mirrors.run_mirrors(env.store, env.cfg)
+    path = _rpath(env, "Gone", sid)
+    path.unlink()
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert sid in report.written and path.exists()
+
+
+def test_changed_code_fingerprint_rerenders_everything(
+    env: Env, reads: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _two_sessions(env)
+    mirrors.run_mirrors(env.store, env.cfg)
+    reads.clear()
+    mirrors._VIEW_CACHE.clear()  # pylint: disable=protected-access
+    monkeypatch.setattr(mirrors, "_CODE_FP", ["another-build"])
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert len(reads) == 2
+    assert report.written == []  # same bytes: only the receipts were upgraded
+
+
+@pytest.mark.usefixtures("reads")
+def test_expired_vouch_with_same_fingerprint_and_raw_takes_the_revouch_path(env: Env) -> None:
+    _running_session(env, "Aging")
+    mirrors.run_mirrors(env.store, env.cfg)
+    calls = len(env.scrubber.calls)
+    _expire_vouches(env)
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    assert report.written == [] and len(report.vouched) == 2
+    assert len(env.scrubber.calls) == calls + 2
+
+
+def test_expired_vouch_with_changed_raw_is_required_not_revouch(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fingerprint says unchanged but the regenerated document moved: scrub it as REQUIRED."""
+    sid = _running_session(env, "Moved")
+    mirrors.run_mirrors(env.store, env.cfg)
+    _expire_vouches(env)
+    real = mirrors._serialize  # pylint: disable=protected-access
+    monkeypatch.setattr(
+        mirrors, "_serialize", lambda *a, **k: real(*a, **k).replace("Moved", "Moved!", 1)
+    )
+    # Starve the REVOUCH queue: only a REQUIRED card may still be scrubbed.
+    monkeypatch.setattr(mirrors, "REVOUCH_BUDGET_S", 0.0)
+    report = mirrors.run_mirrors(env.store, env.cfg)
+    # The RUNNING card's document moved → scrubbed and written; the untouched SESSION card
+    # is a plain revouch candidate and is the only one the starved budget defers.
+    assert sid in report.written
+    assert str(_rpath(env, "Moved", sid)) not in report.deferred
+    assert len(report.deferred) == 1 and report.deferred[0].startswith(str(env.sessions))
+
+
+def test_rescrub_flag_renders_everything_again(env: Env, reads: list[str]) -> None:
+    _two_sessions(env)
+    mirrors.run_mirrors(env.store, env.cfg)
+    reads.clear()
+    mirrors._VIEW_CACHE.clear()  # pylint: disable=protected-access
+    mirrors.run_mirrors(env.store, env.cfg, rescrub=True)
+    assert len(reads) == 2
+
+
+def test_mirror_bytes_match_the_two_walk_renderers(env: Env) -> None:
+    """One transcript pass is byte-identical to the two old walks (with tool calls)."""
+    from command_center.adapters import ClaudeAdapter
+    from command_center.peek import session_prompts
+
+    sid = _running_session(env, "Parity")
+    cwd = str(env.git_base / "home" / "ccc")
+    tpath = _write_transcript(env, cwd, sid, ["first prompt", "second\nmultiline prompt"])
+    records = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-1",
+                "content": [
+                    {"type": "text", "text": "looking"},
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "Bash",
+                        "input": {"command": "ls -la"},
+                    },
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "file.txt"}],
+            },
+        },
+        {"type": "user", "message": {"role": "user", "content": "third prompt"}},
+    ]
+    with tpath.open("a", encoding="utf-8") as handle:
+        for rec in records:
+            handle.write(json.dumps(rec) + "\n")
+    mirrors.run_mirrors(env.store, env.cfg)
+    session = _get(env, sid)
+    adapter = ClaudeAdapter()
+    expected_body = sessionmd.render_for(adapter, session).rstrip("\n")
+    expected_prompts = mirrors._render_prompts(  # pylint: disable=protected-access
+        session_prompts(adapter, session)
+    )
+    (spath,) = list(env.sessions.rglob("*.md"))
+    assert spath.read_text(encoding="utf-8").endswith(f"{expected_body}\n")
+    assert "ls -la" in expected_body
+    rtext = _rpath(env, "Parity", sid).read_text(encoding="utf-8")
+    assert f"## Prompts\n\n{expected_prompts}\n\n## Transcript" in rtext
+
+
+def test_missing_transcript_matches_the_empty_renderers(env: Env) -> None:
+    sid = _running_session(env, "No transcript")
+    mirrors.run_mirrors(env.store, env.cfg)
+    assert "(no prompts in this session yet)" in _rpath(env, "No transcript", sid).read_text(
+        encoding="utf-8"
+    )
+    (spath,) = list(env.sessions.rglob("*.md"))
+    assert spath.read_text(encoding="utf-8").endswith(
+        sessionmd.render_session([]).rstrip("\n") + "\n"
+    )

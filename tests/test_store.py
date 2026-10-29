@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from command_center.models import DEFAULT_LLM, CloseClaim, LiveSession, TranscriptScan
+from command_center.models import (
+    DEFAULT_LLM,
+    CloseClaim,
+    LiveSession,
+    MirrorVouch,
+    TranscriptScan,
+)
 from command_center.store import AmbiguousJobId, Store, resolve_job_id
 
 
@@ -1328,8 +1334,6 @@ def test_close_unarmed_or_expired_is_never_claimed(tmp_path: Path) -> None:
 # mirror vouches + health (tp#123)
 # ---------------------------------------------------------------------------
 def test_mirror_vouches_upsert_and_drop(tmp_path: Path) -> None:
-    from command_center.models import MirrorVouch
-
     store = _store(tmp_path)
     store.put_mirror_vouches([])  # no-op, no commit needed
     store.put_mirror_vouches(
@@ -1383,3 +1387,19 @@ def test_mirror_health_is_a_single_overwritten_row(tmp_path: Path) -> None:
         at=6, vouched=0, scrubbed=0, withheld=0, deferred=0
     )
     assert store.conn.execute("SELECT COUNT(*) FROM mirror_health").fetchone()[0] == 1
+
+
+def test_mirror_vouch_src_fp_round_trips_and_legacy_reads_empty(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.db")
+    store.put_mirror_vouches(
+        [
+            MirrorVouch("/v/a.md", "s1", "r", "o", "p", 1, "fp-a"),
+            MirrorVouch("/v/b.md", "s2", "r", "o", "p", 1),
+        ]
+    )
+    rows = store.mirror_vouches()
+    assert rows["/v/a.md"].src_fp == "fp-a" and rows["/v/b.md"].src_fp == ""
+    store.conn.execute("UPDATE mirror_vouch SET src_fp = NULL")
+    store.conn.commit()
+    assert store.mirror_vouches()["/v/a.md"].src_fp == ""
+    store.close()
