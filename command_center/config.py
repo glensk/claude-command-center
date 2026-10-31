@@ -732,7 +732,7 @@ def _debate_str_list(key: str, raw: object) -> list[str]:
     return out
 
 
-def codex_debate_policy(cfg: Config | None = None) -> DebateSeatPolicy:
+def codex_debate_policy(cfg: Config | None = None) -> DebateSeatPolicy:  # pylint: disable=too-many-locals
     """The debate start-cap policy, validated as ONE object — fail closed on any doubt.
 
     Raises :class:`DebatePolicyError` (message names the offending key) for a
@@ -1413,6 +1413,18 @@ def _toml_str(value: str) -> str:
     return '"' + "".join(out) + '"'
 
 
+def _toml_list_item(item: object) -> str:
+    """Render one list element; a nested list stays a TOML array (never its ``str()`` repr).
+
+    ``handoff_hooks`` is ``list[list[str]]``: ``_toml_str(str(item))`` turned each inner
+    list into the string ``"['a', 'b']"``, which ``continue-session accept`` then refused
+    (tp#1474).
+    """
+    if isinstance(item, (list, tuple)):
+        return "[" + ", ".join(_toml_list_item(sub) for sub in item) + "]"
+    return _toml_str(str(item))
+
+
 def save_config(cfg: Config) -> None:  # pylint: disable=too-many-branches
     """Write the config back to the TOML file (flat key = value).
 
@@ -1455,7 +1467,7 @@ def save_config(cfg: Config) -> None:  # pylint: disable=too-many-branches
         elif isinstance(value, float):
             lines.append(f"{key} = {value}")
         elif isinstance(value, list):
-            items = ", ".join(_toml_str(str(item)) for item in value)
+            items = ", ".join(_toml_list_item(item) for item in value)
             lines.append(f"{key} = [{items}]")
         elif isinstance(value, dict):
             if value:
