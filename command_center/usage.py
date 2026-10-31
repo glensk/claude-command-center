@@ -121,6 +121,10 @@ _BAR_WIDTH = 27
 # (1 each side) and the 0 1 padding (1 each side) = 34. Keep in sync with the #usage*
 # rules in views/tui.py.
 _CARD_INNER_WIDTH = 34
+# The Claude card's Session row when a fresh snapshot carries no 5-hour window: the
+# /usage endpoint reported none (``five_hour: null``), so a bare dash would read as a
+# fetch gap (tp#1475). Fits _CARD_INNER_WIDTH after "Session: ".
+CLAUDE_NO_SESSION_LABEL = "no 5h limit reported"
 _FILL_COLOR = "#b3b0f0"  # legacy flat Claude fill (light periwinkle) — kept as the _bar/
 # _section default; the Claude cards now colour per-bar via _fill_for_pct (below).
 # Per-bar Claude fills, chosen from each bar's own usage percentage (see _fill_for_pct):
@@ -1537,7 +1541,7 @@ def _appserver_exchange(exe: str, frames: str, env: dict[str, str], timeout: flo
     """
     collected = bytearray()
     try:
-        proc = subprocess.Popen(  # noqa: S603
+        proc = subprocess.Popen(  # noqa: S603  # pylint: disable=consider-using-with  # killed in finally
             [exe, "app-server"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -2092,7 +2096,7 @@ def _bar(
     pct = max(0.0, min(100.0, pct))
     filled = round(pct / 100 * width)
     label = label[:width]
-    bar = Text()
+    cells = Text()
     for i in range(width):
         on_fill = i < filled
         cell_bg = fill_color if on_fill else _TRACK_COLOR
@@ -2101,11 +2105,11 @@ def _bar(
         # usage); a label glyph rides on top in a contrasting colour. A space stays a
         # real space (kept in .plain) — visually identical to the rest of the bar.
         if glyph == " ":
-            bar.append(" ", style=f"on {cell_bg}")
+            cells.append(" ", style=f"on {cell_bg}")
         else:
             fg = _OVERLAY_ON_FILL if on_fill else label_color
-            bar.append(glyph, style=f"bold {fg} on {cell_bg}")
-    return bar
+            cells.append(glyph, style=f"bold {fg} on {cell_bg}")
+    return cells
 
 
 def _bar_row(
@@ -2224,6 +2228,7 @@ def _render_card(  # pylint: disable=too-many-arguments
     staleness: tuple[int, int] | None = None,
     idle_window_sec: tuple[int, int] | None = None,
     rota: dict[str, Any] | None = None,
+    absent_session: str = "",
 ) -> Text:
     """The two-bar card body (session + week), shared by both providers.
 
@@ -2244,6 +2249,11 @@ def _render_card(  # pylint: disable=too-many-arguments
     placeholder the Codex endpoint reports for it (tp#226). ``None`` (the Claude cards)
     keeps the reset label on every row. *rota* is the seat's ``codex_seat_rota`` payload
     (:func:`quota.rota_verdict`), which turns those idle labels into dates.
+
+    *absent_session*, when non-empty, replaces the bare ``Session: —`` row of a FRESH
+    snapshot that carries no 5-hour window (``Session: <absent_session>``, grey, no bar):
+    the source reported none, which is a reading, not a gap (tp#1475). A stale snapshot
+    keeps the dash — there the window is unknown, not absent.
     """
 
     def _fill(win: Window | None) -> str:
@@ -2270,7 +2280,9 @@ def _render_card(  # pylint: disable=too-many-arguments
         not week_stale and usage.seven_day is not None and usage.seven_day.used_percentage >= 100
     )
     text = Text()
-    if not week_full:
+    if not week_full and usage.five_hour is None and not session_stale and absent_session:
+        text.append(f"Session: {absent_session}\n", style="grey50")
+    elif not week_full:
         text.append_text(
             _section(
                 "Session: ",
@@ -2310,6 +2322,12 @@ def render_usage(
 
     Session/Week each go stale (bare ``?%``, no bar) once the snapshot predates its own
     window's lifetime — see :data:`_SESSION_STALE_AFTER_SEC` / :data:`_WEEK_STALE_AFTER_SEC`.
+
+    A fresh snapshot without a 5-hour window reads ``Session: no 5h limit reported``
+    (:data:`CLAUDE_NO_SESSION_LABEL`), never a bare dash: Anthropic's ``/usage`` endpoint
+    answers ``five_hour: null`` (and lists no ``session`` entry in ``limits[]``) for an
+    account it currently meters by the week alone, and the status-line ``rate_limits``
+    then carries no ``five_hour`` either (tp#1475).
     """
     now = int(time.time()) if now is None else now
     if usage is None or usage.is_empty():
@@ -2321,6 +2339,7 @@ def render_usage(
         label_color=accent,
         fill_for_pct=_fill_for_pct,
         staleness=(_SESSION_STALE_AFTER_SEC, _WEEK_STALE_AFTER_SEC),
+        absent_session=CLAUDE_NO_SESSION_LABEL,
     )
 
 
@@ -2537,7 +2556,7 @@ def render_codex_usage(
 
 
 @dataclass
-class CopilotUsage:
+class CopilotUsage:  # pylint: disable=too-many-instance-attributes  # one cache record
     """A month-to-date GitHub Copilot consumption snapshot (one billing month)."""
 
     captured_at: int  # Unix epoch seconds when ccc fetched it
@@ -3504,7 +3523,7 @@ def probe_opencode_free(model: str = "", timeout: float | None = None) -> tuple[
 def _read_opencode_probe(argv: list[str], cwd: str, timeout: float) -> tuple[bool | None, str]:
     """Run *argv* and answer from the first decisive line, then kill it."""
     deadline = time.monotonic() + timeout
-    proc = subprocess.Popen(  # noqa: S603
+    proc = subprocess.Popen(  # noqa: S603  # pylint: disable=consider-using-with  # killed in finally
         argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

@@ -2454,6 +2454,15 @@ when every session is parked, and over `ccc serve` in the browser:
 > mean anything. Each row is gated independently off the one shared `captured_at`
 > clock. Codex and Copilot are unaffected (their own sources are already "as fresh as
 > the last event").
+>
+> **No 5-hour window reported (`Session: no 5h limit reported`).** An account the
+> endpoint meters by the week alone answers `five_hour: null` with no `session` entry in
+> `limits[]` — observed on the private account on 2026-10-31 while it was in active use,
+> and its status-line `rate_limits` then carries no `five_hour` either (tp#1475). A fresh
+> snapshot without that window renders the grey words instead of a bare dash, which
+> would read as a fetch gap; a stale one keeps `Session: —` (the window is unknown, not
+> absent). `ccc quota -j` stays truthful by leaving `five_hour` out of `windows` (only
+> `seven_day` governs the verdict), the same shape every consumer already handles.
 
 ```commands
 echo "$input" | ccc statusline --session "$sid" --capture-usage

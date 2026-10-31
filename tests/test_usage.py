@@ -1480,6 +1480,83 @@ def test_fetch_claude_usage_success_clears_backoff(
     assert usage.oauth_backoff_until() == 0  # cleared by the authoritative replace
 
 
+# The shape the OAuth /usage endpoint returned for the private account on 2026-10-31
+# (tp#1475) while it was in active use: ``five_hour: null`` and no ``session`` entry in
+# ``limits[]`` — the account is metered by the week alone. Values are placeholders.
+_OAUTH_USAGE_NO_SESSION: dict = {
+    "five_hour": None,
+    "seven_day": {"utilization": 4.0, "resets_at": "2026-07-11T14:59:59.649292+00:00"},
+    "limits": [
+        {
+            "kind": "weekly_all",
+            "group": "weekly",
+            "percent": 4,
+            "resets_at": "2026-07-11T14:59:59+00:00",
+            "is_active": True,
+        },
+        _OAUTH_SCOPED_LIMIT,
+    ],
+}
+
+
+def test_fetch_claude_usage_without_session_window_renders_explicit_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A /usage answer with ``five_hour: null`` caches no session window, and the card says
+    so in words instead of a bare dash; ``ccc quota`` leaves the window out (tp#1475)."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setattr(usage, "_keychain_oauth_token", lambda _account: "tok")
+    monkeypatch.setattr(
+        usage, "_get_oauth_usage_body", lambda _token: (json.dumps(_OAUTH_USAGE_NO_SESSION), 0)
+    )
+    snap = usage.fetch_claude_usage("private", now=_NOW)
+    assert snap is not None and snap.five_hour is None and snap.seven_day is not None
+    data = json.loads(usage._usage_path("private").read_text(encoding="utf-8"))
+    assert data["five_hour"] is None
+    cached = usage.read_usage("private")
+    assert cached is not None and cached.five_hour is None
+    plain = usage.render_usage(cached, now=_NOW + 60).plain
+    assert f"Session: {usage.CLAUDE_NO_SESSION_LABEL}" in plain
+    assert "Session: —" not in plain
+    assert "Week: Resets in " in plain and "4%" in plain
+
+
+def test_render_usage_missing_session_row_fits_card() -> None:
+    """The explicit no-session row fits the card's inner width (no wrap, no clip)."""
+    assert cell_len(f"Session: {usage.CLAUDE_NO_SESSION_LABEL}") <= usage._CARD_INNER_WIDTH
+
+
+def test_render_usage_missing_session_stale_keeps_dash() -> None:
+    """A snapshot too old for the session window cannot vouch that none is open: dash."""
+    snap = usage.Usage(
+        captured_at=_NOW - usage._SESSION_STALE_AFTER_SEC - 1,
+        five_hour=None,
+        seven_day=usage.Window(4, _NOW + 3 * 86400),
+    )
+    plain = usage.render_usage(snap, now=_NOW).plain
+    assert "Session: —" in plain
+    assert usage.CLAUDE_NO_SESSION_LABEL not in plain
+
+
+def test_render_usage_missing_session_full_week_drops_row() -> None:
+    """A full week still drops the session row entirely, label or not."""
+    snap = usage.Usage(
+        captured_at=_NOW,
+        five_hour=None,
+        seven_day=usage.Window(100, _NOW + 3 * 86400),
+    )
+    plain = usage.render_usage(snap, now=_NOW).plain
+    assert "Session:" not in plain
+    assert "Week: Resets in " in plain
+
+
+def test_render_work_usage_missing_session_uses_same_label() -> None:
+    """Both Claude cards share the wording; the Codex card keeps its dash."""
+    snap = usage.Usage(captured_at=_NOW, five_hour=None, seven_day=usage.Window(4, _NOW + 86400))
+    assert f"Session: {usage.CLAUDE_NO_SESSION_LABEL}" in usage.render_work_usage(snap, _NOW).plain
+    assert "Session: —" in usage.render_codex_usage(snap, now=_NOW).plain
+
+
 def test_claude_usage_stale_false_during_backoff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
