@@ -519,3 +519,63 @@ def test_cli_smoke_collect_writes_only_under_ccc_home(tmp_path: Path) -> None:
     )
     assert shown.returncode == 0, shown.stderr
     assert json.loads(shown.stdout)["kind"] == "session"
+
+
+def test_handback_text_beats_the_notification_stub(world: dict[str, Any], tmp_path: Path) -> None:
+    stub = (
+        'This agent\'s report was delivered to you as a message from "a1" '
+        "(its SubagentHandback call). Read it there; it is not repeated here."
+    )
+    transcript: Path = world["transcript"]
+    transcript.write_text(
+        transcript.read_text(encoding="utf-8") + _notification("a1", stub) + "\n", encoding="utf-8"
+    )
+    jsonl = tmp_path / "proj" / SID / "subagents" / "agent-a1.jsonl"
+    handback = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "h1",
+                    "name": "SubagentHandback",
+                    "input": {"message": "REAL REPORT **Boxes done**: B4"},
+                }
+            ]
+        },
+    }
+    jsonl.write_text(jsonl.read_text(encoding="utf-8") + json.dumps(handback) + "\n", "utf-8")
+    fields = {
+        f["fields"]["agent_id"]: f["fields"] for f in _by_kind(_collect(world, tmp_path), "agent")
+    }
+    assert fields["a1"]["result_inline"] == "REAL REPORT **Boxes done**: B4"
+    assert fields["a1"]["status"] == "finished"
+    # no handback and only the stub: nothing is stored as a result
+    jsonl.write_text(jsonl.read_text(encoding="utf-8").split("\n")[0] + "\n", "utf-8")
+    fields = {
+        f["fields"]["agent_id"]: f["fields"] for f in _by_kind(_collect(world, tmp_path), "agent")
+    }
+    assert fields["a1"]["result_inline"] == "" and fields["a1"]["result_path"] == ""
+
+
+def test_pid_only_processes_are_not_listed_as_shells(world: dict[str, Any], tmp_path: Path) -> None:
+    from command_center import inflight
+
+    real = inflight.Item(
+        inflight.KIND_UNKNOWN, "pid:99", "untracked shell", "sleep 240; echo t", pid=99
+    )
+    original = inflight.inventory
+
+    def fake(*args: Any, **kwargs: Any) -> Any:
+        inv = original(*args, **kwargs)
+        inv.items.append(real)
+        return inv
+
+    inflight_inventory = inflight.inventory
+    inflight.inventory = fake
+    try:
+        doc = _collect(world, tmp_path)
+    finally:
+        inflight.inventory = inflight_inventory
+    assert "pid:99" not in {f["fields"]["task_id"] for f in _by_kind(doc, "shell")}
+    assert any("untracked process" in w for w in doc["warnings"])

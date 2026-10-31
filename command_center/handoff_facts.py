@@ -487,6 +487,24 @@ def _first_user_text(jsonl: Path) -> str:
     return ""
 
 
+_STUB_RE = re.compile(r"delivered to you as a message from|SubagentHandback call", re.I)
+
+
+def _handback_text(jsonl: Path) -> str:
+    """The input of the agent's LAST ``SubagentHandback`` tool_use (its real report)."""
+    from . import inflight
+
+    last = ""
+    for record in inflight._transcript_records(jsonl):
+        for block in _blocks(record):
+            if block.get("type") == "tool_use" and block.get("name") == "SubagentHandback":
+                params = block.get("input")
+                text = params.get("message") if isinstance(params, dict) else None
+                if isinstance(text, str) and text.strip():
+                    last = text
+    return last
+
+
 def _last_assistant_text(jsonl: Path) -> str:
     from . import inflight
 
@@ -680,8 +698,13 @@ def _spec_for(  # pylint: disable=too-many-locals
         jsonl_path = recorded_jsonl or found
     jsonl = Path(jsonl_path) if jsonl_path and Path(jsonl_path).exists() else None
     spec = (_first_user_text(jsonl) if jsonl else "") or str(params.get("prompt") or "")
-    result = notes.get(agent_id, "")
     finished = agent_id in notes
+    # the real report is the SubagentHandback input; the notification only carries a stub
+    # for such agents ("delivered to you as a message …") which is never stored as a result
+    result = _handback_text(jsonl) if jsonl is not None else ""
+    if not result:
+        note = notes.get(agent_id, "")
+        result = "" if _STUB_RE.search(note) else note
     if not result and jsonl is not None:
         result = _last_assistant_text(jsonl)
     return {
@@ -910,9 +933,14 @@ def transcript_facts(
                 str(item.get("description") or ""),
             ]
             shell_facts.append(shell_fact(item, keys, declared))
-        for item in inflight_items:
-            if item["kind"] == inflight.KIND_UNKNOWN:
-                shell_facts.append(shell_fact(item, [str(item["id"])], declared))
+        # pid-scanned processes that match no parent Bash call are mostly the shells of a
+        # running SUBAGENT; they cannot be attributed, so they are counted, never listed
+        loose = [i for i in inflight_items if i["kind"] == inflight.KIND_UNKNOWN]
+        if loose:
+            warnings.append(
+                f"{len(loose)} untracked process(es) (shells/children not started by this "
+                "session's own Bash calls, e.g. a running subagent's) are not listed"
+            )
     for agent_id, recorded in agent_rows:
         info = _spec_for(agent_id, src.transcript, records, recorded, notes)
         out.append(agent_fact(info, src.session_id, scrubber, persist=persist))
