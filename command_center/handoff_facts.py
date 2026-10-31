@@ -13,7 +13,7 @@ text) from two sources:
 * **configured providers** — config key ``handoff_facts`` (default ``[]``, inert): a list
   of tables ``{argv, timeout_s, optional, name}`` run like ``handoff_hooks`` (argv-only,
   own process group, killed on timeout, stdout capped at 256 KB). Everything
-  Albert-specific (tp items, commit ledger, schedules …) comes from there.
+  user-specific (tp items, commit ledger, schedules …) comes from there.
 
 Two phases (D8): ``capture`` runs BEFORE the drain and writes ``capture.json`` so
 ``finalize`` (at ``start``, after the drain) still knows what was running; ``finalize``
@@ -61,7 +61,7 @@ if TYPE_CHECKING:
 
 VERSION = 1
 
-#: Kinds a PROVIDER may return (the mydotfiles provider's closed set).
+#: Kinds a PROVIDER may return (the external facts provider's closed set).
 PROVIDER_KINDS = frozenset(
     {
         "tp_item",
