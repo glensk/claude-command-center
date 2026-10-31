@@ -371,6 +371,11 @@ DEFAULTS: dict[str, object] = {
     # successor accepts a handoff; every one must exit 0 with a JSON object on stdout or the
     # transfer stays `opened`. Placeholders {old} {new} {label} {transfer}. [] = none.
     "handoff_hooks": [],
+    # `ccc continue-session collect|start` (tp#1479): fact PROVIDERS, a list of tables
+    # {argv = [...], timeout_s = N, optional = bool, name = "..."}; placeholders {session}
+    # {cwd} {transcript} {config_dir} {phase} {tp_ids}. Each prints a typed-record JSON
+    # document (see handoff_facts.py). [] = ccc's own facts only (inert).
+    "handoff_facts": [],
     "resume_stagger_sec": 120,  # min seconds between resumes across different repos (anti-herd)
     "resume_poll_sec": 30,  # resume-halted watcher poll interval
     "resume_max_attempts": 3,  # give up auto-resuming a session after this many failed tries
@@ -507,6 +512,7 @@ INERT_DEFAULT_KEYS: tuple[str, ...] = (
     "autoprogress",  # no sub-goal auto-derive / auto-check LLM passes
     "verify_subgoals_llm",  # no per-sub-goal LLM verification (already off; kept for the contract)
     "handoff_hooks",  # no command runs on a continue-session accept ([] = falsy)
+    "handoff_facts",  # no fact provider runs on a continue-session collect/start ([] = falsy)
 )
 
 
@@ -1222,6 +1228,7 @@ class Config:
     auto_switch_prompt: str = "continue"
     auto_switch_max_per_day: int = 4
     handoff_hooks: list[list[str]] = field(default_factory=list)  # continue-session accept
+    handoff_facts: list[dict[str, object]] = field(default_factory=list)  # fact providers
     resume_stagger_sec: int = 120
     resume_poll_sec: int = 30
     resume_max_attempts: int = 3
@@ -1422,6 +1429,13 @@ def _toml_list_item(item: object) -> str:
     """
     if isinstance(item, (list, tuple)):
         return "[" + ", ".join(_toml_list_item(sub) for sub in item) + "]"
+    if isinstance(item, dict):  # handoff_facts: a list of inline tables
+        pairs = ", ".join(f"{_toml_str(str(k))} = {_toml_list_item(v)}" for k, v in item.items())
+        return "{ " + pairs + " }" if pairs else "{}"
+    if isinstance(item, bool):
+        return str(item).lower()
+    if isinstance(item, (int, float)):
+        return str(item)
     return _toml_str(str(item))
 
 

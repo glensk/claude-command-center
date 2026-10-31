@@ -38,6 +38,7 @@ _EXPECTED_INERT_KEYS = {  # alphabetical, unlike config's grouped tuple
     "drift_check",
     "future_files",
     "grade_on_turn",
+    "handoff_facts",
     "handoff_hooks",
     "mirror_done",
     "mirror_running",

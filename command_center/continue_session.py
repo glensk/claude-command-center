@@ -714,32 +714,44 @@ def _render_hook(template: object, transfer: Any) -> list[str]:
     return argv
 
 
+def run_bounded(argv: list[str], timeout: float) -> tuple[int, bytes, bytes]:
+    """Run *argv* (no shell, own process group) bounded by *timeout*; ``(rc, stdout, stderr)``.
+
+    A timeout kills the whole group and raises ``subprocess.TimeoutExpired``; a program that
+    cannot start raises ``OSError``. Shared by ``handoff_hooks`` and the facts providers.
+    """
+    import signal
+    import subprocess
+
+    with subprocess.Popen(  # noqa: S603 - argv from the user's own config, no shell
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,  # its own group: a timeout kills grandchildren too
+    ) as proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.communicate()
+            raise
+        return proc.returncode, stdout, stderr
+
+
 def run_hook(template: object, transfer: Any) -> dict[str, Any]:
     """Run one hook argv-only (no shell), bounded; its parsed JSON object, or HookFailed."""
     import subprocess
 
     argv = _render_hook(template, transfer)
     name = os.path.basename(argv[0])
-    import signal
-
     try:
-        with subprocess.Popen(  # noqa: S603 - argv from the user's own config, no shell
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,  # its own group: a timeout kills grandchildren too
-        ) as proc:
-            try:
-                stdout, stderr = proc.communicate(timeout=HOOK_TIMEOUT_SEC)
-            except subprocess.TimeoutExpired as exc:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                proc.communicate()
-                raise HookFailed(f"{name}: timed out after {HOOK_TIMEOUT_SEC}s") from exc
-            returncode = proc.returncode
+        returncode, stdout, stderr = run_bounded(argv, HOOK_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired as exc:
+        raise HookFailed(f"{name}: timed out after {HOOK_TIMEOUT_SEC}s") from exc
     except OSError as exc:
         raise HookFailed(f"{name}: could not run ({exc.strerror or exc})") from exc
     if len(stdout) > HOOK_OUTPUT_CAP:
@@ -899,8 +911,10 @@ _VERBS = {
 
 def dispatch(args: argparse.Namespace) -> int:
     """Dispatch ``ccc continue-session <verb>``."""
+    from . import handoff_facts
+
     verb = getattr(args, "cs_command", None)
-    handler = _VERBS.get(verb or "")
+    handler = _VERBS.get(verb or "") or handoff_facts.VERBS.get(verb or "")
     if handler is None:
         args.cs_parser.print_help()
         return 2
@@ -993,3 +1007,7 @@ def add_parser(sub: Any) -> None:
     p_status.add_argument("transfer", nargs="?", help="transfer id (default: this session's)")
     p_status.add_argument("-s", "--session", help="list the transfers of this session id")
     p_status.add_argument("-j", "--json", action="store_true", help="JSON output")
+
+    from . import handoff_facts
+
+    handoff_facts.add_parsers(verbs)

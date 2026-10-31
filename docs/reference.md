@@ -1896,6 +1896,33 @@ ccc keeps no tracker dependency; a ticket tracker plugs in here, e.g.
 argv[0] must be an executable on `PATH` or an absolute path: no shell runs, so a shell
 alias (such as a `tp` alias) is not found and `accept` fails with "could not run".
 
+**`handoff_facts`** (config, default `[]`, inert; tp#1479): fact PROVIDERS for `ccc
+continue-session collect` (and the coming `start` composition). Each entry is a table
+`{argv, timeout_s, optional, name}` run like a hook (argv only, own process group, killed on
+timeout, stdout ≤ 256 KB, stderr never echoed). Placeholders: `{session}`, `{cwd}`,
+`{transcript}`, `{config_dir}`, `{phase}` (`capture`/`finalize`) and `{tp_ids}` (the tp ids
+of the `tp_item` records earlier providers returned, `1479,1480`; with none known the
+argument and its preceding flag are dropped). A provider prints `{version: 1, provider,
+facts: [{kind, key, section, priority, fields}], repos, warnings}` with a closed `kind` set;
+markdown-typed fields, unknown kinds/keys, duplicate keys or control characters make that
+provider a failure, which becomes ONE `warning` fact (`⚠ facts provider NAME failed: … — run
+ARGV by hand`) and never blocks the relay. Providers run in order, so put the required part
+first and let the optional one reuse its tp ids (`tp held` takes 3-5 s idle, more under
+load, hence `timeout_s = 15`):
+
+```toml
+handoff_facts = [
+  { name = "required", timeout_s = 15, argv = ["/path/cc-handoff-facts.py", "-s", "{session}", "-t", "{transcript}", "-c", "{cwd}", "-P", "required", "-p", "{phase}", "-j"] },
+  { name = "optional", timeout_s = 6, optional = true, argv = ["/path/cc-handoff-facts.py", "-s", "{session}", "-t", "{transcript}", "-c", "{cwd}", "-P", "optional", "-p", "{phase}", "-i", "{tp_ids}", "-j"] },
+]
+```
+
+`collect [-s SID] [-j|-m] [-S] [-p capture|finalize] [-F]` prints the facts (`-S` writes
+`handoffs/facts/<sid>/capture.json` BEFORE the drain so `start` still knows what was running;
+`-F` freezes the snapshot `<snap12>.json`); `facts <transfer|sid> [-j] [-k KEY]` reads a
+frozen snapshot back. Every persisted file (snapshot, capture, agent `*.spec.md` /
+`*.result.md`) is scrubbed through `mirror_scrub_cmd` (fail closed) and written 0600.
+
 **A capped seat** cannot run a model turn. The `UserPromptSubmit` intercept
 (`switch_intercept._HANDOFF_COMMANDS` → `handoff_capped.py`) lets a handoff command reach
 the model while the seat has quota; when it is capped (a usage-limit halt per
