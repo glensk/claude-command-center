@@ -434,3 +434,48 @@ def test_non_codex_families_never_stamp_a_codex_seat() -> None:
         for p in ("agy", "opencode", "copilot")
     ]
     assert not codex_ledger.last_runs(rows, now)
+
+
+def test_record_run_accepts_usd_cache_1h_and_job() -> None:
+    row = codex_ledger.validate_row(
+        _claude_row(usd=0.0123, tokens_cache_create_1h=500, job="com.example.x" + "y" * 200)
+    )
+    assert row["usd"] == 0.0123
+    assert row["tokens_cache_create_1h"] == 500
+    assert row["job"].startswith("com.example.x") and len(row["job"]) == codex_ledger.JOB_CHARS
+    assert codex_ledger.validate_row(_claude_row(usd=0))["usd"] == 0
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"usd": -0.1},
+        {"usd": "1.5"},
+        {"usd": True},
+        {"usd": float("inf")},
+        {"tokens_cache_create_1h": -1},
+        {"tokens_cache_create_1h": 1.5},
+        {"tokens_cache_create_1h": True},
+        {"job": 7},
+    ],
+)
+def test_record_run_refuses_wrong_new_key_values(extra: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        codex_ledger.validate_row(_claude_row(**extra))
+
+
+def test_older_rows_without_the_new_keys_stay_valid() -> None:
+    row = codex_ledger.validate_row(_claude_row())
+    assert not {"usd", "job", "tokens_cache_create_1h"} & set(row)
+
+
+def test_launchd_job_reads_ai_job_then_xpc(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AI_JOB", raising=False)
+    monkeypatch.setenv("XPC_SERVICE_NAME", "com.example.ccc-daemon")
+    assert codex_ledger.launchd_job() == "com.example.ccc-daemon"
+    monkeypatch.setenv("XPC_SERVICE_NAME", "application.com.apple.Terminal.1")
+    assert codex_ledger.launchd_job() == ""
+    monkeypatch.setenv("XPC_SERVICE_NAME", "0")
+    assert codex_ledger.launchd_job() == ""
+    monkeypatch.setenv("AI_JOB", "myjob")
+    assert codex_ledger.launchd_job() == "myjob"

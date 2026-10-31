@@ -83,6 +83,19 @@ EXTERNAL_DEPS: dict[str, Dep] = {
             "`opencode_free_model` from config.toml."
         ),
     ),
+    # The usage-log writer (the dotfiles `bin/ai-log-call`, tp#1458). ccc calls it for ONE
+    # thing: `ai-log-call session -s <sid> -j <job> -p <purpose>`, the claim that makes
+    # `ai logs` sum an interactive API-key session's transcripts. Resolved with `resolve`,
+    # fail-open: without it the launch simply files no claim.
+    "ai-log-call": Dep(
+        name="ai-log-call",
+        command="ai-log-call",
+        env="AI_LOG_CALL_BIN",
+        install_hint=(
+            "Put `ai-log-call` (the dotfiles bin/ dir) on $PATH, or set AI_LOG_CALL_BIN to its "
+            "absolute path. Without it an API-key launch files no usage claim."
+        ),
+    ),
     # The two `ccc await` probes. Both are resolved ONCE, at arm time, and the absolute
     # path is persisted in the source's spec — the poller never re-resolves, so a PATH
     # that differs under launchd cannot silently change which script answers. `require`,

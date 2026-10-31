@@ -324,3 +324,49 @@ def test_start_job_with_a_frontmatter_prompt_execs_it_after_the_marker(
     argv = seen["argv"]
     assert spy and argv[-2] == "--" and argv[-1].endswith(FRONTMATTER_PROMPT)
     assert argv.count("--") == 1
+
+
+def _fake_log_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    out = tmp_path / "calls.txt"
+    fake = tmp_path / "ai-log-call"
+    fake.write_text(f'#!/bin/sh\necho "$@" >> {out}\nexit 7\n', encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("AI_LOG_CALL_BIN", str(fake))
+    monkeypatch.delenv("AI_JOB", raising=False)
+    monkeypatch.setenv("XPC_SERVICE_NAME", "0")
+    return out
+
+
+def test_apikey_launch_files_a_session_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = _fake_log_call(tmp_path, monkeypatch)
+    exe = tmp_path / "claude-apikey.py"
+    exe.write_text("#!/bin/sh\n", encoding="utf-8")
+    exe.chmod(0o755)
+    monkeypatch.setattr("command_center.config.resolve_launch_profile", lambda _l: str(exe))
+    argv = launch_argv.profile_argv(["claude", "--resume", "sid-1"], "apiwork")
+    assert argv[0] == str(exe)  # exit 7 of the claim is ignored
+    assert out.read_text(encoding="utf-8").split() == [
+        "session",
+        "-s",
+        "sid-1",
+        "-j",
+        "-p",
+        "ccc-apikey",
+    ]  # fmt: skip  (the empty job argument vanishes in the fake's echo)
+
+
+def test_other_profiles_and_missing_binary_file_no_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = _fake_log_call(tmp_path, monkeypatch)
+    other = tmp_path / "claude-other"
+    other.write_text("#!/bin/sh\n", encoding="utf-8")
+    other.chmod(0o755)
+    monkeypatch.setattr("command_center.config.resolve_launch_profile", lambda _l: str(other))
+    launch_argv.profile_argv(["claude", "--session-id", "sid-2"], "p")
+    assert not out.exists()
+    assert not launch_argv.claim_apikey_session("", "/x/claude-apikey.py")
+    monkeypatch.setenv("AI_LOG_CALL_BIN", str(tmp_path / "missing"))
+    assert not launch_argv.claim_apikey_session("sid-3", "/x/claude-apikey.py")

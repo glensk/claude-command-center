@@ -40,6 +40,45 @@ if TYPE_CHECKING:
 
 CLAUDE = "claude"
 
+#: Executable basename prefix of the API-key launcher (its sessions bill the API).
+APIKEY_EXE_PREFIX = "claude-apikey"
+CLAIM_PURPOSE = "ccc-apikey"
+CLAIM_TIMEOUT_S = 5
+
+
+def claim_apikey_session(session_id: str, exe: str) -> bool:
+    """File ``ai-log-call session -s <sid> -j <job> -p ccc-apikey`` for an API-key launch.
+
+    Only when *exe* is the API-key launcher (basename ``claude-apikey*``) and the id is
+    known. Fail-open by design (tp#1458): ``ai-log-call`` missing, slow (5 s cap), or
+    failing never blocks the launch; its exit status is ignored. True when it was run.
+    """
+    import os
+    import subprocess
+
+    from .codex_ledger import launchd_job
+
+    if not session_id or not os.path.basename(exe or "").startswith(APIKEY_EXE_PREFIX):
+        return False
+    try:
+        from extdeps import resolve
+
+        from .external_deps import EXTERNAL_DEPS
+
+        binary = resolve(EXTERNAL_DEPS["ai-log-call"])
+        if not binary:
+            return False
+        subprocess.run(  # noqa: S603
+            [binary, "session", "-s", session_id, "-j", launchd_job(), "-p", CLAIM_PURPOSE],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=CLAIM_TIMEOUT_S,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return False
+    return True
+
 
 def lookup_name(session_id: str) -> str:
     """The stored canonical name of *session_id*, or ``""`` (no row, no name, any error).
@@ -58,6 +97,14 @@ def lookup_name(session_id: str) -> str:
     return (session.canonical_name or "") if session is not None else ""
 
 
+def _argv_session_id(argv: Sequence[str]) -> str:
+    """The id after ``--resume`` / ``--session-id`` in *argv*, or ``""``."""
+    for flag in ("--resume", "--session-id"):
+        if flag in argv and argv.index(flag) + 1 < len(argv):
+            return str(argv[argv.index(flag) + 1])
+    return ""
+
+
 def profile_argv(argv: Sequence[str], launch_profile: str) -> list[str]:
     """*argv* with its leading ``claude`` swapped for the profile's resolved executable.
 
@@ -71,6 +118,7 @@ def profile_argv(argv: Sequence[str], launch_profile: str) -> list[str]:
         from .config import resolve_launch_profile
 
         out[0] = resolve_launch_profile(launch_profile)
+        claim_apikey_session(_argv_session_id(out), out[0])
     return out
 
 

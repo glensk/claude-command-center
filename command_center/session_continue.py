@@ -272,6 +272,14 @@ def _envelope_fields(envelope: dict[str, Any]) -> dict[str, Any]:
             ),
         }
         fields.update({key: value for key, value in tokens.items() if value is not None})
+        created = usage.get("cache_creation")
+        if isinstance(created, dict):
+            one_hour = _usage_int(created, "ephemeral_1h_input_tokens")
+            if one_hour:
+                fields["tokens_cache_create_1h"] = one_hour
+    cost = envelope.get("total_cost_usd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
+        fields["usd"] = float(cost)
     return fields
 
 
@@ -294,6 +302,7 @@ def _record_probe(outcome: str, started: float, **extra: Any) -> bool:
             "caller": "claude-session-continue",
             "requested_model": PROBE_MODEL,
             "prompt_chars": len(PROBE_PROMPT),
+            "job": codex_ledger.launchd_job(),
             **extra,
         }
         return bool(codex_ledger.append_rows([codex_ledger.validate_row(row)]))

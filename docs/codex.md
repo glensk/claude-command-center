@@ -635,7 +635,14 @@ The caller pipes ONE JSON object or an array of them — one per physical attemp
 `provider` is `codex` | `claude` | `agy` | `opencode` | `copilot` | `gemini` | `openai` |
 `anthropic` (a row without the key predates the field and is Codex; every family but
 Codex leaves `last_run` alone); `attempt_id` defaults to a fresh one (bring your own to
-reference the line later), `caller` is optional;
+reference the line later), `caller` is optional; three optional keys were added to v1
+without a version bump (older rows stay valid, wrong types are still refused, tp#1458):
+`usd` (provider-reported cost, a number >= 0), `tokens_cache_create_1h` (the 1-hour-TTL
+part of `tokens_cache_create`, an int >= 0) and `job` (the launchd label or `AI_JOB` the
+writer ran under, capped at 80 characters). ccc's own `claude -p` probe
+(`claude-session-continue`) files them from the JSON envelope (`total_cost_usd`,
+`usage.cache_creation.ephemeral_1h_input_tokens`); `ai logs` maps `usd`, `job` and every
+`tokens_*` key from these rows;
 `seat` is the caller's label (`work` / `private`), `id` defaults to the ccc oracle id
 (`claude:work`); `requested_model` is the alias handed to `--model` (`opus`) and `model`
 the one Claude Code resolved it to; `outcome` is free text with `ok` the verdict

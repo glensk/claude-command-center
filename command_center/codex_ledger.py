@@ -83,6 +83,9 @@ _ERROR_CHARS = 240
 #: The caller's context note (``#255``) is one short label, never a paragraph.
 NOTE_CHARS = 120
 
+#: The ``job`` label (a launchd label or ``AI_JOB``) is short too.
+JOB_CHARS = 80
+
 #: Provider families a row may name; a row without ``provider`` is ``codex`` (written
 #: before the field existed).
 PROVIDERS = ("codex", "claude", "agy", "opencode", "copilot", "gemini", "openai", "anthropic")
@@ -113,6 +116,9 @@ _OPTIONAL: dict[str, type | tuple[type, ...]] = {
     "tokens_out": int,
     "tokens_cache_read": int,
     "tokens_cache_create": int,
+    "tokens_cache_create_1h": int,
+    "usd": (int, float),
+    "job": str,
     "write": bool,
     "cwd": str,
     "session": str,
@@ -126,6 +132,16 @@ _OPTIONAL: dict[str, type | tuple[type, ...]] = {
 # mislabelled reply judgements; those two cannot be distinguished from each other.
 REPLY_RELABEL_AFTER = datetime.fromisoformat("2026-09-21T19:11:14+02:00")
 REPLY_RELABEL_PURPOSE = "reply-2nd-opinion"
+
+
+def launchd_job() -> str:
+    """The job label a writer files under: ``AI_JOB``, else the launchd label in
+    ``XPC_SERVICE_NAME`` (``0`` and ``application.*`` are not jobs), else ``""``."""
+    job = os.environ.get("AI_JOB", "").strip()
+    if job:
+        return job
+    label = os.environ.get("XPC_SERVICE_NAME", "").strip()
+    return "" if label in ("", "0") or label.startswith("application.") else label
 
 
 def sanitize_note(note: str | None) -> str:
@@ -288,9 +304,25 @@ def validate_row(raw: Any, where: str = "row") -> dict[str, Any]:
         if value is None or value == "":
             continue
         row[key] = sanitize_note(value) if key in ("note", "caller") else value
+    _check_new_keys(row, where)
     if "error_message" in row:
         row["error_message"] = " ".join(str(row["error_message"]).split())[:_ERROR_CHARS]
     return row
+
+
+def _check_new_keys(row: dict[str, Any], where: str) -> None:
+    """The v1 additions (tp#1458): ``usd`` a finite number >= 0, the 1 h cache-write
+    part an int >= 0, ``job`` a label capped at :data:`JOB_CHARS`."""
+    usd = row.get("usd")
+    if usd is not None:
+        if isinstance(usd, bool) or not isinstance(usd, int | float):
+            raise ValueError(f"{where}: 'usd' must be a number")
+        if not 0 <= usd < float("inf"):
+            raise ValueError(f"{where}: 'usd' must be >= 0")
+    if row.get("tokens_cache_create_1h", 0) < 0:
+        raise ValueError(f"{where}: 'tokens_cache_create_1h' must be >= 0")
+    if "job" in row:
+        row["job"] = sanitize_note(row["job"])[:JOB_CHARS]
 
 
 def _check_keys(raw: Any, where: str) -> None:

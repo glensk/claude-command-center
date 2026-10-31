@@ -215,3 +215,19 @@ def test_a_broken_ledger_never_breaks_the_probe(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(codex_ledger, "append_rows", boom)
     _fake_probe(monkeypatch, _envelope("hi"))
     assert sc.probe_limit() == (False, None)
+
+
+def test_probe_envelope_carries_usd_and_one_hour_cache() -> None:
+    fields = sc._envelope_fields(  # noqa: SLF001
+        {
+            "total_cost_usd": 0.004,
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 4,
+                "cache_creation_input_tokens": 900,
+                "cache_creation": {"ephemeral_1h_input_tokens": 600},
+            },
+        }
+    )
+    assert fields["usd"] == 0.004
+    assert fields["tokens_cache_create_1h"] == 600
