@@ -24,7 +24,13 @@ account config dir and its configured label, as in ``ccc sessions -j``), ``actio
 while ``state`` is ``idle``) and ``brief`` (the pending picker's ``**Decision brief**``
 block from the assistant text right before the AskUserQuestion call, raw, ≤ 4000 chars,
 head kept). See :mod:`command_center.adapters.claude_bridge` (``todo_actions``,
-``decision_brief``, ``decision_briefs``).
+``decision_brief``, ``decision_briefs``). ``turn_active`` (bool; ``null`` only when it
+cannot be told, never for a parsed transcript): the transcript says a main-chain turn is
+open (a turn in progress — a ``<task-notification>`` user record opens one — or a pending
+picker), from the transcript alone whatever the registry says; ``state`` keeps the registry
+word, so an idle session holding a background task reads ``state: busy, turn_active:
+false``. ``raw_status``: the registry's own word before the §6 mapping (``shell``, ``busy``,
+…), ``null`` when the session is not live — diagnostics only.
 """
 
 from __future__ import annotations
@@ -167,8 +173,10 @@ def run_inspect(deps: BridgeDeps, session_id: str, *, use_llm: bool = True) -> d
         raise BridgeError("transcript_missing", f"no transcript found for session {session_id}")
     ins = inspect_transcript(path)
     alive = bool(live and live.alive)
-    # the registry's word mapped to §6 (``shell`` — a shell tool running — is ``busy``)
-    raw = contract_status(live.raw_status) if live is not None and alive else ""
+    # the registry's own word (diagnostics) and its §6 mapping (``shell`` — a shell tool
+    # running, or an idle session holding a background task — is ``busy``)
+    raw_status = (live.raw_status or None) if live is not None and alive else None
+    raw = contract_status(raw_status) if raw_status else ""
     state = raw if raw in LIVE_STATES else ins.transcript_state
     aim = (row.aim or "").strip() if row is not None and row.aim else ""
     decision = ins.decision(state, "")
@@ -189,6 +197,8 @@ def run_inspect(deps: BridgeDeps, session_id: str, *, use_llm: bool = True) -> d
         "launch_profile": (row.launch_profile or None) if row is not None else None,
         "actions": ins.actions,
         "brief": ins.brief,
+        "turn_active": ins.turn_active,
+        "raw_status": raw_status,
     }
 
 

@@ -442,6 +442,22 @@ def _typed_prompt(record: dict[str, Any]) -> str | None:
     return text
 
 
+def _is_task_notice(record: dict[str, Any]) -> bool:
+    """A main-chain ``user`` record whose content is a ``<task-notification>`` (a background
+    task ending — e.g. a staff wait — starts a turn with it). Never a human prompt."""
+    if record.get("type") != "user" or not _is_main(record):
+        return False
+    content = _content(record)
+    if isinstance(content, str):
+        text = content
+    else:
+        blocks = _blocks(record)
+        if not blocks or any(b.get("type") == "tool_result" for b in blocks):
+            return False
+        text = "\n".join(str(b.get("text") or "") for b in blocks if b.get("type") == "text")
+    return text.lstrip().startswith(TASK_NOTIFICATION_PREFIX)
+
+
 def _queued_prompt(record: dict[str, Any]) -> str | None:
     """Text of a prompt queued while busy and absorbed into the turn, or None."""
     if record.get("type") != "attachment" or not _is_main(record):
@@ -559,6 +575,10 @@ def scan(records: list[dict[str, Any]]) -> Scan:
             s.reply_anchor = s.todo_anchor = None
             s.turn_open = True
             s.pending = []
+        elif _is_task_notice(record):
+            # a notice starts a turn (not a human input: last_prompt stays); an enqueued
+            # notice (``queue-operation/enqueue``) alone does not
+            s.turn_open = True
         rtype = record.get("type")
         if rtype == "user":
             _scan_user(s, record, answered)
@@ -926,6 +946,9 @@ class Inspection:  # pylint: disable=too-many-instance-attributes  # one field p
     actions: list[dict[str, Any]] = field(default_factory=list)
     #: The pending picker's ``**Decision brief**`` block (:func:`decision_brief`).
     brief: str | None = None
+    #: A main-chain turn is open (``turn_open`` or a pending picker), from the transcript
+    #: alone — whatever the live registry says.
+    turn_active: bool = False
 
     def decision(self, state: str, summary: str) -> dict[str, Any] | None:
         """The §6 ``decision`` object (``None`` when there is none in *state*)."""
@@ -970,6 +993,7 @@ def inspect(records: list[dict[str, Any]]) -> Inspection:
         anchor=anchor,
         actions=todo_actions(reply) if s.todo_anchor else [],
         brief=decision_brief(s.pending[0].preceding_text) if len(s.pending) == 1 else None,
+        turn_active=bool(s.turn_open or s.pending),
     )
 
 

@@ -3435,6 +3435,8 @@ Reads the session's transcript. `data`:
 | `account`     | that dir's configured account label, as in `ccc sessions -j`            |
 | `actions`     | every `You [kind]: …` line of the current turn's to-do list (below)     |
 | `brief`       | the pending picker's `**Decision brief**` block, or `null` (below)      |
+| `turn_active` | the transcript says a main-chain turn is open (below)                   |
+| `raw_status`  | the registry's word before the `state` mapping, `null` when not live    |
 
 `decision = {decision_id, source, questions: [{text, multi_select, options: [{label,
 consequence}]}], recommendation, recommendation_reason, context: {aim, ticket,
@@ -3447,7 +3449,7 @@ to `ccc answer`. `recent_summary` (≤ 800 characters) comes from the ccc LLM pu
 back to the first three sentences of the last reply. Codes: `unknown_session`,
 `transcript_missing`, `transcript_unknown`.
 
-The last five fields are additive (`schema_version` stays 1); absent values are `null` or
+The last seven fields are additive (`schema_version` stays 1); absent values are `null` or
 `[]`, never an error.
 
 - `actions[] = {kind, text, tp_id, brief_ref, brief}` — one per `You [kind]: text` line
@@ -3463,6 +3465,14 @@ The last five fields are additive (`schema_version` stays 1); absent values are 
   i.e. right before the call. The block runs over its labelled lines (`Background:`,
   `Building:`, `Fit:`, `Recommendation:`) up to a heading, another bold title line or a
   blank line not followed by a labelled line.
+- `turn_active` — `true` while the transcript shows a main-chain turn in progress (a prompt,
+  tool call or a `<task-notification>` user record opened it and no end-of-turn marker
+  closed it) or a pending picker; `false` once the turn ended. Read from the transcript
+  alone, whatever the registry says: `state` keeps the registry word, so an idle session
+  that holds a background task (a staff wait, a keep-warm timer) reads `state: busy`,
+  `turn_active: false`. `null` only when it cannot be told (never for a parsed transcript).
+- `raw_status` — the registry's word before it is mapped to `state` (`shell`, `busy`,
+  `idle`, …), `null` when the session is not live. Diagnostics only.
 
 Every `brief` (top-level and per action) is raw markdown, at most 4000 characters, head kept
 (cut with `…`). A `todo_line` decision's question text drops the `(brief D<n>)` marker too.

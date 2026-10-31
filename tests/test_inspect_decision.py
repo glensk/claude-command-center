@@ -17,6 +17,8 @@ from bridgestub import (
     question,
     run_cli,
     task_notice,
+    tool_result,
+    tool_use,
     turn_end,
     user,
 )
@@ -82,6 +84,9 @@ def test_cli_envelope_matches_the_fixture(
     assert data.pop("account") == world.config_dir.name  # not a configured account
     assert data.pop("launch_profile") is None  # a plain session has no profile
     assert data.pop("brief") is None  # no fixture carries a Decision brief
+    # the additive tp#1484 fields: the registry word and the transcript's turn state
+    assert data.pop("raw_status") == expected["state"]
+    assert data.pop("turn_active") is (expected["state"] != "idle")
     kinds = [a["kind"] for a in data.pop("actions")]
     assert kinds == (["decision", "decision"] if name == "todo_decision" else [])
     assert _normalise(data) == expected
@@ -207,3 +212,83 @@ def test_unknown_cli_argument_is_a_usage_error(
     world = World(tmp_path)
     code, _env, _err = run_cli(monkeypatch, capsys, world, ["inspect", "-s", SID, "--bogus"])
     assert code == 2
+
+
+# --------------------------------------------------------------- turn_active (tp#1484)
+
+
+def _closed_turn(world: World) -> None:
+    world.write(user("start the wait"), *turn_end("waiting for the batch"))
+
+
+def _notice_record() -> dict[str, Any]:
+    """A main-chain user record carrying a ``<task-notification>`` (a staff wait ended)."""
+    return {
+        "type": "user",
+        "isSidechain": False,
+        "uuid": "00000000-0000-4000-8000-999999999999",
+        "message": {"role": "user", "content": "<task-notification>\n<task-id>b1</task-id>"},
+        "origin": {"kind": "task-notification", "producer": "session-task"},
+    }
+
+
+@pytest.mark.parametrize("raw", ["shell", "busy"])
+def test_closed_turn_is_not_active_while_the_registry_says_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], raw: str
+) -> None:
+    world = World(tmp_path, status=raw)
+    _closed_turn(world)
+    code, env, _err = run_cli(monkeypatch, capsys, world, ["inspect", "-s", SID, "-N", "-j"])
+    assert code == 0 and env is not None
+    data = env["data"]
+    assert data["state"] == "busy"  # the registry word still maps to busy
+    assert data["raw_status"] == raw
+    assert data["turn_active"] is False
+
+
+def test_not_live_has_no_raw_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = World(tmp_path, status="shell", alive=False)
+    _closed_turn(world)
+    code, env, _err = run_cli(monkeypatch, capsys, world, ["inspect", "-s", SID, "-N", "-j"])
+    assert code == 0 and env is not None
+    assert env["data"]["live"] is False
+    assert env["data"]["raw_status"] is None
+    assert env["data"]["state"] == "idle" and env["data"]["turn_active"] is False
+
+
+def test_open_turn_with_a_running_tool_is_active(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    world.write(user("run it"), tool_use("Bash", "toolu_b", {"command": "true"}))
+    assert cb.inspect(cb.load_records(world.transcript)).turn_active is True
+
+
+def test_pending_picker_is_active(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    world.write(user("go"), ask("toolu_q", [question("Colour?", ["red", "green"])]))
+    ins = cb.inspect(cb.load_records(world.transcript))
+    assert ins.transcript_state == "waiting" and ins.turn_active is True
+
+
+def test_task_notification_user_record_opens_the_turn_but_an_enqueue_does_not(
+    tmp_path: Path,
+) -> None:
+    world = World(tmp_path)
+    _closed_turn(world)
+    world.write(task_notice())  # queue-operation/enqueue of a notice alone
+    ins = cb.inspect(cb.load_records(world.transcript))
+    assert ins.turn_active is False and ins.transcript_state == "idle"
+    world.write(_notice_record())
+    ins = cb.inspect(cb.load_records(world.transcript))
+    assert ins.turn_active is True and ins.transcript_state == "busy"
+    assert ins.last_prompt == "start the wait"  # a notice is never a human input
+
+
+def test_tool_result_after_a_notice_keeps_the_turn_open_until_it_ends(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    _closed_turn(world)
+    world.write(_notice_record(), tool_use("Bash", "toolu_c", {}), tool_result("toolu_c"))
+    assert cb.inspect(cb.load_records(world.transcript)).turn_active is True
+    world.write(*turn_end("read the inbox"))
+    assert cb.inspect(cb.load_records(world.transcript)).turn_active is False
