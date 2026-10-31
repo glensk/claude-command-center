@@ -101,15 +101,20 @@ def test_label_column_is_added_to_an_older_db(tmp_path: Path) -> None:
 
 def test_purpose_and_items_columns_are_added_to_an_older_db(tmp_path: Path) -> None:
     db = tmp_path / "legacy.db"
-    old_schema = AWAIT_SCHEMA.replace(
-        "updated_at         INTEGER NOT NULL DEFAULT 0,\n"
-        "    purpose            TEXT    NOT NULL DEFAULT '',\n"
-        "    items              TEXT    NOT NULL DEFAULT '[]',\n"
-        "    fresh              INTEGER NOT NULL DEFAULT 0\n",
-        "updated_at         INTEGER NOT NULL DEFAULT 0\n",
+    # Derive the older await_groups table by dropping every column added after
+    # ``updated_at`` (line based, so a newly appended column cannot break the test).
+    added = ("purpose", "items", "fresh", "launch_profile")
+    kept = [
+        ln
+        for ln in AWAIT_SCHEMA.splitlines()
+        if not any(ln.strip().startswith(col + " ") for col in added)
+    ]
+    old_schema = "\n".join(kept).replace(
+        "updated_at         INTEGER NOT NULL DEFAULT 0,\n);",
+        "updated_at         INTEGER NOT NULL DEFAULT 0\n);",
     )
     assert "purpose" not in old_schema and "items " not in old_schema
-    assert "fresh" not in old_schema
+    assert "fresh" not in old_schema and "launch_profile" not in old_schema
     conn = sqlite3.connect(db)
     conn.executescript(store_mod._SCHEMA + old_schema)  # noqa: SLF001
     conn.execute("INSERT INTO sessions (session_id, cwd) VALUES ('s1', '/repo')")
