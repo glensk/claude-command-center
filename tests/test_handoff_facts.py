@@ -429,6 +429,36 @@ def test_capture_roundtrip_and_facts_lookup(world: dict[str, Any], tmp_path: Pat
     assert handoff_facts.find_snapshot("nope", None) is None
 
 
+def test_facts_reads_the_transfers_stored_snapshot_not_the_newest(
+    world: dict[str, Any], tmp_path: Path
+) -> None:
+    """``facts <transfer>`` follows ``transfers.facts_snapshot`` (B5), whatever is newer."""
+    from command_center.transfer_store import Transfer
+
+    stub = stub_scrubber(tmp_path)
+    scrubber = handoff_facts.Scrubber(stub.scrub_cmd)
+    older = _collect(world, tmp_path, scrubber=scrubber)
+    snap_old, path_old = handoff_facts.freeze(older, scrubber)
+    newer = dict(
+        older,
+        facts=[
+            *older["facts"],
+            handoff_facts.rec("wait", "w:1", "Open items and questions", 2, note="later"),
+        ],
+    )
+    snap_new, path_new = handoff_facts.freeze(newer, scrubber)
+    assert snap_old != snap_new and path_new.exists()
+    with Store() as store:
+        store.create_transfer(
+            Transfer(
+                transfer_id="t1", source_session=SID, target_session="x", facts_snapshot=snap_old
+            ),
+            1,
+        )
+        assert handoff_facts.find_snapshot("t1", store) == (SID, path_old)
+        assert handoff_facts.find_snapshot(SID, store) is not None  # sid: newest
+
+
 def test_invalid_session_id_is_not_a_path() -> None:
     with pytest.raises(handoff_facts.FactsError):
         handoff_facts.facts_dir("../../etc")

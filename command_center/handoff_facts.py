@@ -52,6 +52,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .handoff_doc import escape_headings
+
 if TYPE_CHECKING:
     from .adapters.claude import ClaudeAdapter
     from .continue_session import Source
@@ -1050,11 +1052,14 @@ def save_capture(doc: dict[str, Any], scrubber: Scrubber | None = None) -> Path:
     return path
 
 
-def freeze(doc: dict[str, Any], scrubber: Scrubber | None = None) -> tuple[str, Path]:
+def freeze(
+    doc: dict[str, Any], scrubber: Scrubber | None = None, *, write: bool = True
+) -> tuple[str, Path]:
     """Freeze *doc* as ``<snap12>.json`` (D2); ``(snapshot id, path)``.
 
     The id is the sha256 of the SCRUBBED canonical JSON, so the same facts always map to
     the same path whatever transfer id comes later. Fail closed on a withheld scrub.
+    ``write=False`` only computes the id (a dry run writes nothing).
     """
     scrub_with = scrubber or Scrubber()
     clean = scrub_with.text(canonical(doc))
@@ -1064,17 +1069,12 @@ def freeze(doc: dict[str, Any], scrubber: Scrubber | None = None) -> tuple[str, 
         raise FactsError("the scrubber broke the snapshot JSON — withheld") from exc
     snap = hashlib.sha256(clean.encode("utf-8")).hexdigest()
     path = facts_dir(doc["session_id"]) / f"{snap[:12]}.json"
-    if not path.exists():
+    if write and not path.exists():
         write_private(path, clean)
     return snap, path
 
 
 # --------------------------------------------------------------------------- rendering
-
-
-def escape_headings(text: str) -> str:
-    """Backslash the first ``#`` of every line matching ``^ {0,3}#`` (D16)."""
-    return re.sub(r"(?m)^( {0,3})#", r"\1\\#", text)
 
 
 def _scalar(value: Any) -> str:

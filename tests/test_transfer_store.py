@@ -213,3 +213,31 @@ def test_closed_status_keeps_handed_off_terminal() -> None:
     assert closed_status(Session(session_id="x", handed_off_to="y")) is Status.HANDED_OFF
     assert closed_status(Session(session_id="x", handed_off_to="y"), done=True) is Status.DONE
     assert closed_status(Session(session_id="x")) is Status.PARKED
+
+
+def test_migration_adds_the_nullable_facts_snapshot_column_to_an_existing_db(
+    tmp_path: Path,
+) -> None:
+    """A transfers table from before B5 gains ``facts_snapshot``; old rows read as ""."""
+    path = tmp_path / "pre-b5.db"
+    with Store(path) as store:
+        store.ensure("s1", cwd="/repo")
+        store.create_transfer(_transfer("s1", transfer_id="told"), NOW)
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE transfers DROP COLUMN facts_snapshot")
+    conn.commit()
+    conn.close()
+    with Store(path) as store:  # reopening runs the additive migration
+        cols = {r["name"] for r in store.conn.execute("PRAGMA table_info(transfers)")}
+        assert "facts_snapshot" in cols
+        old = store.get_transfer("told")
+        assert old is not None and old.facts_snapshot == ""
+        store.transition_transfer("told", "failed", NOW, failure="x")
+        new = store.create_transfer(
+            _transfer("s1", transfer_id="tnew", facts_snapshot="ab" * 32), NOW
+        )
+        assert new.facts_snapshot == "ab" * 32
+    with Store(path) as store:  # a second open (a peer's migration) is a no-op
+        got = store.get_transfer("tnew")
+        assert got is not None and got.facts_snapshot == "ab" * 32
+        assert "facts_snapshot" not in got.snapshot()  # not part of the retry-match fields

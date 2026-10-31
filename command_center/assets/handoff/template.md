@@ -1,45 +1,46 @@
 # Handoff
 
-<!-- Fill EVERY section below; write "none" where a section has nothing to say.
-     The successor session reads only this text (plus the source transcript as evidence),
-     so be concrete: ids, paths, commands, exact next actions. Never paste credential
-     values. Size cap: 24 KB. Comments like this one are ignored by the validator. -->
+<!-- v2. YOU write ONLY the three sections marked "write this": Current state, Decisions
+     and constraints, First steps (at most 10 KB together; no other `##` heading). Delete the
+     other six headings or leave them empty: ccc fills them from recorded facts at
+     `continue-session start` (AIM, tp ownership, repos/files/worktrees, subagent specs and
+     results, background restarts, open items). Run `ccc continue-session collect -m` first
+     to see which facts ccc already carries, and write only what they lack. Be concrete:
+     ids, paths, commands, exact next actions. Never paste credential values.
+     Comments like this one are ignored by the validator. -->
 
 ## Goal and done-condition
 
-<!-- The AIM / done-condition verbatim, the tp item(s), what "finished" looks like. -->
+<!-- filled by ccc (the AIM and sub-goals); leave empty -->
 
 ## Current state
 
-<!-- What is done, what is half done, what was verified (and how). -->
+<!-- write this: what is done, what is half done, what was verified (and how). -->
 
 ## Decisions and constraints
 
-<!-- Decisions taken (and by whom), rules that apply, things NOT to do. -->
+<!-- write this: decisions taken (and by whom), rules that apply, things NOT to do. -->
 
 ## tp ownership
 
-<!-- Work items (e.g. tp tickets) this session claims / drives / may close; plan boxes ticked or reported. -->
+<!-- filled by ccc (tp held items, plan boxes); leave empty -->
 
 ## Repositories, files, worktrees
 
-<!-- Repos, branches, worktrees, changed files, commits landed, uncommitted work. -->
+<!-- filled by ccc (commit ledger, owned files, worktrees); leave empty -->
 
 ## Subagent continuations
 
-<!-- One block per subagent that was running: its type, the continuation capsule it
-     returned (task, progress, decisions, worktree/branch, changed files, commits, checks
-     run, plan boxes, exact next action). "none" when no subagent ran. -->
+<!-- filled by ccc (spec paths and last results of every subagent); leave empty -->
 
 ## Background restarts
 
-<!-- One line per stopped background shell: purpose, cwd, exact restart command, who
-     consumes its result. "none" when nothing has to be restarted. -->
+<!-- filled by ccc (shells classified restartable / evidence only, crons, timers); leave empty -->
 
 ## Open items and questions
 
-<!-- Open questions for the user, pending decisions, known risks. -->
+<!-- filled by ccc (questions, You lines, warnings); leave empty -->
 
 ## First steps
 
-<!-- The exact first actions the successor takes, in order. -->
+<!-- write this: the exact first actions the successor takes, in order. -->

@@ -3,7 +3,8 @@
 
 One row per ``ccc continue-session start``: an IMMUTABLE snapshot of what is being handed
 over (source / target session and account, cwd, the source AIM and its revision, models,
-``no_codex``, the handoff text's sha256 and stored path) plus the state machine::
+``no_codex``, the handoff's digest and stored path, and the id of the facts snapshot it was composed
+from) plus the state machine::
 
     prepared ──► opened ──► accepted ──► finalized
         │           │
@@ -102,7 +103,8 @@ CREATE TABLE IF NOT EXISTS transfers (
     opened_at         INTEGER NOT NULL DEFAULT 0,
     accepted_at       INTEGER NOT NULL DEFAULT 0,
     finalized_at      INTEGER NOT NULL DEFAULT 0,
-    updated_at        INTEGER NOT NULL DEFAULT 0
+    updated_at        INTEGER NOT NULL DEFAULT 0,
+    facts_snapshot    TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_transfers_active_source ON transfers(source_session)
     WHERE state IN ('prepared', 'opened', 'accepted');
@@ -142,6 +144,7 @@ class Transfer:  # pylint: disable=too-many-instance-attributes
     accepted_at: int = 0
     finalized_at: int = 0
     updated_at: int = 0
+    facts_snapshot: str = ""  # id of the frozen facts snapshot the handoff was composed from
 
     def snapshot(self) -> dict[str, Any]:
         """The fields a retry must match (:data:`SNAPSHOT_FIELDS`)."""
@@ -170,6 +173,7 @@ def _row_to_transfer(row: sqlite3.Row) -> Transfer:
     data["no_codex"] = bool(data.get("no_codex"))
     data["capped"] = bool(data.get("capped"))
     data["launch_profile"] = str(data.get("launch_profile") or "")  # NULL (old row) = none
+    data["facts_snapshot"] = str(data.get("facts_snapshot") or "")
     return Transfer(**data)
 
 
@@ -185,6 +189,7 @@ class TransferStoreMixin:
         data["no_codex"] = int(bool(data["no_codex"]))
         data["capped"] = int(bool(data["capped"]))
         data["launch_profile"] = data["launch_profile"] or None
+        data["facts_snapshot"] = data["facts_snapshot"] or None
         cols = ", ".join(data)
         marks = ", ".join("?" for _ in data)
         try:

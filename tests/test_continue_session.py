@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -176,6 +175,12 @@ class _Harness:
             "validate",
             lambda raw, scrub_policy=None: original(raw, scrub_policy=stub.scrub_cmd),
         )
+        from command_center import handoff_facts  # pylint: disable=import-outside-toplevel
+
+        real_scrubber = handoff_facts.Scrubber
+        monkeypatch.setattr(
+            handoff_facts, "Scrubber", lambda policy=None: real_scrubber(policy or stub.scrub_cmd)
+        )
         self.launches: list[str] = []
         self.launcher = "iterm_api"
         monkeypatch.setattr(continue_session, "_launch", self._launch)
@@ -226,7 +231,10 @@ def test_start_hands_off_to_a_new_session_and_finalizes(
         assert transfer.state == "finalized" and transfer.launcher == "iterm_api"
         assert transfer.target_config_dir == str(harness.private)
         stored = Path(transfer.handoff_path).read_text(encoding="utf-8")
-        assert hashlib.sha256(stored.encode()).hexdigest() == transfer.prompt_sha256
+        model = handoff_doc.parse_model_file(harness.file.read_bytes())
+        assert transfer.facts_snapshot
+        assert transfer.prompt_sha256 == handoff_doc.model_digest(model, transfer.facts_snapshot)
+        assert "AIM (done-condition): tp#1 shipped" in stored
         assert oct(Path(transfer.handoff_path).stat().st_mode & 0o777) == "0o600"
         job = store.get(target)
         assert job is not None and job.draft and job.no_codex
@@ -256,6 +264,9 @@ def test_dry_run_uses_session_id_never_resume(
     assert harness.launches == []
     with Store() as store:
         assert store.transfers_of(SID) == []
+    from command_center import config  # pylint: disable=import-outside-toplevel
+
+    assert not (config.app_home() / "handoffs").exists()  # a dry run writes nothing
 
 
 def test_launcher_failure_leaves_the_source_untouched(harness: _Harness) -> None:
@@ -310,6 +321,103 @@ def test_rerun_after_acceptance_finalizes(harness: _Harness) -> None:
     with Store() as store:
         assert store.transfers_of(SID)[0].state == "finalized"
     assert len(harness.launches) == 1
+
+
+def _model_file(**override: str) -> str:
+    parts = ["# Handoff", ""]
+    for title in handoff_doc.MODEL_SECTIONS:
+        parts += [f"## {title}", "", override.get(title, f"mine: {title}"), ""]
+    return "\n".join(parts)
+
+
+def test_start_composes_a_three_section_model_part_with_the_facts(
+    harness: _Harness,
+) -> None:
+    harness.file.write_text(_model_file(), encoding="utf-8")
+    assert harness.start() == 0
+    with Store() as store:
+        (transfer,) = store.transfers_of(SID)
+        stored = Path(transfer.handoff_path).read_text(encoding="utf-8")
+        job = store.get(transfer.target_session)
+    found = handoff_doc.sections(stored)
+    assert "AIM (done-condition): tp#1 shipped" in found["goal and done-condition"]
+    assert "[ ] sub-goal: test" in found["goal and done-condition"]
+    assert found["first steps"] == "mine: First steps"
+    assert "predecessor transcript" in found["current state"].lower()
+    assert transfer.facts_snapshot
+    from command_center import handoff_facts  # pylint: disable=import-outside-toplevel
+
+    path = handoff_facts.facts_dir(SID) / f"{transfer.facts_snapshot[:12]}.json"
+    assert path.exists() and oct(path.stat().st_mode & 0o777) == "0o600"
+    assert job is not None and f"continue-session facts {SID}" in (job.prompt or "")
+    assert "Decide before restarting" in (job.prompt or "")
+
+
+def test_an_eleven_kb_model_part_is_refused_before_anything_is_written(
+    harness: _Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    harness.file.write_text(_model_file(**{"Current state": "y" * 11000}), encoding="utf-8")
+    assert harness.start() == 1
+    assert "the cap is" in capsys.readouterr().err
+    with Store() as store:
+        assert store.transfers_of(SID) == []
+
+
+def test_waiting_then_a_ledger_change_then_the_same_start_reuses_the_transfer(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center import handoff_facts  # pylint: disable=import-outside-toplevel
+
+    harness.file.write_text(_model_file(), encoding="utf-8")
+    harness.accept_on_sleep = False
+    assert harness.start("-w", "0") == continue_session.EXIT_WAITING
+    with Store() as store:
+        (first,) = store.transfers_of(SID)
+        stored = Path(first.handoff_path).read_text(encoding="utf-8")
+    assert first.facts_snapshot
+
+    def _no_recollection(*_a: object, **_k: object) -> None:
+        raise AssertionError("a retry must reuse the stored snapshot, not collect again")
+
+    monkeypatch.setattr(handoff_facts, "collect", _no_recollection)
+    with Store() as store:  # the ledger moves on: sub-goals and AIM facts differ now
+        store.set_subgoals(SID, ["something else"])
+    harness.accept_on_sleep = True
+    assert harness.start() == 0
+    with Store() as store:
+        (again,) = store.transfers_of(SID)
+    assert again.transfer_id == first.transfer_id and again.state == "finalized"
+    assert again.facts_snapshot == first.facts_snapshot
+    assert Path(again.handoff_path).read_text(encoding="utf-8") == stored
+
+
+def test_a_retry_with_another_model_file_still_names_the_digest(
+    harness: _Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    harness.file.write_text(_model_file(), encoding="utf-8")
+    harness.accept_on_sleep = False
+    assert harness.start("-w", "0") == continue_session.EXIT_WAITING
+    harness.file.write_text(_model_file(**{"First steps": "different"}), encoding="utf-8")
+    assert harness.start("-w", "0") == 1
+    assert "different prompt_sha256" in capsys.readouterr().err
+
+
+def test_a_transfer_from_before_snapshots_keeps_the_whole_document_path(
+    harness: _Harness,
+) -> None:
+    harness.accept_on_sleep = False
+    assert harness.start("-w", "0") == continue_session.EXIT_WAITING
+    with Store() as store:
+        (first,) = store.transfers_of(SID)
+        store.conn.execute(
+            "UPDATE transfers SET facts_snapshot = NULL, prompt_sha256 = ?",
+            (handoff_doc.validate(harness.file.read_bytes()).sha256,),
+        )
+        store.conn.commit()
+    harness.accept_on_sleep = True
+    assert harness.start() == 0
+    with Store() as store:
+        assert store.transfers_of(SID)[0].transfer_id == first.transfer_id
 
 
 def test_start_refuses_from_another_shell(

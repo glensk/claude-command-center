@@ -729,7 +729,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         "launch_profile": "TEXT NOT NULL DEFAULT ''",
     }
 
-    _ADDED_TRANSFER_COLUMNS = {"launch_profile": "TEXT"}
+    _ADDED_TRANSFER_COLUMNS = {"launch_profile": "TEXT", "facts_snapshot": "TEXT"}
 
     def _add_column(self, table: str, column: str, decl: str) -> None:
         """``ALTER TABLE`` *table* to add *column*, tolerating a peer that just did it.

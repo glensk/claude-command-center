@@ -27,7 +27,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
     _direct_run(__file__)
 
-# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
+# pylint: disable=wrong-import-position,ungrouped-imports,too-many-lines  # shim first; one verb file
 
 import argparse
 import json
@@ -311,7 +311,10 @@ def preamble(transfer: Any, source_label: str, transcript: str) -> str:
         f"FIRST run: ccc continue-session accept {transfer.transfer_id}\n"
         "Only after it succeeds: relaunch every agent under 'Subagent continuations' as a NEW "
         "Agent from its capsule (old agent ids cannot be resumed across sessions), restart "
-        "every shell under 'Background restarts', then follow 'First steps'. If accept "
+        "ONLY the shells under 'Background restarts' marked `restart:` (declared restartable; "
+        "the ones under 'Decide before restarting' are evidence, judge each before re-running "
+        "anything), then follow 'First steps'. Facts cut for size: "
+        f"ccc continue-session facts {transfer.source_session} -j. If accept "
         "fails, stop and report why: the old session stays authoritative until it succeeds.\n"
         "\n"
     )
@@ -387,7 +390,13 @@ def _checked_profile(profile: str) -> str:
 
 
 def _candidate(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    store: Store, src: Source, target_dir: str, label: str, args: Any, digest: str
+    store: Store,
+    src: Source,
+    target_dir: str,
+    label: str,
+    args: Any,
+    digest: str,
+    facts_snapshot: str = "",
 ) -> Transfer:
     """The snapshot this ``start`` would write (target id and transfer id still unset)."""
     from .transfer_store import Transfer
@@ -411,6 +420,7 @@ def _candidate(  # pylint: disable=too-many-arguments,too-many-positional-argume
         launch_profile=profile,
         prompt_sha256=digest,
         capped=bool(getattr(args, "capped", False)),
+        facts_snapshot=facts_snapshot,
     )
 
 
@@ -628,9 +638,89 @@ def _capped_text(adapter: ClaudeAdapter, store: Store, src: Source) -> bytes | N
     return None if text is None else text.encode("utf-8")
 
 
+@dataclass
+class _Composed:
+    """What ``start`` hands to the transfer: the vouched text, its digest, the snapshot id."""
+
+    text: str
+    digest: str
+    snapshot: str = ""
+
+
+def _stored_snapshot(source_sid: str, snapshot: str) -> dict[str, Any] | None:
+    from . import handoff_facts
+
+    try:
+        hit = sorted(handoff_facts.facts_dir(source_sid).glob(f"{snapshot[:12]}*.json"))
+        doc = json.loads(hit[0].read_text(encoding="utf-8")) if hit else None
+    except (OSError, ValueError, handoff_facts.FactsError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _compose(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    adapter: ClaudeAdapter, store: Store, src: Source, raw: bytes, active: Any, args: Any
+) -> _Composed:
+    """D2: facts frozen into a snapshot + the model file, composed once per transfer.
+
+    An active PREPARED / OPENED transfer that already has a snapshot is REUSED (stored
+    snapshot and stored composed text, no recollection): its digest is recomputed from the
+    given model file and the stored snapshot id, so a changed ledger cannot fork a retry.
+    ``--capped`` (B6 moves it) and a transfer from before snapshots keep the whole-document
+    path.
+    """
+    from . import handoff_doc, handoff_facts
+    from .transfer_store import OPENED, PREPARED
+
+    if getattr(args, "capped", False) or (
+        active is not None and active.state in (PREPARED, OPENED) and not active.facts_snapshot
+    ):
+        doc = handoff_doc.validate(raw)
+        if not doc.ok:
+            raise StartRefused("handoff rejected — " + "; ".join(doc.errors))
+        return _Composed(doc.text, doc.sha256)
+    model = handoff_doc.parse_model_file(raw)
+    if not model.ok:
+        raise StartRefused("handoff rejected — " + "; ".join(model.errors))
+    sid = src.session_id
+    if active is not None and active.state in (PREPARED, OPENED):
+        digest = handoff_doc.model_digest(model, active.facts_snapshot)
+        try:
+            stored = Path(active.handoff_path).read_text(encoding="utf-8")
+        except OSError:
+            stored = ""
+        if stored and digest == active.prompt_sha256:
+            return _Composed(stored, digest, active.facts_snapshot)
+        snap_doc = _stored_snapshot(sid, active.facts_snapshot)
+        if snap_doc is None:
+            raise StartRefused(f"the stored facts snapshot {active.facts_snapshot[:12]} is gone")
+        snapshot = active.facts_snapshot
+    else:
+        scrubber = handoff_facts.Scrubber()
+        try:
+            snap_doc = handoff_facts.collect(
+                adapter, store, src, "finalize", scrubber=scrubber, persist=not args.dry_run
+            )
+            snapshot, _path = handoff_facts.freeze(snap_doc, scrubber, write=not args.dry_run)
+        except handoff_facts.FactsError as exc:
+            raise StartRefused(f"facts collection refused — {exc}") from exc
+    snap12 = snapshot[:12]
+    model_path = handoff_facts.facts_dir(sid) / f"{snap12}.model.md"
+    doc, composed = handoff_doc.compose_checked(
+        model, snap_doc, ref=sid, model_path=str(model_path)
+    )
+    if not doc.ok:
+        raise StartRefused("handoff rejected — " + "; ".join(doc.errors))
+    if composed.model_cut and not args.dry_run:  # D9: the cut part stays retrievable
+        try:
+            handoff_facts.write_private(model_path, handoff_facts.Scrubber().text(model.raw))
+        except handoff_facts.FactsError as exc:
+            raise StartRefused(f"facts collection refused — {exc}") from exc
+    return _Composed(doc.text, handoff_doc.model_digest(model, snapshot), snapshot)
+
+
 def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
     """``continue-session start``: hand this session's work to a NEW session."""
-    from . import handoff_doc
     from .models import now_ms
     from .transfer_store import ACCEPTED
 
@@ -645,7 +735,7 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
         session = store.get(src.session_id)
         if session is not None and session.handed_off_to:
             return _fail(args, src.session_id, f"{src.session_id} was already handed off")
-        if args.capped:
+        if args.capped:  # B6 moves the capped path onto compose; until then it is whole-document
             raw = _capped_text(adapter, store, src)
             if raw is None:
                 return _fail(
@@ -660,21 +750,24 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
                 raw = Path(args.file).read_bytes()
             except OSError as exc:
                 return _fail(args, src.session_id, f"cannot read the handoff file: {exc}")
-        doc = handoff_doc.validate(raw)
-        if not doc.ok:
-            return _fail(args, src.session_id, "handoff rejected — " + "; ".join(doc.errors))
+        try:
+            composed = _compose(adapter, store, src, raw, active, args)
+        except StartRefused as exc:
+            return _fail(args, src.session_id, str(exc))
         try:
             target_dir = _preflight(adapter, store, src, args.account, dry_run=args.dry_run)
-            candidate = _candidate(store, src, target_dir, args.account, args, doc.sha256)
+            candidate = _candidate(
+                store, src, target_dir, args.account, args, composed.digest, composed.snapshot
+            )
             print(_account_change_note(src, candidate), file=sys.stderr)
             if args.dry_run:
                 candidate.transfer_id = "<transfer>"
                 candidate.handoff_path = str(handoff_path("<transfer>"))
-                return _dry_run(candidate, src, doc.text, args.json)
+                return _dry_run(candidate, src, composed.text, args.json)
             transfer = _reuse_or_create(store, candidate, now_ms())
         except StartRefused as exc:
             return _fail(args, src.session_id, str(exc))
-        code = _drive(store, transfer, src, doc.text, args)
+        code = _drive(store, transfer, src, composed.text, args)
         if code not in (0, EXIT_WAITING):
             return _fail(args, src.session_id, f"transfer {transfer.transfer_id} did not open")
         return code
