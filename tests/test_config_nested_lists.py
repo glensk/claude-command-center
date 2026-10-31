@@ -12,7 +12,7 @@ import tomllib
 
 from command_center import config
 
-HOOK = ["/Users/albert/tp.py", "handoff", "-S", "{old}", "--to", "{new}", "-j"]
+HOOK = ["/opt/tools/tp.py", "handoff", "-S", "{old}", "--to", "{new}", "-j"]
 
 
 def test_handoff_hooks_round_trip() -> None:
