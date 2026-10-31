@@ -725,7 +725,11 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         "purpose": "TEXT NOT NULL DEFAULT ''",
         "items": "TEXT NOT NULL DEFAULT '[]'",
         "fresh": "INTEGER NOT NULL DEFAULT 0",
+        # Opaque launch-profile label the armed session ran under ("" = bare claude).
+        "launch_profile": "TEXT NOT NULL DEFAULT ''",
     }
+
+    _ADDED_TRANSFER_COLUMNS = {"launch_profile": "TEXT"}
 
     def _add_column(self, table: str, column: str, decl: str) -> None:
         """``ALTER TABLE`` *table* to add *column*, tolerating a peer that just did it.
@@ -777,6 +781,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         self._ensure_table_columns("mirror_vouch", self._ADDED_MIRROR_VOUCH_COLUMNS)
         self._ensure_table_columns("await_sources", self._ADDED_AWAIT_SOURCE_COLUMNS)
         self._ensure_table_columns("await_groups", self._ADDED_AWAIT_GROUP_COLUMNS)
+        self._ensure_table_columns("transfers", self._ADDED_TRANSFER_COLUMNS)
         self._ensure_table_columns("deliveries", ADDED_DELIVERY_COLUMNS)  # voice bridge
         self._ensure_table_columns("events", ADDED_EVENT_COLUMNS)
         # Partial index for the armed-fire scan (statusline chip + daemon dispatch).

@@ -2622,7 +2622,7 @@ def cmd_fire_attached(args: argparse.Namespace) -> int:
     return 0  # unreachable on success (execvp replaced the process)
 
 
-def cmd_fire_await(args: argparse.Namespace) -> int:
+def cmd_fire_await(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
     """internal: resume a FIRED ``ccc await`` group's session with its event.
 
     Runs in the tab ``await_delivery`` opened for a CLOSED session. The outbox row must
@@ -2659,22 +2659,31 @@ def cmd_fire_await(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        owner = store.get(group.session_id)
-        if owner is not None and accounts.session_launch_profile(owner):
-            store.revert_delivery(
-                group.id, args.token, now, max_attempts=1, reason="session has a launch profile"
-            )
-            print(
-                f"error: {group.session_id} runs under a launch profile — an await delivery "
-                "would start a bare claude, so it is refused",
-                file=sys.stderr,
-            )
-            return 1
         if not accounts.is_trusted(group.config_dir, group.cwd):
             store.revert_delivery(
                 group.id, args.token, now, max_attempts=1, reason="cwd no longer trusted"
             )
             print(f"error: {group.cwd} is not trusted for the session's account", file=sys.stderr)
+            return 1
+        owner = store.get(group.session_id)
+        profile = group.launch_profile or (
+            accounts.session_launch_profile(owner) if owner is not None else ""
+        )
+        try:  # re-resolved from its NAME now, before any state change
+            argv = (
+                launch_argv.claude_argv(
+                    name="", prompt=delivery_prompt(group), launch_profile=profile
+                )
+                if group.fresh
+                else launch_argv.claude_argv(
+                    resume=group.session_id, prompt=delivery_prompt(group), launch_profile=profile
+                )
+            )
+        except LaunchProfileError as exc:
+            store.revert_delivery(
+                group.id, args.token, now, max_attempts=1, reason="launch profile unresolvable"
+            )
+            print(f"error: {exc} — refusing to deliver", file=sys.stderr)
             return 1
         if not store.mark_delivered(group.id, args.token, now):
             print(
@@ -2682,15 +2691,9 @@ def cmd_fire_await(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        prompt = delivery_prompt(group)
     # A -F/--fresh group starts a NEW session (no id yet → no name to carry).
-    argv = (
-        launch_argv.claude_argv(name="", prompt=prompt)
-        if group.fresh
-        else launch_argv.claude_argv(resume=group.session_id, prompt=prompt)
-    )
     try:
-        accounts.pin_environ(group.config_dir, group.no_codex)
+        accounts.pin_environ(group.config_dir, group.no_codex, profile)
         _exec_in(group.cwd, argv, strict=True)
     except OSError as exc:
         with Store() as store:

@@ -20,9 +20,24 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import test_continue_session as tcs
 from bridgestub import SID, World, run_cli
 
-from command_center import accounts, cli, config, future_files, launch_argv, snapshot, terminal
+# pylint: disable=unused-import  # fixtures re-used by name from test_continue_session
+from test_continue_session import _fixture_session as fixture_session  # noqa: F401
+from test_continue_session import _harness as _harness_fixture  # noqa: F401
+
+# pylint: enable=unused-import
+from command_center import (
+    accounts,
+    cli,
+    config,
+    continue_session,
+    future_files,
+    launch_argv,
+    snapshot,
+    terminal,
+)
 from command_center.models import Session
 from command_center.store import Store
 
@@ -479,29 +494,13 @@ def test_cmd_start_job_refuses_a_vanished_profile_and_keeps_the_draft(
         assert row is not None and row.draft is True and row.fire_at == 0
 
 
-def test_await_arm_refuses_a_profile_session(job: str, capsys: pytest.CaptureFixture[str]) -> None:
-    """An await group carries no profile, so a closed-session delivery would be a bare claude."""
-    from command_center import await_cli
-
-    parser = cli.build_parser(only="await")
-    args = parser.parse_args(
-        ["await", "-s", job, "-x", "true", "-u", "1d", "-m", "{event}", "-P", PURPOSE]
-    )
-    assert await_cli.cmd_await(args) != 0
-    assert "launch profile" in capsys.readouterr().err
-    with Store() as store:
-        assert store.get_await_group(1) is None
-
-
-def test_fire_await_refuses_a_profile_session(
-    job: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Even a group armed before the profile existed never delivers through a bare claude."""
+def _arm_group(job: str, tmp_path: Path, **extra: Any) -> int:
+    """Arm a one-source await group on *job* through the store (what ``ccc await`` writes)."""
     from command_center.await_store import SourceSpec
 
     now = int(time.time())
     with Store() as store:
-        gid = store.arm_await(
+        return store.arm_await(
             job,
             config_dir=str(tmp_path / "acct"),
             cwd=str(tmp_path),
@@ -510,10 +509,16 @@ def test_fire_await_refuses_a_profile_session(
             until_epoch=now + 3600,
             sources=[SourceSpec(kind="zoho-reply", spec={}, watermark="w")],
             now=now,
-            purpose="Waiting for the requester to confirm the quota.",
+            purpose=PURPOSE,
             items=[],
-            fresh=False,
+            **extra,
         )
+
+
+def _deliver(gid: int) -> str:
+    """Fire *gid* and mark it ``delivering``; returns the delivery token."""
+    now = int(time.time())
+    with Store() as store:
         src = store.lease_due_sources(now + 120)[0][0]
         token = store.fire_group(
             gid,
@@ -526,7 +531,97 @@ def test_fire_await_refuses_a_profile_session(
             now=now,
         )
         assert token and store.mark_delivering(gid, token, now)
+    return token
+
+
+@pytest.mark.parametrize("fresh", [True, False])
+def test_await_arm_carries_the_profile_name(
+    job: str, fresh: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ccc await`` (-F or resume) snapshots the profile NAME onto the group, not the exe."""
+    from command_center import await_cli
+
+    monkeypatch.setattr(accounts, "ensure_trusted", lambda *_a, **_k: True)
+    monkeypatch.setattr(accounts, "is_trusted", lambda *_a: True)
+
+    parser = cli.build_parser(only="await")
+    argv = ["await", "-s", job, "-x", "true", "-u", "1d", "-m", "{event}", "-P", PURPOSE]
+    args = parser.parse_args(argv + (["-F"] if fresh else []))
+    assert await_cli.cmd_await(args) == 0
+    with Store() as store:
+        group = store.get_await_group(1)
+        assert group is not None and group.launch_profile == LABEL and group.fresh is fresh
+
+
+def test_await_arm_without_a_profile_stores_none(tmp_path: Path, exe: Path) -> None:
+    del exe
+    with Store() as store:
+        store.ensure("plain", cwd=str(tmp_path))
+    gid = _arm_group("plain", tmp_path)
+    with Store() as store:
+        group = store.get_await_group(gid)
+        assert group is not None and group.launch_profile == ""
+
+
+def test_await_arm_refuses_an_unresolvable_profile(
+    job: str, exe: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import await_cli
+
+    _vanish(exe)
+    parser = cli.build_parser(only="await")
+    args = parser.parse_args(
+        ["await", "-s", job, "-F", "-x", "true", "-u", "1d", "-m", "{event}", "-P", PURPOSE]
+    )
+    assert await_cli.cmd_await(args) != 0
+    assert "launch profile" in capsys.readouterr().err
+    with Store() as store:
+        assert store.get_await_group(1) is None
+
+
+def test_await_group_columns_are_added_to_a_pre_existing_db(tmp_path: Path) -> None:
+    """An older DB (no ``await_groups.launch_profile`` / ``transfers.launch_profile``) migrates."""
+    db = tmp_path / "old.db"
+    with Store(db) as store:
+        store.ensure("s", cwd=str(tmp_path))
+    conn = sqlite3.connect(db)
+    conn.execute("ALTER TABLE await_groups DROP COLUMN launch_profile")
+    conn.execute("ALTER TABLE transfers DROP COLUMN launch_profile")
+    conn.execute("INSERT INTO transfers (transfer_id, source_session) VALUES ('told', 's')")
+    conn.commit()
+    conn.close()
+    with Store(db) as store:
+        old = store.get_transfer("told")
+        assert old is not None and old.launch_profile == ""
+        cols = {r["name"] for r in store.conn.execute("PRAGMA table_info(await_groups)")}
+        assert "launch_profile" in cols
+
+
+def test_fire_await_fresh_execs_through_the_profile(
+    job: str, exe: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The delivery re-resolves the NAME: the new session starts through the executable."""
+    gid = _arm_group(job, tmp_path, fresh=True, launch_profile=LABEL)
+    token = _deliver(gid)
     monkeypatch.setattr(cli, "has_terminal", lambda: True)
+    monkeypatch.setattr(accounts, "is_trusted", lambda *_a: True)
+    seen = _Exec()
+    monkeypatch.setattr(os, "execvp", seen)
+    with pytest.raises(SystemExit):
+        cli.cmd_fire_await(argparse.Namespace(group_id=gid, token=token))
+    assert seen.argv[0] == str(exe) and "--resume" not in seen.argv
+    assert seen.env[accounts.PROFILE_VAR] == LABEL
+
+
+def test_fire_await_refuses_a_vanished_profile(
+    job: str, exe: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A profile that stopped resolving blocks the delivery; nothing execs, nothing claimed."""
+    gid = _arm_group(job, tmp_path, fresh=True, launch_profile=LABEL)
+    token = _deliver(gid)
+    _vanish(exe)
+    monkeypatch.setattr(cli, "has_terminal", lambda: True)
+    monkeypatch.setattr(accounts, "is_trusted", lambda *_a: True)
     _no_exec(monkeypatch)
     assert cli.cmd_fire_await(argparse.Namespace(group_id=gid, token=token)) == 1
     with Store() as store:
@@ -534,17 +629,94 @@ def test_fire_await_refuses_a_profile_session(
         assert group is not None and group.state == "blocked"
 
 
-def test_continue_session_refuses_a_profile_source(
-    job: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_fire_await_old_group_falls_back_to_the_session_profile(
+    job: str, exe: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from command_center import continue_session
+    """A group armed before the column existed still delivers through the session's profile."""
+    gid = _arm_group(job, tmp_path)  # launch_profile "" (as a migrated old row reads)
+    token = _deliver(gid)
+    monkeypatch.setattr(cli, "has_terminal", lambda: True)
+    monkeypatch.setattr(accounts, "is_trusted", lambda *_a: True)
+    seen = _Exec()
+    monkeypatch.setattr(os, "execvp", seen)
+    with pytest.raises(SystemExit):
+        cli.cmd_fire_await(argparse.Namespace(group_id=gid, token=token))
+    assert seen.argv[0] == str(exe) and "--resume" in seen.argv
 
+
+# --------------------------------------------------------------------------- #
+# continue-session: the profile travels state -> transfer -> draft -> accept
+# --------------------------------------------------------------------------- #
+@pytest.mark.usefixtures("exe")
+def test_continue_session_state_reports_the_profile(
+    harness: tcs._Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    del harness
     with Store() as store:
-        src = continue_session.Source(session_id=job, cwd="/repo")
-        monkeypatch.setattr(continue_session, "_open_source", lambda _a: (None, store, src))
-        args = argparse.Namespace(capped=False, file="", json=False, account="work", dry_run=False)
-        assert continue_session.cmd_start(args) == 1
-    assert "launch profile" in capsys.readouterr().err
+        store.update_fields(tcs.SID, launch_profile=LABEL)
+    assert cli.main(["continue-session", "state", "-s", tcs.SID, "-j"]) == 0
+    assert json.loads(capsys.readouterr().out)["launch_profile"] == LABEL
+
+
+@pytest.mark.usefixtures("exe")
+def test_continue_session_start_carries_the_profile_end_to_end(harness: tcs._Harness) -> None:
+    with Store() as store:
+        store.update_fields(tcs.SID, launch_profile=LABEL)
+    assert harness.start() == 0
+    with Store() as store:
+        (transfer,) = store.transfers_of(tcs.SID)
+        assert transfer.launch_profile == LABEL and transfer.state == "finalized"
+        draft = store.get(transfer.target_session)
+        assert draft is not None and draft.launch_profile == LABEL
+        assert "launch_profile" in transfer.to_dict()
+
+
+@pytest.mark.usefixtures("exe")
+def test_continue_session_without_a_profile_stays_bare(harness: tcs._Harness) -> None:
+    assert harness.start() == 0
+    with Store() as store:
+        (transfer,) = store.transfers_of(tcs.SID)
+        assert transfer.launch_profile == ""
+        draft = store.get(transfer.target_session)
+        assert draft is not None and draft.launch_profile is None
+
+
+def test_continue_session_start_refuses_an_unresolvable_profile(
+    exe: Path, harness: tcs._Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Fail closed: no transfer, no draft, no tab; the source stays authoritative."""
+    with Store() as store:
+        store.update_fields(tcs.SID, launch_profile=LABEL)
+    _vanish(exe)
+    assert harness.start() == 1
+    assert "authoritative" in capsys.readouterr().err
+    assert harness.launches == []
+    with Store() as store:
+        assert store.transfers_of(tcs.SID) == []
+        source = store.get(tcs.SID)
+        assert source is not None and not source.handed_off_to
+
+
+def test_continue_session_retry_re_resolves_the_profile(exe: Path, harness: tcs._Harness) -> None:
+    """A profile that vanishes between a timed-out start and its retry refuses the retry."""
+    with Store() as store:
+        store.update_fields(tcs.SID, launch_profile=LABEL)
+    harness.accept_on_sleep = False
+    assert harness.start("-w", "0") == continue_session.EXIT_WAITING
+    _vanish(exe)
+    assert harness.start("-w", "0") == 1
+    assert len(harness.launches) == 1  # the retry never relaunched
+    with Store() as store:
+        (transfer,) = store.transfers_of(tcs.SID)
+        assert transfer.state == "opened"
+
+
+def test_old_transfer_rows_read_as_no_profile() -> None:
+    with Store() as store:
+        store.conn.execute("INSERT INTO transfers (transfer_id, source_session) VALUES ('t', 'x')")
+        store.conn.commit()
+        row = store.get_transfer("t")
+        assert row is not None and row.launch_profile == ""
 
 
 def test_switch_account_and_switch_now_refuse_a_profile(

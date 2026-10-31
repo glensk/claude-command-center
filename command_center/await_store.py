@@ -102,7 +102,8 @@ CREATE TABLE IF NOT EXISTS await_groups (
     updated_at         INTEGER NOT NULL DEFAULT 0,
     purpose            TEXT    NOT NULL DEFAULT '',
     items              TEXT    NOT NULL DEFAULT '[]',
-    fresh              INTEGER NOT NULL DEFAULT 0
+    fresh              INTEGER NOT NULL DEFAULT 0,
+    launch_profile     TEXT    NOT NULL DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_await_groups_active
     ON await_groups(session_id) WHERE state IN {_ACTIVE_SQL};
@@ -212,6 +213,7 @@ class AwaitGroup:  # pylint: disable=too-many-instance-attributes  # one row, fl
     purpose: str = ""  # why the session waits (``ccc await -P``); '' on pre-purpose groups
     items: str = "[]"  # JSON list of related work items (``ccc await -T``)
     fresh: bool = False  # deliver into a NEW session, never resume (``ccc await -F``)
+    launch_profile: str = ""  # config label the armed session ran under; re-resolved at delivery
 
     def items_list(self) -> list[str]:
         """The parsed ``items`` JSON (``[]`` when unreadable)."""
@@ -230,6 +232,7 @@ def _row_to_group(row: sqlite3.Row) -> AwaitGroup:
     data = {k: row[k] for k in row.keys() if k in _GROUP_FIELDS}
     data["no_codex"] = bool(data.get("no_codex"))
     data["fresh"] = bool(data.get("fresh"))
+    data["launch_profile"] = str(data.get("launch_profile") or "")
     return AwaitGroup(**data)
 
 
@@ -275,6 +278,7 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
         purpose: str = "",
         items: tuple[str, ...] | list[str] = (),
         fresh: bool = False,
+        launch_profile: str = "",
     ) -> int:
         if not sources:
             raise ValueError("an await group needs at least one source")
@@ -282,8 +286,8 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
             cur = self.conn.execute(
                 "INSERT INTO await_groups (session_id, config_dir, cwd, no_codex, "
                 "prompt_template, until_epoch, grace_until_epoch, state, created_at, "
-                "updated_at, purpose, items, fresh) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'armed', ?, ?, ?, ?, ?)",
+                "updated_at, purpose, items, fresh, launch_profile) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'armed', ?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     config_dir,
@@ -297,6 +301,7 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
                     purpose,
                     json.dumps(list(items)),
                     int(fresh),
+                    launch_profile,
                 ),
             )
         except sqlite3.IntegrityError as exc:
@@ -337,6 +342,7 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
         purpose: str = "",
         items: tuple[str, ...] | list[str] = (),
         fresh: bool = False,
+        launch_profile: str = "",
     ) -> int:
         """Insert one group + its sources atomically; :class:`AwaitConflict` if one is active."""
         with self._immediate():
@@ -352,6 +358,7 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
                 purpose=purpose,
                 items=items,
                 fresh=fresh,
+                launch_profile=launch_profile,
             )
 
     def arm_await_and_close(  # pylint: disable=too-many-arguments
@@ -369,6 +376,7 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
         purpose: str = "",
         items: tuple[str, ...] | list[str] = (),
         fresh: bool = False,
+        launch_profile: str = "",
     ) -> tuple[int, str]:
         """:meth:`arm_await` plus the close-after-turn arm in the SAME transaction.
 
@@ -390,6 +398,7 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
                 purpose=purpose,
                 items=items,
                 fresh=fresh,
+                launch_profile=launch_profile,
             )
             cur = self.conn.execute(
                 "UPDATE sessions SET close_requested_at = ?, close_token = ?, close_bound = '', "

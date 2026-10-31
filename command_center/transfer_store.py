@@ -73,6 +73,7 @@ SNAPSHOT_FIELDS = (
     "llm_overseer",
     "llm_exec",
     "no_codex",
+    "launch_profile",
     "prompt_sha256",
 )
 
@@ -90,6 +91,7 @@ CREATE TABLE IF NOT EXISTS transfers (
     llm_overseer      TEXT    NOT NULL DEFAULT '',
     llm_exec          TEXT    NOT NULL DEFAULT '',
     no_codex          INTEGER NOT NULL DEFAULT 0,
+    launch_profile    TEXT,
     prompt_sha256     TEXT    NOT NULL DEFAULT '',
     handoff_path      TEXT    NOT NULL DEFAULT '',
     launcher          TEXT    NOT NULL DEFAULT '',
@@ -128,6 +130,7 @@ class Transfer:  # pylint: disable=too-many-instance-attributes
     llm_overseer: str = ""
     llm_exec: str = ""
     no_codex: bool = False
+    launch_profile: str = ""  # config label of the source's launch profile; "" = bare claude
     prompt_sha256: str = ""
     handoff_path: str = ""
     launcher: str = ""
@@ -166,6 +169,7 @@ def _row_to_transfer(row: sqlite3.Row) -> Transfer:
     data = {k: row[k] for k in row.keys() if k in _FIELDS}
     data["no_codex"] = bool(data.get("no_codex"))
     data["capped"] = bool(data.get("capped"))
+    data["launch_profile"] = str(data.get("launch_profile") or "")  # NULL (old row) = none
     return Transfer(**data)
 
 
@@ -180,6 +184,7 @@ class TransferStoreMixin:
         data.update(state=PREPARED, created_at=now, updated_at=now)
         data["no_codex"] = int(bool(data["no_codex"]))
         data["capped"] = int(bool(data["capped"]))
+        data["launch_profile"] = data["launch_profile"] or None
         cols = ", ".join(data)
         marks = ", ".join("?" for _ in data)
         try:

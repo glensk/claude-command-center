@@ -138,6 +138,7 @@ def state(adapter: ClaudeAdapter, store: Store, src: Source) -> dict[str, Any]:
         "model": src.model,
         "effort": (session.effort if session else "") or "",
         "no_codex": bool(session and session.no_codex),
+        "launch_profile": (session.launch_profile if session else "") or "",
         "aim": (session.aim if session else "") or "",
         "aim_rev": store.count_aim_history(src.session_id) if session else 0,
         "subgoals": {
@@ -164,7 +165,8 @@ def _render_state(data: dict[str, Any]) -> str:
     lines = [
         f"session:   {data['session_id']} ({data['account'] or '?'}, pid {data['live_pid']})",
         f"cwd:       {data['cwd']}",
-        f"model:     {data['model'] or '?'}  no_codex: {data['no_codex']}",
+        f"model:     {data['model'] or '?'}  no_codex: {data['no_codex']}"
+        + (f"  profile: {data['launch_profile']}" if data.get("launch_profile") else ""),
         f"AIM:       {data['aim'] or '(none)'}",
     ]
     for text in data["subgoals"]["unchecked"]:
@@ -367,6 +369,23 @@ def _preflight(
     return target
 
 
+def _checked_profile(profile: str) -> str:
+    """*profile* ("" = bare claude) proven to resolve NOW, or :class:`StartRefused`.
+
+    Only the NAME travels (transfer row, successor draft); ``start-job`` resolves it again
+    at launch. An unresolvable profile refuses with the source session left authoritative:
+    a successor must never start a bare ``claude`` on another billing route.
+    """
+    from .config import LaunchProfileError, resolve_launch_profile
+
+    if profile:
+        try:
+            resolve_launch_profile(profile)
+        except LaunchProfileError as exc:
+            raise StartRefused(f"{exc} — the source session stays authoritative") from exc
+    return profile
+
+
 def _candidate(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     store: Store, src: Source, target_dir: str, label: str, args: Any, digest: str
 ) -> Transfer:
@@ -374,6 +393,7 @@ def _candidate(  # pylint: disable=too-many-arguments,too-many-positional-argume
     from .transfer_store import Transfer
 
     session = store.get(src.session_id)
+    profile = _checked_profile((session.launch_profile if session else "") or "")
     return Transfer(
         transfer_id="",
         source_session=src.session_id,
@@ -388,6 +408,7 @@ def _candidate(  # pylint: disable=too-many-arguments,too-many-positional-argume
             src.model, getattr(args, "executor", None) or getattr(args, "overseer", None)
         ),
         no_codex=bool(session and session.no_codex),
+        launch_profile=profile,
         prompt_sha256=digest,
         capped=bool(getattr(args, "capped", False)),
     )
@@ -408,6 +429,7 @@ def _create_successor(store: Store, transfer: Any, src: Source, text: str) -> No
         llm_overseer=transfer.llm_overseer,
         llm_exec=transfer.llm_exec,
         config_dir=transfer.target_config_dir,
+        launch_profile=transfer.launch_profile,
     )
     if unchecked:  # Q2: the open sub-goals travel; the checked ones are in the text
         store.set_subgoals(transfer.target_session, unchecked)
@@ -526,6 +548,17 @@ def _drive(store: Store, transfer: Any, src: Source, text: str, args: Any) -> in
 
     if transfer.state in (PREPARED, OPENED):
         _write_handoff(Path(transfer.handoff_path), text)
+        try:  # re-resolved from its name before every (re)launch, never from a snapshot
+            _checked_profile(transfer.launch_profile)
+        except StartRefused as exc:
+            if transfer.state == PREPARED:
+                store.transition_transfer(
+                    transfer.transfer_id, FAILED, now_ms(), failure=f"launch: {exc}"[:200]
+                )
+                if store.get(transfer.target_session) is not None:
+                    store.update_fields(transfer.target_session, archived=True)
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         _create_successor(store, transfer, src, text)
         target_row = store.get(transfer.target_session)
         if target_row is not None and target_row.draft:  # never started: (re)launch it
@@ -612,13 +645,6 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
         session = store.get(src.session_id)
         if session is not None and session.handed_off_to:
             return _fail(args, src.session_id, f"{src.session_id} was already handed off")
-        if session is not None and session.launch_profile:
-            return _fail(
-                args,
-                src.session_id,
-                f"{src.session_id} runs under a launch profile — a handoff successor would "
-                "start a bare claude on another billing route, so it is refused",
-            )
         if args.capped:
             raw = _capped_text(adapter, store, src)
             if raw is None:

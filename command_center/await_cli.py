@@ -454,6 +454,25 @@ def _baselines(args: argparse.Namespace, cwd: str, runner: Any) -> list[Any]:
     return apply_labels(sources, args.label)
 
 
+def _resolved_profile(session: Any, sid: str) -> str:
+    """The session's launch-profile label ("" = bare claude), proven to resolve NOW.
+
+    Only the NAME is snapshotted into the group; delivery re-resolves it. A profile that
+    does not resolve at arm time is refused (fail closed: never a bare ``claude`` on
+    another billing route).
+    """
+    from . import accounts
+    from .config import LaunchProfileError, resolve_launch_profile
+
+    profile = accounts.session_launch_profile(session)
+    if profile:
+        try:
+            resolve_launch_profile(profile)
+        except LaunchProfileError as exc:
+            raise AwaitError(f"session {sid}: {exc} — arming is refused") from exc
+    return profile
+
+
 def _arm(args: argparse.Namespace, runner: Any) -> int:
     from . import accounts
     from .await_store import AwaitConflict
@@ -467,11 +486,7 @@ def _arm(args: argparse.Namespace, runner: Any) -> int:
         session = store.get(sid)
         if session is None:
             raise AwaitError(f"unknown session {sid}", EXIT_USAGE)
-        if session.launch_profile:
-            raise AwaitError(
-                f"session {sid} runs under a launch profile — a delivery to a closed session "
-                "would start a bare claude on another billing route, so arming is refused"
-            )
+        profile = _resolved_profile(session, sid)
         if args.close:
             _check_close(session, sid)
         config_dir, cwd = _snapshot(session, sid)
@@ -485,6 +500,7 @@ def _arm(args: argparse.Namespace, runner: Any) -> int:
             "purpose": clean_purpose(args.purpose),
             "items": clean_items(args.item),
             "fresh": bool(args.fresh),
+            "launch_profile": profile,
             "sources": [dataclasses.asdict(s) for s in sources],
         }
         if args.dry_run:
@@ -508,6 +524,7 @@ def _arm(args: argparse.Namespace, runner: Any) -> int:
             "purpose": preview["purpose"],
             "items": preview["items"],
             "fresh": preview["fresh"],
+            "launch_profile": profile,
         }
         try:
             if args.close:
