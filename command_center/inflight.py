@@ -162,7 +162,8 @@ def background_work(  # pylint: disable=too-many-arguments
     switch. *ignore* is the caller's own process ancestry when it runs inside the session
     (the ``!`` prefix's Bash-tool shell must not veto the very command it is running).
     Keep-warm timers (``adapters.claude.is_keepwarm_command``) never count — they are
-    disposable and the new process re-arms its own; their transcript ids are appended to
+    disposable and the successor's own keep-warm guard arms its own timer; nothing is
+    handed over (tp#1511). Their transcript ids are appended to
     *keepwarm* when the caller passes a list. Only the counter's excess over the transcript's
     running agents counts, and only while the latest SubagentStart (*subagent_started_at*,
     epoch ms) is within :data:`SUBAGENT_COUNTER_GRACE_S` (see :func:`counter_split`).

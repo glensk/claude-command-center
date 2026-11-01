@@ -342,6 +342,35 @@ def test_keepwarm_stopped_recorded_never_a_restart(world: dict[str, Any], tmp_pa
     timers = {f["fields"]["task_id"]: f["fields"] for f in _by_kind(doc, "keepwarm_timer")}
     assert timers["k1"]["state"] == "stopped" and "do NOT restart" in timers["k1"]["note"]
     assert timers["k2"]["state"] == "running"
+    # tp#1511: nothing about a timer is handed over — no command, no re-arm advice
+    assert "command" not in timers["k2"] and "command" not in timers["k1"]
+    assert "not handed over" in timers["k2"]["note"]
+    assert "re-arm" not in timers["k2"]["note"]
+
+
+def test_keepwarm_timer_fact_never_carries_the_predecessor_command(
+    world: dict[str, Any], tmp_path: Path
+) -> None:
+    """tp#1511: the rendered ``Background restarts`` names no keep-warm command or path."""
+    from command_center import handoff_doc
+
+    doc = _collect(world, tmp_path)
+    assert _by_kind(doc, "keepwarm_timer")  # the timers are there, as evidence
+    model = handoff_doc.parse_model_file(
+        "\n".join(f"## {title}\n\n{title}: x\n" for title in handoff_doc.MODEL_SECTIONS)
+    )
+    assert model.ok, model.errors
+    text = handoff_doc.compose(model, doc).text
+    restarts = handoff_doc.sections(text)["background restarts"]
+    assert "k2" in restarts and "not handed over" in restarts
+    assert "cc-keepwarm.sh" not in restarts
+    assert "t.jsonl" not in restarts
+
+
+def test_classify_shell_keepwarm_is_evidence_only() -> None:
+    """tp#1511: a keep-warm command reaching ``shell_fact`` never gets a ``restart:`` line."""
+    kind, _ = handoff_facts.classify_shell("~/.claude/hooks/cc-keepwarm.sh 3000 x", [], {})
+    assert kind == handoff_facts.EVIDENCE_ONLY
 
 
 def test_cron_jobs_not_deleted(world: dict[str, Any], tmp_path: Path) -> None:

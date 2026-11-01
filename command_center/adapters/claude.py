@@ -67,8 +67,9 @@ _BG_SHELL_SIGNATURE = "shell-snapshots/snapshot-"
 
 # A keep-warm timer: a ``run_in_background`` Bash task running ``~/.claude/hooks/
 # cc-keepwarm.sh`` that only sleeps and re-pings to keep the prompt cache warm. It is
-# disposable — killing it loses nothing, and a relaunched session re-arms its own — so
-# it is never background work that must veto a switch. See ``is_keepwarm_command``.
+# disposable — killing it loses nothing, and the successor's own keep-warm guard arms its
+# own timer; nothing is handed over — so it is never background work that must veto a
+# switch. See ``is_keepwarm_command``.
 _KEEPWARM_MARKER = "cc-keepwarm.sh"
 
 # A ``claude`` process launched by ``ccc start-job`` (or the user) carries an explicit
@@ -721,7 +722,8 @@ def is_keepwarm_command(command: str) -> bool:
     The ONE predicate both background-work signals use — the transcript side (the
     launching Bash ``tool_use`` command) and the process side (a Bash-tool shell's argv,
     which embeds the command as ``eval '<command>'``). A keep-warm timer is disposable:
-    the new process re-arms its own, so it never vetoes a relaunch.
+    the successor's own keep-warm guard arms its own timer and nothing is handed over, so
+    it never vetoes a relaunch.
     """
     return _KEEPWARM_MARKER in command
 

@@ -565,16 +565,16 @@ def classify_shell(command: str, keys: list[str], declared: dict[str, str]) -> t
     """``(classification, reason)`` for one pending shell (D15): never inferred.
 
     ``declared-restartable``: a ``cc-bg-keep`` consumer declaration under one of its
-    *keys* (tool_use id, task id, description), or the allowlist — the keep-warm timer
-    (``cc-keepwarm.sh``), ``codex-review.py -w`` and ``tp drive N …``. Everything else is
-    ``evidence-only``: re-running a non-idempotent command can corrupt state.
+    *keys* (tool_use id, task id, description), or the allowlist — ``codex-review.py -w``
+    and ``tp drive N …``. Everything else is ``evidence-only``: re-running a non-idempotent
+    command can corrupt state. A keep-warm timer (``cc-keepwarm.sh``) is never handed over
+    (tp#1511): the successor's own keep-warm guard arms its own timer, so it is
+    ``evidence-only`` and never gets a ``restart:`` line.
     """
     for key in keys:
         if key and key in declared:
             return DECLARED, f"cc-bg-keep consumer: {declared[key]}"
     toks = [Path(t).name if "/" in t else t for t in _tokens(command)]
-    if "cc-keepwarm.sh" in toks:
-        return DECLARED, "allowlist: keep-warm timer"
     if "codex-review.py" in toks and "-w" in toks:
         return DECLARED, "allowlist: codex-review.py -w"
     for idx, tok in enumerate(toks[:-1]):
@@ -631,8 +631,20 @@ def _cron_facts(records: list[dict[str, Any]]) -> list[Record]:
     return [fact for cid, fact in created.items() if cid not in deleted]
 
 
+KEEPWARM_RUNNING_NOTE = (
+    "not handed over: the successor's keep-warm guard arms its own timer when its own work"
+    " needs one"
+)
+KEEPWARM_STOPPED_NOTE = "stopped on purpose: do NOT restart it"
+
+
 def _stopped_timers(records: list[dict[str, Any]], pending_timers: set[str]) -> list[Record]:
-    """Keep-warm timers stopped with ``TaskStop`` (never a restart) and the running ones."""
+    """Keep-warm timers stopped with ``TaskStop`` and the running ones, as evidence only.
+
+    Nothing about a timer is handed over (tp#1511): the fact carries no command (the
+    predecessor's ``cc-keepwarm.sh`` watches the predecessor's transcript), only the task
+    id, its state and a fixed note.
+    """
     from .adapters.claude import is_keepwarm_command
 
     commands = _bash_commands(records)
@@ -666,12 +678,7 @@ def _stopped_timers(records: list[dict[str, Any]], pending_timers: set[str]) -> 
                 2,
                 task_id=task,
                 state=state,
-                command=commands[use_id],
-                note=(
-                    "stopped on purpose: do NOT restart it"
-                    if state == "stopped"
-                    else "re-arm with the same -u in the successor"
-                ),
+                note=KEEPWARM_STOPPED_NOTE if state == "stopped" else KEEPWARM_RUNNING_NOTE,
             )
         )
     return out
