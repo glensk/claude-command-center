@@ -333,6 +333,26 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
   the rebind (successor's session, account dir, cwd, `no_codex`, launch profile; every
   fired group under a fresh `delivery_token`) runs in the `accepted` CAS's transaction,
   after every hook; a `failed` transfer releases the reservation in its own transaction.
+- **Facts are code, collected once per transfer** (`handoff_facts.py`, `handoff_doc.compose`,
+  tp#1479): six sections are filled from recorded facts, the model writes only `Current
+  state`, `Decisions and constraints`, `First steps` (`validate_model_part`: ≤ 10 KB, no
+  other `##`). `start` freezes ONE snapshot `handoffs/facts/<sid>/<snap12>.json` (id =
+  sha256 of its canonical JSON, the transfer's `facts_snapshot` column); `prompt_sha256` =
+  sha256(model part) + snapshot id, and a re-run on an active `prepared`/`opened` transfer
+  reuses the stored snapshot and composed text without recollecting — never let a
+  recomposition move that digest (it forks the `EXIT_WAITING` retry).
+- **Providers never block a relay**: `handoff_facts` entries (default `[]`, inert) return
+  typed records from a closed `kind` set, never markdown; a failing, slow or malformed
+  provider becomes one `warning` fact. Every free text ccc inserts (to-do copy, assistant
+  texts, router supplement, legacy notes, result capsules, provider strings) passes
+  `escape_headings`, because `sections()` keeps the FIRST `##` and ignores fences.
+- **Fail closed on scrub, never on size**: every persisted facts file (snapshot, capture,
+  agent spec/result) goes through `mirror_scrub_cmd`; a scrub failure refuses `start`. Size
+  is solved by priority cuts with a `continue-session facts` pointer (never the three model
+  sections, the AIM, held ids, questions, restarts, spec paths, warnings).
+- **`--facts-only` / `--capped` share one path** (`_compose_generated`): a capped router that
+  is unset, fails or returns anything but the strict JSON supplement falls back to
+  facts-only, never to a refusal. `start -j` prints JSON on a dry run only.
 
 ## The `no_codex` job flag (do not regress)
 

@@ -85,7 +85,7 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 - `ccc daemon [--install|--uninstall|--status|--dry-run]` — the background housekeeper (launchd on macOS, systemd `--user` on Linux).
 - `ccc resume-halted [--watch|--dry-run]` — auto-resume rate-limit-halted sessions once the limit resets.
 - `ccc switch-on-limit` (`-s/--session`, `-c/--cwd`, `-t/--transcript`, `-D/--dry-run`) — the rate-limit FAILOVER for one halted session: move it to an account that still has quota instead of waiting for the reset. Spawned by the `StopFailure` hook the instant a turn dies on a limit, and called by the daemon as a backstop. `-D` prints the decision and changes nothing. Exit 0 = a switch was dispatched, 1 = nothing to do (the reason is printed and appended to `events.log`).
-- `ccc continue-session state|template|drain|start|accept|status` — hand a session's work to a NEW Claude Code session (its own session id, never `--resume`) from a handoff document; the cheap alternative to the same-session `switch-account` (`/…-cache-write-hit`), whose first turn re-writes the whole conversation into the other organization's prompt cache. `state [-s SID] [-j]` (read-only: AIM, unchecked sub-goals, cwd, account, observed model, `no_codex`, the in-flight inventory, lineage), `template` (the fixed handoff template), `drain [-t SEC]` (blocks until the in-flight detector is clear, exit 1 on timeout), `start -A LABEL -f FILE [-s] [-O] [-E] [-w SEC] [-n] [-j] [-C/--capped]` (validate, snapshot, launch the successor, wait for `accept`, finalize), `accept <transfer> [-j]` (in the successor: runs `handoff_hooks`, then accepts), `status [<transfer>|-s SID] [-j]` (state, snapshot, recovery step). Full story: "Hand a session to a new one" below. Shipped as `/cwork-to-cpriv`, `/cpriv-to-cwork`, `/cwork-continue-in-new-session` and `/cpriv-continue-in-new-session`.
+- `ccc continue-session state|template|drain|start|accept|status|collect|facts` — hand a session's work to a NEW Claude Code session (its own session id, never `--resume`) from a handoff document; the cheap alternative to the same-session `switch-account` (`/…-cache-write-hit`), whose first turn re-writes the whole conversation into the other organization's prompt cache. `state [-s SID] [-j]` (read-only: AIM, unchecked sub-goals, cwd, account, observed model, `no_codex`, the in-flight inventory, lineage), `template` (the handoff template: the model writes only its three model sections), `collect [-s SID] [-j|-m] [-S] [-p capture|finalize] [-F]` (the code facts a handoff carries: `-m` previews and writes nothing, `-S` captures the in-flight work BEFORE the drain), `drain [-t SEC]` (blocks until the in-flight detector is clear, exit 1 on timeout), `start -A LABEL (-f FILE | -C/--capped | -F/--facts-only) [-I/--await-idle] [-s] [-O] [-E] [-w SEC] [-n] [-j]` (collect and freeze the facts, compose them with the model part, validate, launch the successor, wait for `accept`, finalize; `-j` prints JSON on a dry run `-n` only, a real start prints plain lines), `accept <transfer> [-j]` (in the successor: runs `handoff_hooks`, then accepts), `status [<transfer>|-s SID] [-j]` (state, snapshot, recovery step), `facts <transfer|sid> [-j] [-k KEY]` (read-only: the frozen facts snapshot a handoff was composed from, the place every size cut points to). Full story: "Hand a session to a new one" below. Shipped as `/cwork-to-cpriv`, `/cpriv-to-cwork`, `/cwork-continue-in-new-session` and `/cpriv-continue-in-new-session`.
 - `ccc codex-switch` (`-t/--target`, `-n/--dry-run`, `-p/--pid`, `-i/--input`) · `ccc codex-switch-now` · `ccc codex-switch-exec <token> [-S]` — the Codex twin of `switch-account -N`: move a LIVE Codex TUI thread to another ChatGPT login (`CODEX_HOME`) in the same iTerm tab / tmux pane, zero model tokens, so it works after "Usage limit reached". Codex has no account beyond `$CODEX_HOME/auth.json`, so the move is: quit the TUI, port the thread's rollout into the target home, relaunch `codex … resume <thread>` there. The trigger is a `UserPromptSubmit` hook (client-side, runs BEFORE any request; its `{"decision":"block"}` cancels the prompt) — `$CODEX_HOME/hooks/codex-switch-hook.py` pipes the payload into `ccc codex-switch`, registered once in the shared `config.toml` with a `hooks.state` trust row per seat (the key embeds each seat's own config path; the hash is `sha256:` of the canonical JSON of the normalized handler, `codex-rs/hooks/src/engine/discovery.rs::hook_hash`). Type `/switch [seat[!]]` WITH a leading space (the composer rejects an unknown slash command; a leading space or a `/` inside the name bypasses that check), or `//switch`, `/switch/`, `switch`. The seat is a label (`default`/`private`/an extra), a `codex_seat_aliases` alias (`["work=default", "gl=private"]`) or the login e-mail; bare `/switch` takes the seat oracle's best OTHER seat (`codex_homes_in_order(probe=False)`: cooldowns, refusals, 100 % windows, pins, fill policy and the weekly `codex_seat_rota` all honoured — a seat whose week belongs to a colleague is never the automatic pick); an explicit seat the oracle does not list is refused unless spelled `<seat>!`, and the forced switch's note then names the block it overrode (`forced past ccc's seat oracle on 'default' (rota: 14.9.–20.9. used by alice)`). Planning (hook side) fails closed with the reason as the block: the `transcript_path` must be a real rollout under a registered seat whose `session_meta` names the thread; the codex process is the OUTERMOST exact-name `codex` ancestor, foreground on its tty, with a `CODEX_HOME` agreeing with the transcript's home; the target must be logged in, not hold the thread's writer lock (`flock` probe on `thread-writer-locks/<uuid>.lock`), its SQLite row (if any) must name the mirrored path, a `-p/--profile` must exist identically as `<home>/<name>.config.toml` there; `--remote` sessions and unknown codex options refuse (complete allow-list of 0.153.4's TUI options, before and after `resume`, `=`/attached-short spellings included; `-i`, positionals and `resume`'s selector flags are dropped). The launch is a 0600 record under `<app_home>/codex-switch/<token>.json` (exe, options, carried env — the launcher families `AI_* TP_* CCC_* CLAUDE_SESSION_* CODEX_*` minus Codex's storage-routing names and secret-shaped names; values never appear in reasons, logs or argv). `codex-switch-now` (detached) waits for the hook process to exit, re-binds the pid to the tab, types `/quit` (never a signal — the TUI has no SIGTERM handler), waits for the process to be gone, the tty to sit at a shell prompt twice a second apart and the source writer lock to be released, then ports the rollout by PREFIX-MERGE (the target's existing copy must be a prefix after nulling `rate_limits` on both sides; its own bytes are kept so its seat telemetry and Codex's byte-offset history projection stay intact, only the new tail is scrubbed; a longer or differing copy is set aside as `*.switch-diverged-<ts>` and the switch refused) and types `ccc codex-switch-exec <token>`, which `execve`s codex under the target `CODEX_HOME`. Any failure after the source exited types `… -S` instead (the source seat comes back — the tab never ends dead); before it, the TUI is left alive. Everything lands in `events.log` (`codex-switch`) and, on abort, a desktop notification with the manual command. A `<thread>.pending` marker (120 s) refuses a second `/switch` while one is in flight. The relaunched session lands IDLE. Tests: `tests/test_codex_switch.py`.
 - `ccc toggle-idle` · `ccc tab-symbol` · `ccc tag` · `ccc copilot-usage` · `ccc codex-usage` — mute idle popups / per-repo badge / typed @tags / refresh Copilot usage / refresh the live OpenAI Codex usage.
 - `ccc restart-tui` — restart the running ccc TUI in its own tab (for automations that changed ccc's code/config).
@@ -1842,21 +1842,63 @@ source a command still hands off to its target and says the account changes or n
 | `/cpriv-to-cwork-cache-write-hit` | the same-session switch (`switch-account work -N -K`)       |
 
 **The procedure** (the four handoff `.md` commands, run by the model): `ccc
-continue-session state -j` (inventory: AIM, unchecked sub-goals, account, observed model,
-`no_codex`, every in-flight item classified `subagent` / `shell` / `keepwarm` / `unknown` by
-`command_center/inflight.py`, the same detector that vetoes `switch-account`); every running
-subagent is asked by `SendMessage` to stop after its current atomic operation and return a
-continuation capsule; restartable background shells are stopped and listed with their
-restart command; keep-warm timers are stopped and never handed over; `ccc continue-session
-drain -t 540` blocks until the detector is clear — exit 1 aborts and the source stays
-authoritative (nothing is `TaskStop`ped for the transfer); the model fills `ccc
-continue-session template` and runs ONE `ccc continue-session start -A <label> -f <file>`
-(the `# new-session-ok` marker, `new-session-guard.py` treats only `start` as a launch).
+continue-session collect -S -m` FIRST — it records what is running right now (agents with
+their spec and transcript, shells with command, cwd, consumer and restart class) in
+`capture.json` and prints the facts preview; `ccc continue-session state -j` (inventory:
+AIM, unchecked sub-goals, account, observed model, `no_codex`, every in-flight item
+classified `subagent` / `shell` / `keepwarm` / `unknown` by `command_center/inflight.py`, the
+same detector that vetoes `switch-account`); every running subagent is asked by
+`SendMessage` to stop after its current atomic operation and return a continuation capsule;
+restartable background shells are stopped; keep-warm timers are stopped and never handed
+over; `ccc continue-session drain -t 540` blocks until the detector is clear — exit 1 aborts
+and the source stays authoritative (nothing is `TaskStop`ped for the transfer); the model
+writes ONLY the three model sections of `ccc continue-session template` (`Current state`,
+`Decisions and constraints`, `First steps`; ≤ 10 KB, only what the preview lacks) and runs
+ONE `ccc continue-session start -A <label> -f <file>` (the `# new-session-ok` marker,
+`new-session-guard.py` treats only `start` as a launch).
 
-**Validation** (every path): strict UTF-8, ≤ 24 KB, no control characters but newline and
-tab, every template section present and non-empty, credential shapes scrubbed through the
-fail-closed `mirror_scrub_cmd` gate (`scrub.py`; no scrubber = rejected), sha256 recorded.
-A rejected handoff changes nothing.
+**Code facts and the model part.** The handoff is split: six sections are filled by code
+(`Goal and done-condition`, `tp ownership`, `Repositories, files, worktrees`, `Subagent
+continuations`, `Background restarts`, `Open items and questions`; ccc fills them from its
+own records plus whatever the `handoff_facts` providers return), three by the model. `start`
+collects the facts ONCE per transfer (phase `finalize`: the recorded transcripts refreshed,
+final agent results attached, the providers re-run), freezes them into a snapshot
+`<app_home>/handoffs/facts/<source_sid>/<snap12>.json` (id = sha256 of its canonical JSON,
+stored in the transfer's `facts_snapshot` column) and composes: code facts first in every
+section, budgeted against 24 KB minus a 2 KB scrub margin, truncated lowest priority first
+(filed-not-held items, older commits, box texts, result capsules, worktree details,
+waits/schedules, owned files, legacy model notes), each cut ending with `… N more — full: ccc
+continue-session facts <transfer> #/<key>`. Never cut: the AIM, held tracker ids with their
+state, open questions and `You` lines, background restarts, agent spec paths, warning lines.
+Subagent specs are copied verbatim from the agent transcript into
+`handoffs/facts/<sid>/agents/<id>.spec.md`, their last result into `<id>.result.md` (≤ 3 KB
+inline). Pending shells are classified, never inferred: `declared-restartable` (a
+`cc-bg-keep` consumer declaration or the allowlist) gets a `restart:` line, everything else
+goes under `Decide before restarting` as evidence. Every inserted free text is
+heading-escaped (a leading `#` gets a backslash), so a copied `## First steps` cannot shadow
+the real section. A legacy full document still works: its bodies under code-filled names go
+into `### Model notes` after that section's facts, sharing the 10 KB model budget. Without a
+capture, the agent sections come from the results that arrived since the relay latch, plus a
+warning line.
+
+**`--facts-only`** (`-F`, no `-f`, no `--capped`) is the zero-model, emergency path: code
+also writes the three model sections (Current state = the last to-do list and the last
+three main-chain assistant texts, ≤ 4 KB, under the banner `EMERGENCY RELAY — no
+model-written part`; Decisions = the recorded tracker decisions plus a pointer to the
+predecessor transcript; First steps = the fixed accept / claims / restart list). `-I/
+--await-idle` first waits up to 120 s (2 s polls) until the session reads idle AND its
+transcript is unchanged for 10 s; no provable idle → exit 1, no transfer. The in-flight
+preflight still applies. An automatic trigger (a relay hook that starts it after N ignored
+relay requests) lives outside ccc.
+
+**Validation** (every path): the model part is ≤ 10 KB and carries no `##` heading but the
+three model section names (`validate_model_part`); the composed document is strict UTF-8,
+≤ 24 KB, no control characters but newline and tab, every template section present and
+non-empty, credential shapes scrubbed through the fail-closed `mirror_scrub_cmd` gate
+(`scrub.py`; no scrubber = rejected), sha256 recorded; when the scrubber lengthens the text
+past 24 KB, compose cuts one more priority tier (at most two passes, then refuses naming the
+sizes). Every persisted facts file is scrubbed the same way, and a scrub failure on any of
+them refuses `start`. A rejected handoff changes nothing.
 
 **The transfer** (`transfers` table, `transfer_store.py`; one active transfer per source;
 every transition a compare-and-set):
@@ -1874,14 +1916,30 @@ The snapshot (source / target session and account, cwd, source AIM and revision,
 immutable: re-running `start` with an identical snapshot reuses the transfer (relaunching
 the successor only while it is still an unstarted draft; a `start` that timed out — exit 3
 — is simply re-run and finalizes once accepted), a different one is refused naming the
-differing fields. The successor is a draft job (`create_draft`: the source's AIM, cwd,
+differing fields. The prompt sha256 binds sha256(model part) and the facts snapshot id, not
+the composed text, and a re-run on an active `prepared`/`opened` transfer reuses its STORED
+snapshot and composed handoff without recollecting — so `start` → exit 3 → a ledger change
+→ the same `start` still reuses the transfer. The successor is a draft job (`create_draft`: the source's AIM, cwd,
 `no_codex`, the observed model unless `-O`/`-E` say otherwise, the unchecked sub-goals)
 launched through `start-job` in a new tab; its prompt is a short preamble (take over from
 session X, transfer T, FIRST run `ccc continue-session accept T`, then relaunch the agents
-from their capsules and restart the listed shells) plus the handoff text. `accept` refuses
-unless it runs in the recorded target session under the recorded account, runs the
-`handoff_hooks` and only then CASes `opened → accepted`; a failing hook leaves `opened` and
-prints why. Finalize keeps the original AIM in the AIM history and the transfer, sets the
+from their capsules, restart only the `restart:` shells, judge the `Decide before
+restarting` ones, and fetch cut facts with `ccc continue-session facts`) plus the handoff
+text. `accept` refuses unless it runs in the recorded target session under the recorded
+account, runs the accept-prepare transaction, then the `handoff_hooks`, and only then CASes
+`opened → accepted`; a failing hook leaves `opened` and prints why.
+
+**The source's `ccc await` group moves by code.** `start` reserves the source's active
+group under the transfer in the same transaction that creates it (delivery defers a
+reserved group); a group the source arms AFTER `start` joins the reservation inside its own
+arm transaction, and arming is refused on a session that is the source of an `accepted`
+transfer or the target of a `prepared`/`opened` one. `accept` first runs accept-prepare,
+BEFORE any hook: it sweeps the source's still-unreserved groups in, refuses when the
+successor already holds an active group (naming `ccc await cancel`; no merge) and refuses
+retryably while a reserved group is mid-delivery. The rebind (successor's session, account
+dir, cwd, `no_codex`, launch profile; every fired group under a fresh delivery token) runs
+in the `accepted` CAS's transaction after every hook; a `failed` transfer releases the
+reservation and a fired group is delivered to the source as usual. Finalize keeps the original AIM in the AIM history and the transfer, sets the
 source AIM to `handoff accepted by session <new8>` (no tp id), status `handed_off`
 (terminal — `ccc ls` / the TUI show `⇢ <8-char successor>`; `limitswitch`, `resume.py`
 and the daemon's auto-resume refuse such a session), records `handed_off_to/from/at` and
@@ -1897,7 +1955,7 @@ argv[0] must be an executable on `PATH` or an absolute path: no shell runs, so a
 alias (such as a `tp` alias) is not found and `accept` fails with "could not run".
 
 **`handoff_facts`** (config, default `[]`, inert; tp#1479): fact PROVIDERS for `ccc
-continue-session collect` (and the coming `start` composition). Each entry is a table
+continue-session collect` and the `start` composition. Each entry is a table
 `{argv, timeout_s, optional, name}` run like a hook (argv only, own process group, killed on
 timeout, stdout ≤ 256 KB, stderr never echoed). Placeholders: `{session}`, `{cwd}`,
 `{transcript}`, `{config_dir}`, `{phase}` (`capture`/`finalize`) and `{tp_ids}` (the tp ids
@@ -1930,11 +1988,13 @@ the model while the seat has quota; when it is capped (a usage-limit halt per
 seat succeeding since the window first read full, or `CCC_HANDOFF_ASSUME_CAPPED=1`) it refuses at once while work is in flight (naming the
 `*-cache-write-hit` command), refuses a handoff to the capped account itself, and otherwise
 spawns a detached `ccc continue-session start --capped` and blocks the prompt with a status
-line. `--capped` builds a bounded digest (state, the last main-chain messages) and gets the
-handoff from `llm_custom_command` with `CCC_LLM_PURPOSE=handoff-summary` (`ccc llm-routing`
-lists it); the text passes the same validation and transfer path. A router that is unset or
-fails is logged to `events.log` (`handoff`), notified, and names the `*-cache-write-hit`
-command. A capped source has no Stop chain, so its tab stays open, idle and `handed_off`.
+line. `--capped` collects and renders the code facts first, sends `llm_custom_command`
+(`CCC_LLM_PURPOSE=handoff-summary`, `ccc llm-routing` lists it) a compact digest (≤ 8 KB)
+and accepts back ONLY a JSON model supplement `{current_state, decisions, first_steps}`
+(strings, each ≤ 3 KB, no `#` headings, no control characters, no other keys), rendered as
+the three model sections through the same compose, scrub and snapshot path. A router that
+is unset, fails or returns anything else falls back to `--facts-only` instead of refusing
+(logged to `events.log`, `handoff`). A capped source has no Stop chain, so its tab stays open, idle and `handed_off`.
 A BLOCKED reading alone is not a cap (tp#1327): a seat on extra usage reads 100 % and still
 runs turns. The usage cache records `full_since` per window (the first capture that read it
 full; `captured_at` is bumped every few seconds by the status line and cannot date it), and
