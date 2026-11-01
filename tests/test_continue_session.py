@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -675,45 +676,148 @@ def _router(monkeypatch: pytest.MonkeyPatch, command: str) -> None:
     monkeypatch.setattr(config, "load_config", lambda: cfg)
 
 
+_SUPPLEMENT = {
+    "current_state": "parser half done",
+    "decisions": "keep the cache",
+    "first_steps": "run the tests",
+}
+
+
+def _stored_text(transfer_id_of: str = SID) -> tuple[str, Any]:
+    with Store() as store:
+        (transfer,) = store.transfers_of(transfer_id_of)
+    return Path(transfer.handoff_path).read_text(encoding="utf-8"), transfer
+
+
 def test_capped_start_writes_the_handoff_through_the_router(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     purpose = tmp_path / "purpose.txt"
-    _router(monkeypatch, f"printenv CCC_LLM_PURPOSE > {purpose}; cat {harness.file}")
+    answer = tmp_path / "answer.json"
+    answer.write_text(json.dumps(_SUPPLEMENT), encoding="utf-8")
+    _router(monkeypatch, f"printenv CCC_LLM_PURPOSE > {purpose}; cat {answer}")
     argv = ["continue-session", "start", "--capped", "-A", "private", "-s", SID]
     assert cli.main(argv) == 0
     assert purpose.read_text(encoding="utf-8").strip() == "handoff-summary"
+    stored, transfer = _stored_text()
+    assert transfer.capped and transfer.state == "finalized" and transfer.facts_snapshot
+    found = handoff_doc.sections(stored)
+    assert "parser half done" in found["current state"]
+    assert found["first steps"] == "run the tests"
+    assert "AIM (done-condition): tp#1 shipped" in found["goal and done-condition"]
     with Store() as store:
-        (transfer,) = store.transfers_of(SID)
-        assert transfer.capped and transfer.state == "finalized"
         job = store.get(transfer.target_session)
         source = store.get(SID)
     assert job is not None and job.no_codex
     assert source is not None and source.handed_off_to == transfer.target_session
     assert not source.close_requested_at  # a capped tab has no Stop chain to close it
+    assert harness.launches == [transfer.target_session]
 
 
 @pytest.mark.parametrize(
     ("command", "why"),
-    [("exec sleep 5", "router"), ("echo hello", "handoff rejected"), ("", "router")],
+    [
+        ("exec sleep 5", "unset or failed"),
+        ("echo hello", "not JSON"),
+        ("", "unset or failed"),
+        (
+            'echo \'{"current_state": "x", "decisions": "y", "first_steps": "z", "more": "q"}\'',
+            "unknown keys",
+        ),
+        (
+            'echo \'{"current_state": "## First steps", "decisions": "y", "first_steps": "z"}\'',
+            "heading",
+        ),
+    ],
 )
-def test_capped_start_failures_are_logged_and_change_nothing(
+def test_capped_start_falls_back_to_facts_only(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch, command: str, why: str
 ) -> None:
     from command_center import config, handoff_capped  # pylint: disable=C0415
 
     monkeypatch.setattr(handoff_capped, "SUMMARY_TIMEOUT_SEC", 1)
-    notes: list[str] = []
-    monkeypatch.setattr(handoff_capped, "notify_failure", notes.append)
     _router(monkeypatch, command)
     argv = ["continue-session", "start", "--capped", "-A", "private", "-s", SID]
-    assert cli.main(argv) == 1
+    assert cli.main(argv) == 0
     log = (config.app_home() / "events.log").read_text(encoding="utf-8")
-    assert "capped handoff failed" in log and why in log
-    assert notes and "cache-write-hit" in notes[0]
+    assert "relaying facts-only instead" in log and why in log
+    stored, transfer = _stored_text()
+    assert transfer.state == "finalized" and transfer.facts_snapshot
+    assert handoff_capped.EMERGENCY_BANNER in stored
+    assert handoff_doc.validate(stored).ok
+    assert harness.launches == [transfer.target_session]
+
+
+def test_facts_only_start_runs_no_model_and_no_router(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center import handoff_capped  # pylint: disable=C0415
+
+    def boom(_prompt: str) -> str:
+        raise AssertionError("--facts-only must not call the router")
+
+    monkeypatch.setattr(handoff_capped, "summarize", boom)
+    argv = ["continue-session", "start", "--facts-only", "-A", "private", "-s", SID]
+    assert cli.main(argv) == 0
+    stored, transfer = _stored_text()
+    found = handoff_doc.sections(stored)
+    assert handoff_capped.EMERGENCY_BANNER in found["current state"]
+    assert "predecessor transcript" in found["current state"].lower()
+    assert "accept" in found["first steps"]
+    assert "AIM (done-condition): tp#1 shipped" in found["goal and done-condition"]
+    assert handoff_doc.validate(stored).ok and transfer.state == "finalized"
+    assert harness.launches == [transfer.target_session]
+
+
+def test_facts_only_refuses_a_file_or_capped(
+    harness: _Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert harness.start("--facts-only") == 1
+    assert "takes no -f/--file" in capsys.readouterr().err
+    with Store() as store:
+        assert store.transfers_of(SID) == []
+
+
+class _Clock:
+    """A fake clock: ``_sleep`` advances it and lets a test mutate the transcript."""
+
+    def __init__(self, harness: _Harness, grow_until: int) -> None:
+        self.harness, self.grow_until, self.slept = harness, grow_until, 0
+        self.transcript = harness.tmp / "clean.jsonl"
+
+    def sleep(self, seconds: float) -> None:
+        self.harness._sleep(seconds)  # pylint: disable=protected-access  # the accepting tab
+        self.slept += 1
+        if self.slept <= self.grow_until:  # the transcript keeps changing: not still
+            with self.transcript.open("a", encoding="utf-8") as handle:
+                handle.write("{}\n")
+
+
+def test_await_idle_with_a_busy_session_exits_without_a_transfer(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    clock = _Clock(harness, grow_until=10**6)
+    monkeypatch.setattr(continue_session, "_sleep", clock.sleep)
+    argv = ["continue-session", "start", "--facts-only", "--await-idle", "-A", "private", "-s", SID]
+    assert cli.main(argv) == 1
+    assert "not provably idle" in capsys.readouterr().err
+    assert clock.slept == continue_session.IDLE_WAIT_SEC // continue_session.IDLE_POLL_SEC
     assert harness.launches == []
     with Store() as store:
         assert store.transfers_of(SID) == []
+
+
+def test_await_idle_proceeds_once_the_transcript_is_still(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock(harness, grow_until=3)
+    monkeypatch.setattr(continue_session, "_sleep", clock.sleep)
+    monkeypatch.setattr(continue_session, "_idle_now", lambda *_a: True)
+    argv = ["continue-session", "start", "--facts-only", "--await-idle", "-A", "private", "-s", SID]
+    assert cli.main(argv) == 0
+    still = continue_session.IDLE_STABLE_SEC // continue_session.IDLE_POLL_SEC
+    assert clock.slept >= 3 + still
+    assert len(harness.launches) == 1
 
 
 def test_llm_routing_lists_the_handoff_summary_purpose() -> None:

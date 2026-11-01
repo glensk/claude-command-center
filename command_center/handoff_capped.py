@@ -13,13 +13,14 @@ model write its handoff there. The ``UserPromptSubmit`` intercept
 * capped and clear → a detached ``ccc continue-session start --capped -A LABEL -s SID``
   and a one-line status.
 
-``start --capped`` builds a BOUNDED digest (AIM, sub-goals, the last main-chain texts,
-the ``state`` output) and gets the handoff from ``llm_custom_command`` with
-``CCC_LLM_PURPOSE=handoff-summary`` — ccc's one LLM route; the router picks the provider
-(``ccc llm-routing`` lists the purpose). A router that is unset, fails or times out is a
-logged failure (``events.log``), a desktop notification and a pointer to the
-``*-cache-write-hit`` command. The summary passes the same validation as a model-written
-handoff and the same transfer path. ``CCC_HANDOFF_ASSUME_CAPPED=1`` forces the capped
+``start --capped`` renders the recorded facts first, builds a BOUNDED digest (≤ 8 KB: the
+facts, the last to-do list, the last main-chain texts) and asks ``llm_custom_command``
+(``CCC_LLM_PURPOSE=handoff-summary`` — ccc's one LLM route; ``ccc llm-routing`` lists the
+purpose) for ONLY a JSON supplement ``{current_state, decisions, first_steps}`` (D11). ccc
+renders it as the three model sections and runs the same compose / scrub / snapshot path.
+A router that is unset, fails, times out or answers anything else falls back to the
+facts-only relay (``start --facts-only``, D10: the three sections written by code), with a
+line in ``events.log``; nothing refuses. ``CCC_HANDOFF_ASSUME_CAPPED=1`` forces the capped
 verdict (canaries never manufacture a quota exhaustion).
 
 A BLOCKED quota reading alone is not a cap (tp#1327): a seat whose snapshot reads a full
@@ -42,6 +43,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -66,7 +68,21 @@ CACHE_WRITE_HIT = {
 ASSUME_CAPPED_ENV = "CCC_HANDOFF_ASSUME_CAPPED"
 SUMMARY_PURPOSE = "handoff-summary"
 SUMMARY_TIMEOUT_SEC = 180
-DIGEST_MAX_CHARS = 40_000  # the whole digest the router sees
+DIGEST_MAX_BYTES = 8 * 1024  # the whole digest the router sees (D11)
+SUPPLEMENT_KEYS = ("current_state", "decisions", "first_steps")
+SUPPLEMENT_MAX_BYTES = 3 * 1024  # each router supplement field (D11)
+STATE_MAX_BYTES = 4 * 1024  # the facts-only "Current state" copies (D10)
+EMERGENCY_BANNER = "EMERGENCY RELAY — no model-written part"
+ROUTER_BANNER = "CAPPED RELAY — written by the configured router from a digest, not by the session"
+FIXED_FIRST_STEPS = """\
+1. Run the `ccc continue-session accept` command named in the handoff preamble.
+2. Re-claim the tp items listed under "tp ownership" before touching them.
+3. Read "Subagent continuations" and "Background restarts": restart only what is declared
+   restartable, decide on the rest (see "Decide before restarting").
+4. Read "Open items and questions", then continue from the AIM above."""
+_TODO_MARK = {"completed": "x", "in_progress": "~"}
+_SUPPLEMENT_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+_SUPPLEMENT_HEADING_RE = re.compile(r"(?m)^\s*#{1,6}(?:\s|$)")
 _MESSAGE_MAX_CHARS = 4_000  # one transcript message inside it
 _TAIL_BYTES = 4 * 1024 * 1024
 
@@ -303,32 +319,205 @@ def recent_messages(transcript: Path | None, limit: int = 40) -> list[tuple[str,
     return out[-limit:]
 
 
-def digest(state: dict[str, Any], transcript: Path | None) -> str:
-    """The bounded input the router summarizes (≤ :data:`DIGEST_MAX_CHARS`)."""
-    head = json.dumps(state, indent=1, ensure_ascii=False)[: DIGEST_MAX_CHARS // 4]
-    parts = [f"## Session state (ccc continue-session state -j)\n{head}", "## Recent messages"]
-    budget = DIGEST_MAX_CHARS - len(parts[0]) - 200
+def last_todos(transcript: Path | None) -> list[str]:
+    """The newest ``TodoWrite`` list of the main chain as ``[x] / [~] / [ ] subject`` lines."""
+    if transcript is None:
+        return []
+    try:
+        with transcript.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - _TAIL_BYTES))
+            raw = handle.read()
+    except OSError:
+        return []
+    found: list[str] = []
+    for line in raw.split(b"\n"):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        message = record.get("message") if isinstance(record, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list) or record.get("isSidechain"):
+            continue
+        for block in content:
+            if not (isinstance(block, dict) and block.get("name") == "TodoWrite"):
+                continue
+            todos = (block.get("input") or {}).get("todos")
+            if isinstance(todos, list):
+                found = [
+                    f"[{_TODO_MARK.get(str(t.get('status')), ' ')}] {t.get('content') or ''}"
+                    for t in todos
+                    if isinstance(t, dict)
+                ]
+    return found
+
+
+def _cut_bytes(text: str, limit: int) -> str:
+    """*text* cut to at most *limit* UTF-8 bytes (a split character is dropped)."""
+    return text.encode("utf-8")[:limit].decode("utf-8", "ignore")
+
+
+def _fact_lines(snap_doc: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for fact in snap_doc.get("facts") or []:
+        if not isinstance(fact, dict):
+            continue
+        fields = json.dumps(fact.get("fields"), ensure_ascii=False, sort_keys=True)
+        out.append(f"- {fact.get('kind')} {fact.get('key')}: {fields[:300]}")
+    return out
+
+
+def digest(snap_doc: dict[str, Any], transcript: Path | None) -> str:
+    """The bounded input the router summarizes (≤ :data:`DIGEST_MAX_BYTES` bytes)."""
+    facts = _cut_bytes("\n".join(_fact_lines(snap_doc)), DIGEST_MAX_BYTES // 2)
+    parts = [f"## Recorded facts\n{facts}"]
+    todos = last_todos(transcript)
+    if todos:
+        parts.append("## Last to-do list\n" + "\n".join(todos))
+    parts.append("## Recent messages")
+    text = "\n\n".join(parts)
+    budget = DIGEST_MAX_BYTES - len(text.encode("utf-8")) - 4
     tail: list[str] = []
-    for role, text in reversed(recent_messages(transcript)):
-        entry = f"[{role}] {text}"
-        if len(entry) > budget:
+    for role, msg in reversed(recent_messages(transcript)):
+        entry = f"[{role}] {msg}"
+        size = len(entry.encode("utf-8")) + 2
+        if size > budget:
             break
         tail.append(entry)
-        budget -= len(entry)
-    parts += list(reversed(tail))
-    return "\n\n".join(parts)
+        budget -= size
+    return _cut_bytes("\n\n".join([text, *reversed(tail)]), DIGEST_MAX_BYTES)
 
 
-def summary_prompt(digest_text: str, template: str) -> str:
-    """The router prompt: fill the template from the digest, output the document only."""
+def summary_prompt(digest_text: str) -> str:
+    """The router prompt: a JSON model supplement, nothing else (D11)."""
     return (
-        "You write a handoff document for a NEW coding-agent session that continues the "
-        "work of an old session whose account is out of quota. Fill EVERY section of the "
-        "template below from the session digest; write 'none' where nothing applies; be "
-        "concrete (ids, paths, commands, next actions); never include credential values. "
-        "Output ONLY the filled markdown document, nothing before or after it.\n\n"
-        f"# Template\n\n{template}\n\n# Session digest\n\n{digest_text}\n"
+        "You help a NEW coding-agent session take over the work of an old session whose "
+        "account is out of quota. From the digest below write ONLY a JSON object with exactly "
+        'the string keys "current_state", "decisions" and "first_steps" (what is done and half '
+        "done; decisions and constraints that apply; the exact next actions). Each value is at "
+        f"most {SUPPLEMENT_MAX_BYTES} bytes of plain text: no markdown headings (no line "
+        "starting with #), no control characters, no other keys, nothing before or after the "
+        "JSON. Be concrete (ids, paths, commands); never include credential values.\n\n"
+        f"# Session digest\n\n{digest_text}\n"
     )
+
+
+def parse_supplement(  # pylint: disable=too-many-return-statements
+    text: str | None,
+) -> tuple[dict[str, str] | None, str]:
+    """``(supplement, "")`` for a valid router answer, else ``(None, why)`` (D11)."""
+    if not text or not text.strip():
+        return None, "the router returned nothing"
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None, "the router answer is not JSON"
+    if not isinstance(data, dict):
+        return None, "the router answer is not a JSON object"
+    if set(data) != set(SUPPLEMENT_KEYS):
+        return None, "the router answer has missing or unknown keys"
+    out: dict[str, str] = {}
+    for key in SUPPLEMENT_KEYS:
+        value = data[key]
+        if not isinstance(value, str):
+            return None, f"{key} is not a string"
+        if len(value.encode("utf-8")) > SUPPLEMENT_MAX_BYTES:
+            return None, f"{key} is over {SUPPLEMENT_MAX_BYTES} bytes"
+        if _SUPPLEMENT_CONTROL_RE.search(value):
+            return None, f"{key} holds control characters"
+        if _SUPPLEMENT_HEADING_RE.search(value):
+            return None, f"{key} holds a markdown heading"
+        out[key] = value
+    return out, ""
+
+
+def _transcript_line(transcript: Path | None) -> str:
+    if transcript is None:
+        return "Predecessor transcript: (none found)"
+    return f"Predecessor transcript (evidence only): {transcript}"
+
+
+def _facts_only_state(snap_doc: dict[str, Any], transcript: Path | None) -> str:
+    """D10: banner + last to-do list + the last 3 assistant texts (≤ 4 KB), each escaped."""
+    from .handoff_doc import escape_headings
+
+    todos = [t for t in snap_doc.get("facts") or [] if t.get("kind") == "todo_list"]
+    todo_lines = [str(todos[-1]["fields"].get("text") or "")] if todos else last_todos(transcript)
+    parts = []
+    if any(t.strip() for t in todo_lines):
+        parts.append("Last to-do list:\n" + "\n".join(todo_lines))
+    texts = [m for role, m in recent_messages(transcript) if role == "assistant"][-3:]
+    for text in texts:
+        parts.append(f"Assistant (verbatim):\n{text}")
+    body = _cut_bytes(escape_headings("\n\n".join(parts) or "none recorded"), STATE_MAX_BYTES)
+    return f"{EMERGENCY_BANNER}\n\n{body}\n\n{_transcript_line(transcript)}"
+
+
+def _tp_decisions(snap_doc: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for fact in snap_doc.get("facts") or []:
+        if fact.get("kind") != "tp_item":
+            continue
+        fields = fact.get("fields") or {}
+        raw = fields.get("decisions") or fields.get("decision") or []
+        for item in [raw] if isinstance(raw, str) else raw:
+            if str(item).strip():
+                out.append(f"- tp#{fields.get('tp_id')}: {item}")
+    return out
+
+
+def _facts_only(snap_doc: dict[str, Any], transcript: Path | None) -> str:
+    from .handoff_doc import escape_headings
+
+    decisions = _cut_bytes(
+        escape_headings("\n".join(_tp_decisions(snap_doc)) or "none recorded"), SUPPLEMENT_MAX_BYTES
+    )
+    return (
+        f"## Current state\n\n{_facts_only_state(snap_doc, transcript)}\n\n"
+        f"## Decisions and constraints\n\n{decisions}\n\n"
+        "Reasoning behind them: read the predecessor transcript.\n\n"
+        f"## First steps\n\n{FIXED_FIRST_STEPS}\n"
+    )
+
+
+def _from_supplement(sup: dict[str, str], transcript: Path | None) -> str:
+    from .handoff_doc import escape_headings
+
+    def body(key: str) -> str:
+        return escape_headings(sup[key].strip()) or "none"
+
+    return (
+        f"## Current state\n\n{ROUTER_BANNER}\n\n{body('current_state')}\n\n"
+        f"{_transcript_line(transcript)}\n\n"
+        f"## Decisions and constraints\n\n{body('decisions')}\n\n"
+        f"## First steps\n\n{body('first_steps')}\n"
+    )
+
+
+def model_part(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    sid: str,
+    snap_doc: dict[str, Any],
+    transcript: Path | None,
+    scrubber: Any,
+    *,
+    use_router: bool,
+) -> str:
+    """The three-section model part written by code (D10) or by the router (D11).
+
+    With *use_router* the router sees a scrubbed digest (≤ 8 KB) and may answer ONLY a JSON
+    supplement; unset / failed / invalid / over-cap falls back to the facts-only text (a
+    logged event, never a refusal). Every inserted text passes ``escape_headings`` (D16).
+    """
+    if use_router:
+        answer = summarize(summary_prompt(scrubber.text(digest(snap_doc, transcript))))
+        sup, why = parse_supplement(answer)
+        if answer is None:
+            why = "the router (llm_custom_command) is unset or failed"
+        if sup is not None:
+            return _from_supplement(sup, transcript)
+        log_event(sid, f"capped handoff: {why}; relaying facts-only instead")
+    return _facts_only(snap_doc, transcript)
 
 
 def summarize(prompt: str) -> str | None:

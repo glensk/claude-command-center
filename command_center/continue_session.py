@@ -47,6 +47,9 @@ if TYPE_CHECKING:
 
 DRAIN_DEFAULT_SEC = 540  # one foreground Bash call, under the 600 s tool cap
 DRAIN_POLL_SEC = 3.0  # the adapter caches the process table for 3 s
+IDLE_WAIT_SEC = 120  # D12: how long ``start --await-idle`` waits for a provable idle
+IDLE_POLL_SEC = 2
+IDLE_STABLE_SEC = 10  # the transcript must stay unchanged this long
 
 
 @dataclass
@@ -641,18 +644,6 @@ def _fail(args: argparse.Namespace, sid: str, message: str) -> int:
     return 1
 
 
-def _capped_text(adapter: ClaudeAdapter, store: Store, src: Source) -> bytes | None:
-    """The router-written handoff for a capped seat, or None (router unset / failed)."""
-    from . import handoff_capped, handoff_doc
-
-    data = state(adapter, store, src)
-    prompt = handoff_capped.summary_prompt(
-        handoff_capped.digest(data, src.transcript), handoff_doc.template()
-    )
-    text = handoff_capped.summarize(prompt)
-    return None if text is None else text.encode("utf-8")
-
-
 @dataclass
 class _Composed:
     """What ``start`` hands to the transfer: the vouched text, its digest, the snapshot id."""
@@ -673,6 +664,74 @@ def _stored_snapshot(source_sid: str, snapshot: str) -> dict[str, Any] | None:
     return doc if isinstance(doc, dict) else None
 
 
+def _snapshot(
+    adapter: ClaudeAdapter, store: Store, src: Source, args: Any
+) -> tuple[dict[str, Any], str, Any]:
+    """Collect and freeze the facts: ``(snapshot document, snapshot id, scrubber)``."""
+    from . import handoff_facts
+
+    scrubber = handoff_facts.Scrubber()
+    try:
+        doc = handoff_facts.collect(
+            adapter, store, src, "finalize", scrubber=scrubber, persist=not args.dry_run
+        )
+        snapshot, _path = handoff_facts.freeze(doc, scrubber, write=not args.dry_run)
+    except handoff_facts.FactsError as exc:
+        raise StartRefused(f"facts collection refused — {exc}") from exc
+    return doc, snapshot, scrubber
+
+
+def _finish(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    model: Any, snap_doc: dict[str, Any], snapshot: str, sid: str, args: Any
+) -> _Composed:
+    """Compose the model part with the snapshot (D1, D9) and keep a cut original."""
+    from . import handoff_doc, handoff_facts
+
+    model_path = handoff_facts.facts_dir(sid) / f"{snapshot[:12]}.model.md"
+    doc, composed = handoff_doc.compose_checked(
+        model, snap_doc, ref=sid, model_path=str(model_path)
+    )
+    if not doc.ok:
+        raise StartRefused("handoff rejected — " + "; ".join(doc.errors))
+    if composed.model_cut and not args.dry_run:  # D9: the cut part stays retrievable
+        try:
+            handoff_facts.write_private(model_path, handoff_facts.Scrubber().text(model.raw))
+        except handoff_facts.FactsError as exc:
+            raise StartRefused(f"facts collection refused — {exc}") from exc
+    return _Composed(doc.text, handoff_doc.model_digest(model, snapshot), snapshot)
+
+
+def _compose_generated(
+    adapter: ClaudeAdapter, store: Store, src: Source, active: Any, args: Any
+) -> _Composed:
+    """D10 / D11: the model part written by code (``--facts-only``) or the router (``--capped``).
+
+    A retry of an active PREPARED / OPENED transfer reuses its stored composed text, so a
+    router that answers differently the second time cannot fork the transfer.
+    """
+    from . import handoff_capped, handoff_doc, handoff_facts
+    from .transfer_store import OPENED, PREPARED
+
+    if active is not None and active.state in (PREPARED, OPENED) and active.facts_snapshot:
+        try:
+            stored = Path(active.handoff_path).read_text(encoding="utf-8")
+        except OSError:
+            stored = ""
+        if stored:
+            return _Composed(stored, active.prompt_sha256, active.facts_snapshot)
+    snap_doc, snapshot, scrubber = _snapshot(adapter, store, src, args)
+    try:
+        text = handoff_capped.model_part(
+            src.session_id, snap_doc, src.transcript, scrubber, use_router=bool(args.capped)
+        )
+    except handoff_facts.FactsError as exc:
+        raise StartRefused(f"facts collection refused — {exc}") from exc
+    model = handoff_doc.validate_model_part(text)
+    if not model.ok:  # code-written text is valid by construction; never ship a bad one
+        raise StartRefused("handoff rejected — " + "; ".join(model.errors))
+    return _finish(model, snap_doc, snapshot, src.session_id, args)
+
+
 def _compose(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     adapter: ClaudeAdapter, store: Store, src: Source, raw: bytes, active: Any, args: Any
 ) -> _Composed:
@@ -681,15 +740,15 @@ def _compose(  # pylint: disable=too-many-arguments,too-many-positional-argument
     An active PREPARED / OPENED transfer that already has a snapshot is REUSED (stored
     snapshot and stored composed text, no recollection): its digest is recomputed from the
     given model file and the stored snapshot id, so a changed ledger cannot fork a retry.
-    ``--capped`` (B6 moves it) and a transfer from before snapshots keep the whole-document
-    path.
+    ``--facts-only`` / ``--capped`` generate the model part (:func:`_compose_generated`);
+    a transfer from before snapshots keeps the whole-document path.
     """
-    from . import handoff_doc, handoff_facts
+    from . import handoff_doc
     from .transfer_store import OPENED, PREPARED
 
-    if getattr(args, "capped", False) or (
-        active is not None and active.state in (PREPARED, OPENED) and not active.facts_snapshot
-    ):
+    if args.facts_only or args.capped:
+        return _compose_generated(adapter, store, src, active, args)
+    if active is not None and active.state in (PREPARED, OPENED) and not active.facts_snapshot:
         doc = handoff_doc.validate(raw)
         if not doc.ok:
             raise StartRefused("handoff rejected — " + "; ".join(doc.errors))
@@ -711,27 +770,45 @@ def _compose(  # pylint: disable=too-many-arguments,too-many-positional-argument
             raise StartRefused(f"the stored facts snapshot {active.facts_snapshot[:12]} is gone")
         snapshot = active.facts_snapshot
     else:
-        scrubber = handoff_facts.Scrubber()
-        try:
-            snap_doc = handoff_facts.collect(
-                adapter, store, src, "finalize", scrubber=scrubber, persist=not args.dry_run
-            )
-            snapshot, _path = handoff_facts.freeze(snap_doc, scrubber, write=not args.dry_run)
-        except handoff_facts.FactsError as exc:
-            raise StartRefused(f"facts collection refused — {exc}") from exc
-    snap12 = snapshot[:12]
-    model_path = handoff_facts.facts_dir(sid) / f"{snap12}.model.md"
-    doc, composed = handoff_doc.compose_checked(
-        model, snap_doc, ref=sid, model_path=str(model_path)
-    )
-    if not doc.ok:
-        raise StartRefused("handoff rejected — " + "; ".join(doc.errors))
-    if composed.model_cut and not args.dry_run:  # D9: the cut part stays retrievable
-        try:
-            handoff_facts.write_private(model_path, handoff_facts.Scrubber().text(model.raw))
-        except handoff_facts.FactsError as exc:
-            raise StartRefused(f"facts collection refused — {exc}") from exc
-    return _Composed(doc.text, handoff_doc.model_digest(model, snapshot), snapshot)
+        snap_doc, snapshot, _scrubber = _snapshot(adapter, store, src, args)
+    return _finish(model, snap_doc, snapshot, sid, args)
+
+
+def _transcript_stamp(path: Path | None) -> tuple[int, int] | None:
+    try:
+        stat = path.stat() if path is not None else None
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size) if stat is not None else None
+
+
+def _idle_now(adapter: ClaudeAdapter, src: Source) -> bool:
+    """The registry reads the session idle AND its transcript holds no open turn."""
+    from .adapters.claude_agents import contract_status
+    from .bridge_send import inspect_transcript
+
+    live = next((e for e in adapter.discover() if e.session_id == src.session_id and e.alive), None)
+    if live is None or contract_status(live.raw_status) != "idle":
+        return False
+    if src.transcript is None or not src.transcript.is_file():
+        return False
+    return inspect_transcript(src.transcript).turn_active is False
+
+
+def _await_idle(adapter: ClaudeAdapter, src: Source) -> bool:
+    """D12: wait (≤ IDLE_WAIT_SEC, poll IDLE_POLL_SEC) for idle + a transcript still for 10 s."""
+    need = -(-IDLE_STABLE_SEC // IDLE_POLL_SEC)
+    stable = 0
+    last: tuple[int, int] | None = None
+    for _ in range(IDLE_WAIT_SEC // IDLE_POLL_SEC):
+        stamp = _transcript_stamp(src.transcript)
+        still = stamp is not None and stamp == last and _idle_now(adapter, src)
+        stable = stable + 1 if still else 0
+        last = stamp
+        if stable >= need:
+            return True
+        _sleep(IDLE_POLL_SEC)
+    return False
 
 
 def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
@@ -744,23 +821,24 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
         if src is None:
             print("error: could not resolve a session (pass -s/--session <id>)", file=sys.stderr)
             return 1
+        if args.await_idle and not _await_idle(adapter, src):
+            print(
+                f"error: session {src.session_id} is not provably idle — no transfer started",
+                file=sys.stderr,
+            )
+            return 1
         active = store.active_transfer(src.session_id)
         if active is not None and active.state == ACCEPTED:  # a re-run after acceptance
             return _drive(store, active, src, "", args)
         session = store.get(src.session_id)
         if session is not None and session.handed_off_to:
             return _fail(args, src.session_id, f"{src.session_id} was already handed off")
-        if args.capped:  # B6 moves the capped path onto compose; until then it is whole-document
-            raw = _capped_text(adapter, store, src)
-            if raw is None:
-                return _fail(
-                    args,
-                    src.session_id,
-                    "the handoff-summary router (llm_custom_command) is unset or failed",
-                )
-        elif not args.file:
-            return _fail(args, src.session_id, "give -f/--file HANDOFF (or --capped)")
-        else:
+        if args.facts_only and (args.file or args.capped):
+            return _fail(args, src.session_id, "--facts-only takes no -f/--file and no --capped")
+        raw = b""
+        if not (args.facts_only or args.capped):
+            if not args.file:
+                return _fail(args, src.session_id, "give -f/--file HANDOFF (or --capped)")
             try:
                 raw = Path(args.file).read_bytes()
             except OSError as exc:
@@ -1089,6 +1167,20 @@ def add_parser(sub: Any) -> None:
         action="store_true",
         help="capped seat: the router writes the handoff (llm_custom_command, "
         "purpose handoff-summary); spawned by the UserPromptSubmit intercept",
+    )
+    p_start.add_argument(
+        "-F",
+        "--facts-only",
+        action="store_true",
+        help="no model turn: the three model sections are written by code from the facts "
+        "(emergency relay; takes no -f and no --capped)",
+    )
+    p_start.add_argument(
+        "-I",
+        "--await-idle",
+        action="store_true",
+        help="first wait (up to 120 s) until the session is provably idle with a still "
+        "transcript; otherwise exit without a transfer",
     )
     p_start.add_argument("-s", "--session", help="the source session id (default: this session)")
     p_start.add_argument("-O", "--overseer", help="model of the new session (default: observed)")
