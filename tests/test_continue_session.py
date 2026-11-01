@@ -169,7 +169,7 @@ def _handoff_text(**override: str) -> str:
     return "\n".join(parts)
 
 
-class _Harness:
+class _Harness:  # pylint: disable=too-many-instance-attributes  # + the fake clock
     """Two accounts, an inside-the-session caller, a clean transcript, a fake launcher."""
 
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, adapter: _Adapter):
@@ -210,7 +210,9 @@ class _Harness:
         self.launcher = "iterm_api"
         monkeypatch.setattr(continue_session, "_launch", self._launch)
         self.accept_on_sleep = True
+        self.clock = 0.0  # the fake monotonic clock: only ``_sleep`` advances it
         monkeypatch.setattr(continue_session, "_sleep", self._sleep)
+        monkeypatch.setattr(continue_session, "_monotonic", lambda: self.clock)
         self.file = tmp_path / "handoff.md"
         self.file.write_text(_handoff_text(), encoding="utf-8")
 
@@ -220,6 +222,7 @@ class _Harness:
 
     def _sleep(self, _seconds: float) -> None:
         """The successor accepts while the source waits (what a real tab would do)."""
+        self.clock += _seconds
         if not self.accept_on_sleep:
             return
         from command_center.transfer_store import ACCEPTED  # pylint: disable=C0415
@@ -497,10 +500,12 @@ def _as_successor(monkeypatch: pytest.MonkeyPatch, harness: _Harness, tid: str) 
     return transfer.target_session
 
 
-def _hooks(monkeypatch: pytest.MonkeyPatch, *hooks: list[str]) -> None:
+def _hooks(monkeypatch: pytest.MonkeyPatch, *hooks: list[str], window: int | None = None) -> None:
     from command_center import config  # pylint: disable=import-outside-toplevel
 
     cfg = config.Config(handoff_hooks=[list(h) for h in hooks])
+    if window is not None:
+        cfg.accept_hook_retry_sec = window
     monkeypatch.setattr(config, "load_config", lambda: cfg)
 
 
@@ -644,8 +649,14 @@ def test_a_failing_hook_moves_no_await_and_a_retry_moves_it_exactly_once(
     assert _group(gid).transfer_id == tid  # reserved by start, with the transfer
     new = _as_successor(monkeypatch, harness, tid)
     _hooks(monkeypatch, [_script(tmp_path, "bad.sh", "exit 3\n")])
+    capsys.readouterr()
     assert cli.main(["continue-session", "accept", tid]) == 1
+    err = capsys.readouterr().err
+    assert "after 3 attempts" in err and "still opened" in err  # 0, 10, 20 s of a 45 s window
     assert _state(tid) == "opened"
+    with Store() as store:
+        failed = store.get_transfer(tid)
+    assert failed is not None and failed.failure.startswith("hook:")
     group = _group(gid)
     assert (group.session_id, group.transfer_id) == (SID, tid)  # no rebind
     log = tmp_path / "ran.log"
@@ -1154,3 +1165,230 @@ def test_capped_start_with_a_failed_required_provider_logs_and_notifies(
     assert cli.main(argv) == 0
     assert _LOUD in logged and _LOUD in notified
     assert len(harness.launches) == 1
+
+
+# ------------------------------------------- accept retries a refusing hook (tp#1521)
+
+
+def _counting_hook(tmp_path: Path, name: str, fail_runs: int) -> tuple[str, Path]:
+    """A hook that exits 1 on its first *fail_runs* runs, then succeeds; its run counter."""
+    counter = tmp_path / f"{name}.count"
+    body = (
+        f'n=$(cat {counter} 2>/dev/null || echo 0)\nn=$((n + 1))\necho "$n" > {counter}\n'
+        f'if [ "$n" -le {fail_runs} ]; then echo "source is working" >&2; exit 1; fi\n'
+        "echo '{\"ok\": true}'\n"
+    )
+    return _script(tmp_path, name, body), counter
+
+
+def _runs(counter: Path) -> int:
+    return int(counter.read_text(encoding="utf-8").strip()) if counter.exists() else 0
+
+
+def _failure(tid: str) -> str:
+    with Store() as store:
+        transfer = store.get_transfer(tid)
+    assert transfer is not None
+    return transfer.failure
+
+
+def test_accept_retry_a_refusing_hook_until_it_succeeds(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    hook, counter = _counting_hook(tmp_path, "flaky.sh", fail_runs=2)
+    _hooks(monkeypatch, [hook], window=60)
+    during: list[str] = []
+    real_sleep = continue_session._sleep  # pylint: disable=protected-access
+
+    def _sleep(seconds: float) -> None:
+        during.append(_failure(tid))
+        real_sleep(seconds)
+
+    monkeypatch.setattr(continue_session, "_sleep", _sleep)
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    err = capsys.readouterr().err
+    assert _runs(counter) == 3 and _state(tid) == "accepted"
+    assert err.count("waiting: handoff hook refused") == 2 and "attempt 1" in err
+    assert during[0].startswith("hook (retrying 1): flaky.sh: exit 1")  # test 7
+    assert during[1].startswith("hook (retrying 2):")
+    assert _failure(tid) == ""
+
+
+def test_accept_retry_starts_no_attempt_past_the_window_and_bounds_each_run(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch, [_script(tmp_path, "slow.sh", "exit 1\n")], window=60)
+    timeouts: list[float] = []
+
+    def _bounded(_argv: list[str], timeout: float) -> tuple[int, bytes, bytes]:
+        timeouts.append(timeout)
+        harness.clock += 25  # each run takes 25 s of the window
+        return 1, b"", b"refused\n"
+
+    monkeypatch.setattr(continue_session, "run_bounded", _bounded)
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    # attempt 1 at 0 s (full timeout), ends at 25; 25 + 10 + 20 <= 60: attempt 2 at 35 with
+    # the 25 s left; it ends at 60, no room for a third
+    assert timeouts == [continue_session.HOOK_TIMEOUT_SEC, 25]
+    assert _state(tid) == "opened"
+
+
+def test_accept_retry_never_retries_a_timeout(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch, [_script(tmp_path, "hang.sh", "exit 0\n")], window=60)
+    calls: list[float] = []
+
+    def _bounded(argv: list[str], timeout: float) -> tuple[int, bytes, bytes]:
+        calls.append(timeout)
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    monkeypatch.setattr(continue_session, "run_bounded", _bounded)
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    assert len(calls) == 1 and "timed out" in capsys.readouterr().err
+    assert _failure(tid).startswith("hook:")
+
+
+@pytest.mark.parametrize(("to_state", "code"), [("failed", 1), ("accepted", 0)])
+def test_accept_retry_stops_when_the_transfer_moved_during_the_wait(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    to_state: str,
+    code: int,
+) -> None:
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    hook, counter = _counting_hook(tmp_path, "flaky.sh", fail_runs=5)
+    _hooks(monkeypatch, [hook], window=60)
+
+    def _sleep(_seconds: float) -> None:
+        with Store() as store:
+            assert store.transition_transfer(tid, to_state, 1, failure="gone")
+
+    monkeypatch.setattr(continue_session, "_sleep", _sleep)
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == code
+    out = capsys.readouterr()
+    assert _runs(counter) == 1  # no hook ran after the move
+    if to_state == "accepted":
+        assert "already accepted" in out.out
+    else:
+        assert f"transfer {tid} is failed" in out.err
+
+
+def test_accept_retry_reruns_accept_prepare_and_stops_on_a_fresh_delivery(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import time  # pylint: disable=import-outside-toplevel
+
+    gid = _arm_await(SID)
+    event: dict[str, Any] = {"event_id": "e", "payload": "{}", "remote_epoch": 1, "watermark": "w"}
+    stale = int(time.time()) - 15 * 60  # a delivery the first attempt may reclaim
+    with Store() as store:
+        src = store.lease_due_sources(1_800_000_120)[0][0]
+        token = store.fire_group(gid, src.id, src.lease_token, now=1_800_000_120, **event)
+        assert token and store.mark_delivering(gid, token, stale)
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    hook, counter = _counting_hook(tmp_path, "flaky.sh", fail_runs=1)
+    _hooks(monkeypatch, [hook], window=60)
+
+    def _sleep(_seconds: float) -> None:  # the old session's delivery is live again mid-wait
+        with Store() as store:
+            store.conn.execute(
+                "UPDATE await_groups SET state = 'delivering', updated_at = ? WHERE id = ?",
+                (int(time.time()), gid),
+            )
+            store.conn.commit()
+
+    monkeypatch.setattr(continue_session, "_sleep", _sleep)
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    assert f"await group {gid} is being delivered" in capsys.readouterr().err
+    assert _runs(counter) == 1 and _state(tid) == "opened"
+    assert (_group(gid).state, _group(gid).session_id) == ("delivering", SID)  # no rebind
+
+
+def test_accept_retry_window_zero_keeps_one_run(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    hook, counter = _counting_hook(tmp_path, "flaky.sh", fail_runs=1)
+    _hooks(monkeypatch, [hook], window=0)
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    err = capsys.readouterr().err
+    assert _runs(counter) == 1 and "waiting:" not in err and "after 1 attempt" in err
+    assert _state(tid) == "opened"
+
+
+def test_accept_retry_reruns_the_whole_hook_list(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    first, first_count = _counting_hook(tmp_path, "first.sh", fail_runs=0)
+    second, second_count = _counting_hook(tmp_path, "second.sh", fail_runs=1)
+    _hooks(monkeypatch, [first], [second], window=60)
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    assert (_runs(first_count), _runs(second_count)) == (2, 2)
+    assert _state(tid) == "accepted"
+
+
+def test_accept_retry_preamble_allows_one_more_accept() -> None:
+    transfer = type(
+        "T", (), {"source_session": "s", "transfer_id": "t1", "handoff_path": "/h.md"}
+    )()
+    text = continue_session.preamble(transfer, "private", "")
+    assert "If accept fails and the error says the transfer is still opened, run accept " in text
+    assert "once more; stop and report on any other failure" in text
+
+
+def test_accept_retry_integration_with_a_stub_executable(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The real ``run_hook`` path: a stub exits 1 until the marker the wait creates exists."""
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    marker = tmp_path / "source-is-running-start"
+    stub = _script(
+        tmp_path,
+        "tp-stub",
+        f'[ -e {marker} ] || {{ echo "session is working" >&2; exit 1; }}\n'
+        "echo '{\"ok\": true}'\n",
+    )
+    _hooks(monkeypatch, [stub, "handoff", "-S", "{old}", "--to", "{new}", "-j"])  # default window
+    real_sleep = continue_session._sleep  # pylint: disable=protected-access
+
+    def _sleep(seconds: float) -> None:
+        marker.touch()  # the source's re-run `start` is back
+        real_sleep(seconds)
+
+    monkeypatch.setattr(continue_session, "_sleep", _sleep)
+    assert continue_session.cmd_accept(type("A", (), {"transfer": tid, "json": False})()) == 0
+    assert _state(tid) == "accepted"

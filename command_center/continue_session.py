@@ -298,6 +298,11 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def _monotonic() -> float:
+    """The clock of ``accept``'s retry window (a seam next to ``_sleep``)."""
+    return time.monotonic()
+
+
 def _job_model(observed: str, explicit: str | None) -> str:
     """Q1: an explicit ``-O``/``-E`` wins; else the observed model when launchable; else default."""
     from .models import NEW_JOB_DEFAULT_LLM, NEW_JOB_LLM_CHOICES
@@ -332,8 +337,9 @@ def preamble(transfer: Any, source_label: str, transcript: str) -> str:
         "ONLY the shells under 'Background restarts' marked `restart:` (declared restartable; "
         "the ones under 'Decide before restarting' are evidence, judge each before re-running "
         "anything), then follow 'First steps'. Facts cut for size: "
-        f"ccc continue-session facts {transfer.source_session} -j. If accept "
-        "fails, stop and report why: the old session stays authoritative until it succeeds.\n"
+        f"ccc continue-session facts {transfer.source_session} -j. If accept fails and the "
+        "error says the transfer is still opened, run accept once more; stop and report on "
+        "any other failure: the old session stays authoritative until it succeeds.\n"
         "\n"
     )
 
@@ -908,12 +914,23 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
 
 
 HOOK_TIMEOUT_SEC = 60
+ACCEPT_HOOK_RETRY_INTERVAL_SEC = 10  # the wait between two accept attempts (tp#1521)
+ACCEPT_HOOK_ATTEMPT_BUDGET_SEC = 20  # one attempt's budget (`tp handoff` measured ~14 s)
 HOOK_OUTPUT_CAP = 64 * 1024
 _PLACEHOLDERS = ("{old}", "{new}", "{label}", "{transfer}")
 
 
 class HookFailed(Exception):
-    """One ``handoff_hooks`` entry did not succeed; the message says why (no output dump)."""
+    """One ``handoff_hooks`` entry did not succeed; the message says why (no output dump).
+
+    ``retryable`` is true only for a non-zero exit (a refusal that may be transient, e.g.
+    the source between two ``start`` runs); a timeout, a missing executable or a malformed
+    answer is final.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def _render_hook(template: object, transfer: Any) -> list[str]:
@@ -966,16 +983,18 @@ def run_bounded(argv: list[str], timeout: float) -> tuple[int, bytes, bytes]:
         return proc.returncode, stdout, stderr
 
 
-def run_hook(template: object, transfer: Any) -> dict[str, Any]:
-    """Run one hook argv-only (no shell), bounded; its parsed JSON object, or HookFailed."""
+def run_hook(template: object, transfer: Any, timeout: float | None = None) -> dict[str, Any]:
+    """Run one hook argv-only (no shell), bounded by *timeout* (default ``HOOK_TIMEOUT_SEC``);
+    its parsed JSON object, or HookFailed."""
     import subprocess
 
+    limit = HOOK_TIMEOUT_SEC if timeout is None else timeout
     argv = _render_hook(template, transfer)
     name = os.path.basename(argv[0])
     try:
-        returncode, stdout, stderr = run_bounded(argv, HOOK_TIMEOUT_SEC)
+        returncode, stdout, stderr = run_bounded(argv, limit)
     except subprocess.TimeoutExpired as exc:
-        raise HookFailed(f"{name}: timed out after {HOOK_TIMEOUT_SEC}s") from exc
+        raise HookFailed(f"{name}: timed out after {limit:g}s") from exc
     except OSError as exc:
         raise HookFailed(f"{name}: could not run ({exc.strerror or exc})") from exc
     if len(stdout) > HOOK_OUTPUT_CAP:
@@ -983,7 +1002,7 @@ def run_hook(template: object, transfer: Any) -> dict[str, Any]:
     detail = stderr.decode("utf-8", "replace").strip().splitlines()
     if returncode != 0:
         tail = f": {detail[-1][:300]}" if detail else ""
-        raise HookFailed(f"{name}: exit {returncode}{tail}")
+        raise HookFailed(f"{name}: exit {returncode}{tail}", retryable=True)
     try:
         data = json.loads(stdout.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
@@ -1070,6 +1089,81 @@ def _accept_and_rebind(store: Store, transfer: Any) -> list[str] | None:
     ]
 
 
+def _run_hooks(
+    hooks: list[Any], transfer: Any, deadline: float | None
+) -> list[str]:  # raises HookFailed
+    """Every hook from the first; with a *deadline* each run is bounded by what remains."""
+    steps: list[str] = []
+    for template in hooks:
+        timeout = None
+        if deadline is not None:
+            timeout = max(1.0, min(float(HOOK_TIMEOUT_SEC), deadline - _monotonic()))
+        steps += run_hook(template, transfer, timeout).get("next_steps", [])
+    return steps
+
+
+def _run_hooks_with_retry(  # pylint: disable=too-many-return-statements
+    store: Store, transfer: Any, hooks: list[Any], cfg: Any
+) -> tuple[Any, list[str]] | int:
+    """Accept-prepare + the hook list, retried on a non-zero exit within ONE monotonic
+    window (``accept_hook_retry_sec``, tp#1521): ``(transfer, next steps)`` or an exit code.
+
+    An attempt starts only if it still fits (elapsed + interval + one attempt's budget ≤
+    the window). Each retry re-reads the transfer (``failed`` stops, ``accepted`` is done),
+    re-runs accept-prepare (an await group mid-delivery stops it, nothing rebound) and then
+    the WHOLE hook list from the first entry, each run bounded by what remains.
+    """
+    from .models import now_ms
+    from .transfer_store import ACCEPTED, FINALIZED, OPENED, PREPARED
+
+    tid = transfer.transfer_id
+    window = float(getattr(cfg, "accept_hook_retry_sec", 0) or 0)
+    started = _monotonic()
+    attempt = 0
+    while True:
+        attempt += 1
+        if attempt > 1:
+            current = store.get_transfer(tid)
+            if current is not None and current.state in (ACCEPTED, FINALIZED):
+                print(f"already accepted: transfer {tid} ({current.state})")
+                return 0
+            if current is None or current.state not in (PREPARED, OPENED):
+                now_state = current.state if current is not None else "gone"
+                why = (current.failure if current is not None else "") or "no longer acceptable"
+                print(f"error: transfer {tid} is {now_state}: {why}", file=sys.stderr)
+                return 1
+            transfer = current
+        refused = _accept_prepare(store, transfer)  # BEFORE any hook (re-checked at the CAS)
+        if refused is not None:
+            return refused
+        try:
+            steps = _run_hooks(hooks, transfer, started + window if attempt > 1 else None)
+        except HookFailed as exc:
+            elapsed = _monotonic() - started
+            fits = (
+                elapsed + ACCEPT_HOOK_RETRY_INTERVAL_SEC + ACCEPT_HOOK_ATTEMPT_BUDGET_SEC <= window
+            )
+            if exc.retryable and fits:
+                store.note_transfer(tid, now_ms(), failure=f"hook (retrying {attempt}): {exc}")
+                print(
+                    f"waiting: handoff hook refused ({exc}); retrying in "
+                    f"{ACCEPT_HOOK_RETRY_INTERVAL_SEC}s (attempt {attempt})",
+                    file=sys.stderr,
+                )
+                _sleep(ACCEPT_HOOK_RETRY_INTERVAL_SEC)
+                continue
+            store.note_transfer(tid, now_ms(), failure=f"hook: {exc}")
+            plural = "attempt" if attempt == 1 else "attempts"
+            print(
+                f"error: handoff hook failed after {attempt} {plural} — {exc}. The transfer "
+                f"is still {transfer.state} and ownership is unchanged; fix the cause and run "
+                "accept again.",
+                file=sys.stderr,
+            )
+            return 1
+        return transfer, steps
+
+
 def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
     """``continue-session accept``: the successor takes the work over (hooks, then CAS
     plus the await rebind in one transaction)."""
@@ -1108,21 +1202,11 @@ def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-ret
                 file=sys.stderr,
             )
             return 1
-        refused = _accept_prepare(store, transfer)  # BEFORE any hook (re-checked at the CAS)
-        if refused is not None:
-            return refused
-        steps: list[str] = []
-        try:
-            for template in config.load_config().handoff_hooks:
-                steps += run_hook(template, transfer).get("next_steps", [])
-        except HookFailed as exc:
-            store.note_transfer(transfer.transfer_id, now_ms(), failure=f"hook: {exc}")
-            print(
-                f"error: handoff hook failed — {exc}. The transfer stays {transfer.state} and "
-                "ownership is unchanged; fix the cause and run accept again.",
-                file=sys.stderr,
-            )
-            return 1
+        cfg = config.load_config()
+        hooks = _run_hooks_with_retry(store, transfer, cfg.handoff_hooks, cfg)
+        if isinstance(hooks, int):
+            return hooks
+        transfer, steps = hooks
         moved = _accept_and_rebind(store, transfer)
         if moved is None:
             return 1

@@ -1927,7 +1927,19 @@ from their capsules, restart only the `restart:` shells, judge the `Decide befor
 restarting` ones, and fetch cut facts with `ccc continue-session facts`) plus the handoff
 text. `accept` refuses unless it runs in the recorded target session under the recorded
 account, runs the accept-prepare transaction, then the `handoff_hooks`, and only then CASes
-`opened → accepted`; a failing hook leaves `opened` and prints why.
+`opened → accepted`; a failing hook leaves `opened` and prints why. A hook that exits
+non-zero (e.g. `tp handoff` refusing while the source is between two `start` runs, after
+an exit 3) is retried within ONE monotonic window of `accept_hook_retry_sec` (config,
+default 45, `0` = one attempt, clamped to 0..60 so accept stays under the successor's 120 s
+Bash timeout): a new attempt starts only if elapsed + 10 s wait + a 20 s attempt budget
+still fits, each of its hook runs is bounded by what remains of the window, and each
+attempt re-reads the transfer (`failed` stops, `accepted` is done), re-runs accept-prepare
+(an await group mid-delivery stops it, nothing rebound) and then the WHOLE hook list from
+the first entry. Each wait prints `waiting: handoff hook refused (…); retrying in 10s
+(attempt K)` and records `hook (retrying K): …` as the transfer's failure; success clears
+it. A timeout, a missing executable or a malformed answer is never retried. The final
+error names the attempt count and says the transfer is still `opened`; the successor's
+preamble lets it run accept once more on exactly that error and stop on any other.
 
 **The source's `ccc await` group moves by code.** `start` reserves the source's active
 group under the transfer in the same transaction that creates it (delivery defers a
@@ -1952,7 +1964,9 @@ true` (`"next_steps"` printed); placeholders `{old}`, `{new}`, `{label}`, `{tran
 ccc keeps no tracker dependency; a ticket tracker plugs in here, e.g.
 `handoff_hooks = [["/path/to/tp.py", "handoff", "-S", "{old}", "--to", "{new}", "-j"]]`.
 argv[0] must be an executable on `PATH` or an absolute path: no shell runs, so a shell
-alias (such as a `tp` alias) is not found and `accept` fails with "could not run".
+alias (such as a `tp` alias) is not found and `accept` fails with "could not run". Hooks
+must be idempotent: a non-zero exit re-runs the whole list from the first hook (see
+`accept_hook_retry_sec` above), as does a manual re-run of `accept`.
 
 **`handoff_facts`** (config, default `[]`, inert; tp#1479): fact PROVIDERS for `ccc
 continue-session collect` and the `start` composition. Each entry is a table
