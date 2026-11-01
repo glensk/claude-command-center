@@ -386,6 +386,8 @@ def _tp_item(fact: dict[str, Any], level: int) -> list[str]:
             plan += "; next open: " + ", ".join(shown)
     if plan:
         out.append(f"  {plan}")
+    # Recorded decisions are not repeated in this never-cut line: the facts-only relay
+    # renders them under "Decisions and constraints" (capped there), and the snapshot keeps them.
     rest, blocks = _kv(
         f,
         (
@@ -398,6 +400,7 @@ def _tp_item(fact: dict[str, Any], level: int) -> list[str]:
             "boxes_done",
             "boxes_total",
             "next_open_boxes",
+            "decisions",
         ),
     )
     if rest:

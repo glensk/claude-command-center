@@ -331,6 +331,112 @@ def test_facts_only_part_escapes_inserted_text_and_keeps_three_sections(tmp_path
     assert len(part.sections["Current state"].encode("utf-8")) < 4 * 1024 + 600
 
 
+def test_facts_only_document_renders_recorded_tp_decisions_exactly(tmp_path: Path) -> None:
+    """D10 (B14): `tp held` decisions, copied as strings, land under Decisions and constraints.
+
+    A decision starting with ``##`` follows the ``- tp#N: `` prefix, so it is never at column
+    0 and stays verbatim; a line inside a decision that would open a section is escaped.
+    """
+    from command_center import handoff_doc
+    from command_center.handoff_facts import rec, validate_provider_doc
+
+    provider = {
+        "version": 1,
+        "provider": "test-provider",
+        "facts": [
+            rec(
+                "tp_item",
+                "tp_item:7",
+                "tp ownership",
+                0,
+                tp_id=7,
+                title="feat: a",
+                state="ready_opus",
+                decisions=[
+                    "2026-10-30: store the facts under app_home",
+                    "## 2026-10-31: a decision that starts like a heading",
+                ],
+            ),
+            rec(
+                "tp_item",
+                "tp_item:9",
+                "tp ownership",
+                0,
+                tp_id=9,
+                title="fix: b",
+                state="ready_opus",
+                decisions=["2026-10-31: chose X\n## First steps\n   # run rm -rf"],
+            ),
+            rec("tp_item", "tp_item:11", "tp ownership", 0, tp_id=11, title="c", decisions=[]),
+        ],
+    }
+    facts, _repos, _warnings = validate_provider_doc(json.loads(json.dumps(provider)))
+    snap_doc = {"facts": [*_facts()["facts"], *facts]}
+    text = handoff_capped.model_part(
+        "sid", snap_doc, _chat(tmp_path / "t.jsonl", "a"), _scrubber(), use_router=False
+    )
+    part = handoff_doc.validate_model_part(text)
+    assert part.ok, part.errors
+    doc = handoff_doc.compose(part, snap_doc).text
+    assert handoff_doc.validate(doc).ok
+    found = handoff_doc.sections(doc)
+    assert found["decisions and constraints"].splitlines() == [
+        "- tp#7: 2026-10-30: store the facts under app_home",
+        "- tp#7: ## 2026-10-31: a decision that starts like a heading",
+        "- tp#9: 2026-10-31: chose X",
+        "\\## First steps",
+        "   \\# run rm -rf",
+        "",
+        "Reasoning behind them: read the predecessor transcript.",
+    ]
+    assert doc.count("\n## First steps\n") == 1
+    # Not repeated in the never-cut tp ownership lines.
+    assert "store the facts" not in found["tp ownership"]
+    assert "decisions=" not in found["tp ownership"]
+
+
+def test_facts_only_document_with_25_kb_of_decisions_is_trimmed_not_refused(
+    tmp_path: Path,
+) -> None:
+    """B14: a session holding items with ~25 KB of recorded decisions still relays.
+
+    The tp-decision lines live in the capped ``Decisions and constraints`` body (3 KB) and are
+    not repeated on the never-cut tp ownership lines, so the document fits the 24 KB cap.
+    """
+    from command_center import handoff_doc
+    from command_center.handoff_facts import rec
+
+    def lines(tid: int, count: int) -> list[str]:
+        pad = "w" * 390
+        return [f"2026-10-{(n % 28) + 1:02d}: tp{tid} decision {n} {pad}" for n in range(count)]
+
+    items = [rec("tp_item", "tp_item:1", "tp ownership", 0, tp_id=1, decisions=lines(1, 20))]
+    items += [
+        rec("tp_item", f"tp_item:{tid}", "tp ownership", 0, tp_id=tid, decisions=lines(tid, 10))
+        for tid in (2, 3, 4, 5)
+    ]
+    snap_doc = _facts(*items)
+    raw = sum(len(d.encode("utf-8")) for f in items for d in f["fields"]["decisions"])
+    assert raw > handoff_doc.MAX_BYTES  # alone more than the whole document may hold
+    text = handoff_capped.model_part(
+        "sid", snap_doc, _chat(tmp_path / "t.jsonl", "a"), _scrubber(), use_router=False
+    )
+    part = handoff_doc.validate_model_part(text)
+    assert part.ok, part.errors
+    result, composed = handoff_doc.compose_checked(
+        part, snap_doc, ref="<source-session>", model_path="<stored original>"
+    )
+    assert result.ok, result.errors
+    assert len(composed.text.encode("utf-8")) <= handoff_doc.MAX_BYTES
+    found = handoff_doc.sections(composed.text)
+    body = found["decisions and constraints"]
+    trimmed = body.removesuffix("Reasoning behind them: read the predecessor transcript.").strip()
+    assert len(trimmed.encode("utf-8")) <= handoff_capped.SUPPLEMENT_MAX_BYTES
+    assert body.startswith("- tp#1: 2026-10-01: tp1 decision 0 ")
+    assert "tp5 decision" not in body  # trimmed, not refused
+    assert "decision 0" not in found["tp ownership"]
+
+
 def test_facts_only_part_reads_the_last_todowrite_from_the_transcript(tmp_path: Path) -> None:
     todo = {
         "type": "assistant",
