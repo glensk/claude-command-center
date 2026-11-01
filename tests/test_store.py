@@ -1403,3 +1403,16 @@ def test_mirror_vouch_src_fp_round_trips_and_legacy_reads_empty(tmp_path: Path) 
     store.conn.commit()
     assert store.mirror_vouches()["/v/a.md"].src_fp == ""
     store.close()
+
+
+def test_subagent_started_at_tracks_the_latest_start(tmp_path: Path) -> None:
+    # Only a SubagentStart (+1) stamps the time; a stop leaves it, an untracked row is None.
+    store = _store(tmp_path)
+    store.ensure("s1", cwd="/repo")
+    assert store.subagent_started_at("s1") is None
+    store.bump_subagents("s1", 1)
+    first = store.subagent_started_at("s1")
+    assert first is not None and first > 0
+    store.bump_subagents("s1", -1)
+    assert store.subagent_started_at("s1") == first
+    assert store.subagent_started_at("nosuch") is None

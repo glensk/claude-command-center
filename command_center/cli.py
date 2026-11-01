@@ -57,6 +57,7 @@ from . import __version__, brokenpipe, config, hookspec, launch_argv
 from .adapters import ClaudeAdapter
 from .config import LaunchProfileError
 from .inflight import background_work as _background_work
+from .inflight import counter_split as _counter_split
 from .models import (
     BUSY_RAW_STATUSES,
     DEFAULT_LLM,
@@ -1649,6 +1650,25 @@ def _notify_switch(message: str) -> None:
         pass
 
 
+def _clear_stale_subagents(
+    store: Store, session_id: str, transcript: Any, in_process: int
+) -> int | None:
+    """Reset a counter whose excess is older than the grace window; return the start stamp.
+
+    The SubagentStart time is returned for the caller's ``background_work`` call. A stale
+    excess (an agent stopped without a SubagentStop) is cleared with a one-line note.
+    """
+    started = store.subagent_started_at(session_id)
+    _fresh, stale = _counter_split(transcript, in_process, started)
+    if stale:
+        store.reset_subagents(session_id)
+        print(
+            f"note: stale subagent counter ({stale}) cleared — no launch record pending",
+            file=sys.stderr,
+        )
+    return started
+
+
 def _usage_limit_halt(
     adapter: ClaudeAdapter,
     session_id: str,
@@ -1866,9 +1886,16 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     own = terminal.pid_ancestry(os.getpid(), terminal.ps_table()) if inside else frozenset()
     with Store() as store:
         in_process = store.active_subagents(session_id)
+        sub_started = _clear_stale_subagents(store, session_id, transcript, in_process)
     timers: list[str] = []
     reasons = _background_work(
-        adapter, live.pid, transcript, own, active_subagents=in_process, keepwarm=timers
+        adapter,
+        live.pid,
+        transcript,
+        own,
+        active_subagents=in_process,
+        keepwarm=timers,
+        subagent_started_at=sub_started,
     )
     if reasons and not args.force:
         print(
@@ -2233,13 +2260,16 @@ def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     # time (then nothing that appeared since is vetoed either: the arm was the decision).
     if not force:
         adapter = _adapter()
+        transcript_now = adapter.transcript_path(cwd, session_id, source)
         with Store() as store:
             in_process = store.active_subagents(session_id)
+            sub_started = _clear_stale_subagents(store, session_id, transcript_now, in_process)
         reasons = _background_work(
             adapter,
             pid,
-            adapter.transcript_path(cwd, session_id, source),
+            transcript_now,
             active_subagents=in_process,
+            subagent_started_at=sub_started,
         )
         if reasons:
             return fail("background work is in flight: " + "; ".join(reasons))
@@ -2285,8 +2315,10 @@ def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     if getattr(args, "auto", False):
         halt_id = (getattr(args, "halt_id", "") or "").strip()
         adapter = _adapter()
+        transcript_now = adapter.transcript_path(cwd, session_id, source)
         with Store() as store:
             in_process = store.active_subagents(session_id)
+            sub_started = _clear_stale_subagents(store, session_id, transcript_now, in_process)
             owned = (
                 store.limit_switch_owns(session_id, halt_id, ("claimed", "dispatched"))
                 if halt_id
@@ -2297,8 +2329,9 @@ def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many
         reasons = _background_work(
             adapter,
             pid,
-            adapter.transcript_path(cwd, session_id, source),
+            transcript_now,
             active_subagents=in_process,
+            subagent_started_at=sub_started,
         )
         if reasons:
             return fail("background work appeared during the wait: " + "; ".join(reasons))

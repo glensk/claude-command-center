@@ -54,6 +54,12 @@ KIND_SHELL = "shell"
 KIND_KEEPWARM = "keepwarm"
 KIND_UNKNOWN = "unknown"
 
+# The SubagentStart/SubagentStop counter only covers the short window between a subagent's
+# start and its launch record reaching the transcript. A subagent killed with TaskStop never
+# fires SubagentStop, so the counter's excess over the transcript's running agents is
+# trusted only while the latest SubagentStart is younger than this.
+SUBAGENT_COUNTER_GRACE_S = 120
+
 # The Bash tool's shell embeds the command as ``eval '<command>' < /dev/null && pwd -P …``
 # with every single quote inside written as ``'\''``.
 _EVAL_RE = re.compile(r"\beval '((?:[^']|'\\'')*)' < /dev/null")
@@ -86,6 +92,9 @@ class Inventory:
 
     items: list[Item] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    # Counter excess older than the grace window: ignored for the verdict, and the caller
+    # resets the store counter (not part of ``to_dict``).
+    stale_counter: int = 0
 
     @property
     def clear(self) -> bool:
@@ -101,7 +110,36 @@ class Inventory:
         }
 
 
-def background_work(
+def counter_split(
+    transcript: Any,
+    active_subagents: int,
+    subagent_started_at: int | None = None,
+    now_ms: int | None = None,
+) -> tuple[int, int]:
+    """``(fresh, stale)`` excess of the store counter over the transcript's running agents.
+
+    The excess is *fresh* (a launch record may still be on its way) while the latest
+    SubagentStart, *subagent_started_at* (epoch ms), is younger than
+    :data:`SUBAGENT_COUNTER_GRACE_S`; older, it is *stale* (an agent stopped without a
+    SubagentStop). A missing timestamp counts as fresh: fail closed.
+    """
+    if active_subagents <= 0:
+        return 0, 0
+    agents = 0
+    if isinstance(transcript, Path):
+        agents = sum(1 for item in _transcript_items(transcript) if item.kind == KIND_SUBAGENT)
+    excess = active_subagents - agents
+    if excess <= 0:
+        return 0, 0
+    if subagent_started_at is None or subagent_started_at <= 0:
+        return excess, 0
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    if now - subagent_started_at < SUBAGENT_COUNTER_GRACE_S * 1000:
+        return excess, 0
+    return 0, excess
+
+
+def background_work(  # pylint: disable=too-many-arguments
     adapter: ClaudeAdapter,
     live_pid: int,
     transcript: Any,
@@ -109,6 +147,8 @@ def background_work(
     *,
     active_subagents: int = 0,
     keepwarm: list[str] | None = None,
+    subagent_started_at: int | None = None,
+    now_ms: int | None = None,
 ) -> list[str]:
     """Why the session must NOT be relaunched yet: background work still in flight, by evidence.
 
@@ -123,15 +163,17 @@ def background_work(
     (the ``!`` prefix's Bash-tool shell must not veto the very command it is running).
     Keep-warm timers (``adapters.claude.is_keepwarm_command``) never count — they are
     disposable and the new process re-arms its own; their transcript ids are appended to
-    *keepwarm* when the caller passes a list.
+    *keepwarm* when the caller passes a list. Only the counter's excess over the transcript's
+    running agents counts, and only while the latest SubagentStart (*subagent_started_at*,
+    epoch ms) is within :data:`SUBAGENT_COUNTER_GRACE_S` (see :func:`counter_split`).
     """
     from .adapters.claude import background_work_split
 
     reasons: list[str] = []
-    if active_subagents > 0:
+    fresh, _stale = counter_split(transcript, active_subagents, subagent_started_at, now_ms)
+    if fresh > 0:
         reasons.append(
-            f"{active_subagents} in-process subagent(s) still running "
-            "(SubagentStart/SubagentStop counter)"
+            f"{fresh} in-process subagent(s) still running (SubagentStart/SubagentStop counter)"
         )
     if live_pid > 0:
         if adapter.has_subagent(live_pid, ignore):
@@ -342,24 +384,31 @@ def inventory(
     ignore: frozenset[int] = frozenset(),
     *,
     active_subagents: int = 0,
+    subagent_started_at: int | None = None,
+    now_ms: int | None = None,
 ) -> Inventory:
     """Classify every in-flight item of a session; reasons are :func:`background_work`'s."""
     items = _transcript_items(transcript) if transcript is not None else []
     items += _process_items(live_pid, ignore, items)
-    agents = sum(1 for item in items if item.kind == KIND_SUBAGENT)
-    if active_subagents > agents:
+    fresh, stale = counter_split(transcript, active_subagents, subagent_started_at, now_ms)
+    if fresh > 0:
         items.append(
             Item(
                 KIND_UNKNOWN,
                 "subagents:counter",
-                f"{active_subagents - agents} subagent(s) counted by the store "
-                "with no launch record yet",
+                f"{fresh} subagent(s) counted by the store with no launch record yet",
             )
         )
     reasons = background_work(
-        adapter, live_pid, transcript, ignore, active_subagents=active_subagents
+        adapter,
+        live_pid,
+        transcript,
+        ignore,
+        active_subagents=active_subagents,
+        subagent_started_at=subagent_started_at,
+        now_ms=now_ms,
     )
-    return Inventory(items=items, reasons=reasons)
+    return Inventory(items=items, reasons=reasons, stale_counter=stale)
 
 
 def drain(  # pylint: disable=too-many-arguments
@@ -371,16 +420,29 @@ def drain(  # pylint: disable=too-many-arguments
     poll: float = 3.0,
     ignore: frozenset[int] = frozenset(),
     active_subagents: Callable[[], int] | None = None,
+    subagent_started_at: Callable[[], int | None] | None = None,
+    on_stale_counter: Callable[[int], None] | None = None,
 ) -> tuple[bool, Inventory]:
     """Poll :func:`inventory` until clear (``True``) or *timeout* seconds pass (``False``).
 
     *poll* below 3 s gains nothing: the adapter caches the process table for 3 s.
-    *active_subagents* is re-read on every poll (the store counter moves).
+    *active_subagents* and *subagent_started_at* are re-read on every poll (the store
+    counter moves); *on_stale_counter* is called with the stale excess when one is found.
     """
     deadline = time.monotonic() + max(0.0, timeout)
     while True:
         count = active_subagents() if active_subagents is not None else 0
-        inv = inventory(adapter, live_pid, transcript, ignore, active_subagents=count)
+        started = subagent_started_at() if subagent_started_at is not None else None
+        inv = inventory(
+            adapter,
+            live_pid,
+            transcript,
+            ignore,
+            active_subagents=count,
+            subagent_started_at=started,
+        )
+        if inv.stale_counter and on_stale_counter is not None:
+            on_stale_counter(inv.stale_counter)
         if inv.clear:
             return True, inv
         if time.monotonic() >= deadline:

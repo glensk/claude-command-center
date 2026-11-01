@@ -238,3 +238,112 @@ def test_drain_returns_when_clear_and_times_out_otherwise(
     )
     ok, inv = inflight.drain(adapter, 0, tmp_path / "t.jsonl", timeout=0, poll=0)
     assert not ok and inv.reasons == ["busy"]
+
+
+# ------------------------------------------------ stale subagent counter (tp#1491)
+
+NOW_MS = 1_800_000_000_000
+
+
+def _empty_transcript(tmp_path: Path) -> Path:
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+    return transcript
+
+
+def test_counter_vetoes_only_while_the_latest_start_is_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Counter 1, no transcript agent: veto at 5 s, clear and stale at 300 s."""
+    monkeypatch.setattr(claude_adapter, "_children_map", dict)
+    adapter = claude_adapter.ClaudeAdapter()
+    transcript = _empty_transcript(tmp_path)
+
+    fresh = inflight.inventory(
+        adapter,
+        0,
+        transcript,
+        active_subagents=1,
+        subagent_started_at=NOW_MS - 5_000,
+        now_ms=NOW_MS,
+    )
+    assert not fresh.clear and fresh.stale_counter == 0
+    assert [item.id for item in fresh.items] == ["subagents:counter"]
+    assert "1 in-process subagent(s) still running" in fresh.reasons[0]
+
+    old = inflight.inventory(
+        adapter,
+        0,
+        transcript,
+        active_subagents=1,
+        subagent_started_at=NOW_MS - 300_000,
+        now_ms=NOW_MS,
+    )
+    assert old.clear and not old.items and old.stale_counter == 1
+
+
+def test_counter_without_a_timestamp_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing start time is treated as fresh: today's behaviour."""
+    monkeypatch.setattr(claude_adapter, "_children_map", dict)
+    inv = inflight.inventory(
+        claude_adapter.ClaudeAdapter(), 0, _empty_transcript(tmp_path), active_subagents=1
+    )
+    assert not inv.clear and inv.stale_counter == 0
+
+
+def test_stale_excess_does_not_hide_a_running_transcript_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Counter 2, one agent running in the transcript, old start: only that agent vetoes."""
+    monkeypatch.setattr(claude_adapter, "_children_map", dict)
+    inv = inflight.inventory(
+        claude_adapter.ClaudeAdapter(),
+        0,
+        PARENT,
+        active_subagents=2,
+        subagent_started_at=NOW_MS - 300_000,
+        now_ms=NOW_MS,
+    )
+    assert not inv.clear
+    assert inv.stale_counter == 1
+    assert "subagents:counter" not in {item.id for item in inv.items}
+    assert not any("in-process subagent" in reason for reason in inv.reasons)
+    assert any("a1" in reason for reason in inv.reasons)
+
+
+def test_unknown_transcript_is_still_refused_with_a_stale_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stale counter or not, an unlocatable transcript means unknown, hence refuse."""
+    monkeypatch.setattr(claude_adapter, "_children_map", dict)
+    inv = inflight.inventory(
+        claude_adapter.ClaudeAdapter(),
+        0,
+        None,
+        active_subagents=1,
+        subagent_started_at=NOW_MS - 300_000,
+        now_ms=NOW_MS,
+    )
+    assert not inv.clear and inv.stale_counter == 1
+
+
+def test_drain_reports_a_stale_counter_once_and_clears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """drain ignores the stale excess and hands it to the reset callback."""
+    monkeypatch.setattr(claude_adapter, "_children_map", dict)
+    monkeypatch.setattr(inflight.time, "time", lambda: NOW_MS / 1000)
+    seen: list[int] = []
+    ok, inv = inflight.drain(
+        claude_adapter.ClaudeAdapter(),
+        0,
+        _empty_transcript(tmp_path),
+        timeout=0,
+        poll=0,
+        active_subagents=lambda: 1,
+        subagent_started_at=lambda: NOW_MS - 300_000,
+        on_stale_counter=seen.append,
+    )
+    assert ok and inv.clear and seen == [1]

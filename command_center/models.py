@@ -547,6 +547,7 @@ class Session:
     # at 0 and reset on session start/end). > 0 vetoes a `switch-account` relaunch: such
     # a subagent has no child process and may not be in the transcript yet.
     active_subagents: int = 0
+    subagent_started_at: int = 0  # epoch ms of the latest SubagentStart (0 = never)
     last_seen_pid: int | None = None
     keep: bool = False  # exempt from the idle reaper
     auto_closed: bool = False

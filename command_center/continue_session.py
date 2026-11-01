@@ -110,17 +110,30 @@ def resolve_source(adapter: ClaudeAdapter, store: Store, explicit: str | None) -
     )
 
 
+def _clear_stale_counter(store: Store, session_id: str, stale: int) -> None:
+    """Reset a stale SubagentStart/SubagentStop counter and say so (stderr: JSON stays clean)."""
+    store.reset_subagents(session_id)
+    print(
+        f"note: stale subagent counter ({stale}) cleared — no launch record pending",
+        file=sys.stderr,
+    )
+
+
 def inventory(adapter: ClaudeAdapter, store: Store, src: Source) -> Inventory:
     """The in-flight inventory of *src* (store counter included)."""
     from . import inflight
 
-    return inflight.inventory(
+    inv = inflight.inventory(
         adapter,
         src.pid,
         src.transcript,
         src.ignore,
         active_subagents=store.active_subagents(src.session_id),
+        subagent_started_at=store.subagent_started_at(src.session_id),
     )
+    if inv.stale_counter:
+        _clear_stale_counter(store, src.session_id, inv.stale_counter)
+    return inv
 
 
 def state(adapter: ClaudeAdapter, store: Store, src: Source) -> dict[str, Any]:
@@ -242,6 +255,8 @@ def cmd_drain(args: argparse.Namespace) -> int:
             poll=DRAIN_POLL_SEC,
             ignore=src.ignore,
             active_subagents=lambda: store.active_subagents(src.session_id),
+            subagent_started_at=lambda: store.subagent_started_at(src.session_id),
+            on_stale_counter=lambda n: _clear_stale_counter(store, src.session_id, n),
         )
     data = inv.to_dict()
     if args.json:

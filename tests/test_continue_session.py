@@ -116,6 +116,28 @@ def test_drain_returns_once_clear(
     assert "in flight: clear" in capsys.readouterr().out
 
 
+def test_drain_clears_a_stale_subagent_counter(
+    fixture_session: _Adapter,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A counter left by a TaskStop-killed agent no longer vetoes; drain resets it."""
+    clean = tmp_path / "clean.jsonl"
+    clean.write_text('{"type": "user", "message": {"content": "hi"}}\n', encoding="utf-8")
+    fixture_session.transcript = clean
+    monkeypatch.setattr(claude_adapter, "_children_map", dict)
+    with Store() as store:
+        store.bump_subagents(SID, 1)
+        store.update_fields(SID, subagent_started_at=1)  # long ago
+    assert cli.main(["continue-session", "drain", "-s", SID, "-t", "0"]) == 0
+    captured = capsys.readouterr()
+    assert "in flight: clear" in captured.out
+    assert "stale subagent counter (1) cleared" in captured.err
+    with Store() as store:
+        assert store.active_subagents(SID) == 0
+
+
 def test_unreadable_transcript_never_drains(
     fixture_session: _Adapter,
     monkeypatch: pytest.MonkeyPatch,

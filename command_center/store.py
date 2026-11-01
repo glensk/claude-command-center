@@ -147,6 +147,7 @@ _SESSION_COLUMNS = (
     "limit_switch_day",
     "limit_switch_successes",
     "active_subagents",
+    "subagent_started_at",
     "last_seen_pid",
     "keep",
     "auto_closed",
@@ -276,6 +277,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     limit_switch_day  TEXT    NOT NULL DEFAULT '',
     limit_switch_successes INTEGER NOT NULL DEFAULT 0,
     active_subagents  INTEGER NOT NULL DEFAULT 0,
+    subagent_started_at INTEGER NOT NULL DEFAULT 0,
     last_seen_pid     INTEGER,
     keep              INTEGER NOT NULL DEFAULT 0,
     auto_closed       INTEGER NOT NULL DEFAULT 0,
@@ -663,6 +665,9 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         # SubagentStop hook pair (see bump_subagents): the one signal a subagent with
         # no child process and no transcript record yet still shows up in.
         "active_subagents": "INTEGER NOT NULL DEFAULT 0",
+        # Epoch ms of the latest SubagentStart: the counter's excess over the transcript
+        # is trusted only for a short grace after it (inflight.SUBAGENT_COUNTER_GRACE_S).
+        "subagent_started_at": "INTEGER NOT NULL DEFAULT 0",
         # Session names + hand-set tab titles (session_names.py). All nullable / zero
         # defaults, so a row an older build writes simply has no name yet.
         "canonical_name": "TEXT",
@@ -1599,10 +1604,12 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         column, or a reset in between) from driving the count negative. ``0`` when the row
         does not exist — an untracked session vetoes nothing.
         """
+        stamp = now_ms()
         self.conn.execute(
             "UPDATE sessions SET active_subagents = MAX(0, active_subagents + ?), "
+            "subagent_started_at = CASE WHEN ? > 0 THEN ? ELSE subagent_started_at END, "
             "updated_at = ? WHERE session_id = ?",
-            (delta, now_ms(), session_id),
+            (delta, delta, stamp, stamp, session_id),
         )
         self.conn.commit()
         return self.active_subagents(session_id)
@@ -1613,6 +1620,14 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             "SELECT active_subagents FROM sessions WHERE session_id = ?", (session_id,)
         ).fetchone()
         return int(row[0] or 0) if row is not None else 0
+
+    def subagent_started_at(self, session_id: str) -> int | None:
+        """Epoch ms of the latest SubagentStart (``None`` when unknown or never set)."""
+        row = self.conn.execute(
+            "SELECT subagent_started_at FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        value = int(row[0] or 0) if row is not None else 0
+        return value or None
 
     def reset_subagents(self, session_id: str) -> None:
         """Zero the counter — a crash/restart must never leave a phantom subagent behind.
