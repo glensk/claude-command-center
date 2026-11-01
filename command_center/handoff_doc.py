@@ -411,6 +411,11 @@ def _agent(fact: dict[str, Any], level: int, ref: str) -> list[str]:
         f"- agent {f.get('agent_id')} ({_one(f.get('agent_type'))}, {_one(f.get('status'))}): "
         f"{_one(f.get('description'))}"
     ]
+    finished = f.get("status") == "finished"
+    if finished and level >= 3:  # history, already delivered: a pointer, not the result
+        if f.get("result_path"):
+            out.append(f"  result_path: {_one(f['result_path'])}")
+        return out
     for key in ("cwd", "model", "isolation", "spec_path", "result_path"):
         if f.get(key):
             out.append(f"  {key}: {_one(f[key])}")
@@ -520,6 +525,9 @@ def _facts_lines(  # pylint: disable=too-many-locals,too-many-branches
         collapse = _COLLAPSE.get(kind)
         if collapse and level >= collapse[0]:
             cut.setdefault((section, collapse[1]), []).append(fact)
+            continue
+        if kind == "agent" and level >= 5 and fact["fields"].get("status") == "finished":
+            cut.setdefault((section, "finished subagents"), []).append(fact)
             continue
         if kind == "commit" and level >= 2:
             repo = _one(fact["fields"].get("repo"))

@@ -295,3 +295,39 @@ def test_escape_headings_lives_here_and_handoff_facts_reuses_it() -> None:
 
     assert handoff_facts.escape_headings is handoff_doc.escape_headings
     assert handoff_doc.escape_headings("## a\n  # b\n    # c") == "\\## a\n  \\# b\n    # c"
+
+
+def test_finished_agents_are_cut_in_tiers_and_running_ones_never(tmp_path: Path) -> None:
+    from command_center.handoff_facts import rec
+
+    def agent(i: str, status: str) -> dict:
+        return rec(
+            "agent",
+            f"core:agent:{i}",
+            "Subagent continuations",
+            0 if status == "running" else 2,
+            agent_id=i,
+            agent_type="general",
+            description=f"job {i}",
+            status=status,
+            result_inline=f"RESULT-{i}\n" + "\n".join("r" * 49 for _ in range(30)),
+            result_path=f"/x/{i}.result.md",
+        )
+
+    facts = [_session_fact(), agent("RUN1", "running")]
+    facts += [agent(f"fin{n:02d}", "finished") for n in range(30)]
+    snap = _snap(*facts)
+    model = handoff_doc.parse_model_file(_model())
+    level0 = handoff_doc.compose(model, snap, level=0, ref="sid-x").text
+    assert "RESULT-fin29" in level0 and "RESULT-RUN1" in level0  # level 0 renders everything
+    level3 = handoff_doc.compose(model, snap, level=3, ref="sid-x").text
+    assert "RESULT-fin00" not in level3 and "/x/fin00.result.md" in level3
+    assert "RESULT-RUN1" in level3
+    result, composed = _compose(_model(), snap, tmp_path)
+    assert result.ok, result.errors
+    assert len(result.text.encode()) <= handoff_doc.MAX_BYTES
+    assert composed.level >= 3
+    assert "RESULT-RUN1" in result.text and "r" * 49 in result.text
+    level5 = handoff_doc.compose(model, snap, level=5, ref="sid-x").text
+    assert "30 more finished subagents — full: ccc continue-session facts sid-x -k" in level5
+    assert "RESULT-RUN1" in level5

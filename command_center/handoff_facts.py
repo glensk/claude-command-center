@@ -750,7 +750,7 @@ def agent_fact(
         "agent",
         f"core:agent:{agent_id}",
         "Subagent continuations",
-        0,
+        2 if info["finished"] else 0,  # running agents are the continuations: sort first
         agent_id=agent_id,
         agent_type=info["agent_type"],
         description=info["description"],
