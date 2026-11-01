@@ -185,7 +185,7 @@ def test_provider_failures_become_one_warning(
     warns = [f for f in _by_kind(doc, "warning") if f["key"] == f"warning:provider:{name}"]
     assert len(warns) == 1
     message = warns[0]["fields"]["message"]
-    assert message.startswith(f"⚠ facts provider {name} failed:") and "by hand" in message
+    assert f"facts provider {name} failed:" in message and "by hand" in message
     assert not _by_kind(doc, "tp_item")  # nothing of the failed provider leaks in
 
 
@@ -223,6 +223,109 @@ def test_tp_ids_dropped_when_unknown() -> None:
     spec = handoff_facts.ProviderSpec("x", ["p", "-i", "{tp_ids}", "-j"])
     assert handoff_facts.render_argv(spec, {}, None) == ["p", "-j"]
     assert handoff_facts.render_argv(spec, {}, [3, 4]) == ["p", "-i", "3,4", "-j"]
+
+
+def _failure_facts(doc: dict[str, Any], name: str) -> list[dict[str, Any]]:
+    return [f for f in _by_kind(doc, "warning") if f["key"] == f"warning:provider:{name}"]
+
+
+def test_a_required_provider_failure_is_unknown_in_its_failure_section(
+    world: dict[str, Any], tmp_path: Path
+) -> None:
+    argv = _provider(tmp_path, "req", "import sys; sys.exit(1)")
+    spec = {"argv": argv, "name": "req", "failure_section": "tp ownership"}
+    doc = _collect(world, tmp_path, specs_config=[spec])
+    (fact,) = _failure_facts(doc, "req")
+    assert fact["section"] == "tp ownership"
+    assert "UNKNOWN" in fact["fields"]["message"]
+    assert fact["fields"]["required"] is True
+    assert fact["fields"]["provider"] == "req" and fact["fields"]["error"] == "exit 1"
+
+
+def test_an_optional_provider_failure_stays_in_open_items_without_unknown(
+    world: dict[str, Any], tmp_path: Path
+) -> None:
+    argv = _provider(tmp_path, "opt", "import sys; sys.exit(1)")
+    doc = _collect(world, tmp_path, specs_config=[{"argv": argv, "name": "opt", "optional": True}])
+    (fact,) = _failure_facts(doc, "opt")
+    assert fact["section"] == "Open items and questions"
+    assert "UNKNOWN" not in fact["fields"]["message"]
+    assert fact["fields"]["required"] is False
+
+
+def test_an_unknown_failure_section_keeps_the_provider_and_warns(
+    world: dict[str, Any], tmp_path: Path
+) -> None:
+    argv = _provider(tmp_path, "req", "import sys; sys.exit(1)")
+    spec = {"argv": argv, "name": "req", "failure_section": "Nonsense"}
+    doc = _collect(world, tmp_path, specs_config=[spec])
+    assert doc["providers"][0]["name"] == "req"  # still parsed and run
+    (fact,) = _failure_facts(doc, "req")
+    assert fact["section"] == "Open items and questions"
+    config_warns = [
+        f
+        for f in _by_kind(doc, "warning")
+        if "failure_section" in f["fields"]["message"] and "Nonsense" in f["fields"]["message"]
+    ]
+    assert len(config_warns) == 1
+
+
+def test_failure_hint_is_rendered_with_placeholders(world: dict[str, Any], tmp_path: Path) -> None:
+    argv = _provider(tmp_path, "req", "import sys; sys.exit(1)")
+    hinted = {"argv": argv, "name": "req", "failure_hint": "tp handoff -S {session} -n"}
+    doc = _collect(world, tmp_path, specs_config=[hinted])
+    message = _failure_facts(doc, "req")[0]["fields"]["message"]
+    assert f"tp handoff -S {SID} -n" in message and "by hand" not in message
+    doc = _collect(world, tmp_path, specs_config=[{"argv": argv, "name": "req"}])
+    message = _failure_facts(doc, "req")[0]["fields"]["message"]
+    assert "run " in message and "by hand" in message
+
+
+def test_a_required_provider_timeout_says_timed_out_and_runs_once(
+    world: dict[str, Any], tmp_path: Path
+) -> None:
+    counter = tmp_path / "runs.txt"
+    body = f"""
+        import time
+        with open({str(counter)!r}, "a", encoding="utf-8") as handle:
+            handle.write("x")
+        time.sleep(2)
+        """
+    argv = _provider(tmp_path, "slowreq", body)
+    spec = {"argv": argv, "name": "slowreq", "timeout_s": 1, "failure_section": "tp ownership"}
+    doc = _collect(world, tmp_path, specs_config=[spec])
+    message = _failure_facts(doc, "slowreq")[0]["fields"]["message"]
+    assert "timed out" in message and "UNKNOWN" in message
+    assert counter.read_text(encoding="utf-8") == "x"
+
+
+def test_providers_entries_carry_optional(world: dict[str, Any], tmp_path: Path) -> None:
+    ok = _provider(tmp_path, "ok", _good_doc(_fact()))
+    specs = [{"argv": ok, "name": "req"}, {"argv": ok, "name": "opt", "optional": True}]
+    doc = _collect(world, tmp_path, specs_config=specs)
+    assert [(p["name"], p["optional"]) for p in doc["providers"]] == [
+        ("req", False),
+        ("opt", True),
+    ]
+
+
+def test_the_failure_text_appears_once_in_the_document_and_the_handoff(
+    world: dict[str, Any], tmp_path: Path
+) -> None:
+    from command_center import handoff_doc  # pylint: disable=import-outside-toplevel
+
+    argv = _provider(tmp_path, "req", "import sys; sys.exit(1)")
+    spec = {"argv": argv, "name": "req", "failure_section": "tp ownership"}
+    doc = _collect(world, tmp_path, specs_config=[spec])
+    text = _failure_facts(doc, "req")[0]["fields"]["message"]
+    in_doc = [f["fields"].get("message") for f in doc["facts"]] + list(doc["warnings"])
+    assert in_doc.count(text) == 1
+    parts = ["# Handoff", ""]
+    for title in handoff_doc.MODEL_SECTIONS:
+        parts += [f"## {title}", "", "x", ""]
+    model = handoff_doc.parse_model_file("\n".join(parts))
+    composed = handoff_doc.compose(model, doc).text
+    assert composed.count("required facts provider req failed") == 1
 
 
 def test_bad_config_entry_is_a_warning_not_a_crash(world: dict[str, Any], tmp_path: Path) -> None:

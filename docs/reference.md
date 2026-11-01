@@ -1956,21 +1956,34 @@ alias (such as a `tp` alias) is not found and `accept` fails with "could not run
 
 **`handoff_facts`** (config, default `[]`, inert; tp#1479): fact PROVIDERS for `ccc
 continue-session collect` and the `start` composition. Each entry is a table
-`{argv, timeout_s, optional, name}` run like a hook (argv only, own process group, killed on
-timeout, stdout ≤ 256 KB, stderr never echoed). Placeholders: `{session}`, `{cwd}`,
+`{argv, timeout_s, optional, name, failure_section, failure_hint}` run like a hook (argv
+only, own process group, killed on timeout, stdout ≤ 256 KB, stderr never echoed). Placeholders: `{session}`, `{cwd}`,
 `{transcript}`, `{config_dir}`, `{phase}` (`capture`/`finalize`) and `{tp_ids}` (the tp ids
 of the `tp_item` records earlier providers returned, `1479,1480`; with none known the
 argument and its preceding flag are dropped). A provider prints `{version: 1, provider,
 facts: [{kind, key, section, priority, fields}], repos, warnings}` with a closed `kind` set;
 markdown-typed fields, unknown kinds/keys, duplicate keys or control characters make that
-provider a failure, which becomes ONE `warning` fact (`⚠ facts provider NAME failed: … — run
-ARGV by hand`) and never blocks the relay. Providers run in order, so put the required part
-first and let the optional one reuse its tp ids (`tp held` takes 3-5 s idle, more under
-load, hence `timeout_s = 15`):
+provider a failure (a kill at `timeout_s` reads `timed out after Ns (timeout_s)`), which
+becomes ONE `warning` fact and never blocks the relay. The fact lands in the entry's
+`failure_section` (default `"Open items and questions"`; a value that is not a handoff
+section keeps the provider, uses the default and adds one config warning) and ends with
+the entry's `failure_hint` (default empty = `run ARGV by hand`; the same placeholders as
+`argv` except `{tp_ids}`). An `optional = true` provider says `⚠ facts provider NAME failed:
+ERR — HINT`. A REQUIRED provider (`optional = false`, the default) says `UNKNOWN — required
+facts provider NAME failed: ERR; what it reports is NOT in this handoff — HINT`, so the
+section it owns shows that line instead of `none` (point `failure_section` at it, e.g.
+`"tp ownership"`), and `start` prints `⚠ required facts provider NAME failed (ERR): the
+handoff marks its section UNKNOWN` on stderr (a `--capped` run, spawned detached, also
+writes it to `events.log` and sends a desktop notification). The transfer proceeds. A
+re-run of `start` on the same PREPARED/OPENED transfer reuses the frozen snapshot, UNKNOWN
+included, and does not re-run the provider; only a new transfer (once this one has failed)
+collects again. `collect -j` lists every run in `providers[]` with `optional`. Providers
+run in order, so put the required part first and let the optional one reuse its tp ids
+(`tp held` takes 3-5 s idle, more under load, hence `timeout_s = 15`):
 
 ```toml
 handoff_facts = [
-  { name = "required", timeout_s = 15, argv = ["/path/cc-handoff-facts.py", "-s", "{session}", "-t", "{transcript}", "-c", "{cwd}", "-P", "required", "-p", "{phase}", "-j"] },
+  { name = "required", timeout_s = 15, failure_section = "tp ownership", failure_hint = "run tp handoff -S {session} -n to see the held items", argv = ["/path/cc-handoff-facts.py", "-s", "{session}", "-t", "{transcript}", "-c", "{cwd}", "-P", "required", "-p", "{phase}", "-j"] },
   { name = "optional", timeout_s = 6, optional = true, argv = ["/path/cc-handoff-facts.py", "-s", "{session}", "-t", "{transcript}", "-c", "{cwd}", "-P", "optional", "-p", "{phase}", "-i", "{tp_ids}", "-j"] },
 ]
 ```

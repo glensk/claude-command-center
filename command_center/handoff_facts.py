@@ -23,7 +23,11 @@ the sha256 of its canonical JSON (D2). Every file persisted here — snapshot, c
 agent spec, agent result — goes through ``mirror_scrub_cmd`` first and is written 0600;
 a withheld scrub raises :class:`FactsError` and nothing is written (fail closed).
 
-A failed provider NEVER blocks the relay (D4): its records become one ``warning`` fact.
+A failed provider NEVER blocks the relay (D4): its records become one ``warning`` fact
+(in the entry's ``failure_section``). A REQUIRED provider (``optional = false``) that fails
+says ``UNKNOWN`` there plus the entry's ``failure_hint``, and ``continue-session start``
+prints the failure (stderr; a ``--capped`` run also logs and notifies), so a failed tp
+provider can never read as "nothing held" (tp#1520).
 """
 
 from __future__ import annotations
@@ -125,6 +129,10 @@ class FactsError(Exception):
     """Collection must stop (a scrub withheld, a bad session id); the message says why."""
 
 
+class ProviderTimeout(FactsError):
+    """A provider was killed at its ``timeout_s`` (told apart from an exit failure)."""
+
+
 # ----------------------------------------------------------------------------- records
 
 
@@ -133,8 +141,13 @@ def rec(kind: str, key: str, section: str, priority: int, **fields: Any) -> Reco
     return {"kind": kind, "key": key, "section": section, "priority": priority, "fields": fields}
 
 
-def _warning(source: str, message: str, section: str = "Open items and questions") -> Record:
-    return rec("warning", f"warning:{source}", section, 0, source=source, message=message)
+DEFAULT_FAILURE_SECTION = "Open items and questions"
+
+
+def _warning(
+    source: str, message: str, section: str = DEFAULT_FAILURE_SECTION, **extra: Any
+) -> Record:
+    return rec("warning", f"warning:{source}", section, 0, source=source, message=message, **extra)
 
 
 # ------------------------------------------------------------------------------ scrub
@@ -202,6 +215,8 @@ class ProviderSpec:
     argv: list[str]
     timeout_s: float = PROVIDER_TIMEOUT_DEFAULT_S
     optional: bool = False
+    failure_section: str = DEFAULT_FAILURE_SECTION  # where the failure fact lands
+    failure_hint: str = ""  # a recovery sentence (argv placeholders); "" = run argv by hand
 
 
 @dataclass
@@ -218,7 +233,13 @@ class ProviderRun:
 
 
 def parse_specs(entries: object) -> tuple[list[ProviderSpec], list[Record]]:
-    """``(specs, warning facts)`` from the config value; a bad entry is a warning, not a crash."""
+    """``(specs, warning facts)`` from the config value; a bad entry is a warning, not a crash.
+
+    An unknown ``failure_section`` keeps the provider (dropping a required one would be
+    worse): it falls back to the default section and adds one config warning.
+    """
+    from .handoff_doc import REQUIRED_SECTIONS
+
     specs: list[ProviderSpec] = []
     bad: list[Record] = []
     if not entries:
@@ -247,7 +268,28 @@ def parse_specs(entries: object) -> tuple[list[ProviderSpec], list[Record]]:
         )
         timeout = min(max(timeout, 1.0), PROVIDER_TIMEOUT_MAX_S)
         name = str(entry.get("name") or "").strip() or _default_name(argv)
-        specs.append(ProviderSpec(name, argv, timeout, bool(entry.get("optional", False))))
+        section = entry.get("failure_section", DEFAULT_FAILURE_SECTION)
+        if section not in REQUIRED_SECTIONS:
+            bad.append(
+                _warning(
+                    f"handoff_facts[{index}]",
+                    f"⚠ handoff_facts entry {index} ({name}): unknown failure_section "
+                    f"{_CONTROL_RE.sub(' ', str(section))!r} — its failure lands in "
+                    f"{DEFAULT_FAILURE_SECTION!r}",
+                )
+            )
+            section = DEFAULT_FAILURE_SECTION
+        hint = entry.get("failure_hint", "")
+        specs.append(
+            ProviderSpec(
+                name,
+                argv,
+                timeout,
+                bool(entry.get("optional", False)),
+                str(section),
+                hint.strip() if isinstance(hint, str) else "",
+            )
+        )
     return specs, bad
 
 
@@ -287,7 +329,7 @@ def _run_provider(argv: list[str], timeout: float) -> bytes:
     try:
         returncode, stdout, _stderr = continue_session.run_bounded(argv, timeout)
     except subprocess.TimeoutExpired as exc:
-        raise FactsError(f"timed out after {timeout:g}s") from exc
+        raise ProviderTimeout(f"timed out after {timeout:g}s (timeout_s)") from exc
     except OSError as exc:
         raise FactsError(f"could not run ({exc.strerror or exc})") from exc
     if returncode != 0:  # stderr is deliberately not echoed (never logged raw)
@@ -385,18 +427,53 @@ def run_provider(
             raise FactsError("stdout is not JSON") from exc
         facts, repos, warns = validate_provider_doc(doc)
     except FactsError as exc:
-        hand = shlex.join(argv)
-        text = f"⚠ facts provider {spec.name} failed: {exc} — run {hand} by hand"
         return ProviderRun(
             spec.name,
             False,
-            [_warning(f"provider:{spec.name}", text)],
+            [_failure_fact(spec, values, argv, str(exc))],
             [],
-            [text],
+            [],  # the text lives once, in the fact (never repeated in ``warnings``)
             round(time.monotonic() - started, 2),
             str(exc),
         )
     return ProviderRun(spec.name, True, facts, repos, warns, round(time.monotonic() - started, 2))
+
+
+def failure_hint(spec: ProviderSpec, values: dict[str, str], argv: list[str]) -> str:
+    """The entry's ``failure_hint`` with placeholders filled, else ``run ARGV by hand``."""
+    if not spec.failure_hint:
+        return f"run {shlex.join(argv)} by hand"
+    hint = spec.failure_hint
+    for key, value in values.items():
+        hint = hint.replace(key, value)
+    return _CONTROL_RE.sub(" ", hint)
+
+
+def _failure_fact(
+    spec: ProviderSpec, values: dict[str, str], argv: list[str], error: str
+) -> Record:
+    """The ONE warning fact of a failed provider, in its ``failure_section``.
+
+    A required provider says UNKNOWN (what it reports is missing, not empty); its fields
+    carry ``required``/``provider``/``error`` so ``start`` can say it out loud from the
+    frozen snapshot alone (``providers[]`` is not frozen).
+    """
+    hint = failure_hint(spec, values, argv)
+    if spec.optional:
+        text = f"⚠ facts provider {spec.name} failed: {error} — {hint}"
+    else:
+        text = (
+            f"UNKNOWN — required facts provider {spec.name} failed: {error}; what it "
+            f"reports is NOT in this handoff — {hint}"
+        )
+    return _warning(
+        f"provider:{spec.name}",
+        text,
+        spec.failure_section,
+        required=not spec.optional,
+        provider=spec.name,
+        error=error,
+    )
 
 
 def run_providers(
@@ -1023,7 +1100,14 @@ def collect(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         "repos": repos,
         "warnings": warnings,
         "providers": [
-            {"name": r.name, "ok": r.ok, "elapsed_s": r.elapsed_s, "error": r.error} for r in runs
+            {
+                "name": r.name,
+                "ok": r.ok,
+                "optional": spec.optional,
+                "elapsed_s": r.elapsed_s,
+                "error": r.error,
+            }
+            for r, spec in zip(runs, specs, strict=True)
         ],
     }
 

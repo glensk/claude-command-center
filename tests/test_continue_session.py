@@ -1063,3 +1063,94 @@ def test_dry_run_never_writes_trust(harness: _Harness, monkeypatch: pytest.Monke
 
     monkeypatch.setattr(accounts, "ensure_trusted", boom)
     assert harness.start("-n") == 0
+
+
+# ------------------------------------------------- a failed required facts provider (tp#1520)
+
+
+def _failing_required(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **extra: str) -> Path:
+    """Configure ONE required provider that exits 1 and counts its runs in a file."""
+    import sys  # pylint: disable=import-outside-toplevel
+
+    from command_center import config  # pylint: disable=import-outside-toplevel
+
+    counter = tmp_path / "provider-runs.txt"
+    script = tmp_path / "failing_provider.py"
+    script.write_text(
+        f"import sys\nopen({str(counter)!r}, 'a', encoding='utf-8').write('x')\nsys.exit(1)\n",
+        encoding="utf-8",
+    )
+    spec: dict[str, object] = {
+        "argv": [sys.executable, str(script)],
+        "name": "req",
+        "failure_section": "tp ownership",
+        **extra,
+    }
+    cfg = config.Config(handoff_facts=[spec])
+    monkeypatch.setattr(config, "load_config", lambda: cfg)
+    return counter
+
+
+_LOUD = "⚠ required facts provider req failed (exit 1): the handoff marks its section UNKNOWN"
+
+
+def test_facts_only_dry_run_with_a_failed_required_provider_says_so(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    del harness  # the fixture sets up the accounts and the session
+    _failing_required(monkeypatch, tmp_path)
+    argv = ["continue-session", "start", "--facts-only", "-n", "-A", "private", "-s", SID]
+    assert cli.main(argv) == 0  # D4: the relay is never blocked
+    assert _LOUD in capsys.readouterr().err
+
+
+def test_a_retry_reuses_the_frozen_unknown_and_still_says_so(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    from command_center import handoff_facts  # pylint: disable=import-outside-toplevel
+
+    counter = _failing_required(monkeypatch, tmp_path)
+    harness.accept_on_sleep = False
+    argv = ["continue-session", "start", "--facts-only", "-A", "private", "-s", SID, "-w", "0"]
+    assert cli.main(argv) == continue_session.EXIT_WAITING
+    capsys.readouterr()
+    with Store() as store:
+        (first,) = store.transfers_of(SID)
+    assert first.state in ("prepared", "opened") and first.facts_snapshot
+    stored = continue_session._stored_snapshot(  # pylint: disable=protected-access
+        SID, first.facts_snapshot
+    )
+    assert continue_session._failed_required(stored) == [  # pylint: disable=protected-access
+        ("req", "exit 1")
+    ]
+    assert counter.read_text(encoding="utf-8") == "x"  # the provider ran once, at the start
+
+    def _no_recollection(*_a: object, **_k: object) -> None:
+        raise AssertionError("a retry must reuse the stored snapshot, not collect again")
+
+    monkeypatch.setattr(handoff_facts, "collect", _no_recollection)
+    assert cli.main(argv) == continue_session.EXIT_WAITING
+    assert _LOUD in capsys.readouterr().err
+    assert counter.read_text(encoding="utf-8") == "x"
+
+
+def test_capped_start_with_a_failed_required_provider_logs_and_notifies(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from command_center import handoff_capped  # pylint: disable=import-outside-toplevel
+
+    _failing_required(monkeypatch, tmp_path)  # no llm_custom_command: facts-only fallback
+    logged: list[str] = []
+    notified: list[str] = []
+    monkeypatch.setattr(handoff_capped, "log_event", lambda _sid, detail: logged.append(detail))
+    monkeypatch.setattr(handoff_capped, "notify_failure", notified.append)
+    argv = ["continue-session", "start", "--capped", "-A", "private", "-s", SID]
+    assert cli.main(argv) == 0
+    assert _LOUD in logged and _LOUD in notified
+    assert len(harness.launches) == 1

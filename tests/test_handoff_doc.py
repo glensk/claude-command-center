@@ -169,6 +169,23 @@ def test_compose_puts_code_facts_first_and_keeps_model_sections(tmp_path: Path) 
     assert len(result.text.encode()) <= handoff_doc.MAX_BYTES
 
 
+def test_a_failed_required_provider_marks_tp_ownership_unknown_not_none(tmp_path: Path) -> None:
+    """tp#1520: the provider that owns ``tp ownership`` failed → UNKNOWN there, never none."""
+    import sys  # pylint: disable=import-outside-toplevel
+
+    from command_center import handoff_facts  # pylint: disable=import-outside-toplevel
+
+    spec = handoff_facts.ProviderSpec(
+        "req", [sys.executable, "-c", "import sys; sys.exit(1)"], failure_section="tp ownership"
+    )
+    run = handoff_facts.run_provider(spec, {"{session}": "sid-x"})
+    result, _ = _compose(_model(), _snap(_session_fact(), *run.facts), tmp_path)
+    assert result.ok, result.errors
+    body = handoff_doc.sections(result.text)["tp ownership"]
+    assert body.startswith("⚠ UNKNOWN") and "required facts provider req failed" in body
+    assert body != "none" and "\nnone" not in body
+
+
 def test_legacy_document_composes_with_notes_after_code_and_a_cut_pointer(tmp_path: Path) -> None:
     legacy = _doc(
         **{

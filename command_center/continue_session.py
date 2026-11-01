@@ -651,6 +651,41 @@ class _Composed:
     text: str
     digest: str
     snapshot: str = ""
+    failed_required: list[tuple[str, str]] = field(default_factory=list)  # (name, error)
+
+
+def _failed_required(snap_doc: dict[str, Any] | None) -> list[tuple[str, str]]:
+    """``(provider, error)`` of every REQUIRED facts provider that failed (tp#1520).
+
+    Read from the snapshot's warning facts (``fields.required``), which ARE frozen, so the
+    fresh and the reuse paths of ``start`` both see them (``providers[]`` is not frozen).
+    """
+    out: list[tuple[str, str]] = []
+    for fact in (snap_doc or {}).get("facts", []):
+        fields = fact.get("fields") if isinstance(fact, dict) else None
+        if fact.get("kind") == "warning" and isinstance(fields, dict) and fields.get("required"):
+            out.append((str(fields.get("provider") or ""), str(fields.get("error") or "")))
+    return out
+
+
+def _reused(text: str, digest: str, sid: str, snapshot: str) -> _Composed:
+    """A reused composed text, with the failed required providers of its stored snapshot."""
+    return _Composed(text, digest, snapshot, _failed_required(_stored_snapshot(sid, snapshot)))
+
+
+def _say_failed_required(args: argparse.Namespace, sid: str, composed: _Composed) -> None:
+    """D4 stays (never block), but loud: stderr; a detached ``--capped`` run logs + notifies."""
+    for name, error in composed.failed_required:
+        line = (
+            f"⚠ required facts provider {name} failed ({error}): the handoff marks its "
+            "section UNKNOWN"
+        )
+        print(line, file=sys.stderr)
+        if getattr(args, "capped", False):
+            from . import handoff_capped
+
+            handoff_capped.log_event(sid, line)
+            handoff_capped.notify_failure(line)
 
 
 def _stored_snapshot(source_sid: str, snapshot: str) -> dict[str, Any] | None:
@@ -698,7 +733,9 @@ def _finish(  # pylint: disable=too-many-arguments,too-many-positional-arguments
             handoff_facts.write_private(model_path, handoff_facts.Scrubber().text(model.raw))
         except handoff_facts.FactsError as exc:
             raise StartRefused(f"facts collection refused — {exc}") from exc
-    return _Composed(doc.text, handoff_doc.model_digest(model, snapshot), snapshot)
+    return _Composed(
+        doc.text, handoff_doc.model_digest(model, snapshot), snapshot, _failed_required(snap_doc)
+    )
 
 
 def _compose_generated(
@@ -718,7 +755,7 @@ def _compose_generated(
         except OSError:
             stored = ""
         if stored:
-            return _Composed(stored, active.prompt_sha256, active.facts_snapshot)
+            return _reused(stored, active.prompt_sha256, src.session_id, active.facts_snapshot)
     snap_doc, snapshot, scrubber = _snapshot(adapter, store, src, args)
     try:
         text = handoff_capped.model_part(
@@ -764,7 +801,7 @@ def _compose(  # pylint: disable=too-many-arguments,too-many-positional-argument
         except OSError:
             stored = ""
         if stored and digest == active.prompt_sha256:
-            return _Composed(stored, digest, active.facts_snapshot)
+            return _reused(stored, digest, sid, active.facts_snapshot)
         snap_doc = _stored_snapshot(sid, active.facts_snapshot)
         if snap_doc is None:
             raise StartRefused(f"the stored facts snapshot {active.facts_snapshot[:12]} is gone")
@@ -847,6 +884,7 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
             composed = _compose(adapter, store, src, raw, active, args)
         except StartRefused as exc:
             return _fail(args, src.session_id, str(exc))
+        _say_failed_required(args, src.session_id, composed)
         try:
             target_dir = _preflight(adapter, store, src, args.account, dry_run=args.dry_run)
             candidate = _candidate(
