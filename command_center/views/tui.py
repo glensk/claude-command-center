@@ -4652,6 +4652,13 @@ class CommandCenterApp(App[None]):
             job_type=job_type,
             config_dir=config_dir,
         )
+        # tp#1512: the form is a human registration — the deliberate (narrowed) trust grant.
+        # Its one line goes to the notification below; stderr would tear the TUI screen.
+        trust_lines: list[str] = []
+        row = store.get(sid)
+        accounts.grant_registration_trust(
+            row.config_dir if row is not None else config_dir, cwd, emit=trust_lines.append
+        )
         from .. import spawn  # pylint: disable=import-outside-toplevel
 
         if self.cfg.aim_score_on_set:
@@ -4663,6 +4670,7 @@ class CommandCenterApp(App[None]):
         self.refresh_data()
         self.notify(
             f"Future job saved: {colors.short_folder(cwd)} — select it and press r to launch."
+            + "".join(f"\n{line}" for line in trust_lines)
         )
 
     def _start_job(self, sid: str) -> None:

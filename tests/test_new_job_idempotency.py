@@ -238,3 +238,68 @@ def test_json_short_options_do_not_collide(home: Path) -> None:
     assert parser.parse_args(["new-job", "-a", "x", "-J"]).json is True
     assert parser.parse_args(["jobs", "-j"]).json is True
     assert parser.parse_args(["jobs"]).json is False
+
+
+# --------------------------------------------------------------------------- #
+# tp#1512: registration trusts the job's folder (narrowed, logged on stderr)
+# --------------------------------------------------------------------------- #
+def _trusted(folder: Path) -> bool:
+    from command_center import accounts  # pylint: disable=import-outside-toplevel
+
+    with Store() as store:
+        (job,) = [s for s in store.list_sessions() if s.draft]
+    return accounts.is_trusted(job.config_dir, folder)
+
+
+def test_new_job_trusts_its_cwd_for_its_account(
+    home: Path,  # pylint: disable=redefined-outer-name  # the pytest fixture
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert not _trusted_raw(home)
+    assert cli.cmd_new_job(_new_job(home, json=True)) == 0
+    captured = capsys.readouterr()
+    assert f"✅ trusted {home.resolve()} for " in captured.err
+    json.loads(captured.out)  # --json stdout stays one clean document
+    assert _trusted(home)
+
+
+def test_new_job_retry_with_the_same_key_trusts_too(
+    home: Path,  # pylint: disable=redefined-outer-name  # the pytest fixture
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from command_center import accounts  # pylint: disable=import-outside-toplevel
+
+    assert cli.cmd_new_job(_new_job(home, idempotency_key="kt", json=True)) == 0
+    capsys.readouterr()
+    # the trust was lost (e.g. registered by an older ccc, or a clobbered .claude.json)
+    (Path.home() / ".claude.json").write_text("{}\n", encoding="utf-8")
+    assert not _trusted(home)
+    assert cli.cmd_new_job(_new_job(home, idempotency_key="kt", json=True)) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["created"] is False
+    assert "✅ trusted" in captured.err
+    assert _trusted(home)
+    assert accounts.is_trusted("", home)
+
+
+def test_new_job_registers_but_warns_when_the_grant_is_refused(
+    home: Path,  # pylint: disable=redefined-outer-name  # the pytest fixture
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cli.cmd_new_job(_new_job(home, cwd="/tmp")) == 0
+    captured = capsys.readouterr()
+    assert "future job created" in captured.out
+    assert "⚠ not trusting /private/tmp for " in captured.err or (
+        "⚠ not trusting /tmp for " in captured.err
+    )
+    assert "the top of /tmp" in captured.err
+    with Store() as store:
+        assert len([s for s in store.list_sessions() if s.draft]) == 1
+    projects = json.loads((Path.home() / ".claude.json").read_text(encoding="utf-8"))
+    assert projects.get("projects", {}) == {}
+
+
+def _trusted_raw(folder: Path) -> bool:
+    from command_center import accounts  # pylint: disable=import-outside-toplevel
+
+    return accounts.is_trusted("", folder)

@@ -2832,6 +2832,8 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
     """
     import uuid
 
+    from . import accounts
+
     as_json = bool(getattr(args, "json", False))
 
     def say(message: str) -> None:
@@ -2940,6 +2942,8 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
                         file=sys.stderr,
                     )
                     return 2
+                # tp#1512: a retry of an older registration gets the grant too.
+                accounts.grant_registration_trust(existing.config_dir, existing.cwd)
                 if as_json:
                     print(_new_job_json(existing, False))
                 else:
@@ -2965,6 +2969,9 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
             fire_window=fire_window,
             idempotency_key=idempotency_key,
         )
+    # tp#1512: registration is the deliberate trust grant (narrowed, logged on stderr), so
+    # an unattended `start-job --auto` later only CHECKS trust and never parks on the dialog.
+    accounts.grant_registration_trust(session.config_dir, session.cwd)
     if as_json:
         print(_new_job_json(session, True))
     else:
@@ -3098,7 +3105,45 @@ def has_terminal() -> bool:
         return False
 
 
-def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many-return-statements
+def _start_job_trust_refusal(
+    session_id: str, config_dir: str, cwd: str, registered_cwd: str, *, auto: bool
+) -> str:
+    """The trust gate of ``start-job`` (tp#1512): an error line, or ``""`` to launch.
+
+    Manual (human) launch: trust *cwd* first (``ensure_trusted``, the ``resume_in_new_tab``
+    path), naming the folder when a job-file edit moved it from *registered_cwd*. Both
+    paths then REQUIRE Claude Code's own lookup to accept the folder (``is_trusted`` with
+    ancestors), so a launch never parks on the trust dialog. ``--auto`` only checks:
+    automatic launches never establish trust (registration already granted it).
+    """
+    from . import accounts
+
+    label = accounts.account_label(config_dir)
+    folder = os.path.realpath(cwd) if cwd else cwd
+    if not auto:
+        if registered_cwd and os.path.realpath(registered_cwd) != folder:
+            print(f"trusting {folder} for {label} (the job file moved it from {registered_cwd})")
+        accounts.ensure_trusted(config_dir, cwd)
+    if accounts.is_trusted(config_dir, cwd, ancestors=True):
+        return ""
+    if not auto and not accounts._claude_json_path(config_dir).is_file():  # pylint: disable=protected-access
+        return (
+            f"error: job {session_id}: account `{label}` has no .claude.json; log in once "
+            "with it, then start the job again"
+        )
+    if auto:
+        return (
+            f"error: auto-fire blocked — job {session_id}'s folder {folder} is not trusted "
+            f"for account `{label}`; job disarmed (kept as draft) — start it manually with "
+            f"`ccc open-job {session_id}`, which trusts the folder"
+        )
+    return (
+        f"error: job {session_id}: folder {folder} could not be trusted for account "
+        f"`{label}` — refusing to launch into Claude Code's trust dialog"
+    )
+
+
+def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many-return-statements,too-many-statements
     args: argparse.Namespace,
 ) -> int:
     """Launch a saved future job: clear its draft flag, then exec ``claude --session-id``.
@@ -3154,6 +3199,22 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
         # a TTY, so this guard passes and the exec proceeds). Refuse outright if no tab can
         # be opened — never exec headless. Checked BEFORE any state mutation, so a refusal
         # leaves the draft and its file exactly as they were.
+        from . import accounts
+
+        if getattr(args, "auto", False) and not accounts.is_trusted(
+            session.config_dir, session.cwd, ancestors=True
+        ):
+            # (0-trust, tp#1512) Cheap pre-check BEFORE a tab opens: an unattended
+            # dispatch into an untrusted folder would park on the trust dialog. Disarm,
+            # keep the draft, open nothing (the authoritative gate below re-checks).
+            store.update_fields(args.session_id, fire_at=0)
+            print(
+                _start_job_trust_refusal(
+                    args.session_id, session.config_dir, session.cwd, session.cwd, auto=True
+                ),
+                file=sys.stderr,
+            )
+            return 1
         if not has_terminal():
             from . import terminal
 
@@ -3179,6 +3240,7 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
                 file=sys.stderr,
             )
             return 1
+        registered_cwd = session.cwd  # the trust gate names a folder a job-file edit moved
         if session.future_file:  # (a) pull in last-minute file edits, then re-read the row
             abs_path = futuresync.vault_root(cfg) / session.future_file
             futuresync.run_sync(store, cfg, only_file=abs_path)
@@ -3263,8 +3325,6 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
         # archive) so nothing is lost. Real drafts always carry an account (create_draft
         # stamps one; the migration backfills legacy rows), so this only trips on a
         # hand-corrupted row.
-        from . import accounts
-
         if not config_dir and accounts.is_multi_account():
             if getattr(args, "auto", False):
                 store.update_fields(args.session_id, fire_at=0)  # disarm, keep the draft
@@ -3300,6 +3360,16 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
                     store.update_fields(args.session_id, fire_at=0)  # disarm, keep the draft
                 print(f"error: job {args.session_id}: {exc} — refusing to launch", file=sys.stderr)
                 return 1
+        # (0d, tp#1512) Trust gate — after the file re-read (a moved cwd is what gets
+        # checked) and BEFORE claim_draft, so a refusal leaves the draft intact.
+        refusal = _start_job_trust_refusal(
+            args.session_id, config_dir, cwd, registered_cwd, auto=getattr(args, "auto", False)
+        )
+        if refusal:
+            if getattr(args, "auto", False):
+                store.update_fields(args.session_id, fire_at=0)  # disarm, keep the draft
+            print(refusal, file=sys.stderr)
+            return 1
         overseer, retired_overseer = resolve_job_llm(session.llm_overseer)
         executor, retired_executor = resolve_job_llm(session.llm_exec)
         if retired_overseer or retired_executor:
@@ -3365,8 +3435,11 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
     # Pin the job's OWN Claude account (D8) into os.environ before exec — the default
     # account unsets CLAUDE_CONFIG_DIR, any other sets it — so an ambient value in this
     # tab can never bill the wrong seat — plus its own flags (CCC_NO_CODEX for a
-    # -N/--no-codex job). os.execvp inherits the mutated environment.
-    accounts.session_apply_to_environ(accounts.LaunchTarget(config_dir, no_codex, profile))
+    # -N/--no-codex job). os.execvp inherits the mutated environment. pin_environ, NOT
+    # session_apply_to_environ (tp#1512): the latter also trusts os.getcwd() — the
+    # LAUNCHER's cwd (the tab's $HOME, launchd's /), not the job's folder — and an --auto
+    # launch must never grant trust. The trust gate above already settled the job's cwd.
+    accounts.pin_environ(config_dir, no_codex, profile)
     try:
         _exec_in(cwd, argv)  # replaces this process on success
     except OSError as exc:  # (d) launch failed — undo the promotion so the job survives
@@ -3670,6 +3743,8 @@ def cmd_restore_job(args: argparse.Namespace) -> int:  # pylint: disable=too-man
         store.update_fields(job.session_id, future_file=str(path))
         refreshed = store.get(job.session_id)
         assert refreshed is not None
+        # tp#1512: a human re-registration is the deliberate grant (narrowed, logged).
+        accounts.grant_registration_trust(refreshed.config_dir, refreshed.cwd)
         futuresync.unarchive_file(store, cfg, refreshed)
     print(f"re-registered future job {session_id} from {file_arg} — staged back into FUTURE")
     return 0

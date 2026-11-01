@@ -190,6 +190,23 @@ def test_grab_registers_armed_job_for_frontmost_tab(monkeypatch: pytest.MonkeyPa
     assert notified == ["⏳ prompt parked"]
 
 
+def test_grab_trusts_the_parked_folder_at_creation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#1512: a park is a human registration, so its folder is trusted right away."""
+    from command_center import accounts, peek
+
+    _grab_setup(monkeypatch, "panel prompt")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(peek, "frontmost_iterm_cwd", lambda: str(repo))
+    assert cli.main(["park", "-g"]) == 0
+    with Store() as store:
+        job = next(s for s in store.list_sessions() if s.draft)
+    assert accounts.is_trusted(job.config_dir, repo)
+    assert f"✅ trusted {repo.resolve()} for " in capsys.readouterr().err
+
+
 def test_grab_cancel_registers_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     _grab_setup(monkeypatch, None)
     assert cli.main(["park", "-g"]) == 130
@@ -564,13 +581,16 @@ def test_start_job_auto_disarms_on_tripped_guard(
 ) -> None:
     from datetime import date, timedelta
 
+    from command_center import accounts
+
     ahead = (date.today() + timedelta(days=3)).isoformat()
     with Store() as store:
         store.create_draft(
             "g1", "/tmp", "guarded", start_date=ahead, fire_at=NOW - 300, fire_window="five_hour"
         )
+    accounts.ensure_trusted("", "/tmp")  # past the tp#1512 trust gate: the date guard trips
     assert cli.main(["start-job", "g1", "--auto"]) == 1
-    assert "auto-fire blocked" in capsys.readouterr().err
+    assert "start date" in capsys.readouterr().err
     with Store() as store:
         job = store.get("g1")
         assert job is not None and job.draft and job.fire_at == 0  # disarmed, draft kept

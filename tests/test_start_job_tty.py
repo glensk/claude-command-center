@@ -14,6 +14,8 @@ The guard turns that into: open a real tab, or refuse — never a silent headles
 from __future__ import annotations
 
 import argparse
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -25,14 +27,33 @@ class _StopExec(Exception):
     """Raised in place of os.execvp so a test can tell that the exec was reached."""
 
 
-def _make_draft(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sid: str = "job-tty") -> Store:
-    """A minimal launchable draft in an isolated store (no future_file → no file sync)."""
+def _make_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sid: str = "job-tty",
+    cwd: str = "/no/such/dir",
+    trusted: bool = True,
+) -> Store:
+    """A minimal launchable draft in an isolated store (no future_file → no file sync).
+
+    *trusted* pre-trusts *cwd* for the default account (as its registration would), so a
+    test of another guard is not stopped by the tp#1512 trust gate first.
+    """
+    from command_center import accounts
+
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress the detached sync-mirrors spawn
     store = Store(tmp_path / "command-center" / "state.db")
-    store.create_draft(sid, "/no/such/dir", "Do the thing", prompt="run it")
+    store.create_draft(sid, cwd, "Do the thing", prompt="run it")
     store.close()
+    if trusted:
+        assert accounts.ensure_trusted("", cwd) is True
     return Store(tmp_path / "command-center" / "state.db")
+
+
+def _claude_json() -> dict:
+    """The pinned default account's ``.claude.json`` (the conftest seeds ``{}``)."""
+    return json.loads((Path.home() / ".claude.json").read_text(encoding="utf-8"))
 
 
 def _no_tty(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -130,7 +151,7 @@ def test_start_job_without_tty_refuses_when_no_tab_can_open(
 
 
 def test_start_job_auto_disarms_when_no_tab_can_open(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Unattended dispatch that cannot get a tab disarms instead of retrying forever."""
     from command_center import cli
@@ -145,10 +166,148 @@ def test_start_job_auto_disarms_when_no_tab_can_open(
 
     rc = cli.cmd_start_job(argparse.Namespace(session_id="job-tty", force=False, auto=True))
     assert rc == 1
+    assert "needs a terminal" in capsys.readouterr().err  # the tab guard, not the trust gate
     session = store.get("job-tty")
     assert session is not None
     assert session.fire_at == 0  # disarmed
     assert session.draft == 1  # but still launchable by hand
+    store.close()
+
+
+# ------------------------------------------------------- tp#1512: the trust gate
+
+
+def _exec_stub(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Record the exec (and the cwd it would run in) instead of replacing the process."""
+    seen: dict[str, object] = {}
+
+    def _capture(_file: str, argv: list[str]) -> None:
+        seen.update(argv=argv, cwd=os.getcwd())
+        raise _StopExec
+
+    monkeypatch.setattr("command_center.cli.os.execvp", _capture)
+    return seen
+
+
+def test_start_job_trusts_an_untrusted_cwd_before_exec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual launch trusts the job's folder itself, then execs (no dialog to park on)."""
+    from command_center import accounts, cli
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _make_draft(tmp_path, monkeypatch, cwd=str(repo), trusted=False).close()
+    assert not accounts.is_trusted("", repo)
+    _a_tty(monkeypatch)
+    seen = _exec_stub(monkeypatch)
+    with pytest.raises(_StopExec):
+        cli.cmd_start_job(argparse.Namespace(session_id="job-tty", force=False, auto=False))
+    assert accounts.is_trusted("", repo)
+    assert seen["cwd"] == str(repo.resolve())
+    # pin_environ, not apply_to_environ: the LAUNCHER's cwd is never trusted on the way
+    assert set(_claude_json()["projects"]) == {str(repo.resolve())}
+
+
+def test_start_job_auto_refuses_an_untrusted_cwd_and_disarms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--auto`` only checks: an untrusted folder disarms, keeps the draft, writes nothing."""
+    from command_center import cli
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = _make_draft(tmp_path, monkeypatch, cwd=str(repo), trusted=False)
+    store.update_fields("job-tty", fire_at=1234)
+    _a_tty(monkeypatch)
+    seen = _exec_stub(monkeypatch)
+    rc = cli.cmd_start_job(argparse.Namespace(session_id="job-tty", force=False, auto=True))
+    assert rc == 1 and not seen
+    assert "not trusted" in capsys.readouterr().err
+    session = store.get("job-tty")
+    assert session is not None and session.draft == 1 and session.fire_at == 0
+    assert _claude_json() == {}  # no trust written
+    store.close()
+
+
+def test_start_job_auto_untrusted_opens_no_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``--auto`` pre-check runs BEFORE the no-terminal branch: no error tab opens."""
+    from command_center import cli
+
+    store = _make_draft(tmp_path, monkeypatch, cwd=str(tmp_path), trusted=False)
+    store.update_fields("job-tty", fire_at=1234)
+    _no_tty(monkeypatch)
+
+    def _no_tab(*_a: object, **_k: object) -> bool:
+        raise AssertionError("an untrusted --auto dispatch must not open a tab")
+
+    monkeypatch.setattr("command_center.terminal.start_job_in_new_tab", _no_tab)
+    rc = cli.cmd_start_job(argparse.Namespace(session_id="job-tty", force=False, auto=True))
+    assert rc == 1
+    session = store.get("job-tty")
+    assert session is not None and session.fire_at == 0 and session.draft == 1
+    store.close()
+
+
+def test_start_job_refusal_happens_before_claim_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A trust refusal never reaches ``claim_draft`` (the draft is not consumed)."""
+    from command_center import accounts, cli
+
+    store = _make_draft(tmp_path, monkeypatch, cwd=str(tmp_path), trusted=False)
+    _a_tty(monkeypatch)
+    _exec_stub(monkeypatch)
+    monkeypatch.setattr(accounts, "is_trusted", lambda *_a, **_k: False)
+
+    def _no_claim(*_a: object, **_k: object) -> bool:
+        raise AssertionError("claim_draft reached on a trust refusal")
+
+    monkeypatch.setattr(Store, "claim_draft", _no_claim)
+    for auto in (False, True):
+        rc = cli.cmd_start_job(argparse.Namespace(session_id="job-tty", force=False, auto=auto))
+        assert rc == 1
+    session = store.get("job-tty")
+    assert session is not None and session.draft == 1
+    store.close()
+
+
+def test_start_job_manual_refuses_when_the_account_has_no_claude_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No ``.claude.json``: ``ensure_trusted`` writes nothing, so the manual path refuses."""
+    from command_center import cli
+
+    store = _make_draft(tmp_path, monkeypatch, cwd=str(tmp_path), trusted=False)
+    (Path.home() / ".claude.json").unlink()
+    _a_tty(monkeypatch)
+    seen = _exec_stub(monkeypatch)
+    rc = cli.cmd_start_job(argparse.Namespace(session_id="job-tty", force=False, auto=False))
+    assert rc == 1 and not seen
+    assert "has no .claude.json; log in once with it" in capsys.readouterr().err
+    session = store.get("job-tty")
+    assert session is not None and session.draft == 1
+    store.close()
+
+
+def test_start_job_auto_accepts_a_trusted_parent_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude Code honours a trusted parent (outside a git repo), so the gate does too."""
+    from command_center import accounts, cli
+
+    sub = tmp_path / "parent" / "child"
+    sub.mkdir(parents=True)
+    store = _make_draft(tmp_path, monkeypatch, cwd=str(sub), trusted=False)
+    assert accounts.ensure_trusted("", tmp_path / "parent") is True
+    _a_tty(monkeypatch)
+    seen = _exec_stub(monkeypatch)
+    with pytest.raises(_StopExec):
+        cli.cmd_start_job(argparse.Namespace(session_id="job-tty", force=False, auto=True))
+    assert seen["cwd"] == str(sub.resolve())
+    assert str(sub.resolve()) not in _claude_json()["projects"]  # --auto granted nothing
     store.close()
 
 

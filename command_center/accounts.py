@@ -44,7 +44,7 @@ import os
 import shlex
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -199,18 +199,13 @@ def ensure_trusted(config_dir: str, cwd: str | Path | None = None) -> bool:
     alone. Returns True when the file was written.
     """
     target = str(Path(cwd).resolve()) if cwd else os.getcwd()
-    # Claude Code's layout: the DEFAULT account's file is the config dir's SIBLING
-    # (~/.claude.json next to ~/.claude/), any other account's is inside its dir.
-    # Derived from the config dir (not Path.home()) so a test that pins CLAUDE_HOME
-    # under tmp can never reach the real ~/.claude.json.
-    # An empty *config_dir* (an unstamped row) IS the default account — never
-    # ``_resolve("")``, which is the process cwd and put the file one level above it.
-    resolved = _resolve(config_dir) if config_dir else default_config_dir()
-    path = (
-        (resolved.parent / ".claude.json")
-        if is_default_config_dir(config_dir)
-        else resolved / ".claude.json"
-    )
+    # The SAME file is_trusted reads back (tp#1512): the DEFAULT account's is
+    # $HOME/.claude.json (Claude Code's own lookup with CLAUDE_CONFIG_DIR unset), any
+    # other account's is inside its dir. It used to be "the config dir's parent", which
+    # equals $HOME only while CLAUDE_HOME is unset — a split the launch gate cannot
+    # survive. The test suite pins $HOME / Path.home() under tmp (conftest
+    # ``_isolate_home``), so a test can never reach the real ~/.claude.json.
+    path = _claude_json_path(config_dir)
     try:
         with path.open(encoding="utf-8") as handle:
             data = json.load(handle)
@@ -240,12 +235,18 @@ def ensure_trusted(config_dir: str, cwd: str | Path | None = None) -> bool:
     return True
 
 
-def is_trusted(config_dir: str, cwd: str | Path | None = None) -> bool:
+def is_trusted(config_dir: str, cwd: str | Path | None = None, *, ancestors: bool = False) -> bool:
     """Read back whether *cwd* carries the accepted-trust flag under *config_dir*'s account.
 
     The success predicate :func:`ensure_trusted` deliberately is not (its ``False`` means
     "already trusted" as well as "could not read/write"): callers that must NOT launch
     into a trust dialog call ``ensure_trusted`` and then require this to be ``True``.
+
+    *ancestors* (tp#1512) mirrors Claude Code's own lookup (2.1.316: ``UI`` → ``zh`` →
+    ``jh``): a trusted parent folder covers *cwd*, walking up from *cwd* and stopping at
+    *cwd*'s git root (inside a repo, trust above the repo root does not count). Stricter
+    than Claude Code on one point: ``/`` and ``$HOME`` count only as the exact key, never
+    as an ancestor reached by the walk.
     """
     target = str(Path(cwd).resolve()) if cwd else os.getcwd()  # ensure_trusted's own key
     try:
@@ -253,8 +254,101 @@ def is_trusted(config_dir: str, cwd: str | Path | None = None) -> bool:
     except (OSError, ValueError):
         return False
     projects = data.get("projects") if isinstance(data, dict) else None
-    entry = projects.get(target) if isinstance(projects, dict) else None
-    return isinstance(entry, dict) and entry.get(TRUST_KEY) is True
+    if not isinstance(projects, dict):
+        return False
+
+    def accepted(key: str) -> bool:
+        entry = projects.get(key)
+        return isinstance(entry, dict) and entry.get(TRUST_KEY) is True
+
+    if accepted(target):
+        return True
+    if not ancestors:
+        return False
+    return any(accepted(str(folder)) for folder in _trust_ancestors(Path(target)))
+
+
+def _trust_ancestors(folder: Path) -> list[Path]:
+    """The parents of *folder* whose trust Claude Code honours for it (see :func:`is_trusted`).
+
+    Up to and including *folder*'s git root when it is inside a repo, else up to ``/``;
+    ``/`` and ``$HOME`` are never included (exact matches only).
+    """
+    chain = [folder, *folder.parents]
+    for index, candidate in enumerate(chain):
+        if (candidate / ".git").exists():
+            chain = chain[: index + 1]
+            break
+    never = {Path("/"), _resolve(Path.home())}
+    return [p for p in chain[1:] if p not in never]
+
+
+# Folders a registration never trusts (tp#1512): shared roots where a later, unrelated
+# file would inherit the grant. Their sub-folders (a ``mktemp -d`` dir) are fine.
+_TMP_ROOTS = (Path("/tmp"), Path("/private/tmp"))
+_VAR_FOLDERS = (Path("/var/folders"), Path("/private/var/folders"))
+_VAR_FOLDERS_TOP_DEPTH = 3  # /var/folders/<xx>/<hash>/T is the per-user temp root
+
+
+def registration_trust_refusal(folder: Path) -> str:  # pylint: disable=too-many-return-statements  # one exit per refusal
+    """Why a registration must not trust the RESOLVED *folder*, or ``""`` when it may.
+
+    Granted only for an existing directory owned by this user and not world-writable,
+    and never for ``/``, ``$HOME``, the top of ``/tmp`` or the per-user ``/var/folders``
+    temp roots (and the levels above them).
+    """
+    if folder == Path("/"):
+        return "the filesystem root"
+    if folder == _resolve(Path.home()):
+        return "the home directory"
+    if folder in _TMP_ROOTS or folder in {_resolve(p) for p in _TMP_ROOTS}:
+        return "the top of /tmp"
+    for root in _VAR_FOLDERS:
+        if folder == root or (
+            root in folder.parents and len(folder.relative_to(root).parts) <= _VAR_FOLDERS_TOP_DEPTH
+        ):
+            return "a top-level /var/folders temp root"
+    try:
+        info = folder.stat()
+    except OSError:
+        return "not an existing directory"
+    if not folder.is_dir():
+        return "not an existing directory"
+    if info.st_uid != os.getuid():
+        return f"owned by uid {info.st_uid}, not by you"
+    if info.st_mode & 0o002:
+        return "world-writable"
+    return ""
+
+
+def grant_registration_trust(
+    config_dir: str, cwd: str | Path, emit: Callable[[str], None] | None = None
+) -> bool:
+    """Trust a newly registered job's *cwd* for its account — narrowed and logged (tp#1512).
+
+    The deliberate grant at ``ccc new-job``-class registration (a human or an agent chose
+    the folder and the account), so an unattended ``start-job --auto`` later only has to
+    CHECK trust. Refused (job still registered) per :func:`registration_trust_refusal`, or
+    when the account has no ``.claude.json`` yet. Every outcome is one line through *emit*
+    (default: stderr): ``✅ trusted <dir> for <account>`` or ``⚠ not trusting <dir> for
+    <account>: <reason>``. Never called for a futuresync import. Returns True when trusted.
+    """
+    say = emit or (lambda line: print(line, file=sys.stderr))
+    label = account_label(config_dir)
+    folder = _resolve(cwd)
+    reason = registration_trust_refusal(folder)
+    if not reason:
+        ensure_trusted(config_dir, folder)
+        if is_trusted(config_dir, folder):
+            say(f"✅ trusted {folder} for {label}")
+            return True
+        reason = (
+            "the account has no .claude.json; log in once with it"
+            if not _claude_json_path(config_dir).is_file()
+            else "the trust flag could not be written"
+        )
+    say(f"⚠ not trusting {folder} for {label}: {reason}")
+    return False
 
 
 def account_email(config_dir: str) -> str | None:

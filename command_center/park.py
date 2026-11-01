@@ -489,7 +489,7 @@ def run_park(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retur
     session_id = str(uuid.uuid4())
     aim = _derive_aim(getattr(args, "aim", None) or "", prompt)
     with Store() as store:
-        store.create_draft(
+        parked = store.create_draft(
             session_id,
             cwd,
             aim,
@@ -498,6 +498,9 @@ def run_park(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retur
             fire_at=fire_at,
             fire_window=(window if fire_at else ""),
         )
+    # tp#1512: parking is a human registration — the deliberate (narrowed, logged) trust
+    # grant, so the --auto launch at reset only has to check it.
+    accounts.grant_registration_trust(parked.config_dir, parked.cwd)
     cfg = config.load_config()
     if cfg.future_files:
         from .spawn import spawn_ccc
@@ -730,13 +733,14 @@ def grab(  # pylint: disable=too-many-locals,too-many-return-statements,too-many
 
         session_id = str(uuid.uuid4())
         with Store() as store:
-            store.create_draft(
+            parked = store.create_draft(
                 session_id,
                 os.getcwd(),
                 _derive_aim(opts.aim, prompt),
                 prompt=prompt,
                 config_dir=accounts.env_config_dir(),
             )
+        accounts.grant_registration_trust(parked.config_dir, parked.cwd)  # tp#1512
         message = f"target resolution timed out — saved UNARMED as job {short_id(session_id)}"
         notify("⏳ park saved unarmed", message, cfg.notify)
         print(f"warning: {message}", file=sys.stderr)
@@ -785,7 +789,7 @@ def grab(  # pylint: disable=too-many-locals,too-many-return-statements,too-many
 
     session_id = str(uuid.uuid4())
     with Store() as store:
-        store.create_draft(
+        parked = store.create_draft(
             session_id,
             cwd,
             _derive_aim(opts.aim, prompt),
@@ -794,6 +798,7 @@ def grab(  # pylint: disable=too-many-locals,too-many-return-statements,too-many
             fire_at=fire_at,
             fire_window=(window if fire_at else ""),
         )
+    accounts.grant_registration_trust(parked.config_dir, parked.cwd)  # tp#1512
     if cfg.future_files:
         from .spawn import spawn_ccc
 

@@ -467,6 +467,7 @@ def test_cmd_start_job_execs_through_the_profile(
     monkeypatch.setenv("CCC_START_JOB_HEADLESS", "1")
     monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
     monkeypatch.setattr(accounts, "ensure_trusted", lambda *_a, **_k: True)
+    monkeypatch.setattr(accounts, "is_trusted", lambda *_a, **_k: True)  # tp#1512 gate
     seen = _Exec()
     monkeypatch.setattr(os, "execvp", seen)
     with pytest.raises(SystemExit):
@@ -483,6 +484,7 @@ def test_cmd_start_job_refuses_a_vanished_profile_and_keeps_the_draft(
     repo.mkdir()
     with Store() as store:
         store.create_draft("sj", str(repo), "aim", launch_profile=LABEL, fire_at=123)
+    accounts.ensure_trusted("", repo)  # past the tp#1512 trust gate: the profile check trips
     monkeypatch.setenv("CCC_START_JOB_HEADLESS", "1")
     _no_exec(monkeypatch)
     _vanish(exe)

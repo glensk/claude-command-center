@@ -269,6 +269,35 @@ def test_unknown_ready_file_registers_and_is_renamed_canonical(env: Env) -> None
     assert 'status: "registered"' in canonical.read_text(encoding="utf-8")
 
 
+def test_imported_auto_job_in_an_untrusted_folder_is_disarmed_not_trusted(
+    env: Env,  # pylint: disable=redefined-outer-name  # the pytest fixture
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """tp#1512: a futuresync import never grants trust; its --auto launch only checks."""
+    import argparse  # pylint: disable=import-outside-toplevel
+
+    from command_center import accounts, cli  # pylint: disable=import-outside-toplevel
+
+    sid = str(uuid.uuid4())
+    ready = env.future_dir / "home" / "ccc" / "phone.md"
+    ready.parent.mkdir(parents=True, exist_ok=True)
+    ready.write_text(
+        serialize(session_id=sid, aim="From the phone", status="ready", repo="home/ccc"),
+        encoding="utf-8",
+    )
+    assert futuresync.run_sync(env.store, env.cfg).registered == [sid]
+    session = _session(env, sid)
+    assert not accounts.is_trusted(session.config_dir, session.cwd)  # the import granted nothing
+    assert "trusted" not in capsys.readouterr().err
+    env.store.update_fields(sid, fire_at=1234)
+    rc = cli.cmd_start_job(argparse.Namespace(session_id=sid, force=False, auto=True))
+    assert rc == 1
+    assert "not trusted" in capsys.readouterr().err
+    session = _session(env, sid)
+    assert session.draft and session.fire_at == 0  # disarmed, kept as a draft
+    assert not accounts.is_trusted(session.config_dir, session.cwd, ancestors=True)
+
+
 def test_invalid_ready_file_writes_error_once_then_no_op(env: Env) -> None:
     sid = str(uuid.uuid4())
     bad = env.future_dir / "home" / "ccc" / "bad.md"

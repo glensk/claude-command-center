@@ -153,21 +153,33 @@ def _guard_real_trust_writes(
     original = _accounts.ensure_trusted
 
     def guarded(config_dir: str, cwd: str | Path | None = None) -> bool:
-        resolved = (
-            _accounts._resolve(config_dir)  # noqa: SLF001
-            if config_dir
-            else _accounts.default_config_dir()
-        )
-        target = (
-            resolved.parent / ".claude.json"
-            if _accounts.is_default_config_dir(config_dir)
-            else resolved / ".claude.json"
-        ).resolve()
+        target = _accounts._claude_json_path(config_dir).resolve()  # noqa: SLF001
         if _REAL_HOME in target.parents and basetemp not in target.parents:
             raise AssertionError(f"test would write trust into the real {target} (cwd={cwd})")
         return original(config_dir, cwd)
 
     monkeypatch.setattr(_accounts, "ensure_trusted", guarded)
+
+
+@pytest.fixture(autouse=True)
+def _seed_default_claude_json(request: pytest.FixtureRequest, tmp_path: Path) -> None:
+    """Seed ``{}`` into the pinned default account's ``$HOME/.claude.json`` (tp#1512).
+
+    ``ccc start-job`` refuses to launch into a folder the account does not trust, and
+    ``ensure_trusted`` writes nothing for an account with no ``.claude.json`` — so
+    without this every start-job test would hit the new refusal. Requests
+    ``_isolate_home`` first so ``Path.home()`` is already under tmp; a
+    ``@pytest.mark.real_home`` test is never seeded.
+    """
+    if request.node.get_closest_marker("real_home"):
+        return
+    request.getfixturevalue("_isolate_home")
+    home = Path.home()
+    if tmp_path.resolve() not in home.resolve().parents:
+        return  # never seed outside this test's tmp dir
+    seed = home / ".claude.json"
+    if not seed.exists():
+        seed.write_text("{}\n", encoding="utf-8")
 
 
 @pytest.fixture(autouse=True)
