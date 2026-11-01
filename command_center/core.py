@@ -194,12 +194,22 @@ def orphan_launched_ids(store: Store, adapter: Adapter, live_ids: set[str]) -> s
     ``transcript_path`` is a concrete-adapter capability (like ``has_background_task`` /
     ``observed_model``), NOT part of the :class:`Adapter` protocol — probe it defensively so a
     stub adapter without it reaps nothing rather than raising.
+
+    A launch still WAITING is not dead (tp#1512): ``start-job`` stamps its own pid (the
+    exec'd claude) into ``last_seen_pid`` at ``claim_draft``, and a claude parked at a
+    dialog shown before its registry entry exists (trust, MCP approval, the
+    bypass-permissions warning, a logged-out seat) has no transcript and no live entry —
+    exactly the dead-launch shape. A row whose pid is alive AND is a ``claude`` process is
+    spared for as long as it waits; the command-name check keeps a reused pid from
+    shielding a dead row. ``ps`` is read once, and only when such a pid is alive.
     """
+    from .store import pid_alive  # pylint: disable=import-outside-toplevel
+
     resolve = getattr(adapter, "transcript_path", None)
     if resolve is None:
         return set()
-    return {
-        session.session_id
+    candidates = [
+        session
         for session in store.list_sessions(include_archived=True)
         if session.session_id not in live_ids
         and session.agent == "claude"
@@ -207,7 +217,20 @@ def orphan_launched_ids(store: Store, adapter: Adapter, live_ids: set[str]) -> s
         and session.status == Status.PARKED.value
         and session.prompt_count == 0
         and resolve(session.cwd, session.session_id, session.config_dir) is None
-    }
+    ]
+    waiting = [s for s in candidates if s.last_seen_pid and pid_alive(s.last_seen_pid)]
+    if waiting:
+        from . import terminal  # pylint: disable=import-outside-toplevel
+
+        table = terminal.ps_table()
+        spared = {
+            s.session_id
+            for s in waiting
+            if s.last_seen_pid and terminal.pid_is_claude(s.last_seen_pid, table)
+        }
+    else:
+        spared = set()
+    return {s.session_id for s in candidates if s.session_id not in spared}
 
 
 def resume_blockers(session_id: str, cwd: str, config_dir: str, adapter: Any = None) -> list[str]:

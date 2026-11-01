@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -1150,4 +1151,89 @@ def test_orphan_launched_ids_flags_only_never_turned_parked_rows(tmp_path: Path)
 
     got = orphan_launched_ids(store, _TxAdapter(have={"real"}), live_ids={"live"})
     assert got == {"dead"}
+    store.close()
+
+
+# ------------------------- tp#1512: a launch waiting at a pre-registry dialog is not dead
+
+
+class _NoTranscript(_StubAdapter):
+    """The concrete ``transcript_path`` probe, finding nothing (a never-turned launch)."""
+
+    def transcript_path(  # pylint: disable=unused-argument
+        self, cwd: str, session_id: str, config_dir: str | None = None
+    ) -> None:
+        return None
+
+
+def _canary_row(store: Store, sid: str, pid: int | None) -> None:
+    """The tp#1479 canary shape: AIM set, launched, parked, no turn, no transcript."""
+    store.create_draft(sid, "/repo", "tp1512 trust canary")
+    assert store.claim_draft(sid, pid=pid or 0)
+    store.update_fields(sid, status=Status.PARKED.value)
+
+
+def _ps(monkeypatch: pytest.MonkeyPatch, rows: dict[int, str]) -> None:
+    import types
+
+    from command_center import terminal
+
+    table = {
+        pid: types.SimpleNamespace(ppid=1, tty="", stat="S", command=cmd)
+        for pid, cmd in rows.items()
+    }
+    monkeypatch.setattr(terminal, "ps_table", lambda: table)
+
+
+def test_a_launched_row_whose_claude_pid_is_alive_is_not_an_orphan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center.core import orphan_launched_ids
+
+    store = Store(tmp_path / "s.db")
+    _canary_row(store, "waiting", os.getpid())  # this pid is alive
+    _ps(monkeypatch, {os.getpid(): "claude --session-id waiting --model x"})
+    assert orphan_launched_ids(store, _NoTranscript(), live_ids=set()) == set()
+    store.close()
+
+
+def test_a_launched_row_whose_pid_is_dead_is_still_an_orphan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center import core
+
+    store = Store(tmp_path / "s.db")
+    _canary_row(store, "dead", 999_999)
+    monkeypatch.setattr("command_center.store.pid_alive", lambda _pid: False)
+
+    def _no_ps() -> dict:
+        raise AssertionError("ps must not be read when no candidate pid is alive")
+
+    monkeypatch.setattr("command_center.terminal.ps_table", _no_ps)
+    assert core.orphan_launched_ids(store, _NoTranscript(), live_ids=set()) == {"dead"}
+    store.close()
+
+
+def test_a_reused_pid_of_a_non_claude_process_does_not_shield_the_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center.core import orphan_launched_ids
+
+    store = Store(tmp_path / "s.db")
+    _canary_row(store, "reused", os.getpid())
+    _ps(monkeypatch, {os.getpid(): "/usr/bin/python3 -m pytest"})
+    assert orphan_launched_ids(store, _NoTranscript(), live_ids=set()) == {"reused"}
+    store.close()
+
+
+def test_a_legacy_row_without_a_pid_keeps_todays_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center.core import orphan_launched_ids
+
+    store = Store(tmp_path / "s.db")
+    _canary_row(store, "legacy", None)
+    assert store.get("legacy").last_seen_pid is None  # type: ignore[union-attr]
+    _ps(monkeypatch, {})
+    assert orphan_launched_ids(store, _NoTranscript(), live_ids=set()) == {"legacy"}
     store.close()

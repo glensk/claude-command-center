@@ -3383,7 +3383,9 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
         resume = _cwd_transcript_exists(cwd, args.session_id, config_dir)
         # (b) promote ATOMICALLY: with several possible launchers (the park waiter, a
         # daemon dispatch tab, a manual start-job) exactly one may pass this line.
-        if not store.claim_draft(args.session_id):
+        # os.getpid(): _exec_in replaces THIS process with claude, so this pid is the
+        # claude pid — the prune pass spares the row while it waits at a dialog (tp#1512).
+        if not store.claim_draft(args.session_id, pid=os.getpid()):
             print(
                 f"error: job {args.session_id} was already claimed by another launcher — "
                 "not starting it twice",

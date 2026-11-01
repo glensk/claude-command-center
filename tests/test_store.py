@@ -1416,3 +1416,18 @@ def test_subagent_started_at_tracks_the_latest_start(tmp_path: Path) -> None:
     store.bump_subagents("s1", -1)
     assert store.subagent_started_at("s1") == first
     assert store.subagent_started_at("nosuch") is None
+
+
+def test_claim_draft_stamps_the_launch_pid(tmp_path: Path) -> None:
+    """tp#1512: the claim writes the exec-in-place claude pid in the same UPDATE."""
+    store = _store(tmp_path)
+    store.create_draft("j1", "/repo", "aim")
+    assert store.claim_draft("j1", pid=4242) is True
+    row = store.get("j1")
+    assert row is not None and not row.draft and row.last_seen_pid == 4242
+    assert store.claim_draft("j1", pid=5151) is False  # a losing claimant stamps nothing
+    assert store.get("j1").last_seen_pid == 4242  # type: ignore[union-attr]
+    store.create_draft("j2", "/repo", "aim")
+    assert store.claim_draft("j2") is True  # no pid: the column is left alone
+    assert store.get("j2").last_seen_pid is None  # type: ignore[union-attr]
+    store.close()

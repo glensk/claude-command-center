@@ -409,3 +409,28 @@ def test_refresh_codex_usage_fetches_each_stale_home(
         cfg.codex_usage = True
         _refresh_codex_usage(store, cfg, DaemonReport(), dry_run=True)
     assert fetched == []
+
+
+def test_daemon_pass_keeps_the_aim_of_a_job_parked_at_a_dialog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1512: a launch waiting at the trust dialog (not live, no transcript, its claude
+    pid alive) survives a prune pass with its AIM; a contentless leftover is still pruned."""
+    from command_center import terminal
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    (tmp_path / "sessions").mkdir(parents=True)
+    with Store() as store:
+        store.create_draft("waiting", "/Users/x/repo", "tp1512 trust canary")
+        assert store.claim_draft("waiting", pid=os.getpid())
+        store.update_fields("waiting", status=Status.PARKED.value)
+        store.ensure("junk", cwd="/")
+    row = types.SimpleNamespace(ppid=1, tty="", stat="S", command="claude --session-id waiting")
+    monkeypatch.setattr(terminal, "ps_table", lambda: {os.getpid(): row})
+
+    report = run_once(do_reap=False, do_summary=False, do_progress=False, do_alerts=False)
+    assert "junk" in report.pruned
+    assert "waiting" not in report.pruned
+    with Store() as store:
+        kept = store.get("waiting")
+        assert kept is not None and kept.aim == "tp1512 trust canary"

@@ -1188,7 +1188,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         """Promote a draft to a real session: drop the draft flag as it launches."""
         self.update_fields(session_id, draft=False, status=Status.IDLE.value)
 
-    def claim_draft(self, session_id: str) -> bool:
+    def claim_draft(self, session_id: str, pid: int = 0) -> bool:
         """One-shot atomic launch claim of a draft: ``True`` for exactly one claimant.
 
         The conditional ``UPDATE ... WHERE draft = 1`` is the claim itself (same
@@ -1197,11 +1197,17 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         ``ccc start-job`` — SQLite serializes the writes and only the first sees
         ``rowcount == 1``; everyone else finds the draft flag already gone and must
         not launch. Claiming also consumes any armed auto-fire (``fire_at = 0``).
+
+        *pid* (tp#1512): ``start-job`` execs claude IN PLACE, so its own pid IS the
+        claude pid; stamped into ``last_seen_pid`` in the same ``UPDATE`` so the prune
+        pass can tell a launch still waiting at a pre-registry dialog from a dead one
+        (``core.orphan_launched_ids``). ``0`` leaves the column alone.
         """
         cur = self.conn.execute(
-            "UPDATE sessions SET draft = 0, fire_at = 0, status = ?, updated_at = ? "
+            "UPDATE sessions SET draft = 0, fire_at = 0, status = ?, updated_at = ?, "
+            "last_seen_pid = CASE WHEN ? > 0 THEN ? ELSE last_seen_pid END "
             "WHERE session_id = ? AND draft = 1",
-            (Status.IDLE.value, now_ms(), session_id),
+            (Status.IDLE.value, now_ms(), pid, pid, session_id),
         )
         self.conn.commit()
         return cur.rowcount == 1
