@@ -71,6 +71,7 @@ SUMMARY_TIMEOUT_SEC = 180
 DIGEST_MAX_BYTES = 8 * 1024  # the whole digest the router sees (D11)
 SUPPLEMENT_KEYS = ("current_state", "decisions", "first_steps")
 SUPPLEMENT_MAX_BYTES = 3 * 1024  # each router supplement field (D11)
+DIGEST_DECISIONS_MAX_BYTES = 1536  # the tp decisions inside the router digest
 STATE_MAX_BYTES = 4 * 1024  # the facts-only "Current state" copies (D10)
 EMERGENCY_BANNER = "EMERGENCY RELAY — no model-written part"
 ROUTER_BANNER = "CAPPED RELAY — written by the configured router from a digest, not by the session"
@@ -363,15 +364,26 @@ def _fact_lines(snap_doc: dict[str, Any]) -> list[str]:
     for fact in snap_doc.get("facts") or []:
         if not isinstance(fact, dict):
             continue
-        fields = json.dumps(fact.get("fields"), ensure_ascii=False, sort_keys=True)
+        shown = fact.get("fields")
+        if fact.get("kind") == "tp_item" and isinstance(shown, dict):
+            # Decisions get their own budgeted part (newest first, never cut mid-entry).
+            shown = {k: v for k, v in shown.items() if k not in ("decisions", "decision")}
+        fields = json.dumps(shown, ensure_ascii=False, sort_keys=True)
         out.append(f"- {fact.get('kind')} {fact.get('key')}: {fields[:300]}")
     return out
 
 
 def digest(snap_doc: dict[str, Any], transcript: Path | None) -> str:
     """The bounded input the router summarizes (≤ :data:`DIGEST_MAX_BYTES` bytes)."""
-    facts = _cut_bytes("\n".join(_fact_lines(snap_doc)), DIGEST_MAX_BYTES // 2)
+    # The tp decisions sit right after the facts and share their half of the digest, so the
+    # recent messages keep their room and the final cut below never reaches the decisions.
+    decisions = (
+        _decision_lines(snap_doc, DIGEST_DECISIONS_MAX_BYTES) if _tp_decisions(snap_doc) else ""
+    )
+    facts = _cut_bytes("\n".join(_fact_lines(snap_doc)), DIGEST_MAX_BYTES // 2 - _size(decisions))
     parts = [f"## Recorded facts\n{facts}"]
+    if decisions:
+        parts.append(f"## Recorded tp decisions\n{decisions}")
     todos = last_todos(transcript)
     if todos:
         parts.append("## Last to-do list\n" + "\n".join(todos))
@@ -454,25 +466,99 @@ def _facts_only_state(snap_doc: dict[str, Any], transcript: Path | None) -> str:
     return f"{EMERGENCY_BANNER}\n\n{body}\n\n{_transcript_line(transcript)}"
 
 
-def _tp_decisions(snap_doc: dict[str, Any]) -> list[str]:
-    out: list[str] = []
+def _tp_decisions(snap_doc: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    """``(tp_id, entries)`` per held tp item with decisions, in fact order, NEWEST first.
+
+    tp appends to a ticket's ``decisions`` (oldest first); each entry is one rendered
+    ``- tp#N: <decision>`` block with its headings escaped (a multi-line decision stays one
+    entry, so a cut never splits it). A second fact for the same tp id is ignored (first wins).
+    """
+    from .handoff_doc import escape_headings
+
+    out: list[tuple[str, list[str]]] = []
+    seen: set[str] = set()
     for fact in snap_doc.get("facts") or []:
-        if fact.get("kind") != "tp_item":
+        if not isinstance(fact, dict) or fact.get("kind") != "tp_item":
             continue
         fields = fact.get("fields") or {}
         raw = fields.get("decisions") or fields.get("decision") or []
-        for item in [raw] if isinstance(raw, str) else raw:
-            if str(item).strip():
-                out.append(f"- tp#{fields.get('tp_id')}: {item}")
+        tid = str(fields.get("tp_id"))
+        if tid in seen:
+            continue
+        seen.add(tid)
+        entries = [
+            escape_headings(f"- tp#{tid}: {item}")
+            for item in ([raw] if isinstance(raw, str) else raw)
+            if str(item).strip()
+        ]
+        if entries:
+            out.append((tid, entries[::-1]))
     return out
 
 
-def _facts_only(snap_doc: dict[str, Any], transcript: Path | None) -> str:
-    from .handoff_doc import escape_headings
+def _size(text: str) -> int:
+    return len(text.encode("utf-8"))
 
-    decisions = _cut_bytes(
-        escape_headings("\n".join(_tp_decisions(snap_doc)) or "none recorded"), SUPPLEMENT_MAX_BYTES
-    )
+
+def _elision(omitted: list[tuple[str, int]], *, compact: bool) -> str:
+    total = sum(n for _tid, n in omitted)
+    what = f"{total} older tp decision{'s' if total != 1 else ''} omitted"
+    if compact:
+        items = f"{len(omitted)} item{'s' if len(omitted) != 1 else ''}"
+        return f"- … {what} on {items}: run tp show <id> per item under tp ownership"
+    named = ", ".join(f"tp#{tid} ({n}, see tp show {tid})" for tid, n in omitted)
+    return f"- … {what}: {named}"
+
+
+def _decision_lines(snap_doc: dict[str, Any], limit: int) -> str:
+    """The recorded tp decisions in at most *limit* UTF-8 bytes, never cut inside an entry.
+
+    Newest first per item. When everything fits it is all returned. Otherwise every item first
+    gets an equal share for its newest entries (floor pass), then the leftover goes round-robin
+    (round k offers every open item its next newest entry), so one item with kilobytes of
+    decisions — or one huge newest decision — cannot starve the others. An entry that does not
+    fit closes its item (what is shown is always a newest prefix). ONE last line then counts
+    what was left out and names ``tp show N`` per item; its size is reserved up front (every
+    item at its full count), so the result never exceeds *limit*.
+    """
+    items = _tp_decisions(snap_doc)
+    if not items:
+        return "none recorded"
+    everything = "\n".join(entry for _tid, entries in items for entry in entries)
+    if _size(everything) <= limit:
+        return everything
+    upper = [(tid, len(entries)) for tid, entries in items]
+    full = _size(_elision(upper, compact=False))
+    compact = full > limit // 2 and _size(_elision(upper, compact=True)) < full
+    budget = limit - _size(_elision(upper, compact=compact)) - 1
+    share = max(0, budget) // len(items)
+    taken = [0] * len(items)
+    for i, (_tid, entries) in enumerate(items):  # floor pass: each item within its share
+        used = 0
+        while taken[i] < len(entries) and used + _size(entries[taken[i]]) + 1 <= share:
+            used += _size(entries[taken[i]]) + 1
+            taken[i] += 1
+        budget -= used
+    open_items = list(range(len(items)))
+    while open_items:  # leftover pass, round-robin
+        still_open = []
+        for i in open_items:
+            entries = items[i][1]
+            if taken[i] < len(entries) and _size(entries[taken[i]]) + 1 <= budget:
+                budget -= _size(entries[taken[i]]) + 1
+                taken[i] += 1
+                still_open.append(i)
+        open_items = still_open
+    pairs = list(zip(items, taken, strict=True))
+    lines = [entry for (_tid, entries), n in pairs for entry in entries[:n]]
+    omitted = [(tid, len(entries) - n) for (tid, entries), n in pairs if n < len(entries)]
+    if omitted:
+        lines.append(_elision(omitted, compact=compact))
+    return "\n".join(lines)
+
+
+def _facts_only(snap_doc: dict[str, Any], transcript: Path | None) -> str:
+    decisions = _decision_lines(snap_doc, SUPPLEMENT_MAX_BYTES)
     return (
         f"## Current state\n\n{_facts_only_state(snap_doc, transcript)}\n\n"
         f"## Decisions and constraints\n\n{decisions}\n\n"

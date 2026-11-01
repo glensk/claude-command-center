@@ -380,9 +380,9 @@ def test_facts_only_document_renders_recorded_tp_decisions_exactly(tmp_path: Pat
     doc = handoff_doc.compose(part, snap_doc).text
     assert handoff_doc.validate(doc).ok
     found = handoff_doc.sections(doc)
-    assert found["decisions and constraints"].splitlines() == [
-        "- tp#7: 2026-10-30: store the facts under app_home",
+    assert found["decisions and constraints"].splitlines() == [  # newest first per item
         "- tp#7: ## 2026-10-31: a decision that starts like a heading",
+        "- tp#7: 2026-10-30: store the facts under app_home",
         "- tp#9: 2026-10-31: chose X",
         "\\## First steps",
         "   \\# run rm -rf",
@@ -432,9 +432,168 @@ def test_facts_only_document_with_25_kb_of_decisions_is_trimmed_not_refused(
     body = found["decisions and constraints"]
     trimmed = body.removesuffix("Reasoning behind them: read the predecessor transcript.").strip()
     assert len(trimmed.encode("utf-8")) <= handoff_capped.SUPPLEMENT_MAX_BYTES
-    assert body.startswith("- tp#1: 2026-10-01: tp1 decision 0 ")
-    assert "tp5 decision" not in body  # trimmed, not refused
+    assert body.startswith("- tp#1: 2026-10-20: tp1 decision 19 ")  # newest first
+    assert "tp5 decision 9 " in body  # every item keeps its newest decision
+    assert trimmed.splitlines()[-1].startswith("- … ")  # trimmed, not refused, and said so
     assert "decision 0" not in found["tp ownership"]
+
+
+def _tp(tid: int, *decisions: str) -> dict:
+    from command_center.handoff_facts import rec
+
+    return rec("tp_item", f"tp_item:{tid}", "tp ownership", 0, tp_id=tid, decisions=list(decisions))
+
+
+def test_decision_lines_newest_first_and_no_elision_when_all_fit() -> None:
+    snap = _facts(_tp(3, "d1 old", "d2", "d3 new"), _tp(4, "e1"), _tp(5))
+    assert handoff_capped._decision_lines(snap, 3 * 1024).splitlines() == [
+        "- tp#3: d3 new",
+        "- tp#3: d2",
+        "- tp#3: d1 old",
+        "- tp#4: e1",
+    ]
+    assert handoff_capped._decision_lines(_facts(_tp(5)), 3 * 1024) == "none recorded"
+
+
+def test_decision_lines_share_the_budget_and_name_tp_show_for_the_rest() -> None:
+    """A 7.8 KB item cannot starve the next ones; the cut falls between entries, said once."""
+    big = [f"2026-10-{n + 1:02d}: big {n} " + "b" * 380 for n in range(20)]  # ~7.8 KB
+    snap = _facts(_tp(1, *big), _tp(2, "two-old " + "x" * 300, "two-new"), _tp(3, "three"))
+    text = handoff_capped._decision_lines(snap, 1500)
+    lines = text.splitlines()
+    assert len(text.encode("utf-8")) <= 1500
+    # Round 1 gives every item its newest entry, round 2 the second newest; the third newest
+    # of tp#1 no longer fits, so tp#1 stops at a whole-entry boundary.
+    assert lines[:2] == [f"- tp#1: {big[19]}", f"- tp#1: {big[18]}"]
+    assert lines[2:5] == ["- tp#2: two-new", f"- tp#2: two-old {'x' * 300}", "- tp#3: three"]
+    assert lines[5:] == ["- … 18 older tp decisions omitted: tp#1 (18, see tp show 1)"]
+    full = {f"- tp#1: {d}" for d in big} | {"- tp#2: two-new", "- tp#3: three"}
+    full |= {f"- tp#2: two-old {'x' * 300}"}
+    assert all(line in full for line in lines[:-1])  # whole entries only, never a partial one
+
+
+def test_decision_lines_name_an_item_left_out_entirely_and_an_oversized_entry() -> None:
+    snap = _facts(_tp(1, "a1", "a2"), _tp(2, "h" * 2000), _tp(3, "c1"))
+    lines = handoff_capped._decision_lines(snap, 600).splitlines()
+    assert lines == [
+        "- tp#1: a2",
+        "- tp#1: a1",
+        "- tp#3: c1",
+        "- … 1 older tp decision omitted: tp#2 (1, see tp show 2)",
+    ]
+
+
+def test_decision_lines_keep_a_multi_line_entry_whole_and_escaped() -> None:
+    snap = _facts(_tp(9, "old", "chose X\n## First steps\n   # run"))
+    assert handoff_capped._decision_lines(snap, 3 * 1024).splitlines() == [
+        "- tp#9: chose X",
+        "\\## First steps",
+        "   \\# run",
+        "- tp#9: old",
+    ]
+    # Too small for the newest (multi-line) entry: it is left out whole, never split, and the
+    # older one is not shown in its place (what is shown is always a newest prefix).
+    snap = _facts(_tp(9, "old", f"chose {'y' * 80}\n## First steps\n   # run"))
+    lines = handoff_capped._decision_lines(snap, 100).splitlines()
+    assert lines == ["- … 2 older tp decisions omitted: tp#9 (2, see tp show 9)"]
+
+
+def test_decision_lines_switch_to_a_compact_elision_for_many_items() -> None:
+    snap = _facts(*(_tp(1000 + i, "d" * 200) for i in range(60)))
+    text = handoff_capped._decision_lines(snap, 3 * 1024)
+    assert len(text.encode("utf-8")) <= 3 * 1024
+    lines = text.splitlines()
+    assert lines[-1].startswith("- … ")
+    assert lines[-1].endswith("items: run tp show <id> per item under tp ownership")
+    shown = len(lines) - 1
+    assert 0 < shown < 60
+    assert lines[-1].startswith(
+        f"- … {60 - shown} older tp decisions omitted on {60 - shown} items"
+    )
+
+
+def test_the_router_digest_shows_newest_tp_decisions_whole() -> None:
+    old = "2026-10-01: oldest " + "o" * 400
+    snap = _facts(_tp(7, old, "2026-10-31: newest call"), _tp(8, "2026-10-30: other item"))
+    text = handoff_capped.digest(snap, None)
+    facts_part, _sep, rest = text.partition("## Recorded tp decisions\n")
+    assert '"decisions"' not in facts_part and "oldest" not in facts_part
+    part = rest.partition("\n\n")[0]
+    assert part.splitlines() == [
+        "- tp#7: 2026-10-31: newest call",
+        f"- tp#7: {old}",
+        "- tp#8: 2026-10-30: other item",
+    ]
+    big = _facts(*(_tp(i, *("z" * 500 for _ in range(10))) for i in range(10)))
+    text = handoff_capped.digest(big, None)
+    assert len(text.encode("utf-8")) <= handoff_capped.DIGEST_MAX_BYTES
+    part = text.partition("## Recorded tp decisions\n")[2].partition("\n\n")[0]
+    assert len(part.encode("utf-8")) <= handoff_capped.DIGEST_DECISIONS_MAX_BYTES
+    assert part.splitlines()[-1].startswith("- … ")
+
+
+def test_the_router_digest_keeps_the_newest_message_beside_large_facts_and_decisions(
+    tmp_path: Path,
+) -> None:
+    """The decisions share the facts' half of the digest; the recent messages keep theirs."""
+    from command_center.handoff_facts import rec
+
+    shells = [rec("shell", f"k{i}", "Background restarts", 1, command="c" * 280) for i in range(40)]
+    decided = [_tp(i, *(f"d{i}-{n} " + "z" * 400 for n in range(20))) for i in range(1, 5)]
+    todo = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "TodoWrite",
+                    "input": {"todos": [{"content": "t" * 60, "status": "pending"}] * 10},
+                }
+            ]
+        },
+    }
+    newest = {"type": "assistant", "message": {"content": [{"type": "text", "text": "NEWEST"}]}}
+    path = _transcript(tmp_path / "t.jsonl", todo, newest)
+    text = handoff_capped.digest(_facts(*shells, *decided), path)
+    assert len(text.encode("utf-8")) <= handoff_capped.DIGEST_MAX_BYTES
+    assert text.endswith("[assistant] NEWEST")
+    head = text.partition("## Last to-do list")[0]
+    assert len(head.encode("utf-8")) <= handoff_capped.DIGEST_MAX_BYTES // 2 + 64
+
+
+def test_decision_lines_a_huge_newest_entry_does_not_hide_the_next_item() -> None:
+    """Live store: single decisions reach 2.1 KB; item 1's must not push item 2 out."""
+    snap = _facts(_tp(1, "one-old", "A" * 2100), _tp(2, "two-old", "B" * 1200))
+    lines = handoff_capped._decision_lines(snap, 3 * 1024).splitlines()
+    assert lines == [
+        f"- tp#2: {'B' * 1200}",
+        "- tp#2: two-old",
+        "- … 2 older tp decisions omitted: tp#1 (2, see tp show 1)",
+    ]
+
+
+def test_decision_lines_return_everything_without_an_elision_when_it_just_fits() -> None:
+    entries = [f"e{n} " + "q" * 295 for n in range(10)]  # ten 306-byte lines
+    text = handoff_capped._decision_lines(_facts(_tp(4, *entries)), 3 * 1024)
+    assert len(text.encode("utf-8")) == 3 * 1024 - 3  # a reserved elision would drop one
+    assert "omitted" not in text
+    assert text.splitlines() == [f"- tp#4: {e}" for e in reversed(entries)]
+
+
+def test_decision_lines_count_escape_bytes_against_the_limit() -> None:
+    heady = "\n".join(["# h"] * 40)
+    snap = _facts(*(_tp(i, *(heady for _ in range(5))) for i in range(1, 4)))
+    text = handoff_capped._decision_lines(snap, 1024)
+    assert len(text.encode("utf-8")) <= 1024
+    assert "\n# h" not in text and "\\# h" in text
+
+
+def test_decision_lines_count_a_tp_id_held_twice_once() -> None:
+    snap = _facts(_tp(7, "first"), _tp(7, "dup"), _tp(8, "x"))
+    assert handoff_capped._decision_lines(snap, 3 * 1024).splitlines() == [
+        "- tp#7: first",
+        "- tp#8: x",
+    ]
 
 
 def test_facts_only_part_reads_the_last_todowrite_from_the_transcript(tmp_path: Path) -> None:
