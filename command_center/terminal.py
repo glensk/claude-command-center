@@ -587,7 +587,9 @@ def resume_halted_in_new_tab(
     return bool(_open_tab(command, tmux_fallback=False))
 
 
-def start_job_in_new_tab(session_id: str, force: bool = False, auto: bool = False) -> bool:
+def start_job_in_new_tab(
+    session_id: str, force: bool = False, auto: bool = False, no_grant: bool = False
+) -> bool:
     """Open a new terminal tab that launches a parked future job via ``ccc start-job``.
 
     ``ccc start-job`` reads the draft's cwd + prompt from the store, clears the draft
@@ -596,12 +598,16 @@ def start_job_in_new_tab(session_id: str, force: bool = False, auto: bool = Fals
     *force* passes ``--force`` through, skipping the premature-start confirmation
     (used by the TUI after its own ConfirmScreen already asked). *auto* passes
     ``--auto`` (unattended dispatch, e.g. the daemon's parked-prompt fire): guards
-    are never bypassed — a tripped one disarms the job instead of asking.
+    are never bypassed — a tripped one disarms the job instead of asking. *no_grant*
+    passes ``--no-grant`` (the futuresync launch toggle, tp#1528): folder trust is only
+    checked, never granted.
     """
-    return bool(start_job_launch(session_id, force=force, auto=auto))
+    return bool(start_job_launch(session_id, force=force, auto=auto, no_grant=no_grant))
 
 
-def start_job_launch(session_id: str, force: bool = False, auto: bool = False) -> str:
+def start_job_launch(
+    session_id: str, force: bool = False, auto: bool = False, no_grant: bool = False
+) -> str:
     """Launch ``ccc start-job <id>`` in a new tab and report the rung that landed it.
 
     The rung-returning twin of :func:`start_job_in_new_tab` (same command, same
@@ -616,7 +622,11 @@ def start_job_launch(session_id: str, force: bool = False, auto: bool = False) -
     so tmux is the honest last resort: the job still launches, and the caller can
     see that it did not land in a tab.
     """
-    flag = (" --force" if force else "") + (" --auto" if auto else "")
+    flag = (
+        (" --force" if force else "")
+        + (" --auto" if auto else "")
+        + (" --no-grant" if no_grant else "")
+    )
     command = f"ccc start-job{flag} {shlex.quote(session_id)}"
     if _launcher_mode() == "tmux":
         return LAUNCHER_TMUX if _tmux_window(command) else ""

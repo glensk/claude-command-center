@@ -3106,36 +3106,44 @@ def has_terminal() -> bool:
 
 
 def _start_job_trust_refusal(
-    session_id: str, config_dir: str, cwd: str, registered_cwd: str, *, auto: bool
+    session_id: str, config_dir: str, cwd: str, registered_cwd: str, *, mode: str
 ) -> str:
     """The trust gate of ``start-job`` (tp#1512): an error line, or ``""`` to launch.
 
-    Manual (human) launch: trust *cwd* first (``ensure_trusted``, the ``resume_in_new_tab``
-    path), naming the folder when a job-file edit moved it from *registered_cwd*. Both
-    paths then REQUIRE Claude Code's own lookup to accept the folder (``is_trusted`` with
-    ancestors), so a launch never parks on the trust dialog. ``--auto`` only checks:
-    automatic launches never establish trust (registration already granted it).
+    *mode* is ``"manual"``, ``"auto"`` or ``"no_grant"``. Manual (human) launch: trust
+    *cwd* first (``ensure_trusted``, the ``resume_in_new_tab`` path), naming the folder
+    when a job-file edit moved it from *registered_cwd*. Every mode then REQUIRES Claude
+    Code's own lookup to accept the folder (``is_trusted`` with ancestors), so a launch
+    never parks on the trust dialog. ``auto`` (``--auto``) and ``no_grant``
+    (``--no-grant``, the futuresync launch toggle, tp#1528) only check: they never
+    establish trust, each with its own refusal wording.
     """
     from . import accounts
 
     label = accounts.account_label(config_dir)
     folder = os.path.realpath(cwd) if cwd else cwd
-    if not auto:
+    if mode == "manual":
         if registered_cwd and os.path.realpath(registered_cwd) != folder:
             print(f"trusting {folder} for {label} (the job file moved it from {registered_cwd})")
         accounts.ensure_trusted(config_dir, cwd)
     if accounts.is_trusted(config_dir, cwd, ancestors=True):
         return ""
-    if not auto and not accounts._claude_json_path(config_dir).is_file():  # pylint: disable=protected-access
+    if mode == "manual" and not accounts._claude_json_path(config_dir).is_file():  # pylint: disable=protected-access
         return (
             f"error: job {session_id}: account `{label}` has no .claude.json; log in once "
             "with it, then start the job again"
         )
-    if auto:
+    if mode == "auto":
         return (
             f"error: auto-fire blocked — job {session_id}'s folder {folder} is not trusted "
             f"for account `{label}`; job disarmed (kept as draft) — start it manually with "
             f"`ccc open-job {session_id}`, which trusts the folder"
+        )
+    if mode == "no_grant":
+        return (
+            f"error: job {session_id}: folder {folder} is not trusted for account `{label}` "
+            f"— the launch toggle never trusts a folder; start it with "
+            f"`ccc open-job {session_id}` (which trusts it)"
         )
     return (
         f"error: job {session_id}: folder {folder} could not be trusted for account "
@@ -3210,7 +3218,7 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
             store.update_fields(args.session_id, fire_at=0)
             print(
                 _start_job_trust_refusal(
-                    args.session_id, session.config_dir, session.cwd, session.cwd, auto=True
+                    args.session_id, session.config_dir, session.cwd, session.cwd, mode="auto"
                 ),
                 file=sys.stderr,
             )
@@ -3222,6 +3230,7 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
                 args.session_id,
                 force=getattr(args, "force", False),
                 auto=getattr(args, "auto", False),
+                no_grant=getattr(args, "no_grant", False),
             ):
                 print(
                     f"no terminal here — opened job {args.session_id} in a new tab instead "
@@ -3362,12 +3371,27 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
                 return 1
         # (0d, tp#1512) Trust gate — after the file re-read (a moved cwd is what gets
         # checked) and BEFORE claim_draft, so a refusal leaves the draft intact.
+        # --auto wins over --no-grant when both are given (tp#1528).
+        if getattr(args, "auto", False):
+            trust_mode = "auto"
+        elif getattr(args, "no_grant", False):
+            trust_mode = "no_grant"
+        else:
+            trust_mode = "manual"
         refusal = _start_job_trust_refusal(
-            args.session_id, config_dir, cwd, registered_cwd, auto=getattr(args, "auto", False)
+            args.session_id, config_dir, cwd, registered_cwd, mode=trust_mode
         )
         if refusal:
-            if getattr(args, "auto", False):
+            if trust_mode == "auto":
                 store.update_fields(args.session_id, fire_at=0)  # disarm, keep the draft
+            elif trust_mode == "no_grant" and session.future_file:
+                # The toggle's tab is unwatched: the refusal also reaches the phone.
+                futuresync.write_launch_callout(
+                    cfg,
+                    session,
+                    futuresync.untrusted_launch_error(session),
+                    futuresync.SyncReport(),
+                )
             print(refusal, file=sys.stderr)
             return 1
         overseer, retired_overseer = resolve_job_llm(session.llm_overseer)
@@ -6908,6 +6932,13 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="internal: unattended dispatch (daemon/park) — a tripped guard disarms "
         "the job's auto-fire instead of asking",
+    )
+    p_startjob.add_argument(
+        "-G",
+        "--no-grant",
+        action="store_true",
+        help="check folder trust, never grant it (the futuresync launch toggle); every "
+        "other guard behaves as a manual start",
     )
     p_startjob.set_defaults(func=cmd_start_job)
 

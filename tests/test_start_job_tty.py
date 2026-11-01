@@ -101,8 +101,10 @@ def test_start_job_without_tty_opens_a_tab_instead_of_exec(
 
     opened: dict[str, object] = {}
 
-    def _fake_tab(session_id: str, force: bool = False, auto: bool = False) -> bool:
-        opened.update(session_id=session_id, force=force, auto=auto)
+    def _fake_tab(
+        session_id: str, force: bool = False, auto: bool = False, no_grant: bool = False
+    ) -> bool:
+        opened.update(session_id=session_id, force=force, auto=auto, no_grant=no_grant)
         return True
 
     monkeypatch.setattr("command_center.terminal.start_job_in_new_tab", _fake_tab)
@@ -114,7 +116,7 @@ def test_start_job_without_tty_opens_a_tab_instead_of_exec(
 
     rc = cli.cmd_start_job(argparse.Namespace(session_id="job-tty", force=True, auto=False))
     assert rc == 0
-    assert opened == {"session_id": "job-tty", "force": True, "auto": False}
+    assert opened == {"session_id": "job-tty", "force": True, "auto": False, "no_grant": False}
     # The draft must be untouched: the tab's own `ccc start-job` is what claims it.
     session = store.get("job-tty")
     assert session is not None
@@ -368,3 +370,75 @@ def test_resume_without_tty_opens_a_tab_instead_of_exec(
 
     assert cli.cmd_resume(argparse.Namespace(session_id="sess-1")) == 0
     assert opened["session_id"] == "sess-1"
+
+
+# ------------------------------------------------- tp#1528: start-job --no-grant
+
+
+def test_start_job_no_grant_refuses_an_untrusted_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--no-grant`` only checks: its own wording, nothing trusted, draft and fire_at kept."""
+    from command_center import accounts, cli
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = _make_draft(tmp_path, monkeypatch, cwd=str(repo), trusted=False)
+    store.update_fields("job-tty", fire_at=1234)
+    _a_tty(monkeypatch)
+    seen = _exec_stub(monkeypatch)
+    rc = cli.cmd_start_job(
+        argparse.Namespace(session_id="job-tty", force=True, auto=False, no_grant=True)
+    )
+    err = capsys.readouterr().err
+    assert rc == 1 and not seen
+    assert "the launch toggle never trusts a folder" in err
+    assert "auto-fire blocked" not in err and "could not be trusted" not in err
+    assert not accounts.is_trusted("", repo, ancestors=True)
+    assert _claude_json() == {}
+    session = store.get("job-tty")
+    assert session is not None and session.draft == 1 and session.fire_at == 1234
+    store.close()
+
+
+def test_start_job_no_grant_passes_a_trusted_cwd_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A trusted folder passes the ``--no-grant`` gate; ``.claude.json`` is not rewritten."""
+    from command_center import cli
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _make_draft(tmp_path, monkeypatch, cwd=str(repo), trusted=True).close()
+    before = (Path.home() / ".claude.json").read_text(encoding="utf-8")
+    _a_tty(monkeypatch)
+    seen = _exec_stub(monkeypatch)
+    with pytest.raises(_StopExec):
+        cli.cmd_start_job(
+            argparse.Namespace(session_id="job-tty", force=True, auto=False, no_grant=True)
+        )
+    assert seen["cwd"] == str(repo.resolve())
+    assert (Path.home() / ".claude.json").read_text(encoding="utf-8") == before
+
+
+def test_start_job_no_grant_survives_the_tab_hop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No terminal: the re-opened tab carries ``no_grant`` (or it would grant there)."""
+    from command_center import cli
+
+    _make_draft(tmp_path, monkeypatch).close()
+    _no_tty(monkeypatch)
+    opened: dict[str, object] = {}
+
+    def _fake_tab(session_id: str, **kwargs: object) -> bool:
+        opened.update(kwargs, session_id=session_id)
+        return True
+
+    monkeypatch.setattr("command_center.terminal.start_job_in_new_tab", _fake_tab)
+    _exec_stub(monkeypatch)
+    rc = cli.cmd_start_job(
+        argparse.Namespace(session_id="job-tty", force=True, auto=False, no_grant=True)
+    )
+    assert rc == 0
+    assert opened == {"session_id": "job-tty", "force": True, "auto": False, "no_grant": True}

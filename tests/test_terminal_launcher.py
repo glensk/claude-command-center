@@ -190,6 +190,22 @@ def test_start_job_launch_names_the_rung_and_the_bool_twin_agrees(
     assert seen[-1] == "ccc start-job --force --auto deadbeef"
 
 
+def test_start_job_launch_no_grant_appends_the_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    no_applescript: None,  # pylint: disable=unused-argument  # the fixture's side effect
+) -> None:
+    """tp#1528: the launch toggle's ``no_grant`` reaches the tab's start-job argv."""
+    monkeypatch.setattr(config, "load_config", lambda: _cfg("tmux"))
+    monkeypatch.setattr(terminal.shutil, "which", _which({"tmux": "/usr/bin/tmux"}))
+    rec = _RunRecorder()
+    monkeypatch.setattr(terminal.subprocess, "run", rec)
+
+    assert terminal.start_job_launch("deadbeef", force=True, no_grant=True)
+    assert rec.calls[-1][-1] == "ccc start-job --force --no-grant deadbeef"
+    assert terminal.start_job_in_new_tab("deadbeef", force=True, no_grant=True) is True
+    assert rec.calls[-1][-1] == "ccc start-job --force --no-grant deadbeef"
+
+
 def test_api_rung_never_connects_unless_iterm_auth_is_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

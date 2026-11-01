@@ -4,6 +4,7 @@ Hermetic: a tmp ``CLAUDE_HOME`` (store + flock + sidecar), a tmp ``$GIT_BASE`` a
 vault. No Obsidian, no real ``ccc`` spawns (``CCC_INTERNAL`` + scoring/short-aim off).
 """
 
+# pylint: disable=too-many-lines  # one module covers the whole reconciler
 from __future__ import annotations
 
 import fcntl
@@ -50,6 +51,20 @@ def _new_draft(env: Env, aim: str, *, repo: str = "home/ccc", prompt: str | None
     session_id = str(uuid.uuid4())
     env.store.create_draft(session_id, str(env.git_base / repo), aim, prompt=prompt)
     return session_id
+
+
+def _trust_repo(env: Env, repo: str = "home/ccc") -> None:  # pylint: disable=redefined-outer-name
+    """Trust ``env.git_base/<repo>`` for the default account under the test HOME (tp#1528).
+
+    The launch toggle only CHECKS folder trust (registration grants it), so every test
+    that expects a spawn trusts its job's folder first, as a registration would.
+    """
+    from command_center import accounts  # pylint: disable=import-outside-toplevel
+
+    folder = env.git_base / repo
+    folder.mkdir(parents=True, exist_ok=True)
+    accounts.ensure_trusted("", folder)
+    assert accounts.is_trusted("", folder, ancestors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +380,7 @@ def test_pad_draft_with_launch_ticked_registers_and_launches(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Phone flow: ticking launch on the pad alone (status still draft) submits the job."""
+    _trust_repo(env)  # tp#1528: the toggle only checks trust
     calls: list[str] = []
 
     def fake_spawn(session_id: str) -> bool:
@@ -393,6 +409,7 @@ def test_pad_error_with_launch_ticked_retries_after_fix(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An error pad keeps retrying while launch is ticked: fixing the field is enough."""
+    _trust_repo(env)  # tp#1528: the toggle only checks trust
     calls: list[str] = []
 
     def fake_spawn(session_id: str) -> bool:
@@ -592,6 +609,7 @@ def test_sync_future_help_exits_zero() -> None:
 def test_launch_toggle_spawns_start_job_and_resets(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _trust_repo(env)  # tp#1528: the toggle only checks trust
     calls: list[str] = []
 
     def fake_spawn(sid: str) -> bool:
@@ -620,6 +638,7 @@ def test_launch_toggle_spawns_start_job_and_resets(
 def test_launch_toggle_failed_spawn_still_consumes(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _trust_repo(env)  # tp#1528: the toggle only checks trust
     monkeypatch.setattr(futuresync, "_spawn_launch", lambda sid: False)
     sid = _new_draft(env, "Spawn will fail")
     futuresync.run_sync(env.store, env.cfg)
@@ -676,6 +695,81 @@ def test_consume_launch_blocked_by_dependency(env: Env, monkeypatch: pytest.Monk
     assert child not in report.launched
     assert "<!-- ccc-sync-error -->" in path.read_text(encoding="utf-8")
     assert "blocked: depends on" in path.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# tp#1528: the launch toggle never trusts a folder (start-job --no-grant)
+# ---------------------------------------------------------------------------
+def test_spawn_launch_passes_force_and_no_grant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The toggle's tab runs ``start-job --force --no-grant``: trust is checked, never granted."""
+    from command_center import terminal  # pylint: disable=import-outside-toplevel
+
+    seen: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_tab(session_id: str, **kwargs: object) -> bool:
+        seen.append((session_id, kwargs))
+        return True
+
+    monkeypatch.setattr(terminal, "start_job_in_new_tab", _fake_tab)
+    assert futuresync._spawn_launch("job-1") is True
+    assert seen == [("job-1", {"force": True, "no_grant": True})]
+
+
+def test_launch_toggle_on_an_untrusted_imported_job_is_blocked(
+    env: Env,  # pylint: disable=redefined-outer-name  # the pytest fixture
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A phone import into a never-trusted folder: no spawn, a callout, nothing trusted."""
+    from command_center import accounts  # pylint: disable=import-outside-toplevel
+
+    spawned = _no_spawn(monkeypatch)
+    sid = str(uuid.uuid4())
+    ready = env.future_dir / "home" / "ccc" / "phone.md"
+    ready.parent.mkdir(parents=True, exist_ok=True)
+    ready.write_text(
+        serialize(session_id=sid, aim="From the phone", status="ready", repo="home/ccc"),
+        encoding="utf-8",
+    )
+    assert futuresync.run_sync(env.store, env.cfg).registered == [sid]
+    claude_json = Path.home() / ".claude.json"
+    before = claude_json.read_text(encoding="utf-8")
+    path = _tick_launch(env, sid)
+
+    report = futuresync.run_sync(env.store, env.cfg)
+
+    assert not spawned and not report.launched
+    assert f"launch blocked (folder not trusted): {sid}" in report.details
+    text = path.read_text(encoding="utf-8")
+    assert "launch: false" in text  # the toggle was consumed
+    callout = _error_callout(text)
+    assert "is not trusted for account" in callout
+    assert f"ccc open-job {sid}" in callout
+    assert claude_json.read_text(encoding="utf-8") == before
+    session = _session(env, sid)
+    assert not accounts.is_trusted(session.config_dir, session.cwd, ancestors=True)
+
+
+def test_start_job_no_grant_refusal_writes_the_callout_to_the_job_file(
+    env: Env,  # pylint: disable=redefined-outer-name  # the pytest fixture
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The toggle's tab is unwatched: a ``--no-grant`` refusal also reaches the phone."""
+    import argparse  # pylint: disable=import-outside-toplevel
+
+    from command_center import cli  # pylint: disable=import-outside-toplevel
+
+    sid = _new_draft(env, "Moved to an untrusted folder")
+    futuresync.run_sync(env.store, env.cfg)  # bootstrap export → future_file
+    path = _abs(env, sid)
+    rc = cli.cmd_start_job(
+        argparse.Namespace(session_id=sid, force=True, auto=False, no_grant=True)
+    )
+    assert rc == 1
+    assert "the launch toggle never trusts a folder" in capsys.readouterr().err
+    callout = _error_callout(path.read_text(encoding="utf-8"))
+    assert "is not trusted for account" in callout and f"ccc open-job {sid}" in callout
+    session = _session(env, sid)
+    assert session.draft and not session.archived
 
 
 # ---------------------------------------------------------------------------
@@ -816,6 +910,7 @@ def test_launch_with_clean_prompt_still_spawns(
     env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A clean verdict changes nothing: the toggle launches exactly as before."""
+    _trust_repo(env)  # tp#1528: the toggle only checks trust
     spawned = _no_spawn(monkeypatch)
     checker = _checker(tmp_path)
     _arm_tripwire(env, checker)
@@ -835,6 +930,7 @@ def test_launch_tripwire_disarmed_without_mirrors(
     env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """No mirror is on → the transcript never leaves the machine → no broker needed."""
+    _trust_repo(env)  # tp#1528: the toggle only checks trust
     spawned = _no_spawn(monkeypatch)
     checker = _checker(tmp_path)
     env.cfg.mirror_scrub_cmd = f"{checker.path} scrub"  # mirrors stay off
@@ -853,6 +949,7 @@ def test_launch_tripwire_disarmed_by_allow_unscrubbed(
     env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``mirror_allow_unscrubbed`` is the one deliberate passthrough — here too."""
+    _trust_repo(env)  # tp#1528: the toggle only checks trust
     spawned = _no_spawn(monkeypatch)
     checker = _checker(tmp_path)
     _arm_tripwire(env, checker)

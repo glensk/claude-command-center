@@ -232,17 +232,50 @@ def _spawn_launch(session_id: str) -> bool:
     """Start a job whose file's ``launch`` toggle was flipped (phone-friendly path).
 
     Opens a terminal (iTerm tab, or a tmux window under the ``launcher = "tmux"``
-    trip config) running ``ccc start-job --force <id>`` — the same command the
-    TUI's resume path uses. ``--force`` because flipping the toggle IS the explicit
+    trip config) running ``ccc start-job --force --no-grant <id>`` — the TUI's resume
+    command plus ``--no-grant``. ``--force`` because flipping the toggle IS the explicit
     "start now" (an interactive premature-start question in an unwatched window
-    would hang forever). Fail-open: any error just reports False.
+    would hang forever). ``--no-grant`` because the toggle never trusts a folder
+    (tp#1528): ``start-job`` only checks the job's folder trust and refuses when it is
+    missing. Fail-open: any error just reports False.
     """
     try:
         from . import terminal  # pylint: disable=import-outside-toplevel
 
-        return terminal.start_job_in_new_tab(session_id, force=True)
+        return terminal.start_job_in_new_tab(session_id, force=True, no_grant=True)
     except Exception:  # pylint: disable=broad-exception-caught
         return False
+
+
+def write_launch_callout(
+    cfg: config.Config, session: Session, error: str, report: SyncReport
+) -> None:
+    """Write *error* as the managed ``ccc-sync-error`` callout onto the job's file.
+
+    The one place a refused launch reaches the phone: a session without a
+    ``future_file`` (or a file that cannot be read) is left alone.
+    """
+    if not session.future_file:
+        return
+    path = _abs_path(cfg, session.future_file)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    if text:
+        _write_error(path, text, [error], report)
+
+
+def untrusted_launch_error(session: Session) -> str:
+    """The callout line for a launch toggle on a job whose folder is not trusted (tp#1528)."""
+    from . import accounts  # pylint: disable=import-outside-toplevel
+
+    label = accounts.account_label(session.config_dir)
+    folder = os.path.realpath(session.cwd) if session.cwd else session.cwd
+    return (
+        f"blocked: folder {folder} is not trusted for account {label} — start it with "
+        f"ccc open-job {session.session_id} or the TUI (the toggle never trusts a folder)"
+    )
 
 
 def _credential_tripwire(cfg: config.Config, session: Session) -> scrub.CheckVerdict | None:
@@ -293,15 +326,7 @@ def _refuse_launch(
         )
         detail = f"launch refused (scrubber degraded): {session.session_id}"
     report.details.append(detail)
-    if not session.future_file:
-        return
-    path = _abs_path(cfg, session.future_file)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        text = ""
-    if text:
-        _write_error(path, text, [error], report)
+    write_launch_callout(cfg, session, error, report)
 
 
 def _consume_launch(store: Store, cfg: config.Config, session_id: str, report: SyncReport) -> None:
@@ -320,6 +345,12 @@ def _consume_launch(store: Store, cfg: config.Config, session_id: str, report: S
     session would echo it straight into the running/session mirrors. A leak or a degraded
     checker refuses the launch the same way a blocked dependency does (callout + report
     line, no spawn); the user scrubs the prompt (or fixes the scrubber) and re-ticks.
+
+    Last, the **folder-trust check** (tp#1528): the toggle never trusts a folder, so a job
+    whose cwd Claude Code does not trust for its account is not spawned (report line
+    ``launch blocked (folder not trusted)`` + callout naming ``ccc open-job``). The
+    ``start-job --no-grant`` gate stays authoritative (the file re-read there can move the
+    cwd after this check).
     """
     session = store.get(session_id)
     if session is None or not session.draft or session.archived or session.done:
@@ -330,23 +361,19 @@ def _consume_launch(store: Store, cfg: config.Config, session_id: str, report: S
         report.details.append(
             f"launch blocked (depends on {blocker.parent_hash} — {blocker.state}): {session_id}"
         )
-        if session.future_file:
-            path = _abs_path(cfg, session.future_file)
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError:
-                text = ""
-            if text:
-                _write_error(
-                    path,
-                    text,
-                    [f"blocked: depends on {blocker.parent_hash} — {blocker.state}"],
-                    report,
-                )
+        write_launch_callout(
+            cfg, session, f"blocked: depends on {blocker.parent_hash} — {blocker.state}", report
+        )
         return
     verdict = _credential_tripwire(cfg, session)
     if verdict is not None and verdict.state != scrub.CLEAN:
         _refuse_launch(cfg, session, verdict, report)
+        return
+    from . import accounts  # pylint: disable=import-outside-toplevel
+
+    if not accounts.is_trusted(session.config_dir, session.cwd, ancestors=True):
+        report.details.append(f"launch blocked (folder not trusted): {session_id}")
+        write_launch_callout(cfg, session, untrusted_launch_error(session), report)
         return
     ok = _spawn_launch(session_id)
     report.launched.append(session_id)

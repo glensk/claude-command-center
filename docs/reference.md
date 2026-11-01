@@ -910,6 +910,17 @@ refusal never loops: remove the value (or fix the scrubber) and tick `launch` ag
 mirror off the tripwire is disarmed — nothing leaves the machine then, and a fresh install with no
 scrubber can still launch jobs.
 
+**The toggle never trusts a folder.** Folder trust is granted when a job is registered with
+`ccc new-job` (a sync import from a job file or the pad grants nothing) and by a human launch (`ccc open-job`, the TUI's `r`, a plain `ccc start-job`); automatic launches
+(`start-job -u/--auto`) and the `launch: true` toggle only check it. The toggle's tab runs
+`ccc start-job --force --no-grant <id>` (`-G/--no-grant`: check folder trust, never grant it;
+every other guard behaves as a manual start), and before it spawns that tab the sync refuses a job
+whose folder is not trusted for its account: nothing is spawned and the file gets the callout
+*"blocked: folder … is not trusted for account … — start it with ccc open-job <id> or the TUI
+(the toggle never trusts a folder)"*. A job registered from the phone into a folder never trusted
+on that account therefore needs one human launch. A `--no-grant` refusal inside `start-job` (the
+file re-read moved the cwd) writes the same callout to the job file.
+
 **Migration (existing installs).** The mirrors now require a resolvable scrubber (or the explicit
 `mirror_allow_unscrubbed = true`). If you already run them: install the scrubber client, then run
 `ccc sync-mirrors --full -v` **once** so every existing card is scrubbed and vouched — after that
