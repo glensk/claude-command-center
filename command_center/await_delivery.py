@@ -201,7 +201,9 @@ def _deliver_one(ctx: _Ctx, group: AwaitGroup, live: LiveSession | None) -> None
         ctx.report.waiting.append(group.id)
         return
     if reason:
-        if ctx.store.block_group(group.id, reason, ctx.now, from_states=("fired",)):
+        if ctx.store.block_group(
+            group.id, reason, ctx.now, from_states=("fired",), token=group.delivery_token
+        ):
             ctx.report.blocked_groups.append(group.id)
             ctx.notify(
                 group.id,

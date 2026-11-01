@@ -475,7 +475,7 @@ def _resolved_profile(session: Any, sid: str) -> str:
 
 def _arm(args: argparse.Namespace, runner: Any) -> int:
     from . import accounts
-    from .await_store import AwaitConflict
+    from .await_store import AwaitConflict, AwaitRefused
     from .models import now_ms
     from .store import Store
 
@@ -533,12 +533,17 @@ def _arm(args: argparse.Namespace, runner: Any) -> int:
                 group_id = store.arm_await(sid, **common)
         except AwaitConflict as exc:
             raise AwaitError(f"{exc} (ccc await -l; -d GROUP to disarm it)") from exc
+        except AwaitRefused as exc:
+            raise AwaitError(f"{exc} — arming is refused") from exc
+        armed = store.get_await_group(group_id)
+        transfer_id = armed.transfer_id if armed is not None else ""
     kinds = ", ".join(s.kind for s in sources)
     _emit(
         args,
-        {"group_id": group_id, **preview},
+        {"group_id": group_id, "transfer_id": transfer_id, **preview},
         f"armed await group {group_id} on {sid[:8]}: {kinds}; until {_fmt(until)}"
         + ("; delivers into a NEW session" if args.fresh else "")
+        + (f"; moves with pending handoff {transfer_id}" if transfer_id else "")
         + ("; this tab closes after the turn" if args.close else ""),
     )
     return 0

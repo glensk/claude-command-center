@@ -25,7 +25,22 @@ creates the ``prepared`` transfer. A reserved group still polls and may fire, bu
 never claimed for delivery (:meth:`AwaitStoreMixin.mark_delivering`) while its transfer
 is ``prepared``/``opened``. A failed transfer releases it (:func:`release_groups`, in the
 ``failed`` transition's transaction); ``accept`` rebinds it to the successor
-(:func:`rebind_groups`, in the ``accepted`` CAS's transaction).
+(:func:`rebind_groups`, in the ``accepted`` CAS's transaction). The invariants that keep
+a late group from slipping past the handoff:
+
+* **Arm-time join** (:func:`handoff_join`, inside the arm transaction): a group armed on
+  the source of a ``prepared``/``opened`` transfer is born reserved under it. Arming is
+  REFUSED (:class:`AwaitRefused`) on a retired source (its transfer is ``accepted``) and
+  on the target of a ``prepared``/``opened`` transfer (accept moves a group there).
+* **Accept-prepare** (``TransferStoreMixin.prepare_accept``, one transaction BEFORE any
+  ``handoff_hooks`` entry runs): sweeps the source's still-unreserved active groups into
+  the reservation (:func:`reserve_groups`), refuses when the successor already holds an
+  active group (:class:`AwaitConflict`, never merged) and, retryably, while a reserved
+  group is in a non-stale ``delivering`` (:class:`AwaitBusy`, :func:`fresh_deliveries`).
+  A refusal rolls the sweep back and runs no hook, so ownership never moves.
+* **Token rotation**: the rebind gives every ``fired`` group a fresh ``delivery_token``
+  (and resets a stale ``delivering`` one to ``fired`` under a fresh token), so a delivery
+  pass that loaded the row before the rebind cannot claim it with the source's data.
 
 Every timestamp in these two tables is epoch SECONDS (the sessions table uses ms).
 Rows are read by column NAME and unknown columns are ignored, so a newer ccc that adds
@@ -156,6 +171,14 @@ class AwaitConflict(Exception):
     """The session already holds an active await group (one per session)."""
 
 
+class AwaitRefused(Exception):
+    """Arming refused by a handoff: the session was handed off, or is a pending successor."""
+
+
+class AwaitBusy(Exception):
+    """A reserved group is mid-delivery to the source; accept must wait (retryable)."""
+
+
 @dataclasses.dataclass
 class SourceSpec:
     """One source to arm: its kind, persisted spec, baseline watermark and interval."""
@@ -284,24 +307,89 @@ _RESERVED_SQL = (
 # reservation moves together with the transfer's own transition) and never commit.
 
 
-def reserve_groups(conn: sqlite3.Connection, session_id: str, transfer_id: str) -> list[int]:
-    """Reserve *session_id*'s active group under *transfer_id*; the reserved ids.
+def handoff_join(conn: sqlite3.Connection, session_id: str) -> str:
+    """The pending transfer a group armed now on *session_id* must join (``""`` = none).
 
-    Delivery state and ``updated_at`` stay untouched (the stale-delivery clock keeps
-    running); a group already reserved by another transfer is left alone.
+    Runs inside the arm transaction. A session that is the SOURCE of a ``prepared``/
+    ``opened`` transfer arms straight into that transfer's reservation, so a group armed
+    after ``continue-session start`` moves to the successor like one armed before it.
+    :class:`AwaitRefused` for a retired source (its transfer is ``accepted``: the
+    successor owns the work, a wake bound here would resume a session being closed) and
+    for the TARGET of a ``prepared``/``opened`` transfer (accept moves the source's group
+    here, and a session holds one group; arm after accept).
     """
     rows = conn.execute(
+        "SELECT transfer_id, source_session, state FROM transfers "
+        "WHERE (source_session = ? AND state IN ('prepared', 'opened', 'accepted')) "
+        "OR (target_session = ? AND state IN ('prepared', 'opened')) ORDER BY created_at",
+        (session_id, session_id),
+    ).fetchall()
+    join = ""
+    for row in rows:
+        tid, state = str(row["transfer_id"]), str(row["state"])
+        if row["source_session"] != session_id:
+            raise AwaitRefused(
+                f"session {session_id[:8]} is the successor of pending handoff {tid} ({state}); "
+                f"run `ccc continue-session accept {tid}` first, then arm"
+            )
+        if state == "accepted":
+            raise AwaitRefused(
+                f"session {session_id[:8]} was handed off (transfer {tid} accepted); "
+                "arm the await in the successor session"
+            )
+        join = tid
+    return join
+
+
+def reserve_groups(conn: sqlite3.Connection, session_id: str, transfer_id: str) -> list[int]:
+    """Reserve *session_id*'s unreserved active groups under *transfer_id*; their ids.
+
+    Used at ``create_transfer`` and again by accept-prepare (the sweep). "Unreserved"
+    includes a reservation whose transfer is no longer pending (it holds nothing back,
+    see :data:`_RESERVED_SQL`). Delivery state and ``updated_at`` stay untouched (the
+    stale-delivery clock keeps running).
+    """
+    unreserved = f"(transfer_id IS NULL OR NOT {_RESERVED_SQL})"
+    rows = conn.execute(
         f"SELECT id FROM await_groups WHERE session_id = ? AND state IN {_ACTIVE_SQL} "
-        "AND transfer_id IS NULL",
+        f"AND {unreserved}",
         (session_id,),
     ).fetchall()
     ids = [int(r[0]) for r in rows]
     for group_id in ids:
         conn.execute(
-            "UPDATE await_groups SET transfer_id = ? WHERE id = ? AND transfer_id IS NULL",
+            f"UPDATE await_groups SET transfer_id = ? WHERE id = ? AND {unreserved}",
             (transfer_id, group_id),
         )
     return ids
+
+
+def reserved_ids(conn: sqlite3.Connection, transfer_id: str, source_session: str) -> list[int]:
+    """The active groups of *source_session* reserved under *transfer_id* (oldest first)."""
+    rows = conn.execute(
+        f"SELECT id FROM await_groups WHERE transfer_id = ? AND session_id = ? "
+        f"AND state IN {_ACTIVE_SQL} ORDER BY id",
+        (transfer_id, source_session),
+    ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def fresh_deliveries(
+    conn: sqlite3.Connection, transfer_id: str, now: int, stale_sec: int
+) -> list[AwaitGroup]:
+    """Groups reserved under *transfer_id* that are ``delivering`` and NOT yet stale.
+
+    Such a row was claimed for the source before the reservation and a ``fire-await``
+    tab may be resuming the source right now; accept must wait for it (it either
+    finishes — ``delivered``, nothing left to move — or goes stale and the rebind hands
+    it back to ``fired`` under a fresh token).
+    """
+    rows = conn.execute(
+        "SELECT * FROM await_groups WHERE transfer_id = ? AND state = 'delivering' "
+        "AND updated_at > ? ORDER BY id",
+        (transfer_id, now - stale_sec),
+    ).fetchall()
+    return [_row_to_group(r) for r in rows]
 
 
 def release_groups(conn: sqlite3.Connection, transfer_id: str, now: int) -> list[int]:
@@ -347,20 +435,18 @@ def rebind_groups(
 ) -> list[AwaitGroup]:
     """Move every active group reserved under *transfer_id* to the successor.
 
-    Only rows that still belong to the source AND still name this transfer move. A stale
-    ``delivering`` row (claimed for the source before the reservation) goes back to
-    ``fired`` under a FRESH token first, so a ``fire-await`` tab still holding the old
-    token can never resume the source. Then ``session_id``, ``config_dir``, ``cwd``,
-    ``no_codex`` and ``launch_profile`` become the successor's and the reservation is
-    cleared. :class:`AwaitConflict` when the successor already holds an active group
-    (never merged: two groups' sources and deadlines differ). Returns the moved groups.
+    Only rows that still belong to the source AND still name this transfer move. Every
+    ``fired`` row gets a FRESH ``delivery_token``, and a stale ``delivering`` row
+    (claimed for the source before the reservation; accept-prepare refused a fresh one)
+    goes back to ``fired`` under a fresh token too: a delivery pass that loaded the row
+    before the rebind holds the old token, so its ``mark_delivering`` CAS fails and it
+    can never deliver with the source's data, nor a ``fire-await`` tab resume the
+    source. Then ``session_id``, ``config_dir``, ``cwd``, ``no_codex`` and
+    ``launch_profile`` become the successor's and the reservation is cleared.
+    :class:`AwaitConflict` when the successor already holds an active group (never
+    merged: two groups' sources and deadlines differ). Returns the moved groups.
     """
-    rows = conn.execute(
-        f"SELECT id FROM await_groups WHERE transfer_id = ? AND session_id = ? "
-        f"AND state IN {_ACTIVE_SQL} ORDER BY id",
-        (transfer_id, rebind.source_session),
-    ).fetchall()
-    ids = [int(r[0]) for r in rows]
+    ids = reserved_ids(conn, transfer_id, rebind.source_session)
     if not ids:
         return []
     held = target_conflict(conn, rebind.target_session)
@@ -370,9 +456,9 @@ def rebind_groups(
             f"({held.state})"
         )
     for group_id in ids:
-        conn.execute(
+        conn.execute(  # every fired row (and a stale delivering one) gets a FRESH token
             "UPDATE await_groups SET state = 'fired', delivery_token = ?, updated_at = ? "
-            "WHERE id = ? AND state = 'delivering'",
+            "WHERE id = ? AND state IN ('fired', 'delivering')",
             (new_token(), now, group_id),
         )
         cur = conn.execute(
@@ -429,12 +515,14 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
     ) -> int:
         if not sources:
             raise ValueError("an await group needs at least one source")
+        # Inside the arm transaction: join the source's pending handoff, or refuse.
+        transfer_id = handoff_join(self.conn, session_id) or None
         try:
             cur = self.conn.execute(
                 "INSERT INTO await_groups (session_id, config_dir, cwd, no_codex, "
                 "prompt_template, until_epoch, grace_until_epoch, state, created_at, "
-                "updated_at, purpose, items, fresh, launch_profile) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'armed', ?, ?, ?, ?, ?, ?)",
+                "updated_at, purpose, items, fresh, launch_profile, transfer_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'armed', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     config_dir,
@@ -449,6 +537,7 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
                     json.dumps(list(items)),
                     int(fresh),
                     launch_profile,
+                    transfer_id,
                 ),
             )
         except sqlite3.IntegrityError as exc:
@@ -491,7 +580,12 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
         fresh: bool = False,
         launch_profile: str = "",
     ) -> int:
-        """Insert one group + its sources atomically; :class:`AwaitConflict` if one is active."""
+        """Insert one group + its sources atomically; :class:`AwaitConflict` if one is active.
+
+        A source of a pending handoff joins its reservation in the same transaction;
+        :class:`AwaitRefused` on a retired source or a pending successor
+        (:func:`handoff_join`).
+        """
         with self._immediate():
             return self._insert_group(
                 session_id,
@@ -841,15 +935,29 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
         ).fetchall()
         return [_row_to_group(r) for r in rows]
 
-    def block_group(
-        self, group_id: int, reason: str, now: int, *, from_states: tuple[str, ...]
+    def block_group(  # pylint: disable=too-many-arguments
+        self,
+        group_id: int,
+        reason: str,
+        now: int,
+        *,
+        from_states: tuple[str, ...],
+        token: str | None = None,
     ) -> bool:
-        """Move a group to ``blocked`` (with *reason*) from one of *from_states*."""
+        """Move a group to ``blocked`` (with *reason*) from one of *from_states*.
+
+        A delivery pass passes the *token* of the row it loaded: after a handoff rebind
+        rotated it, a pass holding the source's row cannot block the successor's group.
+        """
         marks = ", ".join("?" for _ in from_states)
+        guard = " AND delivery_token = ?" if token is not None else ""
+        params: tuple[Any, ...] = (reason, now, group_id, *from_states)
+        if token is not None:
+            params += (token,)
         cur = self.conn.execute(
             "UPDATE await_groups SET state = 'blocked', blocked_reason = ?, notified_at = 0, "
-            f"updated_at = ? WHERE id = ? AND state IN ({marks})",
-            (reason, now, group_id, *from_states),
+            f"updated_at = ? WHERE id = ? AND state IN ({marks}){guard}",
+            params,
         )
         self.conn.commit()
         return cur.rowcount == 1

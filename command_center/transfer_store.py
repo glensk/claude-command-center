@@ -21,7 +21,9 @@ source session — a partial UNIQUE index enforces it.
 The source's active ``ccc await`` group moves WITH the transfer (``await_store``): it is
 reserved in :meth:`TransferStoreMixin.create_transfer`'s transaction, released in the
 ``failed`` transition's, and rebound to the successor in :meth:`accept_transfer`'s — so a
-wake is never lost and never delivered to both sessions.
+wake is never lost and never delivered to both sessions. A group the source arms later
+joins the reservation at arm time; :meth:`prepare_accept` (before any hook) sweeps any
+straggler in and refuses an await collision while nothing has moved yet.
 
 Additive only, like every ccc migration: ``CREATE … IF NOT EXISTS``, no CHECK constraints,
 and rows are read BY NAME (a column a newer build added is ignored here).
@@ -47,12 +49,17 @@ from dataclasses import dataclass
 from typing import Any
 
 from .await_store import (
+    AwaitBusy,
+    AwaitConflict,
     AwaitGroup,
     Rebind,
+    fresh_deliveries,
     immediate,
     rebind_groups,
     release_groups,
     reserve_groups,
+    reserved_ids,
+    target_conflict,
 )
 
 PREPARED = "prepared"
@@ -271,6 +278,46 @@ class TransferStoreMixin:
         won = self._cas_transfer(transfer_id, to_state, now, failure=failure)
         self.conn.commit()
         return won
+
+    def prepare_accept(self, transfer_id: str, now: int, *, stale_sec: int) -> list[int] | None:
+        """Accept-prepare: ONE transaction that runs BEFORE any ``handoff_hooks`` entry.
+
+        Sweeps the source's still-unreserved active await groups into *transfer_id*'s
+        reservation (a group armed before the arm-time join existed), then refuses — the
+        whole transaction rolled back, so nothing changed — with ``AwaitConflict`` when
+        the target already holds an active group while a reserved one would move there,
+        and with ``AwaitBusy`` (retryable) while a reserved group is ``delivering`` for
+        less than *stale_sec*. Returns the swept group ids, or ``None`` when the transfer
+        is no longer ``prepared``/``opened``.
+        """
+        try:
+            with immediate(self.conn):
+                row = self.conn.execute(
+                    "SELECT * FROM transfers WHERE transfer_id = ? "
+                    "AND state IN ('prepared', 'opened')",
+                    (transfer_id,),
+                ).fetchone()
+                if row is None:
+                    raise _CasLost
+                transfer = _row_to_transfer(row)
+                swept = reserve_groups(self.conn, transfer.source_session, transfer_id)
+                reserved = reserved_ids(self.conn, transfer_id, transfer.source_session)
+                if reserved:
+                    held = target_conflict(self.conn, transfer.target_session)
+                    if held is not None:
+                        raise AwaitConflict(
+                            f"this session already holds await group {held.id} ({held.state}) "
+                            f"and the source's await group {reserved[0]} moves here on "
+                            "accept — two waits are never merged"
+                        )
+                busy = fresh_deliveries(self.conn, transfer_id, now // 1000, stale_sec)
+                if busy:
+                    raise AwaitBusy(
+                        f"await group {busy[0].id} is being delivered to the source right now"
+                    )
+        except _CasLost:
+            return None
+        return swept
 
     def accept_transfer(self, transfer_id: str, now: int) -> list[AwaitGroup] | None:
         """``prepared|opened → accepted`` WITH the await rebind, in ONE transaction.

@@ -323,6 +323,16 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
   text passes the same `handoff_doc.validate` (scrub fail-closed) as a model-written one.
 - **ccc stays tracker-free**: ticket ownership moves through the generic, inert
   `handoff_hooks` key only (public mirror).
+- **The source's `ccc await` group moves with the transfer, by code** (`await_groups.
+  transfer_id`; § "`ccc await`" has the store side): reserved in `create_transfer`'s
+  transaction; a group the source arms LATER joins the reservation inside its arm
+  transaction; `accept` runs the accept-prepare transaction (`prepare_accept`: sweep the
+  source's unreserved groups in, refuse when the successor already holds a group, refuse
+  retryably while a reserved group is in a non-stale `delivering`) BEFORE any
+  `handoff_hooks` entry, so a refusal never follows a hook that moved ticket ownership;
+  the rebind (successor's session, account dir, cwd, `no_codex`, launch profile; every
+  fired group under a fresh `delivery_token`) runs in the `accepted` CAS's transaction,
+  after every hook; a `failed` transfer releases the reservation in its own transaction.
 
 ## The `no_codex` job flag (do not regress)
 
@@ -383,6 +393,16 @@ Invariants:
   live-session registry delivers NOTHING that pass (a live session misread as closed
   would be resumed twice). A pending attached prompt (`fire_at > 0`) makes delivery
   WAIT — it is never overwritten.
+- **Handoff reservation** (`continue-session`): a group whose `transfer_id` names a
+  `prepared`/`opened` transfer is RESERVED — it polls and may fire, but `mark_delivering`
+  never claims it (delivery defers it) until accept rebinds it to the successor or a
+  failed transfer releases it to the source. Arming on the source of a pending transfer
+  JOINS it (`handoff_join`, inside the arm transaction); arming is REFUSED
+  (`AwaitRefused`) on the source of an `accepted` transfer (retired) and on the target of
+  a `prepared`/`opened` one (accept moves a group there; one per session). The rebind
+  rotates the `delivery_token` of every fired group, so a pass that loaded the row before
+  the rebind loses its `fired → delivering` CAS. Accept-prepare refuses while a reserved
+  group is `delivering` and younger than the 15 min stale limit (`AwaitBusy`).
 - **Trust rule.** Trust is ensured at ARM time (`accounts.ensure_trusted`, a deliberate
   act of the session) and only CHECKED at delivery (`accounts.is_trusted`);
   `fire-await` pins the account with `accounts.pin_environ`, which never grants trust.

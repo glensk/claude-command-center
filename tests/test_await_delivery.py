@@ -224,6 +224,77 @@ def test_a_failed_transfer_releases_the_group_to_the_source(env: dict[str, Any])
     assert launched == [(gid, group.delivery_token)] and report.launched == [gid]
 
 
+def test_a_group_armed_after_start_is_deferred_then_delivered_to_the_successor(
+    env: dict[str, Any],
+) -> None:
+    store: Store = env["store"]
+    tid = _handoff(env)
+    gid = _armed(env)  # OLD arms after start: it joins the reservation at arm time
+    assert store.get_await_group(gid).transfer_id == tid  # type: ignore[union-attr]
+    _fire(env, gid)
+    report, typed, launched, _notes = _deliver(env, live=[_live(env)])
+    assert not typed and not launched and report.waiting == [gid]
+    assert store.accept_transfer(tid, (NOW + 210) * 1000) is not None
+    _report, typed, launched, _notes = _deliver(env, now=NOW + 220)
+    group = store.get_await_group(gid)
+    assert group is not None and group.session_id == NEW
+    assert launched == [(gid, group.delivery_token)] and not typed
+
+
+def test_a_pass_that_loaded_the_group_before_the_rebind_cannot_claim_it(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The interleaving, deterministic: the pass reads the fired rows, THEN accept rebinds
+    (inside the pass's reservation check), THEN the pass tries its CAS with the old row."""
+    store: Store = env["store"]
+    gid = _fired(env)
+    tid = _handoff(env)
+    old_token = store.get_await_group(gid).delivery_token  # type: ignore[union-attr]
+    real_is_reserved = store.is_reserved
+
+    def accept_in_between(group_id: int) -> bool:
+        transfer = store.get_transfer(tid)
+        if group_id == gid and transfer is not None and transfer.state == "prepared":
+            assert store.accept_transfer(tid, (NOW + 210) * 1000) is not None
+        return real_is_reserved(group_id)
+
+    monkeypatch.setattr(store, "is_reserved", accept_in_between)
+    # OLD is live and idle: with OLD's row a successful CAS would type the wake into OLD's tab
+    report, typed, launched, _notes = _deliver(env, live=[_live(env)])
+    assert not typed and not launched and not report.delivered and not report.launched
+    group = store.get_await_group(gid)
+    assert group is not None and (group.state, group.session_id) == ("fired", NEW)
+    assert group.delivery_token != old_token  # rotated by the rebind
+    monkeypatch.setattr(store, "is_reserved", real_is_reserved)
+    _report, typed, launched, _notes = _deliver(env, live=[_live(env)], now=NOW + 220)
+    assert launched == [(gid, group.delivery_token)] and not typed  # NEW is closed: a new tab
+
+
+def test_a_pass_that_loaded_the_group_before_the_rebind_cannot_block_it(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same interleaving, refusal path: OLD is done, so the pass's preflight on OLD's row
+    would block the group, but the rebind rotated the token and NEW now owns it."""
+    store: Store = env["store"]
+    gid = _fired(env)
+    tid = _handoff(env)
+    store.update_fields(SID, done=True)
+    real_is_reserved = store.is_reserved
+
+    def accept_in_between(group_id: int) -> bool:
+        transfer = store.get_transfer(tid)
+        if group_id == gid and transfer is not None and transfer.state == "prepared":
+            assert store.accept_transfer(tid, (NOW + 210) * 1000) is not None
+        return real_is_reserved(group_id)
+
+    monkeypatch.setattr(store, "is_reserved", accept_in_between)
+    report, typed, launched, _notes = _deliver(env)
+    group = store.get_await_group(gid)
+    assert group is not None and (group.state, group.session_id) == ("fired", NEW)
+    assert group.blocked_reason == "" and not report.blocked_groups
+    assert not typed and not launched
+
+
 # --------------------------------------------------------------------------- live matrix
 def test_idle_live_session_gets_the_prompt_typed(env: dict[str, Any]) -> None:
     gid = _fired(env)

@@ -16,7 +16,14 @@ import pytest
 from awaitstub import seeded_store as _store
 
 from command_center import store as store_mod
-from command_center.await_store import GRACE_SEC, AwaitConflict, AwaitGroup, SourceSpec
+from command_center.await_store import (
+    GRACE_SEC,
+    AwaitBusy,
+    AwaitConflict,
+    AwaitGroup,
+    AwaitRefused,
+    SourceSpec,
+)
 from command_center.store import Store
 from command_center.transfer_store import Transfer, TransferConflict
 
@@ -589,8 +596,9 @@ def test_accept_rebinds_a_blocked_group(tmp_path: Path) -> None:
 def test_accept_rolls_back_when_the_target_already_holds_a_group(tmp_path: Path) -> None:
     store = _store(tmp_path)
     gid = _arm(store)
+    store.ensure(NEW, cwd="/repo2")
+    other = _arm(store, NEW)  # before the transfer: arming a pending target is refused
     _transfer(store)
-    other = _arm(store, NEW)
     with pytest.raises(AwaitConflict):
         store.accept_transfer("t1", NOW * 1000 + 9)
     assert store.get_transfer("t1").state == "prepared"  # type: ignore[union-attr]
@@ -598,3 +606,149 @@ def test_accept_rolls_back_when_the_target_already_holds_a_group(tmp_path: Path)
     assert (group.session_id, group.transfer_id) == ("s1", "t1")
     assert _group(store, other).session_id == NEW
     assert not store.conn.in_transaction
+
+
+# --------------------------------------------------------------------------- late arms (D13 e-g)
+STALE = 15 * 60  # await_delivery.STALE_DELIVERY_SEC
+
+
+def _unreserve(store: Store, gid: int) -> None:
+    """What a build without the arm-time join left behind: a late group not reserved."""
+    store.conn.execute("UPDATE await_groups SET transfer_id = NULL WHERE id = ?", (gid,))
+    store.conn.commit()
+
+
+@pytest.mark.parametrize("close", [False, True])
+def test_a_group_armed_after_start_joins_the_reservation_and_moves_on_accept(
+    tmp_path: Path, close: bool
+) -> None:
+    store = _store(tmp_path)
+    _transfer(store)  # the source had no group at start
+    if close:
+        gid, _tok = store.arm_await_and_close(
+            "s1",
+            config_dir="/acct",
+            cwd="/repo",
+            no_codex=False,
+            prompt_template="got {event}",
+            until_epoch=NOW + 3600,
+            sources=[SourceSpec(kind="zoho-reply", spec={}, watermark="w")],
+            now=NOW,
+            close_now_ms=NOW * 1000,
+        )
+    else:
+        gid = _arm(store)
+    assert _group(store, gid).transfer_id == "t1" and store.is_reserved(gid)  # at arm time
+    moved = store.accept_transfer("t1", NOW * 1000 + 9)
+    assert moved is not None and [g.id for g in moved] == [gid]
+    group = _group(store, gid)
+    assert (group.session_id, group.config_dir, group.transfer_id) == (NEW, "/acct2", "")
+
+
+def test_arming_a_retired_source_is_refused(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _transfer(store)
+    assert store.accept_transfer("t1", NOW * 1000 + 9) == []
+    with pytest.raises(AwaitRefused, match="handed off"):
+        _arm(store)
+    assert store.list_awaits("s1", include_inactive=True) == []
+    assert not store.conn.in_transaction
+
+
+def test_arming_a_pending_target_is_refused_until_the_transfer_ends(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _transfer(store)
+    with pytest.raises(AwaitRefused, match="successor of pending handoff t1"):
+        _arm(store, NEW)
+    assert store.list_awaits(NEW, include_inactive=True) == []
+    assert store.transition_transfer("t1", "failed", NOW * 1000 + 5, failure="launch: x")
+    gid = _arm(store, NEW)  # the transfer ended: NEW is an ordinary session again
+    late = _arm(store)  # and the source arms unreserved
+    assert (_group(store, gid).transfer_id, _group(store, late).transfer_id) == ("", "")
+
+
+def test_prepare_accept_sweeps_an_unreserved_late_group(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _transfer(store)
+    gid = _arm(store)
+    _unreserve(store, gid)
+    assert not store.is_reserved(gid)
+    assert store.prepare_accept("t1", NOW * 1000 + 9, stale_sec=STALE) == [gid]
+    assert _group(store, gid).transfer_id == "t1" and store.is_reserved(gid)
+    assert store.prepare_accept("t1", NOW * 1000 + 10, stale_sec=STALE) == []  # idempotent
+
+
+def test_a_reservation_of_a_dead_transfer_is_taken_over(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    gid = _arm(store)
+    store.conn.execute(  # a failed transfer whose release never ran (a crash, a manual edit)
+        "INSERT INTO transfers (transfer_id, source_session, state) VALUES ('t0', 's1', 'failed')"
+    )
+    store.conn.execute("UPDATE await_groups SET transfer_id = 't0' WHERE id = ?", (gid,))
+    store.conn.commit()
+    _transfer(store)
+    assert _group(store, gid).transfer_id == "t1" and store.is_reserved(gid)  # at start
+    _unreserve(store, gid)
+    store.conn.execute("UPDATE await_groups SET transfer_id = 't0' WHERE id = ?", (gid,))
+    store.conn.commit()
+    assert store.prepare_accept("t1", NOW * 1000 + 9, stale_sec=STALE) == [gid]  # and the sweep
+    assert _group(store, gid).transfer_id == "t1"
+
+
+@pytest.mark.parametrize("reserved_at_arm", [True, False])
+def test_prepare_accept_refuses_a_target_group_and_changes_nothing(
+    tmp_path: Path, reserved_at_arm: bool
+) -> None:
+    store = _store(tmp_path)
+    store.ensure(NEW, cwd="/repo2")
+    held = _arm(store, NEW)
+    _transfer(store)
+    late = _arm(store)  # OLD arms after start
+    if not reserved_at_arm:
+        _unreserve(store, late)
+    with pytest.raises(AwaitConflict, match=f"await group {held}"):
+        store.prepare_accept("t1", NOW * 1000 + 9, stale_sec=STALE)
+    assert _group(store, late).transfer_id == ("t1" if reserved_at_arm else "")  # rolled back
+    assert store.get_transfer("t1").state == "prepared"  # type: ignore[union-attr]
+    assert not store.conn.in_transaction
+
+
+def test_prepare_accept_ignores_a_target_group_when_nothing_moves(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.ensure(NEW, cwd="/repo2")
+    _arm(store, NEW)
+    _transfer(store)
+    assert store.prepare_accept("t1", NOW * 1000 + 9, stale_sec=STALE) == []
+
+
+def test_prepare_accept_refuses_a_fresh_delivery_retryably(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    gid, token = _fired(store)
+    assert store.mark_delivering(gid, token, NOW)  # a fire-await tab is resuming s1
+    _transfer(store)
+    with pytest.raises(AwaitBusy, match=f"await group {gid}"):
+        store.prepare_accept("t1", (NOW + STALE - 1) * 1000, stale_sec=STALE)
+    assert _group(store, gid).state == "delivering"
+    assert store.prepare_accept("t1", (NOW + STALE) * 1000, stale_sec=STALE) == []  # now stale
+    moved = store.accept_transfer("t1", (NOW + STALE) * 1000 + 1)
+    assert moved is not None and [(g.id, g.state) for g in moved] == [(gid, "fired")]
+    assert not store.mark_delivered(gid, token, NOW + STALE)
+
+
+def test_prepare_accept_on_an_ended_transfer_returns_none(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _transfer(store)
+    assert store.accept_transfer("t1", NOW * 1000 + 9) == []
+    assert store.prepare_accept("t1", NOW * 1000 + 10, stale_sec=STALE) is None
+
+
+def test_the_rebind_rotates_the_token_of_every_fired_group(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    gid, token = _fired(store)
+    _transfer(store)
+    moved = store.accept_transfer("t1", NOW * 1000 + 9)
+    assert moved is not None
+    fresh = _group(store, gid).delivery_token
+    assert _group(store, gid).state == "fired" and fresh and fresh != token
+    assert not store.mark_delivering(gid, token, NOW + 10)  # a row loaded before the rebind
+    assert store.mark_delivering(gid, fresh, NOW + 10)

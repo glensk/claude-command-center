@@ -960,20 +960,44 @@ def run_hook(template: object, transfer: Any) -> dict[str, Any]:
     return data
 
 
-def _await_collision(store: Store, transfer: Any) -> str:
-    """Why accept must refuse up front: the successor already holds an active await group
-    while the source has one reserved under *transfer* (one per session; never merged).
-    ``""`` = no collision."""
-    if not store.reserved_awaits(transfer.transfer_id):
-        return ""
-    held = store.active_await(transfer.target_session)
-    if held is None:
-        return ""
-    return (
-        f"this session already holds await group {held.id} ({held.state}) and the source's "
-        f"await group moves here on accept — two waits are never merged. Disarm this "
-        f"session's group (`ccc await -d {held.id}`) and run accept again; nothing changed."
-    )
+def _accept_prepare(store: Store, transfer: Any) -> int | None:
+    """The accept-prepare transaction, run BEFORE any ``handoff_hooks`` entry: sweep the
+    source's late await groups into the reservation, then refuse on an await collision
+    (the successor already holds a group; never merged) or, retryably, while a reserved
+    group is mid-delivery. ``None`` = go on; otherwise the exit code (nothing changed)."""
+    import sqlite3
+
+    from .await_delivery import STALE_DELIVERY_SEC
+    from .await_store import AwaitBusy, AwaitConflict
+    from .models import now_ms
+    from .transfer_store import ACCEPTED, FINALIZED
+
+    tid = transfer.transfer_id
+    try:
+        swept = store.prepare_accept(tid, now_ms(), stale_sec=STALE_DELIVERY_SEC)
+    except AwaitConflict as exc:
+        held = store.active_await(transfer.target_session)
+        disarm = f"`ccc await -d {held.id}`" if held is not None else "`ccc await -d GROUP`"
+        why = f"{exc}. Disarm this session's group ({disarm}) and run accept again"
+    except AwaitBusy as exc:
+        why = (
+            f"{exc}; wait until that delivery finishes (or is reclaimed after "
+            f"{STALE_DELIVERY_SEC // 60} min) and run accept again"
+        )
+    except sqlite3.Error as exc:
+        why = f"could not prepare the await move ({exc}); run accept again"
+    else:
+        if swept is not None:
+            return None
+        current = store.get_transfer(tid)
+        if current is not None and current.state in (ACCEPTED, FINALIZED):
+            print(f"already accepted: transfer {tid} ({current.state})")
+            return 0
+        print(f"error: transfer {tid} changed state", file=sys.stderr)
+        return 1
+    store.note_transfer(tid, now_ms(), failure=f"await: {why}")
+    print(f"error: {why}; nothing changed (no hook ran).", file=sys.stderr)
+    return 1
 
 
 def _accept_and_rebind(store: Store, transfer: Any) -> list[str] | None:
@@ -1046,11 +1070,9 @@ def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-ret
                 file=sys.stderr,
             )
             return 1
-        refusal = _await_collision(store, transfer)
-        if refusal:  # checked BEFORE any hook ran (and again inside the accept transaction)
-            store.note_transfer(transfer.transfer_id, now_ms(), failure=f"await: {refusal}")
-            print(f"error: {refusal}", file=sys.stderr)
-            return 1
+        refused = _accept_prepare(store, transfer)  # BEFORE any hook (re-checked at the CAS)
+        if refused is not None:
+            return refused
         steps: list[str] = []
         try:
             for template in config.load_config().handoff_hooks:

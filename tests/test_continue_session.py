@@ -1,5 +1,7 @@
 """``ccc continue-session`` (tp#1300): the read-only verbs on fixture transcripts."""
 
+# pylint: disable=too-many-lines  # one module covers every continue-session verb
+
 from __future__ import annotations
 
 import json
@@ -615,6 +617,18 @@ def _group(gid: int) -> Any:
     return group
 
 
+def _held_by(session_id: str) -> int:
+    """A group *session_id* already holds by a path the arm-time refusal does not cover
+    (a build before it): armed on a scratch session, then moved by hand."""
+    with Store() as store:
+        store.ensure("scratch-holder", cwd="/repo")
+    gid = _arm_await("scratch-holder")
+    with Store() as store:
+        store.conn.execute("UPDATE await_groups SET session_id = ? WHERE id = ?", (session_id, gid))
+        store.conn.commit()
+    return gid
+
+
 def _ok_hook(tmp_path: Path, log: Path) -> str:
     return _script(tmp_path, "ok.sh", f"echo ran >> {log}\necho '{{\"ok\": true}}'\n")
 
@@ -663,7 +677,7 @@ def test_accept_refuses_before_any_hook_when_the_successor_holds_an_await(
     gid = _arm_await(SID)
     tid = _opened_transfer(harness)
     new = _as_successor(monkeypatch, harness, tid)
-    held = _arm_await(new)
+    held = _held_by(new)
     log = tmp_path / "ran.log"
     _hooks(monkeypatch, [_ok_hook(tmp_path, log)])
     capsys.readouterr()
@@ -691,6 +705,118 @@ def test_accept_rebinds_a_blocked_await(
         new,
         "no viable source",
     )
+
+
+# ------------------------------------------------------------------ late arms (D13 e-g)
+def test_a_group_armed_after_start_is_reserved_at_arm_and_moves_on_accept(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tid = _opened_transfer(harness)  # the source held no group at start
+    gid = _arm_await(SID)  # OLD arms after start returned EXIT_WAITING
+    assert _group(gid).transfer_id == tid  # reserved in the arm transaction
+    new = _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch, [_ok_hook(tmp_path, tmp_path / "ran.log")])
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid, "-j"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["next_steps"] == [
+        f"await group {gid} (armed) now wakes this session (`ccc await -l` lists it)"
+    ]
+    group = _group(gid)
+    assert (group.session_id, group.config_dir, group.transfer_id) == (
+        new,
+        str(harness.private),
+        "",
+    )
+
+
+def test_arming_the_pending_successor_or_the_retired_source_is_refused(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from command_center.await_store import AwaitRefused  # pylint: disable=C0415
+
+    tid = _opened_transfer(harness)
+    new = _as_successor(monkeypatch, harness, tid)
+    with pytest.raises(AwaitRefused, match=f"accept {tid}"):
+        _arm_await(new)
+    _hooks(monkeypatch, [_ok_hook(tmp_path, tmp_path / "ran.log")])
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    with pytest.raises(AwaitRefused, match="handed off"):
+        _arm_await(SID)
+    gid = _arm_await(new)  # the successor owns the work now: it may wait
+    with Store() as store:
+        assert store.list_awaits(SID, include_inactive=True) == []
+        assert [g.id for g, _ in store.list_awaits(new)] == [gid]
+
+
+@pytest.mark.parametrize("reserved_at_arm", [True, False])
+def test_a_late_arm_colliding_with_the_successors_group_refuses_before_any_hook(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    reserved_at_arm: bool,
+) -> None:
+    tid = _opened_transfer(harness)
+    new = _as_successor(monkeypatch, harness, tid)
+    held = _held_by(new)
+    late = _arm_await(SID)  # OLD arms after start
+    if not reserved_at_arm:  # a group a build without the arm-time join left unreserved
+        with Store() as store:
+            store.conn.execute("UPDATE await_groups SET transfer_id = NULL WHERE id = ?", (late,))
+            store.conn.commit()
+    owner = tmp_path / "owner"  # what a real hook (ticket ownership) would move
+    hook = _script(tmp_path, "own.sh", f"echo {new} > {owner}\necho '{{\"ok\": true}}'\n")
+    _hooks(monkeypatch, [hook])
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    err = capsys.readouterr().err
+    assert f"await group {held}" in err and f"ccc await -d {held}" in err
+    assert "no hook ran" in err
+    assert not owner.exists()  # ownership unchanged: the hook never ran
+    assert _state(tid) == "opened"
+    group = _group(late)
+    assert (group.session_id, group.transfer_id) == (SID, tid if reserved_at_arm else "")
+    assert _group(held).session_id == new
+
+
+def test_a_fresh_delivery_refuses_accept_retryably(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import time  # pylint: disable=import-outside-toplevel
+
+    gid = _arm_await(SID)
+    event: dict[str, Any] = {"event_id": "e", "payload": "{}", "remote_epoch": 1, "watermark": "w"}
+    with Store() as store:
+        src = store.lease_due_sources(1_800_000_120)[0][0]
+        token = store.fire_group(gid, src.id, src.lease_token, now=1_800_000_120, **event)
+        assert token and store.mark_delivering(gid, token, int(time.time()))  # resuming OLD
+    tid = _opened_transfer(harness)
+    new = _as_successor(monkeypatch, harness, tid)
+    log = tmp_path / "ran.log"
+    _hooks(monkeypatch, [_ok_hook(tmp_path, log)])
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    err = capsys.readouterr().err
+    assert f"await group {gid} is being delivered" in err and "run accept again" in err
+    assert not log.exists() and _state(tid) == "opened"
+    assert (_group(gid).state, _group(gid).session_id) == ("delivering", SID)
+    with Store() as store:  # the delivery never finished: it ages past the stale limit
+        store.conn.execute(
+            "UPDATE await_groups SET updated_at = updated_at - ? WHERE id = ?", (15 * 60, gid)
+        )
+        store.conn.commit()
+    assert cli.main(["continue-session", "accept", tid]) == 0  # the retry goes through
+    group = _group(gid)
+    assert (group.state, group.session_id) == ("fired", new)
+    assert group.delivery_token != token
+    assert log.exists()
 
 
 def test_status_names_the_recovery_step(

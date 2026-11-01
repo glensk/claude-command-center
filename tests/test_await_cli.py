@@ -202,6 +202,43 @@ def test_dry_run_writes_nothing_and_grants_no_trust(env: dict[str, Any]) -> None
     assert json.loads(env["trust"].read_text()) == {}
 
 
+def _transfer_row(source: str, target: str, state: str) -> None:
+    with Store() as store:
+        store.conn.execute(
+            "INSERT INTO transfers (transfer_id, source_session, target_session, state) "
+            "VALUES ('t1', ?, ?, ?)",
+            (source, target, state),
+        )
+        store.conn.commit()
+
+
+def test_arming_on_a_pending_handoffs_source_joins_it(env: dict[str, Any], capsys: Any) -> None:
+    _transfer_row(SID, "other-session", "opened")
+    assert _run("-z", "209", "-u", "1d", "-m", "{event}", "-P", PURPOSE, runner=_runner()) == 0
+    assert "moves with pending handoff t1" in capsys.readouterr().out
+    with Store() as store:
+        [(group, _sources)] = store.list_awaits(SID)
+    assert group.transfer_id == "t1"
+
+
+@pytest.mark.parametrize(
+    ("source", "target", "state", "needle"),
+    [
+        ("other-session", SID, "prepared", "successor of pending handoff t1"),
+        (SID, "other-session", "accepted", "was handed off"),
+    ],
+)
+def test_arming_is_refused_by_a_handoff(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    env: dict[str, Any], capsys: Any, source: str, target: str, state: str, needle: str
+) -> None:
+    _transfer_row(source, target, state)
+    assert _run("-z", "209", "-u", "1d", "-m", "{event}", "-P", PURPOSE, runner=_runner()) == 1
+    err = capsys.readouterr().err
+    assert needle in err and "arming is refused" in err
+    with Store() as store:
+        assert store.list_awaits(SID, include_inactive=True) == []
+
+
 def test_a_second_arm_is_refused(env: dict[str, Any], capsys: Any) -> None:
     assert _run("-z", "209", "-u", "1d", "-m", "{event}", "-P", PURPOSE, runner=_runner()) == 0
     assert _run("-z", "209", "-u", "1d", "-m", "{event}", "-P", PURPOSE, runner=_runner()) == 1
