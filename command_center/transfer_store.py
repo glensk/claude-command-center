@@ -18,6 +18,11 @@ Every transition is a compare-and-set (``UPDATE … WHERE state IN (…)``), so 
 callers cannot both win. At most ONE active (prepared / opened / accepted) transfer per
 source session — a partial UNIQUE index enforces it.
 
+The source's active ``ccc await`` group moves WITH the transfer (``await_store``): it is
+reserved in :meth:`TransferStoreMixin.create_transfer`'s transaction, released in the
+``failed`` transition's, and rebound to the successor in :meth:`accept_transfer`'s — so a
+wake is never lost and never delivered to both sessions.
+
 Additive only, like every ccc migration: ``CREATE … IF NOT EXISTS``, no CHECK constraints,
 and rows are read BY NAME (a column a newer build added is ignored here).
 """
@@ -40,6 +45,15 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from typing import Any
+
+from .await_store import (
+    AwaitGroup,
+    Rebind,
+    immediate,
+    rebind_groups,
+    release_groups,
+    reserve_groups,
+)
 
 PREPARED = "prepared"
 OPENED = "opened"
@@ -116,6 +130,10 @@ class TransferConflict(Exception):
     """Another transfer of the same source session is still active."""
 
 
+class _CasLost(Exception):
+    """Internal: the transfer was not acceptable any more; roll the transaction back."""
+
+
 @dataclass
 class Transfer:  # pylint: disable=too-many-instance-attributes
     """One ``transfers`` row."""
@@ -183,7 +201,11 @@ class TransferStoreMixin:
     conn: sqlite3.Connection
 
     def create_transfer(self, transfer: Transfer, now: int) -> Transfer:
-        """Insert *transfer* as ``prepared``; :class:`TransferConflict` if one is active."""
+        """Insert *transfer* as ``prepared``; :class:`TransferConflict` if one is active.
+
+        The source's active ``ccc await`` group is reserved under the new transfer in the
+        SAME transaction: either both land or neither does.
+        """
         data = dataclasses.asdict(transfer)
         data.update(state=PREPARED, created_at=now, updated_at=now)
         data["no_codex"] = int(bool(data["no_codex"]))
@@ -193,13 +215,13 @@ class TransferStoreMixin:
         cols = ", ".join(data)
         marks = ", ".join("?" for _ in data)
         try:
-            self.conn.execute(
-                f"INSERT INTO transfers ({cols}) VALUES ({marks})",  # noqa: S608 - fixed names
-                tuple(data.values()),
-            )
-            self.conn.commit()
+            with immediate(self.conn):
+                self.conn.execute(
+                    f"INSERT INTO transfers ({cols}) VALUES ({marks})",  # noqa: S608 - fixed names
+                    tuple(data.values()),
+                )
+                reserve_groups(self.conn, transfer.source_session, transfer.transfer_id)
         except sqlite3.IntegrityError as exc:
-            self.conn.rollback()
             raise TransferConflict(str(exc)) from exc
         got = self.get_transfer(transfer.transfer_id)
         assert got is not None
@@ -236,8 +258,62 @@ class TransferStoreMixin:
         """CAS *transfer_id* into *to_state* from any state with that legal edge.
 
         ``False`` when the row is missing or not in a state that may move to *to_state*
-        (another caller won, or the edge is illegal). ``failure`` is recorded on ``failed``.
+        (another caller won, or the edge is illegal). ``failure`` is recorded on ``failed``,
+        and a ``failed`` transition releases the transfer's await reservations in the same
+        transaction (a fired group is then delivered to the source as usual).
         """
+        if to_state == FAILED:
+            with immediate(self.conn):
+                won = self._cas_transfer(transfer_id, to_state, now, failure=failure)
+                if won:
+                    release_groups(self.conn, transfer_id, now // 1000)
+            return won
+        won = self._cas_transfer(transfer_id, to_state, now, failure=failure)
+        self.conn.commit()
+        return won
+
+    def accept_transfer(self, transfer_id: str, now: int) -> list[AwaitGroup] | None:
+        """``prepared|opened → accepted`` WITH the await rebind, in ONE transaction.
+
+        Every active group reserved under *transfer_id* moves to the transfer's target
+        (session, account dir, cwd, ``no_codex``, launch profile; a stale ``delivering``
+        row back to ``fired`` first), the reservation is cleared, then the CAS. Returns the
+        moved groups, or ``None`` when the CAS lost (nothing changed). Raises
+        ``AwaitConflict`` when the target already holds an active group, or any
+        ``sqlite3.Error`` — every failure rolls the whole transaction back, so accept stays
+        retryable.
+        """
+        moved: list[AwaitGroup] = []
+        try:
+            with immediate(self.conn):
+                row = self.conn.execute(
+                    "SELECT * FROM transfers WHERE transfer_id = ? "
+                    "AND state IN ('prepared', 'opened')",
+                    (transfer_id,),
+                ).fetchone()
+                if row is None:
+                    raise _CasLost
+                transfer = _row_to_transfer(row)
+                rebind = Rebind(
+                    source_session=transfer.source_session,
+                    target_session=transfer.target_session,
+                    config_dir=transfer.target_config_dir,
+                    cwd=transfer.cwd,
+                    no_codex=transfer.no_codex,
+                    launch_profile=transfer.launch_profile,
+                )
+                moved = rebind_groups(self.conn, transfer_id, rebind, now // 1000)
+                self._cas_transfer(transfer_id, OPENED, now)  # a launcher race
+                if not self._cas_transfer(transfer_id, ACCEPTED, now):
+                    raise _CasLost
+        except _CasLost:
+            return None
+        return moved
+
+    def _cas_transfer(
+        self, transfer_id: str, to_state: str, now: int, *, failure: str = ""
+    ) -> bool:
+        """The CAS of :meth:`transition_transfer`, without a commit (the caller owns it)."""
         sources = tuple(s for s, targets in TRANSITIONS.items() if to_state in targets)
         if not sources:
             return False
@@ -255,7 +331,6 @@ class TransferStoreMixin:
             f"WHERE transfer_id = ? AND state IN ({marks})",
             (*params, transfer_id, *sources),
         )
-        self.conn.commit()
         return cur.rowcount == 1
 
     def note_transfer(

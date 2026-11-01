@@ -960,8 +960,57 @@ def run_hook(template: object, transfer: Any) -> dict[str, Any]:
     return data
 
 
+def _await_collision(store: Store, transfer: Any) -> str:
+    """Why accept must refuse up front: the successor already holds an active await group
+    while the source has one reserved under *transfer* (one per session; never merged).
+    ``""`` = no collision."""
+    if not store.reserved_awaits(transfer.transfer_id):
+        return ""
+    held = store.active_await(transfer.target_session)
+    if held is None:
+        return ""
+    return (
+        f"this session already holds await group {held.id} ({held.state}) and the source's "
+        f"await group moves here on accept — two waits are never merged. Disarm this "
+        f"session's group (`ccc await -d {held.id}`) and run accept again; nothing changed."
+    )
+
+
+def _accept_and_rebind(store: Store, transfer: Any) -> list[str] | None:
+    """The ``accepted`` CAS + the await rebind (ONE transaction): the moved groups as next
+    steps, or ``None`` after printing why (nothing changed; accept stays retryable)."""
+    import sqlite3
+
+    from .await_store import AwaitConflict
+    from .models import now_ms
+    from .transfer_store import ACCEPTED, FINALIZED
+
+    try:
+        moved = store.accept_transfer(transfer.transfer_id, now_ms())
+    except (AwaitConflict, sqlite3.Error) as exc:
+        store.note_transfer(transfer.transfer_id, now_ms(), failure=f"await rebind: {exc}")
+        print(
+            f"error: could not move the await group to this session — {exc}. The transfer "
+            f"stays {transfer.state} and ownership is unchanged; fix the cause and run accept "
+            "again.",
+            file=sys.stderr,
+        )
+        return None
+    if moved is None:  # lost the CAS: fine only when a racing accept already won
+        current = store.get_transfer(transfer.transfer_id)
+        if current is None or current.state not in (ACCEPTED, FINALIZED):
+            print(f"error: transfer {transfer.transfer_id} changed state", file=sys.stderr)
+            return None
+        return []
+    return [
+        f"await group {group.id} ({group.state}) now wakes this session (`ccc await -l` lists it)"
+        for group in moved
+    ]
+
+
 def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
-    """``continue-session accept``: the successor takes the work over (hooks, then CAS)."""
+    """``continue-session accept``: the successor takes the work over (hooks, then CAS
+    plus the await rebind in one transaction)."""
     from . import accounts, config
     from .models import now_ms
     from .store import Store
@@ -997,6 +1046,11 @@ def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-ret
                 file=sys.stderr,
             )
             return 1
+        refusal = _await_collision(store, transfer)
+        if refusal:  # checked BEFORE any hook ran (and again inside the accept transaction)
+            store.note_transfer(transfer.transfer_id, now_ms(), failure=f"await: {refusal}")
+            print(f"error: {refusal}", file=sys.stderr)
+            return 1
         steps: list[str] = []
         try:
             for template in config.load_config().handoff_hooks:
@@ -1009,17 +1063,11 @@ def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-ret
                 file=sys.stderr,
             )
             return 1
-        now = now_ms()
-        store.transition_transfer(transfer.transfer_id, OPENED, now)  # a launcher race
-        if not store.transition_transfer(transfer.transfer_id, ACCEPTED, now):
-            current = store.get_transfer(transfer.transfer_id)
-            if current is None or current.state not in (ACCEPTED, FINALIZED):
-                print(
-                    f"error: transfer {transfer.transfer_id} changed state",
-                    file=sys.stderr,
-                )
-                return 1
-        store.note_transfer(transfer.transfer_id, now, failure="")
+        moved = _accept_and_rebind(store, transfer)
+        if moved is None:
+            return 1
+        steps += moved
+        store.note_transfer(transfer.transfer_id, now_ms(), failure="")
     if args.json:
         print(json.dumps({"ok": True, "transfer": transfer.transfer_id, "next_steps": steps}))
     else:

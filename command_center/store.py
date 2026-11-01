@@ -732,6 +732,9 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         "fresh": "INTEGER NOT NULL DEFAULT 0",
         # Opaque launch-profile label the armed session ran under ("" = bare claude).
         "launch_profile": "TEXT NOT NULL DEFAULT ''",
+        # The handoff transfer the group is reserved under (NULL = not reserved, which is
+        # what every group armed before reservations existed correctly means).
+        "transfer_id": "TEXT",
     }
 
     _ADDED_TRANSFER_COLUMNS = {"launch_profile": "TEXT", "facts_snapshot": "TEXT"}

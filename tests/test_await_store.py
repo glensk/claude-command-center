@@ -16,8 +16,9 @@ import pytest
 from awaitstub import seeded_store as _store
 
 from command_center import store as store_mod
-from command_center.await_store import GRACE_SEC, AwaitConflict, SourceSpec
+from command_center.await_store import GRACE_SEC, AwaitConflict, AwaitGroup, SourceSpec
 from command_center.store import Store
+from command_center.transfer_store import Transfer, TransferConflict
 
 NOW = 1_800_000_000
 
@@ -466,3 +467,134 @@ def test_notice_claims_are_once(tmp_path: Path) -> None:
     assert not store.claim_group_notice(gid, NOW)
     assert store.claim_source_notice(src.id, NOW)
     assert not store.claim_source_notice(src.id, NOW)
+
+
+# --------------------------------------------------------------------------- handoff reservation
+NEW = "s2"
+
+
+def _transfer(store: Store, tid: str = "t1") -> Transfer:
+    """A ``prepared`` handoff of ``s1`` to ``s2`` (another account dir, cwd and profile)."""
+    if store.get(NEW) is None:
+        store.ensure(NEW, cwd="/repo2")
+    return store.create_transfer(
+        Transfer(
+            transfer_id=tid,
+            source_session="s1",
+            target_session=NEW,
+            target_config_dir="/acct2",
+            cwd="/repo2",
+            no_codex=True,
+            launch_profile="lbl",
+        ),
+        NOW * 1000,
+    )
+
+
+def _group(store: Store, gid: int) -> AwaitGroup:
+    group = store.get_await_group(gid)
+    assert group is not None
+    return group
+
+
+def test_transfer_id_column_is_added_to_a_pre_existing_db(tmp_path: Path) -> None:
+    db = tmp_path / "old.db"
+    with Store(db) as store:
+        store.ensure("s1", cwd="/repo")
+        gid = _arm(store)
+    conn = sqlite3.connect(db)
+    conn.execute("ALTER TABLE await_groups DROP COLUMN transfer_id")
+    conn.commit()
+    conn.close()
+    with Store(db) as store:
+        cols = {r["name"] for r in store.conn.execute("PRAGMA table_info(await_groups)")}
+        assert "transfer_id" in cols
+        assert _group(store, gid).transfer_id == ""  # NULL on an old row = not reserved
+        assert not store.is_reserved(gid)
+
+
+def test_create_transfer_reserves_the_source_group_in_its_transaction(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    gid = _arm(store)
+    _transfer(store)
+    assert _group(store, gid).transfer_id == "t1" and store.is_reserved(gid)
+    assert [g.id for g in store.reserved_awaits("t1")] == [gid]
+    with pytest.raises(TransferConflict):
+        _transfer(store, "t2")
+    assert _group(store, gid).transfer_id == "t1"  # the loser reserved nothing
+
+
+def test_a_failed_insert_reserves_nothing(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    gid = _arm(store)
+    store.conn.execute(  # an active transfer that predates the reservation column
+        "INSERT INTO transfers (transfer_id, source_session, state) VALUES ('t0', 's1', 'opened')"
+    )
+    store.conn.commit()
+    with pytest.raises(TransferConflict):
+        _transfer(store)
+    assert _group(store, gid).transfer_id == ""  # rolled back with the INSERT
+
+
+def test_a_reserved_fired_group_is_not_claimed_until_the_transfer_fails(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    gid, token = _fired(store)
+    _transfer(store)
+    assert not store.mark_delivering(gid, token, NOW)
+    assert _group(store, gid).state == "fired"
+    assert store.transition_transfer("t1", "failed", NOW * 1000 + 5, failure="launch: x")
+    released = _group(store, gid)
+    assert (released.transfer_id, released.session_id, released.state) == ("", "s1", "fired")
+    assert store.mark_delivering(gid, token, NOW)  # delivered to the source as usual
+
+
+def test_a_reservation_of_an_ended_transfer_no_longer_defers(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    gid, token = _fired(store)
+    _transfer(store)
+    store.conn.execute("UPDATE transfers SET state = 'finalized' WHERE transfer_id = 't1'")
+    store.conn.commit()
+    assert not store.is_reserved(gid)
+    assert store.mark_delivering(gid, token, NOW)
+
+
+def test_accept_rebinds_every_launch_field_and_resets_a_stale_delivery(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    gid, token = _fired(store)
+    assert store.mark_delivering(gid, token, NOW)  # claimed for the source before the handoff
+    _transfer(store)
+    moved = store.accept_transfer("t1", NOW * 1000 + 9)
+    assert moved is not None and [g.id for g in moved] == [gid]
+    group = _group(store, gid)
+    assert (group.session_id, group.config_dir, group.cwd) == (NEW, "/acct2", "/repo2")
+    assert (group.no_codex, group.launch_profile, group.transfer_id) == (True, "lbl", "")
+    assert group.state == "fired" and group.delivery_token and group.delivery_token != token
+    assert not store.mark_delivered(gid, token, NOW)  # the source's stale tab cannot claim it
+    assert store.get_transfer("t1").state == "accepted"  # type: ignore[union-attr]
+    assert store.active_await("s1") is None and store.active_await(NEW) is not None
+    assert store.accept_transfer("t1", NOW * 1000 + 10) is None  # once only
+
+
+def test_accept_rebinds_a_blocked_group(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    gid, _token = _fired(store)
+    assert store.block_group(gid, "untrusted", NOW, from_states=("fired",))
+    _transfer(store)
+    moved = store.accept_transfer("t1", NOW * 1000 + 9)
+    assert moved is not None and [(g.id, g.state) for g in moved] == [(gid, "blocked")]
+    group = _group(store, gid)
+    assert (group.session_id, group.blocked_reason) == (NEW, "untrusted")
+
+
+def test_accept_rolls_back_when_the_target_already_holds_a_group(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    gid = _arm(store)
+    _transfer(store)
+    other = _arm(store, NEW)
+    with pytest.raises(AwaitConflict):
+        store.accept_transfer("t1", NOW * 1000 + 9)
+    assert store.get_transfer("t1").state == "prepared"  # type: ignore[union-attr]
+    group = _group(store, gid)
+    assert (group.session_id, group.transfer_id) == ("s1", "t1")
+    assert _group(store, other).session_id == NEW
+    assert not store.conn.in_transaction

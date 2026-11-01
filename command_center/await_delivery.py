@@ -31,6 +31,13 @@ The group is an outbox row keyed by its ``delivery_token``:
   skips the two checks that only protect a resume (the old transcript, a pending
   attached prompt); a failed registry read does not hold it back either.
 
+* **Reserved group** — a group whose session is being handed off
+  (``await_groups.transfer_id`` names a ``prepared``/``opened`` transfer) is DEFERRED: it
+  stays ``fired`` and is delivered after ``continue-session accept`` rebound it to the
+  successor, or after a failed transfer released it back to the source. The
+  ``fired → delivering`` CAS re-checks the reservation, so a pass racing the reservation
+  cannot claim it either.
+
 A ``delivering`` row nobody finished within :data:`STALE_DELIVERY_SEC` (a crash
 between the CAS and the send, a tab that never ran ``fire-await``) is handed back the
 same way. When the live-session registry cannot be read, NOTHING is delivered that
@@ -256,7 +263,12 @@ def deliver_pending(  # pylint: disable=too-many-arguments
     )
     for stale in store.stale_deliveries(now, STALE_DELIVERY_SEC):
         ctx.fail(stale, stale.delivery_token, "delivery did not complete")
-    fired = store.await_groups_in("fired")
+    fired = []
+    for group in store.await_groups_in("fired"):
+        if store.is_reserved(group.id):  # a pending handoff: it goes to whoever ends up owning it
+            report.waiting.append(group.id)
+        else:
+            fired.append(group)
     if not fired:
         return
     live_map: dict[str, LiveSession] = {}

@@ -592,6 +592,107 @@ def test_accept_refuses_the_wrong_session_and_the_wrong_account(
     assert cli.main(["continue-session", "accept", "t-missing"]) == 1
 
 
+def _arm_await(session_id: str) -> int:
+    from command_center.await_store import SourceSpec  # pylint: disable=import-outside-toplevel
+
+    with Store() as store:
+        return store.arm_await(
+            session_id,
+            config_dir="/cfg/work",
+            cwd="/repo",
+            no_codex=False,
+            prompt_template="got {event}",
+            until_epoch=2_000_000_000,
+            sources=[SourceSpec(kind="cmd", spec={"cmd": "true"})],
+            now=1_800_000_000,
+        )
+
+
+def _group(gid: int) -> Any:
+    with Store() as store:
+        group = store.get_await_group(gid)
+    assert group is not None
+    return group
+
+
+def _ok_hook(tmp_path: Path, log: Path) -> str:
+    return _script(tmp_path, "ok.sh", f"echo ran >> {log}\necho '{{\"ok\": true}}'\n")
+
+
+def test_a_failing_hook_moves_no_await_and_a_retry_moves_it_exactly_once(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    gid = _arm_await(SID)
+    tid = _opened_transfer(harness)
+    assert _group(gid).transfer_id == tid  # reserved by start, with the transfer
+    new = _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch, [_script(tmp_path, "bad.sh", "exit 3\n")])
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    assert _state(tid) == "opened"
+    group = _group(gid)
+    assert (group.session_id, group.transfer_id) == (SID, tid)  # no rebind
+    log = tmp_path / "ran.log"
+    _hooks(monkeypatch, [_ok_hook(tmp_path, log)])
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid, "-j"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["next_steps"] == [
+        f"await group {gid} (armed) now wakes this session (`ccc await -l` lists it)"
+    ]
+    group = _group(gid)
+    assert (group.session_id, group.transfer_id) == (new, "")
+    assert (group.config_dir, group.cwd, group.no_codex) == (str(harness.private), "/repo", True)
+    assert _state(tid) == "accepted"
+    assert cli.main(["continue-session", "accept", tid]) == 0  # a retry after success
+    assert "await group" not in capsys.readouterr().out
+    with Store() as store:
+        assert len(store.list_awaits(include_inactive=True)) == 1
+        assert store.active_await(SID) is None
+    assert _group(gid).updated_at == group.updated_at  # moved exactly once
+
+
+def test_accept_refuses_before_any_hook_when_the_successor_holds_an_await(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    gid = _arm_await(SID)
+    tid = _opened_transfer(harness)
+    new = _as_successor(monkeypatch, harness, tid)
+    held = _arm_await(new)
+    log = tmp_path / "ran.log"
+    _hooks(monkeypatch, [_ok_hook(tmp_path, log)])
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    err = capsys.readouterr().err
+    assert f"await group {held}" in err and f"ccc await -d {held}" in err
+    assert not log.exists()  # refused before any hook ran
+    assert _state(tid) == "opened"
+    assert (_group(gid).session_id, _group(gid).transfer_id) == (SID, tid)
+
+
+def test_accept_rebinds_a_blocked_await(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    gid = _arm_await(SID)
+    with Store() as store:
+        assert store.block_group(gid, "no viable source", 1, from_states=("armed",))
+    tid = _opened_transfer(harness)
+    new = _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch, [_ok_hook(tmp_path, tmp_path / "ran.log")])
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    group = _group(gid)
+    assert (group.state, group.session_id, group.blocked_reason) == (
+        "blocked",
+        new,
+        "no viable source",
+    )
+
+
 def test_status_names_the_recovery_step(
     harness: _Harness, capsys: pytest.CaptureFixture[str]
 ) -> None:

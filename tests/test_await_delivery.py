@@ -22,6 +22,7 @@ from command_center.await_prompt import FRAMING
 from command_center.await_store import SourceSpec
 from command_center.models import LiveSession
 from command_center.store import Store
+from command_center.transfer_store import Transfer
 
 NOW = 1_800_000_000
 SID = "11111111-2222-3333-4444-555555555555"
@@ -53,8 +54,14 @@ def env_fixture(tmp_path: Path) -> dict[str, Any]:
 
 
 def _fired(env: dict[str, Any], *, no_codex: bool = False, fresh: bool = False) -> int:
+    gid = _armed(env, no_codex=no_codex, fresh=fresh)
+    _fire(env, gid)
+    return gid
+
+
+def _armed(env: dict[str, Any], *, no_codex: bool = False, fresh: bool = False) -> int:
     store: Store = env["store"]
-    gid = store.arm_await(
+    return store.arm_await(
         SID,
         config_dir=env["acct"],
         cwd=env["cwd"],
@@ -67,6 +74,10 @@ def _fired(env: dict[str, Any], *, no_codex: bool = False, fresh: bool = False) 
         items=["zoho#209", "tp#12"],
         fresh=fresh,
     )
+
+
+def _fire(env: dict[str, Any], gid: int) -> None:
+    store: Store = env["store"]
     [(src, _grp)] = store.lease_due_sources(NOW + 120)
     token = store.fire_group(
         gid,
@@ -79,7 +90,6 @@ def _fired(env: dict[str, Any], *, no_codex: bool = False, fresh: bool = False) 
         now=NOW,
     )
     assert token
-    return gid
 
 
 def _live(env: dict[str, Any], **over: Any) -> LiveSession:
@@ -155,6 +165,63 @@ def test_launcher_false_retries_then_blocks(env: dict[str, Any]) -> None:
     # -R recovers it with the payload intact.
     assert env["store"].retry_group(gid, NOW + 300) == "fired"
     assert env["store"].get_await_group(gid).event_payload.startswith('{"source"')
+
+
+# --------------------------------------------------------------------------- handoff reservation
+NEW = "99999999-8888-7777-6666-555555555555"
+
+
+def _handoff(env: dict[str, Any]) -> str:
+    """A ``prepared`` handoff of SID to NEW (same account and cwd; NEW has its transcript)."""
+    store: Store = env["store"]
+    projects = Path(env["acct"]) / "projects" / env["cwd"].replace("/", "-")
+    (projects / f"{NEW}.jsonl").write_text("{}\n")
+    store.ensure(NEW, cwd=env["cwd"])
+    store.update_fields(NEW, config_dir=env["acct"])
+    transfer = store.create_transfer(
+        Transfer(
+            transfer_id="t1",
+            source_session=SID,
+            target_session=NEW,
+            target_config_dir=env["acct"],
+            cwd=env["cwd"],
+        ),
+        NOW * 1000,
+    )
+    return transfer.transfer_id
+
+
+def test_a_group_firing_while_reserved_is_deferred_then_delivered_to_the_successor(
+    env: dict[str, Any],
+) -> None:
+    store: Store = env["store"]
+    gid = _armed(env)
+    tid = _handoff(env)
+    _fire(env, gid)  # the wake arrives mid-handoff
+    report, typed, launched, _notes = _deliver(env)
+    assert not typed and not launched and report.waiting == [gid]
+    assert _state(env, gid) == "fired"
+    moved = store.accept_transfer(tid, (NOW + 210) * 1000)
+    assert moved is not None and [g.id for g in moved] == [gid]
+    report, _typed, launched, _notes = _deliver(env, now=NOW + 220)
+    group = store.get_await_group(gid)
+    assert group is not None and group.session_id == NEW
+    assert launched == [(gid, group.delivery_token)] and report.launched == [gid]
+    _report, _typed, again, _notes = _deliver(env, now=NOW + 230)
+    assert not again  # delivered once
+
+
+def test_a_failed_transfer_releases_the_group_to_the_source(env: dict[str, Any]) -> None:
+    store: Store = env["store"]
+    gid = _fired(env)
+    tid = _handoff(env)
+    _report, _typed, launched, _notes = _deliver(env)
+    assert not launched
+    assert store.transition_transfer(tid, "failed", (NOW + 210) * 1000, failure="launch: x")
+    report, _typed, launched, _notes = _deliver(env, now=NOW + 220)
+    group = store.get_await_group(gid)
+    assert group is not None and (group.session_id, group.transfer_id) == (SID, "")
+    assert launched == [(gid, group.delivery_token)] and report.launched == [gid]
 
 
 # --------------------------------------------------------------------------- live matrix
