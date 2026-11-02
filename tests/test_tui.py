@@ -207,7 +207,8 @@ def test_table_row_paints_only_low_aim_score_red(
             assert "20% improve things" in aim_cell.plain
             # The chip is right-aligned in a fixed 4-cell field so the AIM text starts at
             # the same column whatever the score's width ('-1' … '100%').
-            assert _styled_fragments(aim_cell, "bold red") == [" 20% "]
+            # The chip's separating space is the label run's leading pad, so it stays unred.
+            assert _styled_fragments(aim_cell, "bold red") == [" 20%"]
 
     asyncio.run(scenario())
 
@@ -789,6 +790,61 @@ def test_badge_and_id_share_one_tab_colour_chip(
     # 2-space lead, then ONE painted run holding badge + id (no uncoloured gap between them).
     assert id_cell.plain == f"   {badge} abcd "
     assert _styled_fragments(id_cell, style) == [f" {badge} abcd "]
+
+
+def test_aim_label_wears_the_id_chip_colour_only_on_open_tab_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The AIM label rides ` <label> ` on the id chip's tab colour; a closed row is unpainted.
+
+    Both rows reserve the same run, so the label starts at one column on every row.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))
+    monkeypatch.setenv("CCC_TAB_RGB_DIR", str(tmp_path / "iterm-tab-rgb"))
+
+    rgb_dir = tmp_path / "iterm-tab-rgb"
+    rgb_dir.mkdir(parents=True)
+    for slug in ("w0t0p0_UUID-A", "w0t1p0_UUID-B"):
+        (rgb_dir / slug).write_text("10;20;30\n", encoding="utf-8")  # both cached the colour
+
+    cwd = f"{_BASE}/home/repo-a"
+    open_sid = "abcd1234-1111-2222-3333-444444444444"
+    closed_sid = "ef561234-1111-2222-3333-444444444444"
+    store = Store(tmp_path / "command-center" / "state.db")
+    for sid, iterm in ((open_sid, "w0t0p0:UUID-A"), (closed_sid, "w0t1p0:UUID-B")):
+        store.ensure(sid, cwd=cwd)
+        store.update_fields(sid, status="idle", aim="iterm", iterm_session_id=iterm)
+    store.close()
+    _seed_live_registry(tmp_path, open_sid, os.getpid())  # only the first has an open tab
+    from command_center.adapters.claude import ClaudeAdapter
+
+    monkeypatch.setattr(ClaudeAdapter, "has_subagent", lambda self, pid: False)
+
+    from command_center.views.tui import _AIM_COL, CommandCenterApp, SessionTable, _bg_style
+
+    cells: dict[str, Text] = {}
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            table = app.query_one("#sessions", SessionTable)
+            for sid in (open_sid, closed_sid):
+                cells[sid] = table.get_row_at(table.get_row_index(sid))[_AIM_COL]
+
+    asyncio.run(scenario())
+    painted, closed = cells[open_sid], cells[closed_sid]
+    style = _bg_style((10, 20, 30))
+    # ONE painted run: the label padded by one space each side; lead + chip stay unpainted.
+    assert _styled_fragments(painted, style) == [" iterm "]
+    assert painted.plain.endswith(" iterm ")
+    assert not painted.plain.startswith(" iterm ")
+    # The closed row: no background anywhere, same plain text, same label column.
+    assert all("on #" not in str(span.style) for span in closed.spans)
+    assert "on #" not in str(closed.style)
+    assert closed.plain == painted.plain
+    assert closed.plain.index("iterm") == painted.plain.index("iterm")
 
 
 def test_two_open_tabs_same_colour_get_deduped_backgrounds(

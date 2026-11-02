@@ -3478,14 +3478,16 @@ class CommandCenterApp(App[None]):
         chip_style = "bold red" if low_score else (_DONE_STYLE if done else "grey46")
         aim = Text("  ")
         if chip:
-            aim.append(f"{chip:>4} ", style=chip_style)
+            aim.append(f"{chip:>4}", style=chip_style)
         else:
-            aim.append(" " * 5)
+            aim.append(" " * 4)
         # Show the compact short-AIM label (cheap-model) when present, else the full AIM.
-        aim.append(
-            (_first_line(display_aim(session, self._aim_first)) or "—")[:_AIM_MAX_CHARS],
-            style=aim_style,
-        )
+        # The label rides ONE ` <label> ` run: the chip's separating space is its leading
+        # pad, so the label text starts at the same column on every row. A row with an open
+        # tab paints that run with the id chip's tab colour; every other row keeps the same
+        # run unpainted (same width, same offset).
+        aim_text = (_first_line(display_aim(session, self._aim_first)) or "—")[:_AIM_MAX_CHARS]
+        aim.append(f" {aim_text} ", style=_bg_style(id_rgb) if id_rgb is not None else aim_style)
         if session.draft:
             # Future job: the next-step column doubles as a tags/notes column, carrying
             # any @tags plus the free-text start_when note (moved off the id column).
