@@ -655,6 +655,18 @@ def test_arming_a_retired_source_is_refused(tmp_path: Path) -> None:
     assert not store.conn.in_transaction
 
 
+def test_arming_a_finalized_source_is_refused(tmp_path: Path) -> None:
+    """accept finalizes at once (tp#1582): ``finalized`` must refuse like ``accepted``."""
+    store = _store(tmp_path)
+    _transfer(store)
+    assert store.accept_transfer("t1", NOW * 1000 + 9) == []
+    assert store.transition_transfer("t1", "finalized", NOW * 1000 + 10)
+    with pytest.raises(AwaitRefused, match="handed off \\(transfer t1 finalized\\)"):
+        _arm(store)
+    assert store.list_awaits("s1", include_inactive=True) == []
+    assert not store.conn.in_transaction
+
+
 def test_arming_a_pending_target_is_refused_until_the_transfer_ends(tmp_path: Path) -> None:
     store = _store(tmp_path)
     _transfer(store)

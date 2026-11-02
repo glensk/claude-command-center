@@ -226,6 +226,8 @@ def test_arming_on_a_pending_handoffs_source_joins_it(env: dict[str, Any], capsy
     [
         ("other-session", SID, "prepared", "successor of pending handoff t1"),
         (SID, "other-session", "accepted", "was handed off"),
+        # accept finalizes at once (tp#1582): a finalized source is retired just the same
+        (SID, "other-session", "finalized", "transfer t1 finalized"),
     ],
 )
 def test_arming_is_refused_by_a_handoff(  # pylint: disable=too-many-arguments,too-many-positional-arguments

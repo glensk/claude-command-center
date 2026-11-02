@@ -313,14 +313,15 @@ def handoff_join(conn: sqlite3.Connection, session_id: str) -> str:
     Runs inside the arm transaction. A session that is the SOURCE of a ``prepared``/
     ``opened`` transfer arms straight into that transfer's reservation, so a group armed
     after ``continue-session start`` moves to the successor like one armed before it.
-    :class:`AwaitRefused` for a retired source (its transfer is ``accepted``: the
-    successor owns the work, a wake bound here would resume a session being closed) and
-    for the TARGET of a ``prepared``/``opened`` transfer (accept moves the source's group
-    here, and a session holds one group; arm after accept).
+    :class:`AwaitRefused` for a retired source (its transfer is ``accepted`` or
+    ``finalized``: the successor owns the work, a wake bound here would resume a session
+    being closed — accept finalizes at once, so ``finalized`` is the usual retired state)
+    and for the TARGET of a ``prepared``/``opened`` transfer (accept moves the source's
+    group here, and a session holds one group; arm after accept).
     """
     rows = conn.execute(
         "SELECT transfer_id, source_session, state FROM transfers "
-        "WHERE (source_session = ? AND state IN ('prepared', 'opened', 'accepted')) "
+        "WHERE (source_session = ? AND state IN ('prepared', 'opened', 'accepted', 'finalized')) "
         "OR (target_session = ? AND state IN ('prepared', 'opened')) ORDER BY created_at",
         (session_id, session_id),
     ).fetchall()
@@ -332,9 +333,9 @@ def handoff_join(conn: sqlite3.Connection, session_id: str) -> str:
                 f"session {session_id[:8]} is the successor of pending handoff {tid} ({state}); "
                 f"run `ccc continue-session accept {tid}` first, then arm"
             )
-        if state == "accepted":
+        if state in ("accepted", "finalized"):
             raise AwaitRefused(
-                f"session {session_id[:8]} was handed off (transfer {tid} accepted); "
+                f"session {session_id[:8]} was handed off (transfer {tid} {state}); "
                 "arm the await in the successor session"
             )
         join = tid
