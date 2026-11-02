@@ -570,13 +570,15 @@ def _mark_retired(transfer: Any) -> None:
 
 
 def finalize(store: Store, transfer: Any, *, arm_close: bool = True) -> bool:
-    """Retire the source once the successor ACCEPTED: AIM, lineage, own close, CAS.
+    """Retire the source once the successor ACCEPTED: lineage, own close, CAS.
 
+    The source's AIM is never touched: it stays exactly as the user set it (no new
+    ``aim_history`` row either). The finished handoff shows as status ``handed_off`` plus
+    ``handed_off_to`` (the ``⇢ <id8>`` marker), written by ``set_handoff_lineage``.
     The session writes come first and are idempotent, the ``accepted → finalized`` CAS
     last — so a crash in between is healed by re-running ``accept`` in the successor
     (:func:`finalize_handoff_source` finds the still-``accepted`` transfer and finalizes
-    again; a still-running source ``start`` does the same). The source's ORIGINAL AIM stays in
-    its AIM history and in the transfer record. ``False`` when the transfer is not
+    again; a still-running source ``start`` does the same). ``False`` when the transfer is not
     ``accepted`` (any more).
     """
     from .models import now_ms
@@ -589,11 +591,7 @@ def finalize(store: Store, transfer: Any, *, arm_close: bool = True) -> bool:
         return True
     _mark_retired(current)  # idempotent; accept normally wrote it already
     now = now_ms()
-    target8 = current.target_session[:8]
     session = store.get(current.source_session)
-    final_aim = f"handoff accepted by session {target8}"
-    if session is not None and session.aim != final_aim:
-        store.set_aim(current.source_session, final_aim)
     store.set_handoff_lineage(current.source_session, current.target_session, now)
     if arm_close and session is not None:
         # ONE close token per source: a pending or in-flight close (another finalizer, a

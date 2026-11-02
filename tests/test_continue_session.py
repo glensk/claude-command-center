@@ -287,9 +287,7 @@ def test_start_hands_off_to_a_new_session_and_finalizes(
         assert [g.text for g in store.list_subgoals(target)] == ["test", "ship"]
         source = store.get(SID)
         assert source is not None
-        assert source.aim == f"handoff accepted by session {target[:8]}"
-        assert "tp#" not in source.aim
-        assert [rev.aim for rev in store.list_aim_history(SID)][0] == "tp#1 shipped"
+        assert source.aim == "tp#1 shipped"  # finalize never rewrites the source AIM
         assert source.handed_off_to == target and source.status == "handed_off"
         assert source.close_requested_at > 0 and not source.done
 
@@ -889,6 +887,30 @@ def test_finalize_twice_keeps_the_same_close_token(
         assert _state(tid) == "finalized"
 
 
+def test_b7_finalize_keeps_the_source_aim_and_its_history(harness: _Harness) -> None:
+    """finalize never writes the source AIM: the handoff shows as handed_off + marker."""
+    from command_center.models import handoff_marker  # pylint: disable=C0415
+    from command_center.transfer_store import ACCEPTED  # pylint: disable=C0415
+
+    tid = _opened_transfer(harness)
+    with Store() as store:
+        store.transition_transfer(tid, ACCEPTED, 1)
+        transfer = store.get_transfer(tid)
+        assert transfer is not None
+        before = store.get(SID)
+        assert before is not None
+        history = [(r.aim, r.set_by) for r in store.list_aim_history(SID)]
+        assert continue_session.finalize(store, transfer)
+        source = store.get(SID)
+        assert source is not None
+        assert source.aim == before.aim == "tp#1 shipped"
+        assert [(r.aim, r.set_by) for r in store.list_aim_history(SID)] == history
+        target = transfer.target_session
+        assert source.handed_off_to == target and source.status == "handed_off"
+        assert handoff_marker(source) == f"⇢ {target[:8]}"
+    assert _state(tid) == "finalized"
+
+
 def test_no_retired_marker_without_the_relay_state_dir(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1184,8 +1206,8 @@ def test_accept_finalizes_an_idle_source_whose_start_timed_out(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The reported sequence: start exits 3, the source sits idle, the successor accepts —
-    the transfer is finalized, AIM and lineage move, ONE closer is spawned, and nothing
-    runs in the source (no second start, no launch)."""
+    the transfer is finalized, lineage moves (the AIM stays), ONE closer is spawned, and
+    nothing runs in the source (no second start, no launch)."""
     tid = _opened_transfer(harness)  # start timed out: the source is idle from here on
     new = _as_successor(monkeypatch, harness, tid)
     _hooks(monkeypatch)
@@ -1201,7 +1223,7 @@ def test_accept_finalizes_an_idle_source_whose_start_timed_out(
     }
     assert _state(tid) == "finalized"
     row = _source_row()
-    assert row.aim == f"handoff accepted by session {new[:8]}"
+    assert row.aim == "tp#1 shipped"  # finalize never rewrites the source AIM
     assert row.handed_off_to == new and row.status == "handed_off"
     assert row.close_token and row.close_requested_at > 0  # pending: the closer claims it
     assert harness.spawned == [_closer(tid)]
