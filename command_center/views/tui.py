@@ -95,6 +95,7 @@ from ..adapters.claude import ClaudeAdapter
 from ..await_view import AWAITING_HINT, AWAITING_LABEL, AwaitEntry, visible_awaits
 from ..core import Row, build_rows
 from ..models import (
+    AIM_SET_BY_USER,
     DEFAULT_LLM,
     DEP_MARKER,
     HALTED_RESUME_HELP,
@@ -5510,7 +5511,7 @@ class CommandCenterApp(App[None]):
         def _save(value: str) -> None:
             # Route through the chokepoint: clears the stale auto checklist + sets an
             # instant score; then refine the score out-of-band (detached, non-blocking).
-            if store.set_aim(sid, value) and self.cfg.aim_score_on_set:
+            if store.set_aim(sid, value, set_by=AIM_SET_BY_USER) and self.cfg.aim_score_on_set:
                 from .. import spawn  # pylint: disable=import-outside-toplevel
 
                 spawn.spawn_ccc(["score-aim", "--session", sid])
@@ -5876,7 +5877,7 @@ class CommandCenterApp(App[None]):
         subgoals = self.query_one("#edit-subgoals", TextArea).text
 
         if aim != original.get("aim", ""):
-            if store.set_aim(sid, aim) and self.cfg.aim_score_on_set:
+            if store.set_aim(sid, aim, set_by=AIM_SET_BY_USER) and self.cfg.aim_score_on_set:
                 from .. import spawn  # pylint: disable=import-outside-toplevel
 
                 spawn.spawn_ccc(["score-aim", "--session", sid])

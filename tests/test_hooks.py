@@ -870,3 +870,23 @@ def test_user_prompt_aim_non_blocking_sets_and_asks_for_one_line(
     assert '"decision"' not in out and "additionalContext" in out and "new aim" in out
     got = Store().get("s1")
     assert got is not None and got.aim == "new aim" and not got.aim_prev
+
+
+@pytest.mark.usefixtures("home")
+def test_b5_env_aim_is_stamped_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``CLAUDE_SESSION_AIM`` at session start is the launcher's AIM: stamped ``launch``."""
+    monkeypatch.setenv("CLAUDE_SESSION_AIM", "launched aim")
+    hooks.handle_session_start({"session_id": "s1", "cwd": "/repo"})
+    assert [(r.aim, r.set_by) for r in Store().list_aim_history("s1")] == [
+        ("launched aim", "launch")
+    ]
+
+
+@pytest.mark.usefixtures("home")
+def test_b5_aim_intercept_is_stamped_user(capsys: pytest.CaptureFixture[str]) -> None:
+    """A typed ``/aim <text>`` is the user's AIM: stamped ``user``."""
+    _set_cfg(aim_intercept_block=False)
+    Store().ensure("s1", cwd="/repo")
+    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": "/aim typed aim"})
+    capsys.readouterr()
+    assert [(r.aim, r.set_by) for r in Store().list_aim_history("s1")] == [("typed aim", "user")]

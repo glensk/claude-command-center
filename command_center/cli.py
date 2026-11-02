@@ -59,6 +59,8 @@ from .config import LaunchProfileError
 from .inflight import background_work as _background_work
 from .inflight import counter_split as _counter_split
 from .models import (
+    AIM_SET_BY_CLI_CHOICES,
+    AIM_SET_BY_USER,
     BUSY_RAW_STATUSES,
     DEFAULT_LLM,
     EFFORT_LEVELS,
@@ -348,6 +350,8 @@ def cmd_set_aim(args: argparse.Namespace) -> int:
             "error: --first cannot empty the first AIM (pass the corrected text)", file=sys.stderr
         )
         return 1
+    # Who wrote this revision (aim_history.set_by, tp#1566): the user unless a tool says so.
+    set_by = getattr(args, "by", None) or AIM_SET_BY_USER
     with Store() as store:
         store.ensure(session_id, cwd=os.getcwd())
         if first:
@@ -357,14 +361,15 @@ def cmd_set_aim(args: argparse.Namespace) -> int:
             # regenerated either way: it is built from the original AIM as a hint, so it went
             # stale with this rewrite (set_first_aim dropped it).
             rescore = store.count_aim_history(session_id) <= 1
-            changed = store.set_first_aim(session_id, args.text)
+            changed = store.set_first_aim(session_id, args.text, set_by=set_by)
             if not changed:
                 print(f"first aim unchanged for {session_id}")
                 return 0
             print(f"first aim rewritten for {session_id}")
         else:
             rescore = True
-            changed = store.set_aim(session_id, args.text)  # clears stale auto checklist + offset
+            # clears stale auto checklist + offset
+            changed = store.set_aim(session_id, args.text, set_by=set_by)
             print(f"aim set for {session_id}")
     # On a real change, detached so we never block the caller: (a) refine the instant
     # lexical AIM score with a cheap LLM call, and (b) regenerate the short-AIM label
@@ -807,7 +812,8 @@ def cmd_aim_history(args: argparse.Namespace) -> int:
         )
         score = f"{rev.score}%" if rev.score >= 0 else "—"
         marker = "  ← current" if index == len(revisions) else ""
-        print(f"  {index}. {when}  ·  {score:>4}  {rev.aim}{marker}")
+        by = rev.set_by or "-"  # who wrote it (tp#1566); "-" = a legacy, unstamped row
+        print(f"  {index}. {when}  ·  {score:>4}  ·  {by:<6}  {rev.aim}{marker}")
         if rev.short_aim:  # the cheap-model short label tracked for this revision
             print(f"        ↳ short: {rev.short_aim}")
     return 0
@@ -6245,6 +6251,14 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="rewrite the FIRST recorded AIM (/aim (1)) in place instead of setting "
         "the current one — fixes how the original goal was stated, adds no revision",
+    )
+    p_set_aim.add_argument(
+        "-b",
+        "--by",
+        choices=AIM_SET_BY_CLI_CHOICES,
+        default=AIM_SET_BY_USER,
+        help="who sets this AIM, stamped on its history row (default: user; a tool "
+        "passes 'tool' so the handover never carries it as the user's AIM)",
     )
     p_set_aim.set_defaults(func=cmd_set_aim)
 

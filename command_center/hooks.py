@@ -36,6 +36,8 @@ from typing import Any
 
 from . import config, switch_intercept
 from .models import (
+    AIM_SET_BY_LAUNCH,
+    AIM_SET_BY_USER,
     CloseClaim,
     Session,
     SwitchClaim,
@@ -400,7 +402,9 @@ def handle_session_start(payload: dict[str, Any]) -> int:
             # arrival — a bare write left aim_score at -1, so a hook-seeded AIM was
             # never graded for vagueness. set_aim sets the instant lexical score;
             # the detached score-aim then refines it via one cheap LLM call.
-            if store.set_aim(sid, env_aim.strip()) and config.load_config().aim_score_on_set:
+            # Stamped `launch`: the launcher wrote it, not the user at the prompt (tp#1566).
+            seeded = store.set_aim(sid, env_aim.strip(), set_by=AIM_SET_BY_LAUNCH)
+            if seeded and config.load_config().aim_score_on_set:
                 from . import spawn  # lazy: keep the hook import light
 
                 spawn.spawn_ccc(["score-aim", "--session", sid])
@@ -461,7 +465,7 @@ def _intercept_aim(store: Store, sid: str, current: str | None, text: str, block
     line redraws immediately and no error-looking label appears.
     """
     if text:
-        store.set_aim(sid, text)
+        store.set_aim(sid, text, set_by=AIM_SET_BY_USER)
         session = store.get(sid)
         if session is not None:
             from . import tabsymbol  # lazy: AppleScript layer

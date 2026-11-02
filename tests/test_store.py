@@ -9,6 +9,9 @@ from pathlib import Path
 import pytest
 
 from command_center.models import (
+    AIM_SET_BY_LAUNCH,
+    AIM_SET_BY_TOOL,
+    AIM_SET_BY_USER,
     DEFAULT_LLM,
     CloseClaim,
     LiveSession,
@@ -1431,3 +1434,125 @@ def test_claim_draft_stamps_the_launch_pid(tmp_path: Path) -> None:
     assert store.claim_draft("j2") is True  # no pid: the column is left alone
     assert store.get("j2").last_seen_pid is None  # type: ignore[union-attr]
     store.close()
+
+
+# ---- B5 (tp#1566): aim_history.set_by + latest_user_aim -----------------------------
+
+
+def _stamps(store: Store, sid: str) -> list[tuple[str, str | None]]:
+    return [(rev.aim, rev.set_by) for rev in store.list_aim_history(sid)]
+
+
+def test_b5_set_aim_stamps_the_new_row_and_defaults_to_null(tmp_path: Path) -> None:
+    """``set_aim`` stamps only the row it appends; no stamp leaves it NULL."""
+    with _store(tmp_path) as store:
+        store.ensure("s1", cwd="/repo")
+        store.set_aim("s1", "first", set_by=AIM_SET_BY_LAUNCH)
+        store.set_aim("s1", "second", set_by=AIM_SET_BY_USER)
+        store.set_aim("s1", "third", set_by=AIM_SET_BY_TOOL)
+        store.set_aim("s1", "fourth")
+        assert _stamps(store, "s1") == [
+            ("first", "launch"),
+            ("second", "user"),
+            ("third", "tool"),
+            ("fourth", None),
+        ]
+
+
+def test_b5_seeded_pre_history_original_stays_null(tmp_path: Path) -> None:
+    """The seeded original of a pre-history AIM is unstamped; the new row carries the stamp."""
+    with _store(tmp_path) as store:
+        store.ensure("s1", cwd="/repo")
+        store.update_fields("s1", aim="legacy aim")  # predates history: no row
+        store.set_aim("s1", "new aim", set_by=AIM_SET_BY_USER)
+        assert _stamps(store, "s1") == [("legacy aim", None), ("new aim", "user")]
+
+
+def test_b5_create_draft_stamps_user_by_default(tmp_path: Path) -> None:
+    """Job creation is the user's act: ``create_draft`` stamps ``user`` unless told otherwise."""
+    with _store(tmp_path) as store:
+        store.create_draft("j1", "/repo", "ship the job")
+        store.create_draft("j2", "/repo", "carried aim", aim_set_by=None)
+        assert _stamps(store, "j1") == [("ship the job", "user")]
+        assert _stamps(store, "j2") == [("carried aim", None)]
+
+
+def test_b5_set_first_aim_stamps_the_row_it_rewrites(tmp_path: Path) -> None:
+    """``set_first_aim`` re-stamps revision (1) in place (default ``user``), nothing else."""
+    with _store(tmp_path) as store:
+        store.ensure("s1", cwd="/repo")
+        store.set_aim("s1", "launched aim", set_by=AIM_SET_BY_LAUNCH)
+        store.set_aim("s1", "tool aim", set_by=AIM_SET_BY_TOOL)
+        assert store.set_first_aim("s1", "restated first aim") is True
+        assert _stamps(store, "s1") == [("restated first aim", "user"), ("tool aim", "tool")]
+        assert store.set_first_aim("s1", "again", set_by=AIM_SET_BY_TOOL) is True
+        assert _stamps(store, "s1")[0] == ("again", "tool")
+
+
+def test_b5_migration_adds_set_by_and_leaves_legacy_rows_null(tmp_path: Path) -> None:
+    """An old DB without ``aim_history.set_by`` gains the column; its rows read NULL."""
+    from command_center import store as store_mod
+
+    db = tmp_path / "legacy.db"
+    legacy_schema = store_mod._SCHEMA.replace(
+        "    created_at  INTEGER NOT NULL DEFAULT 0,\n    set_by      TEXT\n",
+        "    created_at  INTEGER NOT NULL DEFAULT 0\n",
+    )
+    assert legacy_schema != store_mod._SCHEMA  # the replace really dropped the column
+    conn = sqlite3.connect(db)
+    conn.executescript(legacy_schema)
+    conn.execute("INSERT INTO sessions (session_id, cwd, aim) VALUES ('old', '/r', 'old aim')")
+    conn.execute(
+        "INSERT INTO aim_history (session_id, aim, score, created_at) "
+        "VALUES ('old', 'old aim', 40, 1)"
+    )
+    conn.commit()
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(aim_history)")}
+    conn.close()
+    assert "set_by" not in columns
+    with Store(db) as store:  # opening runs _ensure_columns → ALTER adds set_by
+        assert _stamps(store, "old") == [("old aim", None)]
+        store.set_aim("old", "new aim", set_by=AIM_SET_BY_USER)
+        assert _stamps(store, "old") == [("old aim", None), ("new aim", "user")]
+
+
+def test_b5_latest_user_aim_picks_the_newest_user_row(tmp_path: Path) -> None:
+    """The newest ``user`` row wins over later ``tool``/``launch``/unstamped rows."""
+    with _store(tmp_path) as store:
+        store.ensure("s1", cwd="/repo")
+        store.set_aim("s1", "A", set_by=AIM_SET_BY_USER)
+        store.set_aim("s1", "B", set_by=AIM_SET_BY_USER)
+        store.set_aim("s1", "B: tp#1", set_by=AIM_SET_BY_TOOL)
+        store.set_aim("s1", "handoff accepted by session 12345678")
+        assert store.latest_user_aim("s1") == ("B", "user")
+
+
+def test_b5_latest_user_aim_falls_back_to_the_stripped_current_aim(tmp_path: Path) -> None:
+    """Legacy history (no ``user`` row): the current AIM without its tp id run, stamp None."""
+    with _store(tmp_path) as store:
+        store.ensure("s1", cwd="/repo")
+        store.set_aim("s1", "A")
+        store.set_aim("s1", "B: tp#5, #6")
+        assert store.latest_user_aim("s1") == ("B", None)
+        # An AIM with no history rows at all (predates tracking) works the same way.
+        store.ensure("s2", cwd="/repo")
+        store.update_fields("s2", aim="plain words")
+        assert store.latest_user_aim("s2") == ("plain words", None)
+        # A multi-line AIM is kept whole (aimtext only reads the first line).
+        store.ensure("s3", cwd="/repo")
+        store.update_fields("s3", aim="line one\nline two")
+        assert store.latest_user_aim("s3") == ("line one\nline two", None)
+
+
+def test_b5_latest_user_aim_falls_back_to_the_first_row(tmp_path: Path) -> None:
+    """A run-only (or missing) current AIM falls back to the first row; nothing → None."""
+    with _store(tmp_path) as store:
+        store.ensure("s1", cwd="/repo")
+        store.set_aim("s1", "A", set_by=AIM_SET_BY_LAUNCH)
+        store.set_aim("s1", "tp#5")
+        assert store.latest_user_aim("s1") == ("A", "launch")
+        store.update_fields("s1", aim=None)
+        assert store.latest_user_aim("s1") == ("A", "launch")
+        store.ensure("empty", cwd="/repo")
+        assert store.latest_user_aim("empty") is None
+        assert store.latest_user_aim("unknown") is None

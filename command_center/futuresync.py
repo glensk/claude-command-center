@@ -66,7 +66,14 @@ from .future_files import (
     upsert_error_block,
     validate,
 )
-from .models import DEFAULT_LLM, JOB_TYPES, LLM_CHOICES, Session, now_ms
+from .models import (  # pylint: disable=wrong-import-position  # after the direct-run shim
+    AIM_SET_BY_USER,
+    DEFAULT_LLM,
+    JOB_TYPES,
+    LLM_CHOICES,
+    Session,
+    now_ms,
+)
 from .store import Store
 
 # A DB change is a "conflict" only if it happened more than this long after the last
@@ -1047,7 +1054,8 @@ def _import_file_wins(  # pylint: disable=too-many-arguments,too-many-positional
 
     new_aim = job.aim.strip()
     if new_aim != (session.aim or ""):  # type: ignore[attr-defined]
-        store.set_aim(session_id, new_aim)  # history + score chokepoint
+        # history + score chokepoint; the user edited the job file (tp#1566)
+        store.set_aim(session_id, new_aim, set_by=AIM_SET_BY_USER)
         _spawn_aim_jobs(cfg, session_id)
         changed.append("aim")
 

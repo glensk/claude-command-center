@@ -201,6 +201,20 @@ class AimRevision:
     score: int  # the AIM's specificity score when it became current (-1 if unknown)
     created_at: int  # epoch ms when this AIM became current (0 = unknown)
     short_aim: str | None = None  # the cheap-model short label for this AIM (None = not generated)
+    # Who wrote this revision (``aim_history.set_by``, tp#1566): one of AIM_SET_BY_USER,
+    # AIM_SET_BY_LAUNCH, AIM_SET_BY_TOOL; None for a row written before the stamp existed.
+    set_by: str | None = None
+
+
+#: ``aim_history.set_by`` stamps (tp#1566): the user (``!aim``, ``/aim``, TUI edits,
+#: job creation, default ``ccc set-aim``) …
+AIM_SET_BY_USER = "user"
+#: … the launcher, through ``CLAUDE_SESSION_AIM`` at session start …
+AIM_SET_BY_LAUNCH = "launch"
+#: … or a tool (``ccc set-aim --by tool``, a one-time cleanup). No agent writes the AIM.
+AIM_SET_BY_TOOL = "tool"
+#: The stamps ``ccc set-aim -b/--by`` accepts (``launch`` is the hook's own).
+AIM_SET_BY_CLI_CHOICES = (AIM_SET_BY_USER, AIM_SET_BY_TOOL)
 
 
 @dataclass

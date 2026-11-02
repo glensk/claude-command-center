@@ -457,6 +457,67 @@ def test_set_aim_first_rewrites_revision_one_without_adding_one(
         assert store.list_aim_history("s1")[0].aim == "first aim, restated: ccc ls lists it"
 
 
+def _b5_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    cfg = _no_score_cfg()
+    setattr(cfg, "short_aim", False)  # noqa: B010 — no detached label generator in the test
+    monkeypatch.setattr("command_center.cli.config.load_config", lambda: cfg)
+    (tmp_path / "command-center").mkdir(parents=True)
+    return tmp_path / "command-center" / "state.db"
+
+
+def test_b5_set_aim_by_defaults_to_user_and_accepts_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ccc set-aim`` stamps ``user`` by default, ``-b/--by tool`` stamps ``tool``."""
+    db = _b5_home(tmp_path, monkeypatch)
+    assert cli.main(["set-aim", "the user's aim", "--session", "s1"]) == 0
+    assert cli.main(["set-aim", "relay audit note", "--session", "s1", "-b", "tool"]) == 0
+    assert cli.main(["set-aim", "the user again", "--session", "s1", "--by", "user"]) == 0
+    with Store(db) as store:
+        assert [(r.aim, r.set_by) for r in store.list_aim_history("s1")] == [
+            ("the user's aim", "user"),
+            ("relay audit note", "tool"),
+            ("the user again", "user"),
+        ]
+    with pytest.raises(SystemExit):  # `launch` is the hook's own stamp, not a CLI choice
+        cli.main(["set-aim", "x", "--session", "s1", "--by", "launch"])
+
+
+def test_b5_set_aim_first_passes_by_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``ccc set-aim --first`` stamps the row it rewrites with ``--by`` (default ``user``)."""
+    db = _b5_home(tmp_path, monkeypatch)
+    with Store(db) as store:
+        store.ensure("s1", cwd="/repo")
+        store.set_aim("s1", "launched aim")  # unstamped
+        store.set_aim("s1", "second aim")
+    assert cli.main(["set-aim", "restated", "--session", "s1", "--first"]) == 0
+    with Store(db) as store:
+        assert store.list_aim_history("s1")[0].set_by == "user"
+    assert cli.main(["set-aim", "by a tool", "--session", "s1", "-f", "-b", "tool"]) == 0
+    with Store(db) as store:
+        history = store.list_aim_history("s1")
+    assert [(r.aim, r.set_by) for r in history] == [("by a tool", "tool"), ("second aim", None)]
+
+
+def test_b5_aim_history_prints_set_by(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``ccc aim-history`` shows each revision's ``set_by``; a legacy row shows ``-``."""
+    db = _b5_home(tmp_path, monkeypatch)
+    with Store(db) as store:
+        store.ensure("s1", cwd="/repo")
+        store.set_aim("s1", "legacy aim")
+        store.set_aim("s1", "user aim", set_by=models.AIM_SET_BY_USER)
+        store.set_aim("s1", "tool aim", set_by=models.AIM_SET_BY_TOOL)
+    capsys.readouterr()
+    assert cli.main(["aim-history", "--session", "s1"]) == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("  ")]
+    assert "·  -       legacy aim" in lines[0]
+    assert "·  user    user aim" in lines[1]
+    assert "·  tool    tool aim  ← current" in lines[2]
+
+
 def _sg_args(items: list[str], **kw: object) -> argparse.Namespace:
     base: dict[str, object] = {
         "session": "s1",
