@@ -1966,8 +1966,10 @@ reservation and a fired group is delivered to the source as usual. Finalize keep
 source AIM to `handoff accepted by session <new8>` (no tp id), status `handed_off`
 (terminal — `ccc ls` / the TUI show `⇢ <8-char successor>`; `limitswitch`, `resume.py`
 and the daemon's auto-resume refuse such a session), records `handed_off_to/from/at` and
-arms the source's OWN close (its Stop chain closes the tab). `ccc continue-session status`
-names the recovery step for every state.
+arms the source's OWN close (its Stop chain closes the tab). Once the transfer is
+`accepted`/`finalized` and the source's process is gone, the next reconcile pass marks the
+source done (it sinks to FINISHED; `handed_off_to` and the `⇢` marker stay).
+`ccc continue-session status` names the recovery step for every state.
 
 **`handoff_hooks`** (config, default `[]`, inert): argv templates run by `accept`, no
 shell, 60 s timeout (process group killed), stdout ≤ 64 KB and a JSON object with `"ok":

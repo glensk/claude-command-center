@@ -1217,8 +1217,10 @@ def derive_status(
     busy = live is not None and live.alive and (live.raw_status or "").lower() in BUSY_RAW_STATUSES
     if stored is not None and stored.handed_off_to:
         # Terminal like done (tp#1300): the work moved to the successor. Only a turn that is
-        # literally still running (the finalize message being written) reads WORKING.
-        return Status.WORKING if busy else Status.HANDED_OFF
+        # literally still running (the finalize message being written) reads WORKING. Once
+        # the reconcile pass closed it as done (handoff done), done wins like any done row.
+        done_or_handed = Status.DONE if stored.done else Status.HANDED_OFF
+        return Status.WORKING if busy else done_or_handed
     if stored is not None and stored.done:
         if busy:
             return Status.WORKING  # done, but still mid-turn — ✓ waits for the turn to end

@@ -349,6 +349,18 @@ def test_derive_status() -> None:
     assert derive_status(_live("idle", alive=False), Session("s"), halted=True) is Status.PARKED
 
 
+def test_derive_status_handed_off_and_done_after_the_handoff() -> None:
+    handed = Session("s", handed_off_to="new")
+    assert derive_status(_live("idle"), handed) is Status.HANDED_OFF
+    assert derive_status(None, handed) is Status.HANDED_OFF
+    assert derive_status(_live("busy"), handed) is Status.WORKING
+    # Closed as done once the handoff is done: done wins, a running turn still reads ▶.
+    closed = Session("s", handed_off_to="new", done=True)
+    assert derive_status(None, closed) is Status.DONE
+    assert derive_status(_live("idle", alive=False), closed) is Status.DONE
+    assert derive_status(_live("busy"), closed) is Status.WORKING
+
+
 def test_derive_status_snoozed() -> None:
     # A live background task refines an otherwise-IDLE session into SNOOZED …
     assert derive_status(_live("idle"), Session("s"), background=True) is Status.SNOOZED

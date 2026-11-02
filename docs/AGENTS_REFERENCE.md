@@ -317,7 +317,10 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
   account, after EVERY `handoff_hooks` entry succeeded (argv-only, bounded, JSON `"ok":
   true`); the source is retired only after `accepted` (`finalize`: idempotent session
   writes first, the `accepted → finalized` CAS last). A `handed_off` session is terminal and
-  refused by `limitswitch`, `resume.py` and the daemon's auto-resume.
+  refused by `limitswitch`, `resume.py` and the daemon's auto-resume (all keyed on
+  `handed_off_to`, never on `done`): `core.reconcile_pass` closes it as done (one
+  `handoff_done_sources` query per pass) once its transfer is `accepted`/`finalized` AND its
+  process is gone, and `set_handoff_lineage` never lifts a done source back out.
 - **The capped-seat summary goes through `llm_custom_command`** (`CCC_LLM_PURPOSE=
   handoff-summary`, a `llmrouting.PURPOSES` row) — never a provider of ccc's own — and its
   text passes the same `handoff_doc.validate` (scrub fail-closed) as a model-written one.

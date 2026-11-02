@@ -400,10 +400,31 @@ class TransferStoreMixin:
         self.conn.commit()
         return cur.rowcount == 1
 
+    def handoff_done_sources(self) -> set[str]:
+        """Not-done sessions whose handoff is done: the successor took over.
+
+        A source qualifies when its lineage names a successor (``handed_off_to``) and the
+        transfer to THAT successor is ``accepted`` or ``finalized``. Process liveness is the
+        caller's half of the condition (``core.reconcile_pass`` knows the registry). One
+        query, so a reconcile pass pays for it once, never per row.
+        """
+        rows = self.conn.execute(
+            "SELECT DISTINCT s.session_id FROM sessions s JOIN transfers t "
+            "ON t.source_session = s.session_id AND t.target_session = s.handed_off_to "
+            "WHERE s.done = 0 AND COALESCE(s.handed_off_to, '') != '' "
+            "AND t.state IN ('accepted', 'finalized')"
+        ).fetchall()
+        return {str(row[0]) for row in rows}
+
     def set_handoff_lineage(self, source: str, target: str, now: int) -> None:
-        """Mark *source* handed off to *target* (status ``handed_off``) and *target*'s origin."""
+        """Mark *source* handed off to *target* (status ``handed_off``) and *target*'s origin.
+
+        A source the reconcile pass already closed as done keeps its ``done`` status, so an
+        idempotent ``finalize`` re-run never lifts it back out of FINISHED.
+        """
         self.conn.execute(
-            "UPDATE sessions SET handed_off_to = ?, handed_off_at = ?, status = 'handed_off', "
+            "UPDATE sessions SET handed_off_to = ?, handed_off_at = ?, "
+            "status = CASE WHEN done = 1 THEN status ELSE 'handed_off' END, "
             "updated_at = ? WHERE session_id = ?",
             (target, now, now, source),
         )

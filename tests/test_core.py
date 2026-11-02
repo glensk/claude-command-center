@@ -286,6 +286,94 @@ def test_reconcile_stamps_closed_at_on_park_and_clears_on_reopen(tmp_path: Path)
     store.close()
 
 
+def _handed_off(store: Store, source: str, target: str, states: tuple[str, ...]) -> None:
+    """A source with lineage to *target* and its transfer walked through *states*."""
+    from command_center.transfer_store import Transfer  # pylint: disable=import-outside-toplevel
+
+    store.ensure(source)
+    store.update_fields(source, cwd="/x", status=Status.IDLE.value, closed_at=0)
+    store.ensure(target)
+    transfer = store.create_transfer(
+        Transfer(transfer_id="t" + source, source_session=source, target_session=target), 1
+    )
+    for state in states:
+        assert store.transition_transfer(transfer.transfer_id, state, 2)
+    store.set_handoff_lineage(source, target, 3)
+
+
+@pytest.mark.parametrize("states", [("opened", "accepted"), ("opened", "accepted", "finalized")])
+def test_reconcile_closes_a_gone_source_once_its_handoff_is_done(
+    tmp_path: Path, states: tuple[str, ...]
+) -> None:
+    """Accepted/finalized + process gone → done (FINISHED), lineage kept for the ⇢ marker."""
+    from command_center.core import reconcile  # pylint: disable=import-outside-toplevel
+    from command_center.models import handoff_marker  # pylint: disable=import-outside-toplevel
+
+    store = Store(tmp_path / "s.db")
+    _handed_off(store, "src", "successor-id", states)
+    before = now_ms()
+    reconcile(store, _StubAdapter())
+    got = store.get("src")
+    assert got is not None and got.done is True
+    assert got.status == Status.DONE.value and got.done_at >= before
+    assert got.handed_off_to == "successor-id" and got.handed_off_at == 3
+    assert got.closed_at >= before
+    assert handoff_marker(got) == "⇢ successo"
+    successor = store.get("successor-id")
+    assert successor is not None and successor.handed_off_from == "src"
+    rows = {r.session.session_id: r for r in build_rows(store, _StubAdapter())}
+    assert rows["src"].status is Status.DONE and rows["src"].is_finished is True
+    # An idempotent finalize re-run rewrites the lineage but never lifts it out of FINISHED.
+    store.set_handoff_lineage("src", "successor-id", 4)
+    again = store.get("src")
+    assert again is not None and again.status == Status.DONE.value and again.done is True
+    store.close()
+
+
+def test_reconcile_keeps_a_live_accepted_source_open(tmp_path: Path) -> None:
+    """The successor accepted but the source's process is still alive → not closed."""
+    from command_center.core import reconcile  # pylint: disable=import-outside-toplevel
+
+    store = Store(tmp_path / "s.db")
+    _handed_off(store, "src", "successor-id", ("opened", "accepted"))
+    reconcile(store, _LiveAdapter("src", "/x"))
+    got = store.get("src")
+    assert got is not None and got.done is False
+    assert got.status == Status.HANDED_OFF.value
+    store.close()
+
+
+def test_reconcile_closes_a_source_whose_registry_entry_is_dead(tmp_path: Path) -> None:
+    """A stale registry entry (pid gone) of a finished handoff counts as process gone."""
+    from command_center.core import reconcile  # pylint: disable=import-outside-toplevel
+
+    store = Store(tmp_path / "s.db")
+    _handed_off(store, "src", "successor-id", ("opened", "accepted"))
+    adapter = _LiveAdapter("src", "/x")
+    adapter._live.alive = False  # pylint: disable=protected-access
+    reconcile(store, adapter)
+    got = store.get("src")
+    assert got is not None and got.done is True and got.status == Status.DONE.value
+    assert got.handed_off_to == "successor-id"
+    store.close()
+
+
+@pytest.mark.parametrize("states", [(), ("opened",), ("failed",), ("opened", "failed")])
+def test_reconcile_keeps_a_source_whose_transfer_is_not_accepted(
+    tmp_path: Path, states: tuple[str, ...]
+) -> None:
+    """prepared / opened / failed → stays HANDED_OFF (not done), even with its process gone."""
+    from command_center.core import reconcile  # pylint: disable=import-outside-toplevel
+
+    store = Store(tmp_path / "s.db")
+    _handed_off(store, "src", "successor-id", states)
+    reconcile(store, _StubAdapter())
+    got = store.get("src")
+    assert got is not None and got.done is False
+    assert got.status == Status.HANDED_OFF.value and got.handed_off_to == "successor-id"
+    store.close()
+
+
 def test_reconcile_stamps_claude_version(tmp_path: Path) -> None:
     """reconcile() records the live session's Claude Code version, but a read miss
     (None) never clobbers a previously-stored value."""

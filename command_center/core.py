@@ -449,6 +449,12 @@ def _relevant_sessions(
     )
 
 
+def _handoff_done_fields() -> dict[str, object]:
+    """The done write for a source whose handoff is done — the same fields every done path
+    writes (``ccc mark-done``, the daemon's done check); the lineage columns are untouched."""
+    return {"done": True, "status": Status.DONE.value, "done_at": now_ms()}
+
+
 @dataclass(frozen=True)
 class ReconcilePass:
     """Everything one :func:`reconcile_pass` learned, so a build reads each source ONCE."""
@@ -494,6 +500,9 @@ def reconcile_pass(  # pylint: disable=too-many-locals,too-many-branches,too-man
     scans = store.transcript_scans()
     dirty: list[TranscriptScan] = []
     live_by_id: dict[str, LiveSession] = {ls.session_id: ls for ls in adapter.discover()}
+    # Handed-off sources whose successor took over (transfer accepted/finalized): ONE
+    # query per pass. Each is closed as done once its own process is gone (below).
+    handoff_done = store.handoff_done_sources()
     # Per-account settings.json effort, realpath-deduped: on this machine every
     # account's settings.json is the same stow file, so the resolved-path key reads it
     # once and reuses the value for the other account (never process one file twice).
@@ -519,6 +528,9 @@ def reconcile_pass(  # pylint: disable=too-many-locals,too-many-branches,too-man
             "last_response_at": adapter.last_activity_ms(live),
             "last_seen_pid": live.pid,
         }
+        if not live.alive and live.session_id in handoff_done:
+            # A stale registry entry of a finished handoff: the process is gone too.
+            fields.update(_handoff_done_fields())
         # Alive again — a stale close stamp no longer applies (resume/reopen).
         if stored is not None and stored.closed_at:
             fields["closed_at"] = 0
@@ -576,8 +588,12 @@ def reconcile_pass(  # pylint: disable=too-many-locals,too-many-branches,too-man
             updates["model"] = model
         if session.handed_off_to and not session.done:
             # Terminal (tp#1300): a handed-off session stays HANDED_OFF once its process is
-            # gone; closed_at is stamped on the first pass that sees it gone.
-            if session.status != Status.HANDED_OFF.value:
+            # gone; closed_at is stamped on the first pass that sees it gone. Once the
+            # handoff is done (the successor took over) it is closed as done instead, so it
+            # sinks to FINISHED; handed_off_to stays, keeping the lineage and the ⇢ marker.
+            if session.session_id in handoff_done:
+                updates.update(_handoff_done_fields())
+            elif session.status != Status.HANDED_OFF.value:
                 updates["status"] = Status.HANDED_OFF.value
             if not session.closed_at:
                 updates["closed_at"] = now_ms()
