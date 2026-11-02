@@ -143,8 +143,8 @@ def score_aim_lexical(aim: str | None) -> int:
     return max(0, min(100, score))
 
 
-# The published rubric the INDEPENDENT checker scores against — and the same one the
-# in-session sharpener is told to target. Transparent (not a black box) and reproducible:
+# The published rubric the INDEPENDENT checker scores against — and the same one the user
+# sharpens a vague AIM toward (with ``!aim``). Transparent (not a black box) and reproducible:
 # four criteria summing to 100, scored by a separate process so it never grades its own work.
 AIM_RUBRIC = """\
 Rate how CONCRETE and VERIFIABLE an AI coding session's done-condition (its "AIM") is — \
@@ -178,7 +178,8 @@ def score_aim_detailed(aim: str | None, cfg: Config, *, note: str = "") -> dict 
 
     Returns ``{"score": int, "criteria": {...}, "reason": str, "missing": str, "backend": str}``
     — the per-criterion breakdown makes the score reproducible, ``missing`` is the actionable
-    hint the sharpener optimizes against, and ``backend`` is ``"router"``.
+    hint for the user sharpening the AIM (``ccc score-aim --dry-run``), and ``backend`` is
+    ``"router"``.
 
     *note* is the session's first AIM — exported (with the ``aim-score`` purpose) into the
     rung subprocesses' env as ``CCC_LLM_NOTE`` / ``CCC_LLM_PURPOSE``, log/route metadata

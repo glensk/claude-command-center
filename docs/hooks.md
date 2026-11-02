@@ -27,7 +27,7 @@ own the wiring: delete the forwarder, don't wrap it.
 | Event               | ccc does                                                                          |
 | :------------------ | :-------------------------------------------------------------------------------- |
 | **SessionStart**    | registers the session, seeds its AIM from `$CLAUDE_SESSION_AIM`, badges its tab   |
-| **UserPromptSubmit** | nags to set an AIM if missing; nudges to sharpen a vague AIM / re-align sub-goals / tick finished items |
+| **UserPromptSubmit** | nags to set an AIM if missing; nudges to re-align sub-goals / tick finished items (never to rewrite the AIM: it is static, and an AIM change is not announced to the agent) |
 | **PreToolUse** (`Edit\|Write\|MultiEdit\|NotebookEdit`) | acquires the cross-session file lock on the target file (or denies + queues) |
 | **PostToolUse**     | forwards the session's live `TodoWrite`/Task list into ccc; nudges the lock holder to hand off when a peer waits |
 | **Stop**            | end-of-turn: spawns the detached progress grader / AIM-met assessment (when enabled) |

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """An AIM's words and its work-item ids: ``fix decide: tp#1363, #1364`` (tp#1366).
 
-A session's AIM may end in the run of work items it holds — ``<few words>: tp#N, #M``, the
-form an external tracker keeps up to date with ``ccc set-aim`` — or, in the older form,
+A session's AIM may end in a run of work-item ids — ``<few words>: tp#N, #M``, as the user
+typed it (the AIM is static: no tracker rewrites it, tp#1566) — or, in the older form,
 lead with it (``tp#N, #M: <few words>``). This module splits the two parts so a tab
 title can show the words alone, a staff session's ``/aim`` row the ids alone, and the
 status line can clip the words without cutting the ids off.

@@ -31,11 +31,16 @@ flags. Grouped by what they do:
 **AIM, progress & the checkers**
 
 - `ccc set-aim "<done-when>"` — set the done-condition (the single chokepoint for CLI/TUI/hook);
-  `-f/--first` instead rewrites the FIRST recorded AIM (`/aim (1)`) in place, adding no revision.
+  `-f/--first` instead rewrites the FIRST recorded AIM (`/aim (1)`) in place, adding no revision;
+  `-b/--by {user,tool}` (default `user`) stamps who wrote it on the history row (`set_by`), so a
+  tool that writes an AIM passes `--by tool` and the handover never carries it as the user's AIM.
+  The AIM is static: only the user sets it (`!aim`, `/aim`, the TUI); no agent and no tracker
+  rewrites it, and a change is not announced to the agent (no "AIM changed" notice).
 - `ccc set-aim-eta [ETA]` (`-s/--session`, `-c/--clear`, `-g/--get`) — store the session's estimated time of done
   BESIDE the AIM (one line, ≤ 40 chars: `17:30`, `45 min`, `tomorrow`, `?`); never touches the AIM or anything
   derived from it. `-g` prints it back (empty line when none); the TUI detail pane shows it as `· ~<eta>`.
-- `ccc aim` · `ccc aim-history` — the current AIM / its first→current progression.
+- `ccc aim` · `ccc aim-history` — the current AIM / its first→current progression (each
+  revision with its `set_by` stamp: `user`, `launch`, `tool`, or `-` for a legacy row).
 - `ccc set-next` · `ccc set-blocked` · `ccc set-deadline` · `ccc set-donecheck` — the other job fields.
 - `ccc subgoals "step" …` (`--list`, `--adaptive`, `--merge`) — the progress checklist.
 - `ccc check <N>` (`--uncheck`) · `ccc subgoal-check <N> "<cmd>"` — tick an item / attach a shell predicate.
@@ -1538,7 +1543,8 @@ stuck bar, so the center scores every AIM for specificity (0–100):
 - **Below `aim_score_threshold` (default 50) only the `NN%` score chip renders red** in
   `ccc ls`, the TUI (table, detail, AIM history) and the status line — the AIM text itself
   stays its normal colour, so the red flags the *quality*, not the goal. The status line also
-  keeps its dim `⚠ vague — sharpen it` nudge.
+  keeps its dim `⚠ vague — sharpen it` nudge — addressed to the user, who sharpens it with
+  `!aim` / `/aim`.
 - **`aim_score = false`** hides the `NN%` chip (and the red/`⚠ vague` marker) in `ccc ls`,
   the TUI table/detail and the status line, and stops the daemon's score backfill. The
   stored score is kept; the AIM-history modal still lists it.
@@ -1555,8 +1561,9 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   inline expansion is no longer reliable: Claude Code may hand inline commands to the model.
 - **`aim_intercept = true`** (default): the `UserPromptSubmit` hook catches a typed
   `/aim <text>` and sets the AIM itself, then blocks the prompt — no model turn, no tokens.
-  A bare `/aim` just shows the current AIM. The agent learns the new AIM as context on the
-  next real prompt. With it off, `/aim` falls back to the `commands/aim.md` prompt.
+  A bare `/aim` just shows the current AIM. No "AIM changed" notice is injected on a
+  later turn (the AIM is static), so in block mode the change reaches the agent only through
+  the next session / handover. With it off, `/aim` falls back to the `commands/aim.md` prompt.
   Claude Code always labels a swallowed prompt "operation blocked by hook" — exit 2 /
   `decision: block` is the only no-turn path a `UserPromptSubmit` hook has.
   **`aim_intercept_block = false`** sets the AIM just the same but lets the prompt through
@@ -1578,13 +1585,12 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   `tab_name` (default: the agent id) as its WHOLE tab title, prefixed by its `symbol` (`<symbol> <tab_name>`, no badge, no AIM); its
   `/aim` row reads `/aim: 🎭<symbol> <tab_name> #123, #456` (the ids of the AIM's run).
   `ccc sessions -j` reports it as `display_name` with the agent id in `staff_agent`.
-- **Agent-driven sharpening with an independent checker.** While the AIM is vague, the
-  `UserPromptSubmit` hook nudges the running session **every turn** (`sharpen_every_n_turns`)
-  to rewrite it — *keeping your goal intact, only making it concrete* — grounded in what the
-  session has actually been doing (files edited, todo list, task in progress). The agent
-  drafts, then verifies each candidate against the **independent rubric checker** (a separate
-  routed `aim-score` call, blind to the
-  agent's reasoning), iterating on its `missing` hint until it clears the bar:
+- **The user sharpens a vague AIM; the agent never does.** The AIM is static: no hook tells
+  the agent to rewrite it (the former sharpen nudge and its `sharpen_every_n_turns` key are
+  gone; a `config.toml` that still names the key is ignored). The score and the red
+  `⚠ vague — sharpen it` tag stay, addressed to the user, who checks a sharper wording against
+  the **independent rubric checker** (a separate routed `aim-score` call) and applies it with
+  `!aim` / `/aim`:
 
   ```commands
   ccc score-aim --dry-run "<candidate>"   # → {"score":84,"criteria":{...},"reason":"…","missing":"…"}
@@ -1592,8 +1598,6 @@ stuck bar, so the center scores every AIM for specificity (0–100):
 
   The rubric is published (`aimscore.AIM_RUBRIC`) and reproducible — four criteria summing to
   100: observable end-state (30), objective check (30), bounded scope (20), no vague verbs (20).
-  Once a candidate passes, the agent **auto-applies** it (`ccc set-aim`) and prints old→new + the
-  one-line revert. The goal's meaning is never changed — only how concretely it is stated.
 - **Changing the AIM** drops the auto-derived checklist and resets the grading offset, so a
   fresh, AIM-aligned checklist re-derives (no stale 67%). For the turn it changed in, the status
   line shows the transition `/aim (N-1): <old>  ====> /aim (N) <new>` — always on **one** row
@@ -1684,8 +1688,8 @@ stuck bar, so the center scores every AIM for specificity (0–100):
 
 ### Adaptive sub-goals + impartial drift checker
 
-The AIM and its checklist form a **self-modifying goal loop** — the in-session agent
-sharpens the AIM each turn and re-derives sub-goals from it. Left unchecked, an agent
+The checklist is a **self-modifying goal loop** — the user's AIM stays fixed, but the
+in-session agent re-derives sub-goals from it and ticks them. Left unchecked, an agent
 can quietly move its own goalposts (drop scope, weaken a goal, inflate the bar). Two
 mechanisms keep it honest:
 
@@ -1942,7 +1946,7 @@ the successor only while it is still an unstarted draft; a `start` that timed ou
 differing fields. The prompt sha256 binds sha256(model part) and the facts snapshot id, not
 the composed text, and a re-run on an active `prepared`/`opened` transfer reuses its STORED
 snapshot and composed handoff without recollecting — so `start` → exit 3 → a ledger change
-→ the same `start` still reuses the transfer. The successor is a draft job (`create_draft`: the source's AIM, cwd,
+→ the same `start` still reuses the transfer. The successor is a draft job (`create_draft`: the source's latest user AIM — see below —, cwd,
 `no_codex`, the observed model unless `-O`/`-E` say otherwise, the unchecked sub-goals)
 launched through `start-job` in a new tab; its prompt is a short preamble (take over from
 session X, transfer T, FIRST run `ccc continue-session accept T`, then relaunch the agents
@@ -1974,8 +1978,22 @@ successor already holds an active group (naming `ccc await cancel`; no merge) an
 retryably while a reserved group is mid-delivery. The rebind (successor's session, account
 dir, cwd, `no_codex`, launch profile; every fired group under a fresh delivery token) runs
 in the `accepted` CAS's transaction after every hook; a `failed` transfer releases the
-reservation and a fired group is delivered to the source as usual. Finalize keeps the original AIM in the AIM history and the transfer, sets the
-source AIM to `handoff accepted by session <new8>` (no tp id), status `handed_off`
+reservation and a fired group is delivered to the source as usual.
+
+**The AIM carried over.** The successor's AIM is the LATEST AIM the user set in the source
+lineage (`Store.latest_user_aim`): the newest `aim_history` row stamped `set_by = user`;
+without one (legacy, unstamped history) the source's current AIM with its trailing tp id run
+stripped (`aimtext.words`); when that is empty (no AIM, or a run-only AIM) the source's first
+AIM; and only when the source has no AIM at all the `transfer.source_aim` recorded at `start`,
+then a generic `continue the work handed over by session <old8>`. The carried row keeps its
+stamp, so a chain A→B→C still finds the AIM the user set in B. `accept` copies the source's
+first AIM in as the successor's `/aim (1)` (`carry_first_aim`, stamp kept) and then
+reconciles once (`_reconcile_successor_aim`, idempotent): an AIM the user changed in the
+source between `start` and `accept` replaces the draft's. `transfer.source_aim` keeps the
+source's actual AIM at `start` for audit.
+
+Finalize does NOT touch the source's AIM (it stays exactly as the user set it, history
+included); the handoff shows as status `handed_off` + `handed_off_to`
 (terminal — `ccc ls` / the TUI show `⇢ <8-char successor>`; `limitswitch`, `resume.py`
 and the daemon's auto-resume refuse such a session), records `handed_off_to/from/at` and
 arms the source's OWN close (its Stop chain closes the tab). Once the transfer is

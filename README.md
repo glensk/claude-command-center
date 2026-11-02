@@ -15,9 +15,9 @@ even from your phone.
 
 **1. Give every session an AIM.** An AIM is a few words that define *"this session
 is done when: …"*. It sounds trivial; it changes how you work. `ccc` scores every AIM
-for concreteness (a vague AIM gets flagged red and the session sharpens it
-**automatically from context** — grounded in the files it actually edits and the task
-in progress, verified by an independent scorer), tracks progress against it as a
+for concreteness (a vague AIM gets flagged red by an independent scorer, so you sharpen
+it; the AIM stays exactly as you set it — no agent or tool rewrites it), tracks
+progress against it as a
 checklist bar, and — with the optional checkers
 on — an impartial second model grades whether the goal is actually *met*. You stop
 asking "what was this session even for?" because the session already told you.
@@ -100,7 +100,7 @@ and some are macOS-first (they drive iTerm2 / Karabiner). Honest table:
 | Textual TUI (`ccc`)           | arrow-key UI: cards, bars, category grouping, resume-in-new-tab                              | `textual`                                                          | always on                            |
 | Browser UI (`ccc serve`)      | the same TUI served to `localhost` (ships, but the author has not used it day-to-day so far) | `textual-serve`                                                    | `ccc serve`                          |
 | Hooks + status line           | `/aim` seeding, live progress in the status line, live todos                                 | Claude Code hooks                                                  | `ccc init` / `ccc install-hooks`     |
-| AIM concreteness score        | flags a vague AIM red; the session auto-sharpens it, verified by an independent scorer       | pluggable ladder: Copilot (opencode) / gemini-cli / codex / claude | `aim_score_on_set`                   |
+| AIM concreteness score        | flags a vague AIM red (independent scorer); you sharpen it with `!aim` / `/aim`              | pluggable ladder: Copilot (opencode) / gemini-cli / codex / claude | `aim_score_on_set`                   |
 | Sub-goal auto-derive + grade  | auto-builds + ticks the checklist so the bar moves on its own                                | a cheap LLM (Haiku)                                                | `autoprogress` / `grade_on_turn`     |
 | Drift + DONE checkers         | impartial second model grades goal-drift and "is the AIM met?"                               | a cheap LLM (Haiku)                                                | `drift_check` / `assess_aim_on_turn` |
 | Future jobs                   | park a described job, launch it later from terminal or Obsidian                              | Python only                                                        | always on                            |
@@ -139,7 +139,7 @@ A few features that don't fit in a one-liner but are the reason people keep it r
   holds back another's. A halt that ccc will revive shows a green `▶` after the red
   `||` (`||▶`); a bare `||` means it is stranded until you resume it yourself.
 - **Impartial drift + DONE checkers with published rubrics.** A long-running agent that
-  sharpens its own AIM and re-derives its own sub-goals can quietly move the goalposts.
+  re-derives its own sub-goals can quietly move the goalposts.
   A **separate** model — never the session agent, fed only the goals and the evidence —
   grades goal-drift and whether the AIM is genuinely met, against a fixed, published
   rubric. A confirmed drift shows a blue `●`; a met AIM shows a red `DONE` stamped

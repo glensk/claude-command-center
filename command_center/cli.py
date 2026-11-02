@@ -462,7 +462,7 @@ def cmd_score_aim(args: argparse.Namespace) -> int:
     """Score an AIM via the independent rubric checker.
 
     ``--dry-run "<candidate>"`` scores a *candidate* string and prints the JSON breakdown
-    WITHOUT touching the store — this is the loop the in-session sharpener iterates against.
+    WITHOUT touching the store — the user checks a sharper wording with it before ``!aim``.
     Otherwise it refines the *stored* AIM's score (the detached entry spawned after set-aim).
     """
     from . import aimscore, llm
