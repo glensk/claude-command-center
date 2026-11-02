@@ -479,6 +479,19 @@ def _write_handoff(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def _mark_retired(transfer: Any) -> None:
+    """Write the source's relay retired marker (tp#1536); a failure only warns — the
+    handoff itself never depends on the relay hooks."""
+    from . import relay_state
+
+    try:
+        relay_state.write_retired(
+            transfer.source_session, transfer.transfer_id, transfer.target_session
+        )
+    except OSError as exc:
+        print(f"warning: could not write the relay retired marker: {exc}", file=sys.stderr)
+
+
 def finalize(store: Store, transfer: Any, *, arm_close: bool = True) -> bool:
     """Retire the source once the successor ACCEPTED: AIM, lineage, own close, CAS.
 
@@ -496,6 +509,7 @@ def finalize(store: Store, transfer: Any, *, arm_close: bool = True) -> bool:
         return False
     if current.state == FINALIZED:
         return True
+    _mark_retired(current)  # idempotent; accept normally wrote it already
     now = now_ms()
     target8 = current.target_session[:8]
     session = store.get(current.source_session)
@@ -1211,6 +1225,7 @@ def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-ret
         if moved is None:
             return 1
         steps += moved
+        _mark_retired(transfer)
         store.note_transfer(transfer.transfer_id, now_ms(), failure="")
     if args.json:
         print(json.dumps({"ok": True, "transfer": transfer.transfer_id, "next_steps": steps}))

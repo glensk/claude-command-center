@@ -741,3 +741,103 @@ def test_pid_only_processes_are_not_listed_as_shells(world: dict[str, Any], tmp_
         inflight.inventory = inflight_inventory
     assert "pid:99" not in {f["fields"]["task_id"] for f in _by_kind(doc, "shell")}
     assert any("untracked process" in w for w in doc["warnings"])
+
+
+# ------------------------------------------------------------- relay capsules (tp#1536)
+
+CAPSULE = (
+    "## Status\n\ncontinue\n\n## Done\n\nB1 landed\n\n## Next\n\nB2\n\n## Worktree\n\nnone\n\n"
+    "## Questions\n\nnone\n\n## Boxes done\n\n**Boxes done**: B1\n"
+)
+CALL = {
+    "subagent_type": "lint-fixer",
+    "model": "opus",
+    "isolation": "worktree",
+    "description": "lint two (cont.)",
+    "prompt": "[boxes: B2]\nContinue this work. Read the capsule `CAP` first.",
+}
+
+
+def _relaunch_record(tmp_path: Path, agent_id: str = "a2", **override: Any) -> Path:
+    from command_center import relay_state
+
+    capsule = tmp_path / "capsules" / f"{SID}-{agent_id}.md"
+    capsule.parent.mkdir(parents=True, exist_ok=True)
+    capsule.write_text(CAPSULE, encoding="utf-8")
+    body: dict[str, Any] = {
+        "version": 1,
+        "session": SID,
+        "agent_id": agent_id,
+        "capsule_path": str(capsule),
+        "call": CALL,
+        "consumed": None,
+        **override,
+    }
+    path = relay_state.record_path(SID, agent_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body), encoding="utf-8")
+    return capsule
+
+
+def _agents(world: dict[str, Any], tmp_path: Path) -> dict[str, dict[str, Any]]:
+    return {f["fields"]["agent_id"]: f for f in _by_kind(_collect(world, tmp_path), "agent")}
+
+
+def test_relayed_agent_capsule_becomes_the_result_and_relaunch_is_verbatim(
+    world: dict[str, Any], tmp_path: Path
+) -> None:
+    from command_center import handoff_doc
+
+    capsule = _relaunch_record(tmp_path)
+    agents = _agents(world, tmp_path)
+    fields = agents["a2"]["fields"]
+    assert fields["result_inline"] == CAPSULE  # not the notification text
+    assert Path(fields["result_path"]).read_text(encoding="utf-8") == CAPSULE
+    assert fields["capsule_path"] == str(capsule)
+    assert fields["relaunch"] == CALL  # the record's call, never re-rendered
+    assert agents["a2"]["priority"] == 0  # a relayed agent is a continuation, not history
+    assert agents["a1"]["fields"]["relaunch"] == {} and agents["a1"]["fields"]["capsule_path"] == ""
+    lines = handoff_doc._agent(agents["a2"], 5, "ref")  # pylint: disable=protected-access
+    assert f"  capsule_path: {capsule}" in lines
+    assert f"  relaunch (Agent call): {json.dumps(CALL, ensure_ascii=False)}" in lines
+    assert "    ## Status" in lines  # indented under result: never a section heading
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"consumed": {"at": 1, "reason": "launched"}}, {"version": 2}, {"call": "not an object"}],
+)
+def test_a_consumed_or_foreign_relay_capsule_record_changes_nothing(
+    world: dict[str, Any], tmp_path: Path, override: dict[str, Any]
+) -> None:
+    _relaunch_record(tmp_path, **override)
+    fields = _agents(world, tmp_path)["a2"]["fields"]
+    assert fields["result_inline"].startswith("Lint fixed.")
+    assert fields["relaunch"] == {} and fields["capsule_path"] == ""
+
+
+def test_a_corrupt_relay_capsule_record_falls_back(world: dict[str, Any], tmp_path: Path) -> None:
+    from command_center import relay_state
+
+    path = relay_state.record_path(SID, "a2")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+    fields = _agents(world, tmp_path)["a2"]["fields"]
+    assert fields["result_inline"].startswith("Lint fixed.") and fields["relaunch"] == {}
+
+
+def test_a_missing_capsule_keeps_the_result_but_carries_the_relaunch(
+    world: dict[str, Any], tmp_path: Path
+) -> None:
+    _relaunch_record(tmp_path).unlink()
+    fields = _agents(world, tmp_path)["a2"]["fields"]
+    assert fields["result_inline"].startswith("Lint fixed.")
+    assert fields["relaunch"] == CALL and fields["capsule_path"].endswith(f"{SID}-a2.md")
+
+
+def test_relay_capsule_record_ids_are_sanitized_like_the_hooks() -> None:
+    from command_center import relay_state
+
+    assert relay_state.safe("a/b c") == "a_b_c" and relay_state.safe("") == "x"
+    path = relay_state.record_path("s/1", "a:2")
+    assert path.parts[-3:] == ("relaunch", "s_1", "a_2.json")

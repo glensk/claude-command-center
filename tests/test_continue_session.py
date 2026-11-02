@@ -599,6 +599,84 @@ def test_accept_refuses_the_wrong_session_and_the_wrong_account(
     assert cli.main(["continue-session", "accept", "t-missing"]) == 1
 
 
+def _relay_state_dir() -> Path:
+    import os  # pylint: disable=import-outside-toplevel
+
+    path = Path(os.environ["CC_RELAY_STATE_DIR"])  # pinned under tmp_path by conftest
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_accept_writes_the_retired_marker_0600_and_finalize_keeps_it(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center import relay_state  # pylint: disable=import-outside-toplevel
+
+    base = _relay_state_dir()
+    tid = _opened_transfer(harness)
+    new = _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    assert not relay_state.retired_path(SID).exists()  # nothing before the accept event
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    marker = base / "retired" / f"{SID}.json"
+    body = json.loads(marker.read_text(encoding="utf-8"))
+    assert body["transfer"] == tid and body["successor"] == new and body["at"] > 0
+    assert oct(marker.stat().st_mode & 0o777) == "0o600"
+    assert oct(marker.parent.stat().st_mode & 0o777) == "0o700"
+    assert not [p for p in marker.parent.iterdir() if p.name != marker.name]  # no temp left
+    # the source's own re-run of start finalizes; the marker is kept (same accept time)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SID)
+    assert harness.start("-w", "0") == 0
+    assert _state(tid) == "finalized"
+    assert json.loads(marker.read_text(encoding="utf-8")) == body
+
+
+def test_finalize_writes_a_missing_retired_marker(harness: _Harness) -> None:
+    from command_center.transfer_store import ACCEPTED  # pylint: disable=C0415
+
+    base = _relay_state_dir()
+    tid = _opened_transfer(harness)
+    with Store() as store:
+        store.transition_transfer(tid, ACCEPTED, 1)  # accepted before the marker existed
+        transfer = store.get_transfer(tid)
+    assert transfer is not None
+    assert harness.start("-w", "0") == 0
+    body = json.loads((base / "retired" / f"{SID}.json").read_text(encoding="utf-8"))
+    assert body["transfer"] == tid and body["successor"] == transfer.target_session
+
+
+def test_no_retired_marker_without_the_relay_state_dir(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center import relay_state  # pylint: disable=import-outside-toplevel
+
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    assert _state(tid) == "accepted"
+    assert not relay_state.state_dir().exists()  # inert: the hooks are not installed
+
+
+def test_a_retired_marker_write_failure_never_blocks_accept(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import relay_state  # pylint: disable=import-outside-toplevel
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    _relay_state_dir()
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    monkeypatch.setattr(relay_state, "write_retired", boom)
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    assert "retired marker" in capsys.readouterr().err
+    assert _state(tid) == "accepted"
+
+
 def _arm_await(session_id: str) -> int:
     from command_center.await_store import SourceSpec  # pylint: disable=import-outside-toplevel
 

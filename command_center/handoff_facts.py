@@ -770,9 +770,15 @@ def _spec_for(  # pylint: disable=too-many-locals
     records: list[dict[str, Any]],
     recorded_jsonl: str,
     notes: dict[str, str],
+    *,
+    session_id: str = "",
 ) -> dict[str, Any]:
-    """Everything the successor needs to relaunch *agent_id*; model is optional (tool_use only)."""
-    from . import inflight
+    """Everything the successor needs to relaunch *agent_id*; model is optional (tool_use only).
+
+    An agent that relayed (an unconsumed relay relaunch record of *session_id*, tp#1536)
+    hands over its capsule as the ``result`` plus ``capsule_path`` and ``relaunch`` — the
+    record's Agent call, verbatim; a missing or corrupt record changes nothing."""
+    from . import inflight, relay_state
 
     launches, uses = inflight._launch_details(records)
     launch = launches.get(agent_id)
@@ -793,6 +799,9 @@ def _spec_for(  # pylint: disable=too-many-locals
         result = "" if _STUB_RE.search(note) else note
     if not result and jsonl is not None:
         result = _last_assistant_text(jsonl)
+    relaunch = relay_state.relaunch_for(session_id, agent_id) if session_id else None
+    if relaunch is not None and relaunch.capsule:
+        result = relaunch.capsule
     return {
         "agent_id": agent_id,
         "agent_type": str(meta.get("agentType") or params.get("subagent_type") or ""),
@@ -804,6 +813,8 @@ def _spec_for(  # pylint: disable=too-many-locals
         "spec": spec,
         "result": result,
         "finished": finished,
+        "capsule_path": relaunch.capsule_path if relaunch else "",
+        "relaunch": relaunch.call if relaunch else {},
     }
 
 
@@ -834,7 +845,8 @@ def agent_fact(
         "agent",
         f"core:agent:{agent_id}",
         "Subagent continuations",
-        2 if info["finished"] else 0,  # running agents are the continuations: sort first
+        # running and relayed agents are the continuations: sort first
+        2 if info["finished"] and not info.get("relaunch") else 0,
         agent_id=agent_id,
         agent_type=info["agent_type"],
         description=info["description"],
@@ -848,6 +860,8 @@ def agent_fact(
         result_inline=inline,
         result_truncated=truncated,
         result_path=result_path,
+        capsule_path=str(info.get("capsule_path") or ""),
+        relaunch=info.get("relaunch") or {},
     )
 
 
@@ -1028,7 +1042,9 @@ def transcript_facts(
                 "session's own Bash calls, e.g. a running subagent's) are not listed"
             )
     for agent_id, recorded in agent_rows:
-        info = _spec_for(agent_id, src.transcript, records, recorded, notes)
+        info = _spec_for(
+            agent_id, src.transcript, records, recorded, notes, session_id=src.session_id
+        )
         out.append(agent_fact(info, src.session_id, scrubber, persist=persist))
     out += shell_facts
     out += _cron_facts(records)

@@ -414,14 +414,18 @@ def _agent(fact: dict[str, Any], level: int, ref: str) -> list[str]:
         f"- agent {f.get('agent_id')} ({_one(f.get('agent_type'))}, {_one(f.get('status'))}): "
         f"{_one(f.get('description'))}"
     ]
-    finished = f.get("status") == "finished"
+    relaunch = f.get("relaunch")
+    finished = f.get("status") == "finished" and not relaunch
     if finished and level >= 3:  # history, already delivered: a pointer, not the result
         if f.get("result_path"):
             out.append(f"  result_path: {_one(f['result_path'])}")
         return out
-    for key in ("cwd", "model", "isolation", "spec_path", "result_path"):
+    for key in ("cwd", "model", "isolation", "spec_path", "result_path", "capsule_path"):
         if f.get(key):
             out.append(f"  {key}: {_one(f[key])}")
+    if isinstance(relaunch, dict) and relaunch:
+        # the relay hooks rendered this Agent call once; it is carried verbatim (one line)
+        out.append(f"  relaunch (Agent call): {json.dumps(relaunch, ensure_ascii=False)}")
     inline = str(f.get("result_inline") or "")
     cut = bool(f.get("result_truncated"))
     if inline and level >= 4 and len(inline.encode("utf-8")) > 1024:
@@ -529,7 +533,12 @@ def _facts_lines(  # pylint: disable=too-many-locals,too-many-branches
         if collapse and level >= collapse[0]:
             cut.setdefault((section, collapse[1]), []).append(fact)
             continue
-        if kind == "agent" and level >= 5 and fact["fields"].get("status") == "finished":
+        if (
+            kind == "agent"
+            and level >= 5
+            and fact["fields"].get("status") == "finished"
+            and not fact["fields"].get("relaunch")  # a relayed agent is a continuation
+        ):
             cut.setdefault((section, "finished subagents"), []).append(fact)
             continue
         if kind == "commit" and level >= 2:

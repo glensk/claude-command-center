@@ -350,6 +350,14 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
   agent spec/result) goes through `mirror_scrub_cmd`; a scrub failure refuses `start`. Size
   is solved by priority cuts with a `continue-session facts` pointer (never the three model
   sections, the AIM, held ids, questions, restarts, spec paths, warnings).
+- **Context-relay files are read, never imported** (`relay_state.py`, tp#1536): a subagent
+  with an unconsumed relaunch record (`<CC_RELAY_STATE_DIR>/relaunch/<sid>/<agent>.json`,
+  version 1) hands over its capsule as `result` plus `capsule_path` and `relaunch` = the
+  record's `call` VERBATIM (never re-rendered) and is listed as a continuation; a missing
+  or corrupt record changes nothing. `accept` (at the `accepted` event) and `finalize`
+  (idempotent) write the source's retired marker `<state dir>/retired/<sid>.json`
+  `{transfer, successor, at}` (0600, dir 0700, temp + rename) only when the state dir
+  exists; a write failure warns, never blocks the handoff.
 - **`--facts-only` / `--capped` share one path** (`_compose_generated`): a capped router that
   is unset, fails or returns anything but the strict JSON supplement falls back to
   facts-only, never to a refusal. `start -j` prints JSON on a dry run only.

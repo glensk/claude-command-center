@@ -297,6 +297,15 @@ def _pin_codex_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_relay_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep every test off the real context-relay state dir (relaunch records, retired
+    markers); the dir is NOT created, so the retired marker stays inert unless a test
+    makes it."""
+    monkeypatch.setenv("CC_RELAY_STATE_DIR", str(tmp_path / "cc-relay-state"))
+    monkeypatch.setenv("CC_RELAY_CAPSULE_DIR", str(tmp_path / "cc-relay-capsules"))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_tab_symbol_side_effects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep every test off the real badge cache and the real iTerm session."""
     monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))
