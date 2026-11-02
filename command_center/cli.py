@@ -1283,14 +1283,23 @@ def _command_names(commands: list[str]) -> list[str]:
     return list(names)
 
 
-def _close_now_abort(session_id: str, reason: str, rearmed_until: int = 0) -> int:
+def _close_now_abort(
+    session_id: str,
+    reason: str,
+    rearmed_until: int = 0,
+    *,
+    advice: str = "",
+    notify: bool = True,
+) -> int:
     """Refuse a close: log it, notify, and leave BOTH the process and the tab alive.
 
     *rearmed_until* is the epoch-ms the arm stays claimable when :meth:`Store.restore_close`
     handed it back (``0`` = it did not), and picks the advice: a restored arm closes after
     the NEXT turn ends; a retired one needs the tab closed by hand or a fresh arm from
     INSIDE that session — ``mark-done --close`` from another shell arms a close nobody
-    claims while the session sits idle.
+    claims while the session sits idle. The handoff closer (``--handoff-transfer``) passes
+    its own *advice* and keeps a routine refusal (a busy source) out of the notifications
+    (``notify=False``): the events.log line is written either way.
     """
     from datetime import datetime
 
@@ -1299,13 +1308,15 @@ def _close_now_abort(session_id: str, reason: str, rearmed_until: int = 0) -> in
     detail = f"{reason} — NOT closed ({'re-armed' if rearmed_until else 'not re-armed'})"
     hooks._log_event(session_id, "close-now", detail)  # pylint: disable=protected-access
     print(f"close-now: {detail}", file=sys.stderr)
-    if rearmed_until:
+    if not notify:
+        return 1
+    if not advice and rearmed_until:
         until = datetime.fromtimestamp(rearmed_until / 1000).strftime("%H:%M")
         advice = (
             f"re-armed until {until}; it closes after your NEXT turn ends, "
             "or close the tab yourself"
         )
-    else:
+    elif not advice:
         advice = "close the tab yourself, or run /ccc-mark-done-and-close again in that session"
     _notify_close_now(f"{session_id[:8]}: {reason} — {advice}")
     return 1
@@ -1447,12 +1458,18 @@ def cmd_close_now(args: argparse.Namespace) -> int:
     Never raises. The terminal close is best-effort: the hosting tmux pane (first match) or
     the iTerm pane/tab, the latter only on fresh evidence (a hook-supplied ``--iterm`` id, or
     a live PID reaped this run), never on stale-store-only evidence.
+
+    ``--handoff-transfer <id>`` selects the token-scoped handoff closer instead
+    (:func:`command_center.handoff_close.run`): it closes a FINALIZED transfer's source
+    only once it is provably and stably idle, and reuses the drain, SIGTERM and terminal
+    close below.
     """
-    import subprocess
     import time
 
-    from . import terminal
+    if getattr(args, "handoff_transfer", ""):
+        from . import handoff_close
 
+        return handoff_close.run(args)
     session_id = args.session
     if not session_id:
         return 0
@@ -1473,35 +1490,59 @@ def cmd_close_now(args: argparse.Namespace) -> int:
     _close_now_settle_arm(session_id, args, "", "")  # closing: the arm is spent
     with Store() as store:
         session = store.get(session_id)
-    # (3) Terminal close, first match wins. (a) tmux pane.
+    # (3) Terminal close, first match wins: (a) the tmux pane, (b) iTerm — the hook-supplied
+    # fresh id, else the stored id ONLY when a live PID was reaped this run (stale-evidence
+    # guard — never close on a store-only id).
+    pane_id = _tmux_pane_id(session_id)
+    iterm = (getattr(args, "iterm", "") or "").strip()
+    target = iterm or (
+        session.iterm_session_id if reaped_pid and session and session.iterm_session_id else ""
+    )
+    _close_terminal(pane_id, "" if pane_id else target)
+    return 0
+
+
+def _tmux_pane_id(session_id: str) -> str:
+    """The id of the tmux pane hosting *session_id*'s claude (``""`` = none / no tmux)."""
+    from . import terminal
+
     try:
         located = terminal.tmux_pane_for_session(session_id)
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         located = None
-    if located is not None:
-        _window_target, pane_id = located
+    return located[1] if located is not None else ""
+
+
+def _close_terminal(pane_id: str, iterm: str) -> bool:
+    """Close the tmux pane *pane_id*, else the iTerm pane/tab *iterm* — ``True`` on a report
+    of success (``kill-pane`` exit 0, iTerm ``"tab"``/``"session"``).
+
+    The ``close-now`` terminal step, shared by the Stop-chain close (which ignores the
+    result) and the handoff closer (which keeps its close debt on ``False``). Never raises;
+    with neither target nothing is touched and the answer is ``False``.
+    """
+    import subprocess
+
+    from . import terminal
+
+    if pane_id:
         try:
-            subprocess.run(
+            done = subprocess.run(
                 ["tmux", "kill-pane", "-t", pane_id],
                 capture_output=True,
                 timeout=5,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):
-            pass
-        return 0
-    # (b) iTerm: the hook-supplied fresh id, else the stored id ONLY when a live PID was
-    # reaped this run (stale-evidence guard — never close on a store-only id).
-    iterm = (getattr(args, "iterm", "") or "").strip()
-    target = iterm or (
-        session.iterm_session_id if reaped_pid and session and session.iterm_session_id else ""
-    )
-    if target:
-        try:
-            terminal.close_iterm_session(target)
-        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-            pass
-    return 0
+            return False
+        return done.returncode == 0
+    if not iterm:
+        return False
+    try:
+        result = terminal.close_iterm_session(iterm)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return False
+    return result in ("tab", "session")
 
 
 def _transcript_visible_to(config_dir: str, session_id: str, cwd: str) -> bool:
@@ -6525,6 +6566,12 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_closenow.add_argument("-A", "--armed-at", type=int, default=0, help=argparse.SUPPRESS)
     p_closenow.add_argument("-T", "--token", default="", help=argparse.SUPPRESS)
     p_closenow.add_argument("-B", "--bound", default="", help=argparse.SUPPRESS)
+    p_closenow.add_argument(
+        "-H",
+        "--handoff-transfer",
+        default="",
+        help="close a finalized continue-session transfer's idle source (token-scoped)",
+    )
     p_closenow.set_defaults(func=cmd_close_now)
 
     from . import continue_session  # stdlib-only at import: cheap to register
