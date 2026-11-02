@@ -2243,11 +2243,12 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         AIM travels down the chain. The target's current AIM and later rows are untouched;
         the copy is stamped no later than the target's own first row so it sorts first.
         A no-op when the source has no recorded history or the target already starts with
-        that AIM (idempotent: a re-run accept, or a source whose AIM never changed).
+        that AIM (idempotent: a re-run accept, or a source whose AIM never changed). The
+        copy keeps the source row's ``set_by`` stamp (tp#1566).
         """
         query = (
-            "SELECT aim, score, short_aim, created_at FROM aim_history WHERE session_id = ? "
-            "ORDER BY created_at, id LIMIT 1"
+            "SELECT aim, score, short_aim, created_at, set_by FROM aim_history "
+            "WHERE session_id = ? ORDER BY created_at, id LIMIT 1"
         )
         src = self.conn.execute(query, (source_id,)).fetchone()
         dst = self.conn.execute(query, (target_id,)).fetchone()
@@ -2255,7 +2256,12 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             return False
         created_at = min(int(src["created_at"]), int(dst["created_at"]) - 1)
         self._insert_aim_history(
-            target_id, src["aim"], int(src["score"]), created_at, src["short_aim"]
+            target_id,
+            src["aim"],
+            int(src["score"]),
+            created_at,
+            src["short_aim"],
+            set_by=src["set_by"],
         )
         self.conn.commit()
         return True

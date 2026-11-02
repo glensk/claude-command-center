@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from command_center import cli, continue_session, handoff_doc, inflight
 from command_center.adapters import claude as claude_adapter
-from command_center.models import LiveSession
+from command_center.models import AIM_SET_BY_TOOL, AIM_SET_BY_USER, LiveSession
 from command_center.store import Store
 
 FIXTURES = Path(__file__).parent / "fixtures" / "inflight"
@@ -54,7 +55,7 @@ def _fixture_session(monkeypatch: pytest.MonkeyPatch) -> _Adapter:
     monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
     with Store() as store:
         store.ensure(SID, cwd="/repo")
-        store.set_aim(SID, "tp#1 shipped")
+        store.set_aim(SID, "tp#1 shipped", set_by=AIM_SET_BY_USER)
         store.set_subgoals(SID, ["build", "test", "ship"])
         first = store.list_subgoals(SID)[0]
         store.set_subgoal_checked(first.id, True)
@@ -634,7 +635,7 @@ def test_accept_carries_the_lineages_first_aim_as_the_anchor(
     """tp#1553: the successor's history starts with the source's FIRST AIM, its current
     AIM stays the handed-over one, and a second accept adds no duplicate row."""
     with Store() as store:
-        store.set_aim(SID, "build B2: tp#1")
+        store.set_aim(SID, "build B2: tp#1", set_by=AIM_SET_BY_USER)
     tid = _opened_transfer(harness)
     new = _as_successor(monkeypatch, harness, tid)
     with Store() as store:
@@ -661,6 +662,99 @@ def test_carry_first_aim_passes_the_root_down_the_chain() -> None:
         assert not store.carry_first_aim("leaf", "nobody")  # no source history: no-op
         assert [r.aim for r in store.list_aim_history("leaf")] == ["goal", "box 3"]
         assert store.count_aim_history("leaf") == 2
+
+
+def _source_aims(*revisions: tuple[str, str | None]) -> None:
+    """Replace the source's AIM history with *revisions* (``(aim, set_by)``, oldest first)."""
+    with Store() as store:
+        store.conn.execute("DELETE FROM aim_history WHERE session_id = ?", (SID,))
+        store.conn.commit()
+        store.update_fields(SID, aim=None)
+        for aim, set_by in revisions:
+            store.set_aim(SID, aim, set_by=set_by)
+
+
+def _accepted_successor(harness: _Harness, monkeypatch: pytest.MonkeyPatch) -> tuple[str, str]:
+    """Hand the source over and accept in the successor; return (transfer id, successor id)."""
+    tid = _opened_transfer(harness)
+    new = _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    return tid, new
+
+
+def test_b6_successor_takes_the_latest_user_aim(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B6 (a): user "A", tool "A: tp#1", user "B" → current AIM "B", `/aim (1)` "A"."""
+    _source_aims(("A", AIM_SET_BY_USER), ("A: tp#1", AIM_SET_BY_TOOL), ("B", AIM_SET_BY_USER))
+    _, new = _accepted_successor(harness, monkeypatch)
+    with Store() as store:
+        successor = store.get(new)
+        assert successor is not None
+        assert successor.aim == "B" and successor.first_aim == "A"
+        history = store.list_aim_history(new)
+        assert [(r.aim, r.set_by) for r in history] == [("A", "user"), ("B", "user")]
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [("B: tp#5, #6", "B"), ("tp#5", "A")],
+    ids=["run-stripped-current", "run-only-current-falls-back-to-first"],
+)
+def test_b6_legacy_source_without_stamps(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, current: str, expected: str
+) -> None:
+    """B6 (b): unstamped history "A" then *current* → the current AIM without its tp id
+    run, or the first AIM when the current one is only a run."""
+    _source_aims(("A", None), (current, None))
+    _, new = _accepted_successor(harness, monkeypatch)
+    with Store() as store:
+        successor = store.get(new)
+        assert successor is not None
+        assert successor.aim == expected and successor.first_aim == "A"
+
+
+def test_b6_chain_keeps_the_user_aim_set_in_the_middle_session() -> None:
+    """B6 (c): A→B→C — the AIM the user set in B reaches C; B's own carried stamp lets a
+    tool rewrite in B fall back to it too."""
+    seed = continue_session._successor_aim  # pylint: disable=protected-access
+    reconcile = continue_session._reconcile_successor_aim  # pylint: disable=protected-access
+    with Store() as store:
+        store.ensure("a", cwd="/repo")
+        store.set_aim("a", "root goal", set_by=AIM_SET_BY_USER)
+        for source, target in (("a", "b"), ("b", "c")):
+            if source == "b":
+                store.set_aim("b", "B goal", set_by=AIM_SET_BY_USER)
+                store.set_aim("b", "B goal: tp#9", set_by=AIM_SET_BY_TOOL)
+            hop = SimpleNamespace(source_session=source, target_session=target, source_aim="")
+            text, set_by = seed(store, hop)
+            store.create_draft(target, "/repo", text, aim_set_by=set_by)
+            store.carry_first_aim(target, source)
+            assert not reconcile(store, hop)
+            if target == "b":
+                assert store.latest_user_aim("b") == ("root goal", "user")
+        leaf = store.get("c")
+        assert leaf is not None
+        assert leaf.aim == "B goal" and leaf.first_aim == "root goal"
+        assert store.latest_user_aim("c") == ("B goal", "user")
+
+
+def test_b6_reconcile_successor_aim_is_idempotent(harness: _Harness) -> None:
+    """B6 (d): the user changes the source AIM after `start`; the first reconcile moves
+    the successor to it, the second returns False and adds no history row."""
+    tid = _opened_transfer(harness)
+    with Store() as store:
+        store.set_aim(SID, "changed after start", set_by=AIM_SET_BY_USER)
+        transfer = store.get_transfer(tid)
+        assert transfer is not None
+        reconcile = continue_session._reconcile_successor_aim  # pylint: disable=protected-access
+        assert reconcile(store, transfer)
+        rows = store.count_aim_history(transfer.target_session)
+        assert not reconcile(store, transfer)
+        assert store.count_aim_history(transfer.target_session) == rows
+        successor = store.get(transfer.target_session)
+        assert successor is not None and successor.aim == "changed after start"
 
 
 @pytest.mark.parametrize(

@@ -492,16 +492,49 @@ def _candidate(  # pylint: disable=too-many-arguments,too-many-positional-argume
     )
 
 
+def _successor_aim(store: Store, transfer: Any) -> tuple[str, str | None]:
+    """The AIM a successor starts with and its ``aim_history.set_by`` stamp (tp#1566).
+
+    The latest AIM the user set in the source (``Store.latest_user_aim``, its stamp
+    carried so a chain A→B→C still finds it in B); else the source's recorded AIM at
+    ``start``; else a generic pointer at the source. The fallbacks carry no stamp.
+    """
+    carried = store.latest_user_aim(transfer.source_session)
+    if carried is not None:
+        return carried
+    if transfer.source_aim:
+        return transfer.source_aim, None
+    return f"continue the work handed over by session {transfer.source_session[:8]}", None
+
+
+def _reconcile_successor_aim(store: Store, transfer: Any) -> bool:
+    """Give the successor the source's latest user AIM again; True if it changed (tp#1566).
+
+    ``accept`` calls this once, after ``carry_first_aim``: it covers the user changing the
+    source's AIM between ``start`` and ``accept``. Idempotent — a target that already holds
+    that AIM is left alone (no new history row).
+    """
+    carried = store.latest_user_aim(transfer.source_session)
+    target = store.get(transfer.target_session)
+    if carried is None or target is None:
+        return False
+    text, set_by = carried
+    if (target.aim or "") == text:
+        return False
+    return store.set_aim(transfer.target_session, text, set_by=set_by)
+
+
 def _create_successor(store: Store, transfer: Any, src: Source, text: str) -> None:
     """The successor's draft job (idempotent): AIM, cwd, account, models, no_codex, prompt."""
     if store.get(transfer.target_session) is not None:
         return
     unchecked = [g.text for g in store.list_subgoals(src.session_id) if not g.checked]
-    aim = transfer.source_aim or f"continue the work handed over by session {src.session_id[:8]}"
+    aim, aim_set_by = _successor_aim(store, transfer)
     store.create_draft(
         transfer.target_session,
         transfer.cwd,
         aim,
+        aim_set_by=aim_set_by,
         prompt=preamble(transfer, src.label, str(src.transcript or "")) + text,
         no_codex=transfer.no_codex,
         llm_overseer=transfer.llm_overseer,
@@ -1304,6 +1337,8 @@ def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-ret
         steps += moved
         # The lineage's first AIM becomes this session's `/aim (1)` anchor (tp#1553).
         store.carry_first_aim(transfer.target_session, transfer.source_session)
+        # …and its current AIM is the latest one the user set in the source (tp#1566).
+        _reconcile_successor_aim(store, transfer)
         _mark_retired(transfer)
         store.note_transfer(transfer.transfer_id, now_ms(), failure="")
     if args.json:
