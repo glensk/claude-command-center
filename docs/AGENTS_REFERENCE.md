@@ -306,7 +306,7 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
 ## The session handoff — `ccc continue-session` (do not regress)
 
 `continue_session.py` + `transfer_store.py` + `handoff_doc.py` + `inflight.py` +
-`handoff_capped.py` (tp#1300; docs/reference.md § "Hand a session to a new one"). Invariants:
+`handoff_capped.py` + `handoff_close.py` + `handoff_sweep.py` (tp#1300; docs/reference.md § "Hand a session to a new one"). Invariants:
 
 - **One in-flight detector.** `inflight.background_work` IS `cli._background_work` (the
   `switch-account` veto); `inflight.inventory` classifies the same evidence for the handoff.
@@ -316,11 +316,28 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
 - **Ownership moves only on `accept`**, from the recorded target session under the recorded
   account, after EVERY `handoff_hooks` entry succeeded (argv-only, bounded, JSON `"ok":
   true`); the source is retired only after `accepted` (`finalize`: idempotent session
-  writes first, the `accepted → finalized` CAS last). A `handed_off` session is terminal and
+  writes first, the `accepted → finalized` CAS last). **`accept` is the primary finalizer**:
+  once it has CASed `accepted` and the source is idle (or alive) it finalizes at once (marks
+  the transfer finalized, writes the source's handed-off state) and spawns the token-scoped
+  closer `ccc close-now --handoff-transfer <id> -s <src>`; `start` in the source is an
+  idempotent race participant (first finalizer wins, the other is a no-op). A capped
+  transfer is finalized as metadata only: the source is never closed. A handed-off row
+  refuses every new prompt (`UserPromptSubmit` hook) and `ccc await` refuses arming on it.
+  A `handed_off` session is terminal and
   refused by `limitswitch`, `resume.py` and the daemon's auto-resume (all keyed on
   `handed_off_to`, never on `done`): `core.reconcile_pass` closes it as done (one
   `handoff_done_sources` query per pass) once its transfer is `accepted`/`finalized` AND its
   process is gone, and `set_handoff_lineage` never lifts a done source back out.
+- **The handoff closer is the only thing that closes a handed-off source**
+  (`handoff_close.py`): it claims the source's close token, binds ONE live process (PID +
+  start time), requires 10 s of stable idle (one transcript identity throughout), drains the
+  Stop chain, revalidates, SIGTERMs and closes the terminal; any refusal hands the token
+  back. `handoff_sweep.py` runs in EVERY `ccc daemon` pass, independent of reaping: it
+  finalizes stranded `accepted` transfers and retries pending close tokens of finalized
+  ones (one closer spawn per source per 10 min); a kept `handoff:` close debt (signal sent,
+  pane still open) is retried by closing the pane only. It never closes a tab by age and
+  never re-arms a completed close, so a tab the user reopened stays open. `ccc daemon
+  --dry-run -v` shows `handoff_finalized=` / `handoff_closers=`.
 - **The capped-seat summary goes through `llm_custom_command`** (`CCC_LLM_PURPOSE=
   handoff-summary`, a `llmrouting.PURPOSES` row) — never a provider of ccc's own — and its
   text passes the same `handoff_doc.validate` (scrub fail-closed) as a model-written one.

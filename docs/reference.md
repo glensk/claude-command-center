@@ -1934,15 +1934,15 @@ every transition a compare-and-set):
 | :---------- | :------------------------------------------------- | :----------------------------------------------- |
 | `prepared`  | `start`: validated, snapshot written               | untouched                                        |
 | `opened`    | `start`: a launcher accepted `start-job`           | untouched                                        |
-| `accepted`  | `accept` in the successor, every hook succeeded    | untouched                                        |
-| `finalized` | `start` (source side) observed `accepted`          | AIM rewritten, status `handed_off`, close armed  |
+| `accepted`  | `accept` in the successor, every hook succeeded    | untouched until finalized (same `accept` call)   |
+| `finalized` | `accept` (primary), `start` or the daemon sweep    | status `handed_off`, closer spawned              |
 | `failed`    | a typed refusal / launcher failure                 | untouched                                        |
 
 The snapshot (source / target session and account, cwd, source AIM and revision, models,
 `no_codex`, prompt sha256, the stored handoff `<app_home>/handoffs/<transfer>.md`) is
 immutable: re-running `start` with an identical snapshot reuses the transfer (relaunching
 the successor only while it is still an unstarted draft; a `start` that timed out — exit 3
-— is simply re-run and finalizes once accepted), a different one is refused naming the
+— is simply re-run and finalizes once accepted, unless `accept` already did), a different one is refused naming the
 differing fields. The prompt sha256 binds sha256(model part) and the facts snapshot id, not
 the composed text, and a re-run on an active `prepared`/`opened` transfer reuses its STORED
 snapshot and composed handoff without recollecting — so `start` → exit 3 → a ledger change
@@ -1971,7 +1971,7 @@ preamble lets it run accept once more on exactly that error and stop on any othe
 **The source's `ccc await` group moves by code.** `start` reserves the source's active
 group under the transfer in the same transaction that creates it (delivery defers a
 reserved group); a group the source arms AFTER `start` joins the reservation inside its own
-arm transaction, and arming is refused on a session that is the source of an `accepted`
+arm transaction, and arming is refused on a session that is the source of an `accepted` or `finalized`
 transfer or the target of a `prepared`/`opened` one. `accept` first runs accept-prepare,
 BEFORE any hook: it sweeps the source's still-unreserved groups in, refuses when the
 successor already holds an active group (naming `ccc await cancel`; no merge) and refuses
@@ -1996,10 +1996,29 @@ Finalize does NOT touch the source's AIM (it stays exactly as the user set it, h
 included); the handoff shows as status `handed_off` + `handed_off_to`
 (terminal — `ccc ls` / the TUI show `⇢ <8-char successor>`; `limitswitch`, `resume.py`
 and the daemon's auto-resume refuse such a session), records `handed_off_to/from/at` and
-arms the source's OWN close (its Stop chain closes the tab). Once the transfer is
+hands the source's close to a token-scoped closer. Once the transfer is
 `accepted`/`finalized` and the source's process is gone, the next reconcile pass marks the
 source done (it sinks to FINISHED; `handed_off_to` and the `⇢` marker stay).
-`ccc continue-session status` names the recovery step for every state.
+`ccc continue-session status` names the recovery step for every state; for an `accepted`
+transfer it is to re-run `ccc continue-session accept` in the successor (never touch the
+source).
+
+**Who finalizes and closes the source.** `ccc continue-session accept` is the primary
+finalizer: right after the `opened → accepted` CAS, when the source is idle (or alive), it
+marks the transfer `finalized`, writes the source's handed-off state and spawns the closer
+`ccc close-now --handoff-transfer <id> -s <src>`. `start` in the source is an idempotent race
+participant: whichever of `accept` / `start` finalizes first wins, the other is a no-op. From
+then on the source row refuses every new prompt (the `UserPromptSubmit` hook), and `ccc await`
+refuses arming on the source of a finalized handoff. The closer claims the source's close
+token, binds ONE live process (PID + start time), requires 10 s of stable idle, drains the
+Stop chain, revalidates, sends SIGTERM and closes the terminal; a refusal hands the token
+back. A capped transfer is finalized as metadata only: the source is never closed. The
+`ccc daemon` pass runs a handoff repair sweep EVERY pass, independent of reaping: it
+finalizes stranded `accepted` transfers and retries pending close tokens of finalized
+transfers (one closer spawn per source per 10 min); a kept `handoff:` close debt (signal
+sent, pane still open) is retried by closing the pane only. It never closes a tab by age, and
+a completed close is never re-armed, so a tab the user reopened stays open. `ccc daemon
+--dry-run -v` shows `handoff_finalized=` / `handoff_closers=`.
 
 **`handoff_hooks`** (config, default `[]`, inert): argv templates run by `accept`, no
 shell, 60 s timeout (process group killed), stdout ≤ 64 KB and a JSON object with `"ok":
@@ -2064,7 +2083,7 @@ and accepts back ONLY a JSON model supplement `{current_state, decisions, first_
 (strings, each ≤ 3 KB, no `#` headings, no control characters, no other keys), rendered as
 the three model sections through the same compose, scrub and snapshot path. A router that
 is unset, fails or returns anything else falls back to `--facts-only` instead of refusing
-(logged to `events.log`, `handoff`). A capped source has no Stop chain, so its tab stays open, idle and `handed_off`.
+(logged to `events.log`, `handoff`). A capped transfer is finalized as metadata only: the source is never closed, so its tab stays open, idle and `handed_off`.
 A BLOCKED reading alone is not a cap (tp#1327): a seat on extra usage reads 100 % and still
 runs turns. The usage cache records `full_since` per window (the first capture that read it
 full; `captured_at` is bumped every few seconds by the status line and cannot date it), and
