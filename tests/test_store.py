@@ -1321,6 +1321,67 @@ def test_retire_close_with_a_stale_token_is_a_noop(tmp_path: Path) -> None:
     store.close()
 
 
+def test_ensure_close_armed_keeps_one_token_across_concurrent_callers(tmp_path: Path) -> None:
+    """Concurrent finalizers converge on ONE token; a pending or in-flight arm is kept."""
+    import threading  # pylint: disable=import-outside-toplevel
+
+    store = _store(tmp_path)
+    store.ensure("s1")
+    assert store.ensure_close_armed("missing", 1_000_000) == ""
+    barrier = threading.Barrier(4)
+    tokens: list[str] = []
+
+    def arm(now: int) -> None:
+        with Store(tmp_path / "state.db") as own:
+            barrier.wait()
+            tokens.append(own.ensure_close_armed("s1", now))
+
+    workers = [threading.Thread(target=arm, args=(1_000_000 + i,)) for i in range(4)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    row = store.get("s1")
+    assert row is not None and row.close_token and set(tokens) == {row.close_token}
+    token = row.close_token
+    assert store.claim_close("s1", token) == row.close_requested_at  # now in flight
+    assert store.ensure_close_armed("s1", 2_000_000) == token  # in flight is kept too
+    row = store.get("s1")
+    assert row is not None and (row.close_requested_at, row.close_token) == (0, token)
+    store.close()
+
+
+def test_token_scoped_close_with_a_stale_token_is_a_noop(tmp_path: Path) -> None:
+    """claim / restore / retire act only on the row's CURRENT token; one claimer wins."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    old = store.arm_close("s1", 1_000_000)
+    token = store.arm_close("s1", 1_010_000)
+    assert store.claim_close("s1", old) == 0 and store.claim_close("s1", "") == 0
+    row = store.get("s1")
+    assert row is not None and (row.close_requested_at, row.close_token) == (1_010_000, token)
+    assert store.claim_close("s1", token) == 1_010_000
+    assert store.claim_close("s1", token) == 0  # the duplicate closer loses
+    assert not store.restore_close("s1", old) and not store.retire_close("s1", old)
+    row = store.get("s1")
+    assert row is not None and (row.close_requested_at, row.close_token) == (0, token)
+    assert store.restore_close("s1", token, armed_at=1_010_000)  # back pending, same stamp
+    assert not store.restore_close("s1", token)  # already pending: no double restore
+    row = store.get("s1")
+    assert row is not None and (row.close_requested_at, row.close_token) == (1_010_000, token)
+    assert store.claim_close("s1", token) == 1_010_000
+    assert store.restore_close("s1", token)  # no stamp given: re-armed at the current time
+    row = store.get("s1")
+    assert row is not None and row.close_requested_at > 1_010_000
+    assert store.claim_close("s1", token) > 0
+    assert store.retire_close("s1", token)
+    assert not store.retire_close("s1", token)
+    row = store.get("s1")
+    assert row is not None and (row.close_requested_at, row.close_token) == (0, "")
+    assert store.ensure_close_armed("s1", 3_000_000) not in ("", token)  # debt gone: new arm
+    store.close()
+
+
 def test_close_unarmed_or_expired_is_never_claimed(tmp_path: Path) -> None:
     """Unarmed → nothing; a stamp past the TTL is cleared (token too), never claimed."""
     store = _store(tmp_path)

@@ -1286,6 +1286,70 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         self.conn.commit()
         return token
 
+    def ensure_close_armed(self, session_id: str, now: int) -> str:
+        """Arm a close for *session_id* unless one exists — the row's close token either way.
+
+        One ``BEGIN IMMEDIATE`` transaction: a pending OR in-flight token is kept as is (so
+        concurrent finalizers converge on ONE token and never clobber a claimed close), and
+        only a row with no token gets a fresh one stamped *now*, unbound. ``""`` when the
+        row does not exist.
+        """
+        if self.conn.in_transaction:
+            self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT close_token FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                self.conn.commit()
+                return ""
+            token = str(row[0] or "")
+            if not token:
+                token = uuid.uuid4().hex
+                self.conn.execute(
+                    "UPDATE sessions SET close_requested_at = ?, close_token = ?, "
+                    "close_bound = '', updated_at = ? WHERE session_id = ?",
+                    (now, token, now_ms(), session_id),
+                )
+        except sqlite3.Error:
+            self.conn.rollback()
+            raise
+        self.conn.commit()
+        return token
+
+    def claim_close(self, session_id: str, token: str) -> int:
+        """Claim THIS pending close arm (pending → in flight) — its stamp on a win, else 0.
+
+        A compare-and-swap on *token*: only while the row still holds it PENDING (stamp
+        set). The stamp is zeroed, token and binding stay for :meth:`restore_close` /
+        :meth:`retire_close`, so of two concurrent claimers exactly one wins; a stale,
+        replaced or already-claimed token is a no-op.
+        """
+        if not token:
+            return 0
+        if self.conn.in_transaction:
+            self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT close_requested_at FROM sessions "
+                "WHERE session_id = ? AND close_token = ? AND close_requested_at > 0",
+                (session_id, token),
+            ).fetchone()
+            armed_at = int(row[0] or 0) if row is not None else 0
+            if armed_at:
+                self.conn.execute(
+                    "UPDATE sessions SET close_requested_at = 0, updated_at = ? "
+                    "WHERE session_id = ? AND close_token = ?",
+                    (now_ms(), session_id, token),
+                )
+        except sqlite3.Error:
+            self.conn.rollback()
+            raise
+        self.conn.commit()
+        return armed_at
+
     def disarm_close(self, session_id: str) -> None:
         """Drop any close arm — pending or in flight — so nothing can restore it either."""
         self.conn.execute(
@@ -1298,29 +1362,38 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
     def restore_close(  # pylint: disable=too-many-arguments
         self,
         session_id: str,
-        *,
-        armed_at: int,
         token: str,
-        bound: str,
-        now: int,
-        ttl_ms: int,
+        *,
+        armed_at: int = 0,
+        bound: str = "",
+        now: int = 0,
+        ttl_ms: int = 0,
     ) -> bool:
         """Hand a claimed-but-refused close arm back, bound to *bound* — ``True`` when it was.
 
         A compare-and-swap: only while the row still holds THIS arm in flight (same
-        *token*, stamp zeroed by the claim) and the ORIGINAL *armed_at* is inside *ttl_ms*
-        of *now*. The stamp goes back to *armed_at*, never to *now*, so the retry window
-        is never extended; a new arm, an undo, a switch or a SessionStart replaced or
-        cleared the token and defeats it. Never raises (``False`` on a database error).
+        *token*, stamp zeroed by the claim). With a *ttl_ms* (the Stop-chain close) the
+        ORIGINAL *armed_at* must be inside *ttl_ms* of *now* and the stamp goes back to
+        *armed_at*, never to *now*, so the retry window is never extended. Without one
+        (the token-scoped handoff close) the arm goes back pending, stamped *armed_at* or,
+        when that is 0, the current time. A new arm, an undo, a switch or a SessionStart
+        replaced or cleared the token and defeats it. Never raises (``False`` on a database
+        error).
         """
-        if not token or armed_at <= 0:
+        if not token:
             return False
+        if ttl_ms > 0:
+            if armed_at <= 0:
+                return False
+            stamp, floor = armed_at, now - ttl_ms
+        else:
+            stamp, floor = armed_at if armed_at > 0 else now_ms(), 0
         try:
             cur = self.conn.execute(
                 "UPDATE sessions SET close_requested_at = ?, close_bound = ?, updated_at = ? "
                 "WHERE session_id = ? AND close_token = ? AND close_requested_at = 0 "
                 "AND ? > ?",
-                (armed_at, bound, now_ms(), session_id, token, armed_at, now - ttl_ms),
+                (stamp, bound, now_ms(), session_id, token, stamp, floor),
             )
             self.conn.commit()
         except sqlite3.Error:
@@ -1331,16 +1404,21 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             return False
         return cur.rowcount == 1
 
-    def retire_close(self, session_id: str, token: str) -> None:
-        """Forget an in-flight arm for good — a no-op once *token* is no longer the row's."""
+    def retire_close(self, session_id: str, token: str) -> bool:
+        """Forget THIS arm for good — ``True`` when it did; a no-op once *token* is stale.
+
+        A compare-and-swap on *token*: a replaced or already-retired token never clears
+        another closer's arm (unlike the blanket :meth:`disarm_close`).
+        """
         if not token:
-            return
-        self.conn.execute(
+            return False
+        cur = self.conn.execute(
             "UPDATE sessions SET close_token = '', close_bound = '', updated_at = ? "
             "WHERE session_id = ? AND close_token = ?",
             (now_ms(), session_id, token),
         )
         self.conn.commit()
+        return cur.rowcount == 1
 
     def claim_after_turn(
         self, session_id: str, now: int, ttl_ms: int

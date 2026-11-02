@@ -479,8 +479,25 @@ def _intercept_aim(store: Store, sid: str, current: str | None, text: str, block
         _emit_context("UserPromptSubmit", _AIM_REPLY.format(aim=aim))
 
 
+_HANDED_OFF_REASON = (
+    "⛔ this session was handed off to session {target8} — continue there; it takes no new prompts"
+)
+
+
+def _handed_off_target(sid: str) -> str:
+    """The successor *sid* was handed off to (``handed_off_to``), or ``""``."""
+    with Store() as store:
+        session = store.get(sid)
+    return (session.handed_off_to or "").strip() if session is not None else ""
+
+
 def handle_user_prompt(payload: dict[str, Any]) -> int:
     if not (sid := _session_id(payload)):
+        return 0
+    # A handed-off source is terminal: refuse EVERY prompt client-side (no model turn, no
+    # `/switch`, no `/aim`), so no new turn can start while its close is being proven idle.
+    if target := _handed_off_target(sid):
+        _block_prompt(_HANDED_OFF_REASON.format(target8=target[:8]))
         return 0
     cfg = config.load_config()
     if cfg.switch_intercept and switch_intercept.intercept(sid, str(payload.get("prompt") or "")):

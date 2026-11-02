@@ -761,6 +761,30 @@ def test_finalize_writes_a_missing_retired_marker(harness: _Harness) -> None:
     assert body["transfer"] == tid and body["successor"] == transfer.target_session
 
 
+def test_finalize_twice_keeps_the_same_close_token(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash before the finalized CAS re-runs finalize: the close token is never replaced."""
+    from command_center.transfer_store import ACCEPTED  # pylint: disable=C0415
+
+    tid = _opened_transfer(harness)
+    with Store() as store:
+        store.transition_transfer(tid, ACCEPTED, 1)
+        transfer = store.get_transfer(tid)
+        assert transfer is not None
+        with monkeypatch.context() as patch:  # the first finalizer dies before its CAS
+            patch.setattr(Store, "transition_transfer", lambda *_a, **_k: False)
+            assert not continue_session.finalize(store, transfer)
+        first = store.get(SID)
+        assert first is not None and first.close_token and first.close_requested_at > 0
+        assert store.claim_close(SID, first.close_token) > 0  # a closer holds it in flight
+        assert continue_session.finalize(store, transfer)
+        again = store.get(SID)
+        assert again is not None and again.close_token == first.close_token
+        assert again.close_requested_at == 0  # the in-flight claim was not re-armed
+        assert _state(tid) == "finalized"
+
+
 def test_no_retired_marker_without_the_relay_state_dir(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:

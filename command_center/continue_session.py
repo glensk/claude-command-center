@@ -561,8 +561,10 @@ def finalize(store: Store, transfer: Any, *, arm_close: bool = True) -> bool:
     if session is not None and session.aim != final_aim:
         store.set_aim(current.source_session, final_aim)
     store.set_handoff_lineage(current.source_session, current.target_session, now)
-    if arm_close and session is not None and not session.close_requested_at:
-        store.arm_close(current.source_session, now)  # its own Stop chain closes the tab
+    if arm_close and session is not None:
+        # ONE close token per source: a pending or in-flight close (another finalizer, a
+        # `mark-done --close`) is kept, never overwritten; its own Stop chain closes the tab.
+        store.ensure_close_armed(current.source_session, now)
     return store.transition_transfer(current.transfer_id, FINALIZED, now) or (
         (store.get_transfer(current.transfer_id) or current).state == FINALIZED
     )

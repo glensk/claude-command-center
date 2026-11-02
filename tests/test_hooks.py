@@ -890,3 +890,46 @@ def test_b5_aim_intercept_is_stamped_user(capsys: pytest.CaptureFixture[str]) ->
     hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": "/aim typed aim"})
     capsys.readouterr()
     assert [(r.aim, r.set_by) for r in Store().list_aim_history("s1")] == [("typed aim", "user")]
+
+
+_SUCCESSOR = "abcdef12-0000-4000-8000-000000000000"
+
+
+@pytest.mark.usefixtures("home")
+@pytest.mark.parametrize(
+    "prompt", ["go on", "/aim new aim", "/cwork-to-cpriv-cache-write-hit -f", "", "/aim"]
+)
+def test_user_prompt_on_a_handed_off_source_is_denied(
+    prompt: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A handed-off source takes no prompt at all — not even `/switch` or `/aim`."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    def no_run(*_a: object, **_k: object) -> None:
+        raise AssertionError("a handed-off source must not run the switch")
+
+    monkeypatch.setattr(subprocess, "run", no_run)
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.set_aim("s1", "old aim")
+    store.update_fields("s1", prompt_count=3)
+    store.set_handoff_lineage("s1", _SUCCESSOR, 1_000)
+    capsys.readouterr()
+    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": prompt})
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1 and '"decision": "block"' in out
+    assert "handed off to session abcdef12" in out and "additionalContext" not in out
+    got = Store().get("s1")
+    assert got is not None and got.aim == "old aim" and got.prompt_count == 3  # no turn
+
+
+@pytest.mark.usefixtures("home")
+def test_user_prompt_on_a_normal_row_is_not_denied(capsys: pytest.CaptureFixture[str]) -> None:
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.update_fields("s1", prompt_count=3)
+    capsys.readouterr()
+    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": "go on"})
+    assert "handed off" not in capsys.readouterr().out
+    got = Store().get("s1")
+    assert got is not None and got.prompt_count == 4  # the normal turn ran
