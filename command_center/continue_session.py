@@ -573,8 +573,9 @@ def finalize(store: Store, transfer: Any, *, arm_close: bool = True) -> bool:
     """Retire the source once the successor ACCEPTED: AIM, lineage, own close, CAS.
 
     The session writes come first and are idempotent, the ``accepted → finalized`` CAS
-    last — so a crash in between is healed by re-running ``start`` (it finds the
-    still-``accepted`` transfer and finalizes again). The source's ORIGINAL AIM stays in
+    last — so a crash in between is healed by re-running ``accept`` in the successor
+    (:func:`finalize_handoff_source` finds the still-``accepted`` transfer and finalizes
+    again; a still-running source ``start`` does the same). The source's ORIGINAL AIM stays in
     its AIM history and in the transfer record. ``False`` when the transfer is not
     ``accepted`` (any more).
     """
@@ -601,6 +602,115 @@ def finalize(store: Store, transfer: Any, *, arm_close: bool = True) -> bool:
     return store.transition_transfer(current.transfer_id, FINALIZED, now) or (
         (store.get_transfer(current.transfer_id) or current).state == FINALIZED
     )
+
+
+class FinalizeFailed(Exception):
+    """:func:`finalize_handoff_source` could not finalize (the transfer is not accepted)."""
+
+
+def _source_alive(adapter: ClaudeAdapter, session_id: str) -> bool:
+    """Does *session_id* have a live registry entry? An unreadable registry counts as
+    alive: the closer then decides, and it refuses on any doubt (nothing is signalled)."""
+    try:
+        return any(e.session_id == session_id and e.alive for e in adapter.discover())
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return True
+
+
+def _spawn_closer(transfer_id: str, session_id: str) -> bool:
+    """Start the detached token-scoped handoff closer (``close-now --handoff-transfer``)."""
+    from . import spawn
+
+    return spawn.spawn_ccc(
+        ["close-now", "--handoff-transfer", transfer_id, "--session", session_id]
+    )
+
+
+def finalize_handoff_source(store: Store, adapter: ClaudeAdapter, transfer: Any) -> dict[str, Any]:
+    """Retire an ACCEPTED transfer's source from the successor side (tp#1582).
+
+    ``accept`` is the primary finalizer: a source whose own ``start`` timed out sits idle
+    and has no next Stop to run :func:`finalize` or claim a close. Non-capped:
+    :func:`finalize` (close token ensured, AIM, lineage, the ``finalized`` CAS last) and,
+    when the source process is alive and its close token is PENDING, the detached B3 closer
+    (it proves stable idle before any signal and refuses a busy source, handing the token
+    back for the source's own Stop chain). A token already in flight (a closer or the
+    source's Stop chain holds it) spawns nothing; a gone source is only finalized. Capped:
+    finalize the metadata, no token, no spawn — its tab stays open. Idempotent: a duplicate
+    ``accept`` on an ``accepted`` or ``finalized`` transfer heals a crash in between.
+
+    Returns the ``"source"`` record of ``accept -j``: ``session``, ``state``, ``capped``,
+    ``alive`` and ``closer`` (``spawned`` | ``in_flight`` | ``spawn_failed`` | ``none``).
+    :class:`FinalizeFailed` when the transfer is not ``accepted``/``finalized``.
+    """
+    current = store.get_transfer(transfer.transfer_id) or transfer
+    sid = current.source_session
+    capped = bool(current.capped)
+    if not finalize(store, current, arm_close=not capped):
+        raise FinalizeFailed(f"transfer {current.transfer_id} is {current.state}, not accepted")
+    record: dict[str, Any] = {
+        "session": sid,
+        "state": "finalized",
+        "capped": capped,
+        "alive": False,
+        "closer": "none",
+    }
+    if capped:
+        return record
+    record["alive"] = _source_alive(adapter, sid)
+    row = store.get(sid)
+    if not record["alive"] or row is None or not row.close_token:
+        return record
+    if not row.close_requested_at:  # claimed: a closer or the source's own Stop holds it
+        record["closer"] = "in_flight"
+        return record
+    spawned = _spawn_closer(current.transfer_id, sid)
+    record["closer"] = "spawned" if spawned else "spawn_failed"
+    return record
+
+
+def _source_line(record: dict[str, Any], transfer_id: str) -> str:
+    """The one line ``accept`` prints about the source (stderr for a warning)."""
+    sid8 = str(record.get("session") or "")[:8]
+    if record.get("capped"):
+        return f"source {sid8} — finalized (capped: its tab stays open)"
+    if not record.get("alive"):
+        return f"source {sid8} gone — finalized"
+    closer = record.get("closer")
+    if closer in ("spawned", "in_flight"):
+        return f"source {sid8} — finalized, closing its tab when idle"
+    if closer == "spawn_failed":
+        return (
+            f"warning: source {sid8} — finalized, but its closer did not start; run "
+            f"`ccc continue-session accept {transfer_id}` again here to retry"
+        )
+    return f"source {sid8} — finalized (no close pending)"
+
+
+def _finalize_after_accept(store: Store, transfer: Any) -> dict[str, Any]:
+    """:func:`finalize_handoff_source` for ``accept`` — a failure only warns (``accept``
+    already succeeded): the record then carries ``state`` = ``error`` and the reason."""
+    try:
+        return finalize_handoff_source(store, _adapter(), transfer)
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        print(
+            f"warning: accepted, but the source {transfer.source_session[:8]} was not "
+            f"finalized ({exc}); run `ccc continue-session accept {transfer.transfer_id}` "
+            "again here to retry — never resume the source",
+            file=sys.stderr,
+        )
+        return {"session": transfer.source_session, "state": "error", "error": str(exc)}
+
+
+def _say_source(record: dict[str, Any], transfer_id: str, as_json: bool) -> None:
+    """Print :func:`_source_line` (text mode; a warning goes to stderr in both modes)."""
+    if record.get("state") == "error":
+        return  # _finalize_after_accept already warned
+    line = _source_line(record, transfer_id)
+    if line.startswith("warning:"):
+        print(line, file=sys.stderr)
+    elif not as_json:
+        print(line)
 
 
 def _wait_accepted(store: Store, transfer_id: str, timeout: float) -> Any:
@@ -1288,6 +1398,29 @@ def _run_hooks_with_retry(  # pylint: disable=too-many-return-statements
         return transfer, steps
 
 
+def _accept_again(store: Store, transfer: Any, as_json: bool) -> int:
+    """A duplicate ``accept`` (``accepted``/``finalized``): no hook runs again; it heals a
+    crash after the accepted CAS (finalize + closer, both idempotent and token-scoped)."""
+    before = transfer.state
+    source = _finalize_after_accept(store, transfer)
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "transfer": transfer.transfer_id,
+                    "already": before,
+                    "next_steps": [],
+                    "source": source,
+                }
+            )
+        )
+    else:
+        print(f"already accepted: transfer {transfer.transfer_id} ({before})")
+    _say_source(source, transfer.transfer_id, as_json)
+    return 0
+
+
 def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
     """``continue-session accept``: the successor takes the work over (hooks, then CAS
     plus the await rebind in one transaction)."""
@@ -1317,8 +1450,7 @@ def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-ret
             )
             return 1
         if transfer.state in (ACCEPTED, FINALIZED):
-            print(f"already accepted: transfer {transfer.transfer_id} ({transfer.state})")
-            return 0
+            return _accept_again(store, transfer, bool(args.json))
         if transfer.state not in (PREPARED, OPENED):
             print(
                 f"error: transfer {transfer.transfer_id} is {transfer.state}: "
@@ -1341,14 +1473,27 @@ def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-ret
         _reconcile_successor_aim(store, transfer)
         _mark_retired(transfer)
         store.note_transfer(transfer.transfer_id, now_ms(), failure="")
+        # accept is the primary finalizer (tp#1582): an idle source never runs it itself.
+        source = _finalize_after_accept(store, transfer)
     if args.json:
-        print(json.dumps({"ok": True, "transfer": transfer.transfer_id, "next_steps": steps}))
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "transfer": transfer.transfer_id,
+                    "next_steps": steps,
+                    "source": source,
+                }
+            )
+        )
     else:
         print(
             f"accepted: transfer {transfer.transfer_id} — you now own the work of "
             f"{transfer.source_session}. Relaunch the subagents and restart the shells the "
             "handoff lists, then follow its First steps."
         )
+    _say_source(source, transfer.transfer_id, args.json)
+    if not args.json:
         for step in steps:
             print(f"next: {step}")
     return 0
@@ -1366,7 +1511,12 @@ def recovery_step(transfer: Any, target_is_draft: bool) -> str:
             else f"in the successor run `ccc continue-session accept {tid}`; if its tab is "
             f"gone: `ccc resume {transfer.target_session}` and accept there"
         ),
-        "accepted": "re-run the same `ccc continue-session start` in the source (it finalizes)",
+        "accepted": (
+            "nothing in the source — accept finalizes it and closes its tab in the background "
+            "once it is idle; never resume or prompt the source. If it stays accepted: in the "
+            f"successor run `ccc continue-session accept {tid}` again (it finalizes, never "
+            "re-running the hooks)"
+        ),
         "finalized": "nothing — the handoff is complete",
         "failed": f"fix the cause ({transfer.failure or '?'}) and start a new transfer",
     }.get(transfer.state, "?")

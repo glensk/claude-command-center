@@ -216,6 +216,17 @@ class _Harness:  # pylint: disable=too-many-instance-attributes  # + the fake cl
         monkeypatch.setattr(continue_session, "_monotonic", lambda: self.clock)
         self.file = tmp_path / "handoff.md"
         self.file.write_text(_handoff_text(), encoding="utf-8")
+        # accept spawns the detached handoff closer (tp#1582): never a real ccc in a test
+        self.spawned: list[list[str]] = []
+        self.spawn_ok = True
+        from command_center import spawn  # pylint: disable=import-outside-toplevel
+
+        monkeypatch.setattr(spawn, "spawn_ccc", self._spawn)
+
+    def _spawn(self, args: list[str], *, internal: bool = True) -> bool:
+        del internal
+        self.spawned.append(args)
+        return self.spawn_ok
 
     def _launch(self, target: str) -> str:
         self.launches.append(target)
@@ -624,9 +635,9 @@ def test_accept_runs_hooks_with_placeholders_then_accepts(
     assert cli.main(["continue-session", "accept", tid]) == 0
     assert log.read_text(encoding="utf-8").split() == ["-S", SID, "--to", new, "private", tid]
     assert "next: tp show 1" in capsys.readouterr().out
-    assert _state(tid) == "accepted"
+    assert _state(tid) == "finalized"
     assert cli.main(["continue-session", "accept", tid]) == 0  # duplicate: idempotent
-    assert _state(tid) == "accepted"
+    assert _state(tid) == "finalized"
 
 
 def test_accept_carries_the_lineages_first_aim_as_the_anchor(
@@ -834,10 +845,9 @@ def test_accept_writes_the_retired_marker_0600_and_finalize_keeps_it(
     assert oct(marker.stat().st_mode & 0o777) == "0o600"
     assert oct(marker.parent.stat().st_mode & 0o777) == "0o700"
     assert not [p for p in marker.parent.iterdir() if p.name != marker.name]  # no temp left
-    # the source's own re-run of start finalizes; the marker is kept (same accept time)
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SID)
-    assert harness.start("-w", "0") == 0
+    # accept finalized at once; a duplicate accept re-finalizes and keeps the marker
     assert _state(tid) == "finalized"
+    assert cli.main(["continue-session", "accept", tid]) == 0
     assert json.loads(marker.read_text(encoding="utf-8")) == body
 
 
@@ -888,7 +898,7 @@ def test_no_retired_marker_without_the_relay_state_dir(
     _as_successor(monkeypatch, harness, tid)
     _hooks(monkeypatch)
     assert cli.main(["continue-session", "accept", tid]) == 0
-    assert _state(tid) == "accepted"
+    assert _state(tid) == "finalized"
     assert not relay_state.state_dir().exists()  # inert: the hooks are not installed
 
 
@@ -908,7 +918,7 @@ def test_a_retired_marker_write_failure_never_blocks_accept(
     capsys.readouterr()
     assert cli.main(["continue-session", "accept", tid]) == 0
     assert "retired marker" in capsys.readouterr().err
-    assert _state(tid) == "accepted"
+    assert _state(tid) == "finalized"
 
 
 def _arm_await(session_id: str) -> int:
@@ -982,7 +992,7 @@ def test_a_failing_hook_moves_no_await_and_a_retry_moves_it_exactly_once(
     group = _group(gid)
     assert (group.session_id, group.transfer_id) == (new, "")
     assert (group.config_dir, group.cwd, group.no_codex) == (str(harness.private), "/repo", True)
-    assert _state(tid) == "accepted"
+    assert _state(tid) == "finalized"
     assert cli.main(["continue-session", "accept", tid]) == 0  # a retry after success
     assert "await group" not in capsys.readouterr().out
     with Store() as store:
@@ -1154,6 +1164,223 @@ def test_status_names_the_recovery_step(
     out = capsys.readouterr().out
     assert tid in out and "next:" in out
     assert cli.main(["continue-session", "status", "t-missing"]) == 1
+
+
+# ------------------------------------------------- accept finalizes the source (tp#1582)
+
+
+def _closer(tid: str) -> list[str]:
+    return ["close-now", "--handoff-transfer", tid, "--session", SID]
+
+
+def _source_row() -> Any:
+    with Store() as store:
+        row = store.get(SID)
+    assert row is not None
+    return row
+
+
+def test_accept_finalizes_an_idle_source_whose_start_timed_out(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The reported sequence: start exits 3, the source sits idle, the successor accepts —
+    the transfer is finalized, AIM and lineage move, ONE closer is spawned, and nothing
+    runs in the source (no second start, no launch)."""
+    tid = _opened_transfer(harness)  # start timed out: the source is idle from here on
+    new = _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid, "-j"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["source"] == {
+        "session": SID,
+        "state": "finalized",
+        "capped": False,
+        "alive": True,
+        "closer": "spawned",
+    }
+    assert _state(tid) == "finalized"
+    row = _source_row()
+    assert row.aim == f"handoff accepted by session {new[:8]}"
+    assert row.handed_off_to == new and row.status == "handed_off"
+    assert row.close_token and row.close_requested_at > 0  # pending: the closer claims it
+    assert harness.spawned == [_closer(tid)]
+    assert len(harness.launches) == 1  # only the timed-out start ever launched
+
+
+def test_accept_text_names_the_source_line(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    assert f"source {SID[:8]} — finalized, closing its tab when idle" in capsys.readouterr().out
+
+
+def test_accept_with_the_source_gone_finalizes_only(
+    harness: _Harness,
+    fixture_session: _Adapter,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    monkeypatch.setattr(fixture_session, "discover", list)  # no live registry entry
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    assert f"source {SID[:8]} gone — finalized" in capsys.readouterr().out
+    assert _state(tid) == "finalized" and _source_row().handed_off_to
+    assert not harness.spawned
+
+
+def test_a_busy_source_start_still_running_keeps_one_token_for_its_own_stop(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """start is still waiting in the source: the closer accept spawns refuses the busy
+    source and hands the token back; start's own wait sees ``finalized``, and its Stop
+    chain claims the SAME token."""
+    from command_center import handoff_close  # pylint: disable=import-outside-toplevel
+    from command_center.hooks import CLOSE_REQUEST_TTL_MS  # pylint: disable=C0415
+    from command_center.models import CloseClaim, now_ms  # pylint: disable=C0415
+
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    assert harness.spawned == [_closer(tid)]
+    token = _source_row().close_token
+
+    def busy(_self: Any, session_id: str = "") -> list[LiveSession]:
+        return [LiveSession(4242, session_id, "/repo", raw_status="busy", alive=True)]
+
+    def no_kill(*_a: object) -> None:
+        raise AssertionError("a busy source must never be signalled")
+
+    monkeypatch.setattr(cli.ClaudeAdapter, "discover_raw", busy)
+    monkeypatch.setattr(cli.ClaudeAdapter, "transcript_path", lambda *_a, **_k: None)
+    monkeypatch.setattr(handoff_close, "_start_of", lambda _pid: "start-1")
+    monkeypatch.setattr(cli.os, "kill", no_kill)
+    assert cli.main(["close-now", "-H", tid, "-s", SID]) == 1  # the spawned closer, run inline
+    row = _source_row()
+    assert row.close_token == token and row.close_requested_at > 0  # handed back, pending
+    with Store() as store:
+        transfer = store.get_transfer(tid)
+        assert continue_session.finalize(store, transfer)  # start's own wait: already done
+        kind, claim = store.claim_after_turn(SID, now_ms(), CLOSE_REQUEST_TTL_MS)
+    assert kind == "close" and isinstance(claim, CloseClaim) and claim.token == token
+
+
+def test_a_capped_accept_finalizes_metadata_only(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tid = _opened_transfer(harness)
+    with Store() as store:
+        store.conn.execute("UPDATE transfers SET capped = 1 WHERE transfer_id = ?", (tid,))
+        store.conn.commit()
+    new = _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    assert "finalized (capped: its tab stays open)" in capsys.readouterr().out
+    assert _state(tid) == "finalized"
+    row = _source_row()
+    assert row.handed_off_to == new and not row.close_token and not row.close_requested_at
+    assert not harness.spawned
+
+
+def test_a_duplicate_accept_heals_a_crash_after_the_accepted_cas(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Accepted but never finalized (the live t1e301… state): accept again finalizes
+    without re-running the hooks; a token already in flight spawns no second closer."""
+    from command_center.transfer_store import ACCEPTED  # pylint: disable=C0415
+
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    log = tmp_path / "hook.log"
+    _hooks(monkeypatch, [_ok_hook(tmp_path, log)])
+    with Store() as store:
+        assert store.transition_transfer(tid, ACCEPTED, 1)  # the crash right after the CAS
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    out = capsys.readouterr().out
+    assert f"already accepted: transfer {tid} (accepted)" in out
+    assert "closing its tab when idle" in out
+    assert not log.exists()  # no hook ran again
+    assert _state(tid) == "finalized" and harness.spawned == [_closer(tid)]
+    with Store() as store:
+        assert store.claim_close(SID, _source_row().close_token) > 0  # the closer holds it
+    assert cli.main(["continue-session", "accept", tid, "-j"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["already"] == "finalized" and data["source"]["closer"] == "in_flight"
+    assert harness.spawned == [_closer(tid)]  # no needless second closer
+
+
+def test_a_failed_closer_spawn_warns_and_a_retry_spawns_it(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    harness.spawn_ok = False
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    assert "closer did not start" in capsys.readouterr().err
+    harness.spawn_ok = True
+    assert cli.main(["continue-session", "accept", tid]) == 0  # token still pending
+    assert harness.spawned == [_closer(tid)] * 2
+
+
+def test_a_hook_failure_finalizes_nothing_and_spawns_nothing(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch, [_script(tmp_path, "bad.sh", "exit 3\n")])
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    assert _state(tid) == "opened" and not _source_row().handed_off_to
+    assert not harness.spawned
+
+
+def test_a_finalize_failure_after_accept_only_warns(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sqlite3  # pylint: disable=import-outside-toplevel
+
+    def boom(*_a: object, **_k: object) -> bool:
+        raise sqlite3.OperationalError("database is locked")
+
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    monkeypatch.setattr(continue_session, "finalize", boom)
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid, "-j"]) == 0  # accept succeeded
+    out = capsys.readouterr()
+    assert "was not finalized (database is locked)" in out.err and "never resume" in out.err
+    assert json.loads(out.out)["source"]["state"] == "error"
+    assert _state(tid) == "accepted" and not harness.spawned
+
+
+def test_the_accepted_recovery_step_never_sends_the_source_back_to_start(
+    harness: _Harness,
+) -> None:
+    from command_center.transfer_store import ACCEPTED  # pylint: disable=C0415
+
+    tid = _opened_transfer(harness)
+    with Store() as store:
+        store.transition_transfer(tid, ACCEPTED, 1)
+        transfer = store.get_transfer(tid)
+    step = continue_session.recovery_step(transfer, target_is_draft=False)
+    assert f"in the successor run `ccc continue-session accept {tid}` again" in step
+    assert "background" in step and "never resume" in step
+    assert "continue-session start" not in step
 
 
 # ------------------------------------------------------------------ capped path
@@ -1525,7 +1752,7 @@ def test_accept_retry_a_refusing_hook_until_it_succeeds(
     capsys.readouterr()
     assert cli.main(["continue-session", "accept", tid]) == 0
     err = capsys.readouterr().err
-    assert _runs(counter) == 3 and _state(tid) == "accepted"
+    assert _runs(counter) == 3 and _state(tid) == "finalized"
     assert err.count("waiting: handoff hook refused") == 2 and "attempt 1" in err
     assert during[0].startswith("hook (retrying 1): flaky.sh: exit 1")  # test 7
     assert during[1].startswith("hook (retrying 2):")
@@ -1669,7 +1896,7 @@ def test_accept_retry_reruns_the_whole_hook_list(
     _hooks(monkeypatch, [first], [second], window=60)
     assert cli.main(["continue-session", "accept", tid]) == 0
     assert (_runs(first_count), _runs(second_count)) == (2, 2)
-    assert _state(tid) == "accepted"
+    assert _state(tid) == "finalized"
 
 
 def test_accept_retry_preamble_allows_one_more_accept() -> None:
@@ -1703,4 +1930,4 @@ def test_accept_retry_integration_with_a_stub_executable(
 
     monkeypatch.setattr(continue_session, "_sleep", _sleep)
     assert continue_session.cmd_accept(type("A", (), {"transfer": tid, "json": False})()) == 0
-    assert _state(tid) == "accepted"
+    assert _state(tid) == "finalized"
