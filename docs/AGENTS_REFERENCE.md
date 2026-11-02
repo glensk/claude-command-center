@@ -361,6 +361,12 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
   (idempotent) write the source's retired marker `<state dir>/retired/<sid>.json`
   `{transfer, successor, at}` (0600, dir 0700, temp + rename) only when the state dir
   exists; a write failure warns, never blocks the handoff.
+- **`start -D` drains before anything exists; `-w` fits the tool cap**: `-D N` (0..60) runs
+  the ONE detector (`_drain_source`, shared with `drain`; keep-warm ignored, nothing
+  signalled) BEFORE `_compose`, so a busy source exits 1 with the inventory and no
+  transfer row. `effective_wait` lowers `-w` to `min(-w, max(120, 540 − D − Σ
+  handoff_facts timeout_s − 30))` and `start` prints it on stderr; callers pass the Bash
+  tool `timeout: 600000`. Never let the clamp raise `-w`.
 - **`--facts-only` / `--capped` share one path** (`_compose_generated`): a capped router that
   is unset, fails or returns anything but the strict JSON supplement falls back to
   facts-only, never to a refusal. `start -j` prints JSON on a dry run only.

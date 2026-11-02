@@ -469,6 +469,87 @@ def test_start_refuses_while_work_is_in_flight(
         assert store.transfers_of(SID) == []
 
 
+def test_start_drain_with_work_in_flight_exits_1_and_creates_no_transfer(
+    harness: _Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    harness_adapter = continue_session._adapter()  # noqa: SLF001
+    assert isinstance(harness_adapter, _Adapter)
+    harness_adapter.transcript = PARENT
+    assert harness.start("-D", "0") == 1
+    out = capsys.readouterr()
+    assert "in flight: NOT clear" in out.out and "subagent  a1" in out.out
+    assert "work is still in flight after 0s — no transfer started" in out.err
+    assert harness.launches == []
+    with Store() as store:
+        assert store.transfers_of(SID) == []
+
+
+def test_start_drain_clear_proceeds_and_says_the_accept_wait(
+    harness: _Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert harness.start("-D", "5") == 0
+    out = capsys.readouterr()
+    assert "finalized" in out.out and "in flight" not in out.out
+    assert "accept wait: 420s (effective -w)" in out.err
+    with Store() as store:
+        assert store.transfers_of(SID)[0].state == "finalized"
+
+
+@pytest.mark.parametrize(
+    ("wait", "drain", "timeouts", "expected"),
+    [
+        (420, 0, [], 420),  # 540 - 0 - 0 - 30 = 510: untouched
+        (420, 30, [15.0, 6.0], 420),  # 459: untouched
+        (420, 60, [120.0, 120.0], 210),  # 540 - 60 - 240 - 30
+        (420, 60, [120.0, 120.0, 120.0], 120),  # 90 → the 120 s floor
+        (500, 30, [25.5], 454),  # 454.5 → whole seconds
+        (60, 0, [], 60),  # an explicit smaller -w is kept, even below the floor
+        (0, 60, [120.0] * 4, 0),
+    ],
+)
+def test_effective_wait_clamps_to_the_tool_cap(
+    wait: int, drain: int, timeouts: list[float], expected: int
+) -> None:
+    assert continue_session.effective_wait(wait, drain, timeouts) == expected
+
+
+def test_start_clamps_the_accept_wait_by_the_provider_timeouts(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sys  # pylint: disable=import-outside-toplevel
+
+    from command_center import config  # pylint: disable=import-outside-toplevel
+
+    quiet = [sys.executable, "-c", 'print(\'{"version": 1, "facts": []}\')']
+    specs: list[dict[str, object]] = [
+        {"argv": quiet, "name": "a", "timeout_s": 120, "optional": True},
+        {"argv": quiet, "name": "b", "timeout_s": 100, "optional": True},
+    ]
+    cfg = config.Config(handoff_facts=specs)
+    monkeypatch.setattr(config, "load_config", lambda: cfg)
+    assert harness.start("-D", "40") == 0
+    assert "accept wait: 250s (effective -w)" in capsys.readouterr().err  # 540-40-220-30
+
+
+@pytest.mark.parametrize("value", ["61", "-1", "x"])
+def test_start_drain_out_of_range_is_a_usage_error(
+    value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["continue-session", "start", "-A", "private", "-D", value])
+    assert exc.value.code == 2
+    assert "-D/--drain" in capsys.readouterr().err
+
+
+def test_start_help_lists_drain(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["continue-session", "start", "-h"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "-D, --drain SECONDS" in out or "-D SECONDS, --drain SECONDS" in out
+    assert "timeout 600000" in out
+
+
 def test_start_refuses_an_invalid_handoff(
     harness: _Harness, capsys: pytest.CaptureFixture[str]
 ) -> None:

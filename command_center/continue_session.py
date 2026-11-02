@@ -241,26 +241,36 @@ def cmd_template(_args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_drain(args: argparse.Namespace) -> int:
-    """``continue-session drain``: block until nothing is in flight (exit 1 on timeout)."""
+def _drain_source(
+    adapter: ClaudeAdapter, store: Store, src: Source, timeout: float
+) -> tuple[bool, Inventory]:
+    """The ONE in-flight wait of ``drain`` and ``start -D``: ``(clear, last inventory)``.
+
+    Keep-warm timers never count as in flight (the detector's rule); nothing is signalled.
+    """
     from . import inflight
 
+    return inflight.drain(
+        adapter,
+        src.pid,
+        src.transcript,
+        timeout=timeout,
+        poll=DRAIN_POLL_SEC,
+        ignore=src.ignore,
+        active_subagents=lambda: store.active_subagents(src.session_id),
+        subagent_started_at=lambda: store.subagent_started_at(src.session_id),
+        on_stale_counter=lambda n: _clear_stale_counter(store, src.session_id, n),
+    )
+
+
+def cmd_drain(args: argparse.Namespace) -> int:
+    """``continue-session drain``: block until nothing is in flight (exit 1 on timeout)."""
     adapter, store, src = _open_source(args)
     with store:
         if src is None:
             print("error: could not resolve a session (pass -s/--session <id>)", file=sys.stderr)
             return 1
-        ok, inv = inflight.drain(
-            adapter,
-            src.pid,
-            src.transcript,
-            timeout=float(args.timeout),
-            poll=DRAIN_POLL_SEC,
-            ignore=src.ignore,
-            active_subagents=lambda: store.active_subagents(src.session_id),
-            subagent_started_at=lambda: store.subagent_started_at(src.session_id),
-            on_stale_counter=lambda n: _clear_stale_counter(store, src.session_id, n),
-        )
+        ok, inv = _drain_source(adapter, store, src, float(args.timeout))
     data = inv.to_dict()
     if args.json:
         print(json.dumps({"drained": ok, **data}, indent=2))
@@ -281,10 +291,44 @@ def cmd_drain(args: argparse.Namespace) -> int:
 ACCEPT_WAIT_DEFAULT_SEC = 420  # `start` waits this long for `accepted` (under the tool cap)
 ACCEPT_POLL_SEC = 2.0
 EXIT_WAITING = 3  # `start` timed out waiting for `accepted`: both sessions stay open
+START_DRAIN_MAX_SEC = 60  # `start -D`: the longest in-flight wait inside the one call
+START_CALL_BUDGET_SEC = 540  # the whole `start` call stays under the 600 s Bash tool cap
+START_CALL_MARGIN_SEC = 30  # launch, compose and finalize besides the timed parts
+ACCEPT_WAIT_FLOOR_SEC = 120  # the clamp never cuts the accept wait below this
 
 
 class StartRefused(Exception):
     """A fail-closed preflight refusal; the message is printed, nothing was written."""
+
+
+def effective_wait(wait: int, drain: int, provider_timeouts: list[float]) -> int:
+    """The accept wait clamped so one ``start`` call stays under the Bash tool cap.
+
+    ``min(wait, max(floor, budget − drain − Σ provider timeout_s − margin))``: the clamp
+    only ever lowers ``-w``, and never below ``ACCEPT_WAIT_FLOOR_SEC`` (an explicitly
+    smaller ``-w`` is kept).
+    """
+    room = START_CALL_BUDGET_SEC - drain - sum(provider_timeouts) - START_CALL_MARGIN_SEC
+    return min(wait, max(ACCEPT_WAIT_FLOOR_SEC, int(room)))
+
+
+def _provider_timeouts() -> list[float]:
+    """The ``timeout_s`` of every configured ``handoff_facts`` provider (they run in order)."""
+    from . import config, handoff_facts
+
+    specs, _bad = handoff_facts.parse_specs(config.load_config().handoff_facts)
+    return [spec.timeout_s for spec in specs]
+
+
+def _drain_seconds(value: str) -> int:
+    """argparse type of ``start -D``: whole seconds in ``0..START_DRAIN_MAX_SEC``."""
+    try:
+        seconds = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not a whole number of seconds: {value!r}") from exc
+    if not 0 <= seconds <= START_DRAIN_MAX_SEC:
+        raise argparse.ArgumentTypeError(f"must be 0..{START_DRAIN_MAX_SEC} seconds, not {seconds}")
+    return seconds
 
 
 def _launch(target_session: str) -> str:
@@ -868,6 +912,36 @@ def _await_idle(adapter: ClaudeAdapter, src: Source) -> bool:
     return False
 
 
+def _clamp_wait(args: argparse.Namespace) -> None:
+    """Lower ``args.wait`` to what the 600 s Bash cap leaves; say the effective value."""
+    wait = effective_wait(int(args.wait), int(args.drain or 0), _provider_timeouts())
+    args.wait = wait
+    if not args.dry_run:
+        print(f"accept wait: {wait}s (effective -w)", file=sys.stderr)
+
+
+def _start_drained(adapter: ClaudeAdapter, store: Store, src: Source, args: Any) -> bool:
+    """``start -D N``: one bounded in-flight wait; prints the inventory when still busy."""
+    ok, inv = _drain_source(adapter, store, src, float(args.drain))
+    if not ok:
+        print(_render_inflight(inv.to_dict()))
+    return ok
+
+
+def _start_input(args: argparse.Namespace) -> tuple[bytes, str]:
+    """``(model file bytes, refusal)``: the handoff file, or why the flags give none."""
+    if args.facts_only and (args.file or args.capped):
+        return b"", "--facts-only takes no -f/--file and no --capped"
+    if args.facts_only or args.capped:
+        return b"", ""
+    if not args.file:
+        return b"", "give -f/--file HANDOFF (or --capped)"
+    try:
+        return Path(args.file).read_bytes(), ""
+    except OSError as exc:
+        return b"", f"cannot read the handoff file: {exc}"
+
+
 def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
     """``continue-session start``: hand this session's work to a NEW session."""
     from .models import now_ms
@@ -884,22 +958,23 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
                 file=sys.stderr,
             )
             return 1
+        _clamp_wait(args)
         active = store.active_transfer(src.session_id)
         if active is not None and active.state == ACCEPTED:  # a re-run after acceptance
             return _drive(store, active, src, "", args)
         session = store.get(src.session_id)
         if session is not None and session.handed_off_to:
             return _fail(args, src.session_id, f"{src.session_id} was already handed off")
-        if args.facts_only and (args.file or args.capped):
-            return _fail(args, src.session_id, "--facts-only takes no -f/--file and no --capped")
-        raw = b""
-        if not (args.facts_only or args.capped):
-            if not args.file:
-                return _fail(args, src.session_id, "give -f/--file HANDOFF (or --capped)")
-            try:
-                raw = Path(args.file).read_bytes()
-            except OSError as exc:
-                return _fail(args, src.session_id, f"cannot read the handoff file: {exc}")
+        raw, problem = _start_input(args)
+        if problem:
+            return _fail(args, src.session_id, problem)
+        if args.drain is not None and not _start_drained(adapter, store, src, args):
+            return _fail(
+                args,
+                src.session_id,
+                f"work is still in flight after {args.drain}s — no transfer started; "
+                "the source session stays authoritative",
+            )
         try:
             composed = _compose(adapter, store, src, raw, active, args)
         except StartRefused as exc:
@@ -1361,8 +1436,8 @@ def add_parser(sub: Any) -> None:
         "start",
         help="validate the handoff, open a NEW session on an account, finalize on accept",
         epilog=(
-            "example (from inside the session, after drain):\n"
-            "  ccc continue-session start -A private -f /path/handoff.md  # new-session-ok"
+            "example (from inside the session; pass the Bash tool timeout 600000):\n"
+            "  ccc continue-session start -A private -D 30 -f /path/handoff.md  # new-session-ok"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1399,7 +1474,18 @@ def add_parser(sub: Any) -> None:
         "--wait",
         type=int,
         default=ACCEPT_WAIT_DEFAULT_SEC,
-        help=f"seconds to wait for the successor's accept (default {ACCEPT_WAIT_DEFAULT_SEC})",
+        help=f"seconds to wait for the successor's accept (default {ACCEPT_WAIT_DEFAULT_SEC}); "
+        f"lowered to {START_CALL_BUDGET_SEC} − drain − Σ handoff_facts timeout_s − "
+        f"{START_CALL_MARGIN_SEC}, never below {ACCEPT_WAIT_FLOOR_SEC}",
+    )
+    p_start.add_argument(
+        "-D",
+        "--drain",
+        type=_drain_seconds,
+        default=None,
+        metavar="SECONDS",
+        help=f"first wait up to SECONDS (0..{START_DRAIN_MAX_SEC}) until nothing is in flight; "
+        "still busy → exit 1 with the inventory, no transfer (default: no wait)",
     )
     p_start.add_argument(
         "-n", "--dry-run", action="store_true", help="print prompt and argv; launch nothing"
