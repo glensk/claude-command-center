@@ -49,3 +49,21 @@ def test_clip_keeps_the_item_run_whole() -> None:
     # a run too wide to keep room for the words is cut like any text
     wide = "words: tp#1" + "".join(f", #{n}" for n in range(100, 120))
     assert aimtext.clip(wide, 20) == wide[:19] + "…"
+
+
+def test_b9_strip_tail_run_and_is_run_only() -> None:
+    """Only a one-line AIM ending in ``: tp#N`` with words before it is stripped (tp#1566)."""
+    assert aimtext.strip_tail_run("fix decide: tp#1363, #1364") == "fix decide"
+    assert aimtext.strip_tail_run("ship it — : tp#7") == "ship it"
+    for aim in (
+        "tp#5",
+        ": tp#5",
+        "tp#5: lead form",
+        "plain words",
+        "",
+        None,
+        "a: tp#1\nmore",
+    ):
+        assert aimtext.strip_tail_run(aim) is None, aim
+    assert aimtext.is_run_only("tp#5") and aimtext.is_run_only(": tp#5, #6")
+    assert not aimtext.is_run_only("fix: tp#5") and not aimtext.is_run_only("plain")

@@ -71,6 +71,29 @@ def words(aim: str | None) -> str:
     return split(aim).words
 
 
+def strip_tail_run(aim: str | None) -> str | None:
+    """The words of a one-line AIM that ENDS in an item run, else ``None`` (tp#1566, B9).
+
+    ``fix decide: tp#1363, #1364`` → ``fix decide``. ``None`` for an AIM without a trailing
+    run, a run-only AIM (no words before it), the older leading form and a multi-line AIM
+    (only a one-line AIM is ever rewritten by the one-time cleanup).
+    """
+    text = (aim or "").strip()
+    if not text or "\n" in text:
+        return None
+    tail = _TAIL_RE.search(text)
+    if tail is None:
+        return None
+    head = text[: tail.start()].rstrip(_SEPARATORS)
+    return head or None
+
+
+def is_run_only(aim: str | None) -> bool:
+    """True when *aim*'s first line is an item run and nothing else (``tp#5``, ``: tp#5``)."""
+    parts = split(aim)
+    return bool(parts.ids) and not parts.words
+
+
 def title_words(aim: str | None, width: int) -> str:
     """The AIM words a tab title shows, cut to *width* chars (``""``: the AIM is ids only)."""
     text = words(aim)

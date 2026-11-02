@@ -2351,3 +2351,119 @@ def test_start_job_failed_exec_leaves_caller_cwd(
     assert cmd_start_job(argparse.Namespace(session_id="job-y")) == 1
     assert seen == [job_cwd.resolve()]
     assert Path.cwd() == before
+
+
+# ---- B9 (tp#1566): ccc strip-aim-runs — the one-time cleanup of tracker-written runs ------
+
+
+def _b9_seed(db: Path) -> None:
+    """Five sessions: a run to strip, a run-only AIM, plain words, a done and an archived one."""
+    with Store(db) as store:
+        for sid, aim in (
+            ("aaaa1111-strip", "fix decide: tp#7, #8"),
+            ("bbbb2222-runonly", "tp#5"),
+            ("cccc3333-plain", "plain words"),
+            ("dddd4444-done", "finished thing: tp#9"),
+            ("eeee5555-archived", "archived thing: tp#10"),
+        ):
+            store.ensure(sid, cwd="/repo")
+            store.set_aim(sid, aim)
+        store.set_subgoals("aaaa1111-strip", ["derived step"], source="auto")
+        store.update_fields(
+            "aaaa1111-strip",
+            aim_met=True,
+            context_offset=99,
+            aim_score=61,
+            aim_prev="fix decide",
+        )
+        store.update_fields("dddd4444-done", done=True)
+        store.update_fields("eeee5555-archived", archived=True)
+
+
+def _b9_snapshot(db: Path) -> dict[str, tuple[object, ...]]:
+    with Store(db) as store:
+        return {
+            s.session_id: (
+                s.aim,
+                s.aim_met,
+                s.context_offset,
+                s.aim_score,
+                s.aim_prev,
+                len(store.list_aim_history(s.session_id)),
+                len(store.list_subgoals(s.session_id)),
+            )
+            for s in store.list_sessions(include_archived=True)
+        }
+
+
+def test_b9_strip_aim_runs_dry_run_lists_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``-n`` prints id8, old and new AIM per session and leaves the store untouched."""
+    db = _b5_home(tmp_path, monkeypatch)
+    _b9_seed(db)
+    before = _b9_snapshot(db)
+    capsys.readouterr()
+    assert cli.main(["strip-aim-runs", "-a", "-n"]) == 0
+    out = capsys.readouterr().out
+    assert "strip     aaaa1111  old: fix decide: tp#7, #8" in out
+    assert "new: fix decide" in out
+    assert "run-only  bbbb2222  tp#5  (untouched)" in out
+    assert "cccc3333" not in out
+    assert "dddd4444" not in out and "eeee5555" not in out
+    assert "would strip 1 AIM; 1 run-only left untouched" in out
+    assert "dry run: nothing written" in out
+    assert _b9_snapshot(db) == before
+
+
+def test_b9_strip_aim_runs_all_keeps_words_and_stamps_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``-a`` keeps the words, stamps ``tool``, resets nothing; run-only/done/archived stay."""
+    db = _b5_home(tmp_path, monkeypatch)
+    _b9_seed(db)
+    before = _b9_snapshot(db)
+    assert cli.main(["strip-aim-runs", "--all"]) == 0
+    assert "stripped 1 AIM;" in capsys.readouterr().out
+    after = _b9_snapshot(db)
+    # Only the stripped session changed: its text and one more history row.
+    assert after["aaaa1111-strip"] == ("fix decide", True, 99, 61, "fix decide", 2, 1)
+    assert before["aaaa1111-strip"][1:5] == after["aaaa1111-strip"][1:5]
+    for sid in (
+        "bbbb2222-runonly",
+        "cccc3333-plain",
+        "dddd4444-done",
+        "eeee5555-archived",
+    ):
+        assert after[sid] == before[sid], sid
+    with Store(db) as store:
+        assert [(r.aim, r.set_by) for r in store.list_aim_history("aaaa1111-strip")] == [
+            ("fix decide: tp#7, #8", None),
+            ("fix decide", "tool"),
+        ]
+        assert [g.source for g in store.list_subgoals("aaaa1111-strip")] == ["auto"]
+    # A second run finds nothing left to strip.
+    assert cli.main(["strip-aim-runs", "-a"]) == 0
+    assert "stripped 0 AIMs;" in capsys.readouterr().out
+    assert _b9_snapshot(db) == after
+
+
+def test_b9_strip_aim_runs_one_session_and_scope_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``-s`` touches only that session (a done one is skipped); -a / -s are required."""
+    db = _b5_home(tmp_path, monkeypatch)
+    _b9_seed(db)
+    before = _b9_snapshot(db)
+    assert cli.main(["strip-aim-runs", "-s", "dddd4444-done"]) == 0
+    assert "1 archived/done skipped" in capsys.readouterr().out
+    assert _b9_snapshot(db) == before
+    assert cli.main(["strip-aim-runs", "-s", "aaaa1111-strip"]) == 0
+    with Store(db) as store:
+        session = store.get("aaaa1111-strip")
+    assert session is not None and session.aim == "fix decide"
+    assert cli.main(["strip-aim-runs", "-s", "nope"]) == 1
+    with pytest.raises(SystemExit):
+        cli.main(["strip-aim-runs", "-n"])
+    with pytest.raises(SystemExit):
+        cli.main(["strip-aim-runs", "-a", "-s", "aaaa1111-strip"])

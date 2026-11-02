@@ -1617,3 +1617,71 @@ def test_b5_latest_user_aim_falls_back_to_the_first_row(tmp_path: Path) -> None:
         store.ensure("empty", cwd="/repo")
         assert store.latest_user_aim("empty") is None
         assert store.latest_user_aim("unknown") is None
+
+
+# ---- B9 (tp#1566): Store.rewrite_aim_text — the one-time strip's write path --------------
+
+
+def test_b9_rewrite_aim_text_keeps_everything_but_the_text(tmp_path: Path) -> None:
+    """Only ``sessions.aim`` changes plus one ``tool`` history row; nothing is reset."""
+    with _store(tmp_path) as store:
+        store.ensure("s1", cwd="/repo")
+        store.set_aim("s1", "fix decide", set_by=AIM_SET_BY_USER)
+        # The old tracker rewrite (unstamped).
+        store.set_aim("s1", "fix decide: tp#7, #8")
+        # Auto sub-goals: set_aim would clear these, rewrite_aim_text must not.
+        store.set_subgoals("s1", ["derived step", "second step"], source="auto")
+        store.update_fields(
+            "s1",
+            aim_met=True,
+            context_offset=4242,
+            aim_score=77,
+            aim_prev="fix decide",
+            short_aim="decide fix",
+        )
+        before = store.get("s1")
+        assert before is not None
+        subgoals_before = [(g.text, g.source) for g in store.list_subgoals("s1")]
+        assert [source for _, source in subgoals_before] == ["auto", "auto"]
+
+        assert store.rewrite_aim_text("s1", "fix decide") is True
+
+        after = store.get("s1")
+        assert after is not None
+        assert after.aim == "fix decide"
+        assert (
+            after.aim_met,
+            after.context_offset,
+            after.aim_score,
+            after.aim_prev,
+            after.short_aim,
+        ) == (True, 4242, 77, "fix decide", "decide fix")
+        assert [(g.text, g.source) for g in store.list_subgoals("s1")] == subgoals_before
+        history = store.list_aim_history("s1")
+        assert [(r.aim, r.set_by) for r in history] == [
+            ("fix decide", "user"),
+            ("fix decide: tp#7, #8", None),
+            ("fix decide", "tool"),
+        ]
+        assert history[-1].short_aim == "decide fix"
+        # Re-running is a no-op (same text): no new row.
+        assert store.rewrite_aim_text("s1", "fix decide") is False
+        assert len(store.list_aim_history("s1")) == 3
+
+
+def test_b9_rewrite_aim_text_seeds_a_pre_history_original(tmp_path: Path) -> None:
+    """An AIM that predates history keeps its original as an unstamped first row."""
+    with _store(tmp_path) as store:
+        store.ensure("s1", cwd="/repo")
+        store.update_fields("s1", aim="old words: tp#3")
+        assert store.rewrite_aim_text("s1", "old words") is True
+        assert [(r.aim, r.set_by) for r in store.list_aim_history("s1")] == [
+            ("old words: tp#3", None),
+            ("old words", "tool"),
+        ]
+        # No AIM, empty text or an unknown session: refused, nothing written.
+        store.ensure("bare", cwd="/repo")
+        assert store.rewrite_aim_text("bare", "x") is False
+        assert store.rewrite_aim_text("s1", "  ") is False
+        assert store.rewrite_aim_text("unknown", "x") is False
+        assert store.list_aim_history("bare") == []

@@ -41,6 +41,12 @@ flags. Grouped by what they do:
   derived from it. `-g` prints it back (empty line when none); the TUI detail pane shows it as `· ~<eta>`.
 - `ccc aim` · `ccc aim-history` — the current AIM / its first→current progression (each
   revision with its `set_by` stamp: `user`, `launch`, `tool`, or `-` for a legacy row).
+- `ccc strip-aim-runs` (`-a/--all` | `-s/--session`, `-n/--dry-run`) — one-time cleanup from
+  when a tracker still rewrote AIMs: a non-archived, not-done session whose one-line AIM ends
+  in a `: tp#N, #M` run with words before it gets the words alone (`Store.rewrite_aim_text`,
+  one history row stamped `tool`; sub-goals, score, DONE verdict, grading offset and the
+  `old ====> new` transition are left as they are). A run-only AIM is listed, not touched.
+  Run `-n` first: it prints each session's id, old and new AIM and writes nothing.
 - `ccc set-next` · `ccc set-blocked` · `ccc set-deadline` · `ccc set-donecheck` — the other job fields.
 - `ccc subgoals "step" …` (`--list`, `--adaptive`, `--merge`) — the progress checklist.
 - `ccc check <N>` (`--uncheck`) · `ccc subgoal-check <N> "<cmd>"` — tick an item / attach a shell predicate.

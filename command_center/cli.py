@@ -819,6 +819,58 @@ def cmd_aim_history(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_strip_aim_runs(args: argparse.Namespace) -> int:
+    """One-time cleanup: drop the tracker-written ``: tp#N`` tail from session AIMs (tp#1566).
+
+    Before the AIM became static, tp appended the run of items a session held to its AIM
+    and kept rewriting it; a stale run keeps binding a session to an item it released. For
+    every non-archived, not-done session (``-a``) or one session (``-s``) whose one-line AIM
+    ends in such a run with words before it, the AIM becomes the words alone through
+    ``Store.rewrite_aim_text`` (stamped ``tool``; nothing else reset). A run-only AIM is
+    listed and left untouched. ``-n`` prints the plan and writes nothing.
+    """
+    from . import aimtext
+    from .models import AIM_SET_BY_TOOL, short_id
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    with Store() as store:
+        if getattr(args, "all", False):
+            sessions = store.list_sessions()
+        else:
+            session_id = resolve_session_id(_adapter(), args.session, None)
+            if not session_id:
+                print("error: could not resolve a session (pass -s <id> or -a)", file=sys.stderr)
+                return 1
+            one = store.get(session_id)
+            if one is None:
+                print(f"error: unknown session {session_id}", file=sys.stderr)
+                return 1
+            sessions = [one]
+        stripped = run_only = skipped = 0
+        for session in sorted(sessions, key=lambda s: s.session_id):
+            if session.archived or session.done:
+                skipped += 1
+                continue
+            words = aimtext.strip_tail_run(session.aim)
+            if words is None:
+                if aimtext.is_run_only(session.aim):
+                    run_only += 1
+                    print(f"run-only  {short_id(session.session_id)}  {session.aim}  (untouched)")
+                continue
+            stripped += 1
+            print(f"strip     {short_id(session.session_id)}  old: {session.aim}")
+            print(f"                    new: {words}")
+            if not dry_run:
+                store.rewrite_aim_text(session.session_id, words, set_by=AIM_SET_BY_TOOL)
+    verb = "would strip" if dry_run else "stripped"
+    print(
+        f"{verb} {stripped} AIM{'s' if stripped != 1 else ''}; {run_only} run-only left "
+        f"untouched; {skipped} archived/done skipped"
+        + (" (dry run: nothing written)" if dry_run else "")
+    )
+    return 0
+
+
 def cmd_subgoal_history(args: argparse.Namespace) -> int:
     """Print the session's sub-goal evolution — each version, with the impartial drift verdict."""
     from datetime import datetime
@@ -6457,6 +6509,28 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     )
     p_aimhist.add_argument("--session")
     p_aimhist.set_defaults(func=cmd_aim_history)
+
+    p_strip = sub.add_parser(
+        "strip-aim-runs",
+        help="one-time cleanup: drop the tracker-written ': tp#N' tail from session AIMs",
+        description="Rewrite each non-archived, not-done session AIM that ends in a\n"
+        "': tp#N, #M' run with words before it to the words alone (stamped 'tool' in the\n"
+        "AIM history; sub-goals, score and DONE verdict untouched). A run-only AIM is\n"
+        "listed and left untouched. Run with -n first and check the list.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    strip_scope = p_strip.add_mutually_exclusive_group(required=True)
+    strip_scope.add_argument(
+        "-a", "--all", action="store_true", help="every non-archived, not-done session"
+    )
+    strip_scope.add_argument("-s", "--session", help="only this session (full id)")
+    p_strip.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="print each session's old and new AIM, write nothing",
+    )
+    p_strip.set_defaults(func=cmd_strip_aim_runs)
 
     p_handoff = sub.add_parser(
         "handoff", help="commit+push a locked file, then release it for a waiting session"

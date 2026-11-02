@@ -42,6 +42,7 @@ from .bridge_store import (
     BridgeStoreMixin,
 )
 from .models import (
+    AIM_SET_BY_TOOL,
     AIM_SET_BY_USER,
     DEFAULT_LLM,
     JOB_TYPES,
@@ -2187,6 +2188,44 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         self.clear_auto_subgoals(session_id)
         if new is not None:
             self._record_aim_history(session_id, old, current, new, set_by)
+        return True
+
+    def rewrite_aim_text(
+        self, session_id: str, text: str, set_by: str | None = AIM_SET_BY_TOOL
+    ) -> bool:
+        """Rewrite the AIM's TEXT only; return whether it changed (tp#1566, B9).
+
+        For ``ccc strip-aim-runs``: dropping a tracker-written ``: tp#N`` tail does not
+        change the goal, so unlike :meth:`set_aim` nothing derived from the AIM is reset —
+        no auto-sub-goal clear, and ``aim_met``, ``context_offset``, ``aim_score``,
+        ``aim_prev`` and ``short_aim`` stay as they are. It updates ``sessions.aim`` and
+        appends ONE history row stamped *set_by* (its lexical score, the session's
+        ``short_aim`` carried); a session whose AIM predates history first gets its
+        original seeded (unstamped), as in :meth:`set_aim`. Empty *text* or a session
+        without an AIM is refused (``False``).
+        """
+        current = self.get(session_id)
+        new = (text or "").strip()
+        if current is None or not current.aim or not new or new == current.aim:
+            return False
+        self.update_fields(session_id, aim=new)
+        has_history = self.conn.execute(
+            "SELECT 1 FROM aim_history WHERE session_id = ? LIMIT 1", (session_id,)
+        ).fetchone()
+        if has_history is None:
+            seeded_at = current.aim_changed_at or current.created_at or 0
+            self._insert_aim_history(
+                session_id, current.aim, current.aim_score, seeded_at, current.short_aim
+            )
+        self._insert_aim_history(
+            session_id,
+            new,
+            score_aim_lexical(new),
+            now_ms(),
+            short_aim=current.short_aim,
+            set_by=set_by,
+        )
+        self.conn.commit()
         return True
 
     def set_first_aim(
