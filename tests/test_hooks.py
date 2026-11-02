@@ -56,7 +56,7 @@ def test_user_prompt_nudges_to_adapt_stale_subgoals(
     store.set_aim("s1", "ship X: pytest -q green and PR #5 merged")  # AIM rev 1
     store.set_subgoals("s1", ["write test_x", "open PR #5"], source="agent")  # adaptive @ rev 1
     store.set_aim("s1", "ship X and deploy: prod smoke test passes")  # AIM rev 2 -> stale
-    store.update_fields("s1", aim_score=80)  # force concrete so the sharpen branch is skipped
+    store.update_fields("s1", aim_score=80)  # concrete -> skip the vague-AIM guard
     capsys.readouterr()  # drain
     hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo"})
     out = capsys.readouterr().out
@@ -70,7 +70,7 @@ def test_user_prompt_nudges_on_unresolved_drift(
     store = Store()
     store.ensure("s1", cwd="/repo")
     store.set_aim("s1", "concrete aim: pytest -q green and PR merged")
-    store.update_fields("s1", aim_score=80)  # concrete -> skip the sharpen branch
+    store.update_fields("s1", aim_score=80)  # concrete -> skip the vague-AIM guard
     store.set_drift("s1", "high", "coverage dropped: tests removed")
     capsys.readouterr()  # drain
     hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo"})
@@ -85,7 +85,7 @@ def test_user_prompt_nudges_to_tick_partial_checklist(
     store.ensure("s1", cwd="/repo")
     store.set_aim("s1", "concrete aim: pytest -q green and bug fixed")
     store.set_subgoals("s1", ["add tiebreaker", "tests pass", "docs updated"], source="auto")
-    store.update_fields("s1", aim_score=80)  # concrete -> skip sharpen branch
+    store.update_fields("s1", aim_score=80)  # concrete -> skip the vague-AIM guard
     subs = store.list_subgoals("s1")
     store.set_subgoal_checked(subs[1].id, True)  # 1/3 -> partial, the trigger
     capsys.readouterr()  # drain
@@ -340,42 +340,52 @@ def test_stop_assessor_skipped_when_ccc_internal(
     assert calls == []
 
 
-def test_session_start_sharpens_low_score_aim(
+def test_b4_session_start_vague_aim_injects_no_sharpen_nudge(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """B4: a vague AIM is grounded as-is; the agent is never told to rewrite it."""
     store = Store()
     store.ensure("s1", cwd="/repo")
-    store.update_fields("s1", aim="improve things", aim_score=20)  # < default threshold 50
+    store.update_fields("s1", aim="improve things", aim_score=20, aim_score_reason="no check")
     capsys.readouterr()
     hooks.handle_session_start({"session_id": "s1", "cwd": "/repo"})
     out = capsys.readouterr().out
-    assert "score-aim --dry-run" in out  # points the agent at the independent checker
-    assert "20/100" in out  # tells the agent the current score
+    assert "improve things" in out  # still grounded in the AIM
+    assert "score-aim" not in out
+    assert "ccc set-aim" not in out
 
 
-def test_session_start_no_sharpen_when_specific(
+def test_b4_user_prompt_vague_aim_injects_no_sharpen_nudge(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    store = Store()
-    store.ensure("s1", cwd="/repo")
-    store.update_fields("s1", aim="all tests in tests/ pass", aim_score=85)
-    capsys.readouterr()
-    hooks.handle_session_start({"session_id": "s1", "cwd": "/repo"})
-    assert "score-aim --dry-run" not in capsys.readouterr().out
-
-
-def test_user_prompt_sharpen_mutually_exclusive(
-    home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    _set_cfg(sharpen_every_n_turns=1)
+    """B4: a vague AIM adds no sharpen text on a turn, and not the no-AIM nag either."""
     store = Store()
     store.ensure("s1", cwd="/repo")
     store.update_fields("s1", aim="improve things", aim_score=20)
     capsys.readouterr()
     hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo"})
     out = capsys.readouterr().out
-    assert "score-aim --dry-run" in out  # vague-aim sharpen nudge fired
-    assert "no done-condition" not in out  # not the no-aim nag
+    assert "score-aim" not in out
+    assert "ccc set-aim" not in out
+    assert "no done-condition" not in out
+
+
+def test_b4_vague_aim_still_suppresses_stale_checklist_nudge(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B4: the vague branch stays as an empty guard ahead of the stale-checklist nudge."""
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.set_aim("s1", "ship X: pytest -q green and PR #5 merged")
+    store.set_subgoals("s1", ["write test_x", "open PR #5"], source="agent")
+    store.set_aim("s1", "improve things")  # AIM rev 2 -> checklist stale
+    store.update_fields("s1", aim_score=20)  # vague
+    assert store.subgoals_stale("s1")
+    capsys.readouterr()
+    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo"})
+    out = capsys.readouterr().out
+    assert "--merge" not in out  # no re-align nudge against an ungradeable AIM
+    assert "score-aim" not in out
 
 
 def test_nag_throttle(home: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -394,29 +404,32 @@ def test_nag_throttle(home: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert nagged == [True, False, True, False]
 
 
-def test_sharpen_nudge_is_auto_apply_with_revert(
-    home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The vague-AIM nudge is context-grounded, auto-applies, and keeps the goal intact."""
-    store = Store()
-    store.ensure("s1", cwd="/repo")
-    store.update_fields("s1", aim="improve things", aim_score=20, aim_score_reason="no check")
-    capsys.readouterr()
-    hooks.handle_session_start({"session_id": "s1", "cwd": "/repo"})
-    out = capsys.readouterr().out
-    assert "set-aim" in out  # the agent applies the rewrite itself
-    assert "revert" in out.lower()  # and tells the user how to revert
-    assert "no check" in out  # surfaces the independent checker's reason
-    assert "intact" in out  # intent-preservation guardrail (sharpen specificity only)
-    assert "files you've edited" in out  # grounded in the session's own context
-
-
-def test_user_prompt_clears_aim_transition(home: Path) -> None:
+@pytest.mark.usefixtures("home")
+def test_user_prompt_clears_aim_transition() -> None:
     """A new turn clears the `aim_prev` marker so the status-line transition is turn-scoped."""
     store = Store()
     store.ensure("s1", cwd="/repo")
     store.update_fields("s1", aim="new aim", aim_prev="old aim", aim_score=85)
     hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo"})
+    refreshed = store.get("s1")
+    assert refreshed is not None and refreshed.aim_prev is None
+
+
+@pytest.mark.usefixtures("home")
+def test_b4_aim_change_between_turns_is_not_announced(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """B4: a set-aim between turns injects no AIM-changed text; `aim_prev` still clears."""
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.set_aim("s1", "old aim: pytest -q green")
+    store.set_aim("s1", "new aim: pytest -q green and PR merged")
+    store.update_fields("s1", aim_score=85)
+    got = store.get("s1")
+    assert got is not None and got.aim_prev  # the transition marker is armed
+    capsys.readouterr()
+    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo"})
+    assert "changed this session's AIM" not in capsys.readouterr().out
     refreshed = store.get("s1")
     assert refreshed is not None and refreshed.aim_prev is None
 
@@ -763,9 +776,9 @@ def test_user_prompt_aim_is_set_without_a_model_turn(capsys: pytest.CaptureFixtu
     assert '"decision": "block"' in out and "new aim" in out  # swallowed: no model turn
     got = Store().get("s1")
     assert got is not None and got.aim == "new aim" and got.prompt_count == 3
-    # The next real prompt tells the agent the AIM changed.
+    # B4: the AIM is static — the next real prompt does not announce the change.
     hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": "go on"})
-    assert "changed this session's AIM" in capsys.readouterr().out
+    assert "changed this session's AIM" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

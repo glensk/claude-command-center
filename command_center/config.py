@@ -86,10 +86,9 @@ DEFAULTS: dict[str, object] = {
     # a fresh install spends no tokens. A tab title set by hand becomes the name.
     "session_names": True,
     "aim_score": True,  # NN% AIM-specificity chip + daemon backfill (False = none)
-    "aim_score_threshold": 50,  # AIM specificity < this (0..100) => vague: red + sharpen nudge
+    "aim_score_threshold": 50,  # AIM specificity < this (0..100) => vague: red tag
     "aim_score_on_set": False,  # refine the AIM score with an LLM call when the AIM changes (INERT)
     "verify_subgoals_llm": False,  # also LLM-verify each derived sub-goal is checkable (extra cost)
-    "sharpen_every_n_turns": 1,  # agent re-sharpens a vague AIM every Nth prompt (0 = start only)
     "adapt_subgoals_on_aim_change": True,  # nudge the agent to re-align an adaptive checklist
     "drift_check": False,  # run the impartial drift checker after a sub-goal change (INERT: off)
     # Which AIM revision the narrow /aim column (TUI + `ccc ls`) renders: "first" = the
@@ -484,6 +483,7 @@ DEPRECATED_LLM_CONFIG_KEYS = frozenset(
         "short_aim_backend",
         "short_aim_model",
         "llm_account",
+        "sharpen_every_n_turns",  # the agent-side sharpen nudge is gone (tp#1566)
     }
 )
 
@@ -1146,7 +1146,6 @@ class Config:
     aim_score_threshold: int = 50
     aim_score_on_set: bool = False
     verify_subgoals_llm: bool = False
-    sharpen_every_n_turns: int = 1
     adapt_subgoals_on_aim_change: bool = True
     drift_check: bool = False
     aim_column: str = "first"  # /aim column revision: "first" (revision (1)) | "latest"

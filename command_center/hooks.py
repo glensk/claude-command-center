@@ -64,24 +64,6 @@ _NUDGE = (
     "'done' looks like, then run: ccc set-aim --session {sid} \"...\""
 )
 
-_SHARPEN_AIM = (
-    'Note — this session\'s AIM ("{aim}") scores {score}/100 on concreteness, below the '
-    "{threshold} bar, so progress can't be graded. {why}"
-    "After handling my request this turn, sharpen the AIM yourself — KEEP my underlying goal "
-    "intact, only make it concrete and verifiable. Ground the rewrite in what THIS session has "
-    "actually been doing: the files you've edited, your current TodoWrite list, and the task in "
-    "progress. Verify each candidate against the INDEPENDENT checker (do not self-judge):\n"
-    '    ccc score-aim --dry-run "<candidate>"\n'
-    'It returns a 0-100 score and a "missing" hint; revise until score >= {threshold}, then '
-    "apply it yourself:\n"
-    '    ccc set-aim --session {sid} "<your sharpened AIM>"\n'
-    'Then tell me old -> new and the one-line revert: ccc set-aim --session {sid} "{aim}". '
-    'Report the result as a "🔴 **AIM sharpened** (was {score}/100):" line so it visibly '
-    "stands out (Claude Code can't colour chat text, so the marker substitutes for red). "
-    "Never change what the goal MEANS — only how concretely it is stated."
-)
-
-
 _ADAPT_SUBGOALS = (
     'Your AIM was updated to: "{aim}" (revision {rev}), but the sub-goal checklist still '
     "tracks an earlier AIM (v{old_rev}). Re-align it to the CURRENT AIM, preserving progress: "
@@ -169,14 +151,6 @@ def _parked_prompt_notice(session: Session) -> str | None:
     first = prompt.splitlines()[0][:150] + ("…" if len(prompt) > 150 or "\n" in prompt else "")
     return _PARKED_PROMPT.format(
         fire=park.format_fire(session.fire_at), first=first, sid=session.session_id
-    )
-
-
-def _sharpen_context(session: Session, sid: str, threshold: int) -> str:
-    """The vague-AIM nudge, filled with the session's current score + checker reason."""
-    why = f"The checker's reason: {session.aim_score_reason}. " if session.aim_score_reason else ""
-    return _SHARPEN_AIM.format(
-        aim=session.aim, sid=sid, score=session.aim_score, threshold=threshold, why=why
     )
 
 
@@ -438,10 +412,6 @@ def handle_session_start(payload: dict[str, Any]) -> int:
             progress = f"\nProgress: {checked}/{total} sub-goals done." if total else ""
             nxt = f"\nAgreed next step: {session.next_step}" if session.next_step else ""
             context = _GROUND.format(aim=session.aim, progress=progress, nxt=nxt)
-            # A vague AIM can't be graded — ask the agent to sharpen it first thing.
-            threshold = config.load_config().aim_score_threshold
-            if 0 <= session.aim_score < threshold:
-                context += "\n" + _sharpen_context(session, sid, threshold)
         # An armed parked prompt must be visible from the first turn — a resumed
         # session otherwise guesses from the AIM while the real prompt sits armed.
         context = "\n\n".join(filter(None, [context, _parked_prompt_notice(session)]))
@@ -476,9 +446,6 @@ def _block_prompt(reason: str) -> None:
     sys.stdout.write("\n")
 
 
-_AIM_CHANGED = "The user changed this session's AIM (done-condition) to: {aim}"
-
-
 _AIM_REPLY = (
     "The user's `/aim` command was already handled by the ccc hook: this session's AIM is "
     "now `{aim}`. Do NOT run any tool or command. Reply with exactly this one line and "
@@ -504,7 +471,7 @@ def _intercept_aim(store: Store, sid: str, current: str | None, text: str, block
     if block:
         _block_prompt(f"🎯 /aim: {aim}")
     else:
-        store.update_fields(sid, aim_prev=None)  # announced right now: no repeat next turn
+        store.update_fields(sid, aim_prev=None)  # announced right now: end the transition
         _emit_context("UserPromptSubmit", _AIM_REPLY.format(aim=aim))
 
 
@@ -523,28 +490,25 @@ def _handle_user_prompt_turn(payload: dict[str, Any], sid: str, cfg: config.Conf
         session, _ = ensure_current_session(store, sid, payload.get("cwd", ""))
         if cfg.aim_intercept and aim_text is not None:
             # `/aim <text>` is set here, programmatically. Blocking costs no model turn (the
-            # next real prompt tells the agent, below); non-blocking costs one tiny reply.
+            # agent is not told); non-blocking costs one tiny reply.
             _intercept_aim(store, sid, session.aim, aim_text, cfg.aim_intercept_block)
             return 0
         count = session.prompt_count + 1
         # A new turn begins: clear any "AIM just changed" marker so the status-line
-        # transition (old ====> new) is scoped to the turn it changed in. An AIM set by
-        # the intercepted `/aim` (no turn of its own) is announced to the agent here.
-        aim_changed = (
-            cfg.aim_intercept and bool(session.aim_prev) and session.aim_prev != session.aim
-        )
+        # transition (old ====> new) is scoped to the turn it changed in. The AIM is
+        # static: a change is not announced to the agent.
         store.update_fields(sid, last_response_at=now_ms(), prompt_count=count, aim_prev=None)
         # AIM-related nudges are mutually exclusive (no-aim > vague > stale checklist);
         # an unresolved drift nudge is additive — it can fire alongside any of them.
-        parts: list[str] = [_AIM_CHANGED.format(aim=session.aim)] if aim_changed else []
+        parts: list[str] = []
         if not session.aim:
             every = cfg.nag_every_n_turns
             if every > 0 and (count - 1) % every == 0:
                 parts.append(_NUDGE.format(sid=sid))
         elif 0 <= session.aim_score < cfg.aim_score_threshold:
-            every = cfg.sharpen_every_n_turns
-            if every > 0 and (count - 1) % every == 0:
-                parts.append(_sharpen_context(session, sid, cfg.aim_score_threshold))
+            # A vague AIM is the user's to sharpen (status-line tag); this empty guard keeps
+            # the checklist nudges below from firing against an ungradeable AIM.
+            pass
         elif cfg.adapt_subgoals_on_aim_change and store.subgoals_stale(sid):
             # AIM is concrete but the adaptive checklist still tracks an older AIM: nudge the
             # agent to merge-regenerate it (fires every turn until it does — staleness clears it).
