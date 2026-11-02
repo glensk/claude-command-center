@@ -73,6 +73,11 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
     awaited: list[int] = field(default_factory=list)  # `ccc await` groups fired this pass
     temps_swept: int = 0  # orphaned usage temp files reclaimed; excluded from is_empty()
     panel_restart: str = ""  # stale panel server asked to re-exec (tp#70 S5b); routine
+    # continue-session handoff sweep (tp#1582): transfers finalized (accepted → finalized),
+    # sources a token-scoped closer was spawned for, and "<transfer>: <why>" failures.
+    handoff_finalized: list[str] = field(default_factory=list)
+    handoff_closers: list[str] = field(default_factory=list)
+    handoff_errors: list[str] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not (
@@ -84,6 +89,9 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
             or self.pruned
             or self.limit_switched
             or self.awaited
+            or self.handoff_finalized
+            or self.handoff_closers
+            or self.handoff_errors
             or self.scored
             or self.short_aimed
             or self.assessed
@@ -696,6 +704,24 @@ def _run_await_backstop(store: Store, report: DaemonReport, dry_run: bool) -> No
         print(f"ccc daemon: await pass failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return
     report.awaited.extend(result.fired)
+
+
+def _run_handoff_finalize(
+    store: Store, snapshot: dict[str, LiveSession], report: DaemonReport, dry_run: bool
+) -> None:
+    """The continue-session handoff repair sweep (``handoff_sweep.run``); never raises.
+
+    Judged against this pass's registry *snapshot*; ``dry_run`` reports, mutates and
+    spawns nothing. Each candidate is isolated inside the sweep; this guard only keeps an
+    unexpected failure out of the rest of the housekeeping pass.
+    """
+    from . import handoff_sweep  # pylint: disable=import-outside-toplevel  # module convention
+
+    try:
+        handoff_sweep.run(store, snapshot, report, dry_run)
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        print(f"ccc daemon: handoff sweep failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        report.handoff_errors.append(f"sweep: {type(exc).__name__}: {exc}")
 
 
 def _run_limit_switch(

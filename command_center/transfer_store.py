@@ -187,6 +187,36 @@ class Transfer:  # pylint: disable=too-many-instance-attributes
 
 _FIELDS = frozenset(f.name for f in dataclasses.fields(Transfer))
 
+#: ``close_bound`` prefix of a kept handoff close debt (signal sent, pane still open) — the
+#: same value as ``handoff_close.DEBT_PREFIX``, repeated here to keep this module leaf-level.
+HANDOFF_DEBT_PREFIX = "handoff:"
+
+
+@dataclass(frozen=True)
+class HandoffCandidate:  # pylint: disable=too-many-instance-attributes  # one query row
+    """One row of :meth:`TransferStoreMixin.handoff_finalize_candidates` (tp#1582)."""
+
+    transfer_id: str
+    source_session: str
+    target_session: str
+    state: str  # accepted | finalized
+    capped: bool
+    close_token: str  # "" = no close armed on the source row
+    close_requested_at: int  # > 0 = the token is PENDING, 0 with a token = in flight
+    close_bound: str  # "handoff:{…}" = a kept post-SIGTERM close debt
+
+    @property
+    def token_state(self) -> str:
+        """``none`` | ``pending`` | ``in_flight`` — the source row's close token."""
+        if not self.close_token:
+            return "none"
+        return "pending" if self.close_requested_at > 0 else "in_flight"
+
+    @property
+    def debt(self) -> bool:
+        """A kept post-SIGTERM debt: the pane/tab still to close, never re-signalled."""
+        return self.close_bound.startswith(HANDOFF_DEBT_PREFIX)
+
 
 def new_transfer_id() -> str:
     """A fresh transfer id (``t`` + 12 hex: short enough to type, unique enough)."""
@@ -415,6 +445,51 @@ class TransferStoreMixin:
             "AND t.state IN ('accepted', 'finalized')"
         ).fetchall()
         return {str(row[0]) for row in rows}
+
+    def handoff_finalize_candidates(self) -> list[HandoffCandidate]:
+        """What the daemon's handoff sweep may act on — ONE indexed query (tp#1582).
+
+        * every ``accepted`` transfer (finalized by nobody yet: a crash after the accepted
+          CAS) with its source row's close token, through the partial active-source index;
+        * every NON-capped ``finalized`` transfer whose source row still carries a close
+          token (pending, in flight, or a ``handoff:`` debt) and still names THAT transfer's
+          target as its successor, through the partial close-token index and the target
+          index. A retired token (a completed close) never comes back, so a tab reopened
+          after its close is never closed again — there is no age-based selection.
+
+        Process liveness is the caller's half (the daemon's registry snapshot), like
+        :meth:`handoff_done_sources`.
+        """
+        cols = (
+            "t.transfer_id, t.source_session, t.target_session, t.state, t.capped, "
+            "COALESCE(s.close_token, ''), COALESCE(s.close_requested_at, 0), "
+            "COALESCE(s.close_bound, '')"
+        )
+        rows = self.conn.execute(
+            f"SELECT {cols} FROM transfers t "  # noqa: S608 - fixed column names
+            "LEFT JOIN sessions s ON s.session_id = t.source_session "
+            "WHERE t.state IN ('prepared', 'opened', 'accepted') AND t.state = 'accepted' "
+            "UNION ALL "
+            # CROSS JOIN pins the loop order: the few token rows drive, not a transfers scan.
+            f"SELECT {cols} FROM sessions s "
+            "CROSS JOIN transfers t ON t.target_session = s.handed_off_to "
+            "AND t.source_session = s.session_id "
+            "WHERE s.close_token != '' AND t.state = 'finalized' AND t.capped = 0"
+        ).fetchall()
+        found = [
+            HandoffCandidate(
+                transfer_id=str(row[0]),
+                source_session=str(row[1]),
+                target_session=str(row[2] or ""),
+                state=str(row[3]),
+                capped=bool(row[4]),
+                close_token=str(row[5] or ""),
+                close_requested_at=int(row[6] or 0),
+                close_bound=str(row[7] or ""),
+            )
+            for row in rows
+        ]
+        return sorted(found, key=lambda c: c.transfer_id)  # stable order, no ORDER BY scan
 
     def set_handoff_lineage(self, source: str, target: str, now: int) -> None:
         """Mark *source* handed off to *target* (status ``handed_off``) and *target*'s origin.

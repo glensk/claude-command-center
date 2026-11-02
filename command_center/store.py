@@ -822,6 +822,12 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             "CREATE INDEX IF NOT EXISTS idx_sessions_canonical_name "
             "ON sessions(lower(canonical_name)) WHERE canonical_name IS NOT NULL"
         )
+        # The daemon's handoff sweep (`handoff_finalize_candidates`) starts from the few
+        # rows that hold a close token. Created HERE: an old DB gains close_token above.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_close_token "
+            "ON sessions(close_token) WHERE close_token != ''"
+        )
         self.conn.commit()
 
     def _backfill_config_dir(self) -> None:
