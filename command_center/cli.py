@@ -5348,6 +5348,20 @@ def _aim_label(index: int) -> str:
     return f"/aim ({index})" if index >= 1 else "/aim"
 
 
+def _aim_row_text(aim: str | None) -> str:
+    """*aim* as an ``/aim`` row shows it: the words without the trailing item run (tp#1553).
+
+    The held items already have their own status-line rows, so ``fix decide: tp#1363, #1364``
+    renders as ``fix decide``. An AIM without a run is returned unchanged; one that is the
+    run alone (no words) keeps its full text rather than going blank.
+    """
+    from . import aimtext  # lazy
+
+    text = aim or ""
+    parts = aimtext.split(text)
+    return parts.words if parts.ids and parts.words else text
+
+
 def _first_aim_anchor(  # pylint: disable=too-many-positional-arguments  # colour triple passed through
     session: Session, index: int, changed: bool, green: str, dim: str, reset: str
 ) -> list[str]:
@@ -5365,7 +5379,7 @@ def _first_aim_anchor(  # pylint: disable=too-many-positional-arguments  # colou
     """
     if index <= 1 or (changed and index == 2):
         return []
-    first = (session.first_short_aim or session.first_aim or "").strip()
+    first = _aim_row_text((session.first_short_aim or session.first_aim or "").strip())
     if not first:
         return []
     prefix = f"{green}{_aim_label(1)}:{reset} "
@@ -5431,7 +5445,7 @@ def _aim_statusline_lines(  # pylint: disable=too-many-positional-arguments  # c
     chip_color = red if low_score else dim
     score_pct = aim_score_pct(session.aim, session.aim_score)
     chip = f"{chip_color}{score_pct}{reset} " if score_pct else ""
-    new_aim = display_aim(session) or ""
+    new_aim = _aim_row_text(display_aim(session))
     fraction = effective_progress(session.manual_progress, checked, total)
     if session.aim_met:
         # Impartial checker judged the AIM fulfilled → red DONE stamped inside the bar. The
@@ -5461,7 +5475,9 @@ def _aim_statusline_lines(  # pylint: disable=too-many-positional-arguments  # c
     if not changed:
         return [*anchor, f"{green}{label}:{reset} {mark}{chip}{new_aim}{prog}{tag}"]
     bold = "\033[1m"
-    old_part = f"{green}{_aim_label(index - 1)}:{reset} {dim}{session.aim_prev}{reset}"
+    old_part = (
+        f"{green}{_aim_label(index - 1)}:{reset} {dim}{_aim_row_text(session.aim_prev)}{reset}"
+    )
     arrow = f"{bold}====>{reset} {green}{label}:{reset} {mark}"
     # Always ONE line — old AIM, arrow, new AIM, bar and marker never split across rows;
     # an over-wide line soft-wraps in the terminal rather than costing three status-line rows.

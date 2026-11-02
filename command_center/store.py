@@ -2144,6 +2144,32 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             self.set_short_aim(session_id, None)
         return True
 
+    def carry_first_aim(self, target_id: str, source_id: str) -> bool:
+        """Prepend *source_id*'s FIRST recorded AIM to *target_id*'s history; True if added.
+
+        ``continue-session accept`` calls this so a successor keeps the lineage's original
+        done-condition as its ``/aim (1)`` anchor (tp#1553): the source's first row is
+        itself a carried copy when the source was a successor, so the lineage root's first
+        AIM travels down the chain. The target's current AIM and later rows are untouched;
+        the copy is stamped no later than the target's own first row so it sorts first.
+        A no-op when the source has no recorded history or the target already starts with
+        that AIM (idempotent: a re-run accept, or a source whose AIM never changed).
+        """
+        query = (
+            "SELECT aim, score, short_aim, created_at FROM aim_history WHERE session_id = ? "
+            "ORDER BY created_at, id LIMIT 1"
+        )
+        src = self.conn.execute(query, (source_id,)).fetchone()
+        dst = self.conn.execute(query, (target_id,)).fetchone()
+        if src is None or dst is None or dst["aim"] == src["aim"]:
+            return False
+        created_at = min(int(src["created_at"]), int(dst["created_at"]) - 1)
+        self._insert_aim_history(
+            target_id, src["aim"], int(src["score"]), created_at, src["short_aim"]
+        )
+        self.conn.commit()
+        return True
+
     def _mirror_first_aim_onto_session(self, session_id: str, new: str) -> None:
         """Copy a rewritten first AIM onto the session (it is also the current AIM)."""
         self.update_fields(

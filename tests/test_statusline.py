@@ -371,6 +371,58 @@ def test_statusline_first_aim_anchor_not_duplicated(
     assert out.count("/aim (1):") == 1
 
 
+# --- tp#1553: the /aim rows show the AIM's words, not its held-item run --------------------
+
+
+def _plain(out: str) -> list[str]:
+    return [_ANSI.sub("", ln) for ln in out.splitlines() if "/aim" in ln]
+
+
+def test_statusline_aim_rows_drop_the_item_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Anchor, transition and current AIM all lose the trailing `: tp#N, #M` run."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.set_aim("s1", "session relay too late: tp#1548")
+    store.set_aim("s1", "build B10: tp#1548, #1549")
+    store.set_aim("s1", "build B11: tp#1549, #1550")  # index 3, changed this turn
+    store.close()
+    cli.cmd_statusline(Namespace(session="s1"))
+    rows = _plain(capsys.readouterr().out)
+    assert rows[0] == "/aim (1): session relay too late"
+    assert "/aim (2): build B10   ====> /aim (3):" in rows[1]
+    assert "build B11" in rows[1] and "tp#" not in rows[1] and "#1549" not in rows[1]
+
+
+def test_statusline_aim_of_ids_only_keeps_its_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An AIM that is the item run alone has no words: the row keeps the run, never blank."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.update_fields("s1", aim="tp#7, #8", aim_score=80)
+    store.close()
+    cli.cmd_statusline(Namespace(session="s1"))
+    assert "tp#7, #8" in _plain(capsys.readouterr().out)[0]
+
+
+@pytest.mark.parametrize(
+    ("aim", "shown"),
+    [
+        ("fix decide: tp#1363, #1364", "fix decide"),
+        ("tp#5: older form", "older form"),
+        ("no run here", "no run here"),
+        ("tp#5", "tp#5"),
+        (None, ""),
+    ],
+)
+def test_aim_row_text(aim: str | None, shown: str) -> None:
+    assert cli._aim_row_text(aim) == shown  # pylint: disable=protected-access
+
+
 # --- tp#1166: the role marker on the /aim row ---------------------------------------------
 
 

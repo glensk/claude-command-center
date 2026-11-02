@@ -547,6 +547,41 @@ def test_accept_runs_hooks_with_placeholders_then_accepts(
     assert _state(tid) == "accepted"
 
 
+def test_accept_carries_the_lineages_first_aim_as_the_anchor(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1553: the successor's history starts with the source's FIRST AIM, its current
+    AIM stays the handed-over one, and a second accept adds no duplicate row."""
+    with Store() as store:
+        store.set_aim(SID, "build B2: tp#1")
+    tid = _opened_transfer(harness)
+    new = _as_successor(monkeypatch, harness, tid)
+    with Store() as store:
+        assert [r.aim for r in store.list_aim_history(new)] == ["build B2: tp#1"]
+    _hooks(monkeypatch)
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    with Store() as store:
+        assert [r.aim for r in store.list_aim_history(new)] == ["tp#1 shipped", "build B2: tp#1"]
+        successor = store.get(new)
+        assert successor is not None
+        assert successor.aim == "build B2: tp#1" and successor.first_aim == "tp#1 shipped"
+
+
+def test_carry_first_aim_passes_the_root_down_the_chain() -> None:
+    with Store() as store:
+        for sid, aims in (("root", ["goal", "box 1"]), ("mid", ["box 2"]), ("leaf", ["box 3"])):
+            store.ensure(sid, cwd="/repo")
+            for aim in aims:
+                store.set_aim(sid, aim)
+        assert store.carry_first_aim("mid", "root")
+        assert store.carry_first_aim("leaf", "mid")
+        assert not store.carry_first_aim("leaf", "mid")  # idempotent
+        assert not store.carry_first_aim("leaf", "nobody")  # no source history: no-op
+        assert [r.aim for r in store.list_aim_history("leaf")] == ["goal", "box 3"]
+        assert store.count_aim_history("leaf") == 2
+
+
 @pytest.mark.parametrize(
     ("body", "why"),
     [

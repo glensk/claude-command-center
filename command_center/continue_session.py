@@ -1225,6 +1225,8 @@ def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-ret
         if moved is None:
             return 1
         steps += moved
+        # The lineage's first AIM becomes this session's `/aim (1)` anchor (tp#1553).
+        store.carry_first_aim(transfer.target_session, transfer.source_session)
         _mark_retired(transfer)
         store.note_transfer(transfer.transfer_id, now_ms(), failure="")
     if args.json:
