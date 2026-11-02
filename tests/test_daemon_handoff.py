@@ -383,3 +383,27 @@ def test_the_daemon_entry_point_never_raises_into_the_pass(
     report = _sweep()
     assert report.handoff_errors == ["sweep: OSError: disk full"]
     assert "handoff sweep failed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("do_reap", "dry_run"), [(True, False), (False, False), (True, True), (False, True)]
+)
+def test_run_once_runs_the_handoff_sweep_once_per_pass(
+    monkeypatch: pytest.MonkeyPatch, spawns: _Spawns, do_reap: bool, dry_run: bool
+) -> None:
+    """B7: every pass sweeps once, whatever ``do_reap``, against its snapshot, honouring dry run."""
+    del spawns
+    calls: list[tuple[dict[str, LiveSession], DaemonReport, bool]] = []
+
+    def record(
+        _store: Store, snapshot: dict[str, LiveSession], report: DaemonReport, dry: bool
+    ) -> None:
+        calls.append((snapshot, report, dry))
+
+    monkeypatch.setattr(daemon, "_run_handoff_finalize", record)
+    report = daemon.run_once(
+        dry_run=dry_run, do_reap=do_reap, do_summary=False, do_progress=False, do_alerts=False
+    )
+    assert len(calls) == 1
+    snapshot, passed, dry = calls[0]
+    assert isinstance(snapshot, dict) and passed is report and dry is dry_run

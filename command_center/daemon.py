@@ -221,6 +221,10 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
             if victims and not dry_run:
                 store.delete_many(s.session_id for s in victims)
 
+        # continue-session handoff repair sweep: every pass, independent of `do_reap`,
+        # judged against this pass's registry snapshot; before reaping can park a source.
+        _run_handoff_finalize(store, live, report, dry_run)
+
         if do_reap and cfg.reap:
             for session in store.list_sessions():
                 live_session = live.get(session.session_id)
