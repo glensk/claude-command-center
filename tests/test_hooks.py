@@ -511,6 +511,25 @@ def test_release_locks_passes_the_arm_identity_to_close_now(
     ]
 
 
+@pytest.mark.usefixtures("home")
+def test_release_locks_claim_stamps_the_claim_time_without_a_holder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tp#1595: the Stop chain claims at *now*, holderless — close-now registers itself."""
+    from command_center.models import now_ms
+
+    monkeypatch.setenv("CLAUDE_PID", "8123")
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    token = store.arm_close("s1", now_ms())
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder([]))
+    before = now_ms()
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+    row = store.get("s1")
+    assert row is not None and (row.close_requested_at, row.close_token) == (0, token)
+    assert row.close_claimed_at >= before and row.close_holder == ""
+
+
 def test_release_locks_fires_a_restored_arm_only_in_its_bound_process(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

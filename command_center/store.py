@@ -94,6 +94,11 @@ def _llm_or_default(value: str | None) -> str:
 _NORM_RE = re.compile(r"[^a-z0-9]+")
 
 
+def _holder_clause(holder: str | None) -> tuple[str, tuple[str, ...]]:
+    """The optional ``AND close_holder = ?`` of a holder-checked close CAS (tp#1595)."""
+    return ("", ()) if holder is None else (" AND close_holder = ?", (holder,))
+
+
 def _norm(text: str) -> str:
     return _NORM_RE.sub(" ", text.lower()).strip()
 
@@ -133,6 +138,8 @@ _SESSION_COLUMNS = (
     "close_requested_at",
     "close_token",
     "close_bound",
+    "close_claimed_at",
+    "close_holder",
     "switch_requested_at",
     "switch_config_dir",
     "switch_force",
@@ -263,6 +270,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     close_requested_at INTEGER NOT NULL DEFAULT 0,
     close_token       TEXT    NOT NULL DEFAULT '',
     close_bound       TEXT    NOT NULL DEFAULT '',
+    close_claimed_at  INTEGER NOT NULL DEFAULT 0,
+    close_holder      TEXT    NOT NULL DEFAULT '',
     switch_requested_at INTEGER NOT NULL DEFAULT 0,
     switch_config_dir TEXT    NOT NULL DEFAULT '',
     switch_force      INTEGER NOT NULL DEFAULT 0,
@@ -644,6 +653,11 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         # to (tp#232) — written only by the close transitions (arm_close … disarm_close).
         "close_token": "TEXT NOT NULL DEFAULT ''",
         "close_bound": "TEXT NOT NULL DEFAULT ''",
+        # Who holds an in-flight close token and since when (tp#1595): the epoch-ms of the
+        # pending → in-flight claim and the holder's "pid:start" ("" = no process
+        # registered). Cleared by every transition that clears or re-arms the token.
+        "close_claimed_at": "INTEGER NOT NULL DEFAULT 0",
+        "close_holder": "TEXT NOT NULL DEFAULT ''",
         # `ccc switch-account`: epoch-ms the relaunch-after-turn was armed (0 = unarmed) and
         # the target account's config dir it relaunches under (claimed together).
         "switch_requested_at": "INTEGER NOT NULL DEFAULT 0",
@@ -1282,12 +1296,17 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
     # to). A claim zeroes the stamp but keeps token and bound as "in flight", so the
     # detached ``close-now`` can hand a transiently refused arm back (``restore_close``)
     # without ever reviving an arm that was undone, re-armed or switched meanwhile.
+    # Two more columns say WHO holds an in-flight token and SINCE WHEN (tp#1595):
+    # ``close_claimed_at`` (epoch-ms of the claim) and ``close_holder`` (the holder's
+    # ``"pid:start"``, ``""`` = no process registered). Every transition that clears or
+    # re-arms the token clears both, so the daemon sweep can tell a dead holder's token
+    # (:meth:`reclaim_stale_close`) from a live one's.
     def arm_close(self, session_id: str, now: int) -> str:
         """Arm a close-after-turn for *session_id*: stamp *now*, a fresh token, no binding."""
         token = uuid.uuid4().hex
         self.conn.execute(
             "UPDATE sessions SET close_requested_at = ?, close_token = ?, close_bound = '', "
-            "updated_at = ? WHERE session_id = ?",
+            "close_claimed_at = 0, close_holder = '', updated_at = ? WHERE session_id = ?",
             (now, token, now_ms(), session_id),
         )
         self.conn.commit()
@@ -1316,7 +1335,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
                 token = uuid.uuid4().hex
                 self.conn.execute(
                     "UPDATE sessions SET close_requested_at = ?, close_token = ?, "
-                    "close_bound = '', updated_at = ? WHERE session_id = ?",
+                    "close_bound = '', close_claimed_at = 0, close_holder = '', "
+                    "updated_at = ? WHERE session_id = ?",
                     (now, token, now_ms(), session_id),
                 )
         except sqlite3.Error:
@@ -1325,13 +1345,15 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         self.conn.commit()
         return token
 
-    def claim_close(self, session_id: str, token: str) -> int:
+    def claim_close(self, session_id: str, token: str, holder: str = "") -> int:
         """Claim THIS pending close arm (pending → in flight) — its stamp on a win, else 0.
 
         A compare-and-swap on *token*: only while the row still holds it PENDING (stamp
         set). The stamp is zeroed, token and binding stay for :meth:`restore_close` /
         :meth:`retire_close`, so of two concurrent claimers exactly one wins; a stale,
-        replaced or already-claimed token is a no-op.
+        replaced or already-claimed token is a no-op. The win records the claim time
+        (``close_claimed_at``) and *holder* (the claimer's ``"pid:start"``, ``""`` = none)
+        in the same write.
         """
         if not token:
             return 0
@@ -1346,10 +1368,12 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             ).fetchone()
             armed_at = int(row[0] or 0) if row is not None else 0
             if armed_at:
+                claimed_at = now_ms()
                 self.conn.execute(
-                    "UPDATE sessions SET close_requested_at = 0, updated_at = ? "
+                    "UPDATE sessions SET close_requested_at = 0, close_claimed_at = ?, "
+                    "close_holder = ?, updated_at = ? "
                     "WHERE session_id = ? AND close_token = ?",
-                    (now_ms(), session_id, token),
+                    (claimed_at, holder, claimed_at, session_id, token),
                 )
         except sqlite3.Error:
             self.conn.rollback()
@@ -1361,7 +1385,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         """Drop any close arm — pending or in flight — so nothing can restore it either."""
         self.conn.execute(
             "UPDATE sessions SET close_requested_at = 0, close_token = '', close_bound = '', "
-            "updated_at = ? WHERE session_id = ?",
+            "close_claimed_at = 0, close_holder = '', updated_at = ? WHERE session_id = ?",
             (now_ms(), session_id),
         )
         self.conn.commit()
@@ -1375,6 +1399,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         bound: str = "",
         now: int = 0,
         ttl_ms: int = 0,
+        holder: str | None = None,
     ) -> bool:
         """Hand a claimed-but-refused close arm back, bound to *bound* — ``True`` when it was.
 
@@ -1384,8 +1409,10 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         *armed_at*, never to *now*, so the retry window is never extended. Without one
         (the token-scoped handoff close) the arm goes back pending, stamped *armed_at* or,
         when that is 0, the current time. A new arm, an undo, a switch or a SessionStart
-        replaced or cleared the token and defeats it. Never raises (``False`` on a database
-        error).
+        replaced or cleared the token and defeats it. With a *holder* (not ``None``) the
+        row must also still name that holder, so a closer whose token was reclaimed and
+        re-claimed by another never hands the second claim back. The claim time and
+        holder are cleared. Never raises (``False`` on a database error).
         """
         if not token:
             return False
@@ -1395,12 +1422,14 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             stamp, floor = armed_at, now - ttl_ms
         else:
             stamp, floor = armed_at if armed_at > 0 else now_ms(), 0
+        holder_sql, holder_arg = _holder_clause(holder)
         try:
             cur = self.conn.execute(
-                "UPDATE sessions SET close_requested_at = ?, close_bound = ?, updated_at = ? "
+                "UPDATE sessions SET close_requested_at = ?, close_bound = ?, "
+                "close_claimed_at = 0, close_holder = '', updated_at = ? "
                 "WHERE session_id = ? AND close_token = ? AND close_requested_at = 0 "
-                "AND ? > ?",
-                (stamp, bound, now_ms(), session_id, token, stamp, floor),
+                f"AND ? > ?{holder_sql}",
+                (stamp, bound, now_ms(), session_id, token, stamp, floor, *holder_arg),
             )
             self.conn.commit()
         except sqlite3.Error:
@@ -1411,18 +1440,82 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             return False
         return cur.rowcount == 1
 
-    def retire_close(self, session_id: str, token: str) -> bool:
+    def retire_close(self, session_id: str, token: str, holder: str | None = None) -> bool:
         """Forget THIS arm for good — ``True`` when it did; a no-op once *token* is stale.
 
         A compare-and-swap on *token*: a replaced or already-retired token never clears
-        another closer's arm (unlike the blanket :meth:`disarm_close`).
+        another closer's arm (unlike the blanket :meth:`disarm_close`). With a *holder*
+        (not ``None``) the row must also still name that holder (tp#1595).
         """
         if not token:
             return False
+        holder_sql, holder_arg = _holder_clause(holder)
         cur = self.conn.execute(
-            "UPDATE sessions SET close_token = '', close_bound = '', updated_at = ? "
-            "WHERE session_id = ? AND close_token = ?",
-            (now_ms(), session_id, token),
+            "UPDATE sessions SET close_token = '', close_bound = '', close_claimed_at = 0, "
+            "close_holder = '', updated_at = ? "
+            f"WHERE session_id = ? AND close_token = ?{holder_sql}",
+            (now_ms(), session_id, token, *holder_arg),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def hold_close(self, session_id: str, token: str, holder: str) -> bool:
+        """Register *holder* on THIS in-flight token that no process holds yet — ``True`` on a win.
+
+        The Stop chain's ``claim_after_turn`` cannot know the pid of the ``close-now`` it
+        spawns, so the token goes in flight holderless; the spawned ``close-now`` fills it
+        in. A compare-and-swap: same token, stamp 0, holder ``""``. Anything else (a
+        pending, replaced or already-held token, an empty *holder*) changes nothing.
+        """
+        if not token or not holder:
+            return False
+        cur = self.conn.execute(
+            "UPDATE sessions SET close_holder = ?, updated_at = ? "
+            "WHERE session_id = ? AND close_token = ? AND close_requested_at = 0 "
+            "AND close_holder = ''",
+            (holder, now_ms(), session_id, token),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def mark_in_flight_seen(self, session_id: str, token: str, now: int) -> bool:
+        """Stamp a legacy in-flight token (claim time 0) "first seen *now*" — ``True`` when it did.
+
+        Tokens claimed before ``close_claimed_at`` existed (or by still-running old code)
+        carry 0; the daemon sweep stamps them on the first pass that sees them, so their age
+        counts from there. A compare-and-swap: same token, stamp 0, claim time 0.
+        """
+        if not token or now <= 0:
+            return False
+        cur = self.conn.execute(
+            "UPDATE sessions SET close_claimed_at = ?, updated_at = ? "
+            "WHERE session_id = ? AND close_token = ? AND close_requested_at = 0 "
+            "AND close_claimed_at = 0",
+            (now, now_ms(), session_id, token),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def reclaim_stale_close(
+        self, session_id: str, token: str, *, holder: str, claimed_at: int, now: int
+    ) -> bool:
+        """Put a dead holder's in-flight token back pending — ``True`` when it did.
+
+        The caller (the daemon sweep) judged staleness from the *holder* and *claimed_at* it
+        read; the compare-and-swap repeats exactly those values (and the in-flight stamp
+        0), so a restore, retire, re-claim or hold in between makes this a no-op. The token
+        goes back pending stamped *now*, claim time and holder cleared. ``close_bound`` is
+        KEPT: a ``handoff:`` debt stays a debt (the next closer only closes the pane, never
+        signals) and a ``"pid:start"`` binding stays bound. Nothing is spawned here.
+        """
+        if not token or now <= 0:
+            return False
+        cur = self.conn.execute(
+            "UPDATE sessions SET close_requested_at = ?, close_claimed_at = 0, "
+            "close_holder = '', updated_at = ? "
+            "WHERE session_id = ? AND close_token = ? AND close_requested_at = 0 "
+            "AND close_holder = ? AND close_claimed_at = ?",
+            (now, now_ms(), session_id, token, holder, claimed_at),
         )
         self.conn.commit()
         return cur.rowcount == 1
@@ -1482,22 +1575,27 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             if kind == "switch":
                 self.conn.execute(
                     "UPDATE sessions SET close_requested_at = 0, close_token = '', "
-                    "close_bound = '', switch_requested_at = 0, switch_force = 0, "
+                    "close_bound = '', close_claimed_at = 0, close_holder = '', "
+                    "switch_requested_at = 0, switch_force = 0, "
                     "switch_prompt = '' WHERE session_id = ?",
                     (session_id,),
                 )
             elif kind == "close":
                 # In flight: the stamp goes, the token + binding stay for restore_close.
+                # Claimed now, holderless: the hook cannot know the pid of the close-now
+                # it spawns, which registers itself through hold_close (tp#1595).
                 self.conn.execute(
-                    "UPDATE sessions SET close_requested_at = 0, switch_requested_at = 0, "
+                    "UPDATE sessions SET close_requested_at = 0, close_claimed_at = ?, "
+                    "close_holder = '', switch_requested_at = 0, "
                     "switch_config_dir = '', switch_force = 0, switch_prompt = '' "
                     "WHERE session_id = ?",
-                    (session_id,),
+                    (now, session_id),
                 )
             else:
                 self.conn.execute(
                     "UPDATE sessions SET close_requested_at = 0, close_token = '', "
-                    "close_bound = '', switch_requested_at = 0, switch_config_dir = '', "
+                    "close_bound = '', close_claimed_at = 0, close_holder = '', "
+                    "switch_requested_at = 0, switch_config_dir = '', "
                     "switch_force = 0, switch_prompt = '' WHERE session_id = ?",
                     (session_id,),
                 )
@@ -1665,7 +1763,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             self.conn.execute(
                 "UPDATE sessions SET switch_config_dir = ?, switch_requested_at = 0, "
                 "switch_force = 0, switch_prompt = '', close_requested_at = 0, "
-                "close_token = '', close_bound = '' WHERE session_id = ?",
+                "close_token = '', close_bound = '', close_claimed_at = 0, "
+                "close_holder = '' WHERE session_id = ?",
                 (target, session_id),
             )
         except sqlite3.Error:

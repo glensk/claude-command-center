@@ -204,6 +204,8 @@ class HandoffCandidate:  # pylint: disable=too-many-instance-attributes  # one q
     close_token: str  # "" = no close armed on the source row
     close_requested_at: int  # > 0 = the token is PENDING, 0 with a token = in flight
     close_bound: str  # "handoff:{…}" = a kept post-SIGTERM close debt
+    close_claimed_at: int = 0  # epoch-ms of the in-flight claim (0 = pending/none/legacy)
+    close_holder: str = ""  # the in-flight holder's "pid:start" ("" = none registered)
 
     @property
     def token_state(self) -> str:
@@ -463,7 +465,8 @@ class TransferStoreMixin:
         cols = (
             "t.transfer_id, t.source_session, t.target_session, t.state, t.capped, "
             "COALESCE(s.close_token, ''), COALESCE(s.close_requested_at, 0), "
-            "COALESCE(s.close_bound, '')"
+            "COALESCE(s.close_bound, ''), COALESCE(s.close_claimed_at, 0), "
+            "COALESCE(s.close_holder, '')"
         )
         rows = self.conn.execute(
             f"SELECT {cols} FROM transfers t "  # noqa: S608 - fixed column names
@@ -486,6 +489,8 @@ class TransferStoreMixin:
                 close_token=str(row[5] or ""),
                 close_requested_at=int(row[6] or 0),
                 close_bound=str(row[7] or ""),
+                close_claimed_at=int(row[8] or 0),
+                close_holder=str(row[9] or ""),
             )
             for row in rows
         ]

@@ -1382,6 +1382,283 @@ def test_token_scoped_close_with_a_stale_token_is_a_noop(tmp_path: Path) -> None
     store.close()
 
 
+_HOLDER = "777:Mon Nov  2 21:00:00 2026"
+_OTHER = "888:Mon Nov  2 21:30:00 2026"
+_DEBT = 'handoff:{"iterm": "w0t1p0:X", "pane": "", "pid": 4321, "start": "S", "tty": "t9"}'
+
+
+def _holder_cols(store: Store, sid: str = "s1") -> tuple[int, str]:
+    row = store.get(sid)
+    assert row is not None
+    return row.close_claimed_at, row.close_holder
+
+
+def _in_flight(store: Store, holder: str = _HOLDER, bound: str = "") -> tuple[str, int]:
+    """s1 armed, optionally bound, then claimed by *holder* — ``(token, claimed_at)``."""
+    store.ensure("s1")
+    token = store.arm_close("s1", 1_000_000)
+    if bound:
+        store.update_fields("s1", close_bound=bound)
+    assert store.claim_close("s1", token, holder) == 1_000_000
+    claimed_at, got = _holder_cols(store)
+    assert claimed_at > 0 and got == holder
+    return token, claimed_at
+
+
+def test_claim_close_stamps_holder_and_claim_time(tmp_path: Path) -> None:
+    """The claim records who and since when; a holderless claim records the time only."""
+    from command_center.models import now_ms  # pylint: disable=import-outside-toplevel
+
+    store = _store(tmp_path)
+    before = now_ms()
+    token, claimed_at = _in_flight(store)
+    assert before <= claimed_at <= now_ms()
+    row = store.get("s1")
+    assert row is not None and (row.close_requested_at, row.close_token) == (0, token)
+    assert store.restore_close("s1", token)
+    assert store.claim_close("s1", token) > 0  # legacy caller: no holder
+    claimed_at, holder = _holder_cols(store)
+    assert claimed_at > 0 and holder == ""
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "transition", ["restore", "retire", "disarm", "arm", "ensure_after_retire", "switch"]
+)
+def test_every_clearing_transition_clears_holder_and_claim_time(
+    tmp_path: Path, transition: str
+) -> None:
+    store = _store(tmp_path)
+    token, _at = _in_flight(store)
+    if transition == "restore":
+        assert store.restore_close("s1", token, holder=_HOLDER)
+    elif transition == "retire":
+        assert store.retire_close("s1", token, holder=_HOLDER)
+    elif transition == "disarm":
+        store.disarm_close("s1")
+    elif transition == "arm":
+        assert store.arm_close("s1", 2_000_000) != token
+    elif transition == "ensure_after_retire":
+        assert store.retire_close("s1", token)
+        assert store.ensure_close_armed("s1", 2_000_000) not in ("", token)
+    else:
+        assert (
+            store.arbitrate_now_switch("s1", "/cfg", now=2_000_000, ttl_ms=_TTL, override=True)
+            == ""
+        )
+    assert _holder_cols(store) == (0, "")
+    store.close()
+
+
+def test_stop_chain_claim_stamps_time_holderless_and_its_clears_reset(tmp_path: Path) -> None:
+    """claim_after_turn's close branch: claimed now, no holder; its clearing branches clear."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    token = store.arm_close("s1", 1_000_000)
+    claim = _claim_close(store, 1_000_500)
+    assert claim.token == token
+    assert _holder_cols(store) == (1_000_500, "")
+    assert store.hold_close("s1", token, _HOLDER)
+    assert _holder_cols(store) == (1_000_500, _HOLDER)
+    # An expired stamp (no claim) clears the whole arm, holder columns included.
+    store.conn.execute(
+        "UPDATE sessions SET close_requested_at = 5, close_claimed_at = 9, "
+        "close_holder = ? WHERE session_id = 's1'",
+        (_OTHER,),
+    )
+    store.conn.commit()
+    assert store.claim_after_turn("s1", 1_000_000 + _TTL, _TTL) == ("", None)
+    assert _holder_cols(store) == (0, "")
+    store.close()
+
+
+def test_hold_close_fills_only_an_empty_holder_on_the_same_in_flight_token(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    store.ensure("s1")
+    token = store.arm_close("s1", 1_000_000)
+    assert not store.hold_close("s1", token, _HOLDER)  # pending: nobody to hold for
+    _claim_close(store, 1_000_000)
+    assert not store.hold_close("s1", "stale", _HOLDER)  # another token
+    assert not store.hold_close("s1", token, "")  # an empty identity registers nothing
+    assert store.hold_close("s1", token, _HOLDER)
+    assert not store.hold_close("s1", token, _OTHER)  # already held: never overwritten
+    assert _holder_cols(store)[1] == _HOLDER
+    store.close()
+
+
+def test_mark_in_flight_seen_stamps_only_a_legacy_claim(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    token, _at = _in_flight(store)
+    assert not store.mark_in_flight_seen("s1", token, 5_000_000)  # already has a claim time
+    store.conn.execute("UPDATE sessions SET close_claimed_at = 0 WHERE session_id = 's1'")
+    store.conn.commit()
+    assert not store.mark_in_flight_seen("s1", "stale", 5_000_000)
+    assert store.mark_in_flight_seen("s1", token, 5_000_000)
+    assert _holder_cols(store) == (5_000_000, _HOLDER)
+    assert not store.mark_in_flight_seen("s1", token, 6_000_000)  # first seen stays first
+    assert store.restore_close("s1", token)
+    assert not store.mark_in_flight_seen("s1", token, 6_000_000)  # pending: not in flight
+    store.close()
+
+
+@pytest.mark.parametrize("bound", [_DEBT, _BOUND])
+def test_reclaim_stale_close_goes_pending_and_keeps_the_bound(tmp_path: Path, bound: str) -> None:
+    """A successful reclaim: pending at *now*, holder cleared, close_bound byte-for-byte."""
+    store = _store(tmp_path)
+    token, claimed_at = _in_flight(store, bound=bound)
+    assert store.reclaim_stale_close(
+        "s1", token, holder=_HOLDER, claimed_at=claimed_at, now=9_000_000
+    )
+    row = store.get("s1")
+    assert row is not None
+    assert (row.close_requested_at, row.close_token, row.close_bound) == (9_000_000, token, bound)
+    assert (row.close_claimed_at, row.close_holder) == (0, "")
+    store.close()
+
+
+@pytest.mark.parametrize("change", ["token", "holder", "claimed_at", "pending"])
+def test_reclaim_stale_close_with_changed_values_is_a_noop(tmp_path: Path, change: str) -> None:
+    store = _store(tmp_path)
+    token, claimed_at = _in_flight(store, bound=_DEBT)
+    kwargs = {"holder": _HOLDER, "claimed_at": claimed_at, "now": 9_000_000}
+    sid_token = token
+    if change == "token":
+        sid_token = "stale"
+    elif change == "holder":
+        kwargs["holder"] = _OTHER
+    elif change == "claimed_at":
+        kwargs["claimed_at"] = claimed_at - 1
+    else:
+        assert store.restore_close("s1", token, bound=_DEBT)
+    before = store.get("s1")
+    assert not store.reclaim_stale_close("s1", sid_token, **kwargs)  # type: ignore[arg-type]
+    after = store.get("s1")
+    assert before is not None and after is not None
+    assert (after.close_requested_at, after.close_token, after.close_bound) == (
+        before.close_requested_at,
+        before.close_token,
+        before.close_bound,
+    )
+    assert (after.close_claimed_at, after.close_holder) == (
+        before.close_claimed_at,
+        before.close_holder,
+    )
+    store.close()
+
+
+def test_two_concurrent_reclaims_of_one_token_exactly_one_wins(tmp_path: Path) -> None:
+    import threading  # pylint: disable=import-outside-toplevel
+
+    store = _store(tmp_path)
+    token, claimed_at = _in_flight(store, bound=_DEBT)
+    barrier = threading.Barrier(2)
+    results: list[bool] = []
+
+    def reclaim(now: int) -> None:
+        with Store(tmp_path / "state.db") as own:
+            barrier.wait()
+            results.append(
+                own.reclaim_stale_close("s1", token, holder=_HOLDER, claimed_at=claimed_at, now=now)
+            )
+
+    workers = [threading.Thread(target=reclaim, args=(9_000_000 + i,)) for i in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    assert sorted(results) == [False, True]
+    row = store.get("s1")
+    assert row is not None and row.close_requested_at in (9_000_000, 9_000_001)
+    assert row.close_bound == _DEBT
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "order",
+    ["restore_then_reclaim", "reclaim_then_restore", "retire_then_reclaim", "reclaim_then_retire"],
+)
+def test_reclaim_interleaved_with_the_holders_own_settle_ends_consistent(
+    tmp_path: Path, order: str
+) -> None:
+    """Whichever lands first wins; the other is a no-op and the row is in ONE clean state."""
+    store = _store(tmp_path)
+    token, claimed_at = _in_flight(store, bound=_DEBT)
+    other = Store(tmp_path / "state.db")  # the closer's own connection
+
+    def reclaim() -> bool:
+        return store.reclaim_stale_close(
+            "s1", token, holder=_HOLDER, claimed_at=claimed_at, now=9_000_000
+        )
+
+    if order == "restore_then_reclaim":
+        assert other.restore_close("s1", token, armed_at=1_000_000, bound=_DEBT, holder=_HOLDER)
+        assert not reclaim()
+        expect = (1_000_000, token)
+    elif order == "reclaim_then_restore":
+        assert reclaim()
+        assert not other.restore_close("s1", token, armed_at=1_000_000, bound="", holder=_HOLDER)
+        expect = (9_000_000, token)
+    elif order == "retire_then_reclaim":
+        assert other.retire_close("s1", token, holder=_HOLDER)
+        assert not reclaim()
+        expect = (0, "")
+    else:
+        assert reclaim()
+        assert not other.retire_close("s1", token, holder=_HOLDER)  # holder is gone
+        expect = (9_000_000, token)
+    other.close()
+    row = store.get("s1")
+    assert row is not None and (row.close_requested_at, row.close_token) == expect
+    assert row.close_bound == (_DEBT if expect[1] else "")
+    assert (row.close_claimed_at, row.close_holder) == (0, "")
+    store.close()
+
+
+def test_holder_checked_restore_and_retire_spare_another_holders_claim(tmp_path: Path) -> None:
+    """Reclaimed, then claimed by closer B: closer A's late restore and retire are no-ops."""
+    store = _store(tmp_path)
+    token, claimed_at = _in_flight(store, bound=_DEBT)
+    assert store.reclaim_stale_close(
+        "s1", token, holder=_HOLDER, claimed_at=claimed_at, now=9_000_000
+    )
+    assert store.claim_close("s1", token, _OTHER) == 9_000_000
+    assert not store.restore_close("s1", token, bound="", holder=_HOLDER)
+    assert not store.retire_close("s1", token, holder=_HOLDER)
+    row = store.get("s1")
+    assert row is not None
+    assert (row.close_requested_at, row.close_token, row.close_bound) == (0, token, _DEBT)
+    assert row.close_holder == _OTHER
+    assert store.retire_close("s1", token, holder=_OTHER)  # B's own settle still works
+    store.close()
+
+
+def test_close_holder_columns_migrate_onto_an_older_db(tmp_path: Path) -> None:
+    """A DB from before tp#1595 opens, gains both columns at their defaults and works."""
+    from command_center import store as store_mod  # pylint: disable=import-outside-toplevel
+
+    db = tmp_path / "legacy.db"
+    legacy_schema = store_mod._SCHEMA.replace(  # pylint: disable=protected-access
+        "    close_claimed_at  INTEGER NOT NULL DEFAULT 0,\n", ""
+    ).replace("    close_holder      TEXT    NOT NULL DEFAULT '',\n", "")
+    assert "close_holder" not in legacy_schema and "close_claimed_at" not in legacy_schema
+    conn = sqlite3.connect(db)
+    conn.executescript(legacy_schema)
+    conn.execute(
+        "INSERT INTO sessions (session_id, cwd, close_token, close_requested_at) "
+        "VALUES ('old', '/repo', 'tok', 0)"
+    )
+    conn.commit()
+    conn.close()
+    with Store(db) as store:
+        assert _holder_cols(store, "old") == (0, "")  # a legacy in-flight token
+        assert store.mark_in_flight_seen("old", "tok", 5_000_000)
+        assert store.reclaim_stale_close("old", "tok", holder="", claimed_at=5_000_000, now=7)
+        assert store.claim_close("old", "tok", _HOLDER) == 7
+        assert _holder_cols(store, "old")[1] == _HOLDER
+
+
 def test_close_unarmed_or_expired_is_never_claimed(tmp_path: Path) -> None:
     """Unarmed → nothing; a stamp past the TTL is cleared (token too), never claimed."""
     store = _store(tmp_path)

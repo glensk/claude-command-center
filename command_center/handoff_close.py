@@ -43,6 +43,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 import argparse
 import dataclasses
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,6 +85,7 @@ class Claim:
     token: str
     armed_at: int
     bound: str  # the row's close_bound at claim time
+    holder: str = ""  # this closer's own "pid:start", recorded on the row by the claim
 
 
 @dataclass(frozen=True)
@@ -178,6 +180,14 @@ def _start_of(pid: int) -> str:
     return ident.start
 
 
+def own_identity() -> str:
+    """This process's ``"pid:start"`` — the close-token holder it records (``""`` = unreadable)."""
+    from . import terminal
+
+    pid = os.getpid()
+    return terminal.probe_identity(pid).token(pid)
+
+
 def _stamp(path: Path | None) -> tuple[int, int, int] | None:
     """The transcript identity ``(inode, mtime_ns, size)`` (``None`` = unreadable)."""
     try:
@@ -253,7 +263,12 @@ def _revalidate(
         row = store.get(claim.session_id)
     if reason:
         raise Refused(reason)
-    if row is None or row.close_token != claim.token or row.close_requested_at:
+    if (
+        row is None
+        or row.close_token != claim.token
+        or row.close_requested_at
+        or (row.close_holder or "") != claim.holder
+    ):
         raise Refused("the close token changed hands")
     if observe(adapter, claim.session_id, bound) != stamp:
         raise Refused("source transcript changed before the signal")
@@ -294,16 +309,21 @@ def _restore(claim: Claim, bound: str) -> bool:
     try:
         with Store() as store:
             return store.restore_close(
-                claim.session_id, claim.token, armed_at=claim.armed_at, bound=bound
+                claim.session_id,
+                claim.token,
+                armed_at=claim.armed_at,
+                bound=bound,
+                holder=claim.holder,
             )
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return False
 
 
 def _retire(claim: Claim) -> bool:
+    """Retire this closer's own token — a no-op once another holder claimed it."""
     try:
         with Store() as store:
-            return store.retire_close(claim.session_id, claim.token)
+            return store.retire_close(claim.session_id, claim.token, holder=claim.holder)
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return False
 
@@ -408,6 +428,7 @@ def run(args: argparse.Namespace) -> int:
     if not sid:
         return _refuse(None, "-", tid, "no --session given")
     cfg = config.load_config()
+    holder = ""
     with Store() as store:
         reason = lineage_refusal(store, tid, sid)
         row = store.get(sid)
@@ -415,12 +436,18 @@ def run(args: argparse.Namespace) -> int:
         bound = (row.close_bound or "") if row is not None else ""
         if not reason and not token:
             reason = "no close armed"
-        armed_at = store.claim_close(sid, token) if not reason else 0
+        if not reason:
+            # Our own identity BEFORE the claim: a holder "" must only ever mean "no
+            # process registered", or the daemon sweep could reclaim us by age alone.
+            holder = own_identity()
+            if not holder:
+                reason = "own process could not be identified (ps unreadable) — not claimed"
+        armed_at = store.claim_close(sid, token, holder) if not reason else 0
     if not reason and not armed_at:
         reason = "the close is held by another closer"
     if reason:
         return _refuse(None, sid, tid, reason)
-    claim = Claim(sid, tid, token, armed_at, bound)
+    claim = Claim(sid, tid, token, armed_at, bound, holder)
     debt = Debt.decode(bound)
     try:
         return retry_terminal(claim, debt) if debt else close_source(args, claim, cfg)

@@ -1443,8 +1443,45 @@ def _close_now_reap(  # pylint: disable=too-many-return-statements
     return "", "", bound, _sigterm(pid)
 
 
+def _own_identity() -> tuple[str, bool]:
+    """This process's ``("pid:start", ps_unreadable)`` — ``("", …)`` when it is unknown."""
+    from . import terminal
+
+    pid = os.getpid()
+    ident = terminal.probe_identity(pid)
+    return ident.token(pid), ident.kind == terminal.IDENTITY_PS_UNREADABLE
+
+
+def _close_now_hold(session_id: str, args: argparse.Namespace) -> tuple[str | None, bool]:
+    """Register this ``close-now`` as the holder of its ``--token`` — ``(holder, unreadable)``.
+
+    The Stop hook claims the token holderless (it cannot know this process's pid); this
+    fills in our own ``"pid:start"`` (:meth:`Store.hold_close`), so the daemon sweep never
+    reclaims a token a live ``close-now`` holds (tp#1595). *holder* is our identity when the
+    hold succeeded, else ``None`` (no ``--token``, a failed CAS, an unreadable probe — the
+    later settle then runs without a holder check); *unreadable* is ``True`` when our own
+    identity could not be probed.
+    """
+    token = str(getattr(args, "token", "") or "")
+    if not token:
+        return None, False
+    own, unreadable = _own_identity()
+    if not own:
+        return None, unreadable
+    try:
+        with Store() as store:
+            held = store.hold_close(session_id, token, own)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        held = False
+    return (own if held else None), False
+
+
 def _close_now_settle_arm(
-    session_id: str, args: argparse.Namespace, cause: str, verified: str
+    session_id: str,
+    args: argparse.Namespace,
+    cause: str,
+    verified: str,
+    holder: str | None = None,
 ) -> int:
     """Restore (transient *cause*) or retire the claimed arm ``close-now`` was handed.
 
@@ -1453,6 +1490,8 @@ def _close_now_settle_arm(
     the VERIFIED baseline ``"pid:start"``, else the hook's ``--bound`` when it names the
     same pid (the hook checked it against its own ``$CLAUDE_PID`` this very Stop); with
     neither the arm is retired — an unbound restore could close a relaunched process.
+    With a *holder* (our :func:`_close_now_hold` succeeded) both CASes also require the
+    row to still name it, so a token reclaimed and re-claimed meanwhile is left alone.
     """
     from .hooks import CLOSE_REQUEST_TTL_MS
 
@@ -1473,9 +1512,10 @@ def _close_now_settle_arm(
                     bound=bound,
                     now=now_ms(),
                     ttl_ms=CLOSE_REQUEST_TTL_MS,
+                    holder=holder,
                 ):
                     return armed_at + CLOSE_REQUEST_TTL_MS
-            store.retire_close(session_id, token)
+            store.retire_close(session_id, token, holder=holder)
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         pass
     return 0
@@ -1526,6 +1566,9 @@ def cmd_close_now(args: argparse.Namespace) -> int:
     if not session_id:
         return 0
     cfg = config.load_config()
+    # (0) Hold the claimed --token under our own identity first (tp#1595), so the daemon
+    #     sweep never takes it while we run.
+    holder, own_unreadable = _close_now_hold(session_id, args)
     if not cfg.stop_barrier_enabled:
         # (1) Escape hatch: the pre-lease blind settle, then reap what the registry names.
         time.sleep(_CLOSE_NOW_SETTLE_SEC)
@@ -1533,13 +1576,23 @@ def cmd_close_now(args: argparse.Namespace) -> int:
         reaped_pid = pid > 0 and _sigterm(pid)
     else:
         # (2) Bind the process (the hook's $CLAUDE_PID, else the live registry entry), wait
-        #     for its Stop chain and reap it — or refuse and touch nothing.
+        #     for its Stop chain and reap it — or refuse and touch nothing. An unreadable
+        #     self-probe refuses as ps-unreadable before anything is probed or signalled:
+        #     the token never stays in flight unheld while we wait.
         pid = int(getattr(args, "pid", 0) or 0) or _live_session_pid(session_id)
-        reason, cause, verified, reaped_pid = _close_now_reap(session_id, pid, cfg)
+        if own_unreadable:
+            reason, cause, verified, reaped_pid = (
+                "own process could not be identified (ps unreadable)",
+                CLOSE_PS_UNREADABLE,
+                "",
+                False,
+            )
+        else:
+            reason, cause, verified, reaped_pid = _close_now_reap(session_id, pid, cfg)
         if reason:
-            rearmed_until = _close_now_settle_arm(session_id, args, cause, verified)
+            rearmed_until = _close_now_settle_arm(session_id, args, cause, verified, holder)
             return _close_now_abort(session_id, reason, rearmed_until)
-    _close_now_settle_arm(session_id, args, "", "")  # closing: the arm is spent
+    _close_now_settle_arm(session_id, args, "", "", holder)  # closing: the arm is spent
     with Store() as store:
         session = store.get(session_id)
     # (3) Terminal close, first match wins: (a) the tmux pane, (b) iTerm — the hook-supplied

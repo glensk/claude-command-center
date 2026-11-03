@@ -146,6 +146,20 @@ def test_the_query_selects_only_open_handoff_work() -> None:
     assert got[finalized].token_state == "pending" and not got[finalized].debt
 
 
+def test_a_candidate_carries_the_in_flight_holder_and_claim_time() -> None:
+    """tp#1595: the sweep reads who holds an in-flight token and since when."""
+    tid = _transfer("finalized")
+    holder = "777:Mon Nov  2 21:00:00 2026"
+    with Store() as store:
+        token = store.get(SRC).close_token  # type: ignore[union-attr]
+        got = {c.transfer_id: c for c in store.handoff_finalize_candidates()}
+        assert (got[tid].close_claimed_at, got[tid].close_holder) == (0, "")
+        assert store.claim_close(SRC, token, holder)
+        got = {c.transfer_id: c for c in store.handoff_finalize_candidates()}
+    assert got[tid].token_state == "in_flight"
+    assert got[tid].close_claimed_at > 0 and got[tid].close_holder == holder
+
+
 def test_a_finalized_row_handed_to_another_successor_is_not_a_candidate() -> None:
     tid = _transfer("finalized")
     _set_row(SRC, handed_off_to=DST2)  # a later handoff re-pointed the lineage

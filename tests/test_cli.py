@@ -1566,6 +1566,7 @@ def test_close_now_refuses_when_no_pid_can_be_resolved(
 
 # ---- close-now: restore vs retire of the claimed arm (tp#232) ---------------
 _CLOSE_BOUND = f"{_CLOSE_PID}:{_CLOSE_START}"
+_CLOSE_OWN = "8800:Tue Sep  2 23:05:00 2026"  # the close-now process's own "pid:start"
 
 
 def _claimed_arm(bound: str = "") -> CloseClaim:
@@ -1632,6 +1633,8 @@ def _setup_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
     _barrier(True)
     _no_settle(monkeypatch)
     _stub_drain_probes(monkeypatch, _quiet_tree())
+    # close-now's own identity (its token holder) stays out of the stubbed ps sequence.
+    monkeypatch.setattr(cli, "_own_identity", lambda: (_CLOSE_OWN, False))
     return _refusals(monkeypatch)
 
 
@@ -1654,6 +1657,101 @@ def test_close_now_transient_refusal_restores_the_arm_bound_to_the_process(
     assert notes and "re-armed until" in notes[0] and "NEXT turn" in notes[0]
     log = (tmp_path / "command-center" / "events.log").read_text(encoding="utf-8")
     assert "NOT closed (re-armed)" in log
+
+
+def _holder_row() -> tuple[int, str]:
+    with Store() as store:
+        row = store.get("s1")
+    assert row is not None
+    return row.close_claimed_at, row.close_holder
+
+
+def test_close_now_holds_its_token_under_its_own_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1595: the hook claims holderless; close-now registers itself before it waits."""
+    _setup_close(tmp_path, monkeypatch)
+    seen: list[tuple[int, str]] = []
+
+    def _wait(*_a: object, unknown_causes: list[str] | None = None) -> tuple[str, list[str]]:
+        del unknown_causes
+        seen.append(_holder_row())
+        return "running", ["/bin/zsh /home/me/.claude/run-stop-hook.sh"]
+
+    monkeypatch.setattr(cli, "_wait_for_stop_drain", _wait)
+    killed, _closed = _no_tab_effects(monkeypatch)
+    claim = _claimed_arm()
+    assert _holder_row()[1] == ""  # the Stop hook's claim: time only
+    assert cli.cmd_close_now(_close_args(claim)) == 1
+    assert not killed
+    assert len(seen) == 1
+    claimed_at, holder = seen[0]
+    assert claimed_at > 0 and holder == _CLOSE_OWN
+    # The holder-checked restore succeeded and cleared both columns.
+    assert _arm_row() == (claim.armed_at, claim.token, _CLOSE_BOUND)
+    assert _holder_row() == (0, "")
+
+
+@pytest.mark.parametrize("refused", [True, False], ids=["refusal", "success"])
+def test_close_now_never_settles_a_token_another_holder_took(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refused: bool
+) -> None:
+    """Reclaimed and re-claimed while close-now waited: its restore/retire leave it alone."""
+    _setup_close(tmp_path, monkeypatch)
+    other = "9999:Tue Sep  2 23:30:00 2026"
+    claim = _claimed_arm()
+
+    def _wait(*_a: object, unknown_causes: list[str] | None = None) -> tuple[str, list[str]]:
+        del unknown_causes
+        with Store() as store:
+            claimed_at, holder = _holder_row()
+            assert store.reclaim_stale_close(
+                "s1", claim.token, holder=holder, claimed_at=claimed_at, now=claim.armed_at + 1
+            )
+            assert store.claim_close("s1", claim.token, other)
+        if refused:
+            return "running", ["/bin/zsh /home/me/.claude/run-stop-hook.sh"]
+        return "drained", []
+
+    monkeypatch.setattr(cli, "_wait_for_stop_drain", _wait)
+    _no_tab_effects(monkeypatch)
+    assert cli.cmd_close_now(_close_args(claim)) == (1 if refused else 0)
+    assert _arm_row() == (0, claim.token, "")
+    assert _holder_row()[1] == other
+
+
+def test_close_now_with_an_unreadable_self_probe_refuses_before_any_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No own identity → refused as ps-unreadable (restored when bound), nothing signalled."""
+    _setup_close(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "_own_identity", lambda: ("", True))
+
+    def _no_reap(*_a: object) -> tuple[str, str, str, bool]:
+        raise AssertionError("the target must not be probed")
+
+    monkeypatch.setattr(cli, "_close_now_reap", _no_reap)
+    killed, closed = _no_tab_effects(monkeypatch)
+    claim = _claimed_arm(bound=_CLOSE_BOUND)
+    assert cli.cmd_close_now(_close_args(claim)) == 1
+    assert not killed and not closed
+    assert _arm_row() == (claim.armed_at, claim.token, _CLOSE_BOUND)
+    assert _holder_row() == (0, "")
+    log = (tmp_path / "command-center" / "events.log").read_text(encoding="utf-8")
+    assert "own process could not be identified" in log
+
+
+def test_close_now_without_a_token_registers_no_holder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy argv (no --token) never holds anything and never probes itself."""
+    _setup_close(tmp_path, monkeypatch)
+
+    def _no_probe() -> tuple[str, bool]:
+        raise AssertionError("no --token: nothing to hold")
+
+    monkeypatch.setattr(cli, "_own_identity", _no_probe)
+    assert cli._close_now_hold("s1", _close_args(None)) == (None, False)
 
 
 @pytest.mark.parametrize(

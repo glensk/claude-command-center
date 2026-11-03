@@ -30,6 +30,7 @@ START = "Mon Nov  2 20:00:00 2026"
 ITERM = "w0t1p0:STORED-UUID"
 TTY = "ttys009"
 SHELL = 4000  # the tab's login shell: holds the tty until the tab closes
+OWN = "777:Mon Nov  2 21:00:00 2026"  # this closer's own "pid:start" (its token holder)
 
 
 def _record(kind: str, uuid: str, **extra: Any) -> dict[str, Any]:
@@ -171,6 +172,7 @@ def _install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, barrier: bool =
     monkeypatch.setattr(handoff_close, "STABLE_WINDOW_SEC", 0.0)
     monkeypatch.setattr(handoff_close, "EXIT_WAIT_SEC", 0.0)
     monkeypatch.setattr(handoff_close, "_sleep", _sleep)
+    monkeypatch.setattr(handoff_close, "own_identity", lambda: OWN)
     return world
 
 
@@ -337,6 +339,98 @@ def test_duplicate_closers_one_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert world.killed == [(PID, signal.SIGTERM)]
     assert world.closed == [ITERM]
     assert "no close armed" in _events(tmp_path)
+
+
+def test_the_claim_records_the_closers_own_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In flight, the row names THIS closer and the claim time; the retire clears both."""
+    world = _install(tmp_path, monkeypatch)
+    seen: list[tuple[int, int, str]] = []
+    world.on_sleep.append(
+        lambda: seen.append(
+            (_row().close_requested_at, _row().close_claimed_at, _row().close_holder)
+        )
+    )
+    _seed()
+    assert handoff_close.run(_args()) == 0
+    assert len(seen) == 1
+    stamp, claimed_at, holder = seen[0]
+    assert stamp == 0 and claimed_at > 0 and holder == OWN
+    row = _row()
+    assert (row.close_token, row.close_claimed_at, row.close_holder) == ("", 0, "")
+
+
+def test_an_unreadable_self_probe_refuses_without_claiming(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Holder "" must only mean "nobody registered": no own identity → no claim at all."""
+    world = _install(tmp_path, monkeypatch)
+    monkeypatch.setattr(handoff_close, "own_identity", lambda: "")
+    token = _seed()
+    before = _row()
+    assert handoff_close.run(_args()) == 1
+    assert not world.killed and not world.closed
+    row = _row()
+    assert (row.close_token, row.close_requested_at) == (token, before.close_requested_at)
+    assert (row.close_claimed_at, row.close_holder, row.close_bound) == (0, "", "")
+    assert "not claimed" in _events(tmp_path)
+
+
+def test_own_identity_is_this_process_pid_and_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real probe: OK → "pid:start"; ps unreadable → ""."""
+    import os  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(terminal, "ps_table", lambda: {os.getpid(): PsRow(1, "", "S", "ccc")})
+    monkeypatch.setattr(terminal, "pid_start", lambda _pid: START)
+    assert handoff_close.own_identity() == f"{os.getpid()}:{START}"
+    monkeypatch.setattr(terminal, "ps_table", dict)
+    assert handoff_close.own_identity() == ""
+
+
+def test_a_token_reclaimed_and_reclaimed_mid_run_fails_revalidation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reclaim + a second closer's claim during the window: closer A never signals."""
+    world = _install(tmp_path, monkeypatch)
+    other = "999:Mon Nov  2 22:00:00 2026"
+    token = _seed()
+
+    def steal() -> None:
+        row = _row()
+        with Store() as store:
+            assert store.reclaim_stale_close(
+                SRC, token, holder=OWN, claimed_at=row.close_claimed_at, now=now_ms()
+            )
+            assert store.claim_close(SRC, token, other)
+
+    world.on_sleep.append(steal)
+    assert handoff_close.run(_args()) == 1
+    assert not world.killed and not world.closed
+    row = _row()
+    assert (row.close_token, row.close_requested_at, row.close_holder) == (token, 0, other)
+    assert "changed hands" in _events(tmp_path)
+
+
+def test_a_late_first_closer_never_settles_the_second_closers_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reclaimed, closer B claims: closer A's _retire and _restore are both no-ops."""
+    _install(tmp_path, monkeypatch)
+    other = "999:Mon Nov  2 22:00:00 2026"
+    token = _seed()
+    with Store() as store:
+        armed_at = store.claim_close(SRC, token, OWN)
+        claimed_at = _row().close_claimed_at
+        assert store.reclaim_stale_close(
+            SRC, token, holder=OWN, claimed_at=claimed_at, now=now_ms()
+        )
+        assert store.claim_close(SRC, token, other)
+    claim_a = handoff_close.Claim(SRC, TID, token, armed_at, "", OWN)
+    assert not handoff_close._retire(claim_a)  # pylint: disable=protected-access
+    assert not handoff_close._restore(claim_a, "")  # pylint: disable=protected-access
+    row = _row()
+    assert (row.close_token, row.close_requested_at, row.close_holder) == (token, 0, other)
 
 
 @pytest.mark.parametrize(

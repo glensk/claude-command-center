@@ -528,6 +528,11 @@ class Session:
     # Written only by the Store close transitions (arm/claim/restore/retire/disarm).
     close_token: str = ""
     close_bound: str = ""
+    # Who holds an in-flight close token and since when (tp#1595): epoch-ms of the claim
+    # (0 = pending/none, or claimed before this field existed) and the holder's
+    # "pid:start" ("" = no process registered yet).
+    close_claimed_at: int = 0
+    close_holder: str = ""
     # `ccc switch-account`: epoch-ms the relaunch-after-turn was armed (0 = none) and the
     # target account's config dir. Claimed together by the release-locks Stop hook, which
     # spawns the detached relauncher (`ccc switch-now`).

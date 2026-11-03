@@ -644,7 +644,7 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
             )
             cur = self.conn.execute(
                 "UPDATE sessions SET close_requested_at = ?, close_token = ?, close_bound = '', "
-                "updated_at = ? WHERE session_id = ?",
+                "close_claimed_at = 0, close_holder = '', updated_at = ? WHERE session_id = ?",
                 (close_now_ms, token, close_now_ms, session_id),
             )
             if cur.rowcount != 1:

@@ -177,6 +177,29 @@ def test_arm_and_close_is_atomic(tmp_path: Path) -> None:
     assert store.get("s1").close_requested_at == 0  # type: ignore[union-attr]
 
 
+def test_arm_and_close_clears_a_stale_close_holder(tmp_path: Path) -> None:
+    """The `ccc await` re-arm writes a fresh token: claim time and holder go with the old one."""
+    store = _store(tmp_path)
+    old = store.arm_close("s1", NOW * 1000)
+    assert store.claim_close("s1", old, "77:Mon Nov  2 20:00:00 2026")
+    row = store.get("s1")
+    assert row is not None and row.close_claimed_at > 0 and row.close_holder
+    _gid, token = store.arm_await_and_close(
+        "s1",
+        config_dir="",
+        cwd="",
+        no_codex=False,
+        prompt_template="{event}",
+        until_epoch=NOW + 10,
+        sources=[SourceSpec(kind="cmd", spec={})],
+        now=NOW,
+        close_now_ms=NOW * 1000,
+    )
+    row = store.get("s1")
+    assert row is not None and row.close_token == token != old
+    assert (row.close_claimed_at, row.close_holder) == (0, "")
+
+
 def test_session_delete_cascades(tmp_path: Path) -> None:
     store = _store(tmp_path)
     gid = _arm(store)
