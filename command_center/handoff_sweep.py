@@ -14,11 +14,22 @@ indexed query (:meth:`TransferStoreMixin.handoff_finalize_candidates`):
   or — a kept ``handoff:`` debt (signal sent, pane still open) — regardless of liveness:
   the closer's ``retry_terminal`` closes the pane without signalling again.
 
-One closer spawn per source per :data:`PACING_MS`. Nothing is ever selected by age, and a
-source whose close completed (token retired) is never a candidate again, so a tab the user
-reopened afterwards is never closed by the daemon. ``dry_run`` reports what it would do and
-mutates and spawns nothing. Each candidate is isolated: one failure is reported and the
-rest still run. The daemon's entry point is ``daemon._run_handoff_finalize``.
+* such a transfer whose token is IN FLIGHT (claimed by a closer or the source's Stop
+  chain) is left alone unless its holder is dead (tp#1595): claimed at least
+  :data:`STALE_MS` ago AND either holderless or a recorded ``"pid:start"`` that a
+  readable ``ps`` shows gone or replaced. Such a token goes back PENDING
+  (:meth:`Store.reclaim_stale_close`, ``close_bound`` kept, so a ``handoff:`` debt stays
+  a debt) and a later pass spawns the closer through the pending branch. A live holder or
+  an unreadable ``ps`` is never stale; a legacy token without a claim time is first
+  stamped "seen now" (:meth:`Store.mark_in_flight_seen`).
+
+One closer spawn per source per :data:`PACING_MS`. Nothing is ever selected by age: the
+age floor only gates reverting an existing in-flight token of a candidate the query already
+returns, never a close. A source whose close completed (token retired) is never a candidate
+again, so a tab the user reopened afterwards is never closed by the daemon. ``dry_run``
+reports what it would do and mutates and spawns nothing. Each candidate is isolated: one
+failure is reported and the rest still run. The daemon's entry point is
+``daemon._run_handoff_finalize``.
 """
 
 from __future__ import annotations
@@ -40,7 +51,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from . import config
 from .models import LiveSession, now_ms
@@ -54,12 +65,19 @@ if TYPE_CHECKING:  # pragma: no cover
 #: transcript) hands its token back PENDING, so without pacing every pass would spawn again.
 PACING_MS = 10 * 60 * 1000
 
+#: An in-flight close token younger than this is never reclaimed (tp#1595). Longer than the
+#: longest legitimate hold (10 s stability + up to 900 s drain + 10 s exit wait + the
+#: terminal close); it matters for holderless tokens (the hook → ``close-now`` start gap,
+#: legacy rows) and is a belt for a recorded dead holder.
+STALE_MS = 20 * 60 * 1000
+
 
 class Tally(Protocol):
     """The ``DaemonReport`` fields this sweep fills."""
 
     handoff_finalized: list[str]  # transfers moved accepted → finalized
     handoff_closers: list[str]  # source sessions a closer was spawned for
+    handoff_reclaimed: list[str]  # source sessions whose dead holder's token went pending
     handoff_errors: list[str]  # "<transfer>: <why>"
 
 
@@ -110,6 +128,15 @@ class _Pass:
     dry_run: bool
     now: int
     pacing: dict[str, int]
+    ps: dict[int, Any] | None = None  # one ps_table() per pass, read on first need
+
+    def ps_rows(self) -> dict[int, Any]:
+        """The pass's shared ``ps`` table (an empty dict = unreadable)."""
+        if self.ps is None:
+            from . import terminal
+
+            self.ps = terminal.ps_table() or {}
+        return self.ps
 
 
 def _finalize_stranded(sweep: _Pass, cand: HandoffCandidate) -> None:
@@ -137,6 +164,51 @@ def _finalize_stranded(sweep: _Pass, cand: HandoffCandidate) -> None:
         sweep.report.handoff_errors.append(f"{tid}: closer spawn failed")
 
 
+def _holder_dead(sweep: _Pass, holder: str) -> bool:
+    """True only when a readable ``ps`` proves the ``"pid:start"`` *holder* gone or replaced.
+
+    Fails closed: an unparsable holder, an unreadable ``ps`` or the same live process all
+    answer ``False``.
+    """
+    from . import terminal
+
+    pid_text, sep, start = holder.partition(":")
+    if not sep or not pid_text.isdigit() or not start:
+        return False
+    pid = int(pid_text)
+    ident = terminal.probe_identity(pid, sweep.ps_rows())
+    if ident.kind == terminal.IDENTITY_PID_GONE:
+        return True
+    return ident.kind == terminal.IDENTITY_OK and bool(ident.start) and ident.start != start
+
+
+def _reclaim_stale(sweep: _Pass, cand: HandoffCandidate) -> None:
+    """An in-flight token: put it back pending when its holder is provably dead (tp#1595).
+
+    Never spawns: the pending branch does that on a later pass, paced as usual.
+    """
+    sid = cand.source_session
+    if not cand.close_claimed_at:
+        if not sweep.dry_run:
+            sweep.store.mark_in_flight_seen(sid, cand.close_token, sweep.now)
+        return  # legacy: its age counts from this pass
+    if sweep.now - cand.close_claimed_at < STALE_MS:
+        return
+    if cand.close_holder and not _holder_dead(sweep, cand.close_holder):
+        return  # alive (however old), ps unreadable, or unparsable: fail closed
+    if sweep.dry_run:
+        sweep.report.handoff_reclaimed.append(sid)
+        return
+    if sweep.store.reclaim_stale_close(
+        sid,
+        cand.close_token,
+        holder=cand.close_holder,
+        claimed_at=cand.close_claimed_at,
+        now=sweep.now,
+    ):
+        sweep.report.handoff_reclaimed.append(sid)
+
+
 def _close_finalized(sweep: _Pass, cand: HandoffCandidate) -> None:
     """A ``finalized`` transfer whose source still holds its close token: the B3 closer."""
     from . import continue_session
@@ -150,7 +222,9 @@ def _close_finalized(sweep: _Pass, cand: HandoffCandidate) -> None:
         if contract_status(entry.raw_status) != "idle":
             return  # busy: the closer would refuse; a later pass (or its own Stop) tries
     if cand.token_state != "pending":
-        return  # in flight: a closer or the source's Stop chain holds the token
+        if cand.token_state == "in_flight":
+            _reclaim_stale(sweep, cand)  # a dead holder's token goes pending; spawn next pass
+        return
     if sweep.now - sweep.pacing.get(sid, 0) < PACING_MS:
         return
     if sweep.dry_run:

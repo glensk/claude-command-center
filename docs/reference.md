@@ -2024,7 +2024,24 @@ finalizes stranded `accepted` transfers and retries pending close tokens of fina
 transfers (one closer spawn per source per 10 min); a kept `handoff:` close debt (signal
 sent, pane still open) is retried by closing the pane only. It never closes a tab by age, and
 a completed close is never re-armed, so a tab the user reopened stays open. `ccc daemon
---dry-run -v` shows `handoff_finalized=` / `handoff_closers=`.
+--dry-run -v` shows `handoff_finalized=` / `handoff_closers=` / `handoff_reclaimed=`.
+
+**A closer that died mid-close.** A close token claimed by a closer (or by the source's
+Stop chain) that was then killed — SIGKILL, a crash, a reboot — would otherwise stay "in
+flight" for good. Every claim therefore records who holds the token (`"pid:start"`) and
+since when. The daemon sweep puts such a token back to pending only when BOTH hold: it was
+claimed at least 20 minutes ago (`STALE_MS`, longer than any legitimate close), and no
+process ever registered as its holder or the recorded holder is provably gone (its pid is
+not in a readable `ps`, or the pid now belongs to another process). A live holder is never
+touched however long it runs, and an unreadable `ps` never counts as dead. A token from
+before this rule (no claim time) counts its age from the first pass that sees it. The
+reclaim keeps the token's binding, and the sweep spawns the closer on a later pass, paced as
+usual. The closer writes its close debt onto the token BEFORE it sends SIGTERM, so if it
+dies after the signal, the retry only closes the pane and never signals again. If it dies
+between the debt write and the signal, the retry refuses ("still running after SIGTERM — not
+re-signalled") and leaves the tab open, which is the safe direction. The 20-minute floor
+only decides when an existing in-flight token may be retried. It never closes a tab by age,
+and a completed close is never re-armed.
 
 **`handoff_hooks`** (config, default `[]`, inert): argv templates run by `accept`, no
 shell, 60 s timeout (process group killed), stdout ≤ 64 KB and a JSON object with `"ok":

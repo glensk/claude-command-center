@@ -337,7 +337,25 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
   ones (one closer spawn per source per 10 min); a kept `handoff:` close debt (signal sent,
   pane still open) is retried by closing the pane only. It never closes a tab by age and
   never re-arms a completed close, so a tab the user reopened stays open. `ccc daemon
-  --dry-run -v` shows `handoff_finalized=` / `handoff_closers=`.
+  --dry-run -v` shows `handoff_finalized=` / `handoff_closers=` / `handoff_reclaimed=`.
+- **A dead closer's in-flight token is reclaimed, a live one's never** (tp#1595). Every
+  claim records its holder's `"pid:start"` (`close_holder`) and the claim time
+  (`close_claimed_at`); the handoff closer probes its own identity BEFORE claiming and
+  refuses unclaimed when `ps` is unreadable, and the Stop chain's holderless claim is filled
+  in by the spawned `close-now` (`hold_close`). `restore_close`/`retire_close` from a
+  closer CAS on its holder. The sweep reclaims an in-flight token only when it is at least
+  `handoff_sweep.STALE_MS` (20 min) old AND holderless or its holder is provably dead
+  (`probe_identity` → `PID_GONE` or `OK` with another start, one `ps_table()` per pass); a
+  live holder (however old) and an unreadable `ps` are never stale, and a legacy token
+  without a claim time is first stamped "seen now" (`mark_in_flight_seen`). The reclaim
+  (`reclaim_stale_close`) CASes on exactly the values read, puts the token back PENDING and
+  KEEPS `close_bound`, so a `handoff:` debt stays a debt; it runs after the live/idle/debt
+  gate, spawns nothing (the pending branch does, paced, on a later pass) and writes nothing
+  under `--dry-run`. **The debt is written before the signal**: after the revalidation
+  the closer stores its `handoff:` debt on the still in-flight token (`bind_close_debt`,
+  holder CAS; a failed write refuses unsignalled), so a closer killed after SIGTERM leaves
+  a debt and the retry only closes the pane. The age floor only gates reverting an
+  existing token of a candidate the query already returns: no tab is ever closed by age.
 - **The capped-seat summary goes through `llm_custom_command`** (`CCC_LLM_PURPOSE=
   handoff-summary`, a `llmrouting.PURPOSES` row) — never a provider of ccc's own — and its
   text passes the same `handoff_doc.validate` (scrub fail-closed) as a model-written one.

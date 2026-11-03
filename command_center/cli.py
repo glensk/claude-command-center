@@ -5811,7 +5811,8 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         f"resume={int(report.resume_spawned)} temps_swept={report.temps_swept} "
         f"awaited={len(report.awaited)} "
         f"handoff_finalized={len(report.handoff_finalized)} "
-        f"handoff_closers={len(report.handoff_closers)}"
+        f"handoff_closers={len(report.handoff_closers)} "
+        f"handoff_reclaimed={len(report.handoff_reclaimed)}"
     )
     if report.panel_restart:
         print(f"{prefix}{report.panel_restart}")
@@ -5829,6 +5830,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
             ("short-aim", report.short_aimed),
             ("handoff-finalize", report.handoff_finalized),
             ("handoff-closer", report.handoff_closers),
+            ("handoff-reclaim", report.handoff_reclaimed),
         ):
             for session_id in ids:
                 print(f"  {label}: {session_id}")

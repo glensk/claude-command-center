@@ -74,9 +74,11 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
     temps_swept: int = 0  # orphaned usage temp files reclaimed; excluded from is_empty()
     panel_restart: str = ""  # stale panel server asked to re-exec (tp#70 S5b); routine
     # continue-session handoff sweep (tp#1582): transfers finalized (accepted → finalized),
-    # sources a token-scoped closer was spawned for, and "<transfer>: <why>" failures.
+    # sources a token-scoped closer was spawned for, sources whose dead closer's in-flight
+    # token went back pending (tp#1595), and "<transfer>: <why>" failures.
     handoff_finalized: list[str] = field(default_factory=list)
     handoff_closers: list[str] = field(default_factory=list)
+    handoff_reclaimed: list[str] = field(default_factory=list)
     handoff_errors: list[str] = field(default_factory=list)
 
     def is_empty(self) -> bool:
@@ -91,6 +93,7 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
             or self.awaited
             or self.handoff_finalized
             or self.handoff_closers
+            or self.handoff_reclaimed
             or self.handoff_errors
             or self.scored
             or self.short_aimed

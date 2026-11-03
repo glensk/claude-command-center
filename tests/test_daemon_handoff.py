@@ -6,11 +6,20 @@ itself never signals anything; state lives in the temp ``CCC_HOME`` of ``conftes
 
 from __future__ import annotations
 
+import argparse
 from typing import Any
 
 import pytest
 
-from command_center import cli, continue_session, daemon, handoff_sweep, spawn
+from command_center import (
+    cli,
+    continue_session,
+    daemon,
+    handoff_close,
+    handoff_sweep,
+    spawn,
+    terminal,
+)
 from command_center.daemon import DaemonReport, _run_handoff_finalize
 from command_center.models import LiveSession, now_ms
 from command_center.store import Store
@@ -377,14 +386,19 @@ def test_daemon_cli_prints_the_handoff_fields(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     report = DaemonReport(
-        handoff_finalized=["t1"], handoff_closers=["s1", "s2"], handoff_errors=["t9: boom"]
+        handoff_finalized=["t1"],
+        handoff_closers=["s1", "s2"],
+        handoff_reclaimed=["s3"],
+        handoff_errors=["t9: boom"],
     )
     monkeypatch.setattr(daemon, "run_once", lambda **_k: report)
     assert cli.main(["daemon", "-v"]) == 0
     out = capsys.readouterr()
-    assert "handoff_finalized=1 handoff_closers=2" in out.out
+    assert "handoff_finalized=1 handoff_closers=2 handoff_reclaimed=1" in out.out
     assert "  handoff-finalize: t1" in out.out and "  handoff-closer: s2" in out.out
+    assert "  handoff-reclaim: s3" in out.out
     assert "handoff sweep: t9: boom" in out.err
+    assert not DaemonReport(handoff_reclaimed=["s3"]).is_empty()
 
 
 def test_the_daemon_entry_point_never_raises_into_the_pass(
@@ -421,3 +435,311 @@ def test_run_once_runs_the_handoff_sweep_once_per_pass(
     assert len(calls) == 1
     snapshot, passed, dry = calls[0]
     assert isinstance(snapshot, dict) and passed is report and dry is dry_run
+
+
+# ------------------------------------------------------------------ dead-holder reclaim (tp#1595)
+
+STALE = handoff_sweep.STALE_MS
+HOLDER_PID = 777
+HOLDER_START = "Mon Nov  2 21:00:00 2026"
+HOLDER = f"{HOLDER_PID}:{HOLDER_START}"
+DEBT = 'handoff:{"pid": 4242, "start": "s", "tty": "ttys001"}'
+
+
+class _Ps:
+    """The stubbed ``ps``: a table (``{}`` = unreadable) and per-pid identities."""
+
+    def __init__(self) -> None:
+        self.table: dict[int, Any] = {1: object()}
+        self.idents: dict[int, terminal.Identity] = {}
+        self.reads = 0
+
+    def ps_table(self) -> dict[int, Any]:
+        self.reads += 1
+        return self.table
+
+    def probe(self, pid: int, table: dict[int, Any] | None = None) -> terminal.Identity:
+        assert table == self.table, "the sweep probes against its one shared ps table"
+        if not table:
+            return terminal.Identity(terminal.IDENTITY_PS_UNREADABLE)
+        return self.idents.get(pid, terminal.Identity(terminal.IDENTITY_PID_GONE))
+
+
+@pytest.fixture(name="ps")
+def _ps(monkeypatch: pytest.MonkeyPatch) -> _Ps:
+    stub = _Ps()
+    monkeypatch.setattr(terminal, "ps_table", stub.ps_table)
+    monkeypatch.setattr(terminal, "probe_identity", stub.probe)
+    return stub
+
+
+@pytest.fixture(name="clock")
+def _clock(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    clock = [now_ms()]
+    monkeypatch.setattr(handoff_sweep, "now_ms", lambda: clock[0])
+    return clock
+
+
+def _in_flight(sid: str = SRC, *, age: int, holder: str = HOLDER, bound: str = "") -> int:
+    """Put *sid*'s close token in flight, claimed *age* ms ago (``age < 0``: legacy, 0)."""
+    claimed_at = handoff_sweep.now_ms() - age if age >= 0 else 0  # the sweep's (stubbed) clock
+    _set_row(
+        sid,
+        close_requested_at=0,
+        close_claimed_at=claimed_at,
+        close_holder=holder,
+        close_bound=bound,
+    )
+    return claimed_at
+
+
+def _close_cols(sid: str = SRC) -> tuple[str, int, int, str, str]:
+    row = _row(sid)
+    return (
+        row.close_token,
+        row.close_requested_at,
+        row.close_claimed_at,
+        row.close_holder,
+        row.close_bound,
+    )
+
+
+@pytest.mark.parametrize("death", ["gone", "replaced"])
+def test_a_dead_holder_past_stale_is_reclaimed_and_closed_next_pass(
+    spawns: _Spawns, ps: _Ps, clock: list[int], death: str
+) -> None:
+    tid = _transfer("finalized")
+    token = _row().close_token
+    _in_flight(age=STALE, bound="4242:Mon Nov  2 20:00:00 2026")
+    if death == "replaced":  # the pid was recycled: same number, another start
+        ps.idents[HOLDER_PID] = terminal.Identity(terminal.IDENTITY_OK, start="Tue Nov  3")
+    report = _sweep()
+    assert report.handoff_reclaimed == [SRC]
+    assert not report.handoff_closers and not spawns.calls  # no spawn in the same pass
+    assert _close_cols() == (token, clock[0], 0, "", "4242:Mon Nov  2 20:00:00 2026")
+    assert ps.reads == 1
+    clock[0] += 60_000
+    nxt = _sweep()
+    assert nxt.handoff_closers == [SRC] and not nxt.handoff_reclaimed
+    assert spawns.calls == [_closer(tid)]
+
+
+@pytest.mark.parametrize("age", [STALE, 10 * STALE, 1000 * STALE])
+def test_a_live_holder_is_never_reclaimed_however_old(
+    spawns: _Spawns, ps: _Ps, clock: list[int], age: int
+) -> None:
+    del clock
+    _transfer("finalized")
+    ps.idents[HOLDER_PID] = terminal.Identity(terminal.IDENTITY_OK, start=HOLDER_START)
+    _in_flight(age=age)
+    before = _close_cols()
+    assert _sweep().is_empty()
+    assert _close_cols() == before and not spawns.calls
+
+
+@pytest.mark.parametrize("how", ["empty_table", "no_start"])
+def test_an_unreadable_ps_never_reclaims(
+    spawns: _Spawns, ps: _Ps, clock: list[int], how: str
+) -> None:
+    del clock
+    _transfer("finalized")
+    if how == "empty_table":
+        ps.table = {}
+    else:
+        ps.idents[HOLDER_PID] = terminal.Identity(terminal.IDENTITY_PS_UNREADABLE)
+    _in_flight(age=10 * STALE)
+    before = _close_cols()
+    assert _sweep().is_empty()
+    assert _close_cols() == before and not spawns.calls
+
+
+@pytest.mark.parametrize("holder", [HOLDER, "", "garbage", "abc:start", "12:"])
+def test_a_young_or_unparsable_holder_is_untouched(
+    spawns: _Spawns, ps: _Ps, clock: list[int], holder: str
+) -> None:
+    """Younger than STALE_MS: never; an unparsable holder (no code writes one): never."""
+    del clock
+    _transfer("finalized")
+    _in_flight(age=STALE - 60_000, holder=holder)
+    before = _close_cols()
+    assert _sweep().is_empty() and _close_cols() == before
+    if holder not in (HOLDER, ""):
+        _in_flight(age=10 * STALE, holder=holder)
+        before = _close_cols()
+        assert _sweep().is_empty() and _close_cols() == before
+    assert not spawns.calls and ps.reads == 0  # judged without a probe
+
+
+def test_a_holderless_token_past_stale_is_reclaimed_without_a_ps_read(
+    spawns: _Spawns, ps: _Ps, clock: list[int]
+) -> None:
+    """The Stop chain claimed, its ``close-now`` never registered: stale by age alone."""
+    _transfer("finalized")
+    token = _row().close_token
+    _in_flight(age=STALE, holder="")
+    assert _sweep().handoff_reclaimed == [SRC]
+    assert _close_cols() == (token, clock[0], 0, "", "")
+    assert ps.reads == 0 and not spawns.calls
+
+
+def test_a_legacy_token_is_stamped_first_seen_and_reclaimed_stale_ms_later(
+    spawns: _Spawns, ps: _Ps, clock: list[int]
+) -> None:
+    del ps
+    tid = _transfer("finalized")
+    token = _row().close_token
+    _in_flight(age=-1, holder="")  # claimed before the column existed: claim time 0
+    first = clock[0]
+    assert _sweep().is_empty()
+    assert _close_cols() == (token, 0, first, "", "")  # first seen now, still in flight
+    clock[0] = first + STALE - 1
+    assert _sweep().is_empty() and _close_cols() == (token, 0, first, "", "")
+    clock[0] = first + STALE
+    assert _sweep().handoff_reclaimed == [SRC]
+    assert _close_cols() == (token, clock[0], 0, "", "")
+    clock[0] += 1
+    assert _sweep().handoff_closers == [SRC] and spawns.calls == [_closer(tid)]
+
+
+def test_a_reclaimed_debt_with_the_source_gone_is_retried_pane_only(
+    spawns: _Spawns, ps: _Ps, clock: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A closer died after its SIGTERM (B2: debt on the row): reclaim keeps the debt, the
+    next pass spawns a closer that takes ``retry_terminal`` and never signals."""
+    del ps
+    tid = _transfer("finalized")
+    token = _row().close_token
+    _in_flight(age=STALE, bound=DEBT)
+    assert _sweep({}).handoff_reclaimed == [SRC]
+    assert _close_cols() == (token, clock[0], 0, "", DEBT)  # the debt survived byte-for-byte
+    clock[0] += 1
+    assert _sweep({}).handoff_closers == [SRC] and spawns.calls == [_closer(tid)]
+
+    retried: list[handoff_close.Debt] = []
+
+    def no_signal(*_a: object) -> Any:
+        raise AssertionError("a reclaimed debt must never be signalled again")
+
+    def retry(claim: handoff_close.Claim, debt: handoff_close.Debt) -> int:
+        retried.append(debt)
+        assert claim.holder == "555:Tue Nov  3 01:00:00 2026"
+        return 0
+
+    monkeypatch.setattr(handoff_close, "own_identity", lambda: "555:Tue Nov  3 01:00:00 2026")
+    monkeypatch.setattr(handoff_close, "close_source", no_signal)
+    monkeypatch.setattr(handoff_close, "retry_terminal", retry)
+    monkeypatch.setattr(cli, "_sigterm", no_signal)
+    args = argparse.Namespace(session=SRC, handoff_transfer=tid, iterm="", pid=0)
+    assert handoff_close.run(args) == 0
+    assert retried == [handoff_close.Debt.decode(DEBT)]
+
+
+def test_a_restore_between_the_query_and_the_reclaim_is_a_no_op(
+    spawns: _Spawns, ps: _Ps, clock: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del ps
+    _transfer("finalized")
+    token = _row().close_token
+    _in_flight(age=STALE)
+    with Store() as store:
+        stale = store.handoff_finalize_candidates()
+        assert store.restore_close(SRC, token, armed_at=12345, holder=HOLDER)  # the closer
+    monkeypatch.setattr(Store, "handoff_finalize_candidates", lambda _self: stale)
+    assert _sweep().is_empty()
+    assert _close_cols() == (token, 12345, 0, "", "")  # the closer's restore, untouched
+    assert clock[0] != 12345 and not spawns.calls
+
+
+def test_a_hold_between_the_read_and_the_reclaim_is_a_no_op(
+    spawns: _Spawns, ps: _Ps, clock: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Stop chain's ``close-now`` registers itself after the sweep read a holderless row."""
+    del ps, clock
+    _transfer("finalized")
+    token = _row().close_token
+    claimed_at = _in_flight(age=STALE, holder="")
+    with Store() as store:
+        stale = store.handoff_finalize_candidates()
+        assert store.hold_close(SRC, token, "555:Tue Nov  3 01:00:00 2026")
+    monkeypatch.setattr(Store, "handoff_finalize_candidates", lambda _self: stale)
+    assert _sweep().is_empty()
+    assert _close_cols() == (token, 0, claimed_at, "555:Tue Nov  3 01:00:00 2026", "")
+    assert not spawns.calls
+
+
+def test_a_token_retired_after_the_read_is_never_re_armed(
+    spawns: _Spawns, ps: _Ps, clock: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O10: a completed close (token retired) is never revived by the reclaim."""
+    del ps, clock
+    _transfer("finalized")
+    token = _row().close_token
+    _in_flight(age=STALE, holder="")
+    with Store() as store:
+        stale = store.handoff_finalize_candidates()
+        assert store.retire_close(SRC, token)
+    monkeypatch.setattr(Store, "handoff_finalize_candidates", lambda _self: stale)
+    assert _sweep().is_empty()
+    assert _close_cols() == ("", 0, 0, "", "") and not spawns.calls
+
+
+def test_a_capped_transfer_is_never_reclaimed(spawns: _Spawns, ps: _Ps, clock: list[int]) -> None:
+    del ps, clock
+    _transfer("finalized", capped=True)
+    _set_row(SRC, close_token="feedface")  # an unrelated arm on the capped source row
+    _in_flight(age=10 * STALE, holder="")
+    before = _close_cols()
+    assert _sweep().is_empty() and _close_cols() == before and not spawns.calls
+
+
+def test_dry_run_reports_a_reclaim_and_writes_nothing(
+    spawns: _Spawns, ps: _Ps, clock: list[int]
+) -> None:
+    del ps, clock
+    _transfer("finalized")
+    _transfer("finalized", src=SRC2, dst=DST2)
+    _in_flight(age=STALE, holder="")
+    _in_flight(SRC2, age=-1, holder="")  # legacy: not even the first-seen stamp
+    before = (_close_cols(), _close_cols(SRC2))
+    report = _sweep({**_live(), **_live(SRC2)}, dry_run=True)
+    assert report.handoff_reclaimed == [SRC] and not report.handoff_closers
+    assert (_close_cols(), _close_cols(SRC2)) == before and not spawns.calls
+
+
+@pytest.mark.parametrize("status", ["busy", "gone"])
+def test_a_busy_or_gone_source_without_debt_is_not_reclaimed_this_pass(
+    spawns: _Spawns, ps: _Ps, clock: list[int], status: str
+) -> None:
+    del clock
+    _transfer("finalized")
+    _in_flight(age=10 * STALE)  # dead holder (the stub ps does not list it)
+    before = _close_cols()
+    assert _sweep({} if status == "gone" else _live(status=status)).is_empty()
+    assert _close_cols() == before and not spawns.calls and ps.reads == 0
+
+
+def test_a_failing_reclaim_is_isolated_per_candidate(
+    spawns: _Spawns,
+    ps: _Ps,
+    clock: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    del ps, clock
+    broken = _transfer("finalized")
+    _transfer("finalized", src=SRC2, dst=DST2)
+    _in_flight(age=STALE, holder="")
+    _in_flight(SRC2, age=STALE, holder="")
+    real = Store.reclaim_stale_close
+
+    def flaky(self: Store, sid: str, token: str, **kw: Any) -> bool:
+        if sid == SRC:
+            raise RuntimeError("database is locked")
+        return real(self, sid, token, **kw)
+
+    monkeypatch.setattr(Store, "reclaim_stale_close", flaky)
+    report = _sweep({**_live(), **_live(SRC2)})
+    assert report.handoff_errors == [f"{broken}: RuntimeError: database is locked"]
+    assert report.handoff_reclaimed == [SRC2] and not spawns.calls
+    assert _row().close_requested_at == 0 and _row(SRC2).close_requested_at > 0
+    assert f"handoff {broken} failed" in capsys.readouterr().err
