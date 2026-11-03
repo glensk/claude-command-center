@@ -74,6 +74,7 @@ from .models import (
     Subgoal,
     aim_column_first,
     days_until_start,
+    effective_status,
     empty_track_tint,
     no_codex_conflict,
     now_ms,
@@ -2193,8 +2194,16 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
         and transcript is not None
         and transcript_turn_in_flight(transcript) is False
     )
+    # A ``shell`` status with no open turn is an idle session holding a background shell
+    # (tp#1662); unknown turn state (no transcript) keeps it busy.
+    turn_active = (
+        transcript_turn_in_flight(transcript)
+        if transcript is not None and (live.raw_status or "").strip().lower() == "shell"
+        else None
+    )
+    busy_status = effective_status(live.raw_status, turn_active)
     if (
-        live.raw_status in BUSY_RAW_STATUSES
+        busy_status in BUSY_RAW_STATUSES
         and not args.force
         and not busy_by_this_prompt
         and not adapter.is_halted(cwd, session_id)
@@ -2208,7 +2217,7 @@ def cmd_switch_account(args: argparse.Namespace) -> int:  # pylint: disable=too-
     if (
         gate_continue
         and not prompt
-        and live.raw_status in BUSY_RAW_STATUSES
+        and busy_status in BUSY_RAW_STATUSES
         and not busy_by_this_prompt
     ):
         # Only reachable with -f: a REAL turn was just cut off mid-work, which -K counts as

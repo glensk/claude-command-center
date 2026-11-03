@@ -987,6 +987,38 @@ def test_switch_account_now_refuses_a_busy_session_unless_it_is_rate_limit_halte
         assert "mid-turn" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(("turn_active", "allowed"), [(False, True), (True, False), (None, False)])
+def test_switch_account_now_shell_status_reads_the_turn(  # pylint: disable=too-many-positional-arguments
+    two_accounts: tuple[Path, Path],  # pylint: disable=redefined-outer-name
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    turn_active: bool | None,
+    allowed: bool,
+) -> None:
+    """tp#1667: ``shell`` with no open turn is idle; an open or unknown turn stays busy."""
+    private, _work = two_accounts
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with Store() as store:
+        store.ensure(SID, cwd=str(repo))
+        store.update_fields(SID, iterm_session_id=ITERM)
+    _prepare_arm(
+        monkeypatch,
+        two_accounts,
+        live=_live(str(repo), private, status="shell"),
+        inside=False,
+    )
+    monkeypatch.setattr(cli.ClaudeAdapter, "is_halted", lambda _self, _cwd, _sid: False)
+    monkeypatch.setattr(
+        "command_center.adapters.claude.transcript_turn_in_flight", lambda _path: turn_active
+    )
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder([]))
+    assert cli.main(["switch-account", "work", "-s", SID, "-N"]) == (0 if allowed else 1)
+    if not allowed:
+        assert "mid-turn" in capsys.readouterr().err
+
+
 # The state test behind `-K` (`/cwork-to-cpriv-cache-write-hit`): a switch must not turn an
 # idle session into a running one (2026-09-09): a long-idle session moved to the other seat
 # relaunched and started working, because the slash command hard-coded `-p`.
