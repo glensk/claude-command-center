@@ -50,7 +50,10 @@ ASK_TOOL = "AskUserQuestion"
 # Heading and `You` lines may be wrapped in one backtick pair (inline-code color, 2026-10-29).
 TODO_HEADING_RE = re.compile(r"^\s*#{1,6}\s*`?To-do list`?\s*$", re.IGNORECASE)
 HEADING_RE = re.compile(r"^\s*#{1,6}\s")
-TODO_DECISION_RE = re.compile(r"^\s*\d+\.\s+`?You \[decision\]:\s*(.+?)`?\s*$")
+#: A ``You [decision]:`` line: the same prefixes as :data:`TODO_ACTION_RE` (optional
+#: ``N.``/``N)`` number, optional ``-``/``*`` bullet, optional backticks), so bare,
+#: bulleted and numbered decision lines all count.
+TODO_DECISION_RE = re.compile(r"^\s*(?:\d+[.)]\s*)?(?:[-*]\s*)?`?You \[decision\]:\s*(.+?)`?\s*$")
 OPTION_MARKER_RE = re.compile(r"(?:(?<=\s)|^)([a-z])\)\s+")
 RECOMMENDED_RE = re.compile(r"\s*\(recommended\)", re.IGNORECASE)
 CONSEQUENCE_SPLIT_RE = re.compile(r"\s+(?:—|–|--?)\s+")

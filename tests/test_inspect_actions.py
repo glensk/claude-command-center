@@ -163,3 +163,36 @@ def test_backticked_heading_and_decision_line_parse() -> None:
     assert cb.todo_actions(reply) == [
         {"kind": "decision", "text": "A or B?", "tp_id": None, "brief_ref": "D9", "brief": None}
     ]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "You [decision]: Alpha or Beta?",
+        "`You [decision]: Alpha or Beta?`",
+        "1. You [decision]: Alpha or Beta?",
+        "2) You [decision]: Alpha or Beta?",
+        "3. `You [decision]: Alpha or Beta?`",
+        "- You [decision]: Alpha or Beta?",
+        "* `You [decision]: Alpha or Beta?`",
+        "4. - You [decision]: Alpha or Beta?",
+    ],
+)
+def test_todo_questions_accept_every_todo_action_prefix(line: str) -> None:
+    reply = f"## To-do list\n{line}\n"
+    questions = cb.todo_questions(reply)
+    assert [q.text for q in questions] == ["Alpha or Beta?"]
+    assert [o["label"] for o in questions[0].options] == ["Alpha", "Beta"]
+    assert [a["kind"] for a in cb.todo_actions(reply)] == ["decision"]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "You [sudo]: install the runner",
+        "1. Me, after 1: You [decision]: not a decision line",
+        "Note: You [decision]: inline, not a line prefix",
+    ],
+)
+def test_todo_questions_ignore_non_decision_lines(line: str) -> None:
+    assert not cb.todo_questions(f"## To-do list\n{line}\n")

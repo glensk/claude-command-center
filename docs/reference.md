@@ -3639,8 +3639,9 @@ Reads the session's transcript. `data`:
 `decision = {decision_id, source, questions: [{text, multi_select, options: [{label,
 consequence}]}], recommendation, recommendation_reason, context: {aim, ticket,
 recent_summary}}`. `source` is `ask_user_question` (a pending picker) or `todo_line` (only
-while idle: the `You [decision]:` lines of the last reply's `## To-do list`, options from
-`a)/b)` markers or an "X or Y" split, the recommendation from a `(Recommended)` marker or an
+while idle: the `You [decision]:` lines of the last reply's `## To-do list`, numbered (`1.` or
+`1)`), bulleted (`-`/`*`) or bare, backticked or not (the prefixes `actions[]` reads); options
+from `a)/b)` markers or an "X or Y" split, the recommendation from a `(Recommended)` marker or an
 "I recommend" sentence). `decision_id` is a sha256 over the anchor and the questions — pass it
 to `ccc answer`. `recent_summary` (≤ 800 characters) comes from the ccc LLM purpose
 `voice-brief` (10 s budget, cached per transcript size); `-N`, no router or a failed call fall
