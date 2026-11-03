@@ -4,6 +4,7 @@
 Kept dependency-free so the model layer is trivial to unit-test.
 """
 
+# pylint: disable=too-many-lines  # one cohesive model layer: records, enums, every formatting helper
 from __future__ import annotations
 
 if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
@@ -16,6 +17,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import json
 import re
 import time
@@ -1203,7 +1205,7 @@ def handoff_marker(session: Session) -> str:
     return f"⇢ {target[:8]:<8}" if target else ""
 
 
-def derive_status(
+def derive_status(  # pylint: disable=too-many-return-statements  # ordered precedence ladder, one return per rule
     live: LiveSession | None,
     stored: Session | None,
     halted: bool = False,
