@@ -1476,6 +1476,43 @@ def _close_now_hold(session_id: str, args: argparse.Namespace) -> tuple[str | No
     return (own if held else None), False
 
 
+def _close_now_hand_back(
+    store: Store,
+    session_id: str,
+    args: argparse.Namespace,
+    verified: str,
+    holder: str | None,
+) -> bool:
+    """Hand a refused Stop-chain claim of a HANDOFF token back pending — ``True`` when it did.
+
+    The caller checked that the row's transfer licenses the close
+    (:func:`command_center.handoff_close.keeps_close_token`): the token belongs to the
+    daemon sweep, which spawns the handoff closer (tp#1595 B4). No TTL, bound to the
+    *verified* ``"pid:start"`` (else unbound), and a compare-and-swap on the SAME in-flight
+    token held by us — or still holderless when our hold did not happen — so a token
+    another closer took meanwhile is left alone.
+    """
+    token = str(getattr(args, "token", "") or "")
+    if not token:
+        return False
+    restored = store.restore_close(
+        session_id,
+        armed_at=int(getattr(args, "armed_at", 0) or 0),
+        token=token,
+        bound=verified,
+        now=now_ms(),
+        ttl_ms=0,
+        holder=holder if holder is not None else "",
+    )
+    if restored:
+        from . import hooks
+
+        hooks._log_event(  # pylint: disable=protected-access
+            session_id, "close-now", "handoff token handed back pending for the handoff closer"
+        )
+    return restored
+
+
 def _close_now_settle_arm(
     session_id: str,
     args: argparse.Namespace,
@@ -1492,6 +1529,12 @@ def _close_now_settle_arm(
     neither the arm is retired — an unbound restore could close a relaunched process.
     With a *holder* (our :func:`_close_now_hold` succeeded) both CASes also require the
     row to still name it, so a token reclaimed and re-claimed meanwhile is left alone.
+
+    A refusal on a handed-off row whose transfer licenses the close
+    (:func:`command_center.handoff_close.keeps_close_token`) never retires: whatever the
+    cause, the token goes back pending without a TTL (bound to the verified ``"pid:start"``
+    or unbound), for the daemon sweep's handoff closer (tp#1595 B4). Only an EXISTING
+    in-flight token is handed back — nothing is minted or re-armed.
     """
     from .hooks import CLOSE_REQUEST_TTL_MS
 
@@ -1515,6 +1558,14 @@ def _close_now_settle_arm(
                     holder=holder,
                 ):
                     return armed_at + CLOSE_REQUEST_TTL_MS
+            if cause:
+                from . import handoff_close
+
+                if handoff_close.keeps_close_token(store, session_id):
+                    # A handoff token is never retired by a refusal: handed back, or (a
+                    # lost CAS: another holder took it) left alone.
+                    _close_now_hand_back(store, session_id, args, verified, holder)
+                    return 0
             store.retire_close(session_id, token, holder=holder)
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         pass
@@ -1529,7 +1580,9 @@ def cmd_close_now(args: argparse.Namespace) -> int:
     ``ps`` unreadable) hands it back via :meth:`Store.restore_close`, bound to the verified
     ``"pid:start"`` and to the arm's ``--token``, so the SAME process's next Stop retries
     with every check below — within the original TTL, never extended. Every other refusal
-    (no pid, pid gone or replaced) and every success retires it (:func:`_close_now_settle_arm`).
+    (no pid, pid gone or replaced) and every success retires it (:func:`_close_now_settle_arm`)
+    — except that a refusal never retires a handed-off source's handoff token: it goes back
+    pending for the daemon sweep's handoff closer (tp#1595).
 
     Claude Code runs every hook of one event in PARALLEL, so nothing here can be
     ordered "after the auto-commit": this command WAITS for the session's Stop-hook chain to

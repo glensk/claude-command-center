@@ -1893,6 +1893,123 @@ def test_close_now_success_retires_the_token(
     assert _arm_row() == (0, "", "")
 
 
+# ---- close-now: a refusal never retires a handoff token (tp#1595 B4) --------
+_EXPIRED_MS = 11 * 60 * 1000  # older than the 10-min Stop-chain TTL
+
+
+def _handoff_lineage(state: str = "finalized", *, capped: bool = False) -> None:
+    """s1 handed off to s2 through a transfer driven to *state* (``""`` = no transfer)."""
+    from command_center.transfer_store import ACCEPTED, FINALIZED, OPENED, Transfer
+
+    with Store() as store:
+        store.ensure("s1", cwd="/repo")
+        store.ensure("s2", cwd="/repo")
+        if state:
+            tid = "t1595b4"
+            store.create_transfer(
+                Transfer(transfer_id=tid, source_session="s1", target_session="s2", capped=capped),
+                1,
+            )
+            assert store.transition_transfer(tid, OPENED, 2)
+            assert store.transition_transfer(tid, ACCEPTED, 3)
+            if state == FINALIZED:
+                assert store.transition_transfer(tid, FINALIZED, 4)
+        store.set_handoff_lineage("s1", "s2", 5)
+
+
+def _expired_claim() -> CloseClaim:
+    """A close arm the Stop chain claimed more than the TTL ago (no TTL restore possible)."""
+    from command_center.models import now_ms
+
+    old = now_ms() - _EXPIRED_MS
+    with Store() as store:
+        store.ensure("s1", cwd="/repo")
+        store.arm_close("s1", old)
+        kind, claim = store.claim_after_turn("s1", old, 600_000)
+    assert kind == "close" and isinstance(claim, CloseClaim)
+    return claim
+
+
+@pytest.mark.parametrize(
+    ("case", "bound"),
+    [
+        ("hooks_running", _CLOSE_BOUND),
+        ("no_pid", ""),
+        ("pid_replaced", _CLOSE_BOUND),
+        ("pid_gone", _CLOSE_BOUND),
+    ],
+)
+def test_close_now_refusal_hands_a_handoff_token_back_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str, bound: str
+) -> None:
+    """TTL-expired HOOKS_RUNNING, NO_PID, PID_REPLACED, PID_GONE → pending, never retired."""
+    _setup_close(tmp_path, monkeypatch)
+    _handoff_lineage()
+    if case == "hooks_running":
+        _stub_wait(monkeypatch, "running")
+    elif case == "no_pid":
+        monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [])
+    else:
+        _stub_wait(monkeypatch, "unknown", case)
+    killed, closed = _no_tab_effects(monkeypatch)
+    claim = _expired_claim()
+    assert cli.cmd_close_now(_close_args(claim, pid=0 if case == "no_pid" else _CLOSE_PID)) == 1
+    assert not killed and not closed
+    assert _arm_row() == (claim.armed_at, claim.token, bound)  # pending, no new stamp
+    assert _holder_row() == (0, "")
+    log = (tmp_path / "command-center" / "events.log").read_text(encoding="utf-8")
+    assert "handed back pending for the handoff closer" in log
+
+
+@pytest.mark.parametrize(
+    ("state", "capped"),
+    [("finalized", True), ("accepted", False), ("", False)],
+    ids=["capped", "not_finalized", "no_transfer"],
+)
+def test_close_now_refusal_without_a_licensed_handoff_still_retires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str, capped: bool
+) -> None:
+    """A capped transfer, an unfinalized one or none at all: retired exactly as before."""
+    _setup_close(tmp_path, monkeypatch)
+    _handoff_lineage(state, capped=capped)
+    _stub_wait(monkeypatch, "unknown", cli.CLOSE_PID_GONE)
+    killed, _closed = _no_tab_effects(monkeypatch)
+    claim = _expired_claim()
+    assert cli.cmd_close_now(_close_args(claim)) == 1
+    assert not killed
+    assert _arm_row() == (0, "", "")
+
+
+def test_close_now_success_on_a_handoff_row_still_retires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SIGTERM went out: the handoff token is spent like any other."""
+    _setup_close(tmp_path, monkeypatch)
+    _handoff_lineage()
+    killed, closed = _no_tab_effects(monkeypatch)
+    claim = _expired_claim()
+    assert cli.cmd_close_now(_close_args(claim)) == 0
+    assert killed and closed == ["w0t1p0:FRESH"]
+    assert _arm_row() == (0, "", "")
+
+
+def test_close_now_refusal_never_retires_a_handoff_token_another_holder_took(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Our hold lost (another closer holds it): the refusal neither restores nor retires."""
+    _setup_close(tmp_path, monkeypatch)
+    _handoff_lineage()
+    other = "9999:Tue Sep  2 23:30:00 2026"
+    claim = _expired_claim()
+    with Store() as store:
+        assert store.hold_close("s1", claim.token, other)
+    monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [])
+    _no_tab_effects(monkeypatch)
+    assert cli.cmd_close_now(_close_args(claim, pid=0)) == 1
+    assert _arm_row() == (0, claim.token, "")
+    assert _holder_row()[1] == other
+
+
 @pytest.mark.parametrize(
     ("kind", "cause"),
     [

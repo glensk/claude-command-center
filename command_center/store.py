@@ -93,6 +93,13 @@ def _llm_or_default(value: str | None) -> str:
 # Normalize a sub-goal's text for tick-carryover matching (case/space/punctuation-insensitive).
 _NORM_RE = re.compile(r"[^a-z0-9]+")
 
+#: The close-arm columns ``claim_after_turn``'s clearing branches reset (SET-list prefix);
+#: skipped on a handed-off row, whose close token belongs to the daemon sweep (tp#1595).
+_CLOSE_CLEAR = (
+    "close_requested_at = 0, close_token = '', "
+    "close_bound = '', close_claimed_at = 0, close_holder = '', "
+)
+
 
 def _holder_clause(holder: str | None) -> tuple[str, tuple[str, ...]]:
     """The optional ``AND close_holder = ?`` of a holder-checked close CAS (tp#1595)."""
@@ -1559,7 +1566,9 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         the account the resumed session is EXPECTED to start under (consumed by
         :meth:`pop_switch_expectation`); every other outcome clears all switch AND close
         state. Stamps older than *ttl_ms* are cleared without being claimed, so a stale arm
-        can never fire in a later, unrelated turn.
+        can never fire in a later, unrelated turn. Exception: on a row with
+        ``handed_off_to`` set the close arm is never cleared (a pending, in-flight or debt
+        handoff token belongs to the daemon sweep, tp#1595); a fresh one is still claimed.
         """
         threshold = now - ttl_ms
         if self.conn.in_transaction:
@@ -1568,13 +1577,17 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         try:
             row = self.conn.execute(
                 "SELECT close_requested_at, switch_requested_at, switch_config_dir, "
-                "switch_force, no_codex, cwd, switch_prompt, close_token, close_bound "
-                "FROM sessions WHERE session_id = ?",
+                "switch_force, no_codex, cwd, switch_prompt, close_token, close_bound, "
+                "handed_off_to FROM sessions WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
             if row is None:
                 self.conn.commit()
                 return "", None
+            # A handed-off row's close token belongs to the daemon sweep (tp#1595 B4): the
+            # clearing branches leave the whole close arm alone (stamp, token, binding,
+            # holder, claim time) — only the switch state is cleared.
+            close_clear = "" if row[9] else _CLOSE_CLEAR
             close_at, switch_at = int(row[0] or 0), int(row[1] or 0)
             target = str(row[2] or "")
             kind: str = ""
@@ -1595,8 +1608,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
                 )
             if kind == "switch":
                 self.conn.execute(
-                    "UPDATE sessions SET close_requested_at = 0, close_token = '', "
-                    "close_bound = '', close_claimed_at = 0, close_holder = '', "
+                    f"UPDATE sessions SET {close_clear}"  # noqa: S608 - fixed column names
                     "switch_requested_at = 0, switch_force = 0, "
                     "switch_prompt = '' WHERE session_id = ?",
                     (session_id,),
@@ -1614,8 +1626,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
                 )
             else:
                 self.conn.execute(
-                    "UPDATE sessions SET close_requested_at = 0, close_token = '', "
-                    "close_bound = '', close_claimed_at = 0, close_holder = '', "
+                    f"UPDATE sessions SET {close_clear}"  # noqa: S608 - fixed column names
                     "switch_requested_at = 0, switch_config_dir = '', "
                     "switch_force = 0, switch_prompt = '' WHERE session_id = ?",
                     (session_id,),

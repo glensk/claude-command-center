@@ -740,14 +740,18 @@ def _fire_close_claim(store: Store, sid: str, claim: CloseClaim) -> None:
     A RESTORED arm (``claim.bound`` set) fires only in the process it was bound to: a
     mismatch or an unreadable probe retires it without spawning. A fresh arm spawns with
     its identity; when the spawn itself fails the arm is handed back (same compare-and-swap
-    as ``close-now``'s restore), bound to this process when it can be identified.
+    as ``close-now``'s restore), bound to this process when it can be identified. A
+    HANDOFF token (a debt never matches a process) is handed back instead of retired
+    (:func:`command_center.handoff_close.hand_back_stop_claim`, tp#1595 B4).
     """
-    from . import spawn  # lazy, like _maybe_grade_after_turn
+    from . import handoff_close, spawn  # lazy, like _maybe_grade_after_turn
 
     pid = os.environ.get("CLAUDE_PID", "").strip()
+    keep = handoff_close.hand_back_stop_claim
     if claim.bound and _own_identity(pid) != claim.bound:
-        store.retire_close(sid, claim.token)
-        _log_event(sid, "close-now", "close-now bound to another process — dropped")
+        if not keep(store, sid, claim.token, claim.armed_at, claim.bound):
+            store.retire_close(sid, claim.token)
+            _log_event(sid, "close-now", "close-now bound to another process — dropped")
         return
     args = ["close-now", "--session", sid, "--iterm", os.environ.get("ITERM_SESSION_ID", "")]
     if pid.isdigit():
@@ -767,6 +771,8 @@ def _fire_close_claim(store: Store, sid: str, claim: CloseClaim) -> None:
         now=now_ms(),
         ttl_ms=CLOSE_REQUEST_TTL_MS,
     )
+    if not restored and keep(store, sid, claim.token, claim.armed_at, claim.bound):
+        return
     if not restored:
         store.retire_close(sid, claim.token)
     _log_event(

@@ -496,6 +496,24 @@ class TransferStoreMixin:
         ]
         return sorted(found, key=lambda c: c.transfer_id)  # stable order, no ORDER BY scan
 
+    def lineage_transfer_id(self, source_session: str) -> str:
+        """Id of the transfer to *source_session*'s recorded successor (``""`` = none).
+
+        The transfer whose source is *source_session* and whose target is the row's
+        ``handed_off_to`` — a finalized one first, then the newest. Only a lookup: the
+        caller still judges it (``handoff_close.lineage_refusal``). Indexed: the session
+        primary key, then the target index.
+        """
+        row = self.conn.execute(
+            "SELECT t.transfer_id FROM sessions s "
+            "CROSS JOIN transfers t ON t.target_session = s.handed_off_to "
+            "AND t.source_session = s.session_id "
+            "WHERE s.session_id = ? AND COALESCE(s.handed_off_to, '') != '' "
+            "ORDER BY (t.state = 'finalized') DESC, t.created_at DESC, t.transfer_id LIMIT 1",
+            (source_session,),
+        ).fetchone()
+        return str(row[0]) if row is not None else ""
+
     def set_handoff_lineage(self, source: str, target: str, now: int) -> None:
         """Mark *source* handed off to *target* (status ``handed_off``) and *target*'s origin.
 

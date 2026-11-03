@@ -2043,6 +2043,15 @@ re-signalled") and leaves the tab open, which is the safe direction. The 20-minu
 only decides when an existing in-flight token may be retried. It never closes a tab by age,
 and a completed close is never re-armed.
 
+**The source's own Stop chain hands a handoff token back.** A close token on a handed-off
+source belongs to the daemon sweep. A Stop on that source never clears it, and when the
+source's own close-after-turn path claims it and then refuses (hooks still running, no pid,
+a replaced process, a binding to an older process, a close debt, a failed spawn), it puts
+the same token back to pending instead of dropping it, close debt included. The sweep's
+closer then retries. This applies only while the source's transfer is finalized, not
+capped, and still names the successor. A capped handoff, or an ordinary `mark-done --close`
+on a session that was never handed off, behaves as before.
+
 **`handoff_hooks`** (config, default `[]`, inert): argv templates run by `accept`, no
 shell, 60 s timeout (process group killed), stdout ≤ 64 KB and a JSON object with `"ok":
 true` (`"next_steps"` printed); placeholders `{old}`, `{new}`, `{label}`, `{transfer}`.

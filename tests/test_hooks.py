@@ -599,6 +599,129 @@ def test_release_locks_restores_the_arm_when_the_spawn_fails(
     assert "close-now spawn failed — re-armed" in log
 
 
+# ---- the Stop chain never destroys a handoff token (tp#1595 B4) -------------
+_DEBT = 'handoff:{"iterm": "", "pane": "%7", "pid": 8123, "start": "x", "tty": "ttys009"}'
+
+
+def _handoff(store: Store, state: str = "finalized", *, capped: bool = False) -> None:
+    """s1 handed off to s2 through a transfer driven to *state*."""
+    from command_center.transfer_store import ACCEPTED, FINALIZED, OPENED, Transfer
+
+    store.ensure("s1", cwd="/repo")
+    store.ensure("s2", cwd="/repo")
+    store.create_transfer(
+        Transfer(transfer_id="t1595", source_session="s1", target_session="s2", capped=capped), 1
+    )
+    assert store.transition_transfer("t1595", OPENED, 2)
+    assert store.transition_transfer("t1595", ACCEPTED, 3)
+    if state == FINALIZED:
+        assert store.transition_transfer("t1595", FINALIZED, 4)
+    store.set_handoff_lineage("s1", "s2", 5)
+
+
+def _close_cols(store: Store) -> tuple[int, str, str, int, str]:
+    row = store.get("s1")
+    assert row is not None
+    return (
+        row.close_requested_at,
+        row.close_token,
+        row.close_bound,
+        row.close_claimed_at,
+        row.close_holder,
+    )
+
+
+def _pending_with_bound(store: Store, bound: str) -> tuple[int, str]:
+    """A fresh pending arm on s1 whose row carries *bound* (a debt or a binding)."""
+    from command_center.models import now_ms
+
+    armed_at = now_ms()
+    token = store.arm_close("s1", armed_at)
+    store.conn.execute("UPDATE sessions SET close_bound = ? WHERE session_id = 's1'", (bound,))
+    store.conn.commit()
+    return armed_at, token
+
+
+@pytest.mark.usefixtures("home")
+@pytest.mark.parametrize("bound", [_DEBT, f"8123:{_START}"], ids=["debt", "binding"])
+def test_release_locks_hands_a_handoff_token_back_instead_of_retiring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bound: str
+) -> None:
+    """A debt (never this process) or a stale binding on a licensed handoff → pending, intact."""
+    monkeypatch.setenv("CLAUDE_PID", "8123")
+    _stub_identity(monkeypatch, "Wed Sep  3 07:00:00 2026")  # a relaunched process
+    store = Store()
+    _handoff(store)
+    armed_at, token = _pending_with_bound(store, bound)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+    assert not calls
+    assert _close_cols(store) == (armed_at, token, bound, 0, "")
+    log = (tmp_path / "command-center" / "events.log").read_text(encoding="utf-8")
+    assert "handed back to the daemon sweep" in log and "dropped" not in log
+
+
+@pytest.mark.parametrize(
+    ("state", "capped"), [("finalized", True), ("accepted", False)], ids=["capped", "accepted"]
+)
+@pytest.mark.usefixtures("home")
+def test_release_locks_still_retires_a_debt_without_a_licensed_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str, capped: bool
+) -> None:
+    """A capped or unfinalized transfer: the mismatched arm is dropped exactly as before."""
+    monkeypatch.setenv("CLAUDE_PID", "8123")
+    _stub_identity(monkeypatch, _START)
+    store = Store()
+    _handoff(store, state, capped=capped)
+    _pending_with_bound(store, _DEBT)
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder([]))
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+    assert _close_cols(store)[:3] == (0, "", "")
+    log = (tmp_path / "command-center" / "events.log").read_text(encoding="utf-8")
+    assert "bound to another process — dropped" in log
+
+
+@pytest.mark.usefixtures("home")
+def test_release_locks_failed_spawn_hands_an_unbindable_handoff_token_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spawn failed and no identity to bind: a handoff token goes back pending, unbound."""
+    monkeypatch.setenv("CLAUDE_PID", "8123")
+    _stub_identity(monkeypatch, "")  # unreadable start: no binding for a TTL restore
+    store = Store()
+    _handoff(store)
+    armed_at, token = _pending_with_bound(store, "")
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", lambda _args: False)
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+    assert _close_cols(store) == (armed_at, token, "", 0, "")
+
+
+@pytest.mark.usefixtures("home")
+@pytest.mark.parametrize("held", ["in_flight", "stale_pending"])
+def test_release_locks_leaves_a_handed_off_rows_token_alone(
+    monkeypatch: pytest.MonkeyPatch, held: str
+) -> None:
+    """An in-flight or TTL-expired pending handoff token is the daemon sweep's: untouched."""
+    from command_center.models import now_ms
+
+    monkeypatch.setenv("CLAUDE_PID", "8123")
+    store = Store()
+    _handoff(store)
+    old = now_ms() - hooks.CLOSE_REQUEST_TTL_MS - 60_000
+    token = store.arm_close("s1", old)
+    store.conn.execute("UPDATE sessions SET close_bound = ? WHERE session_id = 's1'", (_DEBT,))
+    store.conn.commit()
+    if held == "in_flight":
+        assert store.claim_close("s1", token, "777:Mon")
+    before = _close_cols(store)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+    assert not calls
+    assert _close_cols(store) == before
+
+
 @pytest.mark.parametrize(
     ("source", "keeps"),
     [

@@ -1248,6 +1248,67 @@ def test_close_arm_is_claimed_once_with_its_token(tmp_path: Path) -> None:
     store.close()
 
 
+def _close_state(store: Store) -> tuple[int, str, str, int, str]:
+    row = store.conn.execute(
+        "SELECT close_requested_at, close_token, close_bound, close_claimed_at, close_holder "
+        "FROM sessions WHERE session_id = 's1'"
+    ).fetchone()
+    return int(row[0]), str(row[1]), str(row[2]), int(row[3]), str(row[4])
+
+
+@pytest.mark.parametrize("held", ["in_flight", "stale_pending", "switch"])
+def test_claim_after_turn_leaves_a_handed_off_rows_close_arm_alone(
+    tmp_path: Path, held: str
+) -> None:
+    """tp#1595 B4: on a handed-off row the clearing branches never touch the close arm."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    store.update_fields("s1", handed_off_to="s2")
+    token = store.arm_close("s1", 1_000_000)
+    store.conn.execute("UPDATE sessions SET close_bound = 'handoff:{}' WHERE session_id = 's1'")
+    store.conn.commit()
+    if held == "in_flight":
+        assert store.claim_close("s1", token, _BOUND)
+    if held == "switch":
+        store.update_fields("s1", switch_requested_at=5_000_000, switch_config_dir="/acct")
+    before = _close_state(store)
+    kind, _claim = store.claim_after_turn("s1", 5_000_000, _TTL)
+    assert kind == ("switch" if held == "switch" else "")
+    assert _close_state(store) == before
+    got = store.get("s1")
+    assert got is not None and got.switch_requested_at == 0
+    store.close()
+
+
+@pytest.mark.parametrize("held", ["in_flight", "stale_pending", "switch"])
+def test_claim_after_turn_still_clears_a_plain_rows_close_arm(tmp_path: Path, held: str) -> None:
+    """Without handed_off_to the clearing branches reset the whole close arm, as before."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    token = store.arm_close("s1", 1_000_000)
+    store.conn.execute("UPDATE sessions SET close_bound = 'x' WHERE session_id = 's1'")
+    store.conn.commit()
+    if held == "in_flight":
+        assert store.claim_close("s1", token, _BOUND)
+    if held == "switch":
+        store.update_fields("s1", switch_requested_at=5_000_000, switch_config_dir="/acct")
+    store.claim_after_turn("s1", 5_000_000, _TTL)
+    assert _close_state(store) == (0, "", "", 0, "")
+    store.close()
+
+
+def test_claim_after_turn_still_claims_a_fresh_handoff_token(tmp_path: Path) -> None:
+    """A pending handoff token inside the TTL is claimed (B4 restores, never retires, it)."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    store.update_fields("s1", handed_off_to="s2")
+    token = store.arm_close("s1", 1_000_000)
+    claim = _claim_close(store, 1_000_000)
+    assert claim.token == token
+    assert _close_state(store)[:2] == (0, token)
+    store.close()
+
+
 def test_restored_close_arm_is_claimed_again_bound_to_its_process(tmp_path: Path) -> None:
     """A transient refusal hands the arm back: the next Stop claims it with its binding."""
     store = _store(tmp_path)

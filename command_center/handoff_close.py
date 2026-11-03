@@ -152,6 +152,47 @@ def lineage_refusal(store: Store, transfer_id: str, session_id: str) -> str:
     return ""
 
 
+def keeps_close_token(store: Store, session_id: str) -> bool:
+    """``True`` when *session_id*'s close token belongs to its handoff (tp#1595 B4).
+
+    The row's recorded successor has a transfer that passes :func:`lineage_refusal`
+    (finalized, not capped, ``handed_off_to`` = its target). A Stop-chain refusal on such a
+    row hands the in-flight token back pending (no TTL) instead of retiring it, so the
+    daemon sweep's handoff closer can still close the source. A capped transfer, a
+    transfer not finalized, or a row that is not handed off (a user's own ``mark-done
+    --close`` arm) answers ``False`` and retires as before. Never raises (``False`` on
+    any error).
+    """
+    try:
+        transfer_id = store.lineage_transfer_id(session_id)
+        return bool(transfer_id) and lineage_refusal(store, transfer_id, session_id) == ""
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return False
+
+
+def hand_back_stop_claim(store: Store, sid: str, token: str, armed_at: int, bound: str) -> bool:
+    """The Stop hook's hand-back of a HANDOFF token — ``True`` = not the hook's to retire.
+
+    ``False`` (the hook retires as before) unless :func:`keeps_close_token`. Then the SAME
+    in-flight, still holderless *token* goes back pending with no TTL and *bound* kept
+    byte-for-byte (a ``handoff:`` debt stays a debt), for the daemon sweep's closer; a
+    lost compare-and-swap leaves the row alone, never retired (tp#1595 B4). Never raises.
+    """
+    from . import hooks
+    from .models import now_ms
+
+    if not token or not keeps_close_token(store, sid):
+        return False
+    restored = store.restore_close(
+        sid, armed_at=armed_at, token=token, bound=bound, now=now_ms(), holder=""
+    )
+    verdict = "handed back to" if restored else "left for"
+    hooks._log_event(  # pylint: disable=protected-access
+        sid, "close-now", f"handoff close token {verdict} the daemon sweep"
+    )
+    return True
+
+
 def _live_entry(adapter: ClaudeAdapter, session_id: str) -> LiveSession:
     """The ONE live registry entry of *session_id*; :class:`Refused` for 0, >1 or unreadable."""
     try:

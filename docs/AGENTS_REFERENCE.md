@@ -356,6 +356,19 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
   holder CAS; a failed write refuses unsignalled), so a closer killed after SIGTERM leaves
   a debt and the retry only closes the pane. The age floor only gates reverting an
   existing token of a candidate the query already returns: no tab is ever closed by age.
+- **The Stop chain never destroys a handoff token** (tp#1595 B4). Close tokens on a
+  handed-off row belong to the daemon sweep. `claim_after_turn`'s clearing branches leave the
+  whole close arm (stamp, token, `close_bound`, holder, claim time) alone when
+  `handed_off_to` is set; a fresh pending token is still claimed. When the row's transfer
+  passes `handoff_close.lineage_refusal` (`keeps_close_token`, via
+  `lineage_transfer_id`: finalized, not capped, `handed_off_to` = its target), every
+  refusal of the generic `close-now` (any cause, also a TTL-expired transient one) and the
+  hook's binding-mismatch or failed-spawn path hand the SAME in-flight token back pending
+  with no TTL (`restore_close(ttl_ms=0)`, holder CAS; a `handoff:` debt is kept
+  byte-for-byte), never `retire_close`; a lost CAS leaves the row alone. A capped
+  transfer, an unfinalized one or a row that is not handed off retires exactly as before;
+  a successful SIGTERM still retires. Nothing is minted, and a retired token is never
+  re-armed.
 - **The capped-seat summary goes through `llm_custom_command`** (`CCC_LLM_PURPOSE=
   handoff-summary`, a `llmrouting.PURPOSES` row) — never a provider of ccc's own — and its
   text passes the same `handoff_doc.validate` (scrub fail-closed) as a model-written one.
