@@ -266,6 +266,62 @@ def test_free_brief_in_the_final_part_reaches_the_inspection() -> None:
     assert [a["brief"] for a in ins.actions] == [BRIEF]
 
 
+#: tp#1635 B10: the B8 live shape — a bare brief plus a numbered ``## Decision briefs``
+#: entry in one turn, each with its own ``You [decision]`` line.
+MIXED_SECTION = """\
+## Decision briefs
+
+**D1 Release timing**
+Background: the migration touches stored data.
+Recommendation: wait for the second review."""
+
+MIXED_TODO = """\
+## To-do list
+1. `You [decision]: Alpha (1, recommended), Beta (2), or Gamma (3) for tp#42`
+2. `You [decision]: Delta (1, recommended), Epsilon (2), or Zeta (3) for tp#42 (brief D1)`
+"""
+
+
+def test_bare_and_numbered_brief_in_one_turn_both_reach_their_cards() -> None:
+    reply = f"Done.\n\n{BRIEF}\n\n{MIXED_SECTION}\n\n{MIXED_TODO}"
+    ins = cb.inspect([user("go"), *turn_end(reply)])
+    got = [(a["brief_ref"], a["brief"]) for a in ins.actions]
+    assert got == [(None, BRIEF), ("D1", got[1][1])]
+    assert got[1][1].startswith("**D1 Release timing**")
+
+
+def test_lone_free_brief_skips_a_line_with_a_dangling_ref() -> None:
+    reply = (
+        f"{BRIEF}\n\n{MIXED_SECTION}\n\n{MIXED_TODO}3. You [decision]: Eta or Theta? (brief D9)\n"
+    )
+    got = [(a["brief_ref"], a["brief"]) for a in cb.todo_actions(reply)]
+    assert got[0] == (None, BRIEF) and got[2] == ("D9", None)
+
+
+def test_lone_free_brief_next_to_titled_briefs_fills_the_one_bare_line() -> None:
+    q1 = "**Decision brief (Q1)**\nBackground: one."
+    reply = (
+        f"{q1}\n\n{BRIEF}\n\n## To-do list\n"
+        "1. You [decision]: Alpha or Beta?\n2. You [decision]: Gamma or Delta?\n"
+    )
+    assert [a["brief"] for a in cb.todo_actions(reply)] == [q1, BRIEF]
+
+
+def test_two_free_briefs_and_one_bare_line_next_to_a_numbered_one_guess_nothing() -> None:
+    second = "**Decision brief**\nBackground: another."
+    reply = f"{BRIEF}\n\n{second}\n\n{MIXED_SECTION}\n\n{MIXED_TODO}"
+    got = [(a["brief_ref"], a["brief"]) for a in cb.todo_actions(reply)]
+    assert got[0] == (None, None)
+    assert got[1][0] == "D1" and got[1][1].startswith("**D1 Release timing**")
+
+
+def test_one_free_brief_and_two_bare_lines_next_to_a_numbered_one_guess_nothing() -> None:
+    reply = f"{BRIEF}\n\n{MIXED_SECTION}\n\n{MIXED_TODO}3. You [decision]: Eta or Theta?\n"
+    got = [(a["brief_ref"], a["brief"]) for a in cb.todo_actions(reply)]
+    assert got[0] == (None, None) and got[2] == (None, None)
+    assert got[1][1].startswith("**D1 Release timing**")
+
+
 def test_paragraph_brief_keeps_all_seven_fields() -> None:
     brief = (
         "**Decision brief**\n"

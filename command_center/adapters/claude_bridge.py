@@ -881,24 +881,36 @@ def decision_brief(text: str) -> str | None:
     return blocks[-1][1] if blocks else None
 
 
-def free_briefs(text: str, count: int) -> list[str | None]:
-    """The free ``**Decision brief**`` block of each of *count* decision lines, in order.
+def pair_free_briefs(text: str, decisions: list[dict[str, Any]]) -> None:
+    """Fill each brief-less action of *decisions* with a free brief block of *text*.
 
-    A ``Q<n>`` / ``D<n>`` in a block's title pairs it with the n-th line (the last such
-    block wins); without numbered titles, blocks pair with lines by order when both counts
-    are equal; otherwise no line gets a block.
+    *decisions* are the ``decision`` actions in order; one that already has its
+    ``## Decision briefs`` entry keeps it. A ``Q<n>`` / ``D<n>`` in a block's title pairs
+    it with the n-th line (the last such block wins). Without numbered titles, the
+    untitled blocks pair by order with the still brief-less lines when both counts are
+    equal. Otherwise ONE leftover untitled block attaches to the ONE leftover line without
+    a ``(brief D<n>)`` marker (tp#1635 B10: a bare brief next to a numbered one); with
+    more of either, those lines get no block — no guessing.
     """
-    blocks = decision_brief_blocks(text)
     numbered: dict[int, str] = {}
-    for title, raw in blocks:
+    spare: list[str] = []
+    for title, raw in decision_brief_blocks(text):
         num = BRIEF_TITLE_NUM_RE.search(title or "")
         if num:
             numbered[int(num.group(1))] = raw
-    if numbered:
-        return [numbered.get(n) for n in range(1, count + 1)]
-    if blocks and len(blocks) == count:
-        return [raw for _title, raw in blocks]
-    return [None] * count
+        else:
+            spare.append(raw)
+    for n, action in enumerate(decisions, 1):
+        if action["brief"] is None:
+            action["brief"] = numbered.get(n)
+    pending = [a for a in decisions if a["brief"] is None]
+    if not numbered and spare and len(spare) == len(pending):
+        for action, raw in zip(pending, spare, strict=True):
+            action["brief"] = raw
+        return
+    unmarked = [a for a in pending if a["brief_ref"] is None]
+    if len(spare) == 1 and len(unmarked) == 1:
+        unmarked[0]["brief"] = spare[0]
 
 
 def decision_briefs(reply: str) -> dict[str, str]:
@@ -934,7 +946,7 @@ def todo_actions(reply: str, final: str | None = None) -> list[dict[str, Any]]:
     A ``decision`` line whose ``(brief D<n>)`` matches no entry falls back to a free
     ``**Decision brief**`` block of *final* — the turn's final assistant text part
     (default: *reply*), so an earlier, answered picker's brief never counts — paired by
-    :func:`free_briefs`; ``brief_ref`` stays as written (``None`` without a marker).
+    :func:`pair_free_briefs`; ``brief_ref`` stays as written (``None`` without a marker).
     """
     section = section_lines(reply, TODO_HEADING_RE)
     if section is None:
@@ -968,10 +980,7 @@ def todo_actions(reply: str, final: str | None = None) -> list[dict[str, Any]]:
         )
     decisions = [a for a in out if a["kind"] == "decision"]
     if any(a["brief"] is None for a in decisions):
-        free = free_briefs(reply if final is None else final, len(decisions))
-        for action, brief in zip(decisions, free, strict=True):
-            if action["brief"] is None:
-                action["brief"] = brief
+        pair_free_briefs(reply if final is None else final, decisions)
     return out
 
 
