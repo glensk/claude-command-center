@@ -75,7 +75,16 @@ def _sleep(seconds: float) -> None:
 
 
 class Refused(Exception):
-    """A refusal before any signal: nothing was touched."""
+    """A refusal before any signal: nothing was touched.
+
+    *code* is the machine-readable reason ``ccc close -j`` reports (tp#1481):
+    ``not_running``, ``conflict``, ``busy``, ``identity_changed``, ``stale_evidence``,
+    ``stop_chain``, ``close_in_flight`` or ``unobservable``; ``""`` for a handoff-only one.
+    """
+
+    def __init__(self, message: str, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -198,14 +207,19 @@ def _live_entry(adapter: ClaudeAdapter, session_id: str) -> LiveSession:
     try:
         entries = [e for e in adapter.discover_raw(session_id) if e.alive]
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-        raise Refused(f"registry unreadable ({exc})") from exc
+        raise Refused(f"registry unreadable ({exc})", "unobservable") from exc
     if not entries:
-        raise Refused("no live source process")
+        raise Refused("no live source process", "not_running")
     if len(entries) > 1:
-        raise Refused(f"{len(entries)} live registry entries (conflict) — cannot bind one")
+        raise Refused(
+            f"{len(entries)} live registry entries (conflict) — cannot bind one", "conflict"
+        )
     entry = entries[0]
     if entry.pid <= 0 or entry.conflict:
-        raise Refused("the live registry entry has no usable pid")
+        raise Refused(
+            "the live registry entry has no usable pid",
+            "conflict" if entry.conflict else "not_running",
+        )
     return entry
 
 
@@ -215,11 +229,11 @@ def _start_of(pid: int) -> str:
 
     ident = terminal.probe_identity(pid)
     if ident.kind == terminal.IDENTITY_PS_UNREADABLE:
-        raise Refused(f"pid {pid} could not be identified (ps unreadable)")
+        raise Refused(f"pid {pid} could not be identified (ps unreadable)", "unobservable")
     if ident.kind != terminal.IDENTITY_OK:
-        raise Refused(f"pid {pid} is gone")
+        raise Refused(f"pid {pid} is gone", "not_running")
     if not ident.is_claude:
-        raise Refused(f"pid {pid} is not a claude process")
+        raise Refused(f"pid {pid} is not a claude process", "identity_changed")
     return ident.start
 
 
@@ -252,22 +266,24 @@ def observe(adapter: ClaudeAdapter, session_id: str, bound: Bound) -> tuple[int,
 
     entry = _live_entry(adapter, session_id)
     if entry.pid != bound.pid:
-        raise Refused(f"the live source pid changed ({bound.pid} → {entry.pid})")
+        raise Refused(
+            f"the live source pid changed ({bound.pid} → {entry.pid})", "identity_changed"
+        )
     if contract_status(entry.raw_status) != "idle":
-        raise Refused(f"source busy (registry {entry.raw_status or 'unknown'})")
+        raise Refused(f"source busy (registry {entry.raw_status or 'unknown'})", "busy")
     if _start_of(bound.pid) != bound.start:
-        raise Refused(f"pid {bound.pid} was replaced (start time differs)")
+        raise Refused(f"pid {bound.pid} was replaced (start time differs)", "identity_changed")
     before = _stamp(bound.transcript)
     if before is None or bound.transcript is None:
-        raise Refused("source transcript unreadable")
+        raise Refused("source transcript unreadable", "unobservable")
     try:
         active = inspect_transcript(bound.transcript).turn_active
     except BridgeError as exc:
-        raise Refused(f"source transcript unreadable ({exc})") from exc
+        raise Refused(f"source transcript unreadable ({exc})", "unobservable") from exc
     if active is not False:
-        raise Refused("source turn active (transcript)")
+        raise Refused("source turn active (transcript)", "busy")
     if _stamp(bound.transcript) != before:
-        raise Refused("source transcript moved while it was read")
+        raise Refused("source transcript moved while it was read", "stale_evidence")
     return before
 
 
@@ -278,7 +294,7 @@ def await_stable(adapter: ClaudeAdapter, session_id: str, bound: Bound) -> tuple
     while True:
         _sleep(max(0.0, min(STABLE_POLL_SEC, deadline - time.monotonic())))
         if observe(adapter, session_id, bound) != first:
-            raise Refused("source transcript changed during the stability window")
+            raise Refused("source transcript changed during the stability window", "stale_evidence")
         if time.monotonic() >= deadline:
             return first
 
@@ -292,17 +308,26 @@ def _drain(bound: Bound, cfg: config.Config) -> None:
     )
     if state == terminal.DRAIN_RUNNING:
         names = ", ".join(cli._command_names(running))  # pylint: disable=protected-access
-        raise Refused(f"Stop hooks still running: {names or 'unnamed hook process(es)'}")
+        raise Refused(
+            f"Stop hooks still running: {names or 'unnamed hook process(es)'}", "stop_chain"
+        )
     if state != terminal.DRAIN_DRAINED:
-        raise Refused("the Stop chain could not be observed (ps unreadable or pid gone)")
+        raise Refused(
+            "the Stop chain could not be observed (ps unreadable or pid gone)", "stop_chain"
+        )
 
 
 def _revalidate(
     adapter: ClaudeAdapter, claim: Claim, bound: Bound, stamp: tuple[int, int, int]
 ) -> None:
-    """Everything again, immediately before the SIGTERM; :class:`Refused` on any drift."""
+    """Everything again, immediately before the SIGTERM; :class:`Refused` on any drift.
+
+    A claim without a ``transfer_id`` (``ccc close``, tp#1481) has no lineage to recheck.
+    """
     with Store() as store:
-        reason = lineage_refusal(store, claim.transfer_id, claim.session_id)
+        reason = (
+            lineage_refusal(store, claim.transfer_id, claim.session_id) if claim.transfer_id else ""
+        )
         row = store.get(claim.session_id)
     if reason:
         raise Refused(reason)
@@ -312,9 +337,9 @@ def _revalidate(
         or row.close_requested_at
         or (row.close_holder or "") != claim.holder
     ):
-        raise Refused("the close token changed hands")
+        raise Refused("the close token changed hands", "close_in_flight")
     if observe(adapter, claim.session_id, bound) != stamp:
-        raise Refused("source transcript changed before the signal")
+        raise Refused("source transcript changed before the signal", "stale_evidence")
 
 
 def _bind_debt(claim: Claim, debt: Debt) -> None:
@@ -327,9 +352,9 @@ def _bind_debt(claim: Claim, debt: Debt) -> None:
         with Store() as store:
             ok = store.bind_close_debt(claim.session_id, claim.token, claim.holder, debt.encode())
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-        raise Refused(f"the close debt could not be recorded ({exc})") from exc
+        raise Refused(f"the close debt could not be recorded ({exc})", "unobservable") from exc
     if not ok:
-        raise Refused("the close token changed hands before the signal")
+        raise Refused("the close token changed hands before the signal", "close_in_flight")
 
 
 def _gone(pid: int, start: str, table: dict[int, Any]) -> bool:

@@ -29,6 +29,10 @@ Code — ccc never renames a running process itself. ``ccc name -s ID -R`` drops
 (``manual`` / ``manual-tab``) name, hands the session back to the automatic namer and
 unfreezes its tab title (tp#1297).
 
+``ccc close -s ID -j`` closes an IDLE live session from outside it (tp#1481,
+:mod:`command_center.bridge_close`): SIGTERM + its tmux pane / iTerm pane or tab, refused
+with a ``reason`` unless the session is provably idle; DONE stays DONE, else PARKED.
+
 ``inspect`` / ``send`` / ``answer`` / ``delivery`` / ``events`` read a session's
 transcript, type into its tab and follow deliveries up (``bridge_inspect`` …
 ``bridge_events``). Message text travels on stdin only. Without ``-j`` the same data is
@@ -91,7 +95,7 @@ if TYPE_CHECKING:
 
 # Subcommands whose argv errors are answered with an envelope (see :func:`dispatch`).
 JSON_COMMANDS: frozenset[str] = frozenset(
-    {"sessions", "name", "inspect", "send", "answer", "delivery", "events"}
+    {"sessions", "name", "inspect", "send", "answer", "delivery", "events", "close"}
 )
 
 _AIM_SHORT_MAX = 80
@@ -194,6 +198,7 @@ def session_entry(
         "status": status if status is not None else contract_status(live.raw_status),
         "status_at": iso(live.status_updated_at or live.updated_at),
         "aim_short": _aim_short(row),
+        "done": bool(row.done) if row else False,
         "tab": {"iterm_session_id": tab[0], "validated": tab[1]},
     }
 
@@ -570,6 +575,12 @@ def cmd_answer(args: argparse.Namespace) -> int:
     return _run(args, body)
 
 
+def cmd_close(args: argparse.Namespace) -> int:
+    from .bridge_close import run_close
+
+    return _run(args, lambda deps: run_close(deps, args.session))
+
+
 def cmd_delivery(args: argparse.Namespace) -> int:
     from .bridge_events import run_delivery
 
@@ -645,7 +656,7 @@ def _json_flag(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_transcript_parsers(sub: Any) -> None:
-    """Register ``inspect``, ``send``, ``answer``, ``delivery`` and ``events``."""
+    """Register ``inspect``, ``send``, ``answer``, ``close``, ``delivery`` and ``events``."""
     p = sub.add_parser(
         "inspect",
         help="what a session last said + the decision it needs (voice bridge)",
@@ -689,6 +700,28 @@ def _add_transcript_parsers(sub: Any) -> None:
     p.add_argument("-s", "--session", required=True, help="Claude session id")
     _json_flag(p)
     p.set_defaults(func=cmd_answer)
+
+    p = sub.add_parser(
+        "close",
+        help="close an IDLE live session: SIGTERM + its pane/tab (decide's close)",
+        description=(
+            "Closes an idle live session from outside it: refused (nothing signalled) "
+            "unless it is live, interactive, one account, not a staff session, registry "
+            "idle with no open turn, no picker, no subagent or background shell, no "
+            "close in flight, a drained Stop chain and an unchanged transcript over the "
+            "stability window. Then SIGTERM (pid identity re-checked on a fresh "
+            "snapshot) and the tmux pane, else the validated iTerm pane or tab, is "
+            "closed without focusing anything. DONE stays DONE, else PARKED; it never "
+            "marks a session done. data: {session_id, result: closed, terminal: "
+            "tab|pane|tmux|none, status, close_debt}; a refusal's error.code (and "
+            "data.reason) is busy|subagents|background_shell|picker_pending|"
+            "not_running|background|conflict|stop_chain|identity_changed|staff_bound|"
+            "close_in_flight|stale_evidence|unobservable. Example: ccc close -s ID -j"
+        ),
+    )
+    p.add_argument("-s", "--session", required=True, help="Claude session id")
+    _json_flag(p)
+    p.set_defaults(func=cmd_close)
 
     p = sub.add_parser("delivery", help="state of one `ccc send` delivery")
     p.add_argument("-i", "--id", required=True, help="delivery id (from ccc send)")

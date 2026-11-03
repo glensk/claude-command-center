@@ -122,6 +122,7 @@ def test_both_accounts_kinds_status_and_names(store: Store) -> None:
         "status",
         "status_at",
         "aim_short",
+        "done",
         "display_name",
         "staff_agent",
         "tab",

@@ -78,7 +78,7 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 - `ccc rm` · `ccc prune` — drop a tracked row / delete leftovers (contentless, headless `claude -p`, and dead-launched jobs that never had a turn).
 - `ccc peek` (`--print`) · `ccc jump` — the macOS peek panel / the ccc↔session toggle.
 - `ccc snapshot` (`-l/--list`, `-n/--dry-run`) · `ccc restore-snapshot [name]` (`-n/--dry-run`, `-y/--yes`) — save the whole iTerm layout before a reboot, rebuild it afterwards.
-- `ccc sessions` · `ccc inspect` · `ccc send` · `ccc answer` · `ccc delivery` · `ccc events` · `ccc name` (all `-j`) — the voice-bridge JSON CLI: list, read, message and answer live sessions; see "The voice-bridge JSON CLI" below.
+- `ccc sessions` · `ccc inspect` · `ccc send` · `ccc answer` · `ccc close` · `ccc delivery` · `ccc events` · `ccc name` (all `-j`) — the voice-bridge JSON CLI: list, read, message, answer and close live sessions; see "The voice-bridge JSON CLI" below.
 
 **Obsidian & mirrors**
 
@@ -3537,7 +3537,7 @@ converge via `observed_at` ordering.
 Machine-facing commands (no TUI key) that the mac-voice Claude bridge (my-stt-tts
 `claude_sessions.py` / `attention.py`) and other agents drive to list, read, message and
 answer live Claude Code sessions. Code: `command_center/bridge_cli.py` and the
-`bridge_{json,target,inspect,send,answer,delivery,events,store}.py` modules beside it.
+`bridge_{json,target,inspect,send,answer,close,delivery,events,store}.py` modules beside it.
 
 ```commands
 ccc sessions -j                                    # every live session of every account
@@ -3546,6 +3546,7 @@ ccc inspect -s <session-id> -N -j                  # the same without the voice-
 echo 'run the tests' | ccc send -s <session-id> -j # type a message into the session's tab
 echo '{"decision_id": "…", "answers": [{"question_index": 0, "option_indices": [1]}]}' \
   | ccc answer -s <session-id> -j                  # answer its AskUserQuestion picker
+ccc close -s <session-id> -j                       # close an IDLE session (decide's close)
 ccc delivery -i <delivery-id> -j                   # follow one send up
 ccc events -a 0 -l 200 -j                          # the problem stream after a cursor
 ```
@@ -3591,6 +3592,7 @@ background jobs from `claude agents --json` too. Headless `claude -p` runs (regi
 | `kind`                 | `interactive` or `background` (background: listed and read, never messaged)                        |
 | `status` / `status_at` | `busy` / `idle` / `waiting` / `blocked` / `unknown` (a registry `shell` = busy)                    |
 | `aim_short`            | the short AIM label                                                                                |
+| `done`                 | ccc's own DONE flag (`ccc mark-done`), `false` without a ccc row                                   |
 | `tab.iterm_session_id` | the iTerm session of the tab (null for a background job)                                           |
 | `tab.validated`        | the registry pid's controlling tty is the tab's tty                                                |
 | `agents`               | optional, `-j` only: the session's running background subagents (below)                            |
@@ -3720,6 +3722,33 @@ supported. The answer is verified within 10 s through the call's `tool_use_id` a
 
 `data = {decision_id, tool_use_id, outcome, channel, keys}` (`mismatched_questions` on a
 mismatch); `outcome` `accepted` / `unknown` / `failed`.
+
+### `ccc close` (`-s/--session ID`, `-j/--json`)
+
+Closes an IDLE live session from outside it (tp#1481; decide's Mac applier). Code:
+`bridge_close.py`, built on the handoff closer (`handoff_close.py`). Any failed check refuses
+(exit 1, `error.code` = `data.reason`) and signals nothing: live, interactive, one account
+(`not_running` / `background` / `conflict`); not a staff session (`staff_bound`); no close
+token in flight (an armed `mark-done --close` firing, another closer, a handoff:
+`close_in_flight`); **idle is mandatory** — no pending picker (`picker_pending`), registry
+`idle` and no open turn (`busy`, also for a DONE session), no subagent or background shell in
+flight (the `continue-session` probe: `subagents` / `background_shell`). Then the close token
+is claimed (`Store.claim_close`; a user's pending `mark-done --close` arm is claimed and, on a
+refusal, handed back pending; otherwise a fresh arm is retired on a refusal), the process is
+bound (pid + start time), proven stably idle with an unchanged transcript
+(`stale_evidence`), its Stop chain drained (≤ 15 s: `stop_chain`), the probe repeated and,
+inside the tab's send lock, everything revalidated on a fresh snapshot (`identity_changed`,
+`stale_evidence`) right before the close debt is bound and the SIGTERM goes out.
+`unobservable` = `ps`, the registry or the transcript could not be read.
+
+The terminal: the hosting tmux pane (`tmux`), else the iTerm pane (`pane`) or tab (`tab`)
+through AppleScript `close` (no `activate`, no selection) — only a tab validated against the
+live pid's tty, never a store-only id (`none`). The store status becomes DONE when ccc's
+DONE flag is set, else PARKED (HANDED_OFF for a handed-off row); the verb never marks a
+session done. `data = {session_id, result: "closed", terminal, status, close_debt}`;
+`close_debt: true` = the pane did not close: a repeated call closes it without signalling
+again. A session already gone answers `not_running`. `ccc mark-done --close` stays the
+in-session path (it arms a close for after the next turn).
 
 ### `ccc delivery` (`-i/--id ID`, `-j/--json`)
 
