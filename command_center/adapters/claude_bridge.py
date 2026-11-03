@@ -74,14 +74,21 @@ TODO_ACTION_RE = re.compile(
 #: convention); the ``D<n>`` names an entry of the ``## Decision briefs`` section.
 BRIEF_REF_RE = re.compile(r"\s*\(brief\s+(?P<ref>D\d+)\)\s*[.;,]?\s*$", re.IGNORECASE)
 TP_ID_RE = re.compile(r"\btp#(\d+)\b")
-#: The line that opens the ``**Decision brief**`` block before an AskUserQuestion call.
-DECISION_BRIEF_HEAD_RE = re.compile(r"^\s*\*\*Decision brief\*\*\s*:?\s*$", re.IGNORECASE)
+#: The line that opens a ``**Decision brief**`` block (before an AskUserQuestion call or
+#: as a free block of a reply), bare or titled: ``**Decision brief (Q1: cache)**``.
+DECISION_BRIEF_HEAD_RE = re.compile(
+    r"^\s*\*\*Decision brief(?:\s*\((?P<title>[^*]*)\))?\*\*\s*:?\s*$", re.IGNORECASE
+)
+#: The ``Q<n>`` / ``D<n>`` of a titled brief head: pairs it with the n-th decision line.
+BRIEF_TITLE_NUM_RE = re.compile(r"\b[QD](\d+)\b", re.IGNORECASE)
 DECISION_BRIEFS_HEADING_RE = re.compile(r"^\s*#{1,6}\s*Decision briefs\s*$", re.IGNORECASE)
 #: One entry of the ``## Decision briefs`` section: ``**D<n> <short title>**``.
 BRIEF_ENTRY_RE = re.compile(r"^\s*\*\*(?P<ref>D\d+)\b[^*]*\*\*")
-#: A labelled line of a brief (``Background:``, ``Building:``, ``Fit:``, ``Recommendation:``).
+#: A labelled line of a brief (``Background:``, ``Building:``, ``Fit:``, ``Recommendation:``,
+#: ``Why now:``, ``Undo:``, ``Checked:``).
 BRIEF_LABEL_RE = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:\*\*)?(?:Background|Building|Fit|Recommendation)(?:\*\*)?\s*:",
+    r"^\s*(?:[-*]\s*)?(?:\*\*)?"
+    r"(?:Background|Building|Fit|Recommendation|Why now|Undo|Checked)(?:\*\*)?\s*:",
     re.IGNORECASE,
 )
 BOLD_TITLE_RE = re.compile(r"^\s*\*\*[^*]+\*\*\s*$")
@@ -808,29 +815,62 @@ def _brief_block(lines: list[str]) -> str | None:
     return cap_head(text, BRIEF_MAX) if text else None
 
 
-def decision_brief(text: str) -> str | None:
-    """The LAST ``**Decision brief**`` block of *text* (raw, ≤ :data:`BRIEF_MAX`), or None.
+def decision_brief_blocks(text: str) -> list[tuple[str | None, str]]:
+    """Every ``**Decision brief**`` block of *text* as ``(title, raw block)``, in order.
 
-    The block is its opening line plus every following line up to a heading, another
-    bold title line, or a blank line whose next non-blank line is not a labelled brief
-    line (``Background:`` / ``Building:`` / ``Fit:`` / ``Recommendation:``) — so a
-    question written after the block is not swallowed.
+    ``title`` is the parenthesised head title (``**Decision brief (Q1: cache)**`` →
+    ``"Q1: cache"``), ``None`` for a bare head. A block is its opening line plus every
+    following line up to a heading, another bold title line, or a blank line whose next
+    non-blank line is not a labelled brief line (:data:`BRIEF_LABEL_RE`) — so a question
+    written after the block is not swallowed. Each block is ≤ :data:`BRIEF_MAX`.
     """
     lines = text.splitlines()
-    starts = [i for i, line in enumerate(lines) if DECISION_BRIEF_HEAD_RE.match(line)]
-    if not starts:
-        return None
-    block = [lines[starts[-1]]]
-    rest = lines[starts[-1] + 1 :]
-    for i, line in enumerate(rest):
-        if HEADING_RE.match(line) or BOLD_TITLE_RE.match(line):
-            break
-        if not line.strip():
-            after = next((x for x in rest[i + 1 :] if x.strip()), "")
-            if not BRIEF_LABEL_RE.match(after):
+    out: list[tuple[str | None, str]] = []
+    for start, head in enumerate(lines):
+        m = DECISION_BRIEF_HEAD_RE.match(head)
+        if not m:
+            continue
+        block = [head]
+        rest = lines[start + 1 :]
+        for i, line in enumerate(rest):
+            if HEADING_RE.match(line) or BOLD_TITLE_RE.match(line):
                 break
-        block.append(line)
-    return _brief_block(block)
+            if not line.strip():
+                after = next((x for x in rest[i + 1 :] if x.strip()), "")
+                if not BRIEF_LABEL_RE.match(after):
+                    break
+            block.append(line)
+        raw = _brief_block(block)
+        if raw:
+            title = m.group("title")
+            out.append((title.strip() if title is not None else None, raw))
+    return out
+
+
+def decision_brief(text: str) -> str | None:
+    """The LAST ``**Decision brief**`` block of *text* (:func:`decision_brief_blocks`)."""
+    blocks = decision_brief_blocks(text)
+    return blocks[-1][1] if blocks else None
+
+
+def free_briefs(text: str, count: int) -> list[str | None]:
+    """The free ``**Decision brief**`` block of each of *count* decision lines, in order.
+
+    A ``Q<n>`` / ``D<n>`` in a block's title pairs it with the n-th line (the last such
+    block wins); without numbered titles, blocks pair with lines by order when both counts
+    are equal; otherwise no line gets a block.
+    """
+    blocks = decision_brief_blocks(text)
+    numbered: dict[int, str] = {}
+    for title, raw in blocks:
+        num = BRIEF_TITLE_NUM_RE.search(title or "")
+        if num:
+            numbered[int(num.group(1))] = raw
+    if numbered:
+        return [numbered.get(n) for n in range(1, count + 1)]
+    if blocks and len(blocks) == count:
+        return [raw for _title, raw in blocks]
+    return [None] * count
 
 
 def decision_briefs(reply: str) -> dict[str, str]:
@@ -854,7 +894,7 @@ def decision_briefs(reply: str) -> dict[str, str]:
     return out
 
 
-def todo_actions(reply: str) -> list[dict[str, Any]]:
+def todo_actions(reply: str, final: str | None = None) -> list[dict[str, Any]]:
     """Every ``You [kind]: text`` line of the last ``## To-do list`` of *reply*.
 
     One ``{kind, text, tp_id, brief_ref, brief}`` per line, in order: ``kind`` is the
@@ -862,6 +902,11 @@ def todo_actions(reply: str) -> list[dict[str, Any]]:
     line after the colon without its ``(brief D<n>)`` marker, ``tp_id`` the first
     ``tp#N`` of the line or else of its ``### tp#N …`` group heading, ``brief_ref`` the
     ``D<n>`` and ``brief`` the matching ``## Decision briefs`` entry (``None`` when absent).
+
+    A ``decision`` line whose ``(brief D<n>)`` matches no entry falls back to a free
+    ``**Decision brief**`` block of *final* — the turn's final assistant text part
+    (default: *reply*), so an earlier, answered picker's brief never counts — paired by
+    :func:`free_briefs`; ``brief_ref`` stays as written (``None`` without a marker).
     """
     section = section_lines(reply, TODO_HEADING_RE)
     if section is None:
@@ -893,6 +938,12 @@ def todo_actions(reply: str) -> list[dict[str, Any]]:
                 "brief": briefs.get(ref) if ref else None,
             }
         )
+    decisions = [a for a in out if a["kind"] == "decision"]
+    if any(a["brief"] is None for a in decisions):
+        free = free_briefs(reply if final is None else final, len(decisions))
+        for action, brief in zip(decisions, free, strict=True):
+            if action["brief"] is None:
+                action["brief"] = brief
     return out
 
 
@@ -994,7 +1045,7 @@ def inspect(records: list[dict[str, Any]]) -> Inspection:
         questions=questions,
         source=source,
         anchor=anchor,
-        actions=todo_actions(reply) if s.todo_anchor else [],
+        actions=todo_actions(reply, s.reply_parts[-1]) if s.todo_anchor else [],
         brief=decision_brief(s.pending[0].preceding_text) if len(s.pending) == 1 else None,
         turn_active=bool(s.turn_open or s.pending),
     )

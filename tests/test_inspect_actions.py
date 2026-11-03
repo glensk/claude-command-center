@@ -196,3 +196,87 @@ def test_todo_questions_accept_every_todo_action_prefix(line: str) -> None:
 )
 def test_todo_questions_ignore_non_decision_lines(line: str) -> None:
     assert not cb.todo_questions(f"## To-do list\n{line}\n")
+
+
+def test_one_decision_line_gets_the_free_brief() -> None:
+    reply = f"Done.\n\n{BRIEF}\n\n## To-do list\n`You [decision]: Alpha or Beta?`\n"
+    actions = cb.todo_actions(reply)
+    assert [(a["kind"], a["brief_ref"], a["brief"]) for a in actions] == [("decision", None, BRIEF)]
+
+
+def test_titled_briefs_pair_with_decision_lines_by_number() -> None:
+    q1 = "**Decision brief (Q1: cache backend)**\nBackground: one.\nRecommendation: alpha."
+    q2 = "**Decision brief (Q2)**\nBackground: two.\nRecommendation: gamma."
+    # written in reverse order: the Q<n> in the title decides, not the order
+    reply = (
+        f"{q2}\n\n{q1}\n\n## To-do list\n"
+        "1. You [decision]: Alpha or Beta?\n2. You [sudo]: restart the runner\n"
+        "3. You [decision]: Gamma or Delta?\n"
+    )
+    actions = cb.todo_actions(reply)
+    assert [(a["kind"], a["brief_ref"], a["brief"]) for a in actions] == [
+        ("decision", None, q1),
+        ("sudo", None, None),
+        ("decision", None, q2),
+    ]
+
+
+def test_untitled_briefs_pair_by_order_when_counts_match() -> None:
+    first = "**Decision brief**\nBackground: one."
+    second = "**Decision brief**\nBackground: two."
+    reply = (
+        f"{first}\n\n{second}\n\n## To-do list\n"
+        "1. You [decision]: Alpha or Beta?\n2. You [decision]: Gamma or Delta?\n"
+    )
+    assert [a["brief"] for a in cb.todo_actions(reply)] == [first, second]
+
+
+def test_two_decision_lines_and_one_free_brief_attach_nothing() -> None:
+    reply = (
+        f"{BRIEF}\n\n## To-do list\n"
+        "1. You [decision]: Alpha or Beta?\n2. You [decision]: Gamma or Delta?\n"
+    )
+    assert [a["brief"] for a in cb.todo_actions(reply)] == [None, None]
+
+
+def test_section_brief_wins_over_a_free_brief() -> None:
+    reply = f"{BRIEF}\n\n{REPLY}"
+    actions = cb.todo_actions(reply)
+    assert actions[0]["brief"].startswith("**D1 Cache backend**")
+    assert actions[2]["brief"].startswith("**D2 Release timing**")
+
+
+def test_an_earlier_picker_brief_is_not_reused_for_the_final_line() -> None:
+    q = question("Which?", ["a", "b"])
+    records = [
+        user("go"),
+        assistant(f"{BRIEF}\n\nPick one.", stop=None),
+        ask("toolu_1", [q]),
+        tool_result("toolu_1"),
+        *turn_end("Done.\n\n## To-do list\n1. You [decision]: Alpha or Beta?\n"),
+    ]
+    ins = cb.inspect(records)
+    assert BRIEF in ins.last_reply  # the old brief is in the turn, not in the final part
+    assert [(a["kind"], a["brief"]) for a in ins.actions] == [("decision", None)]
+
+
+def test_free_brief_in_the_final_part_reaches_the_inspection() -> None:
+    reply = f"Done.\n\n{BRIEF}\n\n## To-do list\nYou [decision]: Alpha or Beta?\n"
+    ins = cb.inspect([user("go"), *turn_end(reply)])
+    assert [a["brief"] for a in ins.actions] == [BRIEF]
+
+
+def test_paragraph_brief_keeps_all_seven_fields() -> None:
+    brief = (
+        "**Decision brief**\n"
+        "Background: the cache is lost on every wipe.\n\n"
+        "**Building**: a faster pipeline.\n\n"
+        "Fit: unblocks the release.\n\n"
+        "Recommendation: shared bucket.\n\n"
+        "Why now: the next wipe is on Friday.\n\n"
+        "**Undo:** switch the setting back.\n\n"
+        "- Checked: the bucket quota fits."
+    )
+    reply = f"{brief}\n\nWhich one do you want?\n\n## To-do list\nYou [decision]: Alpha or Beta?\n"
+    assert cb.decision_brief(reply) == brief
+    assert [a["brief"] for a in cb.todo_actions(reply)] == [brief]
