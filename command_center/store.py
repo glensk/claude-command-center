@@ -419,6 +419,18 @@ CREATE TABLE IF NOT EXISTS transcript_scan (
     scanned_at       INTEGER NOT NULL DEFAULT 0,
     headless         INTEGER
 );
+-- The final running-subagent list of one transcript (``session_agents.inventory``), keyed by
+-- the transcript's (path, size, mtime_ns) identity. Separate from transcript_scan because
+-- ``core.reconcile_pass`` upserts that table and must not invalidate this one. No foreign key.
+CREATE TABLE IF NOT EXISTS subagent_scan (
+    path        TEXT    PRIMARY KEY,
+    session_id  TEXT    NOT NULL,
+    mtime_ns    INTEGER NOT NULL,
+    size        INTEGER NOT NULL,
+    agents      TEXT    NOT NULL,
+    meta_seen   TEXT    NOT NULL,
+    scanned_at  INTEGER NOT NULL
+);
 -- One row per mirror file a scrubber vouched for (see command_center.scrub): the pass
 -- that finds all four identities intact — regenerated document, bytes on disk, the
 -- mirror_scrub_cmd they came from, and the row's age — skips the subprocess entirely.
@@ -1964,6 +1976,70 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             payload,
         )
         self.conn.commit()
+
+    # ---- subagent scans -------------------------------------------------
+    def get_subagent_scans(self, paths: Iterable[str]) -> dict[str, sqlite3.Row]:
+        """The ``subagent_scan`` rows for *paths*, keyed by path (absent = never scanned)."""
+        wanted = list(dict.fromkeys(paths))
+        found: dict[str, sqlite3.Row] = {}
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start : start + 500]
+            marks = ",".join("?" * len(chunk))
+            rows = self.conn.execute(
+                f"SELECT * FROM subagent_scan WHERE path IN ({marks})",  # noqa: S608
+                chunk,
+            ).fetchall()
+            found.update({str(row["path"]): row for row in rows})
+        return found
+
+    def put_subagent_scans(self, rows: Iterable[tuple[str, str, int, int, str, str, int]]) -> None:
+        """UPSERT ``(path, session_id, mtime_ns, size, agents, meta_seen, scanned_at)`` rows.
+
+        One transaction, one commit; nothing at all for an empty *rows*. Last writer wins:
+        a row always matches the identity it was computed for.
+        """
+        payload = list(rows)
+        if not payload:
+            return
+        self.conn.executemany(
+            "INSERT INTO subagent_scan (path, session_id, mtime_ns, size, agents, "
+            "meta_seen, scanned_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(path) DO UPDATE SET session_id=excluded.session_id, "
+            "mtime_ns=excluded.mtime_ns, size=excluded.size, agents=excluded.agents, "
+            "meta_seen=excluded.meta_seen, scanned_at=excluded.scanned_at",
+            payload,
+        )
+        self.conn.commit()
+
+    def prune_subagent_scans(
+        self,
+        live_paths: Iterable[str],
+        now_ms: int,  # pylint: disable=redefined-outer-name
+        *,
+        max_age_ms: int = 24 * 3600 * 1000,
+        max_rows: int = 200,
+    ) -> None:
+        """Drop rows not live AND older than *max_age_ms*, then cap at *max_rows* (oldest first)."""
+        live = set(live_paths)
+        cutoff = now_ms - max_age_ms
+        stale = [
+            str(row["path"])
+            for row in self.conn.execute("SELECT path, scanned_at FROM subagent_scan")
+            if row["scanned_at"] < cutoff and str(row["path"]) not in live
+        ]
+        changed = bool(stale)
+        if stale:
+            self.conn.executemany("DELETE FROM subagent_scan WHERE path = ?", [(p,) for p in stale])
+        count = int(self.conn.execute("SELECT COUNT(*) FROM subagent_scan").fetchone()[0])
+        if count > max_rows:
+            self.conn.execute(
+                "DELETE FROM subagent_scan WHERE path IN (SELECT path FROM subagent_scan "
+                "ORDER BY scanned_at ASC, path ASC LIMIT ?)",
+                (count - max_rows,),
+            )
+            changed = True
+        if changed:
+            self.conn.commit()
 
     # ---- mirror vouches + health ----------------------------------------
     def mirror_vouches(self) -> dict[str, MirrorVouch]:

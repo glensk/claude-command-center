@@ -10,12 +10,18 @@ Stdlib-only at import time.
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .store import Store
 
 MAX_AGENTS = 20  # decide keeps the first 20 entries
+MAX_ROW_BYTES = 256 * 1024  # a larger final list is not persisted
 _TP_ITEM_RE = re.compile(r"(?m)^\[tp-item:\s*(\d+)\]")
 
 
@@ -65,11 +71,15 @@ def _is_agent_launch(record: dict[str, object]) -> bool:
     )
 
 
+def _meta_path(transcript: Path, agent_id: str) -> Path:
+    """Where the agent's ``meta.json`` lives."""
+    return transcript.parent / transcript.stem / "subagents" / f"agent-{agent_id}.meta.json"
+
+
 def _read_meta(transcript: Path, agent_id: str) -> dict[str, Any]:
     """The agent's ``meta.json`` (``{}`` when absent or unreadable)."""
-    path = transcript.parent / transcript.stem / "subagents" / f"agent-{agent_id}.meta.json"
     try:
-        meta = json.loads(path.read_text(encoding="utf-8"))
+        meta = json.loads(_meta_path(transcript, agent_id).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return meta if isinstance(meta, dict) else {}
@@ -102,3 +112,119 @@ def _tp_id(prompt: object) -> int | None:
         return None
     match = _TP_ITEM_RE.search(prompt)
     return int(match.group(1)) if match else None
+
+
+def inventory(
+    store: Store,
+    targets: list[tuple[str, Path | None]],
+    *,
+    deadline_s: float = 0.15,
+    now_ms: int | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Running agents per session, from the ``subagent_scan`` cache or a cold rescan.
+
+    *targets* is ``(session_id, transcript path | None)``. Only the sessions whose inventory
+    is known are returned; a missing sid means "omit the key" (no path, unreadable or
+    malformed transcript, a cold rescan skipped by the deadline, or any error). Never raises.
+
+    Hit: ``(path, size, mtime_ns)`` equal, so no transcript read; agents whose meta file was
+    not seen yet are re-checked. Miss: a cold ``running_agents`` rescan, started only while
+    *deadline_s* of wall time has not passed. Only changed rows are written, then pruned.
+    """
+    try:
+        return _inventory(store, targets, deadline_s, now_ms)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return {}
+
+
+def _inventory(
+    store: Store,
+    targets: list[tuple[str, Path | None]],
+    deadline_s: float,
+    now_ms: int | None,
+) -> dict[str, list[dict[str, Any]]]:
+    started = time.monotonic()
+    now = int(time.time() * 1000) if now_ms is None else now_ms
+    paths = {sid: Path(path) for sid, path in targets if path is not None}
+    cached = store.get_subagent_scans(str(p) for p in paths.values())
+    result: dict[str, list[dict[str, Any]]] = {}
+    writes: list[tuple[str, str, int, int, str, str, int]] = []
+    for sid, path in paths.items():
+        try:
+            stat = path.stat()
+            row = cached.get(str(path))
+            hit = row is not None and (row["size"], row["mtime_ns"]) == (
+                stat.st_size,
+                stat.st_mtime_ns,
+            )
+            if hit:
+                entry = _hit(path, sid, row, now)
+                if entry is not None:
+                    result[sid] = entry[0]
+                    if entry[1] is not None:
+                        writes.append(entry[1])
+                    continue
+            if time.monotonic() - started >= deadline_s:
+                continue
+            cold = running_agents(path)
+            if cold is None:
+                continue
+            result[sid] = cold
+            seen = [a["id"] for a in cold if _meta_path(path, a["id"]).is_file()]
+            row_out = _row(path, sid, stat, cold, seen=seen, now=now)
+            if row_out is not None:
+                writes.append(row_out)
+        except Exception:  # pylint: disable=broad-exception-caught
+            result.pop(sid, None)
+    store.put_subagent_scans(writes)
+    store.prune_subagent_scans({str(p) for p in paths.values()}, now)
+    return result
+
+
+def _hit(
+    path: Path, sid: str, row: Any, now: int
+) -> tuple[list[dict[str, Any]], tuple[str, str, int, int, str, str, int] | None] | None:
+    """Agents of a cache hit, plus the rewritten row when a meta file newly appeared.
+
+    ``None`` when the stored row cannot be decoded (treated as a miss).
+    """
+    try:
+        agents = json.loads(row["agents"])
+        seen = json.loads(row["meta_seen"])
+    except ValueError:
+        return None
+    if not isinstance(agents, list) or not isinstance(seen, list):
+        return None
+    changed = False
+    for agent in agents:
+        agent_id = agent.get("id")
+        if agent_id in seen or not _meta_path(path, agent_id).is_file():
+            continue
+        meta = _read_meta(path, agent_id)
+        agent["description"] = _text(meta.get("description"), agent.get("description"))
+        agent["agent_type"] = _text(meta.get("agentType"), agent.get("agent_type"))
+        seen.append(agent_id)
+        changed = True
+    if not changed:
+        return agents, None
+    stat = path.stat()
+    return agents, _row(path, sid, stat, agents, seen=seen, now=now, identity=row)
+
+
+def _row(
+    path: Path,
+    sid: str,
+    stat: os.stat_result,
+    agents: list[dict[str, Any]],
+    *,
+    seen: list[str],
+    now: int,
+    identity: Any = None,
+) -> tuple[str, str, int, int, str, str, int] | None:
+    """A ``subagent_scan`` row, or ``None`` when the agents JSON is over 256 KiB."""
+    blob = json.dumps(agents, separators=(",", ":"))
+    if len(blob.encode("utf-8")) > MAX_ROW_BYTES:
+        return None
+    size = identity["size"] if identity is not None else stat.st_size
+    mtime_ns = identity["mtime_ns"] if identity is not None else stat.st_mtime_ns
+    return (str(path), sid, int(mtime_ns), int(size), blob, json.dumps(seen), now)
