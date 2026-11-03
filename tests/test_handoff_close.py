@@ -576,3 +576,167 @@ def test_running_stop_hook_is_refused(tmp_path: Path, monkeypatch: pytest.Monkey
     token = _seed()
     assert handoff_close.run(_args()) == 1
     _assert_refused_and_restored(world, token, tmp_path, "Stop hooks still running")
+
+
+# --- debt before the signal (tp#1595 B2) -------------------------------------------------
+
+_EXPECTED_DEBT = handoff_close.Debt(PID, START, "", ITERM, f"/dev/{TTY}")
+
+
+class _Killed(BaseException):
+    """A SIGKILL of the closer: no ``except Exception`` runs, nothing settles the token."""
+
+
+def _no_sigterm(pid: int) -> bool:
+    raise AssertionError(f"a retry must never signal (pid {pid})")
+
+
+def _reclaim(token: str) -> None:
+    """The daemon sweep's reclaim of the dead closer's token (holder and claim time as read)."""
+    row = _row()
+    with Store() as store:
+        assert store.reclaim_stale_close(
+            SRC, token, holder=OWN, claimed_at=row.close_claimed_at, now=now_ms()
+        )
+
+
+def _assert_in_flight_with_debt(token: str) -> None:
+    row = _row()
+    assert (row.close_token, row.close_requested_at, row.close_holder) == (token, 0, OWN)
+    assert handoff_close.Debt.decode(row.close_bound) == _EXPECTED_DEBT
+
+
+def test_the_debt_is_on_the_row_before_the_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = _install(tmp_path, monkeypatch)
+    token = _seed()
+    seen: list[Any] = []
+    real_sigterm = cli._sigterm  # pylint: disable=protected-access
+
+    def _sigterm(pid: int) -> bool:
+        seen.append(_row())
+        return real_sigterm(pid)
+
+    monkeypatch.setattr(cli, "_sigterm", _sigterm)
+    assert handoff_close.run(_args()) == 0
+    assert len(seen) == 1
+    row = seen[0]
+    assert (row.close_token, row.close_requested_at, row.close_holder) == (token, 0, OWN)
+    assert handoff_close.Debt.decode(row.close_bound) == _EXPECTED_DEBT
+    assert world.killed == [(PID, signal.SIGTERM)]
+    assert _row().close_token == ""  # proven close: retired as before
+
+
+@pytest.mark.parametrize("race", ["reclaimed", "holder"])
+def test_a_failed_debt_write_refuses_without_a_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, race: str
+) -> None:
+    """The token moves between the revalidation and the debt write: nothing is signalled."""
+    world = _install(tmp_path, monkeypatch)
+    other = "999:Mon Nov  2 22:00:00 2026"
+    token = _seed()
+    real_revalidate = handoff_close._revalidate  # pylint: disable=protected-access
+
+    def _revalidate_then_lose(*a: Any) -> None:
+        real_revalidate(*a)
+        with Store() as store:
+            if race == "reclaimed":
+                row = _row()
+                assert store.reclaim_stale_close(
+                    SRC, token, holder=OWN, claimed_at=row.close_claimed_at, now=now_ms()
+                )
+                assert store.claim_close(SRC, token, other)
+            else:
+                store.conn.execute(
+                    "UPDATE sessions SET close_holder = ? WHERE session_id = ?", (other, SRC)
+                )
+                store.conn.commit()
+
+    monkeypatch.setattr(handoff_close, "_revalidate", _revalidate_then_lose)
+    monkeypatch.setattr(cli, "_sigterm", _no_sigterm)
+    assert handoff_close.run(_args()) == 1
+    assert not world.killed and not world.closed
+    row = _row()
+    assert (row.close_token, row.close_requested_at, row.close_holder) == (token, 0, other)
+    assert row.close_bound == ""  # no debt written, the other holder's claim untouched
+    assert "changed hands before the signal" in _events(tmp_path)
+
+
+def test_a_closer_killed_after_the_signal_leaves_a_debt_the_retry_closes_unsignalled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = _install(tmp_path, monkeypatch)
+    token = _seed()
+
+    def _killed_while_waiting(_pid: int, _start: str) -> bool:
+        raise _Killed
+
+    monkeypatch.setattr(handoff_close, "_wait_exit", _killed_while_waiting)
+    with pytest.raises(_Killed):
+        handoff_close.run(_args())
+    assert world.killed == [(PID, signal.SIGTERM)] and not world.closed
+    _assert_in_flight_with_debt(token)
+
+    _reclaim(token)
+    monkeypatch.setattr(cli, "_sigterm", _no_sigterm)
+    retried: list[handoff_close.Debt] = []
+    real_retry = handoff_close.retry_terminal
+
+    def _retry(claim: handoff_close.Claim, debt: handoff_close.Debt) -> int:
+        retried.append(debt)
+        return real_retry(claim, debt)
+
+    monkeypatch.setattr(handoff_close, "retry_terminal", _retry)
+    assert handoff_close.run(_args()) == 0
+    assert retried == [_EXPECTED_DEBT]
+    assert world.killed == [(PID, signal.SIGTERM)]  # never re-signalled
+    assert world.closed == [ITERM]
+    row = _row()
+    assert (row.close_token, row.close_bound) == ("", "")
+
+
+def test_a_closer_killed_before_the_signal_leaves_a_debt_the_retry_never_signals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The residual window (debt written, kill() not reached): fail safe, the tab stays."""
+    world = _install(tmp_path, monkeypatch)
+    token = _seed()
+
+    def _killed_before_kill(_pid: int) -> bool:
+        raise _Killed
+
+    monkeypatch.setattr(cli, "_sigterm", _killed_before_kill)
+    with pytest.raises(_Killed):
+        handoff_close.run(_args())
+    assert not world.killed and not world.closed
+    _assert_in_flight_with_debt(token)
+
+    _reclaim(token)
+    monkeypatch.setattr(cli, "_sigterm", _no_sigterm)
+    assert handoff_close.run(_args()) == 1
+    assert not world.killed and not world.closed
+    row = _row()
+    assert row.close_token == token and row.close_requested_at > 0  # pending, debt kept
+    assert handoff_close.Debt.decode(row.close_bound) == _EXPECTED_DEBT
+    assert "still running after SIGTERM" in _events(tmp_path)
+    assert "not re-signalled" in _events(tmp_path)
+
+
+def test_an_error_after_the_signal_keeps_the_debt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exception past the debt write never restores the old binding: retry is pane-only."""
+    world = _install(tmp_path, monkeypatch)
+    token = _seed()
+
+    def _close_raises(_pane: str, _iterm: str) -> bool:
+        raise RuntimeError("osascript exploded")
+
+    monkeypatch.setattr(cli, "_close_terminal", _close_raises)
+    assert handoff_close.run(_args()) == 1
+    assert world.killed == [(PID, signal.SIGTERM)]
+    row = _row()
+    assert row.close_token == token and row.close_requested_at > 0
+    assert handoff_close.Debt.decode(row.close_bound) == _EXPECTED_DEBT
+    assert "internal error" in _events(tmp_path)

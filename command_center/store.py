@@ -1496,6 +1496,27 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         self.conn.commit()
         return cur.rowcount == 1
 
+    def bind_close_debt(self, session_id: str, token: str, holder: str, bound: str) -> bool:
+        """Write *bound* (a ``handoff:`` debt) onto THIS closer's in-flight token (``True`` = won).
+
+        The handoff closer calls this right before its SIGTERM, so a closer killed after
+        the signal leaves the debt on the row and a reclaim + retry only closes the pane,
+        never signals again (tp#1595). A compare-and-swap: same *token*, stamp 0 (in
+        flight) and the same non-empty *holder*; a restored, retired, reclaimed or
+        re-claimed token changes nothing. The token stays in flight; claim time and holder
+        are kept.
+        """
+        if not token or not holder:
+            return False
+        cur = self.conn.execute(
+            "UPDATE sessions SET close_bound = ?, updated_at = ? "
+            "WHERE session_id = ? AND close_token = ? AND close_requested_at = 0 "
+            "AND close_holder = ?",
+            (bound, now_ms(), session_id, token, holder),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
+
     def reclaim_stale_close(
         self, session_id: str, token: str, *, holder: str, claimed_at: int, now: int
     ) -> bool:

@@ -15,7 +15,9 @@ provably and stably idle. Token-scoped and process-bound:
    unchanged transcript identity (inode, mtime, size) over :data:`STABLE_WINDOW_SEC` —
    also with ``stop_barrier_enabled = false``, where only the Stop-chain drain is skipped.
 5. Revalidate lineage, token, PID, PID start time, idle state and transcript immediately
-   before the SIGTERM.
+   before the SIGTERM, then write the ``handoff:`` debt onto the still in-flight token
+   (:meth:`Store.bind_close_debt`, a holder CAS) — a failed write refuses unsignalled, and
+   a closer killed after the signal leaves the debt, never the old binding.
 
 A refusal before the signal sends nothing, hands its own token back
 (:meth:`Store.restore_close`, no TTL: pending again), writes an ``events.log`` line and
@@ -274,6 +276,21 @@ def _revalidate(
         raise Refused("source transcript changed before the signal")
 
 
+def _bind_debt(claim: Claim, debt: Debt) -> None:
+    """Record *debt* on the in-flight token BEFORE the signal; :class:`Refused` when not.
+
+    From here on a closer killed mid-close leaves a debt, so a reclaim + retry goes through
+    :func:`retry_terminal` (pane only, never a second signal) instead of re-binding.
+    """
+    try:
+        with Store() as store:
+            ok = store.bind_close_debt(claim.session_id, claim.token, claim.holder, debt.encode())
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        raise Refused(f"the close debt could not be recorded ({exc})") from exc
+    if not ok:
+        raise Refused("the close token changed hands before the signal")
+
+
 def _gone(pid: int, start: str, table: dict[int, Any]) -> bool:
     """True when the readable *table* no longer holds *pid* with start time *start*."""
     from . import terminal
@@ -387,14 +404,19 @@ def close_source(args: argparse.Namespace, claim: Claim, cfg: config.Config) -> 
             tty=terminal.pid_tty(bound.pid, terminal.ps_table()),
         )
         _revalidate(adapter, claim, bound, stamp)
+        _bind_debt(claim, debt)
     except Refused as exc:
         return _refuse(claim, sid, claim.transfer_id, str(exc), keep=claim.bound)
-    signalled = cli._sigterm(bound.pid)  # pylint: disable=protected-access
-    if signalled:
-        _wait_exit(bound.pid, start)
-    closed = signalled and cli._close_terminal(  # pylint: disable=protected-access
-        debt.pane, "" if debt.pane else debt.iterm
-    )
+    try:
+        signalled = cli._sigterm(bound.pid)  # pylint: disable=protected-access
+        if signalled:
+            _wait_exit(bound.pid, start)
+        closed = signalled and cli._close_terminal(  # pylint: disable=protected-access
+            debt.pane, "" if debt.pane else debt.iterm
+        )
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        # The signal may have gone out: keep the debt, a retry never signals again.
+        return _refuse(claim, sid, claim.transfer_id, f"internal error ({exc})", keep=debt.encode())
     return _finish(claim, debt, signalled, closed)
 
 

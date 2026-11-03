@@ -1548,6 +1548,47 @@ def test_reclaim_stale_close_with_changed_values_is_a_noop(tmp_path: Path, chang
     store.close()
 
 
+def test_bind_close_debt_writes_the_debt_and_keeps_the_token_in_flight(tmp_path: Path) -> None:
+    """The closer's pre-signal write: bound replaced, stamp 0, claim time and holder kept."""
+    store = _store(tmp_path)
+    token, claimed_at = _in_flight(store, bound=_BOUND)
+    assert store.bind_close_debt("s1", token, _HOLDER, _DEBT)
+    row = store.get("s1")
+    assert row is not None
+    assert (row.close_requested_at, row.close_token, row.close_bound) == (0, token, _DEBT)
+    assert (row.close_claimed_at, row.close_holder) == (claimed_at, _HOLDER)
+    store.close()
+
+
+@pytest.mark.parametrize("change", ["token", "holder", "empty_holder", "pending", "reclaimed"])
+def test_bind_close_debt_with_changed_values_is_a_noop(tmp_path: Path, change: str) -> None:
+    store = _store(tmp_path)
+    token, claimed_at = _in_flight(store, bound=_BOUND)
+    sid_token, holder = token, _HOLDER
+    if change == "token":
+        sid_token = "stale"
+    elif change == "holder":
+        holder = _OTHER
+    elif change == "empty_holder":
+        assert store.restore_close("s1", token, bound=_BOUND)
+        assert store.claim_close("s1", token) > 0  # holderless in flight
+        holder = ""
+    elif change == "pending":
+        assert store.restore_close("s1", token, bound=_BOUND)
+    else:  # reclaimed by the sweep, then re-claimed by a second closer
+        assert store.reclaim_stale_close(
+            "s1", token, holder=_HOLDER, claimed_at=claimed_at, now=9_000_000
+        )
+        assert store.claim_close("s1", token, _OTHER) > 0
+    before = store.get("s1")
+    assert not store.bind_close_debt("s1", sid_token, holder, _DEBT)
+    after = store.get("s1")
+    assert before is not None and after is not None
+    assert dataclasses.replace(after, updated_at=0) == dataclasses.replace(before, updated_at=0)
+    assert after.close_bound == _BOUND
+    store.close()
+
+
 def test_two_concurrent_reclaims_of_one_token_exactly_one_wins(tmp_path: Path) -> None:
     import threading  # pylint: disable=import-outside-toplevel
 
