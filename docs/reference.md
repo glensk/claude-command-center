@@ -3593,6 +3593,20 @@ background jobs from `claude agents --json` too. Headless `claude -p` runs (regi
 | `aim_short`            | the short AIM label                                                                                |
 | `tab.iterm_session_id` | the iTerm session of the tab (null for a background job)                                           |
 | `tab.validated`        | the registry pid's controlling tty is the tab's tty                                                |
+| `agents`               | optional, `-j` only: the session's running background subagents (below)                            |
+
+`agents` lists the subagents the session launched in the background that still run, in launch
+order, at most 20. "Running" is the in-flight definition: an `async_launched` agent launch
+with no later `<task-notification>` naming it and no successful `TaskStop` on it (last 32 MB of
+the transcript). Foreground Agent calls, Bash tasks and keep-warm timers are not listed. Each
+entry: `id` (the agent id), `description`, `agent_type` (both from the agent's `meta.json`,
+else the launch input, else `""`), `state` (always `"running"`), `started_at` (the launch
+record's time, ISO-8601 UTC `YYYY-MM-DDTHH:MM:SSZ`, or null) and `tp_id` (the int of the
+first line-start `[tp-item: N]` marker in the launch prompt, or null). Metadata only, never
+transcript text. The key is **omitted** when the inventory is unknown (no or unreadable
+transcript, a malformed record, a scan skipped by the 150 ms per-call budget, any error)
+and is `[]` when the scan ran and nothing runs. Results are cached per transcript in the
+store (`subagent_scan`); plain `ccc sessions` never scans.
 
 `ccc name -s ID "x y"` (`-s/--session`, `-A/--auto`, `-R/--reset`, `-j/--json`) shows or
 sets the name; `-R` drops a hand-set name and hands the session back to the automatic namer

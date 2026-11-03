@@ -19,7 +19,9 @@ to §6 (:mod:`command_center.adapters.claude_agents`: registry ``shell`` → bus
 ``validated`` only when the registry pid's controlling tty is the tab's tty (spike
 S-IDENT); a stored tab id that is missing or wrong is resolved by that tty
 (:func:`bridge_target.resolve_tab`). Headless ``claude -p`` runs (registry
-``entrypoint`` ``sdk-cli``) are not sessions and never listed.
+``entrypoint`` ``sdk-cli``) are not sessions and never listed. With ``-j`` only, a session
+whose subagent inventory is known carries ``agents``: its running background subagents
+(:mod:`command_center.session_agents`; omitted when unknown, ``[]`` when none runs).
 
 ``ccc name -s ID "x y"`` renames a session (a name another active session holds is
 refused, exit 1) and prints the ``/rename <name>`` line to type into the running Claude
@@ -73,12 +75,19 @@ from .bridge_json import (
 from .bridge_target import resolve_tab
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .adapters.claude import ClaudeAdapter
     from .adapters.claude_agents import AgentEntry
     from .config import Config
     from .models import LiveSession, Session
     from .store import Store
     from .tab_titles import ItermPane
+
+    #: ``session_agents.inventory``'s shape: targets ``(sid, transcript)`` → known agents.
+    SubagentsReader = Callable[
+        [Store, list[tuple[str, Path | None]]], dict[str, list[dict[str, Any]]]
+    ]
 
 # Subcommands whose argv errors are answered with an envelope (see :func:`dispatch`).
 JSON_COMMANDS: frozenset[str] = frozenset(
@@ -271,6 +280,31 @@ def _named_row(
     return row
 
 
+def _attach_subagents(
+    entries: list[dict[str, Any]],
+    lives: list[LiveSession],
+    adapter: ClaudeAdapter,
+    db: Store,
+    reader: SubagentsReader,
+) -> None:
+    """Give each entry *reader* knows an ``agents`` list; any error leaves all without one."""
+    try:
+        targets = [
+            (
+                live.session_id,
+                adapter.transcript_path(live.cwd, live.session_id, live.config_dir or None),
+            )
+            for live in lives
+        ]
+        known = reader(db, targets)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return
+    for entry in entries:
+        agents = known.get(entry["session_id"])
+        if isinstance(agents, list):
+            entry["agents"] = agents
+
+
 def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
     *,
     adapter: ClaudeAdapter | None = None,
@@ -280,6 +314,7 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
     ps_reader: Callable[[], dict[int, Any]] | None = None,
     account_label: Callable[[str], str] | None = None,
     agents_reader: Callable[[], list[AgentEntry]] | None = None,
+    subagents_reader: SubagentsReader | None = None,
 ) -> list[dict[str, Any]]:
     """Every Claude Code session of every account, shaped for ``ccc sessions -j``.
 
@@ -290,6 +325,10 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
     deterministic one first (no LLM inside the 3 s budget — the daemon and ``set-aim``
     hand out the LLM names). Every collaborator is injectable so tests never touch iTerm,
     ``ps``, ``claude`` or the real registries.
+
+    *subagents_reader* (``session_agents.inventory`` for ``-j``; ``None`` skips it) maps
+    ``(session_id, transcript path)`` targets to running subagents; a session it returns
+    gets ``agents``, the others no key. Any error in it leaves every session without one.
     """
     from . import accounts, config, tab_titles, terminal
     from .adapters import claude_agents
@@ -331,6 +370,8 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
             if background:
                 entry["kind"] = "background"
             out.append(entry)
+        if subagents_reader is not None:
+            _attach_subagents(out, lives, adapter, db, subagents_reader)
     finally:
         if own_store:
             db.close()
@@ -347,7 +388,11 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
 def cmd_sessions(args: argparse.Namespace) -> int:
     """``ccc sessions [-j]`` — every live Claude Code session, both accounts."""
     if getattr(args, "json", False):
-        return run_json(lambda: {"sessions": collect_sessions()})
+        from . import session_agents
+
+        return run_json(
+            lambda: {"sessions": collect_sessions(subagents_reader=session_agents.inventory)}
+        )
     try:
         sessions = collect_sessions()
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught

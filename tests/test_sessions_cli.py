@@ -30,11 +30,20 @@ class PsRow:
 
 
 class FakeAdapter:
-    def __init__(self, lives: list[LiveSession]) -> None:
+    def __init__(
+        self, lives: list[LiveSession], transcripts: dict[str, Path] | None = None
+    ) -> None:
         self.lives = lives
+        self.transcripts = transcripts or {}
 
     def discover(self) -> list[LiveSession]:
         return self.lives
+
+    def transcript_path(
+        self, cwd: str, session_id: str, config_dir: str | None = None
+    ) -> Path | None:
+        del cwd, config_dir
+        return self.transcripts.get(session_id)
 
 
 def _live(sid: str, pid: int, config_dir: str = PRIV, **kw: Any) -> LiveSession:
@@ -64,6 +73,8 @@ def _collect(  # pylint: disable=too-many-arguments
     ps: dict[int, PsRow],
     panes: list[ItermPane] | None,
     agents: list[AgentEntry] | None = None,
+    *,
+    subagents_reader: Any = None,
 ) -> list[dict[str, Any]]:
     labels = {PRIV: "private", WORK: "work"}
     return bridge_cli.collect_sessions(
@@ -74,6 +85,7 @@ def _collect(  # pylint: disable=too-many-arguments
         ps_reader=lambda: ps,
         account_label=lambda cd: labels.get(cd, cd),
         agents_reader=lambda: list(agents or []),
+        subagents_reader=subagents_reader,
     )
 
 
@@ -300,6 +312,104 @@ def test_account_conflict_is_flagged(store: Store) -> None:
     assert len(entries) == 1
     entry = entries[0]
     assert entry["account_conflict"] is True and entry["account"] is None
+
+
+# --------------------------------------------------------------------------- subagents key
+_AGENT = {
+    "id": "ag1",
+    "description": "build B4",
+    "agent_type": "builder",
+    "state": "running",
+    "started_at": "2026-11-03T02:51:34Z",
+    "tp_id": 42,
+}
+_B2 = Path(__file__).parent / "fixtures" / "session_agents" / "proj" / "sess-0002.jsonl"
+
+
+class _Reader:
+    """A ``subagents_reader`` stub that records its calls and answers *known*."""
+
+    def __init__(self, known: dict[str, list[dict[str, Any]]]) -> None:
+        self.known = known
+        self.calls: list[tuple[Store, list[tuple[str, Path | None]]]] = []
+
+    def __call__(
+        self, store: Store, targets: list[tuple[str, Path | None]]
+    ) -> dict[str, list[dict[str, Any]]]:
+        self.calls.append((store, list(targets)))
+        return self.known
+
+
+def test_subagents_key_present_with_entries(store: Store) -> None:
+    reader = _Reader({"a1": [_AGENT]})
+    lives = [_live("a1", 11), _live("b2", 22, kind="bg")]
+    out = {e["session_id"]: e for e in _collect(store, lives, {}, [], subagents_reader=reader)}
+    assert out["a1"]["agents"] == [_AGENT]
+    assert "agents" not in out["b2"]  # the reader omitted it
+    assert len(reader.calls) == 1 and reader.calls[0][0] is store
+    assert [sid for sid, _ in reader.calls[0][1]] == ["a1", "b2"]  # background included
+
+
+def test_subagents_key_present_and_empty(store: Store) -> None:
+    entries = _collect(store, [_live("a1", 11)], {}, [], subagents_reader=_Reader({"a1": []}))
+    assert entries[0]["agents"] == []
+
+
+def test_subagents_key_absent_when_the_reader_omits_the_sid(store: Store) -> None:
+    entries = _collect(store, [_live("a1", 11)], {}, [], subagents_reader=_Reader({}))
+    assert "agents" not in entries[0]
+
+
+def test_subagents_key_absent_when_the_reader_raises(store: Store) -> None:
+    def boom(_store: Store, _targets: list[tuple[str, Path | None]]) -> dict[str, Any]:
+        raise RuntimeError("cache unreadable")
+
+    entries = _collect(store, [_live("a1", 11), _live("b2", 22)], {}, [], subagents_reader=boom)
+    assert [e["session_id"] for e in entries] == ["a1", "b2"]
+    assert all("agents" not in e for e in entries)
+
+
+def test_subagents_key_absent_without_a_reader(store: Store) -> None:
+    """The plain-text default (``subagents_reader=None``) never adds the key."""
+    entries = _collect(store, [_live("a1", 11)], {}, [])
+    assert "agents" not in entries[0]
+
+
+def test_subagents_key_leaves_every_other_key_unchanged(store: Store) -> None:
+    store.ensure("a1", cwd="/r/voice")
+    store.set_aim("a1", "parser")
+    lives = [_live("a1", 11)]
+    plain = _collect(store, lives, {}, [])
+    with_key = _collect(store, lives, {}, [], subagents_reader=_Reader({"a1": [_AGENT]}))
+    assert with_key[0].pop("agents") == [_AGENT]
+    assert with_key == plain
+
+
+def test_subagents_key_on_an_account_conflict_row(store: Store) -> None:
+    lives = [_live("a1", 11, "", conflict=True)]
+    entries = _collect(store, lives, {}, [], subagents_reader=_Reader({"a1": [_AGENT]}))
+    assert entries[0]["account_conflict"] is True and entries[0]["agents"] == [_AGENT]
+
+
+def test_subagents_key_with_the_real_inventory_and_an_own_store() -> None:
+    """No injected store: the reader runs before ``collect_sessions`` closes its own."""
+    from command_center import session_agents
+
+    entries = bridge_cli.collect_sessions(
+        adapter=FakeAdapter([_live("a1", 11)], {"a1": _B2}),  # type: ignore[arg-type]
+        cfg=config.Config(session_names=True),
+        panes_reader=lambda: [],
+        ps_reader=lambda: {},
+        account_label=lambda cd: cd,
+        agents_reader=lambda: [],
+        subagents_reader=session_agents.inventory,
+    )
+    assert [a["id"] for a in entries[0]["agents"]] == ["ag-run", "ag-nometa", "ag-nots"]
+    reopened = Store()
+    try:
+        assert str(_B2) in reopened.get_subagent_scans([str(_B2)])
+    finally:
+        reopened.close()
 
 
 def test_tab_lookup_prefers_the_live_pid_row(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
