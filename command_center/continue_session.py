@@ -1032,7 +1032,9 @@ def _idle_now(adapter: ClaudeAdapter, src: Source) -> bool:
     from .bridge_send import inspect_transcript
 
     live = next((e for e in adapter.discover() if e.session_id == src.session_id and e.alive), None)
-    if live is None or contract_status(live.raw_status) != "idle":
+    # ``shell`` passes here only provisionally: it is idle only with no open turn
+    # (tp#1662), which the transcript check below enforces.
+    if live is None or contract_status(live.raw_status, False) != "idle":
         return False
     if src.transcript is None or not src.transcript.is_file():
         return False

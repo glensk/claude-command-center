@@ -253,12 +253,53 @@ def test_done_but_busy_is_refused_busy(tmp_path: Path, monkeypatch: pytest.Monke
     _nothing_signalled(world)
 
 
-@pytest.mark.parametrize("raw", ["busy", "shell", "waiting"])
+@pytest.mark.parametrize("raw", ["busy", "waiting"])
 def test_not_idle_registry_is_busy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str
 ) -> None:
     world, deps = _install(tmp_path, monkeypatch)
     world.statuses = [raw]
+    _refused(deps, "busy")
+    _nothing_signalled(world)
+
+
+@pytest.mark.parametrize("keepwarm", [False, True])
+def test_shell_with_no_open_turn_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keepwarm: bool
+) -> None:
+    """tp#1662: ``shell`` after the turn ended (a keep-warm timer alive) is idle."""
+    world, deps = _install(tmp_path, monkeypatch)
+    world.statuses = ["shell"]
+    if keepwarm:
+        world.table[5002] = PsRow(PID, TTY, "S", BG_SHELL.replace("sleep 600", "cc-keepwarm.sh"))
+    data = bridge_close.run_close(deps, SID)
+    assert data["result"] == "closed"
+    assert world.killed == [(PID, signal.SIGTERM)]
+
+
+def test_shell_with_real_background_shell_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    world.statuses = ["shell"]
+    world.table[5001] = PsRow(PID, TTY, "S", BG_SHELL)
+    _refused(deps, "background_shell")
+    _nothing_signalled(world)
+
+
+def test_shell_with_open_turn_is_busy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    world.statuses = ["shell"]
+    world.append(_prompt("u2", "another one"))
+    _refused(deps, "busy")
+    _nothing_signalled(world)
+
+
+def test_shell_without_transcript_is_busy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unknown turn state keeps ``shell`` busy (fail closed)."""
+    world, deps = _install(tmp_path, monkeypatch)
+    world.statuses = ["shell"]
+    monkeypatch.setattr(cli.ClaudeAdapter, "transcript_path", lambda *_a, **_k: None)
     _refused(deps, "busy")
     _nothing_signalled(world)
 

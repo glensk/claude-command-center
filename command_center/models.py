@@ -146,6 +146,22 @@ class CloseClaim:
 BUSY_RAW_STATUSES = frozenset({"busy", "shell"})
 
 
+def effective_status(raw: str | None, turn_active: bool | None) -> str:
+    """The registry *raw* status with a turn-less ``shell`` read as ``idle`` (tp#1662).
+
+    Claude Code 2.1.317 leaves the registry at ``shell`` after a turn ENDS while a
+    ``run_in_background`` Bash (e.g. the keep-warm timer) still lives, so ``shell`` alone
+    cannot tell a running shell tool from an idle session holding a background shell.
+    The transcript can: ``turn_active is False`` (no open turn) makes it ``idle``. A
+    ``True`` or unknown (``None``) *turn_active* keeps ``shell`` busy — fail closed.
+    Every other status is returned unchanged.
+    """
+    text = raw or ""
+    if text.strip().lower() == "shell" and turn_active is False:
+        return "idle"
+    return text
+
+
 @dataclass
 class LiveSession:
     """A session currently registered in ``~/.claude/sessions/<pid>.json``."""
@@ -1211,6 +1227,8 @@ def derive_status(  # pylint: disable=too-many-return-statements  # ordered prec
     halted: bool = False,
     background: bool = False,
     codex_waiting: bool = False,
+    *,
+    turn_active: bool | None = None,
 ) -> Status:
     """Combine the live raw status, process liveness, the done flag and a rate-limit halt.
 
@@ -1234,8 +1252,14 @@ def derive_status(  # pylint: disable=too-many-return-statements  # ordered prec
     otherwise-IDLE slot as SNOOZED, but with explicit precedence: SNOOZED wins when a
     live background task exists; otherwise an idle Codex-workflow session whose quota
     is exhausted becomes WAITING_CODEX until the reset window passes.
+
+    ``turn_active`` is the transcript's open-turn signal, read through
+    :func:`effective_status`: a ``shell`` raw status with ``turn_active is False`` is an
+    idle session holding a background shell (SNOOZED when ``background``), not WORKING.
+    ``None`` (unknown, the default) keeps ``shell`` busy.
     """
-    busy = live is not None and live.alive and (live.raw_status or "").lower() in BUSY_RAW_STATUSES
+    raw = effective_status(live.raw_status, turn_active).lower() if live is not None else ""
+    busy = live is not None and live.alive and raw in BUSY_RAW_STATUSES
     if stored is not None and stored.handed_off_to:
         # Terminal like done (tp#1300): the work moved to the successor. Only a turn that is
         # literally still running (the finalize message being written) reads WORKING. Once
@@ -1250,7 +1274,6 @@ def derive_status(  # pylint: disable=too-many-return-statements  # ordered prec
         return Status.PARKED
     if halted:
         return Status.HALTED
-    raw = (live.raw_status or "").lower()
     if raw in BUSY_RAW_STATUSES:
         return Status.WORKING
     if raw.startswith("wait"):

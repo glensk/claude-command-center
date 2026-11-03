@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..models import BUSY_RAW_STATUSES
+from ..models import BUSY_RAW_STATUSES, effective_status
 
 _LOG = logging.getLogger(__name__)
 
@@ -63,9 +63,16 @@ BACKGROUND_STATE: dict[str, str] = {
 SESSION_KINDS = frozenset({"interactive", "bg", "fleet"})
 
 
-def contract_status(raw: str | None) -> str:
-    """The §6 status of a registry / interactive-agents *raw* status (``unknown`` if new)."""
-    return REGISTRY_STATUS.get(str(raw or "").strip().lower(), "unknown")
+def contract_status(raw: str | None, turn_active: bool | None = None) -> str:
+    """The §6 status of a registry / interactive-agents *raw* status (``unknown`` if new).
+
+    *turn_active* is the transcript's open-turn signal when the caller has it: a ``shell``
+    status with no open turn (``False``) is ``idle`` (:func:`models.effective_status`,
+    tp#1662); ``None`` (unknown, the default) keeps ``shell`` busy.
+    """
+    return REGISTRY_STATUS.get(
+        effective_status(str(raw or ""), turn_active).strip().lower(), "unknown"
+    )
 
 
 def background_status(state: str | None, raw: str | None = None) -> str:

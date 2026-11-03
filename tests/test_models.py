@@ -23,6 +23,7 @@ from command_center.models import (
     done_bar_parts,
     dumps_todos,
     effective_progress,
+    effective_status,
     empty_track_tint,
     expand_llm_choice,
     humanize_age,
@@ -372,6 +373,37 @@ def test_derive_status_snoozed() -> None:
     assert derive_status(_live("idle", alive=False), Session("s"), background=True) is Status.PARKED
     # No background task → plain IDLE (state derived purely from session/live facts).
     assert derive_status(_live("idle"), Session("s"), background=False) is Status.IDLE
+
+
+@pytest.mark.parametrize(
+    ("raw", "turn_active", "want"),
+    [
+        ("shell", False, "idle"),
+        ("SHELL", False, "idle"),
+        ("shell", True, "shell"),
+        ("shell", None, "shell"),
+        ("busy", False, "busy"),
+        ("waiting", False, "waiting"),
+        ("idle", True, "idle"),
+        (None, False, ""),
+    ],
+)
+def test_effective_status(raw: str | None, turn_active: bool | None, want: str) -> None:
+    """tp#1662: only ``shell`` with no open turn reads idle; unknown fails closed."""
+    assert effective_status(raw, turn_active) == want
+
+
+def test_derive_status_shell_with_no_open_turn() -> None:
+    # tp#1662: an ended turn holding a background shell is SNOOZED / IDLE, not WORKING …
+    assert derive_status(_live("shell"), Session("s"), background=True, turn_active=False) is (
+        Status.SNOOZED
+    )
+    assert derive_status(_live("shell"), Session("s"), turn_active=False) is Status.IDLE
+    assert derive_status(_live("shell"), Session("s", done=True), turn_active=False) is Status.DONE
+    # … while an open or unknown turn keeps it WORKING (fail closed).
+    assert derive_status(_live("shell"), Session("s"), turn_active=True) is Status.WORKING
+    assert derive_status(_live("shell"), Session("s")) is Status.WORKING
+    assert derive_status(_live("shell"), Session("s", done=True)) is Status.WORKING
 
 
 def test_derive_status_waiting_codex() -> None:

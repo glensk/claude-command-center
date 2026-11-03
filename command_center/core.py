@@ -289,6 +289,25 @@ def _has_background_task(adapter: Adapter, pid: int) -> bool:
     return bool(fn and fn(pid))
 
 
+def _shell_turn_active(adapter: Adapter, live: LiveSession) -> bool | None:
+    """The transcript's open-turn signal for a live ``shell`` session, else ``None``.
+
+    Only a ``shell`` raw status needs it (:func:`models.effective_status`, tp#1662): an
+    ended turn holding a background shell reads ``shell`` too. ``transcript_path`` is a
+    concrete-adapter capability, probed defensively like ``has_background_task``; the
+    tail read runs for ``shell`` rows only. ``None`` (unknown) keeps the row busy.
+    """
+    if not live.alive or (live.raw_status or "").strip().lower() != "shell":
+        return None
+    find = getattr(adapter, "transcript_path", None)
+    path = find(live.cwd, live.session_id, live.config_dir or None) if find else None
+    if path is None:
+        return None
+    from .adapters.claude import transcript_turn_in_flight
+
+    return transcript_turn_in_flight(path)
+
+
 def _uses_codex_workflow(adapter: Adapter, session: Session) -> bool:
     """Whether *session* is using the Codex implementation workflow.
 
@@ -522,6 +541,7 @@ def reconcile_pass(  # pylint: disable=too-many-locals,too-many-branches,too-man
             halted=halted,
             background=background,
             codex_waiting=uses_codex and codex_exhausted,
+            turn_active=_shell_turn_active(adapter, live),
         )
         fields: dict[str, object] = {
             "status": status.value,

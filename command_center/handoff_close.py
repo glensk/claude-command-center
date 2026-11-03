@@ -269,7 +269,9 @@ def observe(adapter: ClaudeAdapter, session_id: str, bound: Bound) -> tuple[int,
         raise Refused(
             f"the live source pid changed ({bound.pid} → {entry.pid})", "identity_changed"
         )
-    if contract_status(entry.raw_status) != "idle":
+    # ``shell`` passes here only provisionally: it is idle only with no open turn
+    # (tp#1662), which the transcript check below enforces (``active is not False``).
+    if contract_status(entry.raw_status, False) != "idle":
         raise Refused(f"source busy (registry {entry.raw_status or 'unknown'})", "busy")
     if _start_of(bound.pid) != bound.start:
         raise Refused(f"pid {bound.pid} was replaced (start time differs)", "identity_changed")

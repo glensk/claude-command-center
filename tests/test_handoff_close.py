@@ -246,6 +246,40 @@ def test_busy_or_unknown_registry_is_refused(
     _assert_refused_and_restored(world, token, tmp_path, "source busy")
 
 
+def test_shell_status_with_no_open_turn_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1662: ``shell`` after the turn ended (a background shell alive) is idle."""
+    world = _install(tmp_path, monkeypatch)
+    world.statuses = ["shell"]
+    _seed()
+    assert handoff_close.run(_args()) == 0
+    assert world.killed == [(PID, signal.SIGTERM)]
+
+
+def test_shell_status_with_an_open_turn_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = _install(tmp_path, monkeypatch)
+    world.statuses = ["shell"]
+    world.append(_prompt("u2", "still working"))
+    token = _seed()
+    assert handoff_close.run(_args()) == 1
+    _assert_refused_and_restored(world, token, tmp_path, "turn active")
+
+
+def test_shell_status_with_an_unreadable_transcript_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unknown turn state never turns ``shell`` idle (fail closed)."""
+    world = _install(tmp_path, monkeypatch)
+    world.statuses = ["shell"]
+    world.transcript.unlink()
+    token = _seed()
+    assert handoff_close.run(_args()) == 1
+    _assert_refused_and_restored(world, token, tmp_path, "transcript unreadable")
+
+
 @pytest.mark.parametrize(("entries", "text"), [(2, "conflict"), (0, "no live source process")])
 def test_conflicting_or_missing_entries_are_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entries: int, text: str

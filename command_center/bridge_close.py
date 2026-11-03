@@ -137,7 +137,10 @@ def _idle_gate(adapter: ClaudeAdapter, sid: str, live: Any) -> None:
             raise _refusal(sid, "unobservable", exc.message) from exc
     if ins is not None and ins.pending:
         raise _refusal(sid, "picker_pending", "the session shows a question picker")
-    if contract_status(live.raw_status) != "idle":
+    # A ``shell`` status with no open turn is an idle session holding a background shell
+    # (tp#1662); the in-flight probe below still refuses a real one (keep-warm excepted).
+    turn_active = ins.turn_active if ins is not None else None
+    if contract_status(live.raw_status, turn_active) != "idle":
         raise _refusal(sid, "busy", f"session is {live.raw_status or 'unknown'}, not idle")
     if ins is None:
         raise _refusal(sid, "unobservable", "no transcript found for the session")

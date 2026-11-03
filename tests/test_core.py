@@ -123,6 +123,39 @@ def test_reconcile_marks_snoozed_when_background_task_live(tmp_path: Path) -> No
     store.close()
 
 
+@pytest.mark.parametrize(
+    ("tail", "want"),
+    [
+        ('{"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}}', "snz"),
+        ('{"type": "user", "message": {"content": "go on"}}', "wrk"),
+        (None, "wrk"),
+    ],
+)
+def test_reconcile_shell_status_reads_the_transcript_turn(
+    tmp_path: Path, tail: str | None, want: str
+) -> None:
+    """tp#1662: ``shell`` with an ended turn + a live bg task is SNOOZED, else WORKING."""
+    from command_center.core import reconcile
+
+    transcript = tmp_path / "t.jsonl"
+    if tail is not None:
+        transcript.write_text(tail + "\n", encoding="utf-8")
+
+    class _ShellAdapter(_LiveAdapter):
+        def transcript_path(self, *_args: object) -> Path | None:
+            return transcript if tail is not None else None
+
+    store = Store(tmp_path / "s.db")
+    store.ensure("sh")
+    store.update_fields("sh", cwd="/x", status=Status.IDLE.value)
+    reconcile(store, _ShellAdapter("sh", "/x", raw_status="shell", background=True))
+    session = store.get("sh")
+    assert session is not None
+    expected = Status.SNOOZED if want == "snz" else Status.WORKING
+    assert session.status == expected.value
+    store.close()
+
+
 def test_build_rows_exposes_codex_workflow_from_job_type_and_adapter(tmp_path: Path) -> None:
     store = Store(tmp_path / "s.db")
     store.ensure("draft-launched", cwd="/repo")
