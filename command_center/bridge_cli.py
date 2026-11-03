@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Machine-facing ``ccc … -j`` commands of the voice bridge (PLAN_claude-bridge.md §6).
 
-``sessions``, ``name``, ``inspect``, ``send``, ``answer``, ``delivery`` and ``events`` —
-internal-style commands (no TUI key) that the voice assistant and other agents drive with
-``-j``. The envelope, exit codes and input checks live in :mod:`command_center.bridge_json`:
+``sessions``, ``name``, ``inspect``, ``send``, ``answer``, ``close``, ``lineage``,
+``delivery`` and ``events`` — internal-style commands (no TUI key) that the voice
+assistant and other agents drive with ``-j``. The envelope, exit codes and input checks
+live in :mod:`command_center.bridge_json`:
 
 * stdout carries exactly ONE envelope ``{"schema_version": 1, "ok": bool, "data": {…} |
   null, "error": {"code": str, "message": str} | null}``; logs go to stderr only;
@@ -32,6 +33,9 @@ unfreezes its tab title (tp#1297).
 ``ccc close -s ID -j`` closes an IDLE live session from outside it (tp#1481,
 :mod:`command_center.bridge_close`): SIGTERM + its tmux pane / iTerm pane or tab, refused
 with a ``reason`` unless the session is provably idle; DONE stays DONE, else PARKED.
+
+``ccc lineage -s ID -j`` lists a session's continue-session predecessors, newest first
+(tp#1481, :mod:`command_center.bridge_lineage`; read-only, ≤ 50 hops, cycle guard).
 
 ``inspect`` / ``send`` / ``answer`` / ``delivery`` / ``events`` read a session's
 transcript, type into its tab and follow deliveries up (``bridge_inspect`` …
@@ -95,7 +99,7 @@ if TYPE_CHECKING:
 
 # Subcommands whose argv errors are answered with an envelope (see :func:`dispatch`).
 JSON_COMMANDS: frozenset[str] = frozenset(
-    {"sessions", "name", "inspect", "send", "answer", "delivery", "events", "close"}
+    {"sessions", "name", "inspect", "send", "answer", "delivery", "events", "close", "lineage"}
 )
 
 _AIM_SHORT_MAX = 80
@@ -581,6 +585,12 @@ def cmd_close(args: argparse.Namespace) -> int:
     return _run(args, lambda deps: run_close(deps, args.session))
 
 
+def cmd_lineage(args: argparse.Namespace) -> int:
+    from .bridge_lineage import run_lineage
+
+    return _run(args, lambda deps: run_lineage(deps, args.session))
+
+
 def cmd_delivery(args: argparse.Namespace) -> int:
     from .bridge_events import run_delivery
 
@@ -656,7 +666,7 @@ def _json_flag(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_transcript_parsers(sub: Any) -> None:
-    """Register ``inspect``, ``send``, ``answer``, ``close``, ``delivery`` and ``events``."""
+    """Register ``inspect``, ``send``, ``answer``, ``close``, ``lineage``, ``delivery`` …"""
     p = sub.add_parser(
         "inspect",
         help="what a session last said + the decision it needs (voice bridge)",
@@ -722,6 +732,24 @@ def _add_transcript_parsers(sub: Any) -> None:
     p.add_argument("-s", "--session", required=True, help="Claude session id")
     _json_flag(p)
     p.set_defaults(func=cmd_close)
+
+    p = sub.add_parser(
+        "lineage",
+        help="a session's continue-session predecessors, newest first (read-only)",
+        description=(
+            "Lists a session's predecessors (the sessions it took over from through ccc "
+            "continue-session), "
+            "newest first: the row's handed_off_from, else the best non-failed transfer "
+            "into it (a failed transfer is skipped). At most 50 hops; a repeated id cuts "
+            "the walk (cycle guard); either cut sets truncated. Read-only. An unknown id "
+            "answers an empty chain. data: {session_id, chain: [{session_id, at, via: "
+            "continue-session, state}], truncated}; at = ISO-8601 UTC or null, state = "
+            "prepared|opened|accepted|finalized or null. Example: ccc lineage -s ID -j"
+        ),
+    )
+    p.add_argument("-s", "--session", required=True, help="full Claude session id")
+    _json_flag(p)
+    p.set_defaults(func=cmd_lineage)
 
     p = sub.add_parser("delivery", help="state of one `ccc send` delivery")
     p.add_argument("-i", "--id", required=True, help="delivery id (from ccc send)")

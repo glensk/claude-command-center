@@ -78,7 +78,7 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 - `ccc rm` · `ccc prune` — drop a tracked row / delete leftovers (contentless, headless `claude -p`, and dead-launched jobs that never had a turn).
 - `ccc peek` (`--print`) · `ccc jump` — the macOS peek panel / the ccc↔session toggle.
 - `ccc snapshot` (`-l/--list`, `-n/--dry-run`) · `ccc restore-snapshot [name]` (`-n/--dry-run`, `-y/--yes`) — save the whole iTerm layout before a reboot, rebuild it afterwards.
-- `ccc sessions` · `ccc inspect` · `ccc send` · `ccc answer` · `ccc close` · `ccc delivery` · `ccc events` · `ccc name` (all `-j`) — the voice-bridge JSON CLI: list, read, message, answer and close live sessions; see "The voice-bridge JSON CLI" below.
+- `ccc sessions` · `ccc inspect` · `ccc send` · `ccc answer` · `ccc close` · `ccc lineage` · `ccc delivery` · `ccc events` · `ccc name` (all `-j`) — the voice-bridge JSON CLI: list, read, message, answer and close live sessions, list a session's predecessors; see "The voice-bridge JSON CLI" below.
 
 **Obsidian & mirrors**
 
@@ -3537,7 +3537,7 @@ converge via `observed_at` ordering.
 Machine-facing commands (no TUI key) that the mac-voice Claude bridge (my-stt-tts
 `claude_sessions.py` / `attention.py`) and other agents drive to list, read, message and
 answer live Claude Code sessions. Code: `command_center/bridge_cli.py` and the
-`bridge_{json,target,inspect,send,answer,close,delivery,events,store}.py` modules beside it.
+`bridge_{json,target,inspect,send,answer,close,lineage,delivery,events,store}.py` modules beside it.
 
 ```commands
 ccc sessions -j                                    # every live session of every account
@@ -3547,6 +3547,7 @@ echo 'run the tests' | ccc send -s <session-id> -j # type a message into the ses
 echo '{"decision_id": "…", "answers": [{"question_index": 0, "option_indices": [1]}]}' \
   | ccc answer -s <session-id> -j                  # answer its AskUserQuestion picker
 ccc close -s <session-id> -j                       # close an IDLE session (decide's close)
+ccc lineage -s <session-id> -j                     # its continue-session predecessors
 ccc delivery -i <delivery-id> -j                   # follow one send up
 ccc events -a 0 -l 200 -j                          # the problem stream after a cursor
 ```
@@ -3749,6 +3750,20 @@ session done. `data = {session_id, result: "closed", terminal, status, close_deb
 `close_debt: true` = the pane did not close: a repeated call closes it without signalling
 again. A session already gone answers `not_running`. `ccc mark-done --close` stays the
 in-session path (it arms a close for after the next turn).
+
+### `ccc lineage` (`-s/--session ID`, `-j/--json`)
+
+A session's continue-session predecessors, newest first (tp#1481; decide's relay
+lineage collector). Code: `bridge_lineage.py`. Read-only: it only reads ccc's store.
+From the given (full) session id it walks back one hop at a time: the row's
+`handed_off_from` (its `at` / `state` from the matching transfer, else `handed_off_at` and
+`state: null`), else the best non-failed `transfers` row into the session (`finalized`,
+then `accepted`, `opened`, `prepared`, then the newest). A `failed` transfer is never a
+hop. At most 50 hops; an id already in the chain (or the session itself) cuts the walk
+(cycle guard); either cut sets `truncated: true`. An unknown id answers an empty chain
+(exit 0). `data = {session_id, chain: [{session_id, at, via: "continue-session", state}],
+truncated}`; `at` = ISO-8601 UTC when the successor took over (accepted, else finalized /
+opened / created; `null` when unknown).
 
 ### `ccc delivery` (`-i/--id ID`, `-j/--json`)
 
