@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """The running background subagents of one session, read cold from its transcript (tp#1598).
 
 ``running_agents`` is the producer behind the optional per-session ``agents`` array of
@@ -9,6 +10,17 @@ Stdlib-only at import time.
 
 from __future__ import annotations
 
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
+
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import json
 import os
 import re
