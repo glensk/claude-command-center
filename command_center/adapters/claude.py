@@ -758,6 +758,40 @@ def background_work_split(transcript: Path) -> tuple[list[str], list[str]] | Non
     as "refuse", never as "clear". Only the last 32 MB are scanned, which comfortably
     covers any session's background history.
     """
+    scan = background_launch_scan(transcript)
+    return None if scan is None else (scan.pending, scan.keepwarm)
+
+
+@dataclasses.dataclass(frozen=True)
+class BackgroundLaunch:
+    """A background task's launch record and the ``tool_use`` input that started it."""
+
+    record: dict[str, object]  # the transcript record whose toolUseResult reports the launch
+    tool_input: dict[str, object]  # the matching Agent/Task tool_use input ({} when unknown)
+
+
+@dataclasses.dataclass(frozen=True)
+class BackgroundScan:
+    """What :func:`background_launch_scan` found: the split plus the launch records."""
+
+    pending: list[str]
+    keepwarm: list[str]
+    launches: dict[str, BackgroundLaunch]  # every launched task id (ended ones too)
+
+
+# Tool names whose ``tool_use`` input is kept for the launch map (Bash inputs can be huge
+# and the keep-warm check reads them in-pass; agents are what callers need the input of).
+_AGENT_TOOL_NAMES = frozenset({"Agent", "Task"})
+
+
+def background_launch_scan(transcript: Path) -> BackgroundScan | None:
+    """The ONE scan behind :func:`background_work_split` (same contract, same ``None``).
+
+    Reads the last 32 MB (dropping a partial first line), and returns the pending and
+    keep-warm ids plus, for every launched task id, its launch record and the Agent/Task
+    ``tool_use`` input seen earlier in the same pass. ``None`` means UNKNOWN (unreadable
+    file, or a malformed record other than a partial last line).
+    """
     try:
         with transcript.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
@@ -774,6 +808,8 @@ def background_work_split(transcript: Path) -> tuple[list[str], list[str]] | Non
     stops: dict[str, str] = {}  # TaskStop tool_use id -> task id it targets
     keepwarm_uses: set[str] = set()  # Bash tool_use ids whose command is a keep-warm timer
     keepwarm: set[str] = set()  # launched task ids that are keep-warm timers
+    launches: dict[str, BackgroundLaunch] = {}
+    agent_inputs: dict[str, dict[str, object]] = {}  # Agent/Task tool_use id -> input
     for index, line in enumerate(lines):
         if not line.strip():
             continue
@@ -788,16 +824,38 @@ def background_work_split(transcript: Path) -> tuple[list[str], list[str]] | Non
         task_id = _launched_task_id(record)
         if task_id and task_id not in launched:
             launched.append(task_id)
+            use_ids = sorted(_tool_result_use_ids(record) & agent_inputs.keys())
+            launches[task_id] = BackgroundLaunch(
+                record, agent_inputs[use_ids[0]] if use_ids else {}
+            )
         if task_id and keepwarm_uses & _tool_result_use_ids(record):
             keepwarm.add(task_id)
         keepwarm_uses.update(_keepwarm_tool_use_ids(record))
+        agent_inputs.update(_agent_tool_inputs(record))
         ended.update(_notification_task_ids(record))
         _track_task_stops(record, stops, ended)
     in_flight = [task_id for task_id in launched if task_id not in ended]
-    return (
+    return BackgroundScan(
         [task_id for task_id in in_flight if task_id not in keepwarm],
         [task_id for task_id in in_flight if task_id in keepwarm],
+        launches,
     )
+
+
+def _agent_tool_inputs(record: dict[str, object]) -> dict[str, dict[str, object]]:
+    """``tool_use`` id -> input for the Agent/Task ``tool_use`` blocks in *record*."""
+    inputs: dict[str, dict[str, object]] = {}
+    for block in _content_blocks(record):
+        params = block.get("input")
+        use_id = block.get("id")
+        if (
+            block.get("type") == "tool_use"
+            and block.get("name") in _AGENT_TOOL_NAMES
+            and isinstance(use_id, str)
+            and isinstance(params, dict)
+        ):
+            inputs[use_id] = params
+    return inputs
 
 
 def _content_blocks(record: dict[str, object]) -> list[dict[str, object]]:
