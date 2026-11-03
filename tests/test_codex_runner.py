@@ -294,6 +294,68 @@ def test_task_failure_does_not_hop(
     assert quota.read_cooldowns() == {}
 
 
+_CHATGPT_MODEL_REFUSAL = {
+    "scenario": "scripted",
+    "rc": 1,
+    "stdout": [
+        json.dumps(
+            {
+                "type": "error",
+                "message": f"The '{_MODEL}' model is not supported when using Codex "
+                "with a ChatGPT account.",
+            }
+        )
+    ],
+}
+
+
+def test_model_refusal_hops_to_a_seat_that_serves_the_model(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#1632: a ChatGPT seat refusing the model moves on, and blocks nothing."""
+    three_seats.scenarios(
+        private=_CHATGPT_MODEL_REFUSAL,
+        de=_CHATGPT_MODEL_REFUSAL,
+        default={"scenario": "ok", "reply": "team answered"},
+    )
+    assert cic.cmd_run(_run_ns(three_seats)) == cic.EX_OK
+    envelope = _envelope(capsys)
+    assert three_seats.call_homes() == ["private", "de", "default"]
+    assert envelope["seat"]["label"] == "default"
+    assert envelope["reply"] == "team answered"
+    outcomes = [a["outcome"] for a in envelope["attempts"]]
+    assert outcomes == ["refused:model", "refused:model", "ok"]
+    assert quota.read_cooldowns() == {}  # the seats still serve every other model
+
+
+def test_model_refused_by_every_seat_is_exit_3(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No seat serves the model ⇒ model_unavailable (exit 3), not all_seats_unavailable."""
+    three_seats.scenarios(
+        private=_CHATGPT_MODEL_REFUSAL,
+        de=_CHATGPT_MODEL_REFUSAL,
+        default=_CHATGPT_MODEL_REFUSAL,
+    )
+    assert cic.cmd_run(_run_ns(three_seats)) == cic.EX_INVALID_MODEL
+    envelope = _envelope(capsys)
+    assert three_seats.call_homes() == ["private", "de", "default"]
+    assert envelope["error"]["kind"] == "model_unavailable"
+
+
+def test_model_refusal_under_dash_s_never_hops(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`run -S private` stays on that seat: the model refusal is its answer (exit 3)."""
+    three_seats.scenarios(
+        private=_CHATGPT_MODEL_REFUSAL, default={"scenario": "ok", "reply": "team"}
+    )
+    assert cic.cmd_run(_run_ns(three_seats, seat="private")) == cic.EX_INVALID_MODEL
+    envelope = _envelope(capsys)
+    assert three_seats.call_homes() == ["private"]
+    assert envelope["error"]["kind"] == "model_unavailable"
+
+
 def test_prompt_text_never_classifies(three_seats: SeatFixture) -> None:
     """A prompt full of refusal vocabulary must not look like a refusal."""
     three_seats.scenarios(private="task_fail", de={"scenario": "ok", "reply": "de"})

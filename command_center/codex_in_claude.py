@@ -5556,7 +5556,11 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
       still guards stalls).
     * **Only a seat refusal hops.** A task failure, a timeout, a stall and a missing
       binary are terminal: they say nothing about the seat, and hopping would re-run a
-      failing task on a second account.
+      failing task on a second account. The one task failure that hops is
+      ``model_unavailable`` ("The 'gpt-5.6-sol' model is not supported when using Codex
+      with a ChatGPT account"): models are served per account, so the next seat may
+      serve it (tp#1632). It records no cooldown block, and it is reported (exit 3) only
+      when no later seat served the round.
     * **In write mode a refusal that touched the worktree never hops** (``item.completed``
       of a non-benign type, a changed ``git status``, or a status we could not read):
       the caller must review a half-done edit, not get a second seat's attempt layered
@@ -5615,6 +5619,9 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
 
     attempted: set[str] = set()
     physical = 0
+    # (seat, reply, message) of a seat that does not serve *model* (tp#1632): reported
+    # as model_unavailable only when no later seat serves the round.
+    model_refusal: tuple[SeatCandidate, str, str] | None = None
     while True:
         if attempted and resume_home is None:
             # a hold written mid-run removes a seat
@@ -5785,9 +5792,23 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
         if not failure.kind:
             # Non-zero exit the seat is not to blame for: report it, keep the seat.
             kind, _evidence = classify_task_failure(proc.returncode, events, proc.stderr or "")
+            message = task_failure_message(kind, proc.returncode, cause, model)
+            if kind == "model_unavailable" and _model_refusal_may_hop(
+                seat, resume_home, write, before, workdir, events
+            ):
+                # The model is served per ACCOUNT (a ChatGPT login refuses an API-only
+                # slug), so another seat may serve it (tp#1632). No cooldown block: the
+                # seat is fine for every other model.
+                model_refusal = (cand, reply, message)
+                result.attempts.append(done.finish("refused:model", kind, cause, message))
+                print(
+                    f"seat {cand.label} does not serve {model} — trying the next seat",
+                    file=sys.stderr,
+                )
+                continue
             result.seat, result.reply = cand, reply
             result.error_kind = kind
-            result.error_message = task_failure_message(kind, proc.returncode, cause, model)
+            result.error_message = message
             result.attempts.append(done.finish("failed", kind, cause, result.error_message))
             return result
 
@@ -5842,7 +5863,34 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
             + (f"falling back to {nxt}" if nxt else "no seat left to try"),
             file=sys.stderr,
         )
+    if model_refusal is not None:
+        result.seat, result.reply, result.error_message = model_refusal
+        result.error_kind = "model_unavailable"
+        return result
     return _seat_result(result, seat) if seat else _no_seat_result(result)
+
+
+def _model_refusal_may_hop(  # pylint: disable=too-many-positional-arguments
+    seat: str,
+    resume_home: Path | None,
+    write: bool,
+    before: list[str] | None,
+    workdir: codex_launch.Workdir | str,
+    events: list[dict],
+) -> bool:
+    """Whether a ``model_unavailable`` failure may move to the next seat (tp#1632).
+
+    Never under ``-S`` (one seat, never a hop) or a resume (bound to one home); in write
+    mode only when the worktree provably stayed untouched — the same guard a refusal gets.
+    """
+    if seat or resume_home is not None:
+        return False
+    if not write:
+        return True
+    after = _git_status(workdir)
+    return not (
+        _events_show_side_effects(events) or before is None or after is None or before != after
+    )
 
 
 # CodexStalledError.reason -> RunResult.error_kind
