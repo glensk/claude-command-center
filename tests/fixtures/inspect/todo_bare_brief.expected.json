@@ -1,0 +1,45 @@
+{
+  "state": "idle",
+  "last_reply": "I re-claimed the placeholder items for this session. No agents are running.\n\n## The tp#1171 decision\n\n**What step 5 checks**, on the first five placeholder runs:\n- **(a) No new launches** after the wait starts: passed.\n- **(b) Little work after the cut-off:** at most 3 requests per run. **This failed.**\n\n**Options:**\n1. **(Recommended)** Close step 5 with the numbers on record and file one follow-up.\n2. Keep step 5 open and add a step 6.\n3. Raise the cap to about 35k.\n\n**Decision brief**\n- **Background:** the placeholder fix blocks launches during a wait, but runs still spend more than the cap after the cut-off.\n- **Building:** with option 1, a small follow-up item for the placeholder text and a shadow-mode hook.\n- **Fit:** it is a separate cause, so a separate item keeps the placeholder item closable.\n- **Recommendation:** option 1.\n- **Why now:** the placeholder cleanup cannot start until this is settled.\n- **Undo:** reopening step 5 or closing the follow-up is one command.\n- **Checked:** the placeholder plan's acceptance criteria; option 3 still fails two of the five runs.\n\n## `To-do list`\n\n### tp#1171 step 5 placeholder acceptance — waits [albert]: your call on criterion (b) · ~12:00\n`You [decision]: close step 5 of the placeholder plan and file the follow-up (1, recommended), keep step 5 open and add a step 6 (2), or raise the cap to ~35k (3), for tp#1171`\n\n`Session done when: tp#1171 is settled · ~12:00`",
+  "last_prompt": "Check the placeholder acceptance runs and tell me what is left to decide.",
+  "decision": {
+    "decision_id": "<sha256>",
+    "source": "todo_line",
+    "questions": [
+      {
+        "text": "close step 5 of the placeholder plan and file the follow-up (1, recommended), keep step 5 open and add a step 6 (2), or raise the cap to ~35k (3), for tp#1171",
+        "multi_select": false,
+        "options": [
+          {
+            "label": "Close step 5 of the placeholder plan and file the follow-up",
+            "consequence": null
+          },
+          {
+            "label": "Keep step 5 open and add a step 6",
+            "consequence": null
+          },
+          {
+            "label": "Raise the cap to ~35k",
+            "consequence": null
+          }
+        ]
+      }
+    ],
+    "recommendation": "Close step 5 of the placeholder plan and file the follow-up",
+    "recommendation_reason": null,
+    "context": {
+      "aim": null,
+      "ticket": null,
+      "recent_summary": "I re-claimed the placeholder items for this session. No agents are running. **What step 5 checks**, on the first five placeholder runs: - **(a) No new launches** after the wait starts: passed."
+    }
+  },
+  "actions": [
+    {
+      "kind": "decision",
+      "text": "close step 5 of the placeholder plan and file the follow-up (1, recommended), keep step 5 open and add a step 6 (2), or raise the cap to ~35k (3), for tp#1171",
+      "tp_id": 1171,
+      "brief_ref": null,
+      "brief": "**Decision brief**\n- **Background:** the placeholder fix blocks launches during a wait, but runs still spend more than the cap after the cut-off.\n- **Building:** with option 1, a small follow-up item for the placeholder text and a shadow-mode hook.\n- **Fit:** it is a separate cause, so a separate item keeps the placeholder item closable.\n- **Recommendation:** option 1.\n- **Why now:** the placeholder cleanup cannot start until this is settled.\n- **Undo:** reopening step 5 or closing the follow-up is one command.\n- **Checked:** the placeholder plan's acceptance criteria; option 3 still fails two of the five runs."
+    }
+  ]
+}

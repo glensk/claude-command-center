@@ -94,6 +94,51 @@ def test_cli_envelope_matches_the_fixture(
     assert len(world.llm_calls) == (1 if expected["decision"] else 0)
 
 
+#: tp#1635 B7: placeholder copies of two real turns' shapes. The canonical forms (the
+#: ``todo-list`` skill, "Decision briefs") are a ``**Decision brief**`` block with the seven
+#: lines ``Background: … Building: … Fit: … Recommendation: … Why now: … Undo: …
+#: Checked: …`` and a ``1. `You [decision]: <the choice> for tp#N (brief D1)` `` line. The
+#: sessions also write the line bare in backticks with ``A (1, recommended), B (2), or C
+#: (3)`` options and a free brief (``todo_bare_brief``), or two such lines with titled
+#: briefs ``**Decision brief (Q1: …)**`` / ``(Q2: …)`` (``todo_titled_briefs``).
+SESSION_SHAPES = {"todo_bare_brief": 1, "todo_titled_briefs": 2}
+BRIEF_LABELS = ("Background", "Building", "Fit", "Recommendation", "Why now", "Undo", "Checked")
+
+
+@pytest.mark.parametrize("name", SESSION_SHAPES)
+def test_session_shape_parses_exactly_with_its_actions(name: str) -> None:
+    records = cb.load_records(FIXTURES / f"{name}.jsonl")
+    expected = json.loads((FIXTURES / f"{name}.expected.json").read_text(encoding="utf-8"))
+    got = {**cb.inspect_records(records), "actions": cb.inspect(records).actions}
+    assert _normalise(got) == expected
+
+
+@pytest.mark.parametrize(("name", "count"), SESSION_SHAPES.items())
+def test_session_shape_cli_has_options_recommendation_and_own_briefs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    name: str,
+    count: int,
+) -> None:
+    world = _world_from_fixture(tmp_path, name, status="idle")
+    code, env, _err = run_cli(monkeypatch, capsys, world, ["inspect", "-s", SID, "-N", "-j"])
+    assert code == 0 and env is not None
+    data = env["data"]
+    questions = data["decision"]["questions"]
+    actions = [a for a in data["actions"] if a["kind"] == "decision"]
+    assert len(questions) == len(actions) == count
+    for q in questions:
+        assert len(q["options"]) >= 2 and "(1" not in q["options"][0]["label"]
+    assert data["decision"]["recommendation"]
+    briefs = [a["brief"] for a in actions]
+    assert len(set(briefs)) == count and all(a["brief_ref"] is None for a in actions)
+    for brief in briefs:
+        assert all(f"**{label}:**" in brief for label in BRIEF_LABELS)
+    if count == 2:
+        assert "(Q1:" in briefs[0] and "(Q2:" in briefs[1]
+
+
 def test_malformed_transcript_is_transcript_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

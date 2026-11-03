@@ -280,3 +280,34 @@ def test_paragraph_brief_keeps_all_seven_fields() -> None:
     reply = f"{brief}\n\nWhich one do you want?\n\n## To-do list\nYou [decision]: Alpha or Beta?\n"
     assert cb.decision_brief(reply) == brief
     assert [a["brief"] for a in cb.todo_actions(reply)] == [brief]
+
+
+@pytest.mark.parametrize(
+    ("line", "labels", "rec"),
+    [
+        # no stem, three options, a trailing `, for tp#N` (tp#1635 B7)
+        (
+            "close step 5 (1, recommended), keep it open (2), or raise the cap (3), for tp#42",
+            ["Close step 5", "Keep it open", "Raise the cap"],
+            "Close step 5",
+        ),
+        # stem cut at its colon, recommended in the middle
+        (
+            "pick the grouping: by repo (1), by account (2, recommended), or flat (3)",
+            ["By repo", "By account", "Flat"],
+            "By account",
+        ),
+        # stem + two options joined by a bare `or`
+        ("run it how: nightly (1, recommended) or hourly (2)?", ["Nightly", "Hourly"], "Nightly"),
+    ],
+)
+def test_numbered_option_markers_give_the_options(line: str, labels: list[str], rec: str) -> None:
+    questions = cb.todo_questions(f"## To-do list\n`You [decision]: {line}`\n")
+    assert [o["label"] for o in questions[0].options] == labels
+    assert questions[0].recommendation == rec
+    assert questions[0].text == line  # the question keeps the whole line
+
+
+def test_markers_out_of_order_fall_back_to_the_or_split() -> None:
+    questions = cb.todo_questions("## To-do list\nYou [decision]: A (2) or B (1)?\n")
+    assert [o["label"] for o in questions[0].options] == ["A (2)", "B (1)"]

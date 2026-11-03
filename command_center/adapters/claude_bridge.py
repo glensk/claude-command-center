@@ -56,6 +56,10 @@ HEADING_RE = re.compile(r"^\s*#{1,6}\s")
 TODO_DECISION_RE = re.compile(r"^\s*(?:\d+[.)]\s*)?(?:[-*]\s*)?`?You \[decision\]:\s*(.+?)`?\s*$")
 OPTION_MARKER_RE = re.compile(r"(?:(?<=\s)|^)([a-z])\)\s+")
 RECOMMENDED_RE = re.compile(r"\s*\(recommended\)", re.IGNORECASE)
+#: A numbered option marker ``(N)`` / ``(N, recommended)`` that ends an option label.
+NUM_OPTION_MARKER_RE = re.compile(r"\s*\((?P<n>\d+)(?P<rec>\s*,\s*recommended)?\)", re.IGNORECASE)
+#: The ``,`` / ``, or`` / ``or`` that joins one marked option to the next.
+OPTION_JOIN_RE = re.compile(r"^\s*,?\s*(?:or\s+)?", re.IGNORECASE)
 CONSEQUENCE_SPLIT_RE = re.compile(r"\s+(?:—|–|--?)\s+")
 RECOMMEND_SENTENCE_RE = re.compile(
     r"(?:^|(?<=[.?!])\s+)"
@@ -729,6 +733,27 @@ def _explicit_options(body: str) -> tuple[str, list[tuple[str, str | None, bool]
     return question, options
 
 
+def _marker_options(body: str) -> list[tuple[str, str | None, bool]] | None:
+    """``[(label, None, recommended)]`` from ``A (1, recommended), B (2), or C (3)`` markers.
+
+    The markers must count ``1..n`` (n ≥ 2); the labels run from the last ``": "`` before
+    the first marker (the stem's end) through the marker list, joined by ``,`` / ``, or`` /
+    ``or``; text after the last marker (``, for tp#N``) belongs to no label. ``None`` when
+    the line has no such markers.
+    """
+    marks = list(NUM_OPTION_MARKER_RE.finditer(body))
+    if len(marks) < 2 or [int(m.group("n")) for m in marks] != list(range(1, len(marks) + 1)):
+        return None
+    colon = body.rfind(": ", 0, marks[0].start())
+    prev = colon + 2 if colon >= 0 else 0
+    options: list[tuple[str, str | None, bool]] = []
+    for m in marks:
+        seg = OPTION_JOIN_RE.sub("", body[prev : m.start()]).strip()
+        options.append((_label(seg), None, bool(m.group("rec"))))
+        prev = m.end()
+    return options if all(label for label, _c, _r in options) else None
+
+
 def _or_options(question: str) -> list[tuple[str, str | None, bool]]:
     """Options from a top-level ``X or Y`` split of the question sentence (else [])."""
     core = question.strip().rstrip("?").strip()
@@ -787,8 +812,11 @@ def todo_questions(reply: str) -> list[Question]:
             reason = rm.group("why").strip() if rm.group("why") else None
             body = body[: rm.start()].strip()
         explicit = _explicit_options(body)
+        marked_opts = _marker_options(body) if explicit is None else None
         if explicit is not None:
             question, opts = explicit
+        elif marked_opts is not None:
+            question, opts = body, marked_opts
         else:
             question, opts = body, _or_options(body)
         marked = [(label, cons) for label, cons, recommended in opts if recommended]

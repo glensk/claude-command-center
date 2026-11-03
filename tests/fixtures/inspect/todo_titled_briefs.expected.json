@@ -1,0 +1,66 @@
+{
+  "state": "idle",
+  "last_reply": "…f (Q1: how long to keep a placeholder session warm)**\n- **Background:** every wait on you should get a keep-warm timer; today it looks 3 h ahead.\n- **Building:** a separate time limit for waits on you, plan step B4.\n- **Fit:** 12 h covers a night and stays below the placeholder cost break-even.\n- **Recommendation:** 12 h.\n- **Why now:** step B4 cannot be built without a number.\n- **Undo:** it is one placeholder environment variable.\n- **Checked:** the placeholder cost model at one relay per day.\n\n**Decision brief (Q2: may a fresh placeholder session keep warm for data waits?)**\n- **Background:** the current placeholder rule sends every wait over 50 min to the forecast.\n- **Building:** new placeholder rule text, plan step B1.\n- **Fit:** for small sessions keeping warm is cheaper than a handoff for that range.\n- **Recommendation:** yes, capped at 8 h or the break-even, whichever is shorter.\n- **Why now:** without an answer the two placeholder rules contradict each other.\n- **Undo:** a text edit.\n- **Checked:** where each placeholder rule is written.\n\n## `To-do list`\n\n### tp#1171 placeholder idle policy — waits [albert]: two rule parameters · ~17:00\n`You [decision]: keep-warm limit for placeholder waits: 12 h (1, recommended), 8 h (2), or 3 h as today (3), for tp#1171`\n`You [decision]: fresh placeholder sessions may keep warm for data waits up to 8 h: yes (1, recommended) or keep the 50-min rule (2), for tp#1171`\n\n`Session done when: you answered the tp#1171 questions · ~17:00`",
+  "last_prompt": "Check the placeholder acceptance runs and tell me what is left to decide.",
+  "decision": {
+    "decision_id": "<sha256>",
+    "source": "todo_line",
+    "questions": [
+      {
+        "text": "keep-warm limit for placeholder waits: 12 h (1, recommended), 8 h (2), or 3 h as today (3), for tp#1171",
+        "multi_select": false,
+        "options": [
+          {
+            "label": "12 h",
+            "consequence": null
+          },
+          {
+            "label": "8 h",
+            "consequence": null
+          },
+          {
+            "label": "3 h as today",
+            "consequence": null
+          }
+        ]
+      },
+      {
+        "text": "fresh placeholder sessions may keep warm for data waits up to 8 h: yes (1, recommended) or keep the 50-min rule (2), for tp#1171",
+        "multi_select": false,
+        "options": [
+          {
+            "label": "Yes",
+            "consequence": null
+          },
+          {
+            "label": "Keep the 50-min rule",
+            "consequence": null
+          }
+        ]
+      }
+    ],
+    "recommendation": "1) 12 h; 2) Yes",
+    "recommendation_reason": null,
+    "context": {
+      "aim": null,
+      "ticket": null,
+      "recent_summary": "The placeholder plan is written and committed. It needs two answers before its build. **Decision brief (Q1: how long to keep a placeholder session warm)** - **Background:** every wait on you should get a keep-warm timer; today it looks 3 h ahead."
+    }
+  },
+  "actions": [
+    {
+      "kind": "decision",
+      "text": "keep-warm limit for placeholder waits: 12 h (1, recommended), 8 h (2), or 3 h as today (3), for tp#1171",
+      "tp_id": 1171,
+      "brief_ref": null,
+      "brief": "**Decision brief (Q1: how long to keep a placeholder session warm)**\n- **Background:** every wait on you should get a keep-warm timer; today it looks 3 h ahead.\n- **Building:** a separate time limit for waits on you, plan step B4.\n- **Fit:** 12 h covers a night and stays below the placeholder cost break-even.\n- **Recommendation:** 12 h.\n- **Why now:** step B4 cannot be built without a number.\n- **Undo:** it is one placeholder environment variable.\n- **Checked:** the placeholder cost model at one relay per day."
+    },
+    {
+      "kind": "decision",
+      "text": "fresh placeholder sessions may keep warm for data waits up to 8 h: yes (1, recommended) or keep the 50-min rule (2), for tp#1171",
+      "tp_id": 1171,
+      "brief_ref": null,
+      "brief": "**Decision brief (Q2: may a fresh placeholder session keep warm for data waits?)**\n- **Background:** the current placeholder rule sends every wait over 50 min to the forecast.\n- **Building:** new placeholder rule text, plan step B1.\n- **Fit:** for small sessions keeping warm is cheaper than a handoff for that range.\n- **Recommendation:** yes, capped at 8 h or the break-even, whichever is shorter.\n- **Why now:** without an answer the two placeholder rules contradict each other.\n- **Undo:** a text edit.\n- **Checked:** where each placeholder rule is written."
+    }
+  ]
+}
