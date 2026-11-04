@@ -609,14 +609,20 @@ def _fire_reset_jobs(store: Store, cfg: config.Config, report: DaemonReport, dry
     consumes it via the atomic claim; a crash mid-dispatch or a tab that never ran
     simply retries one lease later. Never a config key: the per-job ``--at-reset`` /
     ``ccc park`` arming is the opt-in (inert on a fresh install — no armed jobs).
+
+    A job an ``AI_AUTOMATED`` caller registered (``registered_by = automated``, tp#1698)
+    is never fired, even if something armed it: only the user's explicit start runs it.
     """
-    from . import accounts, park, terminal, usage
+    from . import accounts, automated, park, terminal, usage
 
     now = int(time.time())
     due = [
         s
         for s in store.list_sessions()
-        if s.draft and not s.archived and 0 < s.fire_at <= now - park.FIRE_GRACE_SEC
+        if s.draft
+        and not s.archived
+        and 0 < s.fire_at <= now - park.FIRE_GRACE_SEC
+        and not automated.is_stamped(s)
     ]
     for job in due:
         label = accounts.effective_account_label(job.config_dir or "")

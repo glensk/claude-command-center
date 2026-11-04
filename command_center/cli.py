@@ -2753,6 +2753,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
     with Store() as store:
         session = store.get(args.session_id)
+    if session is not None:
+        refused = _automated_start_refused(session, "resume")
+        if refused is not None:
+            return refused
     config_dir = session.config_dir if session else ""
     cwd = session.cwd if session else ""
     no_codex = bool(session.no_codex) if session else False
@@ -3031,6 +3035,34 @@ def _idempotency_conflict(
     return "; ".join(diffs)
 
 
+def _automated_registration(args: argparse.Namespace, key: str, cwd: str) -> str:
+    """``new-job`` under ``AI_AUTOMATED`` (tp#1698): the ``registered_by`` stamp to write.
+
+    Registration stays allowed for an automated caller (that is how it leaves a draft for
+    the user), but under enforce the job is stamped ``automated`` and ``--at-reset`` fire
+    arming is stripped (warning on stderr), so neither the daemon nor any other auto-start
+    path ever launches it. Observe mode logs what enforce would do and stamps nothing.
+    """
+    from . import automated  # pylint: disable=import-outside-toplevel
+
+    current = automated.mode()
+    if current == automated.MODE_OFF:
+        return ""
+    surface = "new-job --at-reset" if getattr(args, "at_reset", False) else "new-job"
+    if current == automated.MODE_OBSERVE:
+        automated.log_event(automated.EVENT_OBSERVED, "", surface, key=key or "-", cwd=cwd)
+        return ""
+    if getattr(args, "at_reset", False):
+        automated.log_event(automated.EVENT_REFUSED, "", surface, key=key or "-", cwd=cwd)
+        print(
+            "warning: --at-reset ignored under AI_AUTOMATED — an automated caller only "
+            "registers a draft; the user starts it",
+            file=sys.stderr,
+        )
+        args.at_reset = False
+    return automated.REGISTERED_BY_AUTOMATED
+
+
 def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
     args: argparse.Namespace,
 ) -> int:
@@ -3086,6 +3118,7 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
     cwd = args.cwd or os.getcwd()
     session_id = str(uuid.uuid4())
     idempotency_key = (getattr(args, "idempotency_key", None) or "").strip()
+    registered_by = _automated_registration(args, idempotency_key, cwd)
     # --at-reset: arm the job to auto-fire when the selected rate-limit window resets.
     # Deterministic (the window's resets_at + buffer, utilization is not an input) and
     # fail-loud: no usable reset time is a registration ERROR, never "fire now".
@@ -3156,6 +3189,9 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
                         file=sys.stderr,
                     )
                     return 2
+                if registered_by and existing.registered_by != registered_by:
+                    store.update_fields(session_id, registered_by=registered_by)
+                    existing = store.get(session_id) or existing
                 # tp#1512: a retry of an older registration gets the grant too.
                 accounts.grant_registration_trust(existing.config_dir, existing.cwd)
                 if as_json:
@@ -3182,6 +3218,7 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
             fire_at=fire_at,
             fire_window=fire_window,
             idempotency_key=idempotency_key,
+            registered_by=registered_by,
         )
     # tp#1512: registration is the deliberate trust grant (narrowed, logged on stderr), so
     # an unattended `start-job --auto` later only CHECKS trust and never parks on the dialog.
@@ -3298,6 +3335,28 @@ def cmd_new_prompt(args: argparse.Namespace) -> int:
     return 0
 
 
+def _automated_start_refused(session: Session, surface: str) -> int | None:
+    """The CLI half of the start choke point (tp#1698): an exit code, or ``None`` to go on.
+
+    Under ``AI_AUTOMATED`` enforce a start verb launches nothing and exits
+    :data:`automated.EXIT_SKIPPED` (75) with the skip line on stderr, BEFORE any state
+    mutation; the job stays a draft for the user to start. Observe mode only logs.
+    ``open-job`` types ``ccc start-job`` into a fresh login shell that does not inherit
+    the launcher's env, so the verb checks here, at entry, not only in the tab.
+    """
+    from . import automated  # pylint: disable=import-outside-toplevel
+
+    if not automated.refuse_start(
+        session.session_id,
+        surface,
+        key=session.idempotency_key or session.session_id,
+        cwd=session.cwd or "",
+    ):
+        return None
+    print(f"{automated.SKIP_MESSAGE} ({session.session_id})", file=sys.stderr)
+    return automated.EXIT_SKIPPED
+
+
 def has_terminal() -> bool:
     """True when this process is attached to a real terminal on BOTH stdin and stdout.
 
@@ -3409,6 +3468,9 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
         if session.archived:
             print(f"error: job {args.session_id} is archived — cannot launch", file=sys.stderr)
             return 1
+        refused = _automated_start_refused(session, "start-job")
+        if refused is not None:
+            return refused
         # (0a) Terminal guard — a job ALWAYS starts in its own tab. This command execs
         # claude IN PLACE, so without a TTY the launched process gets no stdin, runs its
         # argv prompt as a headless ONE-SHOT and exits after a single turn. Its transcript
@@ -3990,7 +4052,7 @@ def cmd_restore_job(args: argparse.Namespace) -> int:  # pylint: disable=too-man
     return 0
 
 
-def cmd_open_job(args: argparse.Namespace) -> int:
+def cmd_open_job(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
     """Open a saved future job in a new iTerm tab — the CLI twin of the TUI's ``r``.
 
     Accepts EITHER a positional ``session_id`` OR ``-f/--file PATH`` (exactly one; they are
@@ -4040,6 +4102,9 @@ def cmd_open_job(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    refused = _automated_start_refused(session, "open-job")
+    if refused is not None:
+        return refused
     launcher = terminal.start_job_launch(session_id)
     if not launcher:
         print(
@@ -5175,6 +5240,10 @@ def cmd_resume_job(args: argparse.Namespace) -> int:  # pylint: disable=too-many
             file=sys.stderr,
         )
         return 1
+    if args.session_id not in live_ids:  # focusing a live tab starts nothing
+        refused = _automated_start_refused(session, "resume-job")
+        if refused is not None:
+            return refused
     if args.session_id in live_ids:
         # Live: don't open a second REPL on the same transcript — focus the existing tab.
         if session.iterm_session_id and terminal.focus_iterm_session(session.iterm_session_id):

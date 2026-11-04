@@ -702,10 +702,18 @@ def _await_detail_text(
 
 
 def _draft_next_cell(session: Session, base_style: str) -> Text:
-    """A draft row's next-step cell: ``@tags · <start_when note>`` (tags/notes column)."""
+    """A draft row's next-step cell: ``@tags · <start_when note>`` (tags/notes column).
+
+    A job an ``AI_AUTOMATED`` caller registered (tp#1698) leads its note with
+    ``waiting for your start``: nothing starts it but the user.
+    """
+    from .. import automated  # pylint: disable=import-outside-toplevel
+
     prefix = "  "
     next_step = _first_line(session.next_step)
     note = _first_line(session.start_when)
+    if automated.is_stamped(session):
+        note = f"{automated.WAITING_NOTE} · {note}" if note else automated.WAITING_NOTE
     if next_step and note:
         head = next_step[:45]  # keep the head + " · " within the 48-char cell cap
         out = Text(prefix)

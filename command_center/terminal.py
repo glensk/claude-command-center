@@ -500,10 +500,12 @@ def resume_in_new_tab(
     ``CCC_LAUNCH_PROFILE``; a profile that no longer resolves returns ``False`` before
     anything is opened or trusted — it never falls back to the bare ``claude``.
     """
-    from . import launch_argv
+    from . import automated, launch_argv
     from .accounts import LaunchTarget, ensure_trusted
     from .config import LaunchProfileError
 
+    if automated.refuse_start(session_id, "resume_in_new_tab", cwd=cwd):
+        return False  # an AI_AUTOMATED caller never starts a session (tp#1698)
     target = LaunchTarget(config_dir, no_codex, launch_profile)
     argv = launch_argv.claude_argv(resume=session_id)
     try:
@@ -558,10 +560,13 @@ def resume_halted_in_new_tab(
     string is ``_as_quote``-escaped before it is embedded in the AppleScript
     ``"..."`` literal, so a cwd/path containing a double-quote can't break out.
     """
+    from . import automated
     from .accounts import LaunchTarget, ensure_trusted, session_launch_env_prefix
 
     if not cwd or not os.path.isdir(cwd) or not script_path:
         return False
+    if automated.refuse_start(session_id, "resume_halted_in_new_tab", cwd=cwd):
+        return False  # an AI_AUTOMATED caller never starts a session (tp#1698)
     if launch_profile:
         return False  # the continue script starts a bare claude: refuse, never bill another route
     if require_trust:
@@ -621,7 +626,16 @@ def start_job_launch(
     rung is NOT an escape from that gate (see :func:`_iterm_api_auth_is_tcc_free`),
     so tmux is the honest last resort: the job still launches, and the caller can
     see that it did not land in a tab.
+
+    The session-start choke point (tp#1698): every in-process job start (``open-job``,
+    ``start-job``'s no-tty hop, the TUI, the daemon, ``park``, futuresync,
+    ``continue-session``) passes here, so a caller under ``AI_AUTOMATED`` enforce gets
+    ``""`` and nothing opens (:func:`command_center.automated.refuse_start`).
     """
+    from . import automated
+
+    if automated.refuse_start(session_id, "start_job_launch"):
+        return ""
     flag = (
         (" --force" if force else "")
         + (" --auto" if auto else "")

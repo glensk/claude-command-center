@@ -656,6 +656,10 @@ class Session:
     # across rows via a partial index, so one key names exactly one job — how a retrying
     # automation re-finds the job it already registered instead of making a second one.
     idempotency_key: str | None = None
+    # Who registered a future job: '' = the user, 'automated' = an ``AI_AUTOMATED`` caller
+    # (see automated.py). A stamped job is never auto-started by the daemon's reset fire or
+    # the job file's launch toggle; an explicit user start (TUI, CLI, Obsidian) launches it.
+    registered_by: str = ""
     # Future-job file mirror (see future_files.py / futuresync.py): the vault-relative
     # path of the draft's markdown file, the sha256 at last sync (echo suppression), when
     # it last synced, and when its file first went missing (0 = present; starts the grace).

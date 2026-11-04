@@ -358,10 +358,28 @@ def _consume_launch(store: Store, cfg: config.Config, session_id: str, report: S
     ``launch blocked (folder not trusted)`` + callout naming ``ccc open-job``). The
     ``start-job --no-grant`` gate stays authoritative (the file re-read there can move the
     cwd after this check).
+
+    The toggle never auto-starts a job an ``AI_AUTOMATED`` caller registered
+    (``registered_by = automated``, tp#1698), and a sync running under ``AI_AUTOMATED``
+    enforce spawns nothing: both write the callout naming the explicit start instead.
     """
+    from . import automated  # pylint: disable=import-outside-toplevel
+
     session = store.get(session_id)
     if session is None or not session.draft or session.archived or session.done:
         report.details.append(f"launch ignored (not a live draft): {session_id}")
+        return
+    if automated.is_stamped(session) or automated.enforced():
+        report.details.append(f"launch blocked (automated draft): {session_id}")
+        write_launch_callout(
+            cfg,
+            session,
+            "not started: the launch toggle never starts an automated job — "
+            f"press ▶ Start or run `ccc open-job {session_id}`",
+            report,
+        )
+        if automated.enforced():
+            automated.refuse_start(session_id, "futuresync launch toggle")
         return
     blocker = deps.launch_blocker(store, session)
     if blocker is not None:

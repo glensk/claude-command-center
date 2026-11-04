@@ -631,6 +631,22 @@ ccc jobs -j
 options: on `new-job`, `-j` is already `--job-type`, so JSON takes **`-J`**; on `jobs` there is no
 clash and it is **`-j`**. Both accept the long `--json`.
 
+#### Automated callers register, the user starts (`AI_AUTOMATED`)
+
+A launcher that runs unattended (a LaunchAgent, a dispatcher) declares itself with
+`AI_AUTOMATED` in its environment. Under `AI_AUTOMATED=1` it can never start a Claude session:
+`open-job`, `start-job`, `resume`, `resume-job` and `park` exit **75** (`skipped: automated
+session start; registered as a draft`) before any state change, and the in-process launch seam
+(`terminal.start_job_launch`, plus the resume seams) opens nothing, whichever path reaches it.
+`new-job` stays allowed: it registers the draft, strips `--at-reset` arming and stamps the job
+`registered_by = automated`. The daemon's reset fire and the job file's `launch` toggle never
+start a stamped job; the TUI's start key, `ccc open-job`/`start-job` and the ▶ Start button do.
+The TUI shows a stamped draft as `waiting for your start`. Each refusal appends one
+`automated-start` line (`{launcher, job_key, cwd, ts}`; launcher = `AI_AUTOMATED_LAUNCHER` or
+launchd's label) to `events.log`. `AI_AUTOMATED=observe` changes nothing and logs
+`automated-observe` lines instead. Only the explicit value counts: a start with no terminal
+and no `AI_AUTOMATED` (an Obsidian button, the phone toggle, the daemon) is allowed.
+
 **SCHEDULED — future jobs with a fixed start date.** A future job can carry a machine-readable
 `start_date` (`-s/--start-date YYYY-MM-DD`, the dialog's *Fixed start date* field, the `e`
 form's **`Scheduled for:`** row, or the `start_date` frontmatter key of its job file) in

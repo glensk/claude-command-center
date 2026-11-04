@@ -422,6 +422,16 @@ def _derive_aim(aim: str, prompt: str) -> str:
 
 def run_park(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements,too-many-branches,too-many-statements,too-many-locals
     """``ccc park`` — register a parked prompt, wait in this tab, launch at reset."""
+    from . import automated
+
+    # tp#1698: parking arms a fire (a deferred session start), which an AI_AUTOMATED
+    # caller never does — refuse before any capture or state change (observe only logs).
+    if automated.refuse_start("", "park", key="-", cwd=os.getcwd()):
+        print(
+            "skipped: automated session start; nothing parked",
+            file=sys.stderr,
+        )
+        return automated.EXIT_SKIPPED
     if getattr(args, "grab", False):
         return _run_grab(args)
     if sys.platform == "darwin" and not getattr(args, "editor", False):

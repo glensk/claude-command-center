@@ -194,6 +194,7 @@ _SESSION_COLUMNS = (
     "model",
     "effort",
     "idempotency_key",
+    "registered_by",
     "future_file",
     "future_sync_hash",
     "future_synced_at",
@@ -326,6 +327,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     model             TEXT    NOT NULL DEFAULT '',
     effort            TEXT    NOT NULL DEFAULT '',
     idempotency_key   TEXT,
+    registered_by     TEXT    NOT NULL DEFAULT '',
     future_file          TEXT,
     future_sync_hash     TEXT,
     future_synced_at     INTEGER NOT NULL DEFAULT 0,
@@ -645,6 +647,10 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         # UNIQUE via a partial index built in _ensure_columns (SQLite cannot ALTER in
         # a UNIQUE column), so many NULLs coexist and one key owns exactly one row.
         "idempotency_key": "TEXT",
+        # Who registered a future job: '' = the user, 'automated' = an AI_AUTOMATED
+        # caller (automated.py). A stamped job is never auto-started (daemon fire, file
+        # launch toggle); only an explicit user start launches it.
+        "registered_by": "TEXT NOT NULL DEFAULT ''",
         "future_file": "TEXT",
         "future_sync_hash": "TEXT",
         "future_synced_at": "INTEGER NOT NULL DEFAULT 0",
@@ -1174,6 +1180,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         fire_window: str = "",
         idempotency_key: str = "",
         aim_set_by: str | None = AIM_SET_BY_USER,
+        registered_by: str = "",
     ) -> Session:
         """Register a *future job*: a draft row holding an AIM + prompt, launched on demand.
 
@@ -1199,6 +1206,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         ``claude``); it is immutable identity — launch surfaces propagate or refuse it.
         *idempotency_key* records the caller-supplied create-or-retrieve key ("" = none);
         the atomic claim itself is :meth:`claim_idempotency_key`.
+        *registered_by* is ``"automated"`` for a job an ``AI_AUTOMATED`` caller registered
+        (never auto-started, see automated.py); ``""`` = the user.
         *aim_set_by* stamps the AIM's history row (``aim_history.set_by``, tp#1566): job
         creation is the user's own act, so it defaults to ``user``.
         """
@@ -1224,6 +1233,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             fire_at=max(0, int(fire_at)),
             fire_window=fire_window.strip(),
             idempotency_key=(idempotency_key.strip() or None),
+            registered_by=registered_by.strip(),
             status=Status.PARKED.value,
         )
         self.set_aim(session_id, aim, set_by=aim_set_by)
