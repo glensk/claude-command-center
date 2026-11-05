@@ -77,11 +77,20 @@ def _env_session() -> str:
     return os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
 
 
-def resolve_source(adapter: ClaudeAdapter, store: Store, explicit: str | None) -> Source | None:
-    """The source session: ``-s`` > this session's env > the live session in cwd."""
+def resolve_source(
+    adapter: ClaudeAdapter, store: Store, explicit: str | None, *, outside: bool = False
+) -> Source | None:
+    """The source session: ``-s`` > this session's env > the live session in cwd.
+
+    *outside* (``start -X``, tp#1722): only ``-s`` names the source, never the env, and the
+    caller is treated as another shell — account, cwd, pid and transcript come from the
+    registry/store and no process ancestry is ignored.
+    """
     from . import accounts, terminal
 
-    env_sid = _env_session()
+    if outside and not explicit:
+        return None
+    env_sid = "" if outside else _env_session()
     sid = explicit or env_sid
     if not sid:  # like `cli.resolve_session_id`: the live session in this cwd
         here = [e for e in adapter.discover() if e.cwd == os.getcwd() and e.alive]
@@ -218,7 +227,12 @@ def _open_source(args: argparse.Namespace) -> tuple[Any, Any, Source | None]:
 
     adapter = _adapter()
     store = Store()
-    return adapter, store, resolve_source(adapter, store, getattr(args, "session", None))
+    outside = bool(getattr(args, "outside", False))
+    return (
+        adapter,
+        store,
+        resolve_source(adapter, store, getattr(args, "session", None), outside=outside),
+    )
 
 
 def cmd_state(args: argparse.Namespace) -> int:
@@ -408,13 +422,23 @@ def _target_dir(label: str) -> str:
     return target
 
 
-def _preflight(
-    adapter: ClaudeAdapter, store: Store, src: Source, label: str, *, dry_run: bool = False
+def _preflight(  # pylint: disable=too-many-arguments
+    adapter: ClaudeAdapter,
+    store: Store,
+    src: Source,
+    label: str,
+    *,
+    dry_run: bool = False,
+    outside: bool = False,
 ) -> str:
-    """Fail-closed checks before anything is written; returns the target config dir."""
+    """Fail-closed checks before anything is written; returns the target config dir.
+
+    *outside* (``start -X``) skips only the inside-the-source check: the provable-idle
+    wait (``_await_idle``) stands in for it, every other check still applies.
+    """
     from . import accounts
 
-    if not src.inside:
+    if not src.inside and not outside:
         raise StartRefused(
             f"continue-session start must run inside the source session {src.session_id} "
             "(its own Bash tool), not from another shell"
@@ -1092,12 +1116,24 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
     from .models import now_ms
     from .transfer_store import ACCEPTED
 
+    outside = bool(getattr(args, "outside", False))
+    if outside and not args.session:
+        print(
+            "error: -X/--outside requires -s/--session <id> (the source is never taken "
+            "from the environment)",
+            file=sys.stderr,
+        )
+        return 2
     adapter, store, src = _open_source(args)
     with store:
         if src is None:
             print("error: could not resolve a session (pass -s/--session <id>)", file=sys.stderr)
             return 1
-        if args.await_idle and not _await_idle(adapter, src):
+        if outside and src.pid <= 0:  # refuse at once: a closed source never turns idle
+            return _fail(
+                args, src.session_id, f"{src.session_id} is not a live session in Claude's registry"
+            )
+        if (args.await_idle or outside) and not _await_idle(adapter, src):
             print(
                 f"error: session {src.session_id} is not provably idle — no transfer started",
                 file=sys.stderr,
@@ -1126,7 +1162,9 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
             return _fail(args, src.session_id, str(exc))
         _say_failed_required(args, src.session_id, composed)
         try:
-            target_dir = _preflight(adapter, store, src, args.account, dry_run=args.dry_run)
+            target_dir = _preflight(
+                adapter, store, src, args.account, dry_run=args.dry_run, outside=outside
+            )
             candidate = _candidate(
                 store, src, target_dir, args.account, args, composed.digest, composed.snapshot
             )
@@ -1624,7 +1662,9 @@ def add_parser(sub: Any) -> None:
         help="validate the handoff, open a NEW session on an account, finalize on accept",
         epilog=(
             "example (from inside the session; pass the Bash tool timeout 600000):\n"
-            "  ccc continue-session start -A private -D 30 -f /path/handoff.md  # new-session-ok"
+            "  ccc continue-session start -A private -D 30 -f /path/handoff.md  # new-session-ok\n"
+            "example (from any other shell; the source must be live and idle):\n"
+            "  ccc continue-session start -X -s <sid> -A private -f /path/handoff.md"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1652,6 +1692,13 @@ def add_parser(sub: Any) -> None:
         action="store_true",
         help="first wait (up to 120 s) until the session is provably idle with a still "
         "transcript; otherwise exit without a transfer",
+    )
+    p_start.add_argument(
+        "-X",
+        "--outside",
+        action="store_true",
+        help="run from another shell, not the source session: requires -s, implies "
+        "--await-idle, the source must be live (tp#1722)",
     )
     p_start.add_argument("-s", "--session", help="the source session id (default: this session)")
     p_start.add_argument("-O", "--overseer", help="model of the new session (default: observed)")

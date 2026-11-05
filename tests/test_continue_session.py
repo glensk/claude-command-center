@@ -1619,6 +1619,112 @@ def test_await_idle_proceeds_once_the_transcript_is_still(
     assert len(harness.launches) == 1
 
 
+def _outside(*extra: str) -> list[str]:
+    """``start -X -s SID`` from a shell that is not the source session (tp#1722)."""
+    return ["continue-session", "start", "--facts-only", "-A", "private", "-X", *extra]
+
+
+def test_outside_without_x_names_the_flag(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    argv = ["continue-session", "start", "--facts-only", "-A", "private", "-s", SID]
+    assert cli.main(argv) == 1
+    assert "not from another shell" in capsys.readouterr().err
+    assert harness.launches == []
+    with Store() as store:
+        assert store.transfers_of(SID) == []
+
+
+def test_outside_with_x_opens_the_transfer_of_an_idle_live_source(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "someone-else")
+    clock = _Clock(harness, grow_until=0)
+    monkeypatch.setattr(continue_session, "_sleep", clock.sleep)
+    monkeypatch.setattr(continue_session, "_idle_now", lambda *_a: True)
+    assert cli.main(_outside("-s", SID)) == 0
+    assert clock.slept >= continue_session.IDLE_STABLE_SEC // continue_session.IDLE_POLL_SEC
+    assert len(harness.launches) == 1
+    with Store() as store:
+        (transfer,) = store.transfers_of(SID)
+        assert transfer.target_session == harness.launches[0]
+
+
+def test_outside_resolves_from_the_registry_and_ignores_the_env(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del harness
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SID)  # even the source's own env: outside
+    adapter = continue_session._adapter()  # noqa: SLF001
+    with Store() as store:
+        src = continue_session.resolve_source(adapter, store, SID, outside=True)
+        assert continue_session.resolve_source(adapter, store, None, outside=True) is None
+    assert src is not None and not src.inside
+    assert src.config_dir == "/cfg/work" and src.pid == 4242 and src.cwd == "/repo"
+    assert src.ignore == frozenset()
+
+
+def test_outside_with_x_on_a_busy_source_is_refused(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    clock = _Clock(harness, grow_until=10**6)
+    monkeypatch.setattr(continue_session, "_sleep", clock.sleep)
+    assert cli.main(_outside("-s", SID)) == 1
+    assert "not provably idle" in capsys.readouterr().err
+    assert harness.launches == []
+    with Store() as store:
+        assert store.transfers_of(SID) == []
+
+
+def test_outside_with_x_on_a_closed_source_is_refused(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID")
+    adapter = continue_session._adapter()  # noqa: SLF001
+    monkeypatch.setattr(adapter, "discover", list)  # no live process: pid 0
+    clock = _Clock(harness, grow_until=0)
+    monkeypatch.setattr(continue_session, "_sleep", clock.sleep)
+    assert cli.main(_outside("-s", SID)) == 1
+    assert "not a live session" in capsys.readouterr().err
+    assert clock.slept == 0  # refused at once, no idle wait
+    assert harness.launches == []
+    with Store() as store:
+        assert store.transfers_of(SID) == []
+
+
+def test_outside_with_x_skips_only_the_inside_check_in_preflight(harness: _Harness) -> None:
+    del harness
+    src = continue_session.Source(session_id=SID, pid=0, config_dir="/cfg/work", cwd="/repo")
+    adapter = continue_session._adapter()  # noqa: SLF001
+    with Store() as store, pytest.raises(continue_session.StartRefused, match="not a live"):
+        continue_session._preflight(  # noqa: SLF001
+            adapter, store, src, "private", outside=True
+        )
+    with Store() as store, pytest.raises(continue_session.StartRefused, match="inside the"):
+        continue_session._preflight(adapter, store, src, "private")  # noqa: SLF001
+
+
+def test_outside_without_session_is_a_usage_error(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SID)  # the env never stands in for -s
+    assert cli.main(_outside()) == 2
+    assert "-X/--outside requires -s/--session" in capsys.readouterr().err
+    assert harness.launches == []
+    with Store() as store:
+        assert store.transfers_of(SID) == []
+
+
+def test_start_help_lists_outside(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["continue-session", "start", "-h"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "-X, --outside" in out and "start -X -s" in out
+
+
 def test_llm_routing_lists_the_handoff_summary_purpose() -> None:
     from command_center import config, llmrouting  # pylint: disable=import-outside-toplevel
 
