@@ -125,7 +125,13 @@ _OPTIONAL: dict[str, type | tuple[type, ...]] = {
     "error": str,
     "error_message": str,
     "run_dir": str,
+    # tp#1697: the row came from an ``AI_AUTOMATED`` caller / reached a seat anyway.
+    "automated": bool,
+    "seat_violation": bool,
 }
+
+#: The ``outcome`` of a run an automated caller was refused before any seat (tp#1697 B14).
+OUTCOME_SKIPPED = "skipped"
 
 # sdsc's real checker began attaching a ticket note on this commit timestamp. After
 # this instant, a note-less `checker` row can only be one of the two formerly
@@ -196,11 +202,15 @@ def attempt_records(
     (:attr:`~command_center.codex_in_claude.RunAttempt.attempt_id`), the one ``run -j``
     reports, so a caller can reference exactly these lines.
     """
+    from . import automated  # pylint: disable=import-outside-toplevel
     from .codex_in_claude import _seat_pid  # pylint: disable=import-outside-toplevel
 
     physical = [a for a in result.attempts if not a.outcome.startswith("skipped:")]
     clean_note = sanitize_note(note)
     clean_caller = sanitize_note(caller)
+    # An automated caller that reached a Codex seat (only possible under observe) is a
+    # seat violation on every physical attempt it made.
+    violation = automated.is_automated()
     rows: list[dict[str, Any]] = []
     for index, attempt in enumerate(physical):
         ok = attempt.outcome == "ok"
@@ -225,6 +235,9 @@ def attempt_records(
             row["note"] = clean_note
         if clean_caller:
             row["caller"] = clean_caller
+        if violation:
+            row["automated"] = True
+            row["seat_violation"] = True
         if getattr(attempt, "run_dir", ""):
             # The attempt's run-log directory (`codex-in-claude runlog`), when one exists.
             row["run_dir"] = attempt.run_dir
@@ -251,6 +264,51 @@ def record_result(result: RunResult, **context: Any) -> int:
         if not rows:
             return 0
         return _append_locked(rows)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return 0
+
+
+def record_skip(  # pylint: disable=too-many-arguments
+    *,
+    purpose: str,
+    model: str = "",
+    effort: str = "",
+    prompt_chars: int = 0,
+    write: bool = False,
+    workdir: str = "",
+    note: str = "",
+    caller: str = "",
+) -> int:
+    """Append ONE ``outcome = skipped`` row: an automated caller refused before any seat.
+
+    No seat was chosen, so ``seat`` and ``id`` are empty (``last_runs`` ignores the line:
+    it stamps no seat). Best-effort like :func:`record_result`.
+    """
+    row: dict[str, Any] = {
+        "ts": _iso(time.time()),
+        "provider": "codex",
+        "seat": "",
+        "id": "",
+        "attempt_id": new_attempt_id(),
+        "purpose": purpose,
+        "outcome": OUTCOME_SKIPPED,
+        "ok": False,
+        "ms": 0,
+        "model": model,
+        "effort": effort,
+        "prompt_chars": prompt_chars,
+        "write": write,
+        "cwd": workdir,
+        "session": os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
+        "automated": True,
+        "error": OUTCOME_SKIPPED,
+    }
+    for key, value in (("note", note), ("caller", caller), ("job", launchd_job())):
+        clean = sanitize_note(value)
+        if clean:
+            row[key] = clean[:JOB_CHARS] if key == "job" else clean
+    try:
+        return _append_locked([row])
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return 0
 

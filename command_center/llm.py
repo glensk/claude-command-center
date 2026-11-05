@@ -262,7 +262,26 @@ def run_custom(
         )
     except (subprocess.SubprocessError, OSError):
         return None
+    if result.returncode == EXIT_SKIPPED and purpose:
+        _SKIPPED.add(purpose)
     return result.stdout.strip() if result.returncode == 0 else None
+
+
+#: The router's "skipped: no non-Anthropic rung answered" exit (EX_TEMPFAIL, tp#1697).
+EXIT_SKIPPED = 75
+_SKIPPED: set[str] = set()
+
+
+def consume_skip(purpose: str) -> bool:
+    """True (once) when the last router call for *purpose* in this process was SKIPPED.
+
+    A skip is not a failure: the caller leaves its work unset and pending
+    (:mod:`command_center.llm_pending`) instead of counting a miss.
+    """
+    if purpose in _SKIPPED:
+        _SKIPPED.discard(purpose)
+        return True
+    return False
 
 
 def _parse(raw: str) -> tuple[str | None, str | None]:

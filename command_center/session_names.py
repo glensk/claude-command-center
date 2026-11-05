@@ -301,6 +301,17 @@ def llm_name(aim: str, cwd: str, command: str) -> str | None:
     return name
 
 
+def _skipped(session_id: str) -> bool:
+    """After a failed :func:`llm_name`: True when the router SKIPPED it (exit 75) — the
+    session then goes on the ``session-name`` pending queue (:mod:`.llm_pending`)."""
+    from . import llm, llm_pending
+
+    if not llm.consume_skip("session-name"):
+        return False
+    llm_pending.mark("session-name", session_id)
+    return True
+
+
 def generate(
     session: Session, cfg: Config, *, use_llm: bool, hint: str = ""
 ) -> tuple[list[str], str]:
@@ -453,6 +464,8 @@ def ensure_name(
         return _upgrade(store, session, cfg)
     assert cfg is not None
     names, origin = generate(session, cfg, use_llm=use_llm, hint=hint)
+    if use_llm and origin == ORIGIN_FALLBACK:
+        _skipped(session_id)  # a skipped LLM name leaves the fallback provisional + pending
     return _write_name(
         store,
         session_id,
@@ -472,6 +485,8 @@ def _upgrade(store: Store, session: Session, cfg: Config) -> str | None:
     aim = session.first_aim or session.aim or ""
     current = session.canonical_name or ""
     name = llm_name(aim, session.cwd, cfg.llm_custom_command)
+    if not name and _skipped(session.session_id):
+        return current  # a router skip is not a miss: no try spent, pending (tp#1697)
     if not name:
         store.conn.execute(
             "UPDATE sessions SET name_upgrade_tries = name_upgrade_tries + 1 "

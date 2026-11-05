@@ -333,6 +333,8 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
         # so a tab picks the name up in the same pass once it lands.
         if cfg.session_names:
             _backfill_session_names(store, cfg, live, dry_run)
+        # tp#1697 B14: work a router SKIPPED waits on the pending queue; this loop is its tick.
+        _drain_llm_pending(store, cfg, live, dry_run)
 
         if cfg.sync_tab_titles and not dry_run:
             from . import tabsymbol
@@ -482,6 +484,50 @@ def _backfill_session_names(
         for session_id in pending:
             spawn.spawn_ccc(["name", "-A", "-s", session_id])
     return pending
+
+
+def _drain_llm_pending(
+    store: Store, cfg: config.Config, live: dict[str, LiveSession], dry_run: bool
+) -> list[str]:
+    """The daemon tick of the skipped-LLM-work queue (:mod:`.llm_pending`, tp#1697 B14).
+
+    Stale entries are dropped; an entry whose work is done or moot (the session is gone
+    or done, it has a short-AIM label, its name is no longer a provisional fallback) is
+    cleared. ``session-name`` and ``short-aim`` entries are re-run by their own backfills
+    above (a skip spends no retry), so only ``voice-brief`` is re-spawned here — a
+    detached ``ccc inspect`` that refills the brief cache — capped per pass. Returns the
+    session ids it spawned for.
+    """
+    from . import llm_pending, session_names
+
+    queue = llm_pending.prune()
+    spawned: list[str] = []
+    for purpose, items in queue.items():
+        for session_id in list(items):
+            session = store.get(session_id)
+            alive = session_id in live and live[session_id].alive
+            done = (
+                session is None
+                or session.done
+                or (purpose == "short-aim" and bool(session.short_aim))
+                or (
+                    purpose == "session-name"
+                    and session.canonical_name_origin != session_names.ORIGIN_FALLBACK
+                )
+                or (purpose == "voice-brief" and not alive)
+            )
+            if done:
+                if not dry_run:
+                    llm_pending.clear(purpose, session_id)
+                continue
+            if purpose == "voice-brief" and len(spawned) < cfg.max_summaries_per_run:
+                spawned.append(session_id)
+    if not dry_run:
+        from . import spawn
+
+        for session_id in spawned:
+            spawn.spawn_ccc(["inspect", "-s", session_id, "-j"])
+    return spawned
 
 
 def _refresh_copilot_usage(

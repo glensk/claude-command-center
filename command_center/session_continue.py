@@ -322,8 +322,28 @@ def _probe_outcome(returncode: int, envelope: dict[str, Any] | None, limited: bo
     return "ok"
 
 
+def _automated() -> bool:
+    """True for an ``AI_AUTOMATED`` caller (enforce or observe): it never probes a seat."""
+    try:
+        from . import automated  # pylint: disable=import-outside-toplevel
+
+        return automated.is_automated()
+    except Exception:  # pylint: disable=broad-exception-caught  # fail closed: no seat probe
+        return bool(os.environ.get("AI_AUTOMATED", "").strip())
+
+
 def probe_limit() -> tuple[bool, datetime | None]:
-    """Run a cheap 'claude -p' call; return (limited?, reset target or None)."""
+    """Run a cheap 'claude -p' call; return (limited?, reset target or None).
+
+    An ``AI_AUTOMATED`` caller (the daemon's reset detector) never runs ``claude -p``
+    (tp#1697 B14, Codex O1: no seat probe exemption): it reads the non-LLM
+    :func:`ccusage_reset_target` estimate instead and reports "limited" (availability is
+    unknown without a probe). ``None`` as the target means no estimate — the caller does
+    not auto-resume. The real probe runs only for an attended command.
+    """
+    if _automated():
+        print("ℹ️  automated caller: no 'claude -p' probe; using the ccusage estimate")
+        return True, ccusage_reset_target()
     now = datetime.now()
     started = time_mod.monotonic()
     try:
@@ -391,7 +411,18 @@ def ccusage_reset_target() -> datetime | None:
 
 
 def auto_wait_loop() -> None:
-    """Probe the limit, wait until the detected reset, verify, repeat."""
+    """Probe the limit, wait until the detected reset, verify, repeat.
+
+    An automated caller waits ONCE, until the ccusage estimate, with no verifying probe;
+    with no estimate it exits non-zero — no signal, no auto-resume (tp#1697 B14).
+    """
+    if _automated():
+        _, target = probe_limit()
+        if target is None:
+            sys.exit("ERROR: automated caller and no ccusage reset estimate; not auto-resuming.")
+        print(f"⏲  waiting until the ccusage estimate {target:%Y-%m-%d %H:%M} (no probe)")
+        wait_until(target)
+        return
     for attempt in range(1, MAX_AUTO_ATTEMPTS + 1):
         print(f"🔍 probe {attempt}/{MAX_AUTO_ATTEMPTS}: {' '.join(PROBE_CMD)}")
         limited, target = probe_limit()

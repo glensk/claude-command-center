@@ -535,8 +535,13 @@ def cmd_short_aim(args: argparse.Namespace) -> int:
         history = store.list_aim_history(session_id)
         original = history[0].aim if history else None
         label = short_aim.generate(session.aim, original=original)
+        from . import llm, llm_pending
+
         if label:
             store.set_short_aim(session_id, label)
+            llm_pending.clear("short-aim", session_id)
+        elif llm.consume_skip("short-aim"):
+            llm_pending.mark("short-aim", session_id)  # tp#1697: the daemon retries it
         # Revision (1) keeps a label of its own: it is what the `/aim` column renders under
         # `aim_column = "first"`, and it does NOT come along with the current AIM's label
         # once the two diverge (set_short_aim writes the LATEST revision; `set-aim --first`

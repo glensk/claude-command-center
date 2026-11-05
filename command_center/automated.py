@@ -58,6 +58,11 @@ EXIT_SKIPPED = 75
 SKIP_MESSAGE = "skipped: automated session start; registered as a draft"
 EVENT_REFUSED = "automated-start"
 EVENT_OBSERVED = "automated-observe"
+# A seat call (Codex run, Claude probe) an automated caller made (observe) or was refused
+# (enforce) — the ``seat_violation`` tripwire of tp#1697 Design §2.
+EVENT_SEAT_VIOLATION = "seat-violation"
+EVENT_SEAT_REFUSED = "seat-refused"
+SEAT_SKIP_MESSAGE = "skipped: automated caller (AI_AUTOMATED); no seat call"
 WAITING_NOTE = "waiting for your start"
 
 
@@ -75,6 +80,11 @@ def mode(environ: dict[str, str] | None = None) -> str:
 def enforced() -> bool:
     """True when this process runs under ``AI_AUTOMATED`` enforce."""
     return mode() == MODE_ENFORCE
+
+
+def is_automated() -> bool:
+    """True under ``AI_AUTOMATED`` enforce OR observe (a seat probe is skipped in both)."""
+    return mode() != MODE_OFF
 
 
 def launcher_name() -> str:

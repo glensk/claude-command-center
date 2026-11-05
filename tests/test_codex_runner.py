@@ -39,7 +39,7 @@ import pytest
 from conftest import SeatFixture, make_three_seats
 
 from command_center import codex_in_claude as cic
-from command_center import codex_launch, quota
+from command_center import codex_launch, codex_ledger, config, quota
 
 # pylint: disable=too-many-lines  # one cohesive suite: the runner's hops, hygiene and CLI
 
@@ -1540,3 +1540,71 @@ def test_models_fallback_reads_current_home_cache() -> None:
     cache.write_text(json.dumps({"models": [{"slug": "tp192-only", "visibility": "list"}]}))
     models = _REAL_LIST_MODELS(refresh=False, include_hidden=True)
     assert [m["slug"] for m in models] == ["tp192-only"]
+
+
+# ── tp#1697 B14: the AI_AUTOMATED seat guard ───────────────────────────────────────
+def test_automated_enforce_run_exits_75_with_a_skipped_row(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`AI_AUTOMATED=1 codex-in-claude run -p checker -j`: exit 75, no process, one row."""
+    monkeypatch.setenv("AI_AUTOMATED", "1")
+    monkeypatch.setattr(
+        cic.codex_launch,
+        "resolve_codex",
+        lambda: pytest.fail("an automated run must not even resolve codex"),
+    )
+    assert cic.cmd_run(_run_ns(three_seats, purpose="checker")) == cic.EX_SKIPPED == 75
+    envelope = _envelope(capsys)
+    assert envelope["error"]["kind"] == "automated_skipped"
+    assert envelope["seat"] is None and envelope["attempts"] == []
+    assert three_seats.calls() == []
+    rows = codex_ledger.read_runs()
+    assert [(r["purpose"], r["outcome"], r["automated"]) for r in rows] == [
+        ("checker", "skipped", True)
+    ]
+    assert not codex_ledger.last_runs(rows)  # a skip stamps no seat
+
+
+def test_automated_enforce_main_cli_exits_75(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The console entry point itself (argv parsing included) exits 75 under enforce."""
+    monkeypatch.setenv("AI_AUTOMATED", "1")
+    argv = ["run", "-p", "checker", "-j", "-C", str(three_seats.workdir), "say ok"]
+    assert cic.main(argv) == 75
+    assert _envelope(capsys)["error"]["kind"] == "automated_skipped"
+    assert three_seats.calls() == []
+
+
+def test_automated_enforce_delegate_and_in_process_runner_refuse(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`delegate` and a direct `run_with_fallback` caller are refused the same way."""
+    monkeypatch.setenv("AI_AUTOMATED", "enforce")
+    assert cic.cmd_delegate(_delegate_ns(three_seats)) == cic.EX_SKIPPED
+    result = cic.run_with_fallback(prompt="x", purpose="tp-vet", write=False)
+    assert not result.ok and result.error_kind == "automated_skipped"
+    assert three_seats.calls() == []
+    assert [r["purpose"] for r in codex_ledger.read_runs()] == ["delegate", "tp-vet"]
+
+
+def test_automated_observe_runs_and_logs_a_seat_violation(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Observe changes nothing but the record: the run is served, rows say seat_violation."""
+    monkeypatch.setenv("AI_AUTOMATED", "observe")
+    assert cic.cmd_run(_run_ns(three_seats, purpose="checker")) == cic.EX_OK
+    assert _envelope(capsys)["ok"] is True
+    rows = codex_ledger.read_runs()
+    assert rows and all(r["seat_violation"] and r["automated"] for r in rows)
+    events = (config.app_home() / "events.log").read_text(encoding="utf-8")
+    assert "\tseat-violation\t" in events
+
+
+def test_unautomated_run_rows_carry_no_guard_keys(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("AI_AUTOMATED", raising=False)
+    assert cic.cmd_run(_run_ns(three_seats)) == cic.EX_OK
+    capsys.readouterr()
+    assert all("seat_violation" not in r for r in codex_ledger.read_runs())

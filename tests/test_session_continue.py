@@ -231,3 +231,68 @@ def test_probe_envelope_carries_usd_and_one_hour_cache() -> None:
     )
     assert fields["usd"] == 0.004
     assert fields["tokens_cache_create_1h"] == 600
+
+
+# ------------------------- tp#1697 B14: no automated seat probe ------------------------ #
+def _no_claude(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Any subprocess is recorded; a `claude` one fails the test outright."""
+    seen: list[list[str]] = []
+
+    def run(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+        seen.append(cmd)
+        assert cmd[0] != "claude", "an automated caller must never run `claude -p`"
+        return subprocess.CompletedProcess(cmd, 0, "{}", "")
+
+    monkeypatch.setattr(sc.subprocess, "run", run)
+    return seen
+
+
+@pytest.mark.parametrize("value", ["1", "observe"])
+def test_automated_probe_runs_no_claude_and_uses_the_ccusage_estimate(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("AI_AUTOMATED", value)
+    seen = _no_claude(monkeypatch)
+    estimate = datetime(2026, 11, 5, 14, 1)
+    monkeypatch.setattr(sc, "ccusage_reset_target", lambda: estimate)
+    assert sc.probe_limit() == (True, estimate)
+    assert not seen
+    assert not codex_ledger.read_runs()  # no probe, no probe row
+
+
+def test_automated_wait_waits_for_the_estimate_once_without_a_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AI_AUTOMATED", "1")
+    seen = _no_claude(monkeypatch)
+    estimate = datetime(2026, 11, 5, 14, 1)
+    monkeypatch.setattr(sc, "ccusage_reset_target", lambda: estimate)
+    waited: list[datetime] = []
+    monkeypatch.setattr(sc, "wait_until", waited.append)
+    sc.auto_wait_loop()
+    assert waited == [estimate]
+    assert not seen
+
+
+def test_automated_without_an_estimate_does_not_auto_resume(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No ccusage estimate ⇒ the detector exits non-zero and writes NO reset signal."""
+    monkeypatch.setenv("AI_AUTOMATED", "1")
+    seen = _no_claude(monkeypatch)
+    monkeypatch.setattr(sc, "ccusage_reset_target", lambda: None)
+    monkeypatch.setattr(sc, "wait_until", lambda _t: pytest.fail("must not wait"))
+    monkeypatch.setattr(sc.shutil, "which", lambda _name: "/usr/bin/true")
+    signal_file = tmp_path / "reset.signal"
+    with pytest.raises(SystemExit) as exc:
+        sc._main(["auto", "--wait-only", "--signal-file", str(signal_file)])
+    assert exc.value.code not in (0, None)
+    assert not signal_file.exists()
+    assert not seen
+
+
+def test_attended_probe_still_runs_claude(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AI_AUTOMATED", raising=False)
+    seen = _fake_probe(monkeypatch, _envelope("Hello!"))
+    assert sc.probe_limit() == (False, None)
+    assert seen and seen[0][0] == "claude"

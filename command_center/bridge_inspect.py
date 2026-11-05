@@ -148,10 +148,15 @@ def recent_summary(  # pylint: disable=too-many-positional-arguments
     except Exception:  # pylint: disable=broad-exception-caught  # the fallback always works
         out = None
     summary = _clean_summary(out or "")
+    from . import llm, llm_pending  # pylint: disable=import-outside-toplevel
+
     if not summary:
+        if llm.consume_skip("voice-brief"):
+            llm_pending.mark("voice-brief", session_id)  # tp#1697: the daemon re-runs it
         return fallback
     cache[session_id] = {"key": key, "summary": summary, "at": deps.now_ms()}
     _cache_write(cache_path, cache)
+    llm_pending.clear("voice-brief", session_id)
     return summary
 
 

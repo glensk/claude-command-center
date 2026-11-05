@@ -788,7 +788,10 @@ def _ensure_reset_wait(state: QueueState, cfg: config.Config, account: str) -> N
             # Pin the detector to THIS account's config dir, so its `claude -p` probe reads
             # the rate-limit window of the seat whose sessions this gate releases — and an
             # ambient CLAUDE_CONFIG_DIR can never make it probe/bill the wrong one (D8).
-            env=accounts.launch_env(_config_dir_for_key(account)),
+            # tp#1697 B14: the detector is an automated caller, so it never runs the
+            # `claude -p` seat probe — it waits for the ccusage estimate, and with none it
+            # exits without a signal (no auto-resume).
+            env={**accounts.launch_env(_config_dir_for_key(account)), "AI_AUTOMATED": "1"},
         )
         state.reset_wait_pid[account] = proc.pid
         _log("detector-spawned", detail=f"account={account or 'default'} pid={proc.pid}")

@@ -322,6 +322,7 @@ EX_NETWORK = 9  # killed: codex reported a dead network / the machine slept; no 
 EX_MODEL_CAPACITY = 10  # the server said the model is at capacity / overloaded: retry later
 EX_CODEX_USAGE = 11  # codex rejected its own argv or config (clap usage error, bad config)
 EX_CODEX_CRASH = 12  # codex died on a signal or panicked
+EX_SKIPPED = 75  # EX_TEMPFAIL: an AI_AUTOMATED=1 caller is refused before any seat (tp#1697)
 
 
 def _effective_timeout(explicit: int | None, effort: str) -> int:
@@ -3581,6 +3582,8 @@ RUN_EXIT_CODES_HELP = (
     "  10 model_capacity: the model is at capacity / overloaded server-side (retry later)\n"
     "  11 codex_usage: codex rejected its argv or its config\n"
     "  12 codex_crashed: codex died on a signal or panicked\n"
+    "  75 automated_skipped: AI_AUTOMATED=1 — an automated caller never reaches a seat\n"
+    "     (a `skipped` ledger row; AI_AUTOMATED=observe runs and logs a seat_violation)\n"
     "Every failure's error.cause is one scrubbed line (the server's error event, else the\n"
     "stderr tail); every physical attempt leaves a run log: `codex-in-claude runlog`."
 )
@@ -4845,6 +4848,7 @@ class RunResult:  # pylint: disable=too-many-instance-attributes  # flat result 
     # "" | disabled | all_seats_unavailable | attempts_exhausted | codex_failed |
     # model_capacity | model_unavailable | codex_usage | codex_crashed |
     # timeout | stalled | network | slept | startup_timeout | seat_refused_midrun | no_codex
+    # | automated_skipped (``AI_AUTOMATED=1``: refused before any seat, exit 75)
     # | seat_unknown / seat_unavailable / seat_refused (``run -S``: the one confined seat
     # is not registered / was not eligible / refused — never a hop to another seat)
     error_kind: str = ""
@@ -5367,6 +5371,53 @@ def _no_seat_result(result: RunResult, now: int | None = None) -> RunResult:
     return result
 
 
+def automated_refusal(**kwargs: Any) -> RunResult | None:
+    """The ``AI_AUTOMATED`` seat guard of every Codex run (tp#1697 B14, Design §2 point 3).
+
+    Enforce: a ``skipped`` ledger row, one ``seat-refused`` events.log line and a failed
+    :class:`RunResult` (``automated_skipped`` → exit :data:`EX_SKIPPED`) — no seat is read,
+    no process starts. Observe: one ``seat-violation`` events.log line and ``None`` (the run
+    proceeds; its ledger rows carry ``seat_violation``). Off: ``None``, nothing touched.
+    *kwargs* are :func:`run_with_fallback`'s (only the ledger context is read).
+    """
+    from . import automated  # pylint: disable=import-outside-toplevel
+
+    current = automated.mode()
+    if current == automated.MODE_OFF:
+        return None
+    purpose = str(kwargs.get("purpose") or "")
+    workdir = kwargs.get("workdir", "")
+    cwd = os.fspath(workdir) if workdir else ""
+    if current == automated.MODE_OBSERVE:
+        automated.log_event(
+            automated.EVENT_SEAT_VIOLATION, "", "codex-run", key=purpose or "-", cwd=cwd
+        )
+        return None
+    automated.log_event(automated.EVENT_SEAT_REFUSED, "", "codex-run", key=purpose or "-", cwd=cwd)
+    codex_ledger.record_skip(
+        purpose=purpose,
+        model=str(kwargs.get("model") or ""),
+        effort=str(kwargs.get("effort") or ""),
+        prompt_chars=len(str(kwargs.get("prompt") or "")),
+        write=bool(kwargs.get("write", False)),
+        workdir=cwd,
+        note=str(kwargs.get("note") or ""),
+        caller=str(kwargs.get("caller") or ""),
+    )
+    return _failed(RunResult(), "automated_skipped", automated.SEAT_SKIP_MESSAGE)
+
+
+def _enforced_refusal(**kwargs: Any) -> RunResult | None:
+    """The CLI's early ``AI_AUTOMATED=1`` refusal, BEFORE codex/workdir are resolved.
+
+    Enforce only (observe is logged once, inside :func:`run_with_fallback`), so a
+    refused ``run``/``delegate`` exits :data:`EX_SKIPPED` even where codex is missing.
+    """
+    from . import automated  # pylint: disable=import-outside-toplevel
+
+    return automated_refusal(**kwargs) if automated.enforced() else None
+
+
 def run_with_fallback(**kwargs: Any) -> RunResult:
     """Run one Codex round, hopping seats on a REFUSAL — the only launcher in ccc.
 
@@ -5376,7 +5427,13 @@ def run_with_fallback(**kwargs: Any) -> RunResult:
     once the round has returned, whatever its outcome, each line carrying the caller's
     ``note`` (``run -N``) and ``caller`` (``run -X``). Best-effort — a ledger that
     cannot be written never fails or delays the call.
+
+    Under ``AI_AUTOMATED`` the round first passes :func:`automated_refusal`: enforce
+    returns the refusal without starting anything.
     """
+    refused = automated_refusal(**kwargs)
+    if refused is not None:
+        return refused
     # ``note``/``caller`` are ledger-only context (``run -N``/``-X``): pop them before the
     # round, which does not know the keywords, so a caller's label can never turn into a
     # TypeError mid-run.
@@ -6048,6 +6105,7 @@ _KIND_EXIT = {
     "model_unavailable": EX_INVALID_MODEL,
     "codex_usage": EX_CODEX_USAGE,
     "codex_crashed": EX_CODEX_CRASH,
+    "automated_skipped": EX_SKIPPED,
 }
 
 
@@ -6109,6 +6167,16 @@ def cmd_delegate(args: argparse.Namespace) -> int:  # pylint: disable=too-many-r
     print(f"model: {model} (effort {shown_effort})", flush=True)
 
     write = args.write and not args.scout  # scouting is always read-only (plan, no edits)
+    refused = _enforced_refusal(
+        prompt=args.prompt,
+        purpose=getattr(args, "purpose", "delegate"),
+        model=model,
+        effort=shown_effort,
+        write=write,
+        workdir=args.cwd or "",
+    )
+    if refused is not None:
+        return _run_error_exit(refused)
     resume = getattr(args, "resume", None)
     # ONE launch policy for every `codex exec` (see command_center.codex_launch): the
     # binary, the validated `-C` root, and the NAMED permission profile (rebuilt per seat
@@ -6259,7 +6327,7 @@ def cmd_delegate(args: argparse.Namespace) -> int:  # pylint: disable=too-many-r
     return _run_error_exit(result)
 
 
-def cmd_run(args: argparse.Namespace) -> int:
+def cmd_run(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
     """``run`` — the versioned machine entry point external consumers call.
 
     Deliberately NOT ``delegate``: no patch/write contract, no repo map, no journal,
@@ -6288,6 +6356,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     ephemeral = bool(getattr(args, "ephemeral", False)) or ephemeral_default()
     if not as_json:
         print(f"model: {model} (effort {shown_effort})", flush=True)
+    refused = _enforced_refusal(
+        prompt=prompt,
+        purpose=args.purpose or "run",
+        model=model,
+        effort=shown_effort,
+        workdir=args.cwd or "",
+        note=getattr(args, "note", "") or "",
+        caller=getattr(args, "caller", "") or "",
+    )
+    if refused is not None:
+        return _run_cli_report(refused, args, model, shown_effort)
     try:
         codex_bin = codex_launch.resolve_codex()
         workdir = codex_launch.resolve_workdir(args.cwd, write=False)
