@@ -152,6 +152,39 @@ The invariants that keep it under a few seconds:
   twice, so `ALL_HOOK_ARGS` is a set source, not a `choices=` source). `ccc doctor` §
   "Spawn fast path" lists the subcommands the installed wiring spawns and whether each takes
   the short path.
+- **`ccc aim` never imports `cli`.** `command_center/entrypoint.py` is the dispatcher of both
+  the `ccc` console script (`[project.scripts]`) and `python -m command_center`. It answers
+  `aim` with the standard library only: a read-only `sqlite3` URI connection (no schema DDL,
+  no commit), the needed columns only, `aim_on_main_line` from one `tomllib` read of
+  `config.toml`, and the pure bar helpers of `bars.py` (stdlib-only, re-exported by
+  `models`/`cli`). It computes the whole output before printing and hands argv to
+  `cli.main` only on defined "unsupported" conditions (unknown verb, parse doubt, no session
+  id, missing DB, any SQLite error such as a missing column) before any byte is written.
+  The status line spawns `ccc aim` per render per live session; this path costs ~320 M
+  instructions vs ~560 M for a full `cli` start (2026-11-06). On Python 3.14 one argparse
+  `add_argument` alone costs ~100 M (it builds a help formatter, importing `shutil` and
+  `_colorize`). `tests/test_aim_contract.py` pins the output bytes;
+  `tests/test_entrypoint.py` proves in a subprocess that a served `aim` loads none of `cli`,
+  `config`, `models`, `store`, rich or textual — keep any new import out of that path.
+- **One Copilot refresh per window, success or not.** `usage.claim_copilot_refresh()` (flock
+  on a sidecar lock, staleness rechecked under it, atomic `copilot_usage.attempt` stamp) is
+  called by the TUI usage tick and the daemon's `_refresh_copilot_usage` BEFORE they spawn
+  `ccc copilot-usage` / fetch; `copilot_usage_stale` uses the newer of the cache mtime and
+  the attempt stamp. A failing `gh` (it once failed only in ccc's environment) used to leave
+  the cache stale, so the TUI respawned `ccc copilot-usage` + `gh` + `security` on every tick
+  (~66 execs/min). Explicit `ccc copilot-usage` bypasses the claim; an attempt never touches
+  the cache's mtime or `captured_at`.
+- **One `git status` per 3 s, process-wide.** `gitstatus.cached(cwd)` only reads the last
+  value; `gitstatus.refresh_one(cwds)` (called from the TUI refresh worker, never from
+  `_add_session_row`) is the only place Git is spawned: at most once every
+  `_SPACING_SECONDS`, for the least-recently-refreshed cwd older than `_MIN_AGE_SECONDS`.
+  The old per-row 20 s TTL ran ~1 `git status`/s in bursts with ~18 session cwds. Stale
+  glyphs stay displayed until their turn.
+- **Measured and rejected (2026-11-06):** a parsed-`config.toml` JSON cache across processes
+  and a `Store` fast-open that skips the schema scripts behind a `PRAGMA user_version`
+  fingerprint saved 2.7 % and 1.2 % instructions on `ccc statusline` (median of 5; the bar
+  was 10 %). Import cost dominates a hot ccc spawn, so neither was built; do not add them
+  without a new measurement that clears the bar.
 
 Secrets live in `.env` (never commit); see `.env.example`.
 
