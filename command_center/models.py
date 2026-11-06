@@ -25,6 +25,18 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import Enum
 
+# The bar helpers live in the stdlib-only `bars` (the lean `ccc aim` path, tp#1758);
+# re-exported here so every existing `from .models import progress_bar` keeps working.
+from .bars import (  # noqa: F401  # pylint: disable=unused-import  # re-exported
+    DONE_WORD,
+    done_bar_parts,
+    effective_progress,
+    empty_track_tint,
+    progress_bar,
+    progress_fraction,
+    xterm_rgb,
+)
+
 # Session/LiveSession are data records — many fields is the point.
 # pylint: disable=too-many-instance-attributes
 
@@ -843,26 +855,6 @@ def importance_marks(level: int) -> str:
     return "!" * max(0, min(3, level))
 
 
-def progress_fraction(checked: int, total: int) -> float | None:
-    """Fraction of checklist items done, or ``None`` when there is no checklist."""
-    if total <= 0:
-        return None
-    return checked / total
-
-
-def effective_progress(manual: int | None, checked: int, total: int) -> float | None:
-    """The fraction every progress bar shows: manual override else the checklist ratio.
-
-    *manual* is the session's ``manual_progress`` (0..100, clamped; ``None`` = auto).
-    A set value wins over the sub-goal ratio at EVERY bar site (TUI table + detail
-    head, ``ccc ls``, the statusline and ``ccc aim``) — keep this the single chokepoint
-    so the sites can never disagree.
-    """
-    if manual is not None:
-        return min(100, max(0, manual)) / 100
-    return progress_fraction(checked, total)
-
-
 def parse_manual_progress(value: str) -> int | None:
     """Parse a manual progress-bar edit: blank → ``None`` (auto), ``"40"``/``"40%"`` → 40.
 
@@ -876,95 +868,6 @@ def parse_manual_progress(value: str) -> int | None:
     if not 0 <= pct <= 100:
         raise ValueError(f"progress % out of range 0..100: {pct}")
     return pct
-
-
-def progress_bar(fraction: float | None, width: int = 10) -> str:
-    """Render a fixed-width bar; ``—`` (padded) when no checklist exists yet."""
-    if fraction is None:
-        return "—".ljust(width)
-    fraction = min(1.0, max(0.0, fraction))
-    filled = round(fraction * width)
-    return "▓" * filled + "░" * (width - filled)
-
-
-DONE_WORD = "DONE"
-
-_XTERM_CUBE_LEVELS = (0, 95, 135, 175, 215, 255)
-_XTERM_BASE_16 = {
-    0: (0, 0, 0),
-    1: (205, 0, 0),
-    2: (0, 205, 0),
-    3: (205, 205, 0),
-    4: (0, 0, 238),
-    5: (205, 0, 205),
-    6: (0, 205, 205),
-    7: (229, 229, 229),
-    8: (127, 127, 127),
-    9: (255, 0, 0),
-    10: (0, 255, 0),
-    11: (255, 255, 0),
-    12: (92, 92, 255),
-    13: (255, 0, 255),
-    14: (0, 255, 255),
-    15: (255, 255, 255),
-}
-
-
-def xterm_rgb(code: int) -> tuple[int, int, int]:
-    """RGB of an xterm-256 colour index (6×6×6 cube, grayscale ramp, classic 16)."""
-    if 16 <= code <= 231:
-        idx = code - 16
-        return (
-            _XTERM_CUBE_LEVELS[idx // 36],
-            _XTERM_CUBE_LEVELS[(idx % 36) // 6],
-            _XTERM_CUBE_LEVELS[idx % 6],
-        )
-    if 232 <= code <= 255:
-        v = 8 + 10 * (code - 232)
-        return (v, v, v)
-    return _XTERM_BASE_16.get(code, (128, 128, 128))
-
-
-def empty_track_tint(glyph_rgb: tuple[int, int, int]) -> tuple[int, int, int]:
-    """Background RGB for a DONE letter over the *empty* (``░``) track: a faint 25 % tint.
-
-    ``░`` inks 25 % of its cell in the track colour, so over a dark terminal a ░ cell averages
-    to a quarter of the glyph colour — the closest a letter's (necessarily solid) background
-    can get to the dotted empty texture around it.
-    """
-    r, g, b = glyph_rgb
-    return (round(r * 0.25), round(g * 0.25), round(b * 0.25))
-
-
-def done_bar_parts(
-    fraction: float | None, width: int = 10
-) -> tuple[str, str, str, tuple[bool, ...]]:
-    """Split a progress bar into ``(left, "DONE", right, fills)`` — "model thinks done" overlay.
-
-    ``DONE`` is stamped into the centre cells of the bar — so the fill proportion still reads
-    on both sides — and *fills* says, per ``DONE`` letter, whether the cell it covers belongs
-    to the filled part. The DONE bar renders its filled cells as SOLID ``█`` (not the ordinary
-    bar's dotted ``▓``): a letter's background is one flat colour, so no shade glyph next to it
-    can ever match exactly — with a solid fill, painting the letters on the very same fill
-    colour makes letter cells and bar cells pixel-identical (empty-track letters get
-    :func:`empty_track_tint`). When there is no checklist yet (``fraction is None``) the track
-    is all empty cells so the verdict still renders (rather than the padded ``—``). The three
-    string pieces always concatenate to exactly *width* characters, preserving column
-    alignment; a *width* below ``len("DONE")`` degrades to a truncated centre with empty sides.
-    """
-    base = progress_bar(fraction, width) if fraction is not None else "░" * width
-    base = base.replace("▓", "█")
-    if width <= len(DONE_WORD):
-        word = DONE_WORD[:width]
-        return ("", word, "", tuple(ch == "█" for ch in base[: len(word)]))
-    pos = (width - len(DONE_WORD)) // 2
-    covered = base[pos : pos + len(DONE_WORD)]
-    return (
-        base[:pos],
-        DONE_WORD,
-        base[pos + len(DONE_WORD) :],
-        tuple(ch == "█" for ch in covered),
-    )
 
 
 def dumps_todos(todos: list[tuple[str, str]]) -> str:

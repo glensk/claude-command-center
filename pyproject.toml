@@ -29,7 +29,7 @@ dependencies = [
 dev = ["pytest>=8", "ruff", "mypy", "pylint"]
 
 [project.scripts]
-ccc = "command_center.cli:main"
+ccc = "command_center.entrypoint:main"
 codex-in-claude = "command_center.codex_in_claude:main"
 claude-session-continue = "command_center.session_continue:main"
 

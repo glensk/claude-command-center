@@ -53,8 +53,14 @@ import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from . import __version__, brokenpipe, config, hookspec, launch_argv
+from . import __version__, brokenpipe, config, entrypoint, hookspec, launch_argv
 from .adapters import ClaudeAdapter
+from .bars import (  # noqa: F401  # pylint: disable=unused-import  # re-exported
+    _paint_bar_glyphs,
+    _paint_done_word,
+    aim_line,
+    effective_progress,
+)
 from .config import LaunchProfileError
 from .inflight import background_work as _background_work
 from .inflight import counter_split as _counter_split
@@ -75,12 +81,10 @@ from .models import (
     aim_column_first,
     days_until_start,
     effective_status,
-    empty_track_tint,
     no_codex_conflict,
     now_ms,
     parse_iso_date,
     resolve_job_llm,
-    xterm_rgb,
 )
 from .store import Store
 
@@ -208,35 +212,13 @@ def cmd_ls(args: argparse.Namespace) -> int:
     return 0
 
 
-def _paint_bar_glyphs(seg: str, fill: str, empty: str, reset: str) -> str:
-    """Colour a run of progress-bar glyphs: ``▓``/``█`` in *fill*, ``░`` in *empty* (ANSI)."""
-    return "".join(f"{fill if ch in '▓█' else empty}{ch}{reset}" for ch in seg)
+def cmd_aim(args: argparse.Namespace) -> int:
+    """Fast, LLM-free lookup for the status line (the slow path of ``entrypoint``).
 
-
-def _paint_done_word(
-    done_word: str, fills: tuple[bool, ...], fill_code: int, empty_code: int
-) -> str:
-    """Red DONE letters over the bar. The DONE bar's filled cells are solid ``█`` in
-    *fill_code*, and a filled-cell letter's background is that SAME palette entry — so letter
-    cells and bar cells render pixel-identically, no seam. An empty-cell letter gets a faint
-    25 % tint of *empty_code* (``empty_track_tint``), the ``░`` track's average (ANSI)."""
-    parts = []
-    for ch, filled in zip(done_word, fills, strict=True):
-        if filled:
-            parts.append(f"\033[1;38;5;196;48;5;{fill_code}m{ch}\033[0m")
-        else:
-            r, g, b = empty_track_tint(xterm_rgb(empty_code))
-            parts.append(f"\033[1;38;5;196;48;2;{r};{g};{b}m{ch}\033[0m")
-    return "".join(parts)
-
-
-_MAIN_LINE_AIM_W = 60  # chars of the AIM shown on status-line row 1
-
-
-def cmd_aim(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branches  # one branch per display mode
-    """Fast, LLM-free lookup for the status line. Must stay well under ~10 ms."""
-    from .models import done_bar_parts, effective_progress, progress_bar
-
+    The lean :mod:`command_center.entrypoint` answers most ``ccc aim`` runs without
+    importing this module; it hands over when the session must be found by cwd, the DB
+    is missing or needs a migration. Both print :func:`bars.aim_line`, so the bytes match.
+    """
     adapter = _adapter()
     session_id = resolve_session_id(adapter, args.session, None)
     if not session_id:
@@ -244,60 +226,24 @@ def cmd_aim(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branch
     with Store() as store:
         session = store.get(session_id)
         if session is None or not session.aim:
-            if args.format == "statusline":
-                print("🎯 set done-condition  (/aim)")
-            elif args.format == "bar":
-                print("\033[38;5;244m🎯 /aim\033[0m")  # main-line placeholder, no AIM yet
+            print(aim_line(args.format, None), end="")
             return 0
         if args.format == "plain":
-            print(session.aim)
+            print(aim_line("plain", session.aim), end="")
             return 0
         checked, total = store.progress(session_id)
-        fraction = effective_progress(session.manual_progress, checked, total)
-        if args.format == "bar" and config.load_config().aim_on_main_line:
-            from . import aimtext  # lazy: the item run is kept whole (tp#1366)
-
-            print(f"\033[38;5;220m🎯 {aimtext.clip(session.aim, _MAIN_LINE_AIM_W)}\033[0m ", end="")
-        if args.format == "bar":
-            # Compact, colored progress bar for the main status line (line 1). Filled
-            # cells green, empty dim; ``progress_bar`` stays the single glyph source.
-            green, dim, reset = "\033[38;5;42m", "\033[38;5;244m", "\033[0m"
-            pct = f" {int(round(fraction * 100))}%" if fraction is not None else ""
-            if session.aim_met:
-                # Impartial checker judged the AIM fulfilled → red DONE stamped inside the
-                # bar; letters over filled cells carry the green fill as background.
-                left, done_word, right, fills = done_bar_parts(fraction, 8)
-                bar_text = _paint_bar_glyphs(left, green, dim, reset)
-                bar_text += _paint_done_word(done_word, fills, 42, 244)
-                bar_text += _paint_bar_glyphs(right, green, dim, reset)
-                print(f"{bar_text}{pct}")
-            elif fraction is None:
-                print(f"{dim}{'░' * 8}{reset}")  # AIM set, no checklist yet
-            else:
-                plain = progress_bar(fraction, 8)
-                filled = plain.count("▓")
-                bar_text = f"{green}{'▓' * filled}{reset}{dim}{'░' * (8 - filled)}{reset}"
-                print(f"{bar_text}{pct}")
-            return 0
-        parts = [f"🎯 {session.aim}"]
-        if session.aim_met:  # red DONE stamped inside the bar (same overlay as every bar site)
-            left, done_word, right, fills = done_bar_parts(fraction, 8)
-            pct = f" {int(round(fraction * 100))}%" if fraction is not None else ""
-            # The DONE bar's glyph runs are painted 231 (white) — the SAME palette entry the
-            # filled letters use as background — so █ cells and letter cells match exactly.
-            white = "\033[38;5;231m"
-            parts.append(
-                f"{white}{left}\033[0m"
-                f"{_paint_done_word(done_word, fills, 231, 231)}"
-                f"{white}{right}\033[0m{pct}"
-            )
-        elif fraction is not None:
-            parts.append(f"{progress_bar(fraction, 8)} {int(round(fraction * 100))}%")
-        if session.deadline:
-            parts.append(f"⏰{session.deadline}")
-        if session.blocked_on:
-            parts.append(f"⛔{session.blocked_on}")
-        print("  ".join(parts))
+    print(
+        aim_line(
+            args.format,
+            session.aim,
+            fraction=effective_progress(session.manual_progress, checked, total),
+            aim_met=bool(session.aim_met),
+            deadline=session.deadline,
+            blocked_on=session.blocked_on,
+            main_line=args.format == "bar" and bool(config.load_config().aim_on_main_line),
+        ),
+        end="",
+    )
     return 0
 
 
@@ -6331,7 +6277,7 @@ def cmd_tab_symbol(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # argument parser
 # --------------------------------------------------------------------------- #
-_DESCRIPTION = "Command center for parked Claude Code sessions (AIM, progress, next-step)."
+_DESCRIPTION = entrypoint.DESCRIPTION
 
 
 # The hot subcommands, each built by ONE function used by both parser modes (see
@@ -6358,10 +6304,8 @@ def _add_statusline(sub: Any) -> None:
 
 def _add_aim(sub: Any) -> None:
     """`ccc aim` — the status line's progress-bar lookup, once per render."""
-    p_aim = sub.add_parser("aim", help="status-line lookup of a session's done-condition")
-    p_aim.add_argument("--session")
-    p_aim.add_argument("--format", choices=["statusline", "plain", "bar"], default="statusline")
-    p_aim.set_defaults(func=cmd_aim)
+    # The ONE builder, shared with the lean entry point (same -h / errors bytes).
+    entrypoint.add_aim_parser(sub).set_defaults(func=cmd_aim)
 
 
 def cmd_await(args: argparse.Namespace) -> int:
@@ -6505,12 +6449,7 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     if only is not None:
         add_hot = _HOT_SUBCOMMANDS.get(only)
         if add_hot is not None:
-            hot = argparse.ArgumentParser(
-                prog="ccc",
-                formatter_class=argparse.RawDescriptionHelpFormatter,
-                description=_DESCRIPTION,
-            )
-            hot.add_argument("--version", action="version", version=f"ccc {__version__}")
+            hot = entrypoint.hot_root_parser()
             add_hot(hot.add_subparsers(dest="command"))
             return hot
 
