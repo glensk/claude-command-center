@@ -34,7 +34,7 @@ import sys
 import time
 from typing import Any
 
-from . import config, switch_intercept
+from . import closelog, config, switch_intercept
 from .models import (
     AIM_SET_BY_LAUNCH,
     AIM_SET_BY_USER,
@@ -761,6 +761,7 @@ def _fire_close_claim(store: Store, sid: str, claim: CloseClaim) -> None:
         if claim.bound:
             args += ["--bound", claim.bound]
     if spawn.spawn_ccc(args):
+        closelog.log_close(sid, int(pid) if pid.isdigit() else 0, "close-claim")
         return
     bound = claim.bound or _own_identity(pid)
     restored = bool(bound) and store.restore_close(
@@ -847,7 +848,8 @@ def handle_release_locks(payload: dict[str, Any]) -> int:
                     args.append("--force")
                 if claim.no_codex:
                     args.append("--no-codex")
-                spawn.spawn_ccc(args)
+                if spawn.spawn_ccc(args):
+                    closelog.log_close(sid, int(pid) if pid.isdigit() else 0, "switch-claim")
             # LAST, after the claim fired, so it never keeps close-now from running; it
             # swallows its own errors (fail open = no block). See staff_close_guard.py.
             from . import staff_close_guard

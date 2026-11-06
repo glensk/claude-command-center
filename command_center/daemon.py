@@ -122,11 +122,11 @@ def _has_child_process(pid: int) -> bool:
     return bool(result.stdout.strip())
 
 
-def _reap(pid: int) -> None:
-    """SIGTERM a session process, then SIGKILL if it lingers. Transcript persists."""
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
+def _reap(pid: int, session_id: str = "", path: str = "daemon-reap") -> None:
+    """SIGTERM (a ``session-close`` line, tp#1785), then SIGKILL if it lingers. Transcript kept."""
+    from . import closelog
+
+    if not closelog.sigterm(pid, session_id, path):
         return
     for _ in range(10):
         time.sleep(0.2)
@@ -246,7 +246,7 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
                     continue
                 report.reaped.append(session.session_id)
                 if not dry_run:
-                    _reap(live_session.pid)
+                    _reap(live_session.pid, session.session_id, "daemon-reap")
                     store.update_fields(
                         session.session_id, status=Status.PARKED.value, auto_closed=True
                     )

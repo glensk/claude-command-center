@@ -217,6 +217,8 @@ def test_idle_source_is_reaped_and_its_tab_closed(
     row = _row()
     assert row.close_token == "" and row.close_requested_at == 0 and row.close_bound == ""
     assert "reaped, closed" in _events(tmp_path)
+    assert f"{SRC}\tsession-close\tpid={PID} path=handoff-close caller=" in _events(tmp_path)
+    assert f"transfer={TID}" in _events(tmp_path)
 
 
 def test_keep_warm_child_only_still_closes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -274,6 +274,9 @@ def _close_live(  # pylint: disable=too-many-locals
     if not signalled:  # gone between the revalidation and the signal: nothing was sent
         _give_back(claim, own)
         raise _refusal(sid, "not_running", f"pid {bound.pid} was gone at the signal")
+    from . import closelog
+
+    closelog.log_close(sid, bound.pid, "bridge-close")
     status = _set_closed_status(sid)
     try:
         hc._wait_exit(bound.pid, start)

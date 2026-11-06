@@ -478,6 +478,11 @@ def close_source(args: argparse.Namespace, claim: Claim, cfg: config.Config) -> 
     try:
         signalled = cli._sigterm(bound.pid)  # pylint: disable=protected-access
         if signalled:
+            from . import closelog
+
+            closelog.log_close(
+                sid, bound.pid, "handoff-close", note=f"transfer={claim.transfer_id}"
+            )
             _wait_exit(bound.pid, start)
         closed = signalled and cli._close_terminal(  # pylint: disable=protected-access
             debt.pane, "" if debt.pane else debt.iterm

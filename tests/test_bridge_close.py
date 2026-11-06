@@ -18,7 +18,15 @@ from typing import Any
 import pytest
 from bridgestub import ask, question
 
-from command_center import bridge_cli, bridge_close, cli, handoff_close, staffrole, terminal
+from command_center import (
+    bridge_cli,
+    bridge_close,
+    cli,
+    config,
+    handoff_close,
+    staffrole,
+    terminal,
+)
 from command_center.adapters import claude as claude_adapter
 from command_center.adapters.claude_agents import AgentEntry
 from command_center.bridge_json import BridgeError
@@ -233,6 +241,9 @@ def test_idle_closes_tab_and_parks(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert len(world.scripts) == 1
     row = _row()
     assert row.status == Status.PARKED.value and not row.done and not row.close_token
+    # tp#1785: the signal leaves its session-close line.
+    log = (config.app_home() / "events.log").read_text(encoding="utf-8")
+    assert f"{SID}\tsession-close\tpid={PID} path=bridge-close caller=" in log
 
 
 def test_idle_done_stays_done(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

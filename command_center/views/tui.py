@@ -4261,14 +4261,26 @@ class CommandCenterApp(App[None]):
         has a tab worth closing). Returns ``"tab"`` if the whole tab closed (Claude
         was the only pane in it), ``"session"`` if just the pane closed, else ``""``.
         """
+        signalled = False
         if session.last_seen_pid:
             try:
                 os.kill(session.last_seen_pid, signal.SIGTERM)
+                signalled = True
             except OSError:
                 pass
+        closed = ""
         if close_pane and session.iterm_session_id:
-            return terminal.close_iterm_session(session.iterm_session_id)
-        return ""
+            closed = terminal.close_iterm_session(session.iterm_session_id)
+        if signalled or closed:
+            from .. import closelog  # pylint: disable=import-outside-toplevel
+
+            closelog.log_close(
+                session.session_id,
+                session.last_seen_pid or 0,
+                "tui-close",
+                note=f"signalled={'yes' if signalled else 'no'} terminal={closed or 'none'}",
+            )
+        return closed
 
     def _close_worker(
         self, session: Session, *, close_pane: bool, label: str, verb: str, done: bool

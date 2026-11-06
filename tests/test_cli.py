@@ -1891,6 +1891,10 @@ def test_close_now_success_retires_the_token(
     assert cli.cmd_close_now(_close_args(claim)) == 0
     assert killed and closed == ["w0t1p0:FRESH"]
     assert _arm_row() == (0, "", "")
+    # tp#1785: the close leaves its session-close line.
+    log = (tmp_path / "command-center" / "events.log").read_text(encoding="utf-8")
+    assert f"s1\tsession-close\tpid={_CLOSE_PID} path=close-now caller=" in log
+    assert "signalled=yes" in log
 
 
 # ---- close-now: a refusal never retires a handoff token (tp#1595 B4) --------

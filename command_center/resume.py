@@ -690,7 +690,7 @@ def _reap_fresh(adapter: ClaudeAdapter, store: Store, session_id: str) -> None:
         return
     from .daemon import _reap  # SIGTERM → SIGKILL; reuse the daemon's reaper
 
-    _reap(live_session.pid)
+    _reap(live_session.pid, session_id, "resume-reap")
     for _ in range(15):  # wait up to ~3s for the registry entry to disappear
         time.sleep(0.2)
         if not any(ls.session_id == session_id and ls.alive for ls in adapter.discover()):

@@ -1193,6 +1193,7 @@ def test_switch_now_types_the_exact_relaunch_into_the_iterm_tab(
     assert env.notes == []
     log = (config.app_home() / "events.log").read_text(encoding="utf-8")
     assert "relaunched under" in log and "'work'" in log
+    assert f"{SID}\tsession-close\tpid={PID} path=switch-now caller=" in log  # tp#1785
 
 
 def test_switch_now_types_the_resume_with_the_prompt_appended(

@@ -1663,7 +1663,15 @@ def cmd_close_now(args: argparse.Namespace) -> int:
     target = iterm or (
         session.iterm_session_id if reaped_pid and session and session.iterm_session_id else ""
     )
-    _close_terminal(pane_id, "" if pane_id else target)
+    closed = _close_terminal(pane_id, "" if pane_id else target)
+    from . import closelog
+
+    closelog.log_close(
+        session_id,
+        pid,
+        "close-now",
+        note=f"signalled={'yes' if reaped_pid else 'no'} terminal={'closed' if closed else 'none'}",
+    )
     return 0
 
 
@@ -2565,6 +2573,10 @@ def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many
         os.kill(pid, signal.SIGTERM)
     except OSError:
         pass
+    else:
+        from . import closelog
+
+        closelog.log_close(session_id, pid, "switch-now")
     if not _wait_pid_gone(pid, _SWITCH_EXIT_WAIT_SEC):
         return fail(f"pid {pid} still alive after {_SWITCH_EXIT_WAIT_SEC:.0f}s")
     # (8) The tty must be back at a POSIX shell prompt (no claude left, the shell in the
