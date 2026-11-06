@@ -1010,6 +1010,115 @@ def test_copilot_usage_stale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert usage.copilot_usage_stale(900, now=fresh_now + 1000) is True
 
 
+def test_claim_copilot_refresh_no_files_is_stale_and_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No cache and no attempt stamp: stale, and the first claim wins and stamps."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    assert not usage._copilot_usage_path().exists()
+    assert not usage._copilot_attempt_path().exists()
+    assert usage.copilot_usage_stale(300, now=_NOW) is True
+    assert usage.claim_copilot_refresh(300, now=_NOW) is True
+    assert usage._copilot_attempt_path().read_text(encoding="utf-8").strip() == str(_NOW)
+    # The claim never creates the cache itself.
+    assert not usage._copilot_usage_path().exists()
+
+
+def test_claim_copilot_refresh_failed_fetch_backs_off_for_the_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing fetch writes no cache, yet the attempt keeps it fresh until the window ends."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    assert usage.claim_copilot_refresh(300, now=_NOW) is True
+    # …the fetch fails (gh unusable): nothing written. Every later tick in the window:
+    for dt in (1, 5, 60, 299):
+        assert usage.copilot_usage_stale(300, now=_NOW + dt) is False
+        assert usage.claim_copilot_refresh(300, now=_NOW + dt) is False
+    # The window passed: exactly one retry is claimed, then the back-off resumes.
+    assert usage.copilot_usage_stale(300, now=_NOW + 300) is True
+    assert usage.claim_copilot_refresh(300, now=_NOW + 300) is True
+    assert usage.claim_copilot_refresh(300, now=_NOW + 301) is False
+
+
+def test_claim_copilot_refresh_success_path_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful fetch keeps its own mtime/captured_at; a later claim never rewrites it."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    old = _NOW - 10_000
+    assert usage.claim_copilot_refresh(900, now=old) is True
+    usage._write_copilot_usage(
+        usage.CopilotUsage(old, 2026, 6, "AI Credits", "AI credits", 1.0, 0.01, 0.0)
+    )
+    cache = usage._copilot_usage_path()
+    os.utime(cache, (old, old))
+    before = cache.read_bytes()
+    # Old cache and old attempt: stale, the claim wins but the cache stays byte-identical.
+    assert usage.copilot_usage_stale(900, now=_NOW) is True
+    assert usage.claim_copilot_refresh(900, now=_NOW) is True
+    assert cache.read_bytes() == before
+    assert int(cache.stat().st_mtime) == old
+    snap = usage.read_copilot_usage()
+    assert snap is not None
+    assert snap.captured_at == old
+    # A fresh cache (newer than the attempt) is what keeps it fresh after a success.
+    os.utime(cache, (_NOW + 50, _NOW + 50))
+    assert usage.copilot_usage_stale(900, now=_NOW + 900) is False
+    assert usage.copilot_usage_stale(900, now=_NOW + 950) is True
+
+
+def test_claim_copilot_refresh_corrupt_stamp_falls_back_to_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable attempt stamp is ignored (the cache mtime decides) and then replaced."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    stamp = usage._copilot_attempt_path()
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text("not-a-number\n", encoding="utf-8")
+    assert usage.copilot_usage_stale(300, now=_NOW) is True
+    assert usage.claim_copilot_refresh(300, now=_NOW) is True
+    assert usage.copilot_usage_stale(300, now=_NOW + 1) is False
+
+
+def test_claim_copilot_refresh_concurrent_claimants_one_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TUI and daemon claiming at the same instant: the flock serializes, exactly one wins."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    usage._copilot_attempt_path().parent.mkdir(parents=True, exist_ok=True)
+    n = 8
+    barrier = threading.Barrier(n)
+    results: list[bool] = []
+    lock = threading.Lock()
+
+    def _claim() -> None:
+        barrier.wait()
+        won = usage.claim_copilot_refresh(300, now=_NOW)
+        with lock:
+            results.append(won)
+
+    threads = [threading.Thread(target=_claim) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(results) == [False] * (n - 1) + [True]
+
+
+def test_claim_copilot_refresh_unwritable_home_never_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OSError on the lock/stamp answers False (no spawn) instead of raising."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+
+    def _boom(*_a: object, **_k: object) -> None:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(usage.tempfile, "mkstemp", _boom)
+    assert usage.claim_copilot_refresh(300, now=_NOW) is False
+    assert not usage._copilot_attempt_path().exists()
+
+
 # The seat's own quota endpoint — the only authoritative denominator. A trimmed copy of
 # `/copilot_internal/user` for a faculty/individual seat that has burnt its month.
 _COPILOT_SEAT = {

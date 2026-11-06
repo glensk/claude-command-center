@@ -550,7 +550,8 @@ def _refresh_copilot_usage(
     throttle = usage.adaptive_interval(
         cfg.copilot_usage_refresh_sec, cfg.copilot_usage_refresh_active_sec, active=active
     )
-    if not usage.copilot_usage_stale(throttle):
+    # Shared claim with the TUI: a failing `gh` is retried once per window, by one of them.
+    if not usage.claim_copilot_refresh(throttle):
         return
     report.copilot_refreshed = usage.fetch_copilot_usage() is not None
 

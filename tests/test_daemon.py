@@ -326,6 +326,66 @@ def test_refresh_copilot_usage_tightens_throttle_while_working(
         assert report.copilot_refreshed is True
 
 
+def test_refresh_copilot_usage_failing_fetch_backs_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `gh` failing in the daemon's env writes no cache; the claim's attempt stamp still
+    # keeps the next passes inside the window from fetching again.
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center import usage
+
+    cfg = config.load_config()
+    cfg.copilot_usage = True
+    cfg.copilot_usage_refresh_sec = 900
+    cfg.copilot_usage_refresh_active_sec = 300
+
+    fetches: list[int] = []
+
+    def _failing_fetch(*_a: object, **_k: object) -> None:
+        fetches.append(1)
+
+    monkeypatch.setattr(usage, "fetch_copilot_usage", _failing_fetch)
+
+    with Store() as store:
+        store.ensure("s1", cwd="/repo")
+        store.update_fields("s1", status=Status.IDLE.value)
+        report = DaemonReport()
+        _refresh_copilot_usage(store, cfg, report, dry_run=False)
+        assert fetches == [1]
+        assert report.copilot_refreshed is False
+        for _ in range(3):
+            _refresh_copilot_usage(store, cfg, DaemonReport(), dry_run=False)
+        assert fetches == [1]
+        assert not usage._copilot_usage_path().exists()
+        # The window has passed (stamp aged past the idle throttle): one more attempt.
+        stamp = usage._copilot_attempt_path()
+        stamp.write_text(f"{int(time.time()) - 1000}\n", encoding="utf-8")
+        _refresh_copilot_usage(store, cfg, DaemonReport(), dry_run=False)
+        assert fetches == [1, 1]
+
+
+def test_refresh_copilot_usage_skips_when_the_tui_claimed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The TUI's tick claimed (and spawned) a refresh a moment ago: the daemon must not
+    # fetch in parallel even though the cache file itself is still missing.
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center import usage
+
+    cfg = config.load_config()
+    cfg.copilot_usage = True
+    assert usage.claim_copilot_refresh(cfg.copilot_usage_refresh_active_sec) is True
+
+    fetches: list[int] = []
+    monkeypatch.setattr(usage, "fetch_copilot_usage", lambda *_a, **_k: fetches.append(1))
+
+    with Store() as store:
+        store.ensure("s1", cwd="/repo")
+        store.update_fields("s1", status=Status.WORKING.value)
+        _refresh_copilot_usage(store, cfg, DaemonReport(), dry_run=False)
+    assert not fetches
+
+
 def test_refresh_claude_usage_fetches_each_stale_account(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

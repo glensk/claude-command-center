@@ -3147,7 +3147,9 @@ class CommandCenterApp(App[None]):
                 self.cfg.copilot_usage_refresh_active_sec,
                 active=active,
             )
-            if usage.copilot_usage_stale(throttle):
+            # claim_copilot_refresh stamps the attempt under a lock shared with the daemon,
+            # so a failing `gh` (or a failed spawn) is retried once per window, not per tick.
+            if usage.claim_copilot_refresh(throttle):
                 from .. import spawn  # pylint: disable=import-outside-toplevel
 
                 spawn.spawn_ccc(["copilot-usage"])

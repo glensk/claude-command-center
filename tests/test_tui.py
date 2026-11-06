@@ -2770,6 +2770,45 @@ def test_action_peek_spawns_peek_for_selected_row(
     assert [a for a in spawned if a and a[0] == "peek"] == [["peek", "--session", sid]]
 
 
+def test_usage_tick_copilot_spawn_is_claimed_once_per_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing spawn (or a `gh` that never writes the cache) is not retried per tick.
+
+    tp#1758: the stale cache used to fire a detached `ccc copilot-usage` on EVERY usage
+    tick; the shared claim stamps the attempt first, so repeated ticks spawn once.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    (tmp_path / "command-center").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "command-center" / "config.toml").write_text(
+        "copilot_usage = true\n", encoding="utf-8"
+    )
+
+    from command_center import spawn
+    from command_center.views.tui import CommandCenterApp
+
+    spawned: list[list[str]] = []
+
+    def _failing_spawn(args: list[str], **_kw: object) -> bool:
+        spawned.append(list(args))
+        return False  # e.g. `ccc` not on PATH: nothing started, nothing written
+
+    monkeypatch.setattr(spawn, "spawn_ccc", _failing_spawn)
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for _ in range(5):
+                app._update_usage()
+            await pilot.pause()
+
+    asyncio.run(scenario())
+    assert [a for a in spawned if a == ["copilot-usage"]] == [["copilot-usage"]]
+    assert usage._copilot_attempt_path().exists()
+    assert not usage._copilot_usage_path().exists()
+
+
 def test_card_toggles_flip_persist_and_t4_flips_both(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

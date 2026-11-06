@@ -398,6 +398,7 @@ _TEMP_PATTERNS = (
     "usage.json.*.tmp",
     "usage-*.json.*.tmp",
     "copilot_usage.json.*.tmp",
+    "copilot_usage.attempt.*.tmp",  # claim_copilot_refresh's attempt stamp
     "codex_usage-*.json.*.tmp",  # the per-CODEX_HOME live-usage caches
     # :mod:`.quota`'s observed-rejection store writes through _atomic_write_json too, so a
     # killed writer strands the same shape of orphan here.
@@ -2843,19 +2844,79 @@ def read_copilot_usage() -> CopilotUsage | None:
         return None
 
 
-def copilot_usage_stale(refresh_sec: float, now: int | None = None) -> bool:
-    """True if the cache is missing or older than ``refresh_sec`` (drives the refresh).
+def _copilot_attempt_path() -> Path:
+    """The refresh-attempt stamp: epoch of the last CLAIMED refresh, success or not."""
+    return config.app_home() / "copilot_usage.attempt"
 
-    ``refresh_sec`` is chosen by :func:`adaptive_interval` at the call sites (daemon +
+
+def _copilot_last_touch() -> int | None:
+    """Newer of the cache's mtime and the attempt stamp; None when neither exists.
+
+    The attempt stamp is what backs off a failing ``gh``: ``fetch_copilot_usage`` writes
+    nothing on failure, so the cache's mtime alone would read "stale" on every tick.
+    """
+    newest: int | None = None
+    try:
+        newest = int(_copilot_usage_path().stat().st_mtime)
+    except OSError:
+        pass
+    try:
+        stamp = int(_copilot_attempt_path().read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        stamp = None
+    if stamp is not None and (newest is None or stamp > newest):
+        newest = stamp
+    return newest
+
+
+def copilot_usage_stale(refresh_sec: float, now: int | None = None) -> bool:
+    """True if no refresh happened or was attempted within ``refresh_sec`` (drives refresh).
+
+    Age is taken from the NEWER of the cache's mtime and the attempt stamp written by
+    :func:`claim_copilot_refresh`, so a failing fetch is retried once per window, not per
+    tick. ``refresh_sec`` is chosen by :func:`adaptive_interval` at the call sites (daemon +
     TUI-spawned refresh): the idle ``copilot_usage_refresh_sec`` normally, or the shorter
     ``copilot_usage_refresh_active_sec`` while any job is actively working.
     """
     now = int(time.time()) if now is None else now
-    try:
-        mtime = _copilot_usage_path().stat().st_mtime
-    except OSError:
+    last = _copilot_last_touch()
+    if last is None:
         return True
-    return (now - int(mtime)) >= refresh_sec
+    return (now - last) >= refresh_sec
+
+
+def claim_copilot_refresh(refresh_sec: float, now: int | None = None) -> bool:
+    """Claim the right to refresh the Copilot cache now; True for exactly one claimant.
+
+    Called by the TUI usage tick and the daemon BEFORE they spawn/fetch. Under an
+    exclusive flock on a sidecar lock it rechecks :func:`copilot_usage_stale` and, when
+    stale, atomically writes the attempt stamp — so concurrent claimants (TUI + daemon)
+    serialize and only the first one wins, and a failed fetch or a failed spawn still
+    counts as an attempt for the whole window. The cache file (its mtime and
+    ``captured_at``) is never touched here. An explicit ``ccc copilot-usage`` bypasses
+    the claim. Never raises: an unwritable home answers False (no spawn storm either).
+    """
+    now = int(time.time()) if now is None else now
+    stamp = _copilot_attempt_path()
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        with _flock(stamp.with_name(stamp.name + ".lock")):
+            if not copilot_usage_stale(refresh_sec, now=now):
+                return False
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(stamp.parent), prefix=stamp.name + ".", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(f"{now}\n")
+                os.replace(tmp_name, stamp)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_name)
+                raise
+    except OSError:
+        return False
+    return True
 
 
 def _fmt_credits(value: float) -> str:
