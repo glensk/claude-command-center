@@ -326,7 +326,8 @@ def cmd_todos(args: argparse.Namespace) -> int:
     return 0
 
 
-def _set_field(args: argparse.Namespace, field: str, value: object) -> int:
+def _set_field(args: argparse.Namespace, field: str, value: object, done: str = "") -> int:
+    """Write one field of the resolved session; print *done* (default ``"<field> set"``)."""
     adapter = _adapter()
     session_id = resolve_session_id(adapter, args.session, None)
     if not session_id:
@@ -335,7 +336,7 @@ def _set_field(args: argparse.Namespace, field: str, value: object) -> int:
     with Store() as store:
         store.ensure(session_id, cwd=os.getcwd())
         store.update_fields(session_id, **{field: value})
-    print(f"{field} set for {session_id}")
+    print(f"{done or field + ' set'} for {session_id}")
     return 0
 
 
@@ -2612,7 +2613,8 @@ def cmd_codex_switch_exec(args: argparse.Namespace) -> int:
 
 
 def cmd_keep(args: argparse.Namespace) -> int:
-    return _set_field(args, "keep", not args.off)
+    # `--off` clears the flag, so it must not echo "keep set" (tp#1785).
+    return _set_field(args, "keep", not args.off, "keep cleared" if args.off else "keep set")
 
 
 def cmd_toggle_idle(args: argparse.Namespace) -> int:
