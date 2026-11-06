@@ -75,7 +75,7 @@ def _seed(db: Path) -> None:
         store.set_aim_met(_sid("aim_met"), True, "verified", 1)
         store.set_aim_met(_sid("aim_met_no_progress"), True, "verified", 1)
         store.update_fields(_sid("deadline"), deadline="2026-12-01")
-        store.update_fields(_sid("blocked"), blocked_on="review by Albert")
+        store.update_fields(_sid("blocked"), blocked_on="review by a peer")
         store.update_fields(
             _sid("everything"), deadline="2026-12-01", blocked_on="review", manual_progress=75
         )
@@ -188,7 +188,7 @@ _EXPECTED.update(
         (
             "statusline",
             "blocked",
-        ): b"\xf0\x9f\x8e\xaf ship the light refresh: tp#1758  \xe2\x9b\x94review by Albert\n",
+        ): b"\xf0\x9f\x8e\xaf ship the light refresh: tp#1758  \xe2\x9b\x94review by a peer\n",
         (
             "statusline",
             "everything",
@@ -224,7 +224,7 @@ _EXPECTED.update(
         (
             "default",
             "blocked",
-        ): b"\xf0\x9f\x8e\xaf ship the light refresh: tp#1758  \xe2\x9b\x94review by Albert\n",
+        ): b"\xf0\x9f\x8e\xaf ship the light refresh: tp#1758  \xe2\x9b\x94review by a peer\n",
         (
             "default",
             "everything",
@@ -404,7 +404,7 @@ _EXPECTED.update(
         (
             "statusline_on",
             "blocked",
-        ): b"\xf0\x9f\x8e\xaf ship the light refresh: tp#1758  \xe2\x9b\x94review by Albert\n",
+        ): b"\xf0\x9f\x8e\xaf ship the light refresh: tp#1758  \xe2\x9b\x94review by a peer\n",
         (
             "statusline_on",
             "everything",
