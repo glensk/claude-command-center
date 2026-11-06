@@ -15,8 +15,14 @@ writing anything, whenever it cannot answer exactly as ``cli.cmd_aim`` would:
 * the DB file is missing (``cli`` creates it), or any SQLite error — a missing column or
   table of an older DB (``cli`` migrates it), a corrupt file (``cli`` raises the error).
 
-The parser is the one :func:`add_aim_parser` builds for ``cli`` too, so ``-h``, option
-errors and their exit codes are the same bytes; the output is computed whole by
+* argv is anything but the exact forms :func:`parse_aim_argv` reads by hand
+  (``--session X``, ``--session=X``, ``--format F``, ``--format=F``, F a valid format):
+  ``-h``, abbreviations, unknown options, invalid formats and missing values all go to
+  ``cli``'s argparse parser (built by :func:`add_aim_parser`), so help, errors and exit
+  codes are argparse's own bytes. Importing argparse on Python 3.14 alone costs ~100 M
+  instructions (``_colorize`` → dataclasses, inspect, ast), a third of a served ``aim``.
+
+The output is computed whole by
 :func:`command_center.bars.aim_line` (shared with ``cli.cmd_aim``) before the single
 write, inside the same broken-pipe guard every console script uses.
 """
@@ -34,21 +40,26 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 
 # pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
-import argparse
 import os
 import sqlite3
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import __version__, brokenpipe
+
+if TYPE_CHECKING:
+    import argparse
 
 DESCRIPTION = "Command center for parked Claude Code sessions (AIM, progress, next-step)."
 
 AIM_FORMATS = ("statusline", "plain", "bar")
+AIM_DEFAULT_FORMAT = "statusline"
 
 
 def hot_root_parser() -> argparse.ArgumentParser:
     """The root parser of a single-subcommand (hot) ``ccc`` run; see ``cli.build_parser``."""
+    import argparse  # pylint: disable=import-outside-toplevel,redefined-outer-name
+
     root = argparse.ArgumentParser(
         prog="ccc",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -64,12 +75,43 @@ def add_aim_parser(sub: Any) -> argparse.ArgumentParser:
         "aim", help="status-line lookup of a session's done-condition"
     )
     p_aim.add_argument("--session")
-    p_aim.add_argument("--format", choices=list(AIM_FORMATS), default="statusline")
+    p_aim.add_argument("--format", choices=list(AIM_FORMATS), default=AIM_DEFAULT_FORMAT)
     return p_aim
 
 
 class _Unsupported(Exception):
     """The fast path cannot answer exactly like ``cli``; nothing was written yet."""
+
+
+def parse_aim_argv(argv: list[str]) -> tuple[str | None, str]:
+    """``(session, format)`` from ``aim``'s options, or :class:`_Unsupported`.
+
+    Reads only what :func:`add_aim_parser` would parse to the same values: exact long
+    options, ``=`` or separate-token values (a separate value never starts with ``-``,
+    where argparse may read it as an option), a valid format, last occurrence wins.
+    Everything else is argparse's to answer.
+    """
+    session: str | None = None
+    fmt = AIM_DEFAULT_FORMAT
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        name, sep, value = token.partition("=")
+        if name not in ("--session", "--format"):
+            raise _Unsupported(token)
+        if not sep:
+            if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                raise _Unsupported(token)
+            i += 1
+            value = argv[i]
+        if name == "--session":
+            session = value
+        elif value in AIM_FORMATS:
+            fmt = value
+        else:
+            raise _Unsupported(token)
+        i += 1
+    return session, fmt
 
 
 def _app_home() -> str:
@@ -150,17 +192,13 @@ def aim_output(fmt: str, session_id: str) -> str:
 
 def _serve_aim(argv: list[str]) -> int:
     """Parse and answer ``ccc aim``; raises :class:`_Unsupported` before any output."""
-    parser = hot_root_parser()
-    add_aim_parser(parser.add_subparsers(dest="command"))
-    args = parser.parse_args(argv)
+    session, fmt = parse_aim_argv(argv[1:])
     session_id = (
-        args.session
-        or os.environ.get("CLAUDE_SESSION_ID")
-        or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        session or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID")
     )
     if not session_id:
         raise _Unsupported("session by cwd needs the live registry")
-    text = aim_output(args.format, session_id)
+    text = aim_output(fmt, session_id)
     if text:
         sys.stdout.write(text)
     return 0

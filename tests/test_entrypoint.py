@@ -26,13 +26,18 @@ HEAVY = (
     "command_center.store",
     "rich",
     "textual",
+    "argparse",
 )
 
 _PROBE = """
 import json, sys
 from command_center import entrypoint
-code = entrypoint.main(sys.argv[2:])
-mods = sorted(m for m in sys.modules if m.split(".")[0] in ("command_center", "rich", "textual"))
+try:
+    code = entrypoint.main(sys.argv[2:])
+except SystemExit as exc:
+    code = exc.code
+roots = ("command_center", "rich", "textual", "argparse")
+mods = sorted(m for m in sys.modules if m.split(".")[0] in roots)
 with open(sys.argv[1], "w", encoding="utf-8") as fh:
     json.dump({"code": code, "modules": mods}, fh)
 """
@@ -78,6 +83,88 @@ def test_served_aim_imports_no_heavy_module(tmp_path: Path, fmt: str) -> None:
     assert isinstance(modules, list)
     loaded = [m for m in modules if m.startswith(HEAVY)]
     assert loaded == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("--session=" + SID, "--format=bar"),
+        ("--format", "bar", "--session", SID),
+        ("--format", "plain", "--session=" + SID, "--format=bar"),
+    ],
+)
+def test_hand_parsed_forms_serve_like_argparse(tmp_path: Path, argv: tuple[str, ...]) -> None:
+    """Every accepted form is served lean, with the bytes of the canonical spelling."""
+    home = _home(tmp_path / "home")
+    report, out = _probe(home, tmp_path, "aim", *argv)
+    canonical_report, canonical = _probe(home, tmp_path, "aim", "--session", SID, "--format", "bar")
+    assert (report["code"], out) == (canonical_report["code"], canonical)
+    modules = report["modules"]
+    assert isinstance(modules, list)
+    assert [m for m in modules if m.startswith(HEAVY)] == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("--session", SID, "--format", "bogus"),
+        ("--sess", SID),
+        ("--session",),
+        ("--session", "-x"),
+        ("--session", SID, "extra"),
+        ("-h",),
+    ],
+)
+def test_anything_else_reaches_argparse(tmp_path: Path, argv: tuple[str, ...]) -> None:
+    """Abbreviations, bad values, help and strays get argparse's own answer from ``cli``."""
+    home = _home(tmp_path / "home")
+    report, _ = _probe(home, tmp_path, "aim", *argv)
+    modules = report["modules"]
+    assert isinstance(modules, list)
+    assert "command_center.cli" in modules
+    expected = 0 if argv[0] in ("-h", "--sess") else 2
+    assert report["code"] == expected
+
+
+@pytest.mark.parametrize(
+    ("argv", "parsed"),
+    [
+        ([], (None, "statusline")),
+        (["--session", "s"], ("s", "statusline")),
+        (["--session=s"], ("s", "statusline")),
+        (["--session="], ("", "statusline")),
+        (["--session", ""], ("", "statusline")),
+        (["--format=plain", "--session", "a=b"], ("a=b", "plain")),
+        (["--session", "a", "--session", "b"], ("b", "statusline")),
+    ],
+)
+def test_parse_aim_argv_accepts(argv: list[str], parsed: tuple[str | None, str]) -> None:
+    from command_center import entrypoint  # pylint: disable=import-outside-toplevel
+
+    assert entrypoint.parse_aim_argv(argv) == parsed
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["-h"],
+        ["--help"],
+        ["--format"],
+        ["--format", "x"],
+        ["--format=x"],
+        ["--format", "--session"],
+        ["--session", "-1"],
+        ["--session", "--format=bar"],
+        ["--sess=s"],
+        ["--", "--session", "s"],
+        ["s"],
+    ],
+)
+def test_parse_aim_argv_declines(argv: list[str]) -> None:
+    from command_center import entrypoint  # pylint: disable=import-outside-toplevel
+
+    with pytest.raises(entrypoint._Unsupported):  # pylint: disable=protected-access
+        entrypoint.parse_aim_argv(argv)
 
 
 def test_unknown_session_db_missing_falls_back_to_cli(tmp_path: Path) -> None:

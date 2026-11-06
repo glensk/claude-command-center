@@ -158,14 +158,16 @@ The invariants that keep it under a few seconds:
   no commit), the needed columns only, `aim_on_main_line` from one `tomllib` read of
   `config.toml`, and the pure bar helpers of `bars.py` (stdlib-only, re-exported by
   `models`/`cli`). It computes the whole output before printing and hands argv to
-  `cli.main` only on defined "unsupported" conditions (unknown verb, parse doubt, no session
-  id, missing DB, any SQLite error such as a missing column) before any byte is written.
-  The status line spawns `ccc aim` per render per live session; this path costs ~320 M
-  instructions vs ~560 M for a full `cli` start (2026-11-06). On Python 3.14 one argparse
-  `add_argument` alone costs ~100 M (it builds a help formatter, importing `shutil` and
-  `_colorize`). `tests/test_aim_contract.py` pins the output bytes;
-  `tests/test_entrypoint.py` proves in a subprocess that a served `aim` loads none of `cli`,
-  `config`, `models`, `store`, rich or textual — keep any new import out of that path.
+  `cli.main` only on defined "unsupported" conditions (unknown verb, any argv beyond the
+  hand-parsed `--session X|=X` / `--format F|=F` forms, no session id, missing DB, any SQLite
+  error such as a missing column) before any byte is written. It never imports argparse:
+  on Python 3.14 argparse costs ~100 M instructions (`_colorize` pulls in dataclasses,
+  inspect, ast), so `-h`, abbreviations and option errors are `cli`'s argparse answer.
+  The status line spawns `ccc aim` per render per live session; this path costs ~226 M
+  instructions (median of 5, 2026-11-06; ~300 M with argparse) vs ~560 M for a full `cli`
+  start. `tests/test_aim_contract.py` pins the output bytes; `tests/test_entrypoint.py`
+  proves in a subprocess that a served `aim` loads none of `cli`, `config`, `models`,
+  `store`, argparse, rich or textual — keep any new import out of that path.
 - **One Copilot refresh per window, success or not.** `usage.claim_copilot_refresh()` (flock
   on a sidecar lock, staleness rechecked under it, atomic `copilot_usage.attempt` stamp) is
   called by the TUI usage tick and the daemon's `_refresh_copilot_usage` BEFORE they spawn
