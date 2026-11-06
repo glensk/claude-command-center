@@ -33,9 +33,15 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Account resolution lives in the stdlib-only `usagecache` (the lean `ccc statusline`
+# path, tp#1806 B2); re-exported so every `config.claude_home()` caller keeps working.
 # A Claude account label feeds usage-cache filenames, so it must never contain a
 # path separator: lowercase alphanumerics / dash / underscore, not starting with -/_.
-_ACCOUNT_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+from .usagecache import (  # noqa: F401  # pylint: disable=unused-import  # re-exported
+    _ACCOUNT_LABEL_RE,
+    claude_home,
+    parse_claude_accounts,
+)
 
 # Config is a flat settings record — many fields is expected.
 # pylint: disable=too-many-instance-attributes
@@ -520,12 +526,6 @@ INERT_DEFAULT_KEYS: tuple[str, ...] = (
 )
 
 
-def claude_home() -> Path:
-    """Root of Claude Code's state (``~/.claude`` unless ``CLAUDE_HOME`` is set)."""
-    env = os.environ.get("CLAUDE_HOME")
-    return Path(env) if env else Path.home() / ".claude"
-
-
 def ccc_home() -> Path:
     """Root of ccc's OWN state (``$CCC_HOME`` if set, else :func:`claude_home`).
 
@@ -845,24 +845,6 @@ def claude_config_dirs() -> dict[str, Path]:
     single-``private`` default.
     """
     return parse_claude_accounts(load_config().claude_accounts)
-
-
-def parse_claude_accounts(entries: list[str]) -> dict[str, Path]:
-    """Pure ``"label=path"`` parser behind :func:`claude_config_dirs`.
-
-    Split out so callers holding an already-loaded ``Config`` (e.g. the TUI's 5 s
-    render tick) can resolve the accounts without re-reading the config file.
-    """
-    dirs: dict[str, Path] = {}
-    for entry in entries:
-        label, sep, raw = entry.partition("=")
-        if not sep:
-            continue  # no "=" → not a "label=path" entry
-        label, raw = label.strip(), raw.strip()
-        if not raw or not _ACCOUNT_LABEL_RE.match(label):
-            continue  # blank path or a label that could smuggle a path separator
-        dirs[label] = Path(raw).expanduser().resolve()
-    return dirs or {"private": claude_home()}
 
 
 _LAUNCH_PROFILE_RE = re.compile(r"^[a-z0-9-]{1,32}$")

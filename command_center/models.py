@@ -37,6 +37,14 @@ from .bars import (  # noqa: F401  # pylint: disable=unused-import  # re-exporte
     xterm_rgb,
 )
 
+# The live-status rules live in the stdlib-only `livestatus` (the lean `ccc statusline`
+# path, tp#1806 B2); re-exported so every `from .models import effective_status` works.
+from .livestatus import (  # noqa: F401  # pylint: disable=unused-import  # re-exported
+    BUSY_RAW_STATUSES,
+    derive_status_value,
+    effective_status,
+)
+
 # The status-line helpers live in the stdlib-only `slrender` (the lean `ccc statusline`
 # path, tp#1806); re-exported so every `from .models import loads_todos` keeps working.
 from .slrender import (  # noqa: F401  # pylint: disable=unused-import  # re-exported
@@ -163,28 +171,6 @@ class CloseClaim:
     armed_at: int
     token: str = ""
     bound: str = ""
-
-
-#: Registry ``status`` values that mean mid-turn. Claude Code 2.1.295 writes ``busy`` |
-#: ``shell`` | ``idle`` | ``waiting``; ``shell`` = a shell tool is running (the CLI's own
-#: ``claude agents`` view folds it into ``busy``).
-BUSY_RAW_STATUSES = frozenset({"busy", "shell"})
-
-
-def effective_status(raw: str | None, turn_active: bool | None) -> str:
-    """The registry *raw* status with a turn-less ``shell`` read as ``idle`` (tp#1662).
-
-    Claude Code 2.1.317 leaves the registry at ``shell`` after a turn ENDS while a
-    ``run_in_background`` Bash (e.g. the keep-warm timer) still lives, so ``shell`` alone
-    cannot tell a running shell tool from an idle session holding a background shell.
-    The transcript can: ``turn_active is False`` (no open turn) makes it ``idle``. A
-    ``True`` or unknown (``None``) *turn_active* keeps ``shell`` busy — fail closed.
-    Every other status is returned unchanged.
-    """
-    text = raw or ""
-    if text.strip().lower() == "shell" and turn_active is False:
-        return "idle"
-    return text
 
 
 @dataclass
@@ -1056,7 +1042,7 @@ def handoff_marker(session: Session) -> str:
     return f"⇢ {target[:8]:<8}" if target else ""
 
 
-def derive_status(  # pylint: disable=too-many-return-statements  # ordered precedence ladder, one return per rule
+def derive_status(
     live: LiveSession | None,
     stored: Session | None,
     halted: bool = False,
@@ -1092,29 +1078,17 @@ def derive_status(  # pylint: disable=too-many-return-statements  # ordered prec
     :func:`effective_status`: a ``shell`` raw status with ``turn_active is False`` is an
     idle session holding a background shell (SNOOZED when ``background``), not WORKING.
     ``None`` (unknown, the default) keeps ``shell`` busy.
+
+    The ladder itself is :func:`livestatus.derive_status_value` (stdlib, shared with the
+    lean status line); this wraps its value into :class:`Status`.
     """
-    raw = effective_status(live.raw_status, turn_active).lower() if live is not None else ""
-    busy = live is not None and live.alive and raw in BUSY_RAW_STATUSES
-    if stored is not None and stored.handed_off_to:
-        # Terminal like done (tp#1300): the work moved to the successor. Only a turn that is
-        # literally still running (the finalize message being written) reads WORKING. Once
-        # the reconcile pass closed it as done (handoff done), done wins like any done row.
-        done_or_handed = Status.DONE if stored.done else Status.HANDED_OFF
-        return Status.WORKING if busy else done_or_handed
-    if stored is not None and stored.done:
-        if busy:
-            return Status.WORKING  # done, but still mid-turn — ✓ waits for the turn to end
-        return Status.DONE
-    if live is None or not live.alive:
-        return Status.PARKED
-    if halted:
-        return Status.HALTED
-    if raw in BUSY_RAW_STATUSES:
-        return Status.WORKING
-    if raw.startswith("wait"):
-        return Status.WAITING_INPUT
-    if background:
-        return Status.SNOOZED  # idle, but a background task is still running
-    if raw == "idle" and codex_waiting:
-        return Status.WAITING_CODEX
-    return Status.IDLE
+    return Status(
+        derive_status_value(
+            (live.raw_status, bool(live.alive)) if live is not None else None,
+            (bool(stored.done), stored.handed_off_to or "") if stored is not None else None,
+            halted,
+            background,
+            codex_waiting,
+            turn_active=turn_active,
+        )
+    )

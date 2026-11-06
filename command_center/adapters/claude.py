@@ -24,7 +24,16 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
-from .. import config
+from .. import config, livestatus
+
+# The registry parse, pid probe, transcript tail and halt rules live in the stdlib-only
+# `livestatus` (the lean `ccc statusline` path, tp#1806 B2); the private names stay here.
+from ..livestatus import HALT_TAIL_BYTES as _HALT_TAIL_BYTES
+from ..livestatus import (  # noqa: F401  # pylint: disable=unused-import  # handoff_capped
+    RATE_LIMIT_RE as _RATE_LIMIT_RE,
+)
+from ..livestatus import assistant_text as _assistant_text
+from ..livestatus import pid_alive as _pid_alive
 from ..models import (
     CODEX_WORKFLOW_NAME,
     EFFORT_LEVELS,
@@ -47,15 +56,6 @@ _CODEX_WORKFLOW_MARKER = f"<command-name>/{CODEX_WORKFLOW_NAME}"
 # Short-lived cache of the process tree (ppid -> [(pid, command)]) so all the
 # per-session has_subagent() calls in one TUI refresh share a single `ps` scan.
 _PROC_CACHE: dict[str, object] = {"ts": 0.0, "map": {}}
-
-# Claude Code's rate-limit halt text, e.g. "You've hit your weekly limit · resets …"
-# or "You've hit your session limit · resets …" (5-hour window). Matched only inside
-# an isApiErrorMessage assistant record (see is_halted) so user prompts that merely
-# quote the phrase never trigger it.
-_RATE_LIMIT_RE = re.compile(r"hit your \w[\w-]* limit", re.IGNORECASE)
-# Tail size scanned for the halt: the error is always the final transcript line, so a
-# small read suffices regardless of how large the full transcript is.
-_HALT_TAIL_BYTES = 65_536
 
 # A Bash-tool shell signature: Claude Code runs every Bash tool call as a zsh that
 # first ``source``s a per-session shell snapshot under ``~/.claude/shell-snapshots/``.
@@ -108,37 +108,23 @@ def _resolve_registry_group(entries: list[LiveSession]) -> LiveSession:
       would blank ``config_dir`` forever (the stale file never "exits"), permanently
       refusing resume for an id that merely once ran under the other account — exactly
       what resuming a session under the second account's ``claude --resume`` produces.
+
+    The choice itself is :func:`livestatus.resolve_registry_group` (shared with the lean
+    status line); this applies it: warn on a conflict, flag the row, blank its account.
     """
-    alive = [e for e in entries if e.alive]
-    chosen = max(alive or entries, key=lambda e: e.updated_at)
-    homes = {e.config_dir for e in alive}
-    if len(homes) > 1:
+    index, conflict = livestatus.resolve_registry_group(
+        [(e.alive, e.updated_at, e.config_dir) for e in entries]
+    )
+    chosen = entries[index]
+    if conflict is not None:
         # accounts ⇄ adapters cycle keeps this import local
         from .. import accounts  # pylint: disable=import-outside-toplevel
 
-        first, second = sorted(homes)[:2]
+        first, second = conflict
         accounts.warn_conflict(chosen.session_id, first, second)
         chosen.conflict = True
         chosen.config_dir = ""
     return chosen
-
-
-def _assistant_text(record: dict) -> str:
-    """Concatenate the text blocks of an assistant transcript record (else "")."""
-    message = record.get("message")
-    if not isinstance(message, dict):
-        return ""
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    parts = [
-        str(block.get("text", ""))
-        for block in content
-        if isinstance(block, dict) and block.get("type") == "text"
-    ]
-    return " ".join(parts)
 
 
 # Wrapper blocks Claude Code wraps around a user turn that are not part of what the
@@ -988,21 +974,6 @@ def _children_map() -> dict[int, list[tuple[int, str]]]:
     return children
 
 
-def _pid_alive(pid: int) -> bool:
-    """True if a process with *pid* exists (signal 0 probe)."""
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but owned by another user
-    except OSError:
-        return False
-    return True
-
-
 def _command_for_pid(pid: int) -> str | None:
     """The command line of *pid* from the cached process scan (``None`` if not found).
 
@@ -1105,40 +1076,14 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         return out
 
     def _parse_registry_entry(self, path: Path, home_str: str) -> LiveSession | None:
-        """Parse one ``sessions/<pid>.json`` into a stamped :class:`LiveSession`."""
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        """Parse one ``sessions/<pid>.json`` into a stamped :class:`LiveSession`.
+
+        The parse (sdk filter, pid probe) is :func:`livestatus.parse_registry_entry`.
+        """
+        fields = livestatus.parse_registry_entry(path, home_str, _pid_alive)
+        if fields is None:
             return None
-        session_id = data.get("sessionId")
-        if not session_id:
-            return None
-        # Skip headless / SDK sessions: every `claude -p` (the daemon's own
-        # summary & auto-progress calls, plus any other tool's headless runs)
-        # registers here with entrypoint "sdk-cli", reusing kind "interactive".
-        # They are not user sessions — left unfiltered they flood the store with
-        # short-lived "parked" rows (typically at cwd "/", the launchd cwd) that
-        # reconcile() then persists forever. entrypoint is the robust signal
-        # (cwd-independent); kind is not (Claude reuses "interactive").
-        entrypoint = str(data.get("entrypoint", "cli"))
-        if entrypoint.startswith("sdk"):
-            return None
-        pid = int(data.get("pid", 0) or 0)
-        return LiveSession(
-            pid=pid,
-            session_id=session_id,
-            cwd=data.get("cwd", ""),
-            kind=data.get("kind", "interactive"),
-            entrypoint=entrypoint,
-            raw_status=data.get("status", "idle"),
-            name=data.get("name"),
-            agent=data.get("agent", "claude"),
-            started_at=int(data.get("startedAt", 0) or 0),
-            updated_at=int(data.get("updatedAt", 0) or 0),
-            status_updated_at=int(data.get("statusUpdatedAt", 0) or 0),
-            alive=_pid_alive(pid),
-            config_dir=home_str,
-        )
+        return LiveSession(**fields)
 
     def _ordered_projects_dirs(self, config_dir: str | None) -> list[Path]:
         """Account ``projects/`` dirs to search, the owning account first (D14)."""
@@ -1170,9 +1115,9 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         with the exact-munged-path probe still live, so a new transcript in its canonical
         location lands instantly — only cross-account glob DISCOVERY is delayed. The
         plain-dict cache is safe under the GIL for the TUI's worker-thread use: a race
-        only causes redundant re-resolution, never a wrong answer.
+        only causes redundant re-resolution, never a wrong answer. The memo-free search
+        itself is :func:`livestatus.find_transcript` (shared with the lean status line).
         """
-        encoded = cwd.replace("/", "-")
         cached = self._transcript_cache.get(session_id)
         if cached is not None:
             path, stamp = cached
@@ -1182,22 +1127,15 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
                 self._transcript_cache.pop(session_id, None)  # deleted → full re-resolve below
             elif time.monotonic() - stamp < _TRANSCRIPT_NEG_TTL:
                 # cheap exact-path probes only; skip the expensive glob during the TTL
-                for projects_dir in self._ordered_projects_dirs(config_dir):
-                    candidate = projects_dir / encoded / f"{session_id}.jsonl"
-                    if candidate.exists():
-                        self._transcript_cache[session_id] = (candidate, time.monotonic())
-                        return candidate
-                return None
-        resolved = None
-        for projects_dir in self._ordered_projects_dirs(config_dir):
-            candidate = projects_dir / encoded / f"{session_id}.jsonl"
-            if candidate.exists():
-                resolved = candidate
-                break
-            hits = list(projects_dir.glob(f"*/{session_id}.jsonl"))
-            if hits:
-                resolved = hits[0]
-                break
+                candidate = livestatus.find_transcript(
+                    self._ordered_projects_dirs(config_dir), cwd, session_id, glob=False
+                )
+                if candidate is not None:
+                    self._transcript_cache[session_id] = (candidate, time.monotonic())
+                return candidate
+        resolved = livestatus.find_transcript(
+            self._ordered_projects_dirs(config_dir), cwd, session_id
+        )
         self._transcript_cache[session_id] = (resolved, time.monotonic())
         return resolved
 
@@ -1461,31 +1399,9 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
 
         Reads only the tail so a multi-MB transcript stays cheap to poll each refresh.
         When the file exceeds *max_bytes* the first (possibly mid-record) line is dropped.
+        Delegates to :func:`livestatus.tail_records`.
         """
-        try:
-            size = path.stat().st_size
-            with path.open("rb") as handle:
-                truncated = size > max_bytes
-                if truncated:
-                    handle.seek(-max_bytes, os.SEEK_END)
-                chunk = handle.read()
-        except OSError:
-            return []
-        lines = chunk.decode("utf-8", errors="replace").splitlines()
-        if truncated and lines:
-            lines = lines[1:]
-        records: list[dict] = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict):
-                records.append(record)
-        return records
+        return livestatus.tail_records(path, max_bytes)
 
     def halt_record(
         self, cwd: str, session_id: str, config_dir: str = "", path: Path | None = None
@@ -1502,17 +1418,7 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         target = path if path is not None else self.transcript_path(cwd, session_id, config_dir)
         if target is None:
             return None
-        last_assistant: dict | None = None
-        for record in self._tail_records(target):
-            if record.get("isSidechain"):
-                continue
-            if record.get("type") == "assistant":
-                last_assistant = record
-        if last_assistant is None or not last_assistant.get("isApiErrorMessage"):
-            return None
-        if _RATE_LIMIT_RE.search(_assistant_text(last_assistant)) is None:
-            return None
-        return last_assistant
+        return livestatus.halt_record(self._tail_records(target))
 
     def is_halted(self, cwd: str, session_id: str) -> bool:
         """True if the session's last main-chain *assistant* turn is a rate-limit halt.
@@ -1532,19 +1438,12 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         Sub-agent (``isSidechain``) chatter is ignored — only the main thread counts.
         Gating on ``isApiErrorMessage`` is what keeps the many user prompts and
         task-notifications that merely *quote* the phrase from false-triggering.
+        The scan is :func:`livestatus.halt_record` (shared with the lean status line).
         """
         path = self.transcript_path(cwd, session_id)
         if path is None:
             return False
-        last_assistant: dict | None = None
-        for record in self._tail_records(path):
-            if record.get("isSidechain"):
-                continue
-            if record.get("type") == "assistant":
-                last_assistant = record
-        if last_assistant is None or not last_assistant.get("isApiErrorMessage"):
-            return False
-        return _RATE_LIMIT_RE.search(_assistant_text(last_assistant)) is not None
+        return livestatus.halt_record(self._tail_records(path)) is not None
 
     def successful_response_since(self, cwd: str, session_id: str, byte_offset: int) -> bool:
         """True iff a successful MAIN-CHAIN assistant record landed after *byte_offset*.

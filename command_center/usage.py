@@ -51,7 +51,6 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 import base64
 import calendar
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
@@ -64,7 +63,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -73,7 +72,7 @@ from typing import Any
 from rich.cells import cell_len
 from rich.text import Text
 
-from . import config, seat_rota
+from . import config, seat_rota, usagecache
 from .codex_in_claude import (
     _FIVE_HOUR_MINUTES,
     _SEVEN_DAY_MINUTES,
@@ -81,6 +80,17 @@ from .codex_in_claude import (
     codex_refusal,
     refusal_label,
     short_refusal_label,
+)
+
+# The status-line cache write lives in the stdlib-only `usagecache` (the lean
+# `ccc statusline` path, tp#1806 B2); its helpers are re-exported here so every
+# `usage._flock` / `usage._atomic_write_json` caller keeps working.
+from .usagecache import (  # noqa: F401  # pylint: disable=unused-import  # re-exported
+    _OAUTH_AUTHORITY_SEC,
+    _atomic_write_json,
+    _flock,
+    _int_field,
+    _load_json_dict,
 )
 
 # Statuses that mean a job is actively doing work — while any tracked session is in one
@@ -216,12 +226,6 @@ _codex_email_cache: dict[tuple[str, int], str | None] = {}
 _OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 _OAUTH_BETA_HEADER = "oauth-2025-04-20"
 
-# Window at which a stored authoritative OAuth fetch still outranks an incoming
-# status-line window in the merge (see :func:`_merge_window`). One hour: long enough to
-# survive a persistently-idle session replaying its pre-rebase ``rate_limits`` every 3s,
-# short enough that the periodic fetch keeps re-asserting authority.
-_OAUTH_AUTHORITY_SEC = 3600
-
 # Ceiling on a persisted 429 backoff. The OAuth usage endpoint has been seen to answer a
 # 429 with a very large ``Retry-After`` (observed 3357 s, and it can be larger); we honour
 # the server's wait but never longer than this, so a bogus/huge value cannot wedge the
@@ -323,11 +327,11 @@ def _account_config_dir(account: str) -> Path:
 
 def _account_hash(account: str) -> str:
     """8-hex ``sha256`` of the account's resolved config dir — keys the usage cache."""
-    return hashlib.sha256(str(_account_config_dir(account)).encode()).hexdigest()[:8]
+    return usagecache._account_hash(_account_config_dir(account))
 
 
 def _usage_path(account: str = "private") -> Path:
-    """Per-account usage-cache path.
+    """Per-account usage-cache path (:func:`usagecache._usage_path`).
 
     The default account (label ``private``) keeps the back-compat ``usage.json``; any
     other label writes ``usage-<label>-<hash8>.json`` (``hash8`` = the account's config
@@ -336,57 +340,7 @@ def _usage_path(account: str = "private") -> Path:
     base = config.app_home()
     if account == "private":
         return base / "usage.json"
-    return base / f"usage-{account}-{_account_hash(account)}.json"
-
-
-@contextlib.contextmanager
-def _flock(lock_path: Path) -> Iterator[None]:
-    """Hold an exclusive advisory ``flock`` on *lock_path* for a critical section.
-
-    Serializes the read-merge-write across every concurrent statusline writer (each
-    session calls :func:`write_usage` every few seconds), so the shared cache file is
-    never interleaved. The lock file itself is a persistent zero-byte sentinel.
-    """
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
-
-
-def _atomic_write_json(path: Path, payload: dict) -> None:
-    """Atomically replace *path* with *payload* via a unique ``mkstemp`` temp file.
-
-    A per-write unique temp name (not a fixed ``.json.tmp``) plus ``os.replace`` means
-    concurrent writers cannot clobber one another's temp file.
-
-    The ``finally`` unlink covers every *exception* path (the old ``except OSError``
-    leaked on ``TypeError`` from ``json.dump`` and on ``KeyboardInterrupt``, which
-    contradicted :func:`write_usage`'s "never raises" contract). It cannot cover
-    asynchronous death: Claude Code cancels an in-flight status-line command when the
-    next update arrives, and this writer is the last thing the status-line script runs
-    every few seconds — so the process is killed outright with no Python unwinding.
-    Those orphans are reclaimed by :func:`sweep_stale_temps`, not here.
-
-    Deliberately no ``fsync``: this is a cache refreshed every few seconds, and the
-    extra latency would widen the very cancellation window that strands the temp file.
-    """
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-    replaced = False
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-        os.replace(tmp_name, path)
-        replaced = True
-    finally:
-        # Only when the replace did NOT happen — otherwise tmp_name IS *path* now.
-        if not replaced:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_name)
+    return usagecache._usage_path(base, account, _account_config_dir(account))
 
 
 # Temp files this module strands when a writer is killed mid-write. Enumerated rather
@@ -436,66 +390,9 @@ def sweep_stale_temps(now: float | None = None, *, max_age_sec: int = _TEMP_MAX_
 
 
 def _window(raw: object) -> Window | None:
-    if not isinstance(raw, dict):
-        return None
-    pct = raw.get("used_percentage")
-    resets = raw.get("resets_at")
-    if pct is None or resets is None:
-        return None
-    try:
-        return Window(used_percentage=float(pct), resets_at=int(resets))
-    except (TypeError, ValueError):
-        return None
-
-
-def _merge_window(
-    incoming: Window | None,
-    stored: Window | None,
-    now: int,
-    *,
-    stored_authoritative: bool = False,
-    incoming_stale: bool = False,
-) -> Window | None:
-    """Pick the live window between a fresh capture and the persisted one.
-
-    A window's reset is always in the *future*; ``resets_at <= now`` means the
-    capturing session simply hasn't talked to the API since the window rolled, so
-    its snapshot is stale — discard it. Between two live windows keep the one with
-    the later ``resets_at`` (the account-global boundary only ever moves forward, so
-    a smaller one is an older session's view), and **on an equal reset keep the
-    higher ``used_percentage``**: usage within a fixed window is cumulative, so the
-    larger figure is the freshest total — this stops idle sessions, which share the
-    same weekly boundary but report a days-old lower total, from flip-flopping the
-    card (e.g. 8% ↔ 28%). A genuine reset moves ``resets_at`` forward, so the new
-    low percentage is still adopted (later reset beats higher percentage).
-
-    **Authority guard** (*stored_authoritative*): when the stored window was written
-    by a recent authoritative OAuth fetch (within :data:`_OAUTH_AUTHORITY_SEC`) and is
-    still LIVE, two kinds of incoming status-line windows are REJECTED (stored kept):
-
-    - one whose reset is *later* than the stored one, and
-    - ANY window from a stale payload (*incoming_stale* — the reporting session's own
-      5-hour window is dead/absent, i.e. it has not talked to the API for >5h).
-
-    Anthropic can rebase windows at a rollout (seen in July 2026: the weekly boundary
-    moved BACKWARD Jul 15 → Jul 11, and the weekly percentage was recalibrated DOWN,
-    84% → 3%, at the *same* boundary); a long-idle session then replays its pre-rebase
-    ``rate_limits`` every 3s, and the plain "later reset wins" / "same reset, higher
-    percentage wins" rules would re-pin the stale figures minutes after every
-    authoritative fetch heals them. An ACTIVE session's same-reset increase still wins
-    (the ~3s fast path between fetches survives). A genuine forward roll is unaffected:
-    a truly reset stored window is dead (``resets_at <= now``), dropped from the live
-    set, so the incoming later window is adopted as today regardless of authority.
-    """
-    live = [w for w in (incoming, stored) if w is not None and w.resets_at > now]
-    if not live:
-        return None
-    if stored_authoritative and stored is not None and stored.resets_at > now:
-        if incoming_stale:
-            return stored
-        if incoming is not None and incoming.resets_at > stored.resets_at:
-            return stored
-    return max(live, key=lambda w: (w.resets_at, w.used_percentage))
+    """A cache/payload window dict as a :class:`Window` (``usagecache._window``)."""
+    win = usagecache._window(raw)
+    return None if win is None else Window(used_percentage=win[0], resets_at=win[1])
 
 
 def _window_dict(win: Window | None) -> dict | None:
@@ -505,40 +402,13 @@ def _window_dict(win: Window | None) -> dict | None:
     return {"used_percentage": win.used_percentage, "resets_at": win.resets_at}
 
 
-# A window counts as full at this percentage. ``full_since`` (tp#1327) records, per window,
-# the FIRST capture that read it full for the window's current boundary. ``captured_at``
-# cannot date that: the status line bumps it every few seconds, so a turn is never newer
-# than it. The handoff's capped check asks "did a turn succeed on the seat after it filled?"
-# and needs the earliest moment the window was known full.
-_FULL_PCT = 100.0
-# Two readings of one window may name boundaries a few seconds apart (OAuth ISO vs the
-# status line's epoch); a genuine new window of the same name is hours away.
-_SAME_WINDOW_SLACK_SEC = 3600
-
-
 def _full_since(prev: dict | None, windows: dict[str, Window | None], now: int) -> dict[str, int]:
-    """``{window: epoch}`` of the first capture that read each window full (tp#1327).
-
-    A window full in *prev* with a still-live boundary within
-    :data:`_SAME_WINDOW_SLACK_SEC` of the new one keeps its stored time; a window that
-    became full now starts at *now*; one below :data:`_FULL_PCT` drops out.
-    """
-    stored = prev.get("full_since") if prev else None
-    stored = stored if isinstance(stored, dict) else {}
-    out: dict[str, int] = {}
-    for name, win in windows.items():
-        if win is None or win.used_percentage < _FULL_PCT:
-            continue
-        old = _window(prev.get(name)) if prev else None
-        since = _int_field(stored, name)
-        same = (
-            old is not None
-            and old.used_percentage >= _FULL_PCT
-            and old.resets_at > now
-            and abs(old.resets_at - win.resets_at) < _SAME_WINDOW_SLACK_SEC
-        )
-        out[name] = since if same and 0 < since <= now else now
-    return out
+    """``{window: epoch}`` of the first full capture per window (:func:`usagecache._full_since`)."""
+    plain = {
+        name: None if win is None else (win.used_percentage, win.resets_at)
+        for name, win in windows.items()
+    }
+    return usagecache._full_since(prev, plain, now)
 
 
 def full_since(account: str, window: str) -> int:
@@ -556,9 +426,9 @@ def write_usage(rate_limits: object, *, account: str = "private", now: int | Non
     snapshot. The whole read-merge-write runs under a per-account ``flock`` so the
     concurrent statuslines of every live session (each calling this every few seconds)
     cannot interleave. Each window is merged against the persisted one via
-    :func:`_merge_window` — a stale writer (past/older ``resets_at``, or a lower
-    cumulative percentage at the same reset) can neither pull the snapshot backward,
-    persist a past reset that would render as "Resets now", nor flip-flop the
+    :func:`usagecache._merge_window` — a stale writer (past/older ``resets_at``, or a
+    lower cumulative percentage at the same reset) can neither pull the snapshot
+    backward, persist a past reset that would render as "Resets now", nor flip-flop the
     percentage. Merging stays strictly WITHIN one account (the prior read is scoped to
     *account*). The payload stamps the account's ``config_dir_hash`` so a later reader
     can refuse a snapshot left by a different config dir under the same label. Returns
@@ -569,82 +439,20 @@ def write_usage(rate_limits: object, *, account: str = "private", now: int | Non
     so clobbering them to None/0 on every 3-second status-line write would erase what
     :func:`fetch_claude_usage` fetched (or the 429 backoff it recorded). While the stored
     ``oauth_fetched_at`` is fresh (within :data:`_OAUTH_AUTHORITY_SEC`) the merge treats the
-    stored windows as authoritative — see :func:`_merge_window`'s re-pin guard.
+    stored windows as authoritative — see :func:`usagecache._merge_window`'s re-pin guard.
+
+    The merge itself is :func:`usagecache.write_usage` (stdlib, shared with the lean
+    status line); this resolves the app home and the account's config dir.
     """
     if not isinstance(rate_limits, dict):
         return False
-    incoming_five = _window(rate_limits.get("five_hour"))
-    incoming_seven = _window(rate_limits.get("seven_day"))
-    if incoming_five is None and incoming_seven is None:
-        return False
-    now = int(time.time()) if now is None else now
-    path = _usage_path(account)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with _flock(path.with_name(path.name + ".lock")):
-            prev = _read_validated(account)
-            prev_five = _window(prev.get("five_hour")) if prev else None
-            prev_seven = _window(prev.get("seven_day")) if prev else None
-            prev_oauth = _int_field(prev, "oauth_fetched_at") if prev else 0
-            authoritative = 0 < prev_oauth and (now - prev_oauth) < _OAUTH_AUTHORITY_SEC
-            # A payload whose own 5-hour window is dead/absent comes from a session that
-            # has not talked to the API for >5h — its weekly figure is at least that old
-            # too, so under authority it may fill gaps but never override (see
-            # _merge_window's guard; the 84%-replay case).
-            payload_stale = incoming_five is None or incoming_five.resets_at <= now
-            five = _merge_window(
-                incoming_five,
-                prev_five,
-                now,
-                stored_authoritative=authoritative,
-                incoming_stale=payload_stale,
-            )
-            seven = _merge_window(
-                incoming_seven,
-                prev_seven,
-                now,
-                stored_authoritative=authoritative,
-                incoming_stale=payload_stale,
-            )
-            if five is None and seven is None:
-                return False
-            payload = {
-                "captured_at": now,
-                "config_dir_hash": _account_hash(account),
-                "five_hour": _window_dict(five),
-                "seven_day": _window_dict(seven),
-                "full_since": _full_since(prev, {"five_hour": five, "seven_day": seven}, now),
-                # OAuth-only fields preserved verbatim (status line never carries them).
-                "oauth_fetched_at": prev_oauth,
-                "oauth_backoff_until": _int_field(prev, "oauth_backoff_until") if prev else 0,
-            }
-            _atomic_write_json(path, payload)
-    except OSError:
-        return False
-    return True
-
-
-def _load_json_dict(path: Path) -> dict | None:
-    """*path* parsed as a JSON object; ``None`` when absent, unreadable or not an object."""
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _int_field(data: dict | None, key: str) -> int:
-    """Read an int field from a cache dict, tolerating missing/malformed values (→ 0)."""
-    if not data:
-        return 0
-    try:
-        return int(data.get(key, 0) or 0)
-    except (TypeError, ValueError):
-        return 0
+    return usagecache.write_usage(
+        rate_limits,
+        account=account,
+        app_home=config.app_home(),
+        account_dir=_account_config_dir(account),
+        now=now,
+    )
 
 
 def _read_validated(account: str) -> dict | None:
@@ -655,18 +463,9 @@ def _read_validated(account: str) -> dict | None:
     DIFFERENT config dir (label reuse), so return ``None``. A hashless payload (a
     pre-existing ``usage.json``) is accepted for the default ``private`` account only.
     Shared by :func:`read_usage`, :func:`oauth_fetched_at`, and :func:`write_usage`'s
-    merge so all three honour the same fail-closed rule.
+    merge so all three honour the same fail-closed rule (:func:`usagecache._read_validated`).
     """
-    data = _load_json_dict(_usage_path(account))
-    if data is None:
-        return None
-    stored_hash = data.get("config_dir_hash")
-    if stored_hash is not None:
-        if stored_hash != _account_hash(account):
-            return None  # this cache belongs to a different config dir → refuse
-    elif account != "private":
-        return None  # hashless payloads are legacy usage.json — default account only
-    return data
+    return usagecache._read_validated(config.app_home(), account, _account_config_dir(account))
 
 
 def read_usage(account: str = "private") -> Usage | None:

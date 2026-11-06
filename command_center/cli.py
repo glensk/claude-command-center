@@ -5427,25 +5427,12 @@ def _account_from_env() -> str | None:
     was added the old "only if exactly one account" rule made private sessions NEVER
     write their usage snapshot (usage.json froze). A set env matching no configured
     account still returns ``None`` (the caller skips the write rather than contaminate a
-    card with an unknown account's quota).
+    card with an unknown account's quota). The rule is :func:`usagecache.account_from_env`
+    (stdlib, shared with the lean status line).
     """
-    from pathlib import Path
+    from . import usagecache
 
-    dirs = config.claude_config_dirs()
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
-    if env:
-        try:
-            target = Path(env).expanduser().resolve()
-        except OSError:
-            return None
-        for label, path in dirs.items():
-            try:
-                if path.resolve() == target:
-                    return label
-            except OSError:
-                continue
-        return None
-    return next(iter(dirs), None)
+    return usagecache.account_from_env(config.claude_config_dirs())
 
 
 def _read_statusline_stdin() -> dict | None:
