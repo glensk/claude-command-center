@@ -51,6 +51,14 @@ from dataclasses import dataclass
 from typing import IO, TYPE_CHECKING, Any
 
 from . import accounts, config, terminal, usage
+
+# The fire-time formatting lives in the stdlib-only `slrender` (the lean `ccc statusline`
+# path, tp#1806); re-exported so `park.format_fire` & co. keep working.
+from .slrender import (  # noqa: F401  # pylint: disable=unused-import  # re-exported
+    FIRE_GRACE_SEC,
+    _span,
+    format_fire,
+)
 from .store import Store
 
 if TYPE_CHECKING:  # the seam's type only — importing peek eagerly would cost every `ccc`
@@ -65,9 +73,6 @@ DEFAULT_BUFFER_SEC = 90
 # Conservative argv budget: macOS ARG_MAX is ~1 MB including the environment; the
 # prompt travels as ONE argv element of `claude`, so cap well below the ceiling.
 MAX_PROMPT_BYTES = 200_000
-# The daemon dispatches armed jobs only this far past fire_at, so a live foreground
-# waiter (which fires exactly on time) always wins the race for its own tab.
-FIRE_GRACE_SEC = 120
 # Re-arm-forward lease: the daemon pushes fire_at this far ahead BEFORE dispatching,
 # so a crash mid-dispatch (or a tab that opened but never ran) retries — never lost.
 FIRE_RETRY_SEC = 900
@@ -143,37 +148,6 @@ def postpone_until(
     if win.used_percentage >= 100.0 and win.resets_at > now + _POSTPONE_SLACK_SEC:
         return int(win.resets_at) + max(0, int(buffer_sec))
     return None
-
-
-def _span(seconds: int) -> str:
-    """Compact duration: ``45s`` / ``37m`` / ``2h 05m`` / ``2d 3h``."""
-    seconds = max(0, int(seconds))
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m"
-    if seconds < 86400:
-        hours, minutes = divmod(seconds // 60, 60)
-        return f"{hours}h {minutes:02d}m"
-    days, hours = divmod(seconds // 3600, 24)
-    return f"{days}d {hours}h"
-
-
-def format_fire(fire_at: int, now: int | None = None) -> str:
-    """Human line for an armed fire time — overdue-aware, never a silent "now".
-
-    ``fires 14:03 (in 37m)`` ahead of time, ``fires now`` inside the dispatch grace,
-    ``overdue 37m`` past it (both dispatchers failed — the row must say so instead
-    of claiming "now" forever).
-    """
-    now = int(time.time()) if now is None else now
-    delta = int(fire_at) - now
-    hhmm = time.strftime("%H:%M", time.localtime(int(fire_at)))
-    if delta > 60:
-        return f"fires {hhmm} (in {_span(delta)})"
-    if delta >= -FIRE_GRACE_SEC:
-        return "fires now"
-    return f"overdue {_span(-delta)}"
 
 
 def prompt_size_error(prompt: str) -> str | None:

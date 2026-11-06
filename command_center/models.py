@@ -37,6 +37,19 @@ from .bars import (  # noqa: F401  # pylint: disable=unused-import  # re-exporte
     xterm_rgb,
 )
 
+# The status-line helpers live in the stdlib-only `slrender` (the lean `ccc statusline`
+# path, tp#1806); re-exported so every `from .models import loads_todos` keeps working.
+from .slrender import (  # noqa: F401  # pylint: disable=unused-import  # re-exported
+    EFFORT_LEVELS,
+    aim_score_pct,
+    display_aim,
+    drift_unresolved,
+    loads_todos,
+    low_aim_score,
+    todo_box,
+    todos_counts,
+)
+
 # Session/LiveSession are data records — many fields is the point.
 # pylint: disable=too-many-instance-attributes
 
@@ -418,10 +431,6 @@ _RETIRED_MODEL_LABELS: dict[str, str] = {"claude-fable-5": "fable-5"}
 LLM_PREFIX_ALIASES: dict[str, str] = {"opus": "opus-5.5"}
 # Separator glyph between the overseer and executor model in a draft's models readout.
 LLM_ARROW = "▸"
-# Valid ``claude --effort`` levels. Job launches pass the config ``launch_effort``
-# (default xhigh) explicitly so the session's effort never silently depends on the
-# user's ~/.claude/settings.json ``effortLevel`` (whose absence means "high").
-EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
 
 
 def model_label(model_id: str | None) -> str:
@@ -794,15 +803,6 @@ def subgoal_provenance(subgoals: list[Subgoal]) -> str:
     return f"{who} · from AIM v{rev}" if rev else who
 
 
-def drift_unresolved(session: Session) -> bool:
-    """True if the session has a flagged, not-yet-acknowledged sub-goal drift (blue dot).
-
-    A new flag resets ``drift_ack_at`` to 0; ``ack_drift`` sets it > 0; a clean check
-    clears the severity. So "unresolved" = flagging severity AND unacknowledged.
-    """
-    return session.drift_severity in ("low", "medium", "high") and session.drift_ack_at == 0
-
-
 def short_id(session_id: str, width: int = 8) -> str:
     """First *width* chars of a session id — enough to eyeball/disambiguate a row.
 
@@ -871,39 +871,6 @@ def parse_manual_progress(value: str) -> int | None:
 def dumps_todos(todos: list[tuple[str, str]]) -> str:
     """Serialize a ``[(status, subject), …]`` todo list to a JSON string for the store."""
     return json.dumps([[status, subject] for status, subject in todos])
-
-
-def loads_todos(raw: str | None) -> list[tuple[str, str]]:
-    """Parse a stored todo JSON string back to ``[(status, subject), …]`` (empty on junk)."""
-    if not raw:
-        return []
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return []
-    out: list[tuple[str, str]] = []
-    for item in data if isinstance(data, list) else []:
-        if isinstance(item, (list, tuple)) and len(item) == 2:
-            out.append((str(item[0]), str(item[1])))
-    return out
-
-
-def todos_counts(todos: list[tuple[str, str]]) -> tuple[int, int]:
-    """Return ``(completed, total)`` counts for a todo list."""
-    return (sum(1 for status, _ in todos if status == "completed"), len(todos))
-
-
-def todo_box(status: str) -> str:
-    """Checkbox glyph for a todo *status*: ``☒`` done, ``◧`` in-progress, ``☐`` pending.
-
-    Shared by the one-line status-line strip and the TUI detail list so the two
-    surfaces show the same boxes.
-    """
-    if status == "completed":
-        return "☒"
-    if "progress" in status:
-        return "◧"
-    return "☐"
 
 
 def first_json_object(raw: str | None) -> dict[str, object]:
@@ -996,24 +963,6 @@ def aim_score_badge(score: int, threshold: int) -> tuple[str, str]:
     return ("", "green")
 
 
-def low_aim_score(aim: str | None, score: int, threshold: int) -> bool:
-    """True when an AIM has a known concreteness score below the configured threshold."""
-    return bool(aim) and 0 <= score < threshold
-
-
-def aim_score_pct(aim: str | None, score: int) -> str:
-    """Numeric AIM-score chip for the ``/aim`` column.
-
-    ``""`` when no AIM is set OR while the AIM is still unscored (``score < 0``) — the
-    raw ``-1`` sentinel is never surfaced. With ``aim_score_on_set`` disabled the LLM
-    refine never fires, so a bare ``-1`` would otherwise read as a permanently stuck
-    "pending" state; a blank chip degrades gracefully instead. Else ``"NN%"`` (0–100).
-    """
-    if not aim or score < 0:
-        return ""
-    return f"{score}%"
-
-
 def short_version(version: str | None) -> str:
     """The patch component of a Claude Code version, for the narrow ``ver`` column.
 
@@ -1069,25 +1018,6 @@ def aim_column_first(aim_column: str) -> bool:
     (including an empty or misspelled value) keeps the default first-AIM rendering.
     """
     return (aim_column or "").strip().lower() != "latest"
-
-
-def display_aim(session: Session, first: bool = False) -> str | None:
-    """The compact AIM label: the cheap-model short label if one was generated, else the
-    full AIM verbatim. The full AIM is always kept intact in the store and shown in the
-    detail pane / aim-history; this is what the narrow ``/aim`` column AND the in-session
-    status line render. ``store.set_aim`` clears the label on every AIM change, so this is
-    always the LATEST revision's label (or the full new AIM until the generator backfills).
-
-    With *first* (config ``aim_column = "first"``, the default) it renders revision **(1)**
-    instead — the done-condition as originally typed. That keeps the ``/aim`` column, and
-    every "which job is this?" label built from it, stable while the AIM is sharpened over
-    the session's life; the current AIM stays visible in the status line, the detail pane
-    and ``ccc aim-history``. Sessions whose AIM predates history tracking have no recorded
-    revision (1) — they fall back to the live AIM.
-    """
-    if first and session.first_aim:
-        return session.first_short_aim or session.first_aim
-    return session.short_aim or session.aim
 
 
 def synthesize_aim_revision(session: Session) -> AimRevision:

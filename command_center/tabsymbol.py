@@ -61,6 +61,15 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+# The badge palette and the role-mark file live in the stdlib-only `rolemark` (the lean
+# `ccc statusline` path, tp#1806); re-exported so `tabsymbol.PALETTE` & co. keep working.
+from .rolemark import (  # noqa: F401  # pylint: disable=unused-import  # re-exported
+    BADGES,
+    PALETTE,
+    role_mark_dir,
+    sync_role_mark,
+)
+
 if TYPE_CHECKING:
     from .config import Config
     from .models import Session
@@ -70,46 +79,6 @@ if TYPE_CHECKING:
 # tab title (overridable there via ``$CLAUDE_WAIT_MARKER``). The title-sync below
 # preserves it, so seeding a badge never strips a session's "waiting" indicator.
 _DEFAULT_WAIT_MARKER = "🔴 "
-
-# Assignment order = visual priority. Tabs claim the first free badge in this
-# order, so it is front-loaded for maximum distinctness: the first 6 cover all 6
-# shapes (circle / square / diamond / triangle / heart / star) before any shape
-# repeats, the first 8 are 8 well-separated, high-contrast colors before any hue
-# repeats, with only ONE red and ONE warm-yellow up front (the look-alike glyphs
-# — extra reds 🔴🔻🟥, warm 🟨🟧🧡, dark ⚫ — are pushed to the tail). No two
-# adjacent badges share a shape or a color family. Width-2 emoji throughout
-# (uniform cell width); only widely-supported, no-variation-selector glyphs.
-#
-# Each entry is (emoji, shape, color-family); ``color`` groups look-alike hues
-# ("warm" = yellow/gold/orange) so the ordering rules are testable.
-BADGES: tuple[tuple[str, str, str], ...] = (
-    ("🔺", "triangle", "red"),
-    ("🟢", "circle", "green"),
-    ("🟪", "square", "purple"),
-    ("⭐", "star", "warm"),
-    ("🔷", "diamond", "blue"),
-    ("🤎", "heart", "brown"),
-    ("💠", "diamond", "cyan"),
-    ("⚪", "circle", "white"),
-    ("💙", "heart", "blue"),
-    ("🟩", "square", "green"),
-    ("🟣", "circle", "purple"),
-    ("🟨", "square", "warm"),
-    ("🔵", "circle", "blue"),
-    ("🟫", "square", "brown"),
-    ("💜", "heart", "purple"),
-    ("🟧", "square", "warm"),
-    ("🔻", "triangle", "red"),
-    ("🤍", "heart", "white"),
-    ("🟤", "circle", "brown"),
-    ("🟦", "square", "blue"),
-    ("🔴", "circle", "red"),
-    ("🧡", "heart", "warm"),
-    ("⚫", "circle", "black"),
-    ("💚", "heart", "green"),
-)
-
-PALETTE: tuple[str, ...] = tuple(emoji for emoji, _shape, _color in BADGES)
 
 # Visible width of a badge cell ("<emoji> "): emoji renders as 2 cells + 1 space.
 # The no-badge fallback pads to the same width so folder names stay column-aligned.
@@ -377,47 +346,6 @@ def role_symbol(session_id: str | None) -> str | None:
 
     symbol = staffrole.session_symbol(session_id)
     return symbol if symbol and symbol not in PALETTE else None
-
-
-def role_mark_dir() -> Path:
-    """One ``<claude session id>`` file per adopted session (env-overridable for tests)."""
-    env = os.environ.get("CCC_ROLE_MARK_DIR")
-    return Path(env) if env else Path.home() / ".cache" / "ccc-role-mark"
-
-
-def sync_role_mark(session_id: str | None) -> str | None:
-    """Keep ``role_mark_dir()/<session_id>`` = the adopted agent's terminal-font mark (tp#1288).
-
-    The mark is the agent's Nerd Font ``glyph:``, else its ``symbol:`` (never a palette
-    badge). The Claude Code status-line script reads this file instead of the tab's badge
-    file (``statusline-command.sh``), so it needs no agent.yaml parsing of its own; ``ccc
-    statusline`` refreshes it on every render. Not adopted → the file is removed. Writes
-    only on a change (temp file + rename). Returns the mark; never raises.
-    """
-    from . import staffrole  # lazy
-
-    if not session_id or "/" in session_id or session_id.startswith("."):
-        return None
-    mark = staffrole.session_glyph(session_id)
-    if mark in PALETTE:
-        mark = None
-    path = role_mark_dir() / session_id
-    try:
-        if not mark:
-            path.unlink(missing_ok=True)
-            return None
-        try:
-            if path.read_text(encoding="utf-8").strip() == mark:
-                return mark
-        except OSError:
-            pass
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{session_id}.tmp")
-        tmp.write_text(mark + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError:
-        return mark
-    return mark
 
 
 def badge_for(session: Session, iterm_session_id: str | None = None) -> str | None:

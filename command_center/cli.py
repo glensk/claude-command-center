@@ -48,7 +48,6 @@ import argparse
 import contextlib
 import json
 import os
-import re
 import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -86,6 +85,19 @@ from .models import (
     parse_iso_date,
     resolve_job_llm,
 )
+
+# The status-line row builders live in the stdlib-only `slrender` (tp#1806); re-exported so
+# `cli._aim_row_text` & co. keep working.
+from .slrender import (  # noqa: F401  # pylint: disable=unused-import  # re-exported
+    _SL_WIDTH,
+    _aim_label,
+    _aim_row_text,
+    _aim_statusline_lines,
+    _first_aim_anchor,
+    _render_todos_line,
+    _vlen,
+)
+from .slrender import effort_from_payload as _effort_from_statusline_payload
 from .store import Store
 
 if TYPE_CHECKING:  # pragma: no cover - pathlib stays a local import at runtime
@@ -5402,38 +5414,6 @@ def cmd_init(args: argparse.Namespace) -> int:
     return wizard.run(args)
 
 
-def _render_todos_line(
-    todos: list[tuple[str, str]], green: str, dim: str, reset: str, status_color: dict[str, str]
-) -> str:
-    """One-line TodoWrite strip: ``done/total`` counter + each item's box & short label.
-
-    Truncates to a fixed budget so it never sprawls across the status line.
-    """
-    from .models import todo_box, todos_counts
-
-    done_n, total_n = todos_counts(todos)
-    cnt_color = status_color["done"] if done_n == total_n else green
-    segs: list[str] = []
-    used = 0
-    for todo_status, subject in todos:
-        label = subject if len(subject) <= 22 else subject[:21] + "…"
-        seg = f"{todo_box(todo_status)} {label}"
-        if used + len(seg) + 2 > 110:
-            segs.append(f"{dim}…{reset}")
-            break
-        if todo_status == "completed":
-            seg_color = status_color["done"]
-        elif "progress" in todo_status:
-            seg_color = (
-                "\033[38;5;214m"  # amber: in-progress (distinct from red 'waiting for input')
-            )
-        else:
-            seg_color = dim
-        segs.append(f"{seg_color}{seg}{reset}")
-        used += len(seg) + 2
-    return f"{cnt_color}{done_n}/{total_n}{reset}  " + "  ".join(segs)
-
-
 def _account_from_env() -> str | None:
     """The Claude account label for the CURRENT statusline capture, or ``None``.
 
@@ -5509,25 +5489,6 @@ def _capture_usage_from_payload(data: dict) -> None:
     _capture_effort_from_payload(data)
 
 
-def _effort_from_statusline_payload(data: dict) -> str | None:
-    """Best-effort extraction of a reasoning-effort level from the status-line JSON.
-
-    Checks the top-level keys Claude Code might expose (``effort`` / ``effortLevel`` /
-    ``reasoningEffort``) and, when ``model`` is a nested object, its ``effort`` /
-    ``reasoning_effort`` keys. Returns a value only when it is a known
-    :data:`~command_center.models.EFFORT_LEVELS` level, else ``None`` — current Claude
-    Code payloads carry none of these, so this is future-proofing that no-ops today.
-    """
-    candidates = [data.get("effort"), data.get("effortLevel"), data.get("reasoningEffort")]
-    model = data.get("model")
-    if isinstance(model, dict):
-        candidates.extend([model.get("effort"), model.get("reasoning_effort")])
-    for value in candidates:
-        if isinstance(value, str) and value in EFFORT_LEVELS:
-            return value
-    return None
-
-
 def _capture_effort_from_payload(data: dict) -> None:
     """Defensively persist a session's ``--effort`` level from the status-line JSON.
 
@@ -5552,15 +5513,6 @@ def _capture_effort_from_payload(data: dict) -> None:
         pass
 
 
-_SL_WIDTH = 100  # status-line soft width: only the `/aim (1)` anchor row is clipped to it
-_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
-
-
-def _vlen(text: str) -> int:
-    """Visible length of *text*, ignoring ANSI colour escapes."""
-    return len(_ANSI_RE.sub("", text))
-
-
 #: The `/aim` row marker of a session that ran `staff adopt -a <agent>` (tp#1166): it acts
 #: in a staff ROLE, not just under a staff-looking name or AIM. The agent's own `symbol:`
 #: (agent.yaml, tp#1288) follows it: `🎭📧` (:func:`staffrole.role_marker`).
@@ -5572,151 +5524,6 @@ def adopted_role(session_id: str) -> str | None:
     from . import staffrole  # lazy: keep the parser import light
 
     return staffrole.adopted_role(session_id)
-
-
-def _aim_label(index: int) -> str:
-    """The ``/aim`` prefix, carrying the AIM's 1-based running index when known.
-
-    ``index`` is the current AIM's position in the session's history (1 = the first
-    AIM ever defined, 2 = the next, …). ``<= 0`` means the index is unknown, so the
-    bare ``/aim`` is used rather than a misleading number.
-    """
-    return f"/aim ({index})" if index >= 1 else "/aim"
-
-
-def _aim_row_text(aim: str | None) -> str:
-    """*aim* as an ``/aim`` row shows it: the words without the trailing item run (tp#1553).
-
-    The held items already have their own status-line rows, so ``fix decide: tp#1363, #1364``
-    renders as ``fix decide``. An AIM without a run is returned unchanged; one that is the
-    run alone (no words) keeps its full text rather than going blank.
-    """
-    from . import aimtext  # lazy
-
-    text = aim or ""
-    parts = aimtext.split(text)
-    return parts.words if parts.ids and parts.words else text
-
-
-def _first_aim_anchor(  # pylint: disable=too-many-positional-arguments  # colour triple passed through
-    session: Session, index: int, changed: bool, green: str, dim: str, reset: str
-) -> list[str]:
-    """The always-visible ``/aim (1):`` anchor row — the done-condition as originally typed.
-
-    The status line otherwise renders only the CURRENT revision, so once the AIM is
-    sharpened (``/aim (2)``, ``(3)``, …) the goal the user actually typed scrolls out of
-    view. This pins it: revision (1) is shown on its own row above the current one, dimmed
-    so the actionable current AIM stays prominent.
-
-    Returns no row when it would only duplicate what is already on screen: ``index <= 1``
-    (the current AIM *is* revision (1)) or a this-turn transition out of revision (1)
-    (``changed`` with ``index == 2`` already prints ``/aim (1): <old> ====>``). Sessions
-    whose AIM predates history tracking have no recorded revision (1) and get no row.
-    """
-    if index <= 1 or (changed and index == 2):
-        return []
-    first = _aim_row_text((session.first_short_aim or session.first_aim or "").strip())
-    if not first:
-        return []
-    prefix = f"{green}{_aim_label(1)}:{reset} "
-    body_w = max(24, _SL_WIDTH - _vlen(prefix))
-    if len(first) > body_w:
-        first = first[: body_w - 1] + "…"
-    return [f"{prefix}{dim}{first}{reset}"]
-
-
-def _aim_statusline_lines(  # pylint: disable=too-many-positional-arguments  # colour triple passed through
-    session: Session,
-    checked: int,
-    total: int,
-    threshold: int,
-    colors: tuple[str, str, str, str],
-    index: int,
-    role_marker: str = "",
-    staff_name: str = "",
-) -> list[str]:
-    """The ``/aim`` status-line row(s): AIM + running index + progress bar + vague marker.
-
-    ``role_marker`` (``🎭`` + the agent's symbol when the session adopted a staff role,
-    :func:`staffrole.role_marker`) is put right after the current row's ``/aim …:`` label; the
-    ``/aim (1):`` anchor row and the old side of a transition never carry it.
-
-    ``staff_name`` (the adopted agent's ``tab_name``, :func:`staffrole.session_tab_name`)
-    replaces the AIM text: a staff session is named after its agent, so its row reads
-    ``/aim: 🎭<symbol> <agent name> #123, #456`` — the name first, then the ids of the AIM's
-    work-item run (:mod:`.aimtext`, tp#1366).
-
-    ``index`` is the current AIM's running number in the session's AIM history, so the
-    prefix reads ``/aim (N):``. When the AIM changed this turn (``aim_prev`` set) it renders
-    the transition ``/aim (N-1): <old>  ====> /aim (N): <new>`` — always on ONE row, however
-    long: the status line is precious vertical space, so a wide row is left to the terminal's
-    own soft wrap instead of being split into an old-AIM row, wrapped new-AIM rows and a
-    trailing bar row.
-
-    Whenever the current revision is not the first, :func:`_first_aim_anchor` prepends an
-    ``/aim (1):`` row, so the originally typed done-condition stays visible for the whole
-    session no matter how often the AIM is sharpened.
-
-    The AIM text rendered is :func:`~command_center.models.display_aim` — the latest
-    short label when one exists, else the full AIM. ``store.set_aim`` clears the label on
-    every change, so a stale label from a prior revision can never show here.
-    """
-    from .models import (
-        aim_score_pct,
-        display_aim,
-        done_bar_parts,
-        low_aim_score,
-        progress_bar,
-    )
-
-    green, dim, reset, red = colors
-    mark = f"{role_marker} " if role_marker else ""
-    if not session.aim:
-        if staff_name:
-            return [f"{green}/aim:{reset} {mark}{staff_name}"]
-        return [f"{green}/aim:{reset} {mark}{dim}(set one with /aim){reset}"]
-    label = _aim_label(index)
-    low_score = low_aim_score(session.aim, session.aim_score, threshold)
-    chip_color = red if low_score else dim
-    score_pct = aim_score_pct(session.aim, session.aim_score)
-    chip = f"{chip_color}{score_pct}{reset} " if score_pct else ""
-    new_aim = _aim_row_text(display_aim(session))
-    fraction = effective_progress(session.manual_progress, checked, total)
-    if session.aim_met:
-        # Impartial checker judged the AIM fulfilled → red DONE stamped inside the bar. The
-        # bar's glyph runs are painted 231 (white) — the SAME palette entry the filled letters
-        # use as background — so █ cells and letter cells match exactly.
-        left, done_word, right, fills = done_bar_parts(fraction, 8)
-        pct = f" {int(round(fraction * 100))}%" if fraction is not None else ""
-        white = "\033[38;5;231m"
-        prog = (
-            f"  {white}{left}{reset}"
-            f"{_paint_done_word(done_word, fills, 231, 231)}"
-            f"{white}{right}{reset}{pct}"
-        )
-    elif fraction is not None:
-        prog = f"  {progress_bar(fraction, 8)} {int(round(fraction * 100))}%"
-    else:
-        prog = ""
-    tag = f"  {dim}⚠ vague — sharpen it{reset}" if low_score else ""
-    if staff_name:  # the agent's name, then the item ids: no AIM text, score or history
-        from . import aimtext  # lazy
-
-        ids = aimtext.ids_text(aimtext.split(session.aim).ids)
-        body = f"{staff_name} {ids}" if ids else staff_name
-        return [f"{green}{label}:{reset} {mark}{body}{prog}"]
-    changed = bool(session.aim_prev) and session.aim_prev != session.aim
-    anchor = _first_aim_anchor(session, index, changed, green, dim, reset)
-    if not changed:
-        return [*anchor, f"{green}{label}:{reset} {mark}{chip}{new_aim}{prog}{tag}"]
-    bold = "\033[1m"
-    old_part = (
-        f"{green}{_aim_label(index - 1)}:{reset} {dim}{_aim_row_text(session.aim_prev)}{reset}"
-    )
-    arrow = f"{bold}====>{reset} {green}{label}:{reset} {mark}"
-    # Always ONE line — old AIM, arrow, new AIM, bar and marker never split across rows;
-    # an over-wide line soft-wraps in the terminal rather than costing three status-line rows.
-    return [*anchor, f"{old_part}   {arrow}{chip}{new_aim}{prog}{tag}"]
 
 
 def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many-branches  # one branch per status-line row
@@ -5737,10 +5544,10 @@ def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many
 
         print(accounts.current_account_glyph(), end="")
         return 0
-    from .models import (
-        derive_status,
-        loads_todos,
-    )
+    import time
+
+    from . import rolemark, slrender, staffrole  # lazy
+    from .models import derive_status
 
     sid = args.session
     # stdin carries the status-line JSON. Read it once when we need usage capture OR a
@@ -5756,39 +5563,38 @@ def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many
                     sid = derived
     if not sid:
         return 0
-    green, dim, reset = "\033[38;5;42m", "\033[38;5;244m", "\033[0m"
-    status_color = {
-        "working": "\033[38;5;40m",
-        "waiting_input": "\033[38;5;196m",  # input required — red, to stand out
-        "halted": "\033[38;5;196m",  # rate-limit halt — red, to stand out
-        "waiting_codex": "\033[38;5;214m",  # Codex quota reset wait — amber
-        "idle": "\033[38;5;75m",
-        "snoozed": "\033[38;5;40m",
-        "parked": "\033[38;5;244m",
-        "done": "\033[38;5;35m",
-        "failed": "\033[38;5;196m",
-    }
+    checked = total = aim_index = 0
+    armed: tuple[int, int] | None = None
     with Store() as store:
         session = store.get(sid)
-        from . import staffrole, tabsymbol  # lazy
-
         role_marker = staffrole.role_marker(sid)
         staff_name = (staffrole.session_tab_name(sid) or "") if role_marker else ""
-        tabsymbol.sync_role_mark(sid)  # tp#1288: the shell status line's leading badge
-        if session is None:
-            mark = f"{role_marker} " if role_marker else ""
-            if staff_name:
-                print(f"{green}/aim:{reset} {mark}{staff_name}")
-            else:
-                print(f"{green}/aim:{reset} {mark}{dim}(set one with /aim){reset}")
-            print(f"{dim}Status: untracked   /next-step: —{reset}")
-            return 0
-        checked, total = store.progress(sid)
-        todos = loads_todos(session.todos)
-        # Running index of the current AIM (1 = first ever defined). A set-but-unrecorded
-        # AIM (predates history tracking) has no rows yet, so it is the first → 1.
-        aim_index = store.count_aim_history(sid) or (1 if session.aim else 0)
-        armed = store.armed_draft_summary()
+        rolemark.sync_role_mark(sid)  # tp#1288: the shell status line's leading badge
+        if session is not None:
+            checked, total = store.progress(sid)
+            # Running index of the current AIM (1 = first ever defined). A set-but-unrecorded
+            # AIM (predates history tracking) has no rows yet, so it is the first → 1.
+            aim_index = store.count_aim_history(sid) or (1 if session.aim else 0)
+            armed = store.armed_draft_summary()
+    if session is None:
+        print(
+            slrender.statusline_text(
+                None,
+                status_value="",
+                checked=0,
+                total=0,
+                aim_index=0,
+                armed=None,
+                role_marker=role_marker,
+                staff_name=staff_name,
+                threshold=0,
+                aim_score=True,
+                aim_history=True,
+                now=int(time.time()),
+            ),
+            end="",
+        )
+        return 0
 
     # Prefer the live status (fresher than the stored value) when discoverable.
     status_value = session.status
@@ -5803,60 +5609,23 @@ def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many
         pass
 
     cfg = config.load_config()
-    threshold = cfg.aim_score_threshold
-    import dataclasses
-
-    if not cfg.aim_score:  # score hidden: blank chip (-1 = unscored) and no "vague" marker
-        session = dataclasses.replace(session, aim_score=-1)
-    if not cfg.aim_history:  # plain "/aim: <current>": no (N), no anchor row, no transition
-        session = dataclasses.replace(session, aim_prev=None)
-        aim_index = 0
-    aim_lines = _aim_statusline_lines(
-        session,
-        checked,
-        total,
-        threshold,
-        (green, dim, reset, status_color["failed"]),
-        aim_index,
-        role_marker,
-        staff_name,
+    print(
+        slrender.statusline_text(
+            session,
+            status_value=status_value,
+            checked=checked,
+            total=total,
+            aim_index=aim_index,
+            armed=armed,
+            role_marker=role_marker,
+            staff_name=staff_name,
+            threshold=cfg.aim_score_threshold,
+            aim_score=bool(cfg.aim_score),
+            aim_history=bool(cfg.aim_history),
+            now=int(time.time()),
+        ),
+        end="",
     )
-
-    scolor = status_color.get(status_value, dim)
-    nxt = session.next_step.splitlines()[0] if session.next_step else "—"
-    for line in aim_lines:
-        print(line)
-    print(f"Status: {scolor}{status_value}{reset}   /next-step: {nxt}")
-
-    # Impartial-checker drift warning (the blue dot, in every session's status line).
-    from .models import drift_unresolved
-
-    if drift_unresolved(session):
-        blue = "\033[38;5;39m"
-        why = session.drift_reason or "see ccc subgoal-history"
-        print(f"{blue}● sub-goal drift ({session.drift_severity}){reset}: {why}  (ccc ack-drift)")
-
-    # Live TodoWrite list as a single line: left counter + each item's box & short label.
-    if todos:
-        print(_render_todos_line(todos, green, dim, reset, status_color))
-
-    # Armed parked prompt(s): one chip in EVERY session's statusline — the soonest fire
-    # time, overdue-aware (red once both dispatchers should have fired; see park.py).
-    # A prompt attached to THIS session gets its own explicit line first.
-    if session.fire_at:
-        from . import park
-
-        own = park.format_fire(session.fire_at)
-        own_color = status_color["failed"] if own.startswith("overdue") else "\033[38;5;214m"
-        print(f"{own_color}⏳ parked prompt for THIS session {own}{reset}")
-    if armed:
-        from . import park
-
-        earliest, count = armed
-        fire_text = park.format_fire(earliest)
-        more = f"  +{count - 1} more" if count > 1 else ""
-        chip_color = status_color["failed"] if fire_text.startswith("overdue") else dim
-        print(f"{chip_color}⏳ parked prompt {fire_text}{more}  (ccc jobs){reset}")
     return 0
 
 
