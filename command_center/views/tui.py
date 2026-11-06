@@ -2741,6 +2741,9 @@ class CommandCenterApp(App[None]):
                 self._build_foreign_write = True
         if get_current_worker().is_cancelled:
             return  # superseded by a newer refresh — let that one repaint
+        # At most ONE `git status` per tick, process-wide spaced, for the most overdue
+        # displayed cwd (tp#1758); the render path only reads gitstatus.cached.
+        gitstatus.refresh_one([row.session.cwd for row in rows])
         # Rows AND snapshots in ONE handoff: a build that raises publishes neither.
         self.call_from_thread(self._apply_rows, rows, snapshots, awaits, channels)
 
@@ -3528,7 +3531,8 @@ class CommandCenterApp(App[None]):
             # Future job: it typically has no next_step (→ "—"); its model pair lives in the
             # model column now. Age is from when the draft was saved.
             age = Text("  " + humanize_age(session.created_at), style="grey62")
-        git_symbol, git_style = gitstatus.short(session.cwd)
+        # A cache read only: the refresh worker's gitstatus.refresh_one spawns Git (tp#1758).
+        git_symbol, git_style = gitstatus.cached(session.cwd)
         git_cell = Text("  " + git_symbol, style=_DONE_STYLE if done else git_style)
         frac = effective_progress(session.manual_progress, row.checked, row.total)
         pct = f" {int(round(frac * 100))}%" if frac is not None else ""
