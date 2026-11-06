@@ -17,8 +17,9 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position  # the direct-run shim comes first
 import json
-from collections.abc import Callable, Iterable  # pylint: disable=wrong-import-position
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,7 +49,7 @@ _UNSET: Any = object()
 
 
 @dataclass
-class Row:
+class Row:  # pylint: disable=too-many-instance-attributes  # a plain record
     """A session joined with its live entry and derived presentation fields."""
 
     session: Session
@@ -152,11 +153,12 @@ def headless_leak_ids(store: Store, adapter: Adapter, live_ids: set[str]) -> set
 def spare_background_agents(victims: list[Session]) -> list[Session]:
     """*victims* minus the rows of jobs the CLI's ``claude agents`` roster still lists.
 
-    ``ccc sessions -j`` (the bridge) gives every roster background job without a row one
-    (``bridge_cli._named_row``); such a row has no registry entry, no transcript signal and
-    no AIM, so the contentless guards of :meth:`Store.prunable_sessions` read it as junk and
-    the daemon deleted it every pass — recreated by the bridge seconds later, forever
-    (``pruned=1`` on every daemon run, tp#1427). The roster is read only when there is
+    ``ccc sessions -j`` (the bridge) gave every roster background job without a row one
+    (``bridge_cli._named_row``, removed in tp#1808; such rows remain); such a row has no
+    registry entry, no transcript signal and no AIM, so the contentless guards of
+    :meth:`Store.prunable_sessions` read it as junk and the daemon deleted it every pass —
+    recreated by the bridge seconds later, forever (``pruned=1`` on every daemon run,
+    tp#1427). The roster is read only when there is
     something to prune (it is a ~2.5 s subprocess per account) and a failed read spares
     nothing, as before.
     """
@@ -784,7 +786,7 @@ def _hoist_dependents(rows: list[Row], get_session: Callable[[str], Session | No
     return out
 
 
-def build_rows(
+def build_rows(  # pylint: disable=too-many-positional-arguments
     store: Store,
     adapter: Adapter,
     include_done: bool = True,

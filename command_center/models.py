@@ -690,13 +690,13 @@ class Session:
     handed_off_from: str | None = None
     handed_off_at: int | None = None
     # --- session names (session_names.py) ---------------------------------------------
-    # The memorable 1-2 word name the user, the voice bridge and other agents address the
-    # session by. Generated ONCE (origin "llm" / "fallback"), set by `ccc name` ("manual")
-    # or adopted from a tab title the user typed in iTerm ("manual-tab", never overwritten
-    # by ccc again). Unique (casefolded) among the active rows of every account.
+    # A name set by hand with `ccc name` (origin "manual"); ccc generates none (tp#1808).
+    # Older builds also stored "llm" / "fallback" names and adopted hand-typed tab titles
+    # ("manual-tab", tab frozen until `ccc name --reset`). Unique (casefolded) among the
+    # active rows of every account.
     canonical_name: str | None = None
     canonical_name_origin: str = ""
-    # The AIM the name was derived from — a snapshot, so a later AIM change never renames.
+    # Legacy: the AIM an older build's generated name was derived from.
     name_source_aim: str | None = None
     # The name Claude Code's own registry reports (``claude --name`` / ``/rename``), kept
     # apart from ``canonical_name`` so reconcile never clobbers it, and when that runtime
@@ -704,13 +704,11 @@ class Session:
     observed_runtime_name: str | None = None
     runtime_name_applied_at: int = 0
     # The tab-title core ccc last wrote for this session, a per-write generation counter
-    # and the write's epoch ms. A live title that differs from it (after a grace for the
-    # detached write to land) is a title the user typed by hand.
+    # and the write's epoch ms; later writes are compare-and-swap against it.
     title_written: str | None = None
     title_generation: int = 0
     title_written_at: int = 0
-    # Failed LLM attempts at replacing a provisional "fallback" name (session_names.py
-    # gives up after MAX_UPGRADE_TRIES; a successful one makes the name "llm", final).
+    # Legacy: an older build's failed LLM name upgrades (unused since tp#1808).
     name_upgrade_tries: int = 0
     # DERIVED, not columns: the session's FIRST recorded AIM — revision (1) — and that
     # revision's cheap-model short label, joined off ``aim_history`` by every Store read

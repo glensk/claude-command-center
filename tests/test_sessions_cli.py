@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from command_center import bridge_cli, cli, config
+from command_center import bridge_cli, cli
 from command_center.adapters import claude_agents
 from command_center.adapters.claude_agents import AgentEntry
 from command_center.models import LiveSession
@@ -80,7 +80,6 @@ def _collect(  # pylint: disable=too-many-arguments
     return bridge_cli.collect_sessions(
         adapter=FakeAdapter(lives),  # type: ignore[arg-type]
         store=store,
-        cfg=config.Config(session_names=True),
         panes_reader=lambda: panes,
         ps_reader=lambda: ps,
         account_label=lambda cd: labels.get(cd, cd),
@@ -103,7 +102,7 @@ def test_both_accounts_kinds_status_and_names(store: Store) -> None:
     panes = [ItermPane("UA", "/dev/ttys001", "x")]
     out = {e["session_id"]: e for e in _collect(store, lives, ps, panes)}
     assert out["a1"]["account"] == "private" and out["a1"]["kind"] == "interactive"
-    assert out["a1"]["name"] == "voice parser" and out["a1"]["name_origin"] == "fallback"
+    assert out["a1"]["name"] is None and out["a1"]["name_origin"] is None  # ccc names none
     assert out["a1"]["aim_short"] == "the parser"
     assert out["a1"]["status_at"] == "2026-10-03T04:00:00Z"
     assert out["a1"]["tab"] == {"iterm_session_id": "w0t0p0:UA", "validated": True}
@@ -128,7 +127,7 @@ def test_both_accounts_kinds_status_and_names(store: Store) -> None:
         "tab",
     }
     assert out["a1"]["display_name"] == "parser" and out["a1"]["staff_agent"] is None
-    assert out["b2"]["display_name"] == out["b2"]["name"]  # no AIM: the name
+    assert out["b2"]["display_name"] is None  # no AIM, no hand-set name
     assert out["c3"]["display_name"] is None
 
 
@@ -187,11 +186,9 @@ def test_background_job_from_claude_agents_is_listed(store: Store) -> None:
     assert entry["pid"] is None and entry["account"] == "private"
     assert entry["tab"] == {"iterm_session_id": None, "validated": False}
     assert entry["status_at"] == "2026-10-03T04:00:00Z"
-    # a canonical name like the others (a ccc row is created for it), built from the
-    # job's own name since it has no AIM
-    assert entry["name"] == "voice claude" and entry["name_origin"] == "fallback"
-    row = store.get("e38e3586-23f9")
-    assert row is not None and row.config_dir == PRIV
+    # ccc generates no names (tp#1808), so listing creates no ccc row for it either
+    assert entry["name"] is None and entry["name_origin"] is None
+    assert store.get("e38e3586-23f9") is None
 
 
 @pytest.mark.parametrize(
@@ -398,7 +395,6 @@ def test_subagents_key_with_the_real_inventory_and_an_own_store() -> None:
 
     entries = bridge_cli.collect_sessions(
         adapter=FakeAdapter([_live("a1", 11)], {"a1": _B2}),  # type: ignore[arg-type]
-        cfg=config.Config(session_names=True),
         panes_reader=lambda: [],
         ps_reader=lambda: {},
         account_label=lambda cd: cd,

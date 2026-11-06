@@ -1599,9 +1599,9 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   words clipped so the run stays whole); **`aim_in_tab_title = true`** makes the iTerm tab
   title `<badge> <AIM words>` — the AIM without that run (`fix decide: tp#7` → `fix decide`,
   40 chars; the older `tp#N: <words>` form reads the same) — pushed at once by the `/aim`
-  intercept, and kept converged by the daemon / TUI title sync. A session whose name was set
-  by hand (`ccc name`, or a hand-typed tab title; shown with `session_names` on) keeps a bare
-  `<badge> <name>`; an AIM of ids only falls back to `<badge> <name>` too.
+  intercept, and kept converged by the daemon / TUI title sync. A session name (`ccc name`)
+  is never shown (ccc generates no names, tp#1808); an AIM of ids only falls back to
+  `<badge> <folder leaf>`.
 - **Staff sessions are named after their agent.** A session bound to an llm-staff role
   (`staff adopt -a <agent>`: tp's `session-role/<sid>` binding) gets the agent.yaml
   `tab_name` (default: the agent id) as its WHOLE tab title, prefixed by its `symbol` (`<symbol> <tab_name>`, no badge, no AIM); its
@@ -2467,27 +2467,11 @@ them in the TUI**, even with no daemon loaded. All are marker-preserving and
 idempotent.
 
 Every write after a tab's first is compare-and-swap against the title ccc recorded
-(`title_written`), so a title typed by hand is never replaced. Title writes are detached
-and recorded before they land, so a lost write could leave the record naming a title the
-tab never showed — and every later swap refused, freezing the tab on an old badge and
-AIM (tp#1292). The sync therefore swaps from what the tab really shows when that is
-ccc's own shape: it starts with a known badge or agent symbol and its cleaned text is
-the session's name, folder leaf or last recorded name (`drifted_ccc_body`; after the
-same 5 s grace as hand-set detection). Any other title keeps the recorded baseline.
-
-With `session_names` on, a title that differs from ccc's last write is taken as one you
-typed: its cleaned text becomes the session's name (origin `manual-tab`) and ccc never
-writes that tab again. The shell's own titles are not names you typed, so they are never
-adopted (tp#1297; `session_names.rejected_manual_title`, used by the sync, the `--watch` /
-`--heal` override adoption and `adopt_manual_title` itself): a title containing `\`, a
-home path (`~`, `~/…`), what the zsh `chpwd` hook prints for the session's cwd (the
-folder's basename, its repo folder under `$GIT_BASE` or the base's parent, ccc's folder
-leaf, the enclosing git work tree's name), or the session's automatic or Claude Code
-runtime name. A tab showing such a shell title is swapped from it like a stale ccc title.
-`ccc name -s ID -R` (`--reset`) undoes a wrong adoption: it drops the `manual` /
-`manual-tab` name, gives the session a provisional `fallback` name (the namer may upgrade
-it once), and clears `title_written` so the next `ccc tab-symbol --sync` writes the tab
-again.
+(`title_written`), so a title typed by hand is never replaced. ccc no longer reads live
+titles to adopt a hand-typed one as the session's name, nor to heal a lost write
+(tp#1808; both ran only with the removed `session_names` key). A tab an older ccc froze
+(origin `manual-tab`) stays unwritten until `ccc name -s ID -R` (`--reset`) drops that
+name and clears `title_written`.
 
 The **status-line wrapper** (`statusline-command.sh`) reads the same
 `~/.cache/iterm-tab-symbol/<id>` cache to **prepend the badge as the first
@@ -3647,11 +3631,11 @@ transcript, a malformed record, a scan skipped by the 150 ms per-call budget, an
 and is `[]` when the scan ran and nothing runs. Results are cached per transcript in the
 store (`subagent_scan`); plain `ccc sessions` never scans.
 
-`ccc name -s ID "x y"` (`-s/--session`, `-A/--auto`, `-R/--reset`, `-j/--json`) shows or
-sets the name; `-R` drops a hand-set name and hands the session back to the automatic namer
-(e.g. `ccc name -s 1a2b -R`); data `{session_id, name, name_origin, changed,
+`ccc name -s ID "x y"` (`-s/--session`, `-R/--reset`, `-j/--json`) shows or sets a
+hand-set name (ccc generates none, tp#1808); `-R` drops a hand-set name (e.g.
+`ccc name -s 1a2b -R`); data `{session_id, name, name_origin, changed,
 rename_command}`; codes `name_taken`, `invalid_name`, `not_found`, `ambiguous_session`,
-`usage` (`-R` with a name or `-A`).
+`usage` (`-R` with a name).
 
 ### `ccc inspect` (`-s/--session ID`, `-N/--no-llm`, `-j/--json`)
 

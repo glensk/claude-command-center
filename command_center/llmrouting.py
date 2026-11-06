@@ -34,6 +34,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import os
 import re
 import shutil
@@ -75,7 +76,6 @@ PURPOSES: tuple[str, ...] = (
     "subgoal-grade",
     "summary-nextstep",
     "short-aim",
-    "session-name",
     "voice-brief",
     "handoff-summary",
 )
@@ -256,13 +256,6 @@ def rows(
             dispatch("short-aim"),
             "short_aim · llm_custom_command",
             cfg.short_aim,
-        ),
-        (
-            "session name (once per session, ccc name)",
-            "session-name",
-            dispatch("session-name"),
-            "session_names · llm_custom_command",
-            cfg.session_names,
         ),
         (
             "voice briefing (ccc inspect)",

@@ -337,18 +337,6 @@ def cmd_set_aim(args: argparse.Namespace) -> int:
             spawn_ccc(["score-aim", "--session", session_id])
         if cfg.short_aim:
             spawn_ccc(["short-aim", "--session", session_id])
-        if getattr(cfg, "session_names", False):
-            # The memorable name is generated ONCE, from the first AIM it sees (LLM when a
-            # router is set, else the fallback); a provisional fallback name may still be
-            # replaced once by an LLM name. `name -A` is a no-op for a final name.
-            from . import session_names
-
-            with Store() as store:
-                named = store.get(session_id)
-            if named is not None and (
-                not named.canonical_name or session_names.upgradable(named, cfg)
-            ):
-                spawn_ccc(["name", "-A", "-s", session_id])
     return 0
 
 
@@ -5677,7 +5665,6 @@ def _aim_statusline_lines(  # pylint: disable=too-many-positional-arguments  # c
         aim_score_pct,
         display_aim,
         done_bar_parts,
-        effective_progress,
         low_aim_score,
         progress_bar,
     )

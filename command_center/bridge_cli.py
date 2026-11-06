@@ -13,7 +13,7 @@ live in :mod:`command_center.bridge_json`:
   ``-j`` an argv error is an envelope too (:func:`dispatch`).
 
 ``ccc sessions -j`` lists the interactive and background Claude Code sessions of EVERY
-configured account with their memorable name, status and iTerm tab — background jobs
+configured account with their hand-set name (if any), status and iTerm tab — background jobs
 from the CLI's own ``claude agents --json`` roster too (a job whose worker is not running
 has no registry entry), with a null, unvalidated tab. The status is the CLI's view mapped
 to §6 (:mod:`command_center.adapters.claude_agents`: registry ``shell`` → busy). The tab is
@@ -27,8 +27,8 @@ whose subagent inventory is known carries ``agents``: its running background sub
 ``ccc name -s ID "x y"`` renames a session (a name another active session holds is
 refused, exit 1) and prints the ``/rename <name>`` line to type into the running Claude
 Code — ccc never renames a running process itself. ``ccc name -s ID -R`` drops a hand-set
-(``manual`` / ``manual-tab``) name, hands the session back to the automatic namer and
-unfreezes its tab title (tp#1297).
+(``manual`` / ``manual-tab``) name and unfreezes its tab title (tp#1297). ccc generates
+no names itself (tp#1808).
 
 ``ccc close -s ID -j`` closes an IDLE live session from outside it (tp#1481,
 :mod:`command_center.bridge_close`): SIGTERM + its tmux pane / iTerm pane or tab, refused
@@ -87,7 +87,6 @@ if TYPE_CHECKING:
 
     from .adapters.claude import ClaudeAdapter
     from .adapters.claude_agents import AgentEntry
-    from .config import Config
     from .models import LiveSession, Session
     from .store import Store
     from .tab_titles import ItermPane
@@ -263,32 +262,6 @@ def _merge_lives(lives: list[LiveSession], agents: list[AgentEntry]) -> list[Liv
     return out
 
 
-def _named_row(
-    db: Store,
-    live: LiveSession,
-    background: bool,
-    cfg: Config,
-    hint: str,
-) -> Session | None:
-    """The ccc row of *live*, given its deterministic name first when it has none.
-
-    A background session gets a row of its own when ccc has none (no hook ever ran for a
-    job whose worker is not running), so it carries a canonical name like the others.
-    """
-    from . import session_names
-
-    row = db.get(live.session_id)
-    if row is None and background and cfg.session_names:
-        db.ensure(live.session_id, cwd=live.cwd)
-        if live.config_dir:
-            db.update_fields(live.session_id, config_dir=live.config_dir)
-        row = db.get(live.session_id)
-    if row is not None and cfg.session_names and not row.canonical_name and not row.done:
-        session_names.ensure_name(db, live.session_id, use_llm=False, cfg=cfg, hint=hint)
-        row = db.get(live.session_id)
-    return row
-
-
 def _attach_subagents(
     entries: list[dict[str, Any]],
     lives: list[LiveSession],
@@ -318,7 +291,6 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
     *,
     adapter: ClaudeAdapter | None = None,
     store: Store | None = None,
-    cfg: Config | None = None,
     panes_reader: Callable[[], list[ItermPane] | None] | None = None,
     ps_reader: Callable[[], dict[int, Any]] | None = None,
     account_label: Callable[[str], str] | None = None,
@@ -330,10 +302,8 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
     Live registry sessions (interactive and ``bg``) plus every background session the
     CLI's ``claude agents --json`` lists (D4: a job whose worker is not running has no
     registry entry). The status prefers the CLI's view. Background sessions never get a
-    tab (``iterm_session_id`` null, not validated). A session without a name gets its
-    deterministic one first (no LLM inside the 3 s budget — the daemon and ``set-aim``
-    hand out the LLM names). Every collaborator is injectable so tests never touch iTerm,
-    ``ps``, ``claude`` or the real registries.
+    tab (``iterm_session_id`` null, not validated). Every collaborator is injectable so
+    tests never touch iTerm, ``ps``, ``claude`` or the real registries.
 
     *subagents_reader* (``session_agents.inventory`` for ``-j``; ``None`` skips it) maps
     ``(session_id, transcript path)`` targets to running subagents; a session it returns
@@ -344,7 +314,6 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
     from .adapters.claude import ClaudeAdapter as _Adapter
     from .store import Store as _Store
 
-    cfg = cfg if cfg is not None else config.load_config()
     adapter = adapter if adapter is not None else _Adapter()
     registry = [
         live
@@ -369,8 +338,7 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
         for live in lives:
             agent = _agent_for(live, by_sid)
             background = live.kind != "interactive" or (agent is not None and agent.background)
-            hint = (agent.name if agent is not None else "") if background else ""
-            row = _named_row(db, live, background, cfg, hint)
+            row = db.get(live.session_id)
             if background:
                 tab: tuple[str | None, bool] = (None, False)
             else:
@@ -450,8 +418,8 @@ def name_command(args: argparse.Namespace, store: Store | None = None) -> dict[s
     try:
         sid = _resolve_id(db, args.session)
         if getattr(args, "reset", False):
-            if args.auto or args.name is not None:
-                raise BridgeError("usage", "-R/--reset takes no name and no -A", EXIT_USAGE)
+            if args.name is not None:
+                raise BridgeError("usage", "-R/--reset takes no name", EXIT_USAGE)
             before = db.get(sid)
             previous = before.canonical_name if before is not None else None
             try:
@@ -459,15 +427,6 @@ def name_command(args: argparse.Namespace, store: Store | None = None) -> dict[s
             except ValueError as exc:
                 raise BridgeError("not_found", str(exc)) from exc
             changed = name != previous
-        elif args.auto:
-            from . import config
-
-            before = db.get(sid)
-            previous = before.canonical_name if before is not None else None
-            name = session_names.ensure_name(db, sid, use_llm=True, cfg=config.load_config())
-            # an LLM name replaced the provisional fallback: the running process shows the
-            # old one until the user types /rename
-            changed = bool(previous) and name != previous
         elif args.name is not None:
             try:
                 name = session_names.rename(db, sid, " ".join(args.name))
@@ -494,7 +453,7 @@ def name_command(args: argparse.Namespace, store: Store | None = None) -> dict[s
 
 
 def cmd_name(args: argparse.Namespace) -> int:
-    """``ccc name [-s ID] ["x y"] [-A] [-R] [-j]`` — show, set, auto-generate or reset a name."""
+    """``ccc name [-s ID] ["x y"] [-R] [-j]`` — show, set or reset a hand-set name."""
     if getattr(args, "json", False):
         return run_json(lambda: name_command(args))
     try:
@@ -502,11 +461,16 @@ def cmd_name(args: argparse.Namespace) -> int:
     except BridgeError as exc:
         print(f"❌ {exc.message}", file=sys.stderr)
         return exc.exit_code
-    if not data["name"]:
-        print(f"{data['session_id'][:8]}: no name yet")
+    if getattr(args, "reset", False):
+        if data["changed"]:
+            print(f"✅ {data['session_id'][:8]}: hand-set name dropped")
+        elif data["name"]:
+            print(f"{data['session_id'][:8]}: {data['name']!r} is not hand-set — nothing to reset")
+        else:
+            print(f"{data['session_id'][:8]}: no name — nothing to reset")
         return EXIT_OK
-    if getattr(args, "reset", False) and not data["changed"]:
-        print(f"{data['session_id'][:8]}: {data['name']!r} is not hand-set — nothing to reset")
+    if not data["name"]:
+        print(f"{data['session_id'][:8]}: no name")
         return EXIT_OK
     if data["changed"]:
         print(f"✅ {data['session_id'][:8]} is now named {data['name']!r}")
@@ -620,29 +584,19 @@ def add_parsers(sub: Any) -> None:
 
     p_name = sub.add_parser(
         "name",
-        help="show / set a session's memorable name (prints /rename for the running session)",
+        help="show / set a session's hand-set name (prints /rename for the running session)",
         description=(
             'Show or set a session\'s name. Examples: ccc name -s 1a2b "voice bridge"; '
-            "ccc name -s 1a2b -j; ccc name -s 1a2b -R (drop a hand-set name); "
-            "ccc name -s 1a2b -A"
+            "ccc name -s 1a2b -j; ccc name -s 1a2b -R (drop a hand-set name)"
         ),
     )
     p_name.add_argument("name", nargs="*", default=None, help="the new name (1-2 words)")
     p_name.add_argument("-s", "--session", help="session id or unique prefix (default: this one)")
     p_name.add_argument(
-        "-A",
-        "--auto",
-        action="store_true",
-        help="internal: generate the name once if the session has none (LLM, 10 s)",
-    )
-    p_name.add_argument(
         "-R",
         "--reset",
         action="store_true",
-        help=(
-            "drop a hand-set (manual / manual-tab) name: back to the automatic namer, "
-            "and ccc writes the tab title again"
-        ),
+        help=("drop a hand-set (manual / manual-tab) name; ccc writes the tab title again"),
     )
     p_name.add_argument(
         "-j", "--json", action="store_true", help="print the versioned JSON envelope"

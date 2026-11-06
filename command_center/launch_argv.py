@@ -7,8 +7,8 @@ command here (PLAN_claude-bridge.md §7.1, spike S-LAUNCH): ``claude_argv`` for 
 ``claude-session-continue`` auto-resume) and ``claude_command`` for the three that TYPE a
 shell string into a tab (``terminal.resume_in_new_tab``, ``accounts.relaunch_command``,
 snapshot restore). One builder means one place that adds ``--name <canonical name>`` —
-the session's memorable name (:mod:`command_center.session_names`) shows in Claude Code's
-prompt box and ``/resume`` picker. The env half (account pin, ``CCC_NO_CODEX``,
+the session's hand-set name (``ccc name``, :mod:`command_center.session_names`) shows in
+Claude Code's prompt box and ``/resume`` picker. The env half (account pin, ``CCC_NO_CODEX``,
 ``CLAUDE_CODE_DISABLE_TERMINAL_TITLE``) stays in :mod:`command_center.accounts`
 (``session_env_flags`` and its renderings), which ``claude_command`` prepends.
 

@@ -33,9 +33,7 @@ def test_name_replaces_the_leaf_and_precedes_the_aim() -> None:
 @pytest.fixture(name="writes")
 def writes_fixture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[Any]:
     monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "badges"))
-    monkeypatch.setattr(
-        config, "load_config", lambda: config.Config(session_names=True, aim_in_tab_title=True)
-    )
+    monkeypatch.setattr(config, "load_config", lambda: config.Config(aim_in_tab_title=True))
     seen: list[Any] = []
 
     def plain(cores: dict[str, str], marker: str = "") -> None:
@@ -65,7 +63,7 @@ def test_push_title_shows_the_aim_words(writes: list[Any]) -> None:
     assert "voice bridge" not in cores["w0t0p0:U"] and "🎯" not in cores["w0t0p0:U"]
 
 
-def test_hand_set_name_drops_the_aim_tail(writes: list[Any]) -> None:
+def test_hand_set_name_is_not_shown_either(writes: list[Any]) -> None:
     session = Session(
         session_id="s",
         cwd="/Users/x/repo",
@@ -76,13 +74,13 @@ def test_hand_set_name_drops_the_aim_tail(writes: list[Any]) -> None:
     )
     tabsymbol.push_title(session)
     [(kind, cores)] = writes
-    assert kind == "plain" and cores["w0t0p0:U"].endswith(" zoho ticket solver")
-    assert "🎯" not in cores["w0t0p0:U"]
+    assert kind == "plain" and cores["w0t0p0:U"].endswith(" answer the open tickets")
+    assert "zoho" not in cores["w0t0p0:U"] and "🎯" not in cores["w0t0p0:U"]  # tp#1808
 
 
 @pytest.mark.parametrize("origin", ["llm", "fallback", ""])
 def test_generated_or_unnamed_shows_the_aim_words(origin: str) -> None:
-    cfg = config.Config(session_names=True, aim_in_tab_title=True)
+    cfg = config.Config(aim_in_tab_title=True)
     name = "voice bridge" if origin else None
     session = Session(
         session_id="s",
@@ -96,7 +94,7 @@ def test_generated_or_unnamed_shows_the_aim_words(origin: str) -> None:
 
 @pytest.mark.parametrize("origin", ["manual", "llm", ""])
 def test_aim_in_tab_title_off_never_shows_the_aim(origin: str) -> None:
-    cfg = config.Config(session_names=True, aim_in_tab_title=False)
+    cfg = config.Config(aim_in_tab_title=False)
     name = "voice bridge" if origin else None
     session = Session(
         session_id="s",
@@ -105,12 +103,14 @@ def test_aim_in_tab_title_off_never_shows_the_aim(origin: str) -> None:
         canonical_name=name,
         canonical_name_origin=origin,
     )
-    assert tabsymbol._session_core(session, "🟧", cfg) == f"🟧 {name or LEAF}"
+    assert (
+        tabsymbol._session_core(session, "🟧", cfg) == f"🟧 {LEAF}"
+    )  # a name is never shown (tp#1808)
 
 
 def test_manual_name_with_names_off_shows_the_aim_words() -> None:
-    """The name is not shown with ``session_names`` off, so the AIM words show."""
-    cfg = config.Config(session_names=False, aim_in_tab_title=True)
+    """A hand-set name is not shown (tp#1808), so the AIM words show."""
+    cfg = config.Config(aim_in_tab_title=True)
     session = Session(
         session_id="s",
         cwd="/Users/x/repo",
@@ -122,7 +122,7 @@ def test_manual_name_with_names_off_shows_the_aim_words() -> None:
 
 
 def test_names_off_keeps_the_leaf(writes: list[Any], monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(config, "load_config", lambda: config.Config(session_names=False))
+    monkeypatch.setattr(config, "load_config", config.Config)
     session = Session(
         session_id="s",
         cwd="/Users/x/repo",
@@ -206,7 +206,7 @@ def test_one_owner_per_tab_prefers_the_live_pid(monkeypatch: pytest.MonkeyPatch)
 )
 def test_the_tab_shows_the_aim_words_without_the_item_run(aim: str, title: str) -> None:
     """tp#1366: `<few words>: tp#N` titles the tab `<badge> <few words>`."""
-    cfg = config.Config(session_names=True, aim_in_tab_title=True)
+    cfg = config.Config(aim_in_tab_title=True)
     session = Session(session_id="s", cwd="/Users/x/repo", aim=aim)
     assert tabsymbol._session_core(session, "🟧", cfg) == title
 
@@ -223,7 +223,7 @@ def test_a_staff_session_title_is_its_agent_symbol_and_name(
     (roles / "s").write_text("zoho-solver\n")
     monkeypatch.setenv("TP_STAFF_ROOT", str(tmp_path / "staff"))
     monkeypatch.setenv("TP_CACHE_DIR", str(tmp_path / "tp"))
-    cfg = config.Config(session_names=True, aim_in_tab_title=True)
+    cfg = config.Config(aim_in_tab_title=True)
     session = Session(
         session_id="s",
         cwd="/Users/x/repo",

@@ -80,11 +80,6 @@ DEFAULTS: dict[str, object] = {
     "switch_intercept": True,
     "aim_on_main_line": False,  # `ccc aim --format bar` prefixes "🎯 <aim>" (status-line row 1)
     "aim_in_tab_title": False,  # iTerm tab title "<badge> <AIM words>" (no tp#N run)
-    # Memorable 1-2 word session names (`ccc name`, `ccc sessions -j`, tab titles,
-    # `claude --name` on ccc launches). Generated once per session: through
-    # llm_custom_command when one is set, else a deterministic repo-folder name — so
-    # a fresh install spends no tokens. A tab title set by hand becomes the name.
-    "session_names": True,
     "aim_score": True,  # NN% AIM-specificity chip + daemon backfill (False = none)
     "aim_score_threshold": 50,  # AIM specificity < this (0..100) => vague: red tag
     "aim_score_on_set": False,  # refine the AIM score with an LLM call when the AIM changes (INERT)
@@ -488,6 +483,7 @@ DEPRECATED_LLM_CONFIG_KEYS = frozenset(
         "short_aim_model",
         "llm_account",
         "sharpen_every_n_turns",  # the agent-side sharpen nudge is gone (tp#1566)
+        "session_names",  # ccc generates no session names any more (tp#1808)
     }
 )
 
@@ -1145,7 +1141,6 @@ class Config:
     switch_intercept: bool = True
     aim_on_main_line: bool = False
     aim_in_tab_title: bool = False
-    session_names: bool = True
     aim_score: bool = True
     aim_score_threshold: int = 50
     aim_score_on_set: bool = False

@@ -2,9 +2,8 @@
 """The pending queue of ccc's LLM work a router SKIPPED (tp#1697 B14, Design §3).
 
 Under ``AI_AUTOMATED`` the purpose router may exit 75 ("skipped: no non-Anthropic rung
-answered"). For ccc's ``session-name``, ``short-aim`` and ``voice-brief`` work that is
-not a failure: the name or label stays unset (a ``fallback`` name stays provisional and
-its retry budget is NOT spent) and the item goes on this queue in ccc state,
+answered"). For ccc's ``short-aim`` and ``voice-brief`` work that is not a failure: the
+label stays unset (its retry budget is NOT spent) and the item goes on this queue in ccc state,
 ``<app_home>/llm-pending.json`` (``{purpose: {session_id: first-skip epoch}}``). The
 daemon's loop is the tick: it drops resolved and stale entries and re-runs the work
 (:func:`command_center.daemon._drain_llm_pending`). Best-effort: a queue that cannot be
@@ -33,7 +32,7 @@ from pathlib import Path
 
 from . import config
 
-PURPOSES = ("session-name", "short-aim", "voice-brief")
+PURPOSES = ("short-aim", "voice-brief")
 #: An entry older than this is dropped (a one-shot UI hint is stale by then).
 MAX_AGE_SEC = 24 * 3600
 QUEUE_NAME = "llm-pending.json"

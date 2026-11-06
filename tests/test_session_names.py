@@ -1,17 +1,16 @@
-"""Session names: generated once, unique across accounts, hand-set titles win (D2/D3)."""
+"""Hand-set session names (`ccc name`) and the tab-title bookkeeping; ccc generates none."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from command_center import config, llm, session_names, tabsymbol
+from command_center import config, llm_pending, llmrouting, session_names, tabsymbol
 from command_center.bridge_cli import name_command
 from command_center.store import Store
 
@@ -23,301 +22,49 @@ def store_fixture(tmp_path: Path) -> Iterator[Store]:
     s.close()
 
 
-def _cfg(command: str = "") -> config.Config:
-    return config.Config(llm_custom_command=command)
-
-
-def _row(
-    store: Store, sid: str, cwd: str = "/r/voice", aim: str | None = None, **fields: Any
-) -> None:
+def _row(store: Store, sid: str, cwd: str = "/r/voice", **fields: Any) -> None:
     store.ensure(sid, cwd=cwd)
-    if aim:
-        store.set_aim(sid, aim)
     if fields:
         store.update_fields(sid, **fields)
 
 
-# --------------------------------------------------------------------------- namer
-def test_normalize_generated_shapes_a_model_reply() -> None:
-    assert session_names.normalize_generated('"Voice Bridge!"\nbecause…') == "voice bridge"
-    assert session_names.normalize_generated("Zürich Café Löwen extra") == "zurich cafe"
-    assert session_names.normalize_generated("```\nvoice bridge\n```") == "voice bridge"
-    long = session_names.normalize_generated("supercalifragilistic expialidocious")
-    assert long == "supercalifragilistic"
-    assert len(session_names.normalize_generated("a" * 40) or "") == session_names.MAX_CHARS
-    assert session_names.normalize_generated("") is None
-    assert session_names.normalize_generated("!!!") is None
+# --------------------------------------------------------------------------- no namer
+def test_no_session_name_knob_or_purpose_is_left() -> None:
+    """tp#1808: no config key, no LLM purpose, no pending queue for session names."""
+    assert "session_names" not in config.DEFAULTS
+    assert "session-name" not in llmrouting.PURPOSES
+    assert "session-name" not in llm_pending.PURPOSES
 
 
-def test_llm_namer_uses_the_session_name_purpose_with_a_30s_budget(
-    monkeypatch: pytest.MonkeyPatch,
+def test_an_old_session_names_key_is_tolerated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    seen: dict[str, Any] = {}
-
-    def fake(
-        prompt: str, command: str, timeout: int = 0, *, purpose: str = "", note: str = ""
-    ) -> str:
-        del note
-        seen.update(prompt=prompt, command=command, timeout=timeout, purpose=purpose)
-        return "Voice Bridge"
-
-    monkeypatch.setattr(llm, "run_custom", fake)
-    assert (
-        session_names.llm_name("build the voice bridge", "/r/my-stt-tts", "router")
-        == "voice bridge"
-    )
-    assert (
-        seen["purpose"] == "session-name" and seen["timeout"] == session_names.LLM_TIMEOUT_SEC == 30
-    )
-    assert seen["command"] == "router" and "my-stt-tts" in seen["prompt"]
-
-
-def test_no_router_means_no_llm_call(monkeypatch: pytest.MonkeyPatch, store: Store) -> None:
-    monkeypatch.setattr(llm, "run_custom", lambda *_a, **_k: pytest.fail("LLM called"))
-    _row(store, "s1", cwd="/r/my-stt-tts", aim="implement the voice bridge")
-    assert session_names.ensure_name(store, "s1", use_llm=True, cfg=_cfg("")) == "my-stt-tts voice"
-
-
-def test_fallback_is_repo_folder_plus_first_aim_noun(tmp_path: Path) -> None:
-    repo = tmp_path / "my_repo"
-    (repo / ".git").mkdir(parents=True)
-    (repo / "sub").mkdir()
-    assert (
-        session_names.fallback_name(str(repo / "sub"), "Make sure the parser works")
-        == "my-repo parser"
-    )
-    assert session_names.fallback_name(str(repo), None) == "my-repo"
-    assert session_names.fallback_name("/x/averyveryverylongfoldername", "fix tokenizer") == (
-        "averyveryveryl tokenizer"
-    )
-    assert session_names.fallback_name("", "#tp 855") == "session"
-
-
-def test_fallback_is_at_most_two_words_and_skips_generic_nouns(tmp_path: Path) -> None:
-    def name(folder: str, aim: str | None) -> str:
-        repo = tmp_path / folder
-        (repo / ".git").mkdir(parents=True, exist_ok=True)
-        return session_names.fallback_name(str(repo), aim)
-
-    assert name("runai-quickstart", "tp off items") == "runai-quickstart"  # no good noun
-    assert name("02-llm-staff", "lack agent agent standards") == "02-llm-staff agent"
-    assert name("browser-login", "make shared crome run somewhere else") == "browser-login crome"
-    assert name("sdsc-automations", "/home/u/x/PROMPT.md") == "sdsc-automations"  # a path
-    assert name("oicd-azure-build", "oicd continue") == "oicd-azure-build"  # folder word
-    assert name("books-download", "./welib_zlib_daily.py run") == "books-download welib"
-    assert name("my-stt-tts", "#tp 855") == "my-stt-tts"
-    assert name("Zürich_Tools", "Café Löwen") == "zurich-tools cafe"
-    # the first noun that fits beside the WHOLE folder (24 chars), never a cut folder
-    assert name("runai-quickstart", "authentication yubikey") == "runai-quickstart yubikey"
-    for got in (name("runai-quickstart", "users shared items lack"), name("x", "a b c d")):
-        assert len(got) <= session_names.MAX_CHARS and len(got.split()) <= 2
-        assert got == got.lower() and got.isascii()
-
-
-def test_fallback_clash_tries_the_next_noun_before_a_suffix(store: Store, tmp_path: Path) -> None:
-    repo = tmp_path / "runai-quickstart"
-    (repo / ".git").mkdir(parents=True)
-    _row(store, "s1", cwd=str(repo), aim="ssh nas")
-    _row(store, "s2", cwd=str(repo), aim="ssh gitlab")
-    _row(store, "s3", cwd=str(repo), aim="ssh")
-    names = [session_names.ensure_name(store, s, use_llm=False, cfg=_cfg()) for s in ("s1", "s2")]
-    assert names == ["runai-quickstart ssh", "runai-quickstart gitlab"]
-    # no other noun: the §7.1 clash rule (account label, then a session-id word)
-    third = session_names.ensure_name(store, "s3", use_llm=False, cfg=_cfg())
-    assert third is not None and third.startswith("runai-quickstart ssh ")
-
-
-def test_router_failure_falls_back(monkeypatch: pytest.MonkeyPatch, store: Store) -> None:
-    monkeypatch.setattr(llm, "run_custom", lambda *_a, **_k: None)
-    _row(store, "s1", cwd="/r/voice", aim="ship the parser")
-    assert (
-        session_names.ensure_name(store, "s1", use_llm=True, cfg=_cfg("router")) == "voice parser"
-    )
-    got = store.get("s1")
-    assert got is not None and got.canonical_name_origin == session_names.ORIGIN_FALLBACK
-
-
-def test_generated_once_and_aim_change_never_renames(
-    monkeypatch: pytest.MonkeyPatch, store: Store
-) -> None:
-    replies = iter(["voice bridge", "something else"])
-    monkeypatch.setattr(llm, "run_custom", lambda *_a, **_k: next(replies))
-    _row(store, "s1", aim="build the voice bridge")
-    assert session_names.ensure_name(store, "s1", use_llm=True, cfg=_cfg("r")) == "voice bridge"
-    store.set_aim("s1", "a completely different goal now")
-    assert session_names.ensure_name(store, "s1", use_llm=True, cfg=_cfg("r")) == "voice bridge"
-    got = store.get("s1")
-    assert got is not None
-    assert got.canonical_name == "voice bridge" and got.canonical_name_origin == "llm"
-    assert got.name_source_aim == "build the voice bridge"
-
-
-# --------------------------------------------------------------------------- provisional
-def test_fallback_is_upgraded_once_by_the_llm_namer(
-    monkeypatch: pytest.MonkeyPatch, store: Store
-) -> None:
-    """``ccc sessions -j`` names without an LLM; the namer replaces that ONCE, then never."""
-    replies = iter(["voice bridge", "something else"])
-    calls: list[str] = []
-
-    def fake(prompt: str, *_a: Any, **_k: Any) -> str:
-        calls.append(prompt)
-        return next(replies)
-
-    monkeypatch.setattr(llm, "run_custom", fake)
-    _row(store, "s1", aim="build the parser")
-    assert session_names.ensure_name(store, "s1", use_llm=False, cfg=_cfg("r")) == "voice parser"
-    store.set_aim("s1", "build the voice bridge")  # the AIM moved on before the namer ran
-    got = store.get("s1")
-    assert got is not None and session_names.upgradable(got, _cfg("r"))
-    assert not session_names.upgradable(got, _cfg(""))  # no router: nothing to upgrade with
-    assert session_names.ensure_name(store, "s1", use_llm=True, cfg=_cfg("r")) == "voice bridge"
-    got = store.get("s1")
-    assert got is not None and got.canonical_name_origin == "llm"
-    assert got.name_source_aim == "build the parser"  # first AIM, snapshotted at the upgrade
-    assert not session_names.upgradable(got, _cfg("r"))
-    # never twice
-    assert session_names.ensure_name(store, "s1", use_llm=True, cfg=_cfg("r")) == "voice bridge"
-    assert len(calls) == 1
-
-
-def test_failed_upgrades_keep_the_fallback_and_are_bounded(
-    monkeypatch: pytest.MonkeyPatch, store: Store
-) -> None:
-    calls: list[str] = []
-    monkeypatch.setattr(llm, "run_custom", lambda p, *_a, **_k: calls.append(p))
-    _row(store, "s1", aim="ship the parser", canonical_name="voice parser")
-    store.update_fields("s1", canonical_name_origin="fallback")
-    for _ in range(session_names.MAX_UPGRADE_TRIES + 2):
-        assert session_names.ensure_name(store, "s1", use_llm=True, cfg=_cfg("r")) == (
-            "voice parser"
-        )
-    got = store.get("s1")
-    assert got is not None and got.canonical_name_origin == "fallback"
-    assert got.name_upgrade_tries == session_names.MAX_UPGRADE_TRIES
-    assert len(calls) == session_names.MAX_UPGRADE_TRIES
-
-
-@pytest.mark.parametrize("origin", ["llm", "manual", "manual-tab"])
-def test_final_names_are_never_replaced_by_the_namer(
-    monkeypatch: pytest.MonkeyPatch, store: Store, origin: str
-) -> None:
-    monkeypatch.setattr(llm, "run_custom", lambda *_a, **_k: pytest.fail("LLM called"))
-    _row(store, "s1", aim="ship the parser", canonical_name="sauna talk")
-    store.update_fields("s1", canonical_name_origin=origin)
-    assert session_names.ensure_name(store, "s1", use_llm=True, cfg=_cfg("r")) == "sauna talk"
-    got = store.get("s1")
-    assert got is not None and got.canonical_name_origin == origin
-
-
-def test_a_peer_rename_during_the_llm_call_wins(
-    monkeypatch: pytest.MonkeyPatch, store: Store, tmp_path: Path
-) -> None:
-    """The upgrade replaces only the fallback it started from (inside the transaction)."""
-
-    def fake(*_a: Any, **_k: Any) -> str:
-        with Store(tmp_path / "names.db") as peer:
-            session_names.adopt_manual_title(peer, "s1", "sauna talk")
-        return "voice bridge"
-
-    monkeypatch.setattr(llm, "run_custom", fake)
-    _row(store, "s1", aim="ship the parser", canonical_name="voice parser")
-    store.update_fields("s1", canonical_name_origin="fallback")
-    assert session_names.ensure_name(store, "s1", use_llm=True, cfg=_cfg("r")) == "sauna talk"
-    got = store.get("s1")
-    assert got is not None and got.canonical_name_origin == "manual-tab"
-
-
-def test_ccc_name_auto_upgrades_and_prints_rename(
-    monkeypatch: pytest.MonkeyPatch, store: Store
-) -> None:
-    monkeypatch.setattr(config, "load_config", lambda: _cfg("router"))
-    monkeypatch.setattr(llm, "run_custom", lambda *_a, **_k: "voice bridge")
-    _row(store, "s1", aim="build the voice bridge", canonical_name="voice parser")
-    store.update_fields("s1", canonical_name_origin="fallback")
-    data = name_command(_name_args("s1", auto=True), store=store)
-    assert data["name"] == "voice bridge" and data["name_origin"] == "llm"
-    assert data["changed"] is True and data["rename_command"] == "/rename voice bridge"
-
-
-def test_daemon_backfill_picks_unnamed_and_upgradable_rows(
-    monkeypatch: pytest.MonkeyPatch, store: Store
-) -> None:
-    from command_center import daemon, spawn
-    from command_center.models import LiveSession
-
-    spawned: list[list[str]] = []
-    monkeypatch.setattr(spawn, "spawn_ccc", spawned.append)
-    _row(store, "new", aim="a")
-    _row(store, "prov", aim="b", canonical_name="voice b")
-    store.update_fields("prov", canonical_name_origin="fallback")
-    _row(store, "spent", aim="c", canonical_name="voice c", name_upgrade_tries=3)
-    store.update_fields("spent", canonical_name_origin="fallback")
-    _row(store, "final", aim="d", canonical_name="voice d")
-    store.update_fields("final", canonical_name_origin="llm")
-    live = {
-        sid: LiveSession(pid=1, session_id=sid, cwd="/r", alive=True)
-        for sid in ("new", "prov", "spent", "final")
-    }
-    cfg = config.Config(llm_custom_command="router", max_summaries_per_run=10)
-    got = daemon._backfill_session_names(store, cfg, live, dry_run=False)  # noqa: SLF001
-    assert sorted(got) == ["new", "prov"]
-    assert sorted(cmd[-1] for cmd in spawned) == ["new", "prov"]
-    no_router = config.Config(llm_custom_command="", max_summaries_per_run=10)
-    dry = daemon._backfill_session_names(store, no_router, live, dry_run=True)  # noqa: SLF001
-    assert dry == ["new"]
-
-
-# --------------------------------------------------------------------------- uniqueness
-def test_uniqueness_is_casefolded_and_adds_account_then_id(
-    monkeypatch: pytest.MonkeyPatch, store: Store
-) -> None:
-    monkeypatch.setattr(session_names, "_account_label", lambda cd: "work" if cd else "private")
-    _row(store, "aaaa1111", cwd="/r/voice", aim="parser", config_dir="")
-    _row(store, "bbbb2222", cwd="/r/voice", aim="parser", config_dir="/w")
-    _row(store, "cccc3333", cwd="/r/voice", aim="parser", config_dir="/w")
-    store.update_fields("aaaa1111", canonical_name="Voice Parser")  # different case, same name
-    assert (
-        session_names.ensure_name(store, "bbbb2222", use_llm=False, cfg=_cfg())
-        == "voice parser work"
-    )
-    assert (
-        session_names.ensure_name(store, "cccc3333", use_llm=False, cfg=_cfg())
-        == "voice parser cccc"
-    )
-
-
-def test_done_sessions_do_not_hold_names(store: Store) -> None:
-    _row(store, "old", aim="parser", canonical_name="voice parser", done=True)
-    _row(store, "new", aim="parser")
-    assert session_names.ensure_name(store, "new", use_llm=False, cfg=_cfg()) == "voice parser"
-
-
-def test_concurrent_writer_wins_and_is_kept(store: Store, tmp_path: Path) -> None:
-    """The transaction re-reads the row: a name a peer stored meanwhile is not replaced."""
-    _row(store, "s1", aim="parser")
-    with Store(tmp_path / "names.db") as peer:
-        peer.update_fields("s1", canonical_name="peer name", canonical_name_origin="llm")
-    got = session_names._write_name(  # noqa: SLF001
-        store, "s1", "mine", "fallback", source_aim=None, only_if_unnamed=True, refuse_clash=False
-    )
-    assert got == "peer name"
+    """An old config.toml that still says `session_names = …` loads and blocks no writer."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))
+    path = config.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("session_names = false\nshort_aim = true\n", encoding="utf-8")
+    cfg = config.load_config()
+    assert cfg.loaded_from_disk and cfg.short_aim is True
+    assert not hasattr(cfg, "session_names")
+    assert "session_names" not in config.unknown_config_keys()
 
 
 # --------------------------------------------------------------------------- ccc name
-def _name_args(sid: str, *words: str, auto: bool = False) -> argparse.Namespace:
-    return argparse.Namespace(session=sid, name=list(words) or None, auto=auto, json=True)
+def _name_args(sid: str, *words: str) -> argparse.Namespace:
+    return argparse.Namespace(session=sid, name=list(words) or None, json=True)
 
 
 def test_ccc_name_renames_and_prints_rename(store: Store) -> None:
-    _row(store, "s1", aim="parser")
+    _row(store, "s1", title_written="🔺 voice")
     data = name_command(_name_args("s1", "Voice", "Bridge"), store=store)
     assert data["name"] == "Voice Bridge" and data["rename_command"] == "/rename Voice Bridge"
     got = store.get("s1")
     assert got is not None and got.canonical_name_origin == "manual"
+    assert got.title_written is None  # the next title write lands unconditionally
 
 
-def test_ccc_name_collision_is_rejected(store: Store) -> None:
+def test_ccc_name_collision_is_rejected_casefolded(store: Store) -> None:
     from command_center.bridge_json import BridgeError
 
     _row(store, "s1", canonical_name="voice bridge")
@@ -327,6 +74,22 @@ def test_ccc_name_collision_is_rejected(store: Store) -> None:
     assert err.value.code == "name_taken" and err.value.exit_code == 1
     got = store.get("s2")
     assert got is not None and got.canonical_name is None
+
+
+def test_done_sessions_do_not_hold_names(store: Store) -> None:
+    _row(store, "old", canonical_name="voice parser", done=True)
+    _row(store, "new")
+    assert session_names.rename(store, "new", "voice parser") == "voice parser"
+
+
+def test_rename_refuses_empty_long_and_unknown(store: Store) -> None:
+    _row(store, "s1")
+    with pytest.raises(ValueError):
+        session_names.rename(store, "s1", " \x07 ")
+    with pytest.raises(ValueError):
+        session_names.rename(store, "s1", "x" * (session_names.MAX_MANUAL_CHARS + 1))
+    with pytest.raises(ValueError):
+        session_names.rename(store, "nope", "fine")
 
 
 def test_ccc_name_cli_envelope_and_exit_codes(
@@ -346,216 +109,16 @@ def test_ccc_name_cli_envelope_and_exit_codes(
     assert out["data"]["name"] == "free" and out["data"]["rename_command"] == "/rename free"
     assert cli.main(["name", "-s", "nope", "-j"]) == 1
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "not_found"
-
-
-def test_find_is_case_insensitive(store: Store) -> None:
-    _row(store, "s1", canonical_name="Voice Bridge")
-    assert [s.session_id for s in session_names.find(store, "voice BRIDGE")] == ["s1"]
-
-
-# --------------------------------------------------------------------------- hand-set titles
-def _written(store: Store, sid: str, core: str, age_ms: int) -> None:
-    session_names.record_title_write(store, sid, core, int(time.time() * 1000) - age_ms)
-
-
-def test_manual_title_needs_the_5s_grace(store: Store) -> None:
-    _row(store, "s1", cwd="/r/voice", canonical_name="voice bridge", iterm_session_id="w0t0p0:U1")
-    _written(store, "s1", "🔺 voice bridge", age_ms=1000)
-    now = int(time.time() * 1000)
-    session = store.get("s1")
-    assert session is not None
-    assert tabsymbol.manual_title_candidate(session, "🔺 sauna talk", now) is None  # in grace
-    assert tabsymbol.manual_title_candidate(session, "🔺 sauna talk", now + 5000) == "sauna talk"
-
-
-def test_manual_title_strips_marker_badge_aim_and_controls(store: Store) -> None:
-    _row(store, "s1", cwd="/r/voice", canonical_name="voice bridge")
-    _written(store, "s1", "🔺 voice bridge", age_ms=60_000)
-    session = store.get("s1")
-    assert session is not None
-    now = int(time.time() * 1000)
-    assert tabsymbol.manual_title_candidate(session, "🔴 🔺 my\x07 tab 🎯 the aim", now) == "my tab"
-    # empty after stripping, ccc's own shapes and the current name are never "manual"
-    assert tabsymbol.manual_title_candidate(session, "🔴 🔺  ", now) is None
-    assert tabsymbol.manual_title_candidate(session, "🔺 voice bridge 🎯 x", now) is None
-    leaf = tabsymbol.title_core("🟢", "/r/voice")  # the folder-leaf title (no name)
-    assert tabsymbol.manual_title_candidate(session, leaf, now) is None
-    # no ccc baseline yet → nothing can be called hand-set
-    _row(store, "s2", cwd="/r/voice")
-    fresh = store.get("s2")
-    assert fresh is not None and tabsymbol.manual_title_candidate(fresh, "anything", now) is None
-
-
-def _sync_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, live: dict[str, str]) -> list[Any]:
-    from command_center import tab_titles, terminal
-
-    monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "badges"))
-    monkeypatch.setattr(
-        config,
-        "load_config",
-        lambda: config.Config(session_names=True, aim_in_tab_title=False),
-    )
-    writes: list[Any] = []
-    monkeypatch.setattr(
-        terminal, "set_session_titles_preserving", lambda c, marker="": writes.append(("plain", c))
-    )
-    monkeypatch.setattr(
-        tab_titles, "set_titles_cas", lambda e, marker="": writes.append(("cas", e))
-    )
-    monkeypatch.setattr(
-        tab_titles,
-        "read_panes",
-        lambda: [tab_titles.ItermPane(uuid=u, tty="", name=n) for u, n in live.items()],
-    )
-    return writes
-
-
-def test_sync_adopts_a_hand_set_title_and_never_writes_that_tab_again(
-    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _row(store, "s1", cwd="/r/voice", canonical_name="voice bridge", iterm_session_id="w0t0p0:U1")
-    _written(store, "s1", "🔺 voice bridge", age_ms=60_000)
-    writes = _sync_env(monkeypatch, tmp_path, {"U1": "🔴 🔺 sauna talk"})
-    tabsymbol.sync_live(store)
-    got = store.get("s1")
-    assert got is not None
-    assert got.canonical_name == "sauna talk" and got.canonical_name_origin == "manual-tab"
-    assert not writes  # the tab was not written in the adopting pass
-    writes.clear()
-    tabsymbol.sync_live(store)  # nor in any later one
-    assert not writes
-    tabsymbol.push_title(got)
-    tabsymbol.seed_title("w0t0p0:U1", "/r/voice", session=got, store=store)
-    assert not writes
-
-
-def test_sync_writes_name_then_compare_and_swap(
-    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _row(store, "s1", cwd="/r/voice", canonical_name="voice bridge", iterm_session_id="w0t0p0:U1")
-    writes = _sync_env(monkeypatch, tmp_path, {"U1": "🔺 voice"})
-    tabsymbol.sync_live(store)
-    kind, cores = writes[0]
-    core = cores["w0t0p0:U1"]
-    assert kind == "plain" and core.endswith(" voice bridge")
-    got = store.get("s1")
-    assert got is not None and got.title_written == core and got.title_generation == 1
-    store.update_fields("s1", aim="new aim")
-    store.update_fields("s1", canonical_name="voice bridge two")
-    writes.clear()
-    tabsymbol.sync_live(store)  # second write: conditional on the tab still showing `core`
-    assert writes and writes[0][0] == "cas" and writes[0][1]["w0t0p0:U1"][0] == core
-
-
-# tp#1292: a recorded title write that never landed left the zoho tab on an old ccc title
-# (its old badge ⚫ and an old AIM); every later compare-and-swap expected the recorded title
-# and refused for good.
-_ZOHO_STALE = "⚫ zoho-api automater 🎯 tp#1035, #1175, #1177, #1236, #1023: zo…"
-_ZOHO_RECORDED = "🎫 zoho-api automater 🎯 tp#1035, #1175, #1177, #1236: zoho tick…"
-
-
-def _zoho(store: Store, monkeypatch: pytest.MonkeyPatch, age_ms: int = 60_000) -> None:
-    from command_center import staffrole
-
-    monkeypatch.setattr(staffrole, "agent_symbols", lambda: frozenset({"🎫"}))
-    monkeypatch.setattr(staffrole, "session_symbol", lambda sid: "🎫" if sid == "z1" else None)
-    _row(
-        store,
-        "z1",
-        cwd="/r/zoho-api",
-        canonical_name="zoho-api automater",
-        iterm_session_id="w0t9p0:UZ",
-    )
-    _written(store, "z1", _ZOHO_RECORDED, age_ms=age_ms)
-
-
-def test_drifted_ccc_body_spots_a_stale_ccc_title(
-    store: Store, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _zoho(store, monkeypatch)
-    session = store.get("z1")
-    assert session is not None
-    now = int(time.time() * 1000)
-    assert tabsymbol.drifted_ccc_body(session, _ZOHO_STALE, now) == _ZOHO_STALE
-    # the wait marker is not part of the body the swap compares
-    assert tabsymbol.drifted_ccc_body(session, "🔴 " + _ZOHO_STALE, now) == _ZOHO_STALE
-    # an agent symbol in front counts as a badge too
-    assert tabsymbol.drifted_ccc_body(session, "🎫 zoho-api automater", now) == (
-        "🎫 zoho-api automater"
-    )
-    # in sync, hand-typed, unbadged or unknown → keep the recorded baseline
-    assert tabsymbol.drifted_ccc_body(session, _ZOHO_RECORDED, now) is None
-    assert tabsymbol.drifted_ccc_body(session, "⚫ sauna talk", now) is None
-    assert tabsymbol.drifted_ccc_body(session, "zoho-api automater", now) is None
-    assert tabsymbol.drifted_ccc_body(session, None, now) is None
-
-
-def test_drifted_ccc_body_waits_out_the_grace(
-    store: Store, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _zoho(store, monkeypatch, age_ms=1000)
-    session = store.get("z1")
-    assert session is not None
-    now = int(time.time() * 1000)
-    assert tabsymbol.drifted_ccc_body(session, _ZOHO_STALE, now) is None  # may be landing
-    assert tabsymbol.drifted_ccc_body(session, _ZOHO_STALE, now + 5000) == _ZOHO_STALE
-
-
-def test_sync_heals_a_tab_stuck_on_a_stale_ccc_title(
-    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _zoho(store, monkeypatch)
-    writes = _sync_env(monkeypatch, tmp_path, {"UZ": "🔴 " + _ZOHO_STALE})
-    tabsymbol.sync_live(store)
-    got = store.get("z1")
-    assert got is not None and got.canonical_name == "zoho-api automater"  # not adopted
-    assert got.canonical_name_origin != "manual-tab"
-    kind, entries = writes[0]
-    expected, core = entries["w0t9p0:UZ"]
-    assert kind == "cas" and expected == _ZOHO_STALE  # swapped from what the tab shows
-    assert core == "🎫 zoho-api automater" and got.title_written == core
-
-
-def test_sync_keeps_the_recorded_baseline_for_a_hand_set_title(
-    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _zoho(store, monkeypatch, age_ms=1000)  # in grace: not adopted yet, still protected
-    writes = _sync_env(monkeypatch, tmp_path, {"UZ": "⚫ sauna talk"})
-    tabsymbol.sync_live(store)
-    kind, entries = writes[0]
-    assert kind == "cas" and entries["w0t9p0:UZ"][0] == _ZOHO_RECORDED
-
-
-def test_watcher_override_becomes_the_name(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(config, "load_config", lambda: config.Config(session_names=True))
-    _row(store, "s1", cwd="/r/voice", canonical_name="voice bridge", iterm_session_id="w0t0p0:U1")
-    assert tabsymbol.adopt_overrides([("🔺 sauna talk", ["U1"])], store=store) == 1
-    got = store.get("s1")
-    assert got is not None and got.canonical_name == "sauna talk"
-    assert got.canonical_name_origin == "manual-tab"
-    assert tabsymbol.adopt_overrides([("🔺 sauna talk", ["U1"])], store=store) == 0  # idempotent
-
-
-def test_hand_set_title_wins_over_the_generator(store: Store) -> None:
-    _row(store, "s1", aim="parser")
-    session_names.adopt_manual_title(store, "s1", "sauna talk")
-    assert session_names.ensure_name(store, "s1", use_llm=False, cfg=_cfg()) == "sauna talk"
-    got = store.get("s1")
-    assert got is not None and session_names.titles_frozen(got)
-
-
-def test_hand_set_clash_gets_a_suffix_and_is_not_readopted(store: Store) -> None:
-    _row(store, "s1", canonical_name="sauna talk")
-    _row(store, "s2")
-    assert session_names.adopt_manual_title(store, "s2", "sauna talk") == "sauna talk s2"
-    got = store.get("s2")
-    assert got is not None and session_names.already_named(got, "sauna talk")
+    with pytest.raises(SystemExit) as exc:  # no automatic namer any more (tp#1808)
+        cli.main(["name", "-s", "s2", "-A", "-j"])
+    assert exc.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "usage"
 
 
 def test_reconcile_never_clobbers_the_canonical_name(store: Store) -> None:
     from command_center.models import LiveSession
 
-    _row(store, "s1", canonical_name="voice bridge", canonical_name_origin="llm")
+    _row(store, "s1", canonical_name="voice bridge", canonical_name_origin="manual")
     store.upsert_from_live(LiveSession(pid=1, session_id="s1", cwd="/r", name="other"))
     got = store.get("s1")
     assert got is not None and got.canonical_name == "voice bridge"
@@ -565,131 +128,26 @@ def test_reconcile_never_clobbers_the_canonical_name(store: Store) -> None:
     assert got is not None and got.runtime_name_applied_at > 0
 
 
-@pytest.mark.parametrize(
-    ("aim", "ok"),
-    [
-        ("#tp 855", False),
-        ("tp#855", False),
-        ("ticket 12 #wip", False),
-        ("", False),
-        ("build the voice bridge", True),
-        ("fix tp#855 voice bridge", True),
-    ],
-)
-def test_aim_without_substance_is_not_sent_to_the_llm(aim: str, ok: bool) -> None:
-    assert session_names.aim_has_substance(aim) is ok
-
-
-# --------------------------------------------------------------------------- shell titles (tp#1297)
-# The zsh chpwd hook `_repo_tab_color_hook` titles a tab "<symbol> ${PWD:t}", then
-# "<symbol> <repo folder>" (or a "~/…" custom path). ccc adopted those as hand-set names
-# and froze the tabs: obsidian (be5bdd74, cwd ~/obsidian/01-llm/staff/email-agent) was one.
-def _vault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    from command_center import repos
-
-    vault = tmp_path / "obsidian"
-    (vault / ".git").mkdir(parents=True)
-    (vault / "01-llm" / "staff" / "email-agent").mkdir(parents=True)
-    nixos = vault / "repos" / "infra" / "macbook2014-nixos"
-    (nixos / "docs").mkdir(parents=True)
-    (nixos / ".git").write_text("gitdir: x\n", encoding="utf-8")  # a submodule
-    monkeypatch.setattr(repos, "repo_root", lambda cfg=None: str(vault / "repos"))
-    return vault
-
-
-def test_shell_hook_titles_mirror_the_zsh_hook(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    vault = _vault(tmp_path, monkeypatch)
-    agent = str(vault / "01-llm" / "staff" / "email-agent")
-    assert {"email-agent", "obsidian"} <= session_names.shell_hook_titles(agent)
-    docs = str(vault / "repos" / "infra" / "macbook2014-nixos" / "docs")
-    assert {"docs", "macbook2014-nixos"} <= session_names.shell_hook_titles(docs)
-    assert session_names.shell_hook_titles("") == set()
-
-
-def test_real_manual_tab_names_hook_output_rejected_hand_typed_kept(
-    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    vault = _vault(tmp_path, monkeypatch)
-    agent = str(vault / "01-llm" / "staff" / "email-agent")
-    nixos = str(vault / "repos" / "infra" / "macbook2014-nixos")
-    _row(store, "be5bdd74", cwd=agent)
-    _row(store, "b96ea33f", cwd=nixos)
-    hook = store.get("be5bdd74")
-    nix = store.get("b96ea33f")
-    assert hook is not None and nix is not None
-    reject = session_names.rejected_manual_title
-    assert reject(hook, "obsidian") == "shell hook title"  # the hook's repo folder
-    assert reject(hook, "Email-Agent") == "shell hook title"  # ${PWD:t}, casefolded
-    assert reject(hook, "\\~") == "backslash"  # tp#1296's literal "\~"
-    assert reject(hook, "~") == "home path" and reject(hook, "~/scratch") == "home path"
-    assert reject(nix, "macbook2014-nixos") == "shell hook title"
-    # names the user really typed stay adoptable
-    for kept in ("LED strip WZ", "movies", "claud's memory", "use mac lab", "~tilde"):
-        assert reject(nix, kept) is None and reject(hook, kept) is None
-
-
-def test_auto_and_runtime_names_are_not_hand_set(store: Store) -> None:
-    _row(store, "s1", cwd="/r/voice", canonical_name="voice bridge", canonical_name_origin="llm")
-    store.update_fields("s1", observed_runtime_name="claude chat")
-    got = store.get("s1")
-    assert got is not None
-    assert session_names.rejected_manual_title(got, "Voice Bridge") == "auto name"
-    assert session_names.rejected_manual_title(got, "claude chat") == "runtime name"
-    # a manual name is not "auto": re-checking a stored manual-tab name keeps it
-    store.update_fields("s1", canonical_name="sauna talk", canonical_name_origin="manual-tab")
-    got = store.get("s1")
-    assert got is not None and session_names.rejected_manual_title(got, "sauna talk") is None
-
-
-def test_sync_does_not_adopt_the_hook_title_and_swaps_from_it(
-    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    vault = _vault(tmp_path, monkeypatch)
-    agent = str(vault / "01-llm" / "staff" / "email-agent")
-    _row(store, "s1", cwd=agent, canonical_name="carl", iterm_session_id="w0t0p0:U1")
-    _written(store, "s1", "🟧 carl", age_ms=60_000)
-    writes = _sync_env(monkeypatch, tmp_path, {"U1": "🔴 🟧 obsidian"})
-    tabsymbol.sync_live(store)
-    got = store.get("s1")
-    assert got is not None and got.canonical_name == "carl"
-    assert got.canonical_name_origin != "manual-tab" and not session_names.titles_frozen(got)
-    kind, entries = writes[0]
-    expected, core = entries["w0t0p0:U1"]
-    assert kind == "cas" and expected == "🟧 obsidian"  # swapped from the shell's title
-    assert core.endswith(" carl")
-
-
-def test_watcher_override_from_the_hook_is_not_adopted(
-    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    vault = _vault(tmp_path, monkeypatch)
-    monkeypatch.setattr(config, "load_config", lambda: config.Config(session_names=True))
-    agent = str(vault / "01-llm" / "staff" / "email-agent")
-    _row(store, "s1", cwd=agent, canonical_name="carl", iterm_session_id="w0t0p0:U1")
-    assert tabsymbol.adopt_overrides([("🔺 email-agent", ["U1"])], store=store) == 0
-    assert tabsymbol.adopt_overrides([("🔺 \\~", ["U1"])], store=store) == 0
-    got = store.get("s1")
-    assert got is not None and got.canonical_name == "carl"
-
-
 # --------------------------------------------------------------------------- ccc name --reset
-def test_reset_returns_a_manual_tab_name_to_the_namer(store: Store) -> None:
-    _row(store, "s1", cwd="/r/voice", aim="build the parser")
-    session_names.adopt_manual_title(store, "s1", "obsidian")
-    _written(store, "s1", "🟧 voice parser", age_ms=60_000)
+def test_reset_drops_a_hand_set_name_and_unfreezes_the_tab(store: Store) -> None:
+    _row(
+        store,
+        "s1",
+        canonical_name="obsidian",
+        canonical_name_origin="manual-tab",
+        title_written="🟧 voice",
+    )
     before = store.get("s1")
     assert before is not None and session_names.titles_frozen(before)
-    name = session_names.reset_name(store, "s1", cfg=_cfg())
+    assert session_names.reset_name(store, "s1") is None
     got = store.get("s1")
-    assert got is not None and name == got.canonical_name == "voice parser"
-    assert got.canonical_name_origin == "fallback" and not session_names.titles_frozen(got)
-    assert got.title_written is None and got.name_upgrade_tries == 0
-    # an automatic name is left as it is
-    assert session_names.reset_name(store, "s1", cfg=_cfg()) == "voice parser"
+    assert got is not None and got.canonical_name is None and got.canonical_name_origin == ""
+    assert not session_names.titles_frozen(got) and got.title_written is None
+    # a legacy automatic name is left as it is
+    _row(store, "s2", canonical_name="voice parser", canonical_name_origin="fallback")
+    assert session_names.reset_name(store, "s2") == "voice parser"
     with pytest.raises(ValueError):
-        session_names.reset_name(store, "nope", cfg=_cfg())
+        session_names.reset_name(store, "nope")
 
 
 def test_ccc_name_reset_cli(
@@ -698,15 +156,72 @@ def test_ccc_name_reset_cli(
     from command_center import cli
 
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))
-    monkeypatch.setattr(config, "load_config", _cfg)
     with Store() as db:
-        _row(db, "s1-full-id", cwd="/r/voice", aim="build the parser")
-        session_names.adopt_manual_title(db, "s1-full-id", "obsidian")
+        _row(db, "s1-full-id", canonical_name="sauna talk", canonical_name_origin="manual")
     assert cli.main(["name", "-s", "s1", "-R", "-j"]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["data"]["name"] == "voice parser" and out["data"]["name_origin"] == "fallback"
-    assert out["data"]["changed"] is True
+    assert out["data"]["name"] is None and out["data"]["changed"] is True
     assert cli.main(["name", "-s", "s1", "--reset"]) == 0
     assert "nothing to reset" in capsys.readouterr().out
     assert cli.main(["name", "-s", "s1", "-R", "x", "-j"]) == 2
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "usage"
+
+
+# --------------------------------------------------------------------------- tab titles
+def _sync_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[Any]:
+    from command_center import tab_titles, terminal
+
+    monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "badges"))
+    monkeypatch.setattr(config, "load_config", lambda: config.Config(aim_in_tab_title=False))
+    writes: list[Any] = []
+    monkeypatch.setattr(
+        terminal, "set_session_titles_preserving", lambda c, marker="": writes.append(("plain", c))
+    )
+    monkeypatch.setattr(
+        tab_titles, "set_titles_cas", lambda e, marker="": writes.append(("cas", e))
+    )
+
+    def _no_read() -> None:
+        raise AssertionError("the title sync reads no live titles")
+
+    monkeypatch.setattr(tab_titles, "read_panes", _no_read)
+    return writes
+
+
+def test_sync_shows_no_name_then_compare_and_swap(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _row(store, "s1", cwd="/r/voice", canonical_name="voice bridge", iterm_session_id="w0t0p0:U1")
+    writes = _sync_env(monkeypatch, tmp_path)
+    tabsymbol.sync_live(store)
+    kind, cores = writes[0]
+    core = cores["w0t0p0:U1"]
+    badge = core.split(" ", 1)[0]
+    assert kind == "plain" and core == tabsymbol.title_core(badge, "/r/voice")
+    assert "bridge" not in core
+    got = store.get("s1")
+    assert got is not None and got.title_written == core and got.title_generation == 1
+    store.update_fields("s1", cwd="/r/other")
+    writes.clear()
+    tabsymbol.sync_live(store)  # second write: conditional on the tab still showing `core`
+    assert writes and writes[0][0] == "cas" and writes[0][1]["w0t0p0:U1"][0] == core
+
+
+def test_a_frozen_tab_is_never_written(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _row(
+        store,
+        "s1",
+        cwd="/r/voice",
+        canonical_name="sauna talk",
+        canonical_name_origin="manual-tab",
+        iterm_session_id="w0t0p0:U1",
+    )
+    writes = _sync_env(monkeypatch, tmp_path)
+    tabsymbol.sync_live(store)
+    got = store.get("s1")
+    assert got is not None
+    tabsymbol.push_title(got)
+    tabsymbol.seed_title("w0t0p0:U1", "/r/voice", session=got, store=store)
+    assert not writes

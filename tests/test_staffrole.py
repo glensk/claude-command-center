@@ -149,7 +149,6 @@ def test_seed_title_uses_the_agent_name(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 def test_title_parsers_treat_an_agent_symbol_as_a_badge() -> None:
-    assert tabsymbol.clean_title("🔴 📧 email-agent 🎯 route mail") == "email-agent"
     assert tabsymbol.healed_title("📧 pitch", "🔷") == "🔷 pitch"  # role gone: badge back
     assert tabsymbol.healed_title("🔷 pitch", "📧") == "📧 pitch"  # adopted: no stacking
     assert tabsymbol.healed_title("📧 pitch", "📧") is None

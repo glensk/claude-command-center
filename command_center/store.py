@@ -856,7 +856,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             "ON sessions(idempotency_key) WHERE idempotency_key IS NOT NULL"
         )
         # Name lookups are case-insensitive (`ccc name`, the voice bridge's targets). NOT
-        # unique: names are unique among ACTIVE rows only (session_names.assign checks that
+        # unique: names are unique among ACTIVE rows only (session_names.rename checks that
         # inside one transaction), so a done session may keep a name a live one reuses.
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_canonical_name "

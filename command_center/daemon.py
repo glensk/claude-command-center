@@ -328,11 +328,6 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
         # symbol assigned mid-session — which the `cd`-driven zsh hook can't reach while a
         # CLI holds the foreground — still reaches the tab. Side-effect only (no report
         # noise every pass); skipped on dry-run since it assigns badges + sets titles.
-        # Name every live session that still has none — generated ONCE, detached like
-        # the short-AIM backfill (the LLM call takes up to 10 s). Before the title sync,
-        # so a tab picks the name up in the same pass once it lands.
-        if cfg.session_names:
-            _backfill_session_names(store, cfg, live, dry_run)
         # tp#1697 B14: work a router SKIPPED waits on the pending queue; this loop is its tick.
         _drain_llm_pending(store, cfg, live, dry_run)
 
@@ -456,49 +451,19 @@ def _backfill_short_aims(
         spawn.spawn_ccc(["short-aim", "--session", session.session_id])
 
 
-def _backfill_session_names(
-    store: Store, cfg: config.Config, live: dict[str, LiveSession], dry_run: bool
-) -> list[str]:
-    """Spawn ``ccc name -A`` for live sessions with an AIM that still need a name (capped).
-
-    "Need" = no name yet, or a provisional ``fallback`` name an LLM may still replace
-    once (:func:`session_names.upgradable` — a router is configured and the bounded
-    retries are not used up). Sessions without an AIM are left to ``ccc sessions -j``
-    (deterministic name on first listing) or a later ``set-aim``: an LLM name needs the
-    AIM to describe. Returns the ids it spawned for.
-    """
-    from . import session_names
-
-    pending = [
-        s.session_id
-        for s in store.list_sessions()
-        if s.session_id in live
-        and live[s.session_id].alive
-        and s.aim
-        and not s.done
-        and (not s.canonical_name or session_names.upgradable(s, cfg))
-    ][: cfg.max_summaries_per_run]
-    if not dry_run:
-        from . import spawn
-
-        for session_id in pending:
-            spawn.spawn_ccc(["name", "-A", "-s", session_id])
-    return pending
-
-
 def _drain_llm_pending(
     store: Store, cfg: config.Config, live: dict[str, LiveSession], dry_run: bool
 ) -> list[str]:
     """The daemon tick of the skipped-LLM-work queue (:mod:`.llm_pending`, tp#1697 B14).
 
     Stale entries are dropped; an entry whose work is done or moot (the session is gone
-    or done, it has a short-AIM label, its name is no longer a provisional fallback) is
-    cleared. ``session-name`` and ``short-aim`` entries are re-run by their own backfills
-    above (a skip spends no retry), so only ``voice-brief`` is re-spawned here — a
+    or done, it has a short-AIM label, its purpose is no longer queued — e.g. an old
+    ``session-name`` entry, tp#1808) is cleared. ``short-aim`` entries are re-run by their
+    own backfill above (a skip spends no retry), so only ``voice-brief`` is re-spawned here — a
     detached ``ccc inspect`` that refills the brief cache — capped per pass. Returns the
     session ids it spawned for.
     """
-    from . import llm_pending, session_names
+    from . import llm_pending
 
     queue = llm_pending.prune()
     spawned: list[str] = []
@@ -507,13 +472,10 @@ def _drain_llm_pending(
             session = store.get(session_id)
             alive = session_id in live and live[session_id].alive
             done = (
-                session is None
+                purpose not in llm_pending.PURPOSES
+                or session is None
                 or session.done
                 or (purpose == "short-aim" and bool(session.short_aim))
-                or (
-                    purpose == "session-name"
-                    and session.canonical_name_origin != session_names.ORIGIN_FALLBACK
-                )
                 or (purpose == "voice-brief" and not alive)
             )
             if done:
