@@ -214,6 +214,8 @@ class _Harness:  # pylint: disable=too-many-instance-attributes  # + the fake cl
         self.clock = 0.0  # the fake monotonic clock: only ``_sleep`` advances it
         monkeypatch.setattr(continue_session, "_sleep", self._sleep)
         monkeypatch.setattr(continue_session, "_monotonic", lambda: self.clock)
+        self.left_background = 0  # accept's QoS step (tp#1805): counted, never real here
+        monkeypatch.setattr(continue_session, "leave_darwin_background", self._leave_background)
         self.file = tmp_path / "handoff.md"
         self.file.write_text(_handoff_text(), encoding="utf-8")
         # accept spawns the detached handoff closer (tp#1582): never a real ccc in a test
@@ -231,6 +233,9 @@ class _Harness:  # pylint: disable=too-many-instance-attributes  # + the fake cl
     def _launch(self, target: str) -> str:
         self.launches.append(target)
         return self.launcher
+
+    def _leave_background(self) -> None:
+        self.left_background += 1
 
     def _sleep(self, _seconds: float) -> None:
         """The successor accepts while the source waits (what a real tab would do)."""
@@ -591,12 +596,19 @@ def _as_successor(monkeypatch: pytest.MonkeyPatch, harness: _Harness, tid: str) 
     return transfer.target_session
 
 
-def _hooks(monkeypatch: pytest.MonkeyPatch, *hooks: list[str], window: int | None = None) -> None:
+def _hooks(
+    monkeypatch: pytest.MonkeyPatch,
+    *hooks: list[str],
+    window: int | None = None,
+    timeout: int | None = None,
+) -> None:
     from command_center import config  # pylint: disable=import-outside-toplevel
 
     cfg = config.Config(handoff_hooks=[list(h) for h in hooks])
     if window is not None:
         cfg.accept_hook_retry_sec = window
+    if timeout is not None:
+        cfg.accept_hook_timeout_sec = timeout
     monkeypatch.setattr(config, "load_config", lambda: cfg)
 
 
@@ -786,8 +798,7 @@ def test_a_failing_hook_leaves_the_transfer_opened(  # pylint: disable=too-many-
 ) -> None:
     tid = _opened_transfer(harness)
     _as_successor(monkeypatch, harness, tid)
-    monkeypatch.setattr(continue_session, "HOOK_TIMEOUT_SEC", 1)
-    _hooks(monkeypatch, [_script(tmp_path, "bad.sh", body)])
+    _hooks(monkeypatch, [_script(tmp_path, "bad.sh", body)], window=0, timeout=1)
     capsys.readouterr()
     assert cli.main(["continue-session", "accept", tid]) == 1
     assert why in capsys.readouterr().err
@@ -996,7 +1007,8 @@ def test_a_failing_hook_moves_no_await_and_a_retry_moves_it_exactly_once(
     capsys.readouterr()
     assert cli.main(["continue-session", "accept", tid]) == 1
     err = capsys.readouterr().err
-    assert "after 3 attempts" in err and "still opened" in err  # 0, 10, 20 s of a 45 s window
+    # 0, 10, 30, 70 s of a 420 s window: the attempt cap (4) ends it
+    assert "after 4 attempts" in err and "still opened" in err
     assert _state(tid) == "opened"
     with Store() as store:
         failed = store.get_transfer(tid)
@@ -1881,7 +1893,7 @@ def test_accept_retry_a_refusing_hook_until_it_succeeds(
     assert cli.main(["continue-session", "accept", tid]) == 0
     err = capsys.readouterr().err
     assert _runs(counter) == 3 and _state(tid) == "finalized"
-    assert err.count("waiting: handoff hook refused") == 2 and "attempt 1" in err
+    assert err.count("waiting: handoff hook failed") == 2 and "attempt 1 of at most 4" in err
     assert during[0].startswith("hook (retrying 1): flaky.sh: exit 1")  # test 7
     assert during[1].startswith("hook (retrying 2):")
     assert _failure(tid) == ""
@@ -1908,28 +1920,133 @@ def test_accept_retry_starts_no_attempt_past_the_window_and_bounds_each_run(
     assert _state(tid) == "opened"
 
 
-def test_accept_retry_never_retries_a_timeout(
+def _timing_out(harness: _Harness, calls: list[float], succeed_on: int | None = None) -> Any:
+    """A fake ``run_bounded``: every run takes its whole budget on the fake clock and times
+    out, except run number *succeed_on* (1-based), which answers ``{"ok": true}`` at once."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    def _bounded(argv: list[str], timeout: float) -> tuple[int, bytes, bytes]:
+        calls.append(timeout)
+        if len(calls) == succeed_on:
+            return 0, b'{"ok": true}', b""
+        harness.clock += timeout
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    return _bounded
+
+
+def test_accept_retry_retries_a_timeout_until_the_hook_answers(
     harness: _Harness,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    import subprocess  # pylint: disable=import-outside-toplevel
-
+    """tp#1805: under load the idempotent hook timed out and accept gave up after one run;
+    now a timeout is retried within the window and the transfer is accepted."""
+    harness.accept_on_sleep = False
     tid = _opened_transfer(harness)
     _as_successor(monkeypatch, harness, tid)
-    _hooks(monkeypatch, [_script(tmp_path, "hang.sh", "exit 0\n")], window=60)
+    _hooks(monkeypatch, [_script(tmp_path, "slow.sh", "exit 0\n")])  # the defaults
     calls: list[float] = []
+    monkeypatch.setattr(continue_session, "run_bounded", _timing_out(harness, calls, 2))
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    err = capsys.readouterr().err
+    assert calls == [180, 180]
+    assert "waiting: handoff hook failed (slow.sh: timed out after 180s); retrying in 10s" in err
+    assert _state(tid) == "finalized" and _failure(tid) == ""
+    assert harness.left_background == 1  # accept left darwin background before the hook
 
-    def _bounded(argv: list[str], timeout: float) -> tuple[int, bytes, bytes]:
-        calls.append(timeout)
-        raise subprocess.TimeoutExpired(argv, timeout)
 
-    monkeypatch.setattr(continue_session, "run_bounded", _bounded)
+def test_accept_retry_bounds_timeouts_by_the_window_and_names_attempts(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Defaults (180 s per run, 420 s window): runs at 0, 190 and 390 s; the third gets the
+    30 s left; the next wait (40 s) no longer fits, so accept stops at the window."""
+    harness.accept_on_sleep = False
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch, [_script(tmp_path, "hang.sh", "exit 0\n")])
+    calls: list[float] = []
+    monkeypatch.setattr(continue_session, "run_bounded", _timing_out(harness, calls))
     capsys.readouterr()
     assert cli.main(["continue-session", "accept", tid]) == 1
-    assert len(calls) == 1 and "timed out" in capsys.readouterr().err
-    assert _failure(tid).startswith("hook:")
+    err = capsys.readouterr().err
+    assert calls == [180, 180, 30] and harness.clock == 420
+    assert "handoff hook failed after 3 attempts in 420s" in err
+    assert "still opened" in err and "run accept again" in err
+    assert _failure(tid).startswith("hook: hang.sh: timed out")
+    assert _state(tid) == "opened"
+
+
+def test_accept_retry_backs_off_and_caps_the_attempts(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A quick refusal: waits of 10, 20 and 40 s, then attempt 4 is the last one."""
+    harness.accept_on_sleep = False
+    tid = _opened_transfer(harness)
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch, [_script(tmp_path, "no.sh", "exit 1\n")])
+    waits: list[float] = []
+    real_sleep = continue_session._sleep  # pylint: disable=protected-access
+
+    def _sleep(seconds: float) -> None:
+        waits.append(seconds)
+        real_sleep(seconds)
+
+    monkeypatch.setattr(continue_session, "_sleep", _sleep)
+    monkeypatch.setattr(continue_session, "run_bounded", lambda _a, _t: (1, b"", b"refused\n"))
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    assert waits == [10, 20, 40]
+    assert _state(tid) == "opened"
+
+
+def test_accept_retry_timeout_and_window_are_clamped(tmp_path: Path) -> None:
+    from command_center import config  # pylint: disable=import-outside-toplevel
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        "accept_hook_timeout_sec = 9999\naccept_hook_retry_sec = 9999\n", encoding="utf-8"
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(config, "app_home", lambda: home)
+        config.invalidate_config_cache()
+        cfg = config.load_config()
+        config.invalidate_config_cache()
+    assert (cfg.accept_hook_timeout_sec, cfg.accept_hook_retry_sec) == (480, 480)
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_leave_darwin_background_runs_only_on_macos(
+    monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    """accept's QoS step: setpriority + ``taskpolicy -B -p <own pid>``; no-op elsewhere."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    prio: list[tuple[int, int, int]] = []
+    runs: list[list[str]] = []
+
+    def _setpriority(which: int, who: int, value: int) -> None:
+        prio.append((which, who, value))
+        raise OSError("not permitted")  # a refusal never escapes
+
+    def _run(argv: list[str], **_kw: Any) -> Any:
+        runs.append(argv)
+        raise subprocess.TimeoutExpired(argv, 10)
+
+    monkeypatch.setattr(continue_session.sys, "platform", platform)
+    monkeypatch.setattr(continue_session.os, "setpriority", _setpriority, raising=False)
+    monkeypatch.setattr(subprocess, "run", _run)
+    continue_session.leave_darwin_background()
+    if platform == "darwin":
+        assert prio == [(4, 0, 0)]
+        assert runs == [["/usr/sbin/taskpolicy", "-B", "-p", str(continue_session.os.getpid())]]
+    else:
+        assert not prio and not runs
 
 
 @pytest.mark.parametrize(("to_state", "code"), [("failed", 1), ("accepted", 0)])
@@ -2032,8 +2149,13 @@ def test_accept_retry_preamble_allows_one_more_accept() -> None:
         "T", (), {"source_session": "s", "transfer_id": "t1", "handoff_path": "/h.md"}
     )()
     text = continue_session.preamble(transfer, "private", "")
-    assert "If accept fails and the error says the transfer is still opened, run accept " in text
-    assert "once more; stop and report on any other failure" in text
+    flat = " ".join(text.split())
+    assert "accept already retries a refusing or timed-out hook" in flat
+    assert (
+        "if it still fails and the error says the transfer is still opened, run accept "
+        "once more; stop and report on any other failure" in flat
+    )
+    assert "pass the Bash tool timeout 600000" in flat
 
 
 def test_accept_retry_integration_with_a_stub_executable(

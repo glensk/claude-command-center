@@ -370,10 +370,14 @@ DEFAULTS: dict[str, object] = {
     # successor accepts a handoff; every one must exit 0 with a JSON object on stdout or the
     # transfer stays `opened`. Placeholders {old} {new} {label} {transfer}. [] = none.
     "handoff_hooks": [],
-    # tp#1521: `accept` retries a hook that exits non-zero (e.g. tp refusing while the source
-    # is between two `start` runs) within ONE window of this many seconds, each run bounded
-    # by what remains. 0 = one attempt; clamped to 0..60 (the successor's Bash timeout).
-    "accept_hook_retry_sec": 45,
+    # tp#1805: one hook run's budget in seconds (process group killed past it); clamped to
+    # 10..480 so accept stays under the 600 s Bash cap the successor's preamble asks for.
+    "accept_hook_timeout_sec": 180,
+    # tp#1521/tp#1805: `accept` retries a hook that exits non-zero (e.g. tp refusing while the
+    # source is between two `start` runs) or times out (a loaded machine) within ONE window
+    # of this many seconds, with a doubling wait (10, 20, 40 s) and at most 4 attempts, each
+    # run bounded by what remains. 0 = one attempt; clamped to 0..480.
+    "accept_hook_retry_sec": 420,
     # `ccc continue-session collect|start` (tp#1479): fact PROVIDERS, a list of tables
     # {argv = [...], timeout_s = N, optional = bool, name = "..."}; placeholders {session}
     # {cwd} {transcript} {config_dir} {phase} {tp_ids}. Each prints a typed-record JSON
@@ -1231,7 +1235,8 @@ class Config:
     auto_switch_prompt: str = "continue"
     auto_switch_max_per_day: int = 4
     handoff_hooks: list[list[str]] = field(default_factory=list)  # continue-session accept
-    accept_hook_retry_sec: int = 45  # accept's hook retry window (0 = off, ≤ 60)
+    accept_hook_timeout_sec: int = 180  # one accept hook run's budget (10..480)
+    accept_hook_retry_sec: int = 420  # accept's hook retry window (0 = off, ≤ 480)
     handoff_facts: list[dict[str, object]] = field(default_factory=list)  # fact providers
     resume_stagger_sec: int = 120
     resume_poll_sec: int = 30
@@ -1386,7 +1391,8 @@ def load_config() -> Config:
     # printed warning would land in a hook's stdout (a Claude Code protocol channel).
     cfg.stop_barrier_wait_sec = _clamped_int(cfg.stop_barrier_wait_sec, 0, 900, 180)
     cfg.bridge_typing_guard_sec = _clamped_int(cfg.bridge_typing_guard_sec, 0, 600, 30)
-    cfg.accept_hook_retry_sec = _clamped_int(cfg.accept_hook_retry_sec, 0, 60, 45)
+    cfg.accept_hook_timeout_sec = _clamped_int(cfg.accept_hook_timeout_sec, 10, 480, 180)
+    cfg.accept_hook_retry_sec = _clamped_int(cfg.accept_hook_retry_sec, 0, 480, 420)
     if loaded_from_disk:
         _CONFIG_MEMO = (memo_key, copy.deepcopy(cfg))
     return cfg

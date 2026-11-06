@@ -389,15 +389,18 @@ def preamble(transfer: Any, source_label: str, transcript: str) -> str:
         f"below is also stored at {transfer.handoff_path}"
         + (f"; the old session's transcript is {transcript} (evidence only)" if transcript else "")
         + ".\n"
-        f"FIRST run: ccc continue-session accept {transfer.transfer_id}\n"
+        f"FIRST run (pass the Bash tool timeout 600000: under load accept retries a slow "
+        f"handoff hook itself for up to ~8 min): ccc continue-session accept "
+        f"{transfer.transfer_id}\n"
         "Only after it succeeds: relaunch every agent under 'Subagent continuations' as a NEW "
         "Agent from its capsule (old agent ids cannot be resumed across sessions), restart "
         "ONLY the shells under 'Background restarts' marked `restart:` (declared restartable; "
         "the ones under 'Decide before restarting' are evidence, judge each before re-running "
         "anything), then follow 'First steps'. Facts cut for size: "
-        f"ccc continue-session facts {transfer.source_session} -j. If accept fails and the "
-        "error says the transfer is still opened, run accept once more; stop and report on "
-        "any other failure: the old session stays authoritative until it succeeds.\n"
+        f"ccc continue-session facts {transfer.source_session} -j. accept already retries a "
+        "refusing or timed-out hook; if it still fails and the error says the transfer is "
+        "still opened, run accept once more; stop and report on any other failure: the old "
+        "session stays authoritative until it succeeds.\n"
         "\n"
     )
 
@@ -1185,9 +1188,12 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
 # ------------------------------------------------------------------ accept / status
 
 
-HOOK_TIMEOUT_SEC = 60
-ACCEPT_HOOK_RETRY_INTERVAL_SEC = 10  # the wait between two accept attempts (tp#1521)
-ACCEPT_HOOK_ATTEMPT_BUDGET_SEC = 20  # one attempt's budget (`tp handoff` measured ~14 s)
+HOOK_TIMEOUT_SEC = 180  # one hook run's default budget (`accept_hook_timeout_sec`, tp#1805)
+ACCEPT_HOOK_RETRY_INTERVAL_SEC = 10  # the first wait between two accept attempts (tp#1521)
+ACCEPT_HOOK_MAX_ATTEMPTS = 4  # each wait doubles: 10, 20, 40 s (tp#1805)
+ACCEPT_HOOK_ATTEMPT_BUDGET_SEC = 20  # the least a retry must have left to be worth starting
+PRIO_DARWIN_PROCESS = 4  # <sys/resource.h>; ``os`` exports no name for it
+TASKPOLICY = "/usr/sbin/taskpolicy"
 HOOK_OUTPUT_CAP = 64 * 1024
 _PLACEHOLDERS = ("{old}", "{new}", "{label}", "{transfer}")
 
@@ -1195,9 +1201,9 @@ _PLACEHOLDERS = ("{old}", "{new}", "{label}", "{transfer}")
 class HookFailed(Exception):
     """One ``handoff_hooks`` entry did not succeed; the message says why (no output dump).
 
-    ``retryable`` is true only for a non-zero exit (a refusal that may be transient, e.g.
-    the source between two ``start`` runs); a timeout, a missing executable or a malformed
-    answer is final.
+    ``retryable`` is true for a non-zero exit (a refusal that may be transient, e.g. the
+    source between two ``start`` runs) and for a timeout (a loaded machine, tp#1805; hooks
+    are idempotent); a missing executable or a malformed answer is final.
     """
 
     def __init__(self, message: str, *, retryable: bool = False) -> None:
@@ -1266,7 +1272,7 @@ def run_hook(template: object, transfer: Any, timeout: float | None = None) -> d
     try:
         returncode, stdout, stderr = run_bounded(argv, limit)
     except subprocess.TimeoutExpired as exc:
-        raise HookFailed(f"{name}: timed out after {limit:g}s") from exc
+        raise HookFailed(f"{name}: timed out after {limit:g}s", retryable=True) from exc
     except OSError as exc:
         raise HookFailed(f"{name}: could not run ({exc.strerror or exc})") from exc
     if len(stdout) > HOOK_OUTPUT_CAP:
@@ -1361,35 +1367,69 @@ def _accept_and_rebind(store: Store, transfer: Any) -> list[str] | None:
     ]
 
 
+def leave_darwin_background() -> None:
+    """Move this process out of darwin background before the hooks run (tp#1805).
+
+    A Claude session may run its Bash tool in darwin background (E-cores, throttled I/O),
+    and accept and its hooks inherit it: under load ``tp handoff`` then took ~6x its CPU
+    time. accept blocks the successor's interactive session, so it leaves background for
+    ITSELF (its hooks inherit normal QoS); nothing else changes and ``nice`` stays.
+    Two calls, as neither clears both kinds: ``setpriority`` clears a background the
+    process set on itself, ``taskpolicy -B -p`` one another process set. No-op off macOS;
+    never raises.
+    """
+    import contextlib
+    import subprocess
+
+    if sys.platform != "darwin":
+        return
+    with contextlib.suppress(OSError, AttributeError):
+        os.setpriority(PRIO_DARWIN_PROCESS, 0, 0)
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(  # noqa: S603 - a fixed system binary, no shell
+            [TASKPOLICY, "-B", "-p", str(os.getpid())],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+        )
+
+
 def _run_hooks(
-    hooks: list[Any], transfer: Any, deadline: float | None
+    hooks: list[Any], transfer: Any, timeout: float, deadline: float
 ) -> list[str]:  # raises HookFailed
-    """Every hook from the first; with a *deadline* each run is bounded by what remains."""
+    """Every hook from the first, each run bounded by *timeout* and what remains."""
     steps: list[str] = []
     for template in hooks:
-        timeout = None
-        if deadline is not None:
-            timeout = max(1.0, min(float(HOOK_TIMEOUT_SEC), deadline - _monotonic()))
-        steps += run_hook(template, transfer, timeout).get("next_steps", [])
+        limit = max(1.0, min(timeout, deadline - _monotonic()))
+        steps += run_hook(template, transfer, limit).get("next_steps", [])
     return steps
 
 
-def _run_hooks_with_retry(  # pylint: disable=too-many-return-statements
+def _run_hooks_with_retry(  # pylint: disable=too-many-return-statements,too-many-locals
     store: Store, transfer: Any, hooks: list[Any], cfg: Any
 ) -> tuple[Any, list[str]] | int:
-    """Accept-prepare + the hook list, retried on a non-zero exit within ONE monotonic
-    window (``accept_hook_retry_sec``, tp#1521): ``(transfer, next steps)`` or an exit code.
+    """Accept-prepare + the hook list, retried on a non-zero exit or a timeout within ONE
+    monotonic window (``accept_hook_retry_sec``, tp#1521, tp#1805): ``(transfer, next
+    steps)`` or an exit code.
 
-    An attempt starts only if it still fits (elapsed + interval + one attempt's budget ≤
-    the window). Each retry re-reads the transfer (``failed`` stops, ``accepted`` is done),
-    re-runs accept-prepare (an await group mid-delivery stops it, nothing rebound) and then
-    the WHOLE hook list from the first entry, each run bounded by what remains.
+    Each hook run is bounded by ``accept_hook_timeout_sec``; the first attempt also by
+    ``max(window, timeout)``, a retry by the window. A retry starts only while attempts
+    remain (``ACCEPT_HOOK_MAX_ATTEMPTS``) and it still fits (elapsed + the wait + one
+    attempt's minimum budget ≤ the window); the wait doubles from
+    ``ACCEPT_HOOK_RETRY_INTERVAL_SEC``. Each retry re-reads the transfer (``failed``
+    stops, ``accepted`` is done), re-runs accept-prepare (an await group mid-delivery stops
+    it, nothing rebound) and then the WHOLE hook list from the first entry.
     """
     from .models import now_ms
     from .transfer_store import ACCEPTED, FINALIZED, OPENED, PREPARED
 
     tid = transfer.transfer_id
     window = float(getattr(cfg, "accept_hook_retry_sec", 0) or 0)
+    timeout = float(getattr(cfg, "accept_hook_timeout_sec", 0) or HOOK_TIMEOUT_SEC)
+    if hooks:
+        leave_darwin_background()
     started = _monotonic()
     attempt = 0
     while True:
@@ -1408,28 +1448,32 @@ def _run_hooks_with_retry(  # pylint: disable=too-many-return-statements
         refused = _accept_prepare(store, transfer)  # BEFORE any hook (re-checked at the CAS)
         if refused is not None:
             return refused
+        deadline = started + (max(window, timeout) if attempt == 1 else window)
         try:
-            steps = _run_hooks(hooks, transfer, started + window if attempt > 1 else None)
+            steps = _run_hooks(hooks, transfer, timeout, deadline)
         except HookFailed as exc:
             elapsed = _monotonic() - started
+            wait = ACCEPT_HOOK_RETRY_INTERVAL_SEC * 2 ** (attempt - 1)
             fits = (
-                elapsed + ACCEPT_HOOK_RETRY_INTERVAL_SEC + ACCEPT_HOOK_ATTEMPT_BUDGET_SEC <= window
+                attempt < ACCEPT_HOOK_MAX_ATTEMPTS
+                and elapsed + wait + ACCEPT_HOOK_ATTEMPT_BUDGET_SEC <= window
             )
             if exc.retryable and fits:
                 store.note_transfer(tid, now_ms(), failure=f"hook (retrying {attempt}): {exc}")
                 print(
-                    f"waiting: handoff hook refused ({exc}); retrying in "
-                    f"{ACCEPT_HOOK_RETRY_INTERVAL_SEC}s (attempt {attempt})",
+                    f"waiting: handoff hook failed ({exc}); retrying in {wait}s "
+                    f"(attempt {attempt} of at most {ACCEPT_HOOK_MAX_ATTEMPTS})",
                     file=sys.stderr,
                 )
-                _sleep(ACCEPT_HOOK_RETRY_INTERVAL_SEC)
+                _sleep(wait)
                 continue
             store.note_transfer(tid, now_ms(), failure=f"hook: {exc}")
             plural = "attempt" if attempt == 1 else "attempts"
             print(
-                f"error: handoff hook failed after {attempt} {plural} — {exc}. The transfer "
-                f"is still {transfer.state} and ownership is unchanged; fix the cause and run "
-                "accept again.",
+                f"error: handoff hook failed after {attempt} {plural} in {elapsed:.0f}s — "
+                f"{exc}. The transfer is still {transfer.state} and ownership is unchanged; "
+                "accept already retried what fit its window (accept_hook_retry_sec / "
+                "accept_hook_timeout_sec), so fix the cause and run accept again.",
                 file=sys.stderr,
             )
             return 1

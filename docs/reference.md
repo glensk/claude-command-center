@@ -1986,19 +1986,29 @@ from their capsules, restart only the `restart:` shells, judge the `Decide befor
 restarting` ones, and fetch cut facts with `ccc continue-session facts`) plus the handoff
 text. `accept` refuses unless it runs in the recorded target session under the recorded
 account, runs the accept-prepare transaction, then the `handoff_hooks`, and only then CASes
-`opened → accepted`; a failing hook leaves `opened` and prints why. A hook that exits
-non-zero (e.g. `tp handoff` refusing while the source is between two `start` runs, after
-an exit 3) is retried within ONE monotonic window of `accept_hook_retry_sec` (config,
-default 45, `0` = one attempt, clamped to 0..60 so accept stays under the successor's 120 s
-Bash timeout): a new attempt starts only if elapsed + 10 s wait + a 20 s attempt budget
-still fits, each of its hook runs is bounded by what remains of the window, and each
-attempt re-reads the transfer (`failed` stops, `accepted` is done), re-runs accept-prepare
-(an await group mid-delivery stops it, nothing rebound) and then the WHOLE hook list from
-the first entry. Each wait prints `waiting: handoff hook refused (…); retrying in 10s
-(attempt K)` and records `hook (retrying K): …` as the transfer's failure; success clears
-it. A timeout, a missing executable or a malformed answer is never retried. The final
-error names the attempt count and says the transfer is still `opened`; the successor's
-preamble lets it run accept once more on exactly that error and stop on any other.
+`opened → accepted`; a failing hook leaves `opened` and prints why. Each hook run is
+bounded by `accept_hook_timeout_sec` (config, default 180, clamped 10..480; tp#1805). A
+hook that exits non-zero (e.g. `tp handoff` refusing while the source is between two
+`start` runs, after an exit 3) or times out (a loaded machine) is retried within ONE
+monotonic window of `accept_hook_retry_sec` (config, default 420, `0` = one attempt,
+clamped 0..480): accept's deadline is `max(window, timeout)` from its first hook, so it
+stays under the 600 s Bash cap the successor's preamble asks for (`timeout 600000`). The
+wait doubles (10, 20, 40 s), at most 4 attempts; a new attempt starts only if elapsed +
+the wait + a 20 s minimum budget still fits the window, each of its hook runs is bounded
+by `min(accept_hook_timeout_sec, what remains)`, and each attempt re-reads the transfer
+(`failed` stops, `accepted` is done), re-runs accept-prepare (an await group mid-delivery
+stops it, nothing rebound) and then the WHOLE hook list from the first entry. Each wait
+prints `waiting: handoff hook failed (…); retrying in Ns (attempt K of at most 4)` and
+records `hook (retrying K): …` as the transfer's failure; success clears it. A missing
+executable or a malformed answer is never retried. The final error names the attempt
+count and elapsed seconds and says the transfer is still `opened`; the successor's
+preamble says accept already retries by itself and lets it run accept once more on
+exactly that error, stopping on any other.
+
+Right before the first hook, `accept` moves its OWN process out of darwin background
+(`setpriority(PRIO_DARWIN_PROCESS, 0, 0)` plus `taskpolicy -B -p <pid>`, bounded by 10 s,
+never raising, no-op off macOS), so the hooks inherit normal QoS instead of the Bash
+tool's background throttling (tp#1322); `nice` is left as inherited.
 
 **The source's `ccc await` group moves by code.** `start` reserves the source's active
 group under the transfer in the same transaction that creates it (delivery defers a
@@ -2079,13 +2089,13 @@ capped, and still names the successor. A capped handoff, or an ordinary `mark-do
 on a session that was never handed off, behaves as before.
 
 **`handoff_hooks`** (config, default `[]`, inert): argv templates run by `accept`, no
-shell, 60 s timeout (process group killed), stdout ≤ 64 KB and a JSON object with `"ok":
+shell, `accept_hook_timeout_sec` per run (default 180 s, process group killed), stdout ≤ 64 KB and a JSON object with `"ok":
 true` (`"next_steps"` printed); placeholders `{old}`, `{new}`, `{label}`, `{transfer}`.
 ccc keeps no tracker dependency; a ticket tracker plugs in here, e.g.
 `handoff_hooks = [["/path/to/tp.py", "handoff", "-S", "{old}", "--to", "{new}", "-j"]]`.
 argv[0] must be an executable on `PATH` or an absolute path: no shell runs, so a shell
 alias (such as a `tp` alias) is not found and `accept` fails with "could not run". Hooks
-must be idempotent: a non-zero exit re-runs the whole list from the first hook (see
+must be idempotent: a non-zero exit or a timeout re-runs the whole list from the first hook (see
 `accept_hook_retry_sec` above), as does a manual re-run of `accept`.
 
 **`handoff_facts`** (config, default `[]`, inert; tp#1479): fact PROVIDERS for `ccc
