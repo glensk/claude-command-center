@@ -2708,19 +2708,8 @@ def _fetch_premium_used(gh: str, login: str) -> float:
     )
 
 
-def _fetch_copilot_quota(gh: str) -> tuple[int, float] | None:
-    """The seat's live AI-Credit meter as ``(entitlement, credits_used)``; None if unusable.
-
-    Reads ``/copilot_internal/user`` — the endpoint the editor plugins use — whose
-    ``quota_snapshots.premium_interactions`` carries the seat's **actual** monthly
-    entitlement and the credits burnt against it *right now*. This is the only place the
-    denominator can be learnt: it varies per plan (1,500 on an individual/faculty seat,
-    other values on Business/Enterprise), so the configured budget is only ever a guess.
-
-    Returns None when the call fails, when the seat is ``unlimited`` (no meaningful
-    denominator), or when the entitlement is absent — callers then keep the configured
-    fallback. Never raises.
-    """
+def _fetch_copilot_internal(gh: str) -> dict | None:
+    """The raw ``/copilot_internal/user`` payload (needs no extra token scope); None on failure."""
     try:
         raw = subprocess.run(  # noqa: S603
             [gh, "api", "/copilot_internal/user"],
@@ -2732,6 +2721,17 @@ def _fetch_copilot_quota(gh: str) -> tuple[int, float] | None:
         data = json.loads(raw)
     except (subprocess.SubprocessError, OSError, json.JSONDecodeError, ValueError):
         return None
+    return data if isinstance(data, dict) else None
+
+
+def _quota_from_internal(data: dict | None) -> tuple[int, float] | None:
+    """``(entitlement, credits_used)`` from a ``/copilot_internal/user`` payload, or None.
+
+    ``quota_snapshots.premium_interactions`` carries the seat's **actual** monthly
+    entitlement and the credits burnt against it right now. When ``credits_used`` is
+    absent it is derived from ``entitlement - remaining`` (older payload shape). None for
+    an ``unlimited`` seat, a missing entitlement or malformed figures.
+    """
     if not isinstance(data, dict):
         return None
     snap = (data.get("quota_snapshots") or {}).get("premium_interactions")
@@ -2739,50 +2739,70 @@ def _fetch_copilot_quota(gh: str) -> tuple[int, float] | None:
         return None
     try:
         entitlement = int(float(snap.get("entitlement", 0) or 0))
-        used = float(snap.get("credits_used", 0) or 0)
+        if snap.get("credits_used") is not None:
+            used = float(snap.get("credits_used") or 0)
+        else:
+            used = max(0.0, entitlement - float(snap.get("remaining", entitlement) or 0))
     except (TypeError, ValueError):
         return None
     return (entitlement, used) if entitlement > 0 else None
 
 
-def fetch_copilot_usage(
-    now: int | None = None, quota: int = 300, credit_quota: int | None = None
-) -> CopilotUsage | None:
-    """Fetch this month's Copilot usage via ``gh`` and cache it; ``None`` on any failure.
-
-    Resolves the login then queries the per-user enhanced-billing usage endpoint scoped
-    to the current UTC year/month (AI-credit quantity + cost) AND the premium-request
-    endpoint (the count the bar is drawn against, vs the monthly *quota*). Best-effort and
-    never raises: a missing ``gh``, an auth/scope error, a timeout, or malformed JSON all
-    return ``None`` so callers (daemon, detached spawn) degrade to the last cache.
-    """
-    now = int(time.time()) if now is None else now
-    gh = _gh_exe()
-    if not gh:
+def _reset_from_internal(data: dict | None) -> int | None:
+    """Unix epoch of the quota reset in a ``/copilot_internal/user`` payload, or None."""
+    if not isinstance(data, dict):
         return None
-    tm = time.gmtime(now)
+    for key in ("quota_reset_date_utc", "quota_reset_date"):
+        val = data.get(key)
+        if not isinstance(val, str) or len(val) < 10:
+            continue
+        try:
+            y, m, d = int(val[0:4]), int(val[5:7]), int(val[8:10])
+            return calendar.timegm((y, m, d, 0, 0, 0, 0, 0, 0))
+        except ValueError:
+            continue
+    return None
+
+
+def _fetch_copilot_quota(gh: str) -> tuple[int, float] | None:
+    """The seat's live AI-Credit meter as ``(entitlement, credits_used)``; None if unusable.
+
+    Reads ``/copilot_internal/user`` — the endpoint the editor plugins use — the only
+    place the denominator can be learnt: it varies per plan (1,500 on an
+    individual/faculty seat, other values on Business/Enterprise), so the configured
+    budget is only ever a guess. Never raises.
+    """
+    return _quota_from_internal(_fetch_copilot_internal(gh))
+
+
+def _gh_text(gh: str, args: list[str], timeout: int) -> str | None:
+    """Run ``gh api ...`` and return stdout, None on any failure."""
     try:
-        login = subprocess.run(  # noqa: S603
-            [gh, "api", "user", "--jq", ".login"],
+        return subprocess.run(  # noqa: S603
+            [gh, "api", *args],
             capture_output=True,
             text=True,
-            timeout=20,
-            check=True,
-        ).stdout.strip()
-        if not login:
-            return None
-        raw = subprocess.run(  # noqa: S603
-            [
-                gh,
-                "api",
-                f"/users/{login}/settings/billing/usage?year={tm.tm_year}&month={tm.tm_mon}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
+            timeout=timeout,
             check=True,
         ).stdout
     except (subprocess.SubprocessError, OSError):
+        return None
+
+
+def _billing_items(gh: str, tm: time.struct_time) -> tuple[str, list[dict]] | None:
+    """``(login, copilot line-items)`` from the billing API, None when it is unavailable.
+
+    Fails (404/403) when the gh token lacks the ``user`` scope; the caller then falls back
+    to ``/copilot_internal/user``.
+    """
+    login = _gh_text(gh, ["user", "--jq", ".login"], 20)
+    if not login or not login.strip():
+        return None
+    login = login.strip()
+    raw = _gh_text(
+        gh, [f"/users/{login}/settings/billing/usage?year={tm.tm_year}&month={tm.tm_mon}"], 30
+    )
+    if raw is None:
         return None
     try:
         data = json.loads(raw)
@@ -2795,19 +2815,58 @@ def fetch_copilot_usage(
         for i in data.get("usageItems", [])
         if isinstance(i, dict) and i.get("product") == "copilot"
     ]
+    return login, items
+
+
+def fetch_copilot_usage(
+    now: int | None = None, quota: int = 300, credit_quota: int | None = None
+) -> CopilotUsage | None:
+    """Fetch this month's Copilot usage via ``gh`` and cache it; ``None`` on failure.
+
+    Queries the per-user enhanced-billing usage endpoint (AI-credit quantity + cost) and
+    the premium-request endpoint, then ``/copilot_internal/user`` for the seat's live meter.
+    When the billing call fails (the gh token lacks the ``user`` scope -> 404/403, or any
+    other error) the snapshot is still built from ``/copilot_internal/user`` alone, which
+    needs no extra scope. Best-effort and never raises: only when BOTH sources fail (or
+    ``gh`` is missing) does it return ``None`` so callers degrade to the last cache.
+    """
+    now = int(time.time()) if now is None else now
+    gh = _gh_exe()
+    if not gh:
+        return None
+    tm = time.gmtime(now)
+    billing = _billing_items(gh, tm)
+    internal = _fetch_copilot_internal(gh)
+    live = _quota_from_internal(internal)
+    if billing is None and live is None:
+        return None
     if credit_quota is None:
         try:
             credit_quota = config.load_config().copilot_credit_quota
         # pylint: disable=broad-exception-caught
         except Exception:  # noqa: BLE001 - fall back to the Business baseline budget
             credit_quota = 1900
-    snap = _summarize_copilot(items, tm.tm_year, tm.tm_mon, now)
-    snap.premium_used = _fetch_premium_used(gh, login)
+    if billing is not None:
+        login, items = billing
+        snap = _summarize_copilot(items, tm.tm_year, tm.tm_mon, now)
+        snap.premium_used = _fetch_premium_used(gh, login)
+    else:
+        snap = CopilotUsage(
+            now,
+            tm.tm_year,
+            tm.tm_mon,
+            sku="AI Credits",
+            unit="AI credits",
+            quantity=live[1] if live else 0.0,
+            gross=0.0,
+            net=0.0,
+        )
     snap.premium_quota = max(1, quota)
-    snap.premium_reset_at = _next_month_reset(tm.tm_year, tm.tm_mon)
+    snap.premium_reset_at = _reset_from_internal(internal) or _next_month_reset(
+        tm.tm_year, tm.tm_mon
+    )
     # The seat's own entitlement + live meter beat both the configured guess and the
     # billing endpoint's up-to-a-day-stale quantity; fall back to them when unavailable.
-    live = _fetch_copilot_quota(gh)
     if live is not None:
         snap.credit_quota, snap.credits_used = max(1, live[0]), live[1]
         snap.quota_source = "api"

@@ -1825,16 +1825,26 @@ def select_codex_account(
     return candidates[0].id if candidates else ""
 
 
-def _copilot_window(snap: usage.CopilotUsage | None) -> dict[str, WindowState]:
+def _copilot_window(
+    snap: usage.CopilotUsage | None, now: int | None = None
+) -> dict[str, WindowState]:
     """Copilot's credit meter as a window — measurement only, no verdict.
 
     Built from whatever snapshot exists, INCLUDING one whose denominator is a configured
     guess or whose figures are stale, because this is what the seat's meter says and it is
     what the TUI card draws. Whether that reading may establish exhaustion is a separate
     question, answered by :func:`_copilot_quota` alone.
+
+    A snapshot from a window that has already reset (``premium_reset_at`` <= now) or from
+    an earlier calendar month is marked ``stale``: it is not a live percentage.
     """
     if snap is None:
         return {}
+    now = int(time.time()) if now is None else now
+    tm = time.gmtime(now)
+    stale = (0 < snap.premium_reset_at <= now) or (
+        snap.year > 0 and (snap.year, snap.month) < (tm.tm_year, tm.tm_mon)
+    )
     used = snap.credits_used or snap.quantity
     quota = max(1, snap.credit_quota)
     return {
@@ -1842,6 +1852,7 @@ def _copilot_window(snap: usage.CopilotUsage | None) -> dict[str, WindowState]:
             name="credits",
             used_pct=used / quota * 100.0,
             resets_at=int(snap.premium_reset_at),
+            stale=stale,
             evidence_at=snap.captured_at,
         )
     }
@@ -1866,7 +1877,7 @@ def _copilot_quota(now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
     it, so the row and the card can never disagree about what was measured.
     """
     snap = usage.read_copilot_usage()
-    windows = _copilot_window(snap)
+    windows = _copilot_window(snap, now)
     if "copilot" in cooldowns:
         return _cooldown_quota("copilot", "copilot", cooldowns["copilot"], windows)
     if snap is None:

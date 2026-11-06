@@ -84,8 +84,8 @@ def test_window_past_its_reset_is_stale() -> None:
 def _copilot(**kw: object) -> usage.CopilotUsage:
     base: dict = dict(
         captured_at=NOW,
-        year=2026,
-        month=8,
+        year=2027,
+        month=1,
         sku="AI Credits",
         unit="AI credits",
         quantity=1500.0,
@@ -1859,3 +1859,25 @@ def test_muse_row_is_in_the_snapshot_and_draws_a_spanning_budget_bar(
     assert cli.cmd_quota(_quota_args(no_bars=True)) == 0
     plain = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("  ✅ muse "))
     assert "budget 25%" in plain
+
+
+def test_window_stale_when_reset_has_passed() -> None:
+    window = quota._copilot_window(_copilot(premium_reset_at=NOW - 1), NOW)["credits"]
+    assert window.stale
+    assert not window.exhausted
+
+
+def test_window_stale_when_snapshot_is_from_an_earlier_month() -> None:
+    window = quota._copilot_window(_copilot(year=2026, month=12, premium_reset_at=0), NOW)
+    assert window["credits"].stale
+
+
+def test_window_live_in_current_month_before_reset() -> None:
+    window = quota._copilot_window(_copilot(), NOW)["credits"]
+    assert not window.stale
+    assert window.exhausted
+
+
+def test_reset_snapshot_never_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(usage, "read_copilot_usage", lambda: _copilot(premium_reset_at=NOW - 1))
+    assert quota._copilot_quota(NOW, {}).state != quota.BLOCKED

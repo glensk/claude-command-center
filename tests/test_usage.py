@@ -2838,3 +2838,65 @@ def test_cli_fill_thresholds_match_the_oracles_own() -> None:
 
     assert usage._CLI_RISKY_PCT == quota._RISKY_PCT
     assert usage._CLI_FULL_PCT == quota._EXHAUSTED_PCT
+
+
+_INTERNAL_EXHAUSTED = {
+    "quota_reset_date": "2026-12-01",
+    "quota_reset_date_utc": "2026-12-01T00:00:00.000Z",
+    "quota_snapshots": {
+        "premium_interactions": {
+            "credits_used": 1506,
+            "entitlement": 1500,
+            "remaining": -7,
+            "percent_remaining": 0,
+            "unlimited": False,
+        }
+    },
+}
+
+
+def _stub_gh_billing_404(monkeypatch: pytest.MonkeyPatch, internal: str | None) -> None:
+    """`gh api` stub: user ok, billing endpoints 404, /copilot_internal/user = *internal*."""
+
+    def run(cmd: list[str], **_k: object) -> subprocess.CompletedProcess[str]:
+        target = cmd[2]
+        if target == "user":
+            return subprocess.CompletedProcess(cmd, 0, stdout="someone\n", stderr="")
+        if target == "/copilot_internal/user" and internal is not None:
+            return subprocess.CompletedProcess(cmd, 0, stdout=internal, stderr="")
+        raise subprocess.CalledProcessError(1, cmd, stderr="gh: Not Found (HTTP 404)")
+
+    monkeypatch.setattr(usage, "_gh_exe", lambda: "gh")
+    monkeypatch.setattr(usage.subprocess, "run", run)
+
+
+def test_fetch_copilot_usage_falls_back_to_internal_when_billing_404s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_gh_billing_404(monkeypatch, json.dumps(_INTERNAL_EXHAUSTED))
+    now = 1_794_000_000  # 2026-11-06
+    snap = usage.fetch_copilot_usage(now=now, credit_quota=1900)
+    assert snap is not None
+    assert (snap.credits_used, snap.credit_quota, snap.quota_source) == (1506.0, 1500, "api")
+    assert snap.premium_reset_at == 1_796_083_200  # 2026-12-01T00:00:00Z
+    assert (snap.year, snap.month) == (2026, 11)
+    cached = usage.read_copilot_usage()
+    assert cached is not None
+    assert cached.credits_used == 1506.0
+
+
+def test_fetch_copilot_usage_derives_used_from_remaining(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {"quota_snapshots": {"premium_interactions": {"entitlement": 1500, "remaining": 400}}}
+    _stub_gh_billing_404(monkeypatch, json.dumps(payload))
+    snap = usage.fetch_copilot_usage(now=1_794_000_000)
+    assert snap is not None
+    assert snap.credits_used == 1100.0
+    # No reset date in the payload: falls back to the 1st of next month.
+    assert snap.premium_reset_at == 1_796_083_200
+
+
+def test_fetch_copilot_usage_none_when_both_sources_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_gh_billing_404(monkeypatch, None)
+    assert usage.fetch_copilot_usage(now=1_794_000_000) is None
