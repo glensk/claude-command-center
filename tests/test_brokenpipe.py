@@ -39,8 +39,12 @@ _HELP = "from command_center import {mod} as m\nraise SystemExit(m.main(['--help
 
 
 def _run_with_dead_stdout(body: str) -> subprocess.CompletedProcess[str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CCC")}
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    # Drop the ccc config env but keep the child guard (CCC_TEST_*, tests/_childguard).
+    env = {
+        k: v for k, v in os.environ.items() if not k.startswith("CCC") or k.startswith("CCC_TEST_")
+    }
+    root = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = os.pathsep.join([root, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
     read_fd, write_fd = os.pipe()
     with subprocess.Popen(  # noqa: S603
         [sys.executable, "-c", _PRODUCER.format(body=body)],

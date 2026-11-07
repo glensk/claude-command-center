@@ -212,7 +212,8 @@ def test_shim_bootstrap_failure_is_one_line(tmp_path: Path) -> None:
     (tmp_path / "tools").mkdir()
     py = _bare_python(tmp_path)
     env = {**os.environ, "UV_TOOL_DIR": str(tmp_path / "tools"), "CCC_NO_CODEX": "1"}
-    env.pop("PYTHONPATH", None)
+    # Nothing of the repo or its venv on the path, only the conftest child guard.
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parent / "_childguard")
     proc = subprocess.run(
         [str(py), str(repo / "codex-in-claude.py"), "headroom"],
         capture_output=True,

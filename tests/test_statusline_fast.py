@@ -23,7 +23,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
@@ -529,11 +529,16 @@ def _forbidden(module: str) -> bool:
     return any(module == name or module.startswith(name + ".") for name in FORBIDDEN)
 
 
+def _pythonpath(env: Mapping[str, str]) -> str:
+    """ROOT prepended to *env*'s PYTHONPATH, so the conftest child guard stays on it."""
+    return os.pathsep.join([str(ROOT), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+
+
 def _probe(tmp_path: Path, stdin: str, *argv: str) -> tuple[dict, bytes]:
     report = tmp_path / "report.json"
     drop = {"CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CONFIG_DIR", "CCC_NO_FASTPATH"}
     env = {k: v for k, v in os.environ.items() if k not in drop}
-    env["PYTHONPATH"] = str(ROOT)
+    env["PYTHONPATH"] = _pythonpath(env)
     proc = subprocess.run(  # noqa: S603
         [sys.executable, "-c", _PROBE, str(report), *argv],
         input=stdin.encode(),
@@ -568,7 +573,7 @@ def test_kill_switch_reaches_cli_in_a_real_process(tmp_path: Path) -> None:
     os.environ["CCC_NO_FASTPATH"] = "1"
     try:
         report = tmp_path / "report.json"
-        env = dict(os.environ, PYTHONPATH=str(ROOT))
+        env = dict(os.environ, PYTHONPATH=_pythonpath(os.environ))
         proc = subprocess.run(  # noqa: S603
             [sys.executable, "-c", _PROBE, str(report), *DEFAULT_ARGV],
             input=PAYLOAD.encode(),
@@ -593,7 +598,7 @@ def test_bad_registry_pid_exits_like_cli_in_a_real_process(tmp_path: Path) -> No
     report = tmp_path / "report.json"
     drop = {"CLAUDE_CONFIG_DIR", "CCC_NO_FASTPATH"}
     env = {k: v for k, v in os.environ.items() if k not in drop}
-    env["PYTHONPATH"] = str(ROOT)
+    env["PYTHONPATH"] = _pythonpath(env)
     proc = subprocess.run(  # noqa: S603
         [sys.executable, "-m", "command_center", *DEFAULT_ARGV],
         input=PAYLOAD.encode(),

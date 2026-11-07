@@ -61,7 +61,12 @@ def _probe(home: Path, tmp_path: Path, *argv: str) -> tuple[dict[str, object], b
         for k, v in os.environ.items()
         if k not in {"CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CCC_HOME", "CLAUDE_HOME"}
     }
-    env.update(PYTHONPATH=str(ROOT), HOME=str(home), CCC_HOME=str(home), CLAUDE_HOME=str(home))
+    env.update(
+        PYTHONPATH=os.pathsep.join([str(ROOT), env.get("PYTHONPATH", "")]).rstrip(os.pathsep),
+        HOME=str(home),
+        CCC_HOME=str(home),
+        CLAUDE_HOME=str(home),
+    )
     proc = subprocess.run(
         [sys.executable, "-c", _PROBE, str(report), *argv],
         capture_output=True,

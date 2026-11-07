@@ -59,7 +59,11 @@ def _forbidden(module: str) -> bool:
 def test_lean_modules_load_no_heavy_module(tmp_path: Path) -> None:
     report = tmp_path / "modules.json"
     env = {k: v for k, v in os.environ.items() if k not in {"CCC_HOME", "CLAUDE_HOME"}}
-    env.update(PYTHONPATH=str(ROOT), HOME=str(tmp_path), CLAUDE_HOME=str(tmp_path / "claude"))
+    env.update(
+        PYTHONPATH=os.pathsep.join([str(ROOT), env.get("PYTHONPATH", "")]).rstrip(os.pathsep),
+        HOME=str(tmp_path),
+        CLAUDE_HOME=str(tmp_path / "claude"),
+    )
     subprocess.run(
         [sys.executable, "-c", _PROBE, str(report), str(tmp_path)],
         capture_output=True,

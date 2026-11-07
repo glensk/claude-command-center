@@ -887,7 +887,8 @@ def test_runner_sigterm_relay_kills_codex_group(tmp_path: Path) -> None:
         "raise SystemExit(main(sys.argv))"
     )
     env = fixture.env(FAKE_CODEX_SENTINEL=str(sentinel), PATH=_fake_codex_path(tmp_path))
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    root = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = os.pathsep.join([root, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
     runner = subprocess.Popen(  # pylint: disable=consider-using-with
         [sys.executable, "-c", script],
         env=env,
@@ -1486,7 +1487,8 @@ def test_e2e_run_cli_with_real_executable(tmp_path: Path) -> None:
         de={"scenario": "ok", "reply": "de answered e2e"},
     )
     env = fixture.env(PATH=_fake_codex_path(tmp_path))
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    root = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = os.pathsep.join([root, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
     proc = subprocess.run(
         [
             sys.executable,

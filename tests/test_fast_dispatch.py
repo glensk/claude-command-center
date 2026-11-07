@@ -170,8 +170,12 @@ def test_the_installed_statusline_only_spawns_hot_subcommands(
 # ------------------------------ import hygiene ------------------------------ #
 def test_the_hot_path_never_imports_llmrouting() -> None:
     """`llmrouting` pulls subprocess; it may not land on a 400-spawns-a-minute path."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CCC")}
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    # Drop the ccc config env but keep the child guard (CCC_TEST_*, tests/_childguard).
+    env = {
+        k: v for k, v in os.environ.items() if not k.startswith("CCC") or k.startswith("CCC_TEST_")
+    }
+    root = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = os.pathsep.join([root, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
     proc = subprocess.run(
         [
             sys.executable,
