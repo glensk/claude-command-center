@@ -47,6 +47,7 @@ def test_close_iterm_session_no_osascript(monkeypatch: pytest.MonkeyPatch) -> No
     assert terminal.close_iterm_session("") == ""
 
 
+@pytest.mark.real_title_writer
 def test_set_session_titles_builds_script(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
 
@@ -59,6 +60,7 @@ def test_set_session_titles_builds_script(monkeypatch: pytest.MonkeyPatch) -> No
     assert '🔴 my\\"repo' in script  # title embedded with the quote escaped
 
 
+@pytest.mark.real_title_writer
 def test_set_session_titles_skips_when_empty_or_no_osascript(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -74,6 +76,7 @@ def test_set_session_titles_skips_when_empty_or_no_osascript(
     assert calls == []
 
 
+@pytest.mark.real_title_writer
 def test_set_session_titles_preserving_builds_marker_aware_script(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -92,6 +95,7 @@ def test_set_session_titles_preserving_builds_marker_aware_script(
     assert "starts with" in script and "text (mlen + 1) thru -1 of n" in script
 
 
+@pytest.mark.real_title_writer
 def test_set_session_titles_preserving_skips_when_empty_or_no_osascript(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

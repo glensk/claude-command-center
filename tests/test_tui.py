@@ -2818,8 +2818,18 @@ def test_card_toggles_flip_persist_and_t4_flips_both(
     a stale ``self.cfg`` snapshot can never clobber Settings-screen edits.
     """
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    from command_center import config
+    from command_center import config, spawn
     from command_center.views.tui import CommandCenterApp
+
+    # `copilot_usage = true` makes the copilot card refresh spawn `ccc copilot-usage`:
+    # record it, never start the live installed `ccc` (tp#1793).
+    spawned: list[list[str]] = []
+
+    def _record_spawn(args: list[str], **_kw: object) -> bool:
+        spawned.append(args)
+        return True
+
+    monkeypatch.setattr(spawn, "spawn_ccc", _record_spawn)
 
     # `t2` is a no-op without a configured `work` account (there would be nothing to
     # show), so give this machine one. Also exercises the claude_accounts round-trip.

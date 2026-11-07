@@ -28,10 +28,14 @@ from __future__ import annotations
 
 import base64
 import errno
+import importlib
 import json
 import os
+import shlex
 import subprocess
+import sys
 import time
+import types
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,13 +44,21 @@ from typing import NoReturn
 
 import pytest
 
+# The iTerm Python API guard (tp#1793 B2) stubs this package's shared Connection class.
+_iterm2: types.ModuleType | None
+try:
+    _iterm2 = importlib.import_module("iterm2")
+except ImportError:  # pragma: no cover - iterm2 is a hard dependency of ccc
+    _iterm2 = None
+
 
 def pytest_configure(config: pytest.Config) -> None:
     """Register the tests-only opt-out markers of the real-machine guards below (tp#1793)."""
     for line in (
-        "real_signal: opt OUT of the os.kill / os.killpg guard (see _guard_real_signals)",
-        "real_osascript: opt OUT of the osascript guard in tests/conftest.py",
-        "real_iterm: opt OUT of the iTerm Python API guard in tests/conftest.py",
+        "real_signal: opt OUT of the os.kill / os.killpg guard and the tmux/kill/ccc Popen guard",
+        "real_osascript: opt OUT of the osascript Popen guard (see _guard_real_spawns)",
+        "real_iterm: opt OUT of the iTerm Python API guard (see _guard_real_iterm_api)",
+        "real_title_writer: keep the real terminal.set_session_titles* (Popen guard stays on)",
     ):
         config.addinivalue_line("markers", line)
 
@@ -406,6 +418,172 @@ def _guard_real_signals(request: pytest.FixtureRequest, monkeypatch: pytest.Monk
     monkeypatch.setattr(os, "killpg", guarded_killpg)
 
 
+# --------------------------------------------------------------------------- #
+# Popen, spawn_ccc and iTerm Python API guards (tp#1793 B2)
+#
+# The other ways a test reaches the real machine: an ``osascript`` that drives iTerm
+# (close a tab, type into one), a ``tmux kill-pane`` / ``kill`` binary, the live installed
+# ``ccc`` (``spawn.spawn_ccc``), and the iTerm Python API (``async_send_text`` into a real
+# tab). Each refusal writes a ``refused`` audit line, then raises ``AssertionError``.
+# --------------------------------------------------------------------------- #
+# Binary basename -> the marker that opts a test out of the Popen guard for it.
+_POPEN_GUARDED: dict[str, str] = {
+    "osascript": "real_osascript",
+    "tmux": "real_signal",
+    "kill": "real_signal",
+    "ccc": "real_signal",
+}
+# The test interpreter's OWN ``ccc`` console script (this checkout's code, the same child as
+# ``sys.executable -m command_center``, which B3 covers) is not the live installed ``ccc``.
+_OWN_CCC = os.path.realpath(Path(sys.executable).with_name("ccc"))
+_SHELL_POS = 7  # ``shell`` in ``Popen._execute_child(args, executable, *rest)``
+_ARGV_KEEP = 6  # argv entries kept in a refusal line
+_ARG_CHARS = 200  # characters kept per argv entry (an AppleScript body is long)
+
+
+def _is_own_ccc(program: str, basetemp: Path) -> bool:
+    """True for a ``ccc`` that is this checkout's code, not the live install.
+
+    That is the test interpreter's own console script, or one a test built under the pytest
+    basetemp (``test_packaging`` installs the wheel into a tmp venv). A bare ``ccc`` is
+    never trusted: ``PATH`` resolves it to the live install.
+    """
+    if not os.path.isabs(program):
+        return False
+    real = Path(os.path.realpath(program))
+    return str(real) == _OWN_CCC or basetemp in real.parents
+
+
+_AUDIT_CHANNELS.extend(f"popen:{name}" for name in _POPEN_GUARDED)
+_AUDIT_CHANNELS.append("spawn_ccc")
+_AUDIT_CHANNELS.append("iterm_api:snapshot._connect")
+if _iterm2 is not None:
+    _AUDIT_CHANNELS.append("iterm_api:Connection.async_create")
+
+
+def _popen_argv(args: object, executable: object, shell: object) -> list[str]:
+    """The argv ``Popen._execute_child`` is about to run (its own POSIX normalisation).
+
+    Under ``shell=True`` the shell itself is argv[0]; the program judged is then the
+    first word of the command string.
+    """
+    if isinstance(args, (str, bytes, os.PathLike)):
+        argv = [os.fsdecode(args)]
+    else:
+        argv = [
+            os.fsdecode(arg) if isinstance(arg, (bytes, os.PathLike)) else str(arg)
+            for arg in args  # type: ignore[attr-defined]
+        ]
+    if shell and argv:
+        try:
+            words = shlex.split(argv[0])
+        except ValueError:
+            words = argv[0].split()
+        argv = [*words, *argv[1:]]
+    elif isinstance(executable, (str, bytes, os.PathLike)):
+        argv = [os.fsdecode(executable), *argv[1:]]
+    return argv
+
+
+def _refusal(nodeid: str, channel: str, **extra: object) -> dict[str, object]:
+    """One ``refused`` audit line (no pid: nothing was started)."""
+    record: dict[str, object] = {
+        "ts": _now(),
+        "nodeid": nodeid,
+        "channel": channel,
+        "pid": None,
+        "sig": None,
+        "target": "",
+        "verdict": "refused",
+    }
+    record.update(extra)
+    return record
+
+
+@pytest.fixture(autouse=True)
+def _guard_real_spawns(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refuse a real ``osascript`` / ``tmux`` / ``kill`` / ``ccc`` exec and ``spawn_ccc``.
+
+    The guard sits in ``Popen._execute_child``, under every ``subprocess.run`` /
+    ``check_output`` / ``Popen`` (also one built from a captured ``Popen`` reference), so a
+    test that fakes the caller (``subprocess.run``, ``terminal._osascript``, ...) never
+    reaches it, and one that does reach it would really have started the binary. The child
+    pid record of :func:`_guard_real_signals` still runs for everything let through.
+    Opt-outs: ``@pytest.mark.real_osascript`` (osascript), ``@pytest.mark.real_signal``
+    (tmux, kill, ccc). ``spawn.spawn_ccc`` is stubbed outright; a test that drives it
+    patches its own fake over this one (monkeypatch is last-wins).
+    """
+    request.getfixturevalue("_guard_real_signals")  # its _execute_child first, ours on top
+    nodeid = request.node.nodeid
+    basetemp = tmp_path_factory.getbasetemp().resolve()
+    opted_out = {
+        name for name, marker in _POPEN_GUARDED.items() if request.node.get_closest_marker(marker)
+    }
+
+    def guarded_execute_child(
+        self: subprocess.Popen, args: object, executable: object, *rest: object, **kwargs: object
+    ) -> None:
+        shell = rest[_SHELL_POS] if len(rest) > _SHELL_POS else kwargs.get("shell", False)
+        argv = _popen_argv(args, executable, shell)
+        name = os.path.basename(argv[0]) if argv else ""
+        own_ccc = name == "ccc" and _is_own_ccc(argv[0], basetemp)
+        if name in _POPEN_GUARDED and name not in opted_out and not own_ccc:
+            kept = [arg[:_ARG_CHARS] for arg in argv[:_ARGV_KEEP]]
+            _audit_write(_refusal(nodeid, f"popen:{name}", target=name, argv=kept))
+            raise AssertionError(
+                f"a test ran the real {name} ({argv[0]}) through subprocess.Popen; fake its "
+                f"caller (opt-out: @pytest.mark.{_POPEN_GUARDED[name]})"
+            )
+        _record_popen_child(self, args, executable, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "_execute_child", guarded_execute_child)
+
+    from command_center import spawn  # pylint: disable=import-outside-toplevel
+
+    def refused_spawn_ccc(args: list[str], *, internal: bool = True) -> NoReturn:
+        _audit_write(_refusal(nodeid, "spawn_ccc", target="ccc", argv=list(args)[:_ARGV_KEEP]))
+        raise AssertionError(
+            f"a test reached the real spawn.spawn_ccc({args!r}, internal={internal}); "
+            "monkeypatch spawn.spawn_ccc"
+        )
+
+    monkeypatch.setattr(spawn, "spawn_ccc", refused_spawn_ccc)
+
+
+@pytest.fixture(autouse=True)
+def _guard_real_iterm_api(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refuse the iTerm Python API: ``snapshot._connect`` and ``iterm2.Connection.async_create``.
+
+    ``terminal`` builds its connections inline (no ``_connect`` helper), as does
+    ``iterm_api.ItermLink``, so the shared ``iterm2.Connection.async_create`` is stubbed.
+    Tests that fake iTerm (their own ``sys.modules["iterm2"]``, their own
+    ``async_create`` or ``snapshot._connect``) re-override this. Opt out with
+    ``@pytest.mark.real_iterm``.
+    """
+    if request.node.get_closest_marker("real_iterm"):
+        return
+    nodeid = request.node.nodeid
+    from command_center import snapshot  # pylint: disable=import-outside-toplevel
+
+    def refused_connect(*_args: object, **_kwargs: object) -> NoReturn:
+        _audit_write(_refusal(nodeid, "iterm_api:snapshot._connect", target="iTerm2"))
+        raise AssertionError("a test reached the real iTerm Python API via snapshot._connect")
+
+    monkeypatch.setattr(snapshot, "_connect", refused_connect)
+    if _iterm2 is None:  # pragma: no cover - iterm2 is a hard dependency of ccc
+        return
+
+    def refused_async_create(*_args: object, **_kwargs: object) -> NoReturn:
+        _audit_write(_refusal(nodeid, "iterm_api:Connection.async_create", target="iTerm2"))
+        raise AssertionError("a test reached the real iTerm Python API (Connection.async_create)")
+
+    monkeypatch.setattr(_iterm2.Connection, "async_create", staticmethod(refused_async_create))
+
+
 @pytest.fixture(autouse=True)
 def _guard_real_trust_writes(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
@@ -583,6 +761,29 @@ def _isolate_tab_symbol_side_effects(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))
     monkeypatch.setenv("CCC_ROLE_MARK_DIR", str(tmp_path / "ccc-role-mark"))
     monkeypatch.delenv("ITERM_SESSION_ID", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_session_title_writers(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No-op ``terminal.set_session_titles`` / ``set_session_titles_preserving`` (tp#1793).
+
+    Both fire a detached ``osascript`` that walks every real iTerm session and renames
+    the matching ones; the TUI and hook tests reached them unfaked until the B2 Popen
+    guard refused it. Tests that patch their own fake simply re-override this
+    (monkeypatch is last-wins); tests of the writers themselves opt out with
+    ``@pytest.mark.real_title_writer`` and fake ``Popen`` — the Popen guard stays active.
+    """
+    if request.node.get_closest_marker("real_title_writer"):
+        return
+    from command_center import terminal  # pylint: disable=import-outside-toplevel
+
+    def _no_titles(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(terminal, "set_session_titles", _no_titles)
+    monkeypatch.setattr(terminal, "set_session_titles_preserving", _no_titles)
 
 
 @pytest.fixture(autouse=True)
