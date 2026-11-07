@@ -568,6 +568,7 @@ def _isolate_bridge_from_iterm(monkeypatch: pytest.MonkeyPatch) -> None:
             iterm_frontmost=_refuse,
             keystroke_idle=_refuse,
             focused_tab=_refuse,
+            screen=_refuse,
         ),
     )
 

@@ -197,8 +197,9 @@ pending decision, cwd, account, every `You [kind]: …` step of its last to-do l
 `**Decision brief**` blocks; `ccc send` / `ccc answer` type into the session's tab without
 ever focusing it, and refuse with `user_active` while you are typing into that tab (it is
 iTerm's focused tab and a key was pressed in the last `bridge_typing_guard_sec`, default
-30 s). Contract and error codes: [docs/reference.md](docs/reference.md) § "The voice-bridge
-JSON CLI".
+30 s); `ccc send` also refuses with `input_not_empty` while the session's input box already
+holds text, never clearing it (`bridge_input_guard`, default on). Contract and error codes:
+[docs/reference.md](docs/reference.md) § "The voice-bridge JSON CLI".
 
 ccc makes a handful of small LLM calls of its own (AIM scoring, the done-check, sub-goal
 derive/grade, drift, parked-session summaries, the short-AIM label). **`ccc llm-routing`

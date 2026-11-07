@@ -18,6 +18,7 @@ from typing import Any
 
 from command_center.bridge_target import BridgeDeps
 from command_center.models import LiveSession
+from command_center.screenread import ScreenRead, from_json
 from command_center.snapshot import PsRow
 from command_center.store import Store
 from command_center.tab_titles import ItermPane, uuid_of
@@ -26,8 +27,19 @@ SID = "00000000-0000-4000-8000-00000000b001"
 TAB = "w0t1p0:AAAA-BBBB-CCCC"
 PID = 4100
 TTY = "/dev/ttys041"
+#: The masked input-box screen captures (tp#1844 B2).
+COMPOSER_FIXTURES = Path(__file__).parent / "fixtures" / "composer"
 
 _counter = itertools.count(1)
+_screens: dict[str, ScreenRead] = {}
+
+
+def fixture_screen(name: str) -> ScreenRead:
+    """The ``tests/fixtures/composer/<name>.json`` capture as a :class:`ScreenRead`."""
+    if name not in _screens:
+        data = json.loads((COMPOSER_FIXTURES / f"{name}.json").read_text(encoding="utf-8"))
+        _screens[name] = from_json(data)
+    return _screens[name]
 
 
 def _uuid() -> str:
@@ -187,6 +199,12 @@ class World:  # pylint: disable=too-many-instance-attributes  # one fake machine
     focused: str | None = ""
     guard_sec: float = 30.0
     focus_reads: int = 0
+    #: The input-box guard (tp#1844): the screen the tab shows (default: the ``empty_idle``
+    #: fixture; ``None`` = unreadable), the config switch and the number of screen reads.
+    screen: ScreenRead | None = field(default_factory=lambda: fixture_screen("empty_idle"))
+    input_guard: bool = True
+    screen_reads: int = 0
+    started_at: int = 0
 
     def __post_init__(self) -> None:
         self.config_dir = self.tmp / "claude"
@@ -219,6 +237,7 @@ class World:  # pylint: disable=too-many-instance-attributes  # one fake machine
             raw_status=self.status,
             alive=self.alive,
             config_dir=str(self.config_dir),
+            started_at=self.started_at,
         )
 
     def discover(self) -> list[LiveSession]:
@@ -287,6 +306,11 @@ class World:  # pylint: disable=too-many-instance-attributes  # one fake machine
         self.focus_reads += 1
         return self.focused
 
+    def screen_tail(self, iterm_session_id: str) -> ScreenRead | None:
+        assert uuid_of(iterm_session_id) == uuid_of(TAB)
+        self.screen_reads += 1
+        return self.screen
+
     def deps(self) -> BridgeDeps:
         return BridgeDeps(
             discover=self.discover,
@@ -307,6 +331,8 @@ class World:  # pylint: disable=too-many-instance-attributes  # one fake machine
             keystroke_idle=lambda: self.key_idle,
             focused_tab=self.focused_tab,
             typing_guard_sec=lambda: self.guard_sec,
+            screen=self.screen_tail,
+            input_guard=lambda: self.input_guard,
         )
 
 

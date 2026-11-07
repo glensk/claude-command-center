@@ -697,7 +697,10 @@ def _add_transcript_parsers(sub: Any) -> None:
             "Reads the message from stdin (<= 4000 chars, no control characters except "
             "newline/tab), revalidates the tab, types it via the iTerm2 API and matches "
             "the transcript record; refuses with user_active while the tab is iTerm's "
-            "focused tab and a key was pressed within bridge_typing_guard_sec (30 s). "
+            "focused tab and a key was pressed within bridge_typing_guard_sec (30 s), with "
+            "input_not_empty when the session's input box already holds text (nothing is "
+            "typed or cleared) and with input_not_ready when a fresh session's box is not "
+            "drawn yet (bridge_input_guard, default on). "
             "Example: echo 'run the tests' | ccc send -s ID -j"
         ),
     )

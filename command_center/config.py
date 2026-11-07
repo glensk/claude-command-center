@@ -405,6 +405,10 @@ DEFAULTS: dict[str, object] = {
     # tab of the frontmost iTerm2 window and a key was pressed within this many seconds
     # (clamped to 0..600; 0 = no typing guard). Read-only probes; nothing is ever focused.
     "bridge_typing_guard_sec": 30,
+    # `ccc send` reads the target's input box (one read-only iTerm screen read) and refuses
+    # with `input_not_empty` when it already holds text (tp#1844). A safety guard, so on by
+    # default; false skips the read (the rollback switch).
+    "bridge_input_guard": True,
     "split_ratio": 0.6,  # TUI: left (table) fraction of the width, 0..1
     "tab_title": "!!!",  # iTerm tab title set when ccc starts ("" = leave alone)
     "tab_color": "red",  # iTerm tab color when ccc starts (name or #rrggbb; "" = none)
@@ -1229,6 +1233,7 @@ class Config:
     stop_barrier_wait_sec: int = 180
     stop_barrier_settle_sec: int = 2
     bridge_typing_guard_sec: int = 30
+    bridge_input_guard: bool = True
     split_ratio: float = 0.6
     tab_title: str = "!!!"
     tab_color: str = "red"
@@ -1368,6 +1373,8 @@ def load_config() -> Config:
     # printed warning would land in a hook's stdout (a Claude Code protocol channel).
     cfg.stop_barrier_wait_sec = _clamped_int(cfg.stop_barrier_wait_sec, 0, 900, 180)
     cfg.bridge_typing_guard_sec = _clamped_int(cfg.bridge_typing_guard_sec, 0, 600, 30)
+    # A safety guard fails closed: only an explicit boolean false turns it off.
+    cfg.bridge_input_guard = cfg.bridge_input_guard is not False
     cfg.accept_hook_timeout_sec = _clamped_int(cfg.accept_hook_timeout_sec, 10, 480, 180)
     cfg.accept_hook_retry_sec = _clamped_int(cfg.accept_hook_retry_sec, 0, 480, 420)
     if loaded_from_disk:

@@ -3730,9 +3730,33 @@ holds a message when a key was pressed in another app or another iTerm tab withi
 and the user then switched to the target tab; it never lets a message through while the user
 is typing into the focused target tab. Dictation that sends no key events is not seen.
 
-`data = {delivery_id, outcome, channel}` — `outcome` `accepted` (matching record within 8 s),
-`unknown` (typed, no record yet; `ok: false`, code `delivery_unknown`) or `failed` (nothing
-typed; code `delivery_failed`).
+Right after the typing guard, still inside the lock, comes the **input-box guard** (tp#1844):
+one read-only iTerm2 Python-API screen read of the tab (`async_get_screen_contents`, the
+bottom 60 lines, cell by cell). Claude Code's input box is the lines between the last two
+full-width `─` rules; its first line opens with the prompt glyph (`❯`, `>` on older builds,
+`!` in bash mode). Content is every cell after the glyph that is neither blank nor faint, so
+the dim placeholder and suggestion text do not count, while a typed draft, a single stray
+character, a `[Pasted text #1 +N lines]` marker or a slash command do. The cursor cell is not
+content when Ink draws it inverse on the first letter of a faint placeholder (every later cell
+on that line faint or blank); an inverse cursor after real text still leaves that text
+counted. Bash mode refuses even with nothing after the `!`: the paste would run as a shell
+command. A box holding text is refused with `input_not_empty` (exit 1, nothing typed, nothing
+cleared, no delivery row; `data = {input_chars, input_mode}` — a count and `prompt` / `bash` /
+`unknown`, never the text). When the box cannot be classified (no rule pair, an unknown
+glyph — `unrecognized`) or not read at all (no screen, or any exception while reading or
+parsing — `unreadable`; the stderr line names only the exception type), an ESTABLISHED
+session gets the message anyway and the result's `data.input_check` says `unrecognized` or
+`unreadable` (absent when the box read empty), so a Claude Code TUI change shows up instead
+of holding every send. A FRESH session (no transcript yet) or one whose process started less
+than 30 s ago is refused with `input_not_ready` instead, since its box may not be drawn yet.
+The read and the paste are not atomic: a key pressed in the second between them is not seen;
+the typing guard and the stray-prefix matcher cover that window. Config `bridge_input_guard`
+(default `true`; `false` skips the read entirely) is the switch. `ccc answer` is not guarded:
+a pending picker replaces the input box and its keys go to the picker, so a draft survives.
+
+`data = {delivery_id, outcome, channel}` (plus `input_check` as above) — `outcome` `accepted`
+(matching record within 8 s), `unknown` (typed, no record yet; `ok: false`, code
+`delivery_unknown`) or `failed` (nothing typed; code `delivery_failed`).
 
 ### `ccc answer` (`-s/--session ID`, `-j/--json`)
 
@@ -3826,6 +3850,8 @@ details never carry message text. Code: `invalid_cursor` (a negative cursor, exi
 | `no_tab` / `stale_tab` / `foreground_not_claude` / `iterm_unreachable`                                                                                                  | send, answer          | the tab cannot be proven to be this session's claude                    |
 | `tab_locked`                                                                                                                                                            | send, answer          | another send/answer to this tab is running (3 s wait)                   |
 | `user_active`                                                                                                                                                           | send, answer          | the user is typing into the focused target tab — retry later            |
+| `input_not_empty`                                                                                                                                                       | send                  | the input box already holds text — nothing typed; clear it              |
+| `input_not_ready`                                                                                                                                                       | send                  | a fresh session's input box is not drawn yet — retry                    |
 | `waiting` / `blocked` / `unknown_status` / `picker_pending`                                                                                                             | send                  | not typed into in this state (`picker_pending`: use `ccc answer`)       |
 | `delivery_failed` / `delivery_unknown`                                                                                                                                  | send                  | nothing reached the tab / typed, but no matching record within 8 s      |
 | `not_waiting` / `decision_changed` / `unsupported_shape` / `invalid_answer`                                                                                             | answer                | no single pending picker matching the `decision_id`, or a bad choice    |

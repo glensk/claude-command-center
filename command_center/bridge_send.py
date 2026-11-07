@@ -15,9 +15,14 @@ expectation is recorded; any of the three prompt shapes with the right sha prove
 since the session may turn busy between the check and the paste);
 ``waiting`` / ``blocked`` / any other status, background sessions and a pending picker
 are refused.
-The last check before the first byte is the typing guard
-(:func:`bridge_target.guard_user_active`): ``user_active`` while the tab is the focused
-tab of the frontmost iTerm2 window and a key was pressed within the guard window.
+Then the typing guard (:func:`bridge_target.guard_user_active`): ``user_active`` while
+the tab is the focused tab of the frontmost iTerm2 window and a key was pressed within
+the guard window. The last check before the first byte is the input-box guard
+(:func:`bridge_target.guard_input_empty`, tp#1844, config ``bridge_input_guard``): one
+read-only screen read; ``input_not_empty`` (``data.input_chars`` / ``data.input_mode``,
+never the draft) when Claude Code's input box already holds text, ``input_not_ready`` when
+a fresh or just-started session's box cannot be read yet. An unreadable or unrecognised
+box on an established session does not stop the send; ``data.input_check`` says so.
 
 Correlation: the transcript's inode + byte size are taken before sending; only records
 appended after that are scanned (a FRESH session has no transcript until its first
@@ -56,7 +61,14 @@ from .adapters import claude_bridge as cb
 from .bridge_delivery import assign, finish, stray_prefix
 from .bridge_json import BridgeError, validate_message
 from .bridge_store import Delivery
-from .bridge_target import guard_user_active, require_live, revalidate, tab_for, tab_lock
+from .bridge_target import (
+    guard_input_empty,
+    guard_user_active,
+    require_live,
+    revalidate,
+    tab_for,
+    tab_lock,
+)
 
 if TYPE_CHECKING:
     from .bridge_target import BridgeDeps
@@ -169,6 +181,7 @@ def run_send(deps: BridgeDeps, session_id: str, text: str) -> dict[str, Any]:
                 f"session {session_id} reports status {target.raw_status!r}",
             )
         guard_user_active(deps, tab)
+        input_check = guard_input_empty(deps, tab, target.live, fresh)
         anchor = cb.Anchor.take_or_fresh(path)
         now = deps.now_ms()
         d = Delivery(
@@ -198,6 +211,8 @@ def run_send(deps: BridgeDeps, session_id: str, text: str) -> dict[str, Any]:
             "outcome": "failed",
             "channel": channel or None,
         }
+        if input_check:
+            data["input_check"] = input_check
         if sent == "none":
             with deps.store() as store:
                 finish(

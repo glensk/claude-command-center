@@ -19,6 +19,10 @@
    ``user_active`` while the tab is the focused tab of the frontmost iTerm2 window and a
    key was pressed within ``bridge_typing_guard_sec`` (default 30 s). It never focuses
    anything.
+5. ``ccc send`` only — the input-box guard (:func:`guard_input_empty`, tp#1844), right after
+   the typing guard: one read-only screen read of the tab; ``input_not_empty`` when Claude
+   Code's input box already holds text, ``input_not_ready`` when a fresh or just-started
+   session's box cannot be read yet. The draft itself is never logged or reported.
 
 Every collaborator that touches the machine (registry, ``ps``, iTerm, the clock, the
 sender) is a field of :class:`BridgeDeps`, so tests drive the whole path with fakes.
@@ -51,11 +55,15 @@ from .bridge_json import BridgeError
 if TYPE_CHECKING:
     from .adapters.claude_agents import AgentEntry
     from .models import LiveSession
+    from .screenread import ScreenRead
     from .store import Store
     from .tab_titles import ItermPane
 
 #: How long ``ccc send`` / ``ccc answer`` wait for another mutation of the same tab.
 LOCK_WAIT_SEC = 3.0
+#: A session whose process started less than this long ago may not have drawn its input
+#: box yet: an unreadable box there is ``input_not_ready``, not a fail-open send (tp#1844).
+INPUT_READY_GRACE_SEC = 30.0
 
 
 def _default_discover() -> list[LiveSession]:
@@ -148,6 +156,18 @@ def _default_typing_guard_sec() -> float:
     return float(load_config().bridge_typing_guard_sec)
 
 
+def _default_screen(iterm_session_id: str) -> ScreenRead | None:
+    from . import terminal
+
+    return terminal.iterm_screen_tail(iterm_session_id)
+
+
+def _default_input_guard() -> bool:
+    from .config import load_config
+
+    return bool(load_config().bridge_input_guard)
+
+
 def _default_lock_dir() -> Path:
     from . import config
 
@@ -177,6 +197,8 @@ class BridgeDeps:  # pylint: disable=too-many-instance-attributes  # one seam pe
     keystroke_idle: Callable[[], float | None] = _default_keystroke_idle
     focused_tab: Callable[[], str | None] = _default_focused_tab
     typing_guard_sec: Callable[[], float] = _default_typing_guard_sec
+    screen: Callable[[str], ScreenRead | None] = _default_screen
+    input_guard: Callable[[], bool] = _default_input_guard
     sleep: Callable[[float], None] = time.sleep
     monotonic: Callable[[], float] = time.monotonic
     now_ms: Callable[[], int] = _now_ms
@@ -332,6 +354,61 @@ def guard_user_active(deps: BridgeDeps, iterm_session_id: str) -> None:
         f"the target tab {where} and the user is typing ({seen}, guard {window:g} s)"
         " — nothing was typed; retry later",
     )
+
+
+def _just_started(deps: BridgeDeps, live: LiveSession) -> bool:
+    """True when *live*'s process started less than :data:`INPUT_READY_GRACE_SEC` ago
+    (an unknown start time, ``0``, counts as established)."""
+    started = int(live.started_at or 0)
+    return started > 0 and deps.now_ms() - started < INPUT_READY_GRACE_SEC * 1000
+
+
+def guard_input_empty(
+    deps: BridgeDeps, iterm_session_id: str, live: LiveSession, fresh: bool
+) -> str | None:
+    """Refuse when the target's input box is not empty; the ``input_check`` note otherwise.
+
+    Called by ``ccc send`` inside the per-tab lock right after :func:`guard_user_active`.
+    One read-only screen read (``deps.screen``) classified by
+    :func:`composer.parse_screen`:
+
+    * ``text`` → ``input_not_empty`` (a draft, a stray character, a paste marker, or bash
+      mode — whose glyph alone would turn the paste into a shell command);
+    * ``empty`` → ``None`` (send);
+    * ``unrecognized`` / ``unreadable`` (no screen, or any exception while reading or
+      parsing) → on a *fresh* session (no transcript yet) or one started less than
+      :data:`INPUT_READY_GRACE_SEC` ago ``input_not_ready``; on an established one the send
+      goes on and the note (``"unrecognized"`` / ``"unreadable"``) is returned for ``data``.
+
+    ``bridge_input_guard = false`` skips the read (``None``). The draft text never leaves
+    this function: refusals carry a count and a mode, the log line only an exception type.
+    """
+    from . import composer
+    from .bridge_json import log
+
+    if not deps.input_guard():
+        return None
+    try:
+        box = composer.parse_screen(deps.screen(iterm_session_id))
+    except Exception as exc:  # pylint: disable=broad-exception-caught  # fail typed, never leak
+        box = composer.Composer("unreadable", error=type(exc).__name__)
+    if box.error:
+        log(f"ccc send: input box unreadable ({box.error})")
+    if box.state == "text":
+        in_mode = f" in {box.mode} mode" if box.mode not in ("prompt", "unknown") else ""
+        raise BridgeError(
+            "input_not_empty",
+            f"the target's input box holds {box.chars} character(s){in_mode}"
+            " — nothing was typed; clear it in that tab or retry later",
+            data={"input_chars": box.chars, "input_mode": box.mode},
+        )
+    if box.state == "empty":
+        return None
+    if fresh or _just_started(deps, live):
+        raise BridgeError(
+            "input_not_ready", "the target's input box is not drawn yet — retry shortly"
+        )
+    return box.state
 
 
 @contextmanager
