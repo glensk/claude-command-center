@@ -13,7 +13,10 @@ A delivery is one ``ccc send`` (or ``ccc answer``) row. States::
   claimed — a ``user`` record (typed while idle), a ``queue-operation/enqueue`` (typed
   while busy) or an ``attachment/queued_command``. Two identical messages therefore
   claim two records in order; a prompt typed by hand in between (another sha) is
-  ignored; ``<task-notification>`` enqueues are never a match.
+  ignored; ``<task-notification>`` enqueues are never a match. A record that is the
+  message behind one or two stray characters glued to its start (``yRun …``: a byte
+  already in the composer when the paste arrived, tp#1836) matches too, for messages of
+  at least :data:`STRAY_MIN_LEN` characters (:func:`stray_prefix`).
 - **Consumption**: a ``user`` / ``queued_command`` match is consumed where it stands; an
   ``enqueue`` is consumed by the first later unclaimed ``user`` / ``queued_command``
   record with the same sha (the queue draining it, or absorbing it mid-turn).
@@ -75,14 +78,57 @@ class Assignment:
     consumed: cb.Located | None = None
 
 
-def _sha_matches(delivery: Delivery, text: str) -> bool:
-    """The record text (raw, or with ``<pasted_content>`` wrappers removed) is this
-    delivery's message (or its one-line AppleScript form)."""
+#: The longest run of stray characters a record may carry in front of a delivered message
+#: and still be that message (tp#1836: a byte already sitting in the composer — a late
+#: terminal reply or a key pressed into the fresh tab — is prepended to the paste).
+STRAY_PREFIX_MAX = 2
+#: A prefixed record only proves a message at least this long: a short message (``es``
+#: vs a typed ``yes``) is never matched that way, only exactly.
+STRAY_MIN_LEN = 16
+
+
+def _stray_head(text: str, wanted: set[str]) -> str | None:
+    """The 1..:data:`STRAY_PREFIX_MAX` stray characters in front of a wanted message.
+
+    The head must be printable non-whitespace glued to the message (``yRun …``, never
+    ``y Run …`` — a separate word is something somebody typed), and the rest must be the
+    whole message, at least :data:`STRAY_MIN_LEN` characters long.
+    """
+    norm = cb.normalise(text)
+    for k in range(1, STRAY_PREFIX_MAX + 1):
+        head, rest = norm[:k], norm[k:]
+        last = head[-1:]
+        if len(rest) < STRAY_MIN_LEN or not last.isprintable() or last.isspace():
+            return None
+        if rest[:1].isspace():
+            continue
+        if cb.text_sha(rest) in wanted:
+            return head
+    return None
+
+
+def stray_prefix(delivery: Delivery, text: str) -> str | None:
+    """How the record text proves this delivery: ``""`` exactly, the stray prefix, or None.
+
+    Exactly: the text (raw, or with ``<pasted_content>`` wrappers removed) is this
+    delivery's message (or its one-line AppleScript form). Otherwise a record that is
+    that message behind a short stray prefix (:func:`_stray_head`) still proves it.
+    """
     wanted = {delivery.content_sha} | ({delivery.alt_sha} if delivery.alt_sha else set())
-    if cb.text_sha(text) in wanted:
-        return True
     unwrapped = cb.unwrap_pastes(text)
-    return unwrapped != text and cb.text_sha(unwrapped) in wanted
+    forms = [text] if unwrapped == text else [text, unwrapped]
+    if any(cb.text_sha(form) in wanted for form in forms):
+        return ""
+    for form in forms:
+        head = _stray_head(form, wanted)
+        if head is not None:
+            return head
+    return None
+
+
+def _sha_matches(delivery: Delivery, text: str) -> bool:
+    """The record text is this delivery's message (:func:`stray_prefix`)."""
+    return stray_prefix(delivery, text) is not None
 
 
 def _first_unclaimed(

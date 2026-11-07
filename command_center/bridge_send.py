@@ -25,7 +25,11 @@ prompt — spike S-SEND — so its anchor is ``(inode 0, size 0)`` on the path C
 will create, :func:`claude_bridge.expected_transcript_path`, and the file appearing with
 any inode is accepted), and the first unclaimed record whose normalised text
 sha256 matches is this delivery's (FIFO across the session's deliveries — no marker is
-ever added to the text). The outcome — ``accepted`` / ``failed`` (nothing typed) /
+ever added to the text). A record that holds the message behind one or two stray
+characters glued to its start (a byte already in the composer — a late terminal reply
+or a key pressed into the fresh tab; never typed by ccc, tp#1836) is accepted too, with
+``data.stray_prefix`` and the row's ``reason`` = ``stray_prefix`` saying so.
+The outcome — ``accepted`` / ``failed`` (nothing typed) /
 ``unknown`` (typed, but no matching record within :data:`CORRELATE_SEC`, or a paste
 whose submitting CR did not go out) — is known within 8 s and never auto-retried. Every
 send leaves a ``deliveries`` row the state machine (``ccc delivery``) follows up.
@@ -49,7 +53,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .adapters import claude_bridge as cb
-from .bridge_delivery import assign, finish
+from .bridge_delivery import assign, finish, stray_prefix
 from .bridge_json import BridgeError, validate_message
 from .bridge_store import Delivery
 from .bridge_target import guard_user_active, require_live, revalidate, tab_for, tab_lock
@@ -111,6 +115,13 @@ def _inode(path: Path) -> int:
         return path.stat().st_ino
     except OSError:
         return 0
+
+
+def _stray_of(d: Delivery, loc: cb.Located) -> str:
+    """The stray characters the matched record carries in front of the message (``""``
+    for an exact match): a byte that sat in the composer before the paste (tp#1836)."""
+    found = cb.prompt_record(loc.record)
+    return (stray_prefix(d, found[1]) or "") if found is not None else ""
 
 
 def _correlate(deps: BridgeDeps, d: Delivery, deadline: float) -> tuple[cb.Located, str] | None:
@@ -203,6 +214,8 @@ def run_send(deps: BridgeDeps, session_id: str, text: str) -> dict[str, Any]:
         with deps.store() as store:
             if hit is not None:
                 loc, kind = hit
+                stray = _stray_of(d, loc)
+                noted: dict[str, Any] = {"reason": "stray_prefix"} if stray else {}
                 store.update_delivery(
                     d.delivery_id,
                     "sending",
@@ -215,8 +228,11 @@ def run_send(deps: BridgeDeps, session_id: str, text: str) -> dict[str, Any]:
                     matched_offset=loc.start,
                     accepted_at=done,
                     updated_at=done,
+                    **noted,
                 )
                 data["outcome"] = "accepted"
+                if stray:
+                    data["stray_prefix"] = stray
                 return data
             reason = "partial_paste" if sent == "partial" else "no_matching_record"
             store.update_delivery(

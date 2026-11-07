@@ -21,8 +21,10 @@ from bridgestub import (
     user,
 )
 
+from command_center import bridge_delivery
 from command_center.adapters import claude_bridge as cb
 from command_center.adapters.claude_agents import AgentEntry
+from command_center.bridge_store import Delivery
 from command_center.store import Store
 
 
@@ -293,6 +295,109 @@ def test_no_matching_record_within_eight_seconds_is_unknown(
     assert rc == 1 and env is not None and env["data"]["outcome"] == "unknown"
     (d,) = _deliveries(world)
     assert d.reason == "no_matching_record"
+
+
+#: The tp#1785 canary3 message (2026-11-07 11:14): the record began with a stray ``y``.
+CANARY3 = (
+    "Run exactly this one command and nothing else: CLAUDE_EFFORT=none decide ask -f "
+    "/tmp/tp1785-canary3/q.json -j -C\nThen reply only with: OK, canary asked (and the qid "
+    "it printed).\n"
+)
+
+
+def test_stray_character_before_the_paste_is_still_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#1836: a byte already in the composer is glued to the paste (``yRun …``); the
+    delivery is accepted and says so, it is not reported ``delivery_unknown``."""
+    world = _idle_world(tmp_path)
+    world.on_text = lambda w, text: w.write(user("y" + text))
+    code, env, _err = _send(world, monkeypatch, capsys, CANARY3)
+    assert code == 0 and env is not None and env["ok"] is True, env
+    assert env["data"]["outcome"] == "accepted" and env["data"]["stray_prefix"] == "y"
+    assert world.texts == [CANARY3]  # ccc itself typed only the message
+    (d,) = _deliveries(world)
+    assert d.state == "accepted" and d.reason == "stray_prefix" and d.matched_kind == "user"
+
+
+def test_exact_match_reports_no_stray_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = _idle_world(tmp_path)
+    world.on_text = lambda w, text: w.write(user(text))
+    code, env, _err = _send(world, monkeypatch, capsys, CANARY3)
+    assert code == 0 and env is not None and "stray_prefix" not in env["data"]
+    (d,) = _deliveries(world)
+    assert d.reason == ""
+
+
+def test_stray_prefix_in_a_wrapped_busy_enqueue_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = World(tmp_path, status="busy")
+    world.write(user("long job"))
+    world.on_text = lambda w, text: w.write(enqueue("~" + text))
+    code, env, _err = _send(world, monkeypatch, capsys, CANARY3)
+    assert code == 0 and env is not None and env["data"]["stray_prefix"] == "~"
+    (d,) = _deliveries(world)
+    assert d.matched_kind == "queue-operation/enqueue"
+
+
+@pytest.mark.parametrize(
+    ("record", "text"),
+    [
+        ("yes", "es"),  # a short message is only ever matched exactly
+        ("y" + "short message.", "short message."),  # 14 < STRAY_MIN_LEN
+        ("y " + CANARY3, CANARY3),  # a separate word is somebody typing, not a stray byte
+        ("abc" + CANARY3, CANARY3),  # longer than STRAY_PREFIX_MAX
+        ("\x07" + CANARY3, CANARY3),  # a non-printable head
+        ("y" + CANARY3 + "!", CANARY3),  # the message must be the whole rest
+        (CANARY3[1:], CANARY3),  # a missing first character is not a stray one
+    ],
+)
+def test_loose_lookalikes_are_not_accepted(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    record: str,
+    text: str,
+) -> None:
+    world = _idle_world(tmp_path)
+    world.on_text = lambda w, _text: w.write(user(record))
+    rc, env, _err = _send(world, monkeypatch, capsys, text)
+    assert rc == 1 and env is not None and env["error"]["code"] == "delivery_unknown", env
+    (d,) = _deliveries(world)
+    assert d.reason == "no_matching_record"
+
+
+def test_stray_prefix_reports_exact_stray_or_none() -> None:
+    d = _delivery_for(CANARY3)
+    assert bridge_delivery.stray_prefix(d, CANARY3) == ""
+    assert bridge_delivery.stray_prefix(d, "y" + CANARY3) == "y"
+    assert bridge_delivery.stray_prefix(d, "$y" + CANARY3) == "$y"
+    assert bridge_delivery.stray_prefix(d, _pasted("y" + CANARY3.strip())) == "y"
+    assert bridge_delivery.stray_prefix(d, "other text that is long enough") is None
+
+
+def _delivery_for(text: str) -> Delivery:
+    return Delivery(
+        delivery_id="d1",
+        session_id=SID,
+        kind="send",
+        iterm_session_id=TAB,
+        config_dir="",
+        pid=1,
+        transcript_path="",
+        transcript_inode=0,
+        anchor_offset=0,
+        content_sha=cb.text_sha(text),
+        alt_sha="",
+        expected="user",
+        status_at_send="idle",
+        state="sending",
+        created_at=0,
+        updated_at=0,
+    )
 
 
 def _pasted(text: str, paste_id: str = "2f43") -> str:
