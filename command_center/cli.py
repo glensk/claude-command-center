@@ -5444,17 +5444,13 @@ def _read_statusline_stdin() -> dict | None:
     usage capture and — when no ``--session`` was passed — deriving the session id.
     Best-effort and silent: it must never break the status line.
     """
+    from . import usagecache
+
     try:
         raw = sys.stdin.read()
     except (OSError, ValueError):
         return None
-    if not raw.strip():
-        return None
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+    return usagecache.loads_dict(raw)
 
 
 def _capture_usage_from_payload(data: dict) -> None:

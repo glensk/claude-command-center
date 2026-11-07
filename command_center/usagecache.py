@@ -295,17 +295,26 @@ def _full_since(
     return out
 
 
+def loads_dict(raw: str) -> dict | None:
+    """*raw* parsed as a JSON object; ``None`` when blank, malformed or not an object.
+
+    The one tolerant parse behind the usage cache, the status-line stdin payload and the
+    Keychain credentials blob: callers on hot or best-effort paths never raise on junk.
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _load_json_dict(path: Path) -> dict | None:
     """*path* parsed as a JSON object; ``None`` when absent, unreadable or not an object."""
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError:
         return None
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+    return loads_dict(raw)
 
 
 def _read_validated(app_home: Path, account: str, account_dir: Path) -> dict | None:

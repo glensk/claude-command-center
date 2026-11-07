@@ -581,11 +581,8 @@ def _keychain_oauth_token(account: str) -> str | None:  # pylint: disable=too-ma
         ).stdout
     except (subprocess.SubprocessError, OSError):
         return None
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    data = usagecache.loads_dict(raw)
+    oauth = data.get("claudeAiOauth") if data is not None else None
     if not isinstance(oauth, dict):
         return None
     token = oauth.get("accessToken")
