@@ -168,6 +168,16 @@ The invariants that keep it under a few seconds:
   start. `tests/test_aim_contract.py` pins the output bytes; `tests/test_entrypoint.py`
   proves in a subprocess that a served `aim` loads none of `cli`, `config`, `models`,
   `store`, argparse, rich or textual — keep any new import out of that path.
+- **`ccc statusline --session <sid> --capture-usage` never imports `cli` either.** The same
+  dispatcher answers it from the stdlib modules `cli` itself renders through (`slrender`,
+  `rolemark`, `livestatus`, `usagecache`, `staffrole`, `bars`): read everything and render
+  the whole output first, then the usage write, the role-mark sync and one stdout write. It
+  falls through to `cli` before any write on the rules listed in the `entrypoint` docstring
+  (other argv, missing DB or SQLite error, an effort level in the payload, a session live
+  under two accounts, an unreadable config, any other read-phase exception);
+  `CCC_NO_FASTPATH=1` sends every verb to `cli` (kill switch). Cost: ~290 M instructions
+  per call (median of 5, 2026-11-07) vs ~815 M through `cli`.
+  `tests/test_statusline_fast.py` pins byte parity with `cli` and the forbidden imports.
 - **One Copilot refresh per window, success or not.** `usage.claim_copilot_refresh()` (flock
   on a sidecar lock, staleness rechecked under it, atomic `copilot_usage.attempt` stamp) is
   called by the TUI usage tick and the daemon's `_refresh_copilot_usage` BEFORE they spawn
