@@ -1,5 +1,6 @@
 """Headless smoke test for the Textual TUI (no real terminal needed)."""
 
+# pylint: disable=too-many-lines  # one module drives every TUI screen headlessly
 from __future__ import annotations
 
 import asyncio
@@ -244,7 +245,6 @@ def test_table_row_shows_codex_badge_and_waiting_reset_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    from command_center import usage
 
     sid = "codex-workflow-session"
     store = Store(tmp_path / "command-center" / "state.db")
@@ -293,7 +293,10 @@ def test_table_row_shows_codex_badge_and_waiting_reset_status(
 def _codex_stub(idents: list[int]) -> object:
     """A ``read_codex_usage`` replacement recording the thread it ran on (5h window 42%)."""
 
-    def stub(now: int | None = None, home: Path | None = None) -> usage.Usage:
+    # Signature mirrors read_codex_usage; the stub ignores both arguments.
+    def stub(  # pylint: disable=unused-argument
+        now: int | None = None, home: Path | None = None
+    ) -> usage.Usage:
         idents.append(threading.get_ident())
         return usage.Usage(int(time.time()), usage.Window(42.0, int(time.time()) + 3600), None)
 
@@ -603,7 +606,7 @@ def test_close_parked_no_tab_close(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     asyncio.run(scenario())
 
-    assert closed == []  # no tab-close attempted for a parked session
+    assert not closed  # no tab-close attempted for a parked session
 
     store = Store(tmp_path / "command-center" / "state.db")
     session = store.get(sid)
@@ -1659,7 +1662,10 @@ def test_oo_chord_opens_future_file_in_obsidian(
         def poll(self) -> int:
             return self.returncode
 
-        def wait(self, timeout: float | None = None) -> int:  # noqa: ARG002
+        # Popen.wait signature; the fake returns at once.
+        def wait(  # pylint: disable=unused-argument
+            self, timeout: float | None = None
+        ) -> int:  # noqa: ARG002
             return self.returncode
 
         def kill(self) -> None:
@@ -1832,8 +1838,8 @@ def test_e_opens_inline_edit_form_and_esc_saves(
     assert saved.deadline == "2026-07-01"
     assert saved.manual_progress == 40  # "40%" parsed; overrides the sub-goal bar
     assert saved.blocked_on == "@susi"
-    assert [s.text for s in subs] == ["a", "c"]
-    assert [s.checked for s in subs] == [True, False]  # a's tick carried over
+    # a's tick carried over
+    assert [(s.text, s.checked) for s in subs] == [("a", True), ("c", False)]
     assert {s.source for s in subs} == {"user"}  # manual edit → provenance "manual"
 
 
@@ -3208,7 +3214,6 @@ def test_second_codex_card_shows_its_own_account_and_t5_toggles_it(
 ) -> None:
     """With a second CODEX_HOME the card appears, titles itself by account, and t5 folds it."""
     import base64
-    import json
 
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     default_home = tmp_path / "codex"
@@ -3268,7 +3273,6 @@ def test_second_codex_card_shows_its_own_account_and_t5_toggles_it(
 def _write_codex_auth(home: Path, email: str) -> None:
     """Seed *home* with the ``auth.json`` a ChatGPT `codex login` writes."""
     import base64
-    import json
 
     claims = base64.urlsafe_b64encode(json.dumps({"email": email}).encode()).decode().rstrip("=")
     home.mkdir(parents=True, exist_ok=True)
@@ -3336,7 +3340,7 @@ def test_third_codex_card_from_codex_homes_extra_and_t6_toggles_it(
             await pilot.pause()
             assert config.load_config().usage_card_codex_extra_collapsed == []
             assert card.has_class("card-collapsed") is False
-            assert app._undo_stack == []  # the re-entrant toggle did not re-push
+            assert not app._undo_stack  # the re-entrant toggle did not re-push
 
     asyncio.run(scenario())
 
@@ -3357,7 +3361,7 @@ def test_extra_codex_cards_absent_and_t6_inert_without_codex_homes_extra(
         app = CommandCenterApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            assert app._codex_homes_extra() == {}
+            assert not app._codex_homes_extra()
             assert len(app.query("#usage-codex-x-de")) == 0  # never composed
             assert len(app.query(".usage-codex-extra")) == 0
 
@@ -3367,7 +3371,7 @@ def test_extra_codex_cards_absent_and_t6_inert_without_codex_homes_extra(
             # Inert: nothing flipped, nothing persisted, nothing to undo.
             assert app.cfg.usage_card_codex_extra_collapsed == []
             assert config.load_config().usage_card_codex_extra_collapsed == []
-            assert app._undo_stack == []
+            assert not app._undo_stack
 
     asyncio.run(scenario())
 
@@ -3382,7 +3386,6 @@ def test_subscription_end_dates_reach_every_card_title_uncut(
     asserts the widths too: every card must be wide enough for its own whole title.
     """
     import base64
-    import json
 
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     default_home = tmp_path / "codex"
@@ -3559,7 +3562,8 @@ def test_marked_codex_ver_cell_width_over_all_status_icons(
         app = CommandCenterApp()
         async with app.run_test() as pilot:
             await settle(pilot)
-            app.update_detail = lambda: None  # type: ignore[method-assign]  # skip the highlight→detail side-effect
+            # skip the highlight→detail side-effect
+            app.update_detail = lambda: None  # type: ignore[method-assign]
             table = app.query_one("#sessions", SessionTable)
             for status in Status:
                 table.clear()
@@ -3606,7 +3610,8 @@ def test_model_column_shows_play_icon_while_working_and_ttl_otherwise(
         app = CommandCenterApp()
         async with app.run_test() as pilot:
             await settle(pilot)
-            app.update_detail = lambda: None  # type: ignore[method-assign]  # skip the highlight→detail side-effect
+            # skip the highlight→detail side-effect
+            app.update_detail = lambda: None  # type: ignore[method-assign]
             monkeypatch.setattr(
                 app.adapter, "transcript_path", lambda *_a, **_kw: transcript, raising=False
             )
@@ -4016,7 +4021,7 @@ def test_tui_poll_consumes_toggle_and_focuses(
     asyncio.run(scenario())
     assert records["toggle_after"] is False  # poll consumed the toggle
     assert records["name"] == ["!!!"]  # fell through to the tab-title focus
-    assert records["iterm"] == []  # no ITERM_SESSION_ID → never focused by uuid
+    assert not records["iterm"]  # no ITERM_SESSION_ID → never focused by uuid
 
 
 def test_undo_empty_stack_notifies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4035,7 +4040,7 @@ def test_undo_empty_stack_notifies(tmp_path: Path, monkeypatch: pytest.MonkeyPat
             app.action_undo()
             await pilot.pause()
             assert notes and "Nothing to undo." in notes[-1]
-            assert app._undo_stack == []
+            assert not app._undo_stack
 
     asyncio.run(scenario())
 
@@ -4129,7 +4134,10 @@ def test_undo_close_live_reopens_tab(tmp_path: Path, monkeypatch: pytest.MonkeyP
         closed.append(iterm_session_id)
         return "tab"
 
-    def fake_resume(cwd: str, session_id: str, config_dir: str = "", **_: object) -> bool:
+    # resume_session signature; config_dir is irrelevant to this fake.
+    def fake_resume(  # pylint: disable=unused-argument
+        cwd: str, session_id: str, config_dir: str = "", **_: object
+    ) -> bool:
         resumed.append((cwd, session_id))
         return True
 
@@ -4224,7 +4232,7 @@ def test_undo_view_toggles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
             app.action_undo()  # reverts finished
             await settle(pilot)
             assert app._show_finished is False
-            assert app._undo_stack == []  # undo never pushed onto the stack
+            assert not app._undo_stack  # undo never pushed onto the stack
 
     asyncio.run(scenario())
 
@@ -4249,7 +4257,7 @@ def test_undo_card_toggle_restores_config(tmp_path: Path, monkeypatch: pytest.Mo
             await settle(pilot)
             assert config.load_config().usage_card_private is True
             assert app.cfg.usage_card_private is True
-            assert app._undo_stack == []  # the re-entrant toggle did not re-push
+            assert not app._undo_stack  # the re-entrant toggle did not re-push
 
     asyncio.run(scenario())
 
@@ -4314,7 +4322,7 @@ def test_reexec_in_place_execv_for_absolute_image(monkeypatch: pytest.MonkeyPatc
 
     tui._reexec_in_place()
     assert execv_calls == [(exe, [exe, "tui"])]
-    assert execvp_calls == []
+    assert not execvp_calls
 
 
 def test_reexec_in_place_execvp_for_bare_ccc(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4329,7 +4337,7 @@ def test_reexec_in_place_execvp_for_bare_ccc(monkeypatch: pytest.MonkeyPatch) ->
 
     tui._reexec_in_place()
     assert execvp_calls == [("ccc", ["ccc", "tui"])]
-    assert execv_calls == []
+    assert not execv_calls
 
 
 def test_tui_clears_a_stale_restart_request_on_startup(

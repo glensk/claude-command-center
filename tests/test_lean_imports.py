@@ -14,23 +14,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+from leanprobe import child_pythonpath, forbidden
+
 LEAN = ("slrender", "rolemark", "livestatus", "usagecache")
-FORBIDDEN = (
-    "command_center.cli",
-    "command_center.config",
-    "command_center.models",
-    "command_center.store",
-    "command_center.usage",  # prefix-matched exactly below: usagecache is allowed
-    "command_center.park",
-    "command_center.tabsymbol",
-    "command_center.accounts",
-    "command_center.adapters",
-    "dataclasses",
-    "argparse",
-    "rich",
-    "textual",
-)
 
 _PROBE = """
 import json, sys
@@ -52,15 +38,11 @@ with open(sys.argv[1], "w", encoding="utf-8") as fh:
 """
 
 
-def _forbidden(module: str) -> bool:
-    return any(module == name or module.startswith(name + ".") for name in FORBIDDEN)
-
-
 def test_lean_modules_load_no_heavy_module(tmp_path: Path) -> None:
     report = tmp_path / "modules.json"
     env = {k: v for k, v in os.environ.items() if k not in {"CCC_HOME", "CLAUDE_HOME"}}
     env.update(
-        PYTHONPATH=os.pathsep.join([str(ROOT), env.get("PYTHONPATH", "")]).rstrip(os.pathsep),
+        PYTHONPATH=child_pythonpath(env),
         HOME=str(tmp_path),
         CLAUDE_HOME=str(tmp_path / "claude"),
     )
@@ -75,11 +57,11 @@ def test_lean_modules_load_no_heavy_module(tmp_path: Path) -> None:
     modules = json.loads(report.read_text(encoding="utf-8"))
     assert all(f"command_center.{name}" in modules for name in LEAN)
     assert (tmp_path / "app" / "usage.json").is_file()  # the probe really wrote
-    assert [m for m in modules if _forbidden(m)] == []
+    assert [m for m in modules if forbidden(m)] == []
 
 
 def test_forbidden_matcher_spares_usagecache() -> None:
-    assert not _forbidden("command_center.usagecache")
-    assert _forbidden("command_center.usage")
-    assert _forbidden("command_center.adapters.claude")
-    assert _forbidden("rich.text")
+    assert not forbidden("command_center.usagecache")
+    assert forbidden("command_center.usage")
+    assert forbidden("command_center.adapters.claude")
+    assert forbidden("rich.text")

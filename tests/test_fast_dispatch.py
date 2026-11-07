@@ -50,7 +50,7 @@ def _error_stderr(parser, argv: list[str]) -> str:
 
 
 # ------------------------------ parity ------------------------------ #
-@pytest.mark.parametrize("argv", _HOT_ARGVS, ids=lambda a: " ".join(a))
+@pytest.mark.parametrize("argv", _HOT_ARGVS, ids=" ".join)
 def test_short_parser_parses_exactly_like_the_full_one(argv: list[str]) -> None:
     short = cli.build_parser(only=argv[0]).parse_args(argv)
     full = cli.build_parser().parse_args(argv)

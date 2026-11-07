@@ -14,10 +14,10 @@ import sys
 from pathlib import Path
 
 import pytest
+from leanprobe import ENTRYPOINT_PROBE_HEAD, child_pythonpath
 
 from command_center.store import Store
 
-ROOT = Path(__file__).resolve().parents[1]
 SID = "sess-entrypoint"
 HEAVY = (
     "command_center.cli",
@@ -29,18 +29,15 @@ HEAVY = (
     "argparse",
 )
 
-_PROBE = """
-import json, sys
-from command_center import entrypoint
-try:
-    code = entrypoint.main(sys.argv[2:])
-except SystemExit as exc:
-    code = exc.code
+_PROBE = (
+    ENTRYPOINT_PROBE_HEAD
+    + """
 roots = ("command_center", "rich", "textual", "argparse")
 mods = sorted(m for m in sys.modules if m.split(".")[0] in roots)
 with open(sys.argv[1], "w", encoding="utf-8") as fh:
     json.dump({"code": code, "modules": mods}, fh)
 """
+)
 
 
 def _home(root: Path) -> Path:
@@ -62,7 +59,7 @@ def _probe(home: Path, tmp_path: Path, *argv: str) -> tuple[dict[str, object], b
         if k not in {"CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CCC_HOME", "CLAUDE_HOME"}
     }
     env.update(
-        PYTHONPATH=os.pathsep.join([str(ROOT), env.get("PYTHONPATH", "")]).rstrip(os.pathsep),
+        PYTHONPATH=child_pythonpath(env),
         HOME=str(home),
         CCC_HOME=str(home),
         CLAUDE_HOME=str(home),

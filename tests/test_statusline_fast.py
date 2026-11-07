@@ -23,16 +23,16 @@ import sqlite3
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from leanprobe import ENTRYPOINT_PROBE_HEAD, child_pythonpath, forbidden
 
 from command_center import cli, config, entrypoint
 from command_center.models import Session
 from command_center.store import Store
 
-ROOT = Path(__file__).resolve().parents[1]
 SID = "sess-fast"
 OTHER = "sess-other"
 NOW = 1_900_000_000
@@ -496,49 +496,21 @@ def test_parity_without_capture_leaves_stdin_unread(
 
 # ---- lean imports -----------------------------------------------------------------------
 
-FORBIDDEN = (
-    "command_center.cli",
-    "command_center.config",
-    "command_center.models",
-    "command_center.store",
-    "command_center.usage",
-    "command_center.park",
-    "command_center.tabsymbol",
-    "command_center.accounts",
-    "command_center.adapters",
-    "dataclasses",
-    "argparse",
-    "rich",
-    "textual",
-)
-
-_PROBE = """
-import json, sys
-from command_center import entrypoint
-try:
-    code = entrypoint.main(sys.argv[2:])
-except SystemExit as exc:
-    code = exc.code
+_PROBE = (
+    ENTRYPOINT_PROBE_HEAD
+    + """
 sys.stdout.flush()
 with open(sys.argv[1], "w", encoding="utf-8") as fh:
     json.dump({"code": code, "modules": sorted(sys.modules)}, fh)
 """
-
-
-def _forbidden(module: str) -> bool:
-    return any(module == name or module.startswith(name + ".") for name in FORBIDDEN)
-
-
-def _pythonpath(env: Mapping[str, str]) -> str:
-    """ROOT prepended to *env*'s PYTHONPATH, so the conftest child guard stays on it."""
-    return os.pathsep.join([str(ROOT), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+)
 
 
 def _probe(tmp_path: Path, stdin: str, *argv: str) -> tuple[dict, bytes]:
     report = tmp_path / "report.json"
     drop = {"CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CONFIG_DIR", "CCC_NO_FASTPATH"}
     env = {k: v for k, v in os.environ.items() if k not in drop}
-    env["PYTHONPATH"] = _pythonpath(env)
+    env["PYTHONPATH"] = child_pythonpath(env)
     proc = subprocess.run(  # noqa: S603
         [sys.executable, "-c", _PROBE, str(report), *argv],
         input=stdin.encode(),
@@ -564,7 +536,7 @@ def test_served_statusline_loads_no_heavy_module(tmp_path: Path) -> None:
     assert (tmp_path / "ccc-role-mark" / SID).is_file()
     modules = report["modules"]
     assert "command_center.livestatus" in modules
-    assert [m for m in modules if _forbidden(m)] == []
+    assert [m for m in modules if forbidden(m)] == []
 
 
 def test_kill_switch_reaches_cli_in_a_real_process(tmp_path: Path) -> None:
@@ -573,7 +545,7 @@ def test_kill_switch_reaches_cli_in_a_real_process(tmp_path: Path) -> None:
     os.environ["CCC_NO_FASTPATH"] = "1"
     try:
         report = tmp_path / "report.json"
-        env = dict(os.environ, PYTHONPATH=_pythonpath(os.environ))
+        env = dict(os.environ, PYTHONPATH=child_pythonpath(os.environ))
         proc = subprocess.run(  # noqa: S603
             [sys.executable, "-c", _PROBE, str(report), *DEFAULT_ARGV],
             input=PAYLOAD.encode(),
@@ -598,7 +570,7 @@ def test_bad_registry_pid_exits_like_cli_in_a_real_process(tmp_path: Path) -> No
     report = tmp_path / "report.json"
     drop = {"CLAUDE_CONFIG_DIR", "CCC_NO_FASTPATH"}
     env = {k: v for k, v in os.environ.items() if k not in drop}
-    env["PYTHONPATH"] = _pythonpath(env)
+    env["PYTHONPATH"] = child_pythonpath(env)
     proc = subprocess.run(  # noqa: S603
         [sys.executable, "-m", "command_center", *DEFAULT_ARGV],
         input=PAYLOAD.encode(),

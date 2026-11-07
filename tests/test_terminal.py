@@ -73,7 +73,7 @@ def test_set_session_titles_skips_when_empty_or_no_osascript(
     # osascript missing -> no subprocess, even with titles to set.
     monkeypatch.setattr(terminal.shutil, "which", lambda _name: None)
     terminal.set_session_titles({"w0t1p0:UUID": "🔴 repo"})
-    assert calls == []
+    assert not calls
 
 
 @pytest.mark.real_title_writer
@@ -106,7 +106,7 @@ def test_set_session_titles_preserving_skips_when_empty_or_no_osascript(
     terminal.set_session_titles_preserving({})
     monkeypatch.setattr(terminal.shutil, "which", lambda _name: None)
     terminal.set_session_titles_preserving({"w0t1p0:UUID": "🟧 repo"})
-    assert calls == []
+    assert not calls
 
 
 # --------------------------------------------------------------------------- #
