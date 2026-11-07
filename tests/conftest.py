@@ -27,18 +27,14 @@ purpose (``test_tabsymbol``, ``test_tui``) still point the cache at their own
 from __future__ import annotations
 
 import base64
-import errno
 import importlib
 import json
 import os
-import shlex
 import subprocess
 import sys
 import time
 import types
-from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 
@@ -156,228 +152,44 @@ def _guard_real_codex_reads(
     _wrap(_cic, "_codex_rate_snapshot", 0)
 
 
-# The developer's REAL home, captured at conftest import — before ``_isolate_home``
-# re-points ``$HOME`` / ``Path.home()`` for the first test.
-_REAL_HOME = Path(os.path.expanduser("~")).resolve()
-
-
 # --------------------------------------------------------------------------- #
-# Kill guard + out-of-tmp audit file (tp#1793)
+# Kill guard, Popen guard and out-of-tmp audit file (tp#1793)
 #
-# A test that hands a fixture pid (4321, 4242, ...) to an unfaked ``os.kill`` signals
-# whatever process holds that pid right now: under suite load pids wrap every few minutes,
-# so that can be a live claude. Every signal a test sends goes through
-# :func:`_guarded_signal`; one aimed at a live process outside the pytest tree is refused
-# and recorded. The record goes to an audit file OUTSIDE the pytest tmp dir, because
-# ``closelog.log_close`` writes its events.log under the pinned (throwaway) app home.
-# Everything here is captured at conftest import, before any test can patch it.
+# The guard logic lives in ONE tests-only module, ``tests/_childguard/ccc_test_guard.py``:
+# this conftest installs it per test (B1/B2, through monkeypatch), and
+# ``tests/_childguard/sitecustomize.py`` installs it in every Python child of the suite
+# (B3; see :func:`_pin_child_guard_env`). Its real ``os.kill`` / ``Popen`` references are
+# captured at import, before any test can patch them.
 # --------------------------------------------------------------------------- #
-_REAL_KILL = os.kill
-_REAL_KILLPG = os.killpg
-_REAL_GETPGRP = os.getpgrp
-_REAL_POPEN = subprocess.Popen
-_ROOT_PID = os.getpid()
-_PS = "/bin/ps" if os.path.exists("/bin/ps") else "ps"  # never a fake ``ps`` on a test PATH
-_WALK_CAP = 64
-_AUDIT_ENV = "CCC_TEST_KILL_AUDIT"
-_STRICT_ENV = "CCC_TEST_KILL_STRICT"
-# The channels instrumented in this run, named in the audit header (B2/B3 append theirs).
-_AUDIT_CHANNELS: list[str] = ["os.kill", "os.killpg", "log_close"]
-_HEADERED: set[str] = set()  # audit files that already got this session's header
-# Pids this session spawned (every ``subprocess.Popen`` child, see _record_popen_child) or
-# proved to be in the pytest tree; they stay here after they die.
-_OWN_PIDS: set[int] = {_ROOT_PID}
-_REAL_EXECUTE_CHILD = subprocess.Popen._execute_child  # type: ignore[attr-defined]  # pylint: disable=no-member
+_CHILDGUARD_DIR = Path(__file__).resolve().parent / "_childguard"
+if str(_CHILDGUARD_DIR) not in sys.path:
+    sys.path.append(str(_CHILDGUARD_DIR))
+import ccc_test_guard as guard  # noqa: E402  # pylint: disable=wrong-import-position
 
-
-def _record_popen_child(self: subprocess.Popen, *args: object, **kwargs: object) -> None:
-    """``Popen._execute_child`` that remembers the child pid in :data:`_OWN_PIDS`."""
-    _REAL_EXECUTE_CHILD(self, *args, **kwargs)
-    _OWN_PIDS.add(self.pid)
-
-
-def _audit_path() -> Path:
-    """``$CCC_TEST_KILL_AUDIT``, else ``~/.cache/ccc-test-kill-audit.log`` of the REAL home."""
-    raw = os.environ.get(_AUDIT_ENV, "")
-    return Path(raw) if raw else _REAL_HOME / ".cache" / "ccc-test-kill-audit.log"
-
-
-def _now() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
-
-
-def _audit_write(record: dict[str, object]) -> None:
-    """Append *record* (and this session's header first, once per file). Never raises."""
-    path = _audit_path()
-    lines = []
-    if str(path) not in _HEADERED:
-        _HEADERED.add(str(path))
-        header = {
-            "ts": _now(),
-            "event": "header",
-            "pytest_pid": _ROOT_PID,
-            "channels": list(_AUDIT_CHANNELS),
-            "strict": os.environ.get(_STRICT_ENV) == "1",
-        }
-        lines.append(json.dumps(header))
-    if record:
-        lines.append(json.dumps(record))
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        try:
-            os.write(fd, ("\n".join(lines) + "\n").encode("utf-8"))
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
-
-
-def _ps_field(pid: int, field: str) -> str | None:
-    """``ps -o <field>= -p <pid>`` through the captured Popen; ``None`` on any failure."""
-    try:
-        with _REAL_POPEN(
-            [_PS, "-o", f"{field}=", "-p", str(pid)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ) as proc:
-            try:
-                out, _ = proc.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                _REAL_KILL(proc.pid, 9)  # our own ps child; never via the guarded os.kill
-                proc.communicate()
-                return None
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return out.strip() if proc.returncode == 0 else None
-
-
-def _in_pytest_tree(pid: int) -> bool:
-    """True when *pid* is the pytest process or one of its descendants.
-
-    Walks ``ppid`` links at most :data:`_WALK_CAP` levels; a parse failure, a timeout or
-    hitting the cap answers ``False`` (the caller treats the target as foreign).
-    """
-    current = pid
-    for _ in range(_WALK_CAP):
-        if current == _ROOT_PID:
-            return True
-        if current <= 1:
-            return False
-        parent = _ps_field(current, "ppid")
-        if not parent or not parent.isdigit():
-            return False
-        current = int(parent)
-    return False
-
-
-def _exists(probe: Callable[[int, int], None], pid: int) -> bool:
-    """Signal-0 probe through the REAL kill: ``EPERM`` still means the target exists."""
-    try:
-        probe(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True
-    return True
-
-
-def _group_of_own_dead_leader(pgid: int) -> bool:
-    """True for a live group whose leader this session spawned and which has since exited.
-
-    A group outlives its leader (a forked grandchild keeps it), and POSIX never hands the
-    pgid out again while the group exists — so such a group is still the one we created.
-    """
-    return pgid in _OWN_PIDS and not _exists(_REAL_KILL, pgid)
-
-
-def _guarded_signal(nodeid: str, channel: str, target: int, sig: int) -> None:
-    """Deliver ``os.kill`` / ``os.killpg`` unless it would hit a live process outside pytest.
-
-    Rules, in order: signal 0 passes; the own process group (``kill(0)``, ``kill(-own)``,
-    ``killpg(own)``, ``killpg(<=0)``) passes; a target that does not exist goes to the real
-    call (which raises ``ProcessLookupError``) and is logged ``would-hit-on-recycle`` unless
-    it was ours; a target in the pytest tree passes, and so does a live group whose
-    leader we spawned and which has exited (:func:`_group_of_own_dead_leader`); anything else — and
-    ``kill(-1, …)``, "every process I may signal" — is ``foreign``: logged, then refused
-    with ``ProcessLookupError`` (or ``AssertionError`` under ``CCC_TEST_KILL_STRICT=1``).
-    A group (``killpg(g)``, ``kill(-g)``) is judged by its leader pid *g*.
-    """
-    is_group = channel == "os.killpg" or target < 0
-
-    def deliver() -> None:
-        if channel == "os.killpg":
-            _REAL_KILLPG(target, sig)
-        else:
-            _REAL_KILL(target, sig)
-
-    if sig == 0:
-        deliver()
-        return
-    if channel == "os.killpg":
-        leader = target
-        if leader <= 0:  # killpg(0) = own group; a negative one is EINVAL from the real call
-            deliver()
-            return
-    else:
-        leader = -target if target < 0 else target
-        if target == 0:
-            deliver()
-            return
-    if is_group and leader == _REAL_GETPGRP():
-        deliver()
-        return
-    if target != -1:
-        alive = _exists(_REAL_KILLPG if is_group else _REAL_KILL, leader)
-        if not alive:
-            if leader not in _OWN_PIDS:
-                _audit_write(_audit_record(nodeid, channel, target, sig, "would-hit-on-recycle"))
-            deliver()
-            return
-        if _in_pytest_tree(leader) or (is_group and _group_of_own_dead_leader(leader)):
-            _OWN_PIDS.add(leader)
-            deliver()
-            return
-    _audit_write(_audit_record(nodeid, channel, target, sig, "foreign"))
-    if os.environ.get(_STRICT_ENV) == "1":
-        raise AssertionError(f"test signalled a foreign pid {target} (sig {sig}) via {channel}")
-    raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
-
-
-def _audit_record(
-    nodeid: str, channel: str, target: int, sig: int | None, verdict: str, **extra: object
-) -> dict[str, object]:
-    """One audit line; *target* is resolved to its ``ps -o comm=`` (a group: its leader's)."""
-    signalled = channel != "log_close" and target not in (0, -1)
-    comm = _ps_field(abs(target), "comm") if signalled else None
-    record: dict[str, object] = {
-        "ts": _now(),
-        "nodeid": nodeid,
-        "channel": channel,
-        "pid": target,
-        "sig": sig,
-        "target": comm or "",
-        "verdict": verdict,
-    }
-    record.update(extra)
-    return record
+# The developer's REAL home, captured at guard import — before ``_isolate_home``
+# re-points ``$HOME`` / ``Path.home()`` for the first test.
+_REAL_HOME = guard._REAL_HOME
+_AUDIT_CHANNELS = guard._AUDIT_CHANNELS  # B2's conftest-only channels are appended below
+_AUDIT_CHANNELS.append("spawn_ccc")
+_AUDIT_CHANNELS.append("iterm_api:snapshot._connect")
+if _iterm2 is not None:
+    _AUDIT_CHANNELS.append("iterm_api:Connection.async_create")
 
 
 @pytest.fixture(scope="session", autouse=True)
 def _kill_audit_header() -> None:
     """Write this session's header (the instrumented channels) to the audit file up front."""
-    _audit_write({})
+    guard._audit_write({})
 
 
 @pytest.fixture(autouse=True)
 def _guard_real_signals(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Route every ``os.kill`` / ``os.killpg`` through :func:`_guarded_signal` (tp#1793).
+    """Route every ``os.kill`` / ``os.killpg`` through ``guard._guarded_signal`` (tp#1793).
 
     Tests that fake ``os.kill`` themselves simply re-override this (monkeypatch is
     last-wins). Every ``closelog.log_close`` call is mirrored into the audit file too,
     then the original still writes the tmp events.log, and every ``subprocess.Popen``
-    child pid is remembered (:data:`_OWN_PIDS`). Opt out of the signal guard (not the
+    child pid is remembered (``guard._OWN_PIDS``). Opt out of the signal guard (not the
     mirror or the pid record) with ``@pytest.mark.real_signal``.
     """
     nodeid = request.node.nodeid
@@ -388,8 +200,8 @@ def _guard_real_signals(request: pytest.FixtureRequest, monkeypatch: pytest.Monk
     def mirrored_log_close(
         session_id: str, pid: int, path: str, *, note: str = "", who: str = ""
     ) -> None:
-        _audit_write(
-            _audit_record(
+        guard._audit_write(
+            guard._audit_record(
                 nodeid,
                 "log_close",
                 pid,
@@ -404,18 +216,35 @@ def _guard_real_signals(request: pytest.FixtureRequest, monkeypatch: pytest.Monk
         original_log_close(session_id, pid, path, note=note, who=who)
 
     monkeypatch.setattr(closelog, "log_close", mirrored_log_close)
-    monkeypatch.setattr(subprocess.Popen, "_execute_child", _record_popen_child)
+    monkeypatch.setattr(subprocess.Popen, "_execute_child", guard._record_popen_child)
     if request.node.get_closest_marker("real_signal"):
         return
 
     def guarded_kill(pid: int, sig: int, /) -> None:
-        _guarded_signal(nodeid, "os.kill", pid, sig)
+        guard._guarded_signal(nodeid, "os.kill", pid, sig)
 
     def guarded_killpg(pgid: int, sig: int, /) -> None:
-        _guarded_signal(nodeid, "os.killpg", pgid, sig)
+        guard._guarded_signal(nodeid, "os.killpg", pgid, sig)
 
     monkeypatch.setattr(os, "kill", guarded_kill)
     monkeypatch.setattr(os, "killpg", guarded_killpg)
+
+
+@pytest.fixture(autouse=True)
+def _pin_child_guard_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Arm the subprocess-child guard (tp#1793 B3) in every Python child a test starts.
+
+    ``tests/_childguard`` goes first on ``PYTHONPATH``, so a child's ``site`` imports its
+    ``sitecustomize``; ``CCC_TEST_KILL_AUDIT`` (resolved now: the env value or the real-home
+    default) activates it and ``CCC_TEST_ROOT_PID`` names the pytest pid as the descendant
+    root. A test that builds its child env from ``os.environ`` keeps all three; one that
+    REPLACES ``PYTHONPATH`` runs its children unguarded.
+    """
+    monkeypatch.setenv(guard._AUDIT_ENV, str(guard._audit_path()))
+    monkeypatch.setenv(guard._ROOT_ENV, str(guard._State.root_pid))
+    existing = [entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep) if entry]
+    if str(_CHILDGUARD_DIR) not in existing:
+        monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(_CHILDGUARD_DIR), *existing]))
 
 
 # --------------------------------------------------------------------------- #
@@ -426,80 +255,6 @@ def _guard_real_signals(request: pytest.FixtureRequest, monkeypatch: pytest.Monk
 # ``ccc`` (``spawn.spawn_ccc``), and the iTerm Python API (``async_send_text`` into a real
 # tab). Each refusal writes a ``refused`` audit line, then raises ``AssertionError``.
 # --------------------------------------------------------------------------- #
-# Binary basename -> the marker that opts a test out of the Popen guard for it.
-_POPEN_GUARDED: dict[str, str] = {
-    "osascript": "real_osascript",
-    "tmux": "real_signal",
-    "kill": "real_signal",
-    "ccc": "real_signal",
-}
-# The test interpreter's OWN ``ccc`` console script (this checkout's code, the same child as
-# ``sys.executable -m command_center``, which B3 covers) is not the live installed ``ccc``.
-_OWN_CCC = os.path.realpath(Path(sys.executable).with_name("ccc"))
-_SHELL_POS = 7  # ``shell`` in ``Popen._execute_child(args, executable, *rest)``
-_ARGV_KEEP = 6  # argv entries kept in a refusal line
-_ARG_CHARS = 200  # characters kept per argv entry (an AppleScript body is long)
-
-
-def _is_own_ccc(program: str, basetemp: Path) -> bool:
-    """True for a ``ccc`` that is this checkout's code, not the live install.
-
-    That is the test interpreter's own console script, or one a test built under the pytest
-    basetemp (``test_packaging`` installs the wheel into a tmp venv). A bare ``ccc`` is
-    never trusted: ``PATH`` resolves it to the live install.
-    """
-    if not os.path.isabs(program):
-        return False
-    real = Path(os.path.realpath(program))
-    return str(real) == _OWN_CCC or basetemp in real.parents
-
-
-_AUDIT_CHANNELS.extend(f"popen:{name}" for name in _POPEN_GUARDED)
-_AUDIT_CHANNELS.append("spawn_ccc")
-_AUDIT_CHANNELS.append("iterm_api:snapshot._connect")
-if _iterm2 is not None:
-    _AUDIT_CHANNELS.append("iterm_api:Connection.async_create")
-
-
-def _popen_argv(args: object, executable: object, shell: object) -> list[str]:
-    """The argv ``Popen._execute_child`` is about to run (its own POSIX normalisation).
-
-    Under ``shell=True`` the shell itself is argv[0]; the program judged is then the
-    first word of the command string.
-    """
-    if isinstance(args, (str, bytes, os.PathLike)):
-        argv = [os.fsdecode(args)]
-    else:
-        argv = [
-            os.fsdecode(arg) if isinstance(arg, (bytes, os.PathLike)) else str(arg)
-            for arg in args  # type: ignore[attr-defined]
-        ]
-    if shell and argv:
-        try:
-            words = shlex.split(argv[0])
-        except ValueError:
-            words = argv[0].split()
-        argv = [*words, *argv[1:]]
-    elif isinstance(executable, (str, bytes, os.PathLike)):
-        argv = [os.fsdecode(executable), *argv[1:]]
-    return argv
-
-
-def _refusal(nodeid: str, channel: str, **extra: object) -> dict[str, object]:
-    """One ``refused`` audit line (no pid: nothing was started)."""
-    record: dict[str, object] = {
-        "ts": _now(),
-        "nodeid": nodeid,
-        "channel": channel,
-        "pid": None,
-        "sig": None,
-        "target": "",
-        "verdict": "refused",
-    }
-    record.update(extra)
-    return record
-
-
 @pytest.fixture(autouse=True)
 def _guard_real_spawns(
     request: pytest.FixtureRequest,
@@ -520,32 +275,26 @@ def _guard_real_spawns(
     request.getfixturevalue("_guard_real_signals")  # its _execute_child first, ours on top
     nodeid = request.node.nodeid
     basetemp = tmp_path_factory.getbasetemp().resolve()
-    opted_out = {
-        name for name, marker in _POPEN_GUARDED.items() if request.node.get_closest_marker(marker)
-    }
+    opted_out = frozenset(
+        name
+        for name, marker in guard._POPEN_GUARDED.items()
+        if request.node.get_closest_marker(marker)
+    )
 
     def guarded_execute_child(
         self: subprocess.Popen, args: object, executable: object, *rest: object, **kwargs: object
     ) -> None:
-        shell = rest[_SHELL_POS] if len(rest) > _SHELL_POS else kwargs.get("shell", False)
-        argv = _popen_argv(args, executable, shell)
-        name = os.path.basename(argv[0]) if argv else ""
-        own_ccc = name == "ccc" and _is_own_ccc(argv[0], basetemp)
-        if name in _POPEN_GUARDED and name not in opted_out and not own_ccc:
-            kept = [arg[:_ARG_CHARS] for arg in argv[:_ARGV_KEEP]]
-            _audit_write(_refusal(nodeid, f"popen:{name}", target=name, argv=kept))
-            raise AssertionError(
-                f"a test ran the real {name} ({argv[0]}) through subprocess.Popen; fake its "
-                f"caller (opt-out: @pytest.mark.{_POPEN_GUARDED[name]})"
-            )
-        _record_popen_child(self, args, executable, *rest, **kwargs)
+        guard._popen_check(nodeid, (args, executable, rest, kwargs), basetemp, opted_out)
+        guard._record_popen_child(self, args, executable, *rest, **kwargs)
 
     monkeypatch.setattr(subprocess.Popen, "_execute_child", guarded_execute_child)
 
     from command_center import spawn  # pylint: disable=import-outside-toplevel
 
     def refused_spawn_ccc(args: list[str], *, internal: bool = True) -> NoReturn:
-        _audit_write(_refusal(nodeid, "spawn_ccc", target="ccc", argv=list(args)[:_ARGV_KEEP]))
+        guard._audit_write(
+            guard._refusal(nodeid, "spawn_ccc", target="ccc", argv=list(args)[: guard._ARGV_KEEP])
+        )
         raise AssertionError(
             f"a test reached the real spawn.spawn_ccc({args!r}, internal={internal}); "
             "monkeypatch spawn.spawn_ccc"
@@ -570,7 +319,7 @@ def _guard_real_iterm_api(request: pytest.FixtureRequest, monkeypatch: pytest.Mo
     from command_center import snapshot  # pylint: disable=import-outside-toplevel
 
     def refused_connect(*_args: object, **_kwargs: object) -> NoReturn:
-        _audit_write(_refusal(nodeid, "iterm_api:snapshot._connect", target="iTerm2"))
+        guard._audit_write(guard._refusal(nodeid, "iterm_api:snapshot._connect", target="iTerm2"))
         raise AssertionError("a test reached the real iTerm Python API via snapshot._connect")
 
     monkeypatch.setattr(snapshot, "_connect", refused_connect)
@@ -578,7 +327,9 @@ def _guard_real_iterm_api(request: pytest.FixtureRequest, monkeypatch: pytest.Mo
         return
 
     def refused_async_create(*_args: object, **_kwargs: object) -> NoReturn:
-        _audit_write(_refusal(nodeid, "iterm_api:Connection.async_create", target="iTerm2"))
+        guard._audit_write(
+            guard._refusal(nodeid, "iterm_api:Connection.async_create", target="iTerm2")
+        )
         raise AssertionError("a test reached the real iTerm Python API (Connection.async_create)")
 
     monkeypatch.setattr(_iterm2.Connection, "async_create", staticmethod(refused_async_create))

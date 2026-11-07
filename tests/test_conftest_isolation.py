@@ -7,11 +7,12 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import NoReturn
 
-import conftest
+import ccc_test_guard as guard
 import pytest
 from conftest import _is_ambient_claude_env
 
@@ -68,7 +69,7 @@ class _FakeKill:
 
 def test_kill_guard_allows_signal_zero(audit: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeKill()
-    monkeypatch.setattr(conftest, "_REAL_KILL", fake)
+    monkeypatch.setattr(guard, "_REAL_KILL", fake)
     os.kill(1, 0)
     assert fake.calls == [(1, 0)]
     assert not _events(audit)
@@ -76,7 +77,7 @@ def test_kill_guard_allows_signal_zero(audit: Path, monkeypatch: pytest.MonkeyPa
 
 def test_kill_guard_refuses_foreign_pid(audit: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeKill()
-    monkeypatch.setattr(conftest, "_REAL_KILL", fake)
+    monkeypatch.setattr(guard, "_REAL_KILL", fake)
     with pytest.raises(ProcessLookupError):
         os.kill(1, signal.SIGTERM)
     assert fake.calls == [(1, 0)]  # the probe only: the real SIGTERM was never sent
@@ -93,7 +94,7 @@ def test_kill_guard_refuses_foreign_pid(audit: Path, monkeypatch: pytest.MonkeyP
 
 def test_kill_guard_strict_raises_assertion(audit: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeKill()
-    monkeypatch.setattr(conftest, "_REAL_KILL", fake)
+    monkeypatch.setattr(guard, "_REAL_KILL", fake)
     monkeypatch.setenv("CCC_TEST_KILL_STRICT", "1")
     with pytest.raises(AssertionError, match="foreign pid 1"):
         os.kill(1, signal.SIGTERM)
@@ -103,7 +104,7 @@ def test_kill_guard_strict_raises_assertion(audit: Path, monkeypatch: pytest.Mon
 
 def test_kill_guard_refuses_kill_all(audit: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeKill()
-    monkeypatch.setattr(conftest, "_REAL_KILL", fake)
+    monkeypatch.setattr(guard, "_REAL_KILL", fake)
     with pytest.raises(ProcessLookupError):
         os.kill(-1, signal.SIGTERM)
     assert not fake.calls
@@ -112,7 +113,7 @@ def test_kill_guard_refuses_kill_all(audit: Path, monkeypatch: pytest.MonkeyPatc
 
 def test_kill_guard_refuses_foreign_group(audit: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeKill()
-    monkeypatch.setattr(conftest, "_REAL_KILLPG", fake)
+    monkeypatch.setattr(guard, "_REAL_KILLPG", fake)
     with pytest.raises(ProcessLookupError):
         os.killpg(1, signal.SIGTERM)
     assert fake.calls == [(1, 0)]
@@ -163,8 +164,8 @@ def test_kill_guard_mirrors_log_close(audit: Path) -> None:
 
 @pytest.mark.real_signal
 def test_kill_guard_real_signal_opt_out() -> None:
-    assert os.kill is conftest._REAL_KILL
-    assert os.killpg is conftest._REAL_KILLPG
+    assert os.kill is guard._REAL_KILL
+    assert os.killpg is guard._REAL_KILLPG
 
 
 def test_kill_guard_dead_own_child_is_not_logged(audit: Path) -> None:
@@ -188,10 +189,10 @@ def test_kill_guard_sweeps_own_group_after_leader_exit(audit: Path) -> None:
     os.killpg(leader.pid, signal.SIGTERM)
     assert not _events(audit)
     for _ in range(100):
-        if not conftest._exists(conftest._REAL_KILL, grandchild):
+        if not guard._exists(guard._REAL_KILL, grandchild):
             break
         time.sleep(0.05)
-    assert not conftest._exists(conftest._REAL_KILL, grandchild)
+    assert not guard._exists(guard._REAL_KILL, grandchild)
 
 
 # --------------------------------------------------------------------------- #
@@ -205,7 +206,7 @@ NO_BIN = "/nonexistent-tp1793/bin"
 
 
 class _NoExec:
-    """Installed as ``conftest._REAL_EXECUTE_CHILD``: records a call that got past the guard."""
+    """Installed as ``guard._REAL_EXECUTE_CHILD``: records a call that got past the guard."""
 
     def __init__(self) -> None:
         self.argv: list[object] = []
@@ -222,7 +223,7 @@ def _no_exec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _NoExec:
     empty.mkdir()
     monkeypatch.setenv("PATH", str(empty))
     fake = _NoExec()
-    monkeypatch.setattr(conftest, "_REAL_EXECUTE_CHILD", fake)
+    monkeypatch.setattr(guard, "_REAL_EXECUTE_CHILD", fake)
     return fake
 
 
@@ -257,8 +258,8 @@ def test_spawn_guard_ccc_popen_refused(audit: Path, no_exec: _NoExec) -> None:
 def test_spawn_guard_lets_own_venv_ccc_through(audit: Path, no_exec: _NoExec) -> None:
     """The interpreter's own console script is this checkout's code, not the live ``ccc``."""
     with pytest.raises(FileNotFoundError):  # raised by the fake under the guard
-        subprocess.Popen([conftest._OWN_CCC, "aim", "-h"])  # pylint: disable=consider-using-with
-    assert no_exec.argv == [[conftest._OWN_CCC, "aim", "-h"]]
+        subprocess.Popen([guard._OWN_CCC, "aim", "-h"])  # pylint: disable=consider-using-with
+    assert no_exec.argv == [[guard._OWN_CCC, "aim", "-h"]]
     assert not _events(audit)
 
 
@@ -368,3 +369,139 @@ def test_osascript_guard_real_iterm_opt_out() -> None:
 
     assert snapshot._connect.__name__ == "_connect"
     assert iterm2.Connection.async_create.__name__ == "async_create"
+
+
+# --------------------------------------------------------------------------- #
+# The subprocess-child guard: tests/_childguard/sitecustomize.py (tp#1793 B3)
+#
+# The child's foreign target is pid 1 (launchd / init): a non-root process can never
+# signal it, so even a broken guard ends in EPERM, never in a delivered signal.
+# --------------------------------------------------------------------------- #
+CHILDGUARD = Path(guard.__file__).resolve().parent
+
+_CHILD_SIGTERM = """
+import os
+from command_center import closelog
+print(closelog.sigterm(1, "sid-1793-b3", "tp1793-child"), os.kill.__module__)
+"""
+
+
+def _child(code: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Run *code* in ``sys.executable`` with the pinned test env (or *env*)."""
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env=dict(os.environ) if env is None else env,
+        timeout=60,
+        check=False,
+    )
+
+
+def test_kill_guard_child_env_is_pinned() -> None:
+    assert os.environ["PYTHONPATH"].split(os.pathsep)[0] == str(CHILDGUARD)
+    assert os.environ["CCC_TEST_ROOT_PID"] == str(os.getpid())
+    assert os.environ["CCC_TEST_KILL_AUDIT"]
+
+
+def test_kill_guard_child_inherits(audit: Path) -> None:
+    """A ``sys.executable`` child's foreign SIGTERM is refused and logged with its own pid."""
+    with subprocess.Popen(
+        [sys.executable, "-c", _CHILD_SIGTERM],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=dict(os.environ),
+    ) as proc:
+        out, err = proc.communicate(timeout=60)
+    assert proc.returncode == 0, err
+    assert out.split() == ["False", "ccc_test_guard"]  # refused: "already gone", nothing logged
+    (event,) = _events(audit)
+    assert (event["channel"], event["verdict"]) == ("os.kill", "foreign")
+    assert (event["pid"], event["sig"]) == (1, signal.SIGTERM)
+    assert event["child_pid"] == proc.pid
+    assert event["via"] == "child_sitecustomize"
+    assert event["nodeid"] == "tests/test_conftest_isolation.py::test_kill_guard_child_inherits"
+    lines = audit.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1  # a child writes no header: the pytest session owns it
+
+
+def test_kill_guard_child_strict_raises_assertion(
+    audit: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CCC_TEST_KILL_STRICT", "1")
+    proc = _child("import os, signal\nos.kill(1, signal.SIGTERM)")
+    assert proc.returncode != 0
+    assert "AssertionError: test signalled a foreign pid 1" in proc.stderr
+    assert [event["verdict"] for event in _events(audit)] == ["foreign"]
+
+
+def test_kill_guard_child_refuses_osascript(audit: Path) -> None:
+    proc = _child(f"import subprocess\nsubprocess.run([{NO_BIN + '/osascript'!r}, '-e', 'beep'])")
+    assert proc.returncode != 0
+    assert "AssertionError: a test ran the real osascript" in proc.stderr
+    (event,) = _events(audit)
+    assert (event["channel"], event["verdict"]) == ("popen:osascript", "refused")
+    assert event["argv"] == [f"{NO_BIN}/osascript", "-e", "beep"]
+    assert isinstance(event["child_pid"], int)
+
+
+def test_kill_guard_child_allows_own_child(audit: Path) -> None:
+    code = (
+        "import signal, subprocess\n"
+        "with subprocess.Popen(['sleep', '30']) as child:\n"
+        "    import os\n"
+        "    os.kill(child.pid, signal.SIGTERM)\n"
+        "    print(child.wait(timeout=10))\n"
+    )
+    proc = _child(code)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == str(-signal.SIGTERM)
+    assert not _events(audit)
+
+
+def test_kill_guard_child_inactive_without_audit_env(audit: Path) -> None:
+    env = dict(os.environ)
+    env.pop("CCC_TEST_KILL_AUDIT")
+    proc = _child("import os, sys\nprint(os.kill.__module__, 'ccc_test_guard' in sys.modules)", env)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ["posix", "True"]  # imported, not installed
+    assert not audit.exists()
+
+
+def test_kill_guard_child_chains_other_sitecustomize(tmp_path: Path) -> None:
+    """A ``sitecustomize`` further down ``PYTHONPATH`` still runs after the child guard."""
+    other = tmp_path / "other-site"
+    other.mkdir()
+    marker = tmp_path / "chained.txt"
+    (other / "sitecustomize.py").write_text(
+        "import os, sys\n"
+        "with open(os.environ['TP1793_MARK'], 'w', encoding='utf-8') as fh:\n"
+        "    fh.write(str('ccc_test_guard' in sys.modules))\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ, TP1793_MARK=str(marker))
+    env["PYTHONPATH"] = os.pathsep.join([env["PYTHONPATH"], str(other)])
+    proc = _child("import os\nprint(os.kill.__module__)", env)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "ccc_test_guard"
+    assert marker.read_text(encoding="utf-8") == "True"  # ran, and after the guard
+
+
+def test_kill_guard_child_lets_tmp_built_ccc_through(audit: Path, tmp_path: Path) -> None:
+    """A child may run a ``ccc`` built under the temp dir (the smoke matrix sandbox venv)."""
+    built = str(tmp_path / "venv" / "bin" / "ccc")
+    code = (
+        "import subprocess\n"
+        "try:\n"
+        f"    subprocess.Popen([{built!r}, '-h'])\n"
+        "except FileNotFoundError:\n"
+        "    print('not-found')\n"
+    )
+    proc = _child(code)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "not-found"  # reached the real exec: the guard let it by
+    assert not _events(audit)
+    refused = _child(f"import subprocess\nsubprocess.Popen([{NO_BIN + '/ccc'!r}, '-h'])")
+    assert "AssertionError: a test ran the real ccc" in refused.stderr
+    assert [event["channel"] for event in _events(audit)] == ["popen:ccc"]
