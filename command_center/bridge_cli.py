@@ -19,7 +19,8 @@ has no registry entry), with a null, unvalidated tab. The status is the CLI's vi
 to §6 (:mod:`command_center.adapters.claude_agents`), with ``raw_status`` (that raw word)
 beside it: an interactive ``shell`` reads ``idle`` when its transcript shows no open turn
 (``livestatus.effective_status``, tp#1790 — an idle staff session holding its doorbell),
-else ``busy`` (an open or unknown turn: fail closed). The tab is
+else ``busy`` (an open or unknown turn: fail closed). The CLI reports a registry ``shell``
+as ``busy``, so a CLI ``busy`` over a registry ``shell`` is read as ``shell``. The tab is
 ``validated`` only when the registry pid's controlling tty is the tab's tty (spike
 S-IDENT); a stored tab id that is missing or wrong is resolved by that tty
 (:func:`bridge_target.resolve_tab`). Headless ``claude -p`` runs (registry
@@ -228,10 +229,19 @@ def _agent_for(live: LiveSession, by_sid: dict[str, AgentEntry]) -> AgentEntry |
 
 
 def live_raw_status(live: LiveSession, agent: AgentEntry | None) -> str:
-    """The raw status word :func:`live_status` maps: the CLI's view first, else the registry's."""
+    """The raw status word :func:`live_status` maps: the CLI's view first, else the registry's.
+
+    One exception for an interactive session: ``claude agents --json`` folds the
+    registry's ``shell`` into ``busy``, which hides the one word the open-turn check
+    (:func:`shell_turn_active`) reads. A CLI ``busy`` over a registry ``shell`` is
+    therefore ``shell`` — still busy unless the transcript shows no open turn (tp#1790).
+    """
     if live.kind != "interactive" or (agent is not None and agent.background):
         return (agent.status if agent is not None else "") or live.raw_status
     if agent is not None and agent.status:
+        cli_busy = agent.status.strip().lower() == "busy"
+        if cli_busy and (live.raw_status or "").strip().lower() == "shell":
+            return live.raw_status
         return agent.status
     return live.raw_status
 

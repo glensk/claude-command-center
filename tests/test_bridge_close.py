@@ -772,6 +772,51 @@ def test_staff_close_sessions_json_shell_status(
     assert [(e["status"], e["raw_status"]) for e in entries] == [(status, "shell")]
 
 
+@pytest.mark.parametrize(
+    ("tail", "status"),
+    [
+        ("ended", "idle"),  # only the doorbell waiter shell, no open turn
+        ("open", "busy"),  # a real tool shell inside an open turn
+        ("unknown", "busy"),  # no transcript: fail closed
+    ],
+)
+def test_staff_close_sessions_json_cli_busy_over_registry_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tail: str, status: str
+) -> None:
+    """The real pair (B7 canary): ``claude agents --json`` says busy, the registry shell."""
+    world, _deps = _install(tmp_path, monkeypatch)
+    _staff_session(world, monkeypatch, f"staff wait -a {AGENT}")
+    if tail == "open":
+        world.append(_prompt("u2", "another one"))
+        world.table[5004] = PsRow(PID, TTY, "S", _shell("pytest -q"))
+    live = LiveSession(pid=PID, session_id=SID, cwd="/repo", raw_status="shell", alive=True)
+    agent = AgentEntry(config_dir="/acct", session_id=SID, kind="interactive", status="busy")
+    adapter = cli.ClaudeAdapter()
+    if tail == "unknown":
+        monkeypatch.setattr(cli.ClaudeAdapter, "transcript_path", lambda *_a, **_k: None)
+    assert bridge_cli.live_raw_status(live, agent) == "shell"
+    entries = bridge_cli.collect_sessions(
+        adapter=_OneLive(adapter, live),  # type: ignore[arg-type]
+        panes_reader=lambda: [],
+        ps_reader=lambda: world.table,
+        account_label=lambda _d: "a",
+        agents_reader=lambda: [agent],
+    )
+    assert [(e["status"], e["raw_status"]) for e in entries] == [(status, "shell")]
+
+
+@pytest.mark.parametrize(("cli_status", "status"), [("busy", "busy"), ("waiting", "waiting")])
+def test_cli_status_wins_over_other_registry_words(cli_status: str, status: str) -> None:
+    """Only a CLI ``busy`` over a registry ``shell`` defers to the registry."""
+    live = LiveSession(pid=PID, session_id=SID, cwd="/repo", raw_status="idle", alive=True)
+    agent = AgentEntry(config_dir="/acct", session_id=SID, kind="interactive", status=cli_status)
+    assert bridge_cli.live_raw_status(live, agent) == cli_status
+    assert bridge_cli.live_status(live, agent, False) == status
+    shell = LiveSession(pid=PID, session_id=SID, cwd="/repo", raw_status="shell", alive=True)
+    waiting = AgentEntry(config_dir="/acct", session_id=SID, kind="interactive", status="waiting")
+    assert bridge_cli.live_raw_status(shell, waiting) == "waiting"
+
+
 class _OneLive:
     """An adapter whose registry is *live* only (the real transcript lookup otherwise)."""
 
