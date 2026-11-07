@@ -30,6 +30,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from .screenread import ScreenCell, ScreenRead
+
 # Same marker as ``adapters.claude._KEEPWARM_MARKER`` (kept here to avoid an import cycle).
 _KEEPWARM_MARKER = "cc-keepwarm.sh"
 
@@ -1289,6 +1291,84 @@ def iterm_session_vars(
                 value = await session.async_get_variable(name)
                 out[name] = "" if value is None else str(value)
             return out
+
+        return asyncio.run(_go())
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+
+
+#: Bottom screen lines :func:`iterm_screen_tail` returns (tp#1844).
+SCREEN_TAIL_LINES = 60
+
+
+def _fg_descriptor(style: Any) -> str:
+    """``CellStyle.fg_color`` as a short string (see :class:`screenread.ScreenCell`)."""
+    color = getattr(style, "fg_color", None) if style is not None else None
+    if color is None:
+        return ""
+    if color.is_rgb:
+        rgb = color.rgb
+        return f"rgb:{rgb.red:02x}{rgb.green:02x}{rgb.blue:02x}"
+    if color.is_standard:
+        return f"std:{color.standard}"
+    if color.is_alternate:
+        return f"alt:{getattr(color.alternate, 'name', color.alternate)}"
+    return ""
+
+
+def _screen_cells(line: Any, cols: int) -> tuple[ScreenCell, ...]:
+    """One line as per-column cells (``string_at`` / ``style_at``; never ``line.string[x]``)."""
+    cells = []
+    for x in range(cols):
+        try:
+            ch = line.string_at(x)
+        except IndexError:
+            ch = ""
+        style = line.style_at(x)
+        cells.append(
+            ScreenCell(
+                ch=ch,
+                faint=bool(getattr(style, "faint", False)),
+                inverse=bool(getattr(style, "inverse", False)),
+                fg=_fg_descriptor(style),
+            )
+        )
+    return tuple(cells)
+
+
+def iterm_screen_tail(iterm_session_id: str, lines: int = SCREEN_TAIL_LINES) -> ScreenRead | None:
+    """Read-only: the bottom *lines* screen lines of a session, cell by cell (tp#1844).
+
+    One fresh Python-API connection (the TCC pre-check of :func:`iterm_session_vars`) and
+    one ``async_get_screen_contents``; nothing is ever sent to the session. ``None`` =
+    unreachable or a session the API does not know. The text read never leaves this
+    process through a log line.
+    """
+    uuid = (iterm_session_id or "").split(":")[-1].strip()
+    if not uuid:
+        return None
+    if not _iterm_api_auth_is_tcc_free() and not _iterm_reachable_by_apple_event():
+        return None
+    try:
+        import asyncio  # pylint: disable=import-outside-toplevel
+
+        import iterm2  # pylint: disable=import-outside-toplevel
+
+        async def _go() -> ScreenRead | None:
+            iterm2.app.invalidate_app()
+            conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
+            app = await iterm2.async_get_app(conn)
+            session = app.get_session_by_id(uuid) if app is not None else None
+            if session is None:
+                return None
+            contents = await session.async_get_screen_contents()
+            cols = int(session.grid_size.width)
+            total = int(contents.number_of_lines)
+            start = max(0, total - max(1, lines))
+            rows = tuple(_screen_cells(contents.line(i), cols) for i in range(start, total))
+            cursor = contents.cursor_coord
+            y = int(cursor.y) - start
+            return ScreenRead(cols, (int(cursor.x), y if 0 <= y < len(rows) else -1), rows)
 
         return asyncio.run(_go())
     except Exception:  # pylint: disable=broad-exception-caught
