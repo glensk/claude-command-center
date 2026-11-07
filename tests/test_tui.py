@@ -2635,6 +2635,10 @@ def test_click_draft_next_step_cell_opens_model_editor(
             # Simulate the table posting the click message (bypasses pixel hit-testing).
             table.post_message(SessionTable.DraftModelsClicked(draft_sid))
             await pilot.pause()
+            # The handler enters edit mode at once but focuses the field only via
+            # call_after_refresh (after the display swap paints): flush that callback,
+            # else a lagging update timer under suite load still reads #sessions focused.
+            await flush_after_refresh(pilot)
             assert app._editing is True
             assert app._edit_sid == draft_sid
             assert (getattr(app.focused, "id", "") or "") == "edit-overseer"
