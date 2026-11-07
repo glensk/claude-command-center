@@ -16,7 +16,10 @@ live in :mod:`command_center.bridge_json`:
 configured account with their hand-set name (if any), status and iTerm tab — background jobs
 from the CLI's own ``claude agents --json`` roster too (a job whose worker is not running
 has no registry entry), with a null, unvalidated tab. The status is the CLI's view mapped
-to §6 (:mod:`command_center.adapters.claude_agents`: registry ``shell`` → busy). The tab is
+to §6 (:mod:`command_center.adapters.claude_agents`), with ``raw_status`` (that raw word)
+beside it: an interactive ``shell`` reads ``idle`` when its transcript shows no open turn
+(``livestatus.effective_status``, tp#1790 — an idle staff session holding its doorbell),
+else ``busy`` (an open or unknown turn: fail closed). The tab is
 ``validated`` only when the registry pid's controlling tty is the tab's tty (spike
 S-IDENT); a stored tab id that is missing or wrong is resolved by that tty
 (:func:`bridge_target.resolve_tab`). Headless ``claude -p`` runs (registry
@@ -33,6 +36,8 @@ no names itself (tp#1808).
 ``ccc close -s ID -j`` closes an IDLE live session from outside it (tp#1481,
 :mod:`command_center.bridge_close`): SIGTERM + its tmux pane / iTerm pane or tab, refused
 with a ``reason`` unless the session is provably idle; DONE stays DONE, else PARKED.
+A staff-bound session closes only with ``-A/--staff-agent A`` naming its bound agent
+(tp#1790), whose doorbell shell then does not count as background work.
 
 ``ccc lineage -s ID -j`` lists a session's continue-session predecessors, newest first
 (tp#1481, :mod:`command_center.bridge_lineage`; read-only, ≤ 50 hops, cycle guard).
@@ -182,8 +187,13 @@ def session_entry(
     tab: tuple[str | None, bool],
     account_label: Callable[[str], str],
     status: str | None = None,
+    *,
+    raw_status: str | None = None,
 ) -> dict[str, Any]:
-    """One ``sessions[]`` item of the §6 contract (*status* defaults to the registry's)."""
+    """One ``sessions[]`` item of the §6 contract (*status* defaults to the registry's).
+
+    ``raw_status`` is the raw word *status* was mapped from (default: the registry's).
+    """
     from .adapters.claude_agents import contract_status
 
     shown, staff_agent = display_name(live.session_id, row)
@@ -199,6 +209,7 @@ def session_entry(
         "pid": live.pid or None,
         "kind": "interactive" if live.kind == "interactive" else "background",
         "status": status if status is not None else contract_status(live.raw_status),
+        "raw_status": (raw_status if raw_status is not None else live.raw_status) or None,
         "status_at": iso(live.status_updated_at or live.updated_at),
         "aim_short": _aim_short(row),
         "done": bool(row.done) if row else False,
@@ -216,21 +227,49 @@ def _agent_for(live: LiveSession, by_sid: dict[str, AgentEntry]) -> AgentEntry |
     return agent if accounts.same_config_dir(agent.config_dir, live.config_dir) else None
 
 
-def live_status(live: LiveSession, agent: AgentEntry | None) -> str:
+def live_raw_status(live: LiveSession, agent: AgentEntry | None) -> str:
+    """The raw status word :func:`live_status` maps: the CLI's view first, else the registry's."""
+    if live.kind != "interactive" or (agent is not None and agent.background):
+        return (agent.status if agent is not None else "") or live.raw_status
+    if agent is not None and agent.status:
+        return agent.status
+    return live.raw_status
+
+
+def shell_turn_active(adapter: ClaudeAdapter, live: LiveSession, raw: str) -> bool | None:
+    """The transcript's open-turn signal for a ``shell`` *raw* status, else ``None``.
+
+    Read only for ``shell`` (the one word :func:`livestatus.effective_status` changes);
+    no transcript or an unreadable one is ``None`` — unknown keeps ``shell`` busy.
+    """
+    if (raw or "").strip().lower() != "shell":
+        return None
+    from .adapters.claude import transcript_turn_in_flight
+
+    try:
+        path = adapter.transcript_path(live.cwd, live.session_id, live.config_dir or None)
+        return transcript_turn_in_flight(path) if path is not None else None
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return None
+
+
+def live_status(
+    live: LiveSession, agent: AgentEntry | None, turn_active: bool | None = None
+) -> str:
     """The §6 status: the CLI's own view (``claude agents``) first, else the registry's.
 
     A background session's status comes from its ``state`` (``working`` → busy,
-    ``blocked`` / ``failed`` → blocked, ``done`` / ``stopped`` → idle).
+    ``blocked`` / ``failed`` → blocked, ``done`` / ``stopped`` → idle). An interactive
+    ``shell`` with *turn_active* ``False`` (no open turn) is ``idle``
+    (``livestatus.effective_status``); ``None`` (unknown) keeps it busy.
     """
     from .adapters.claude_agents import background_status, contract_status
 
+    raw = live_raw_status(live, agent)
     if live.kind != "interactive" or (agent is not None and agent.background):
         state = agent.state if agent is not None else ""
-        raw = (agent.status if agent is not None else "") or live.raw_status
         return background_status(state, raw)
-    if agent is not None and agent.status:
-        return contract_status(agent.status)
-    return contract_status(live.raw_status)
+    return contract_status(raw, turn_active)
 
 
 def _background_live(agent: AgentEntry) -> LiveSession:
@@ -343,7 +382,11 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
                 tab: tuple[str | None, bool] = (None, False)
             else:
                 tab = resolve_tab(row.iterm_session_id if row else None, live.pid, ps, panes)
-            entry = session_entry(live, row, tab, label_of, live_status(live, agent))
+            raw = live_raw_status(live, agent)
+            turn = None if background else shell_turn_active(adapter, live, raw)
+            entry = session_entry(
+                live, row, tab, label_of, live_status(live, agent, turn), raw_status=raw
+            )
             if background:
                 entry["kind"] = "background"
             out.append(entry)
@@ -546,7 +589,7 @@ def cmd_answer(args: argparse.Namespace) -> int:
 def cmd_close(args: argparse.Namespace) -> int:
     from .bridge_close import run_close
 
-    return _run(args, lambda deps: run_close(deps, args.session))
+    return _run(args, lambda deps: run_close(deps, args.session, args.staff_agent or ""))
 
 
 def cmd_lineage(args: argparse.Namespace) -> int:
@@ -670,7 +713,8 @@ def _add_transcript_parsers(sub: Any) -> None:
         help="close an IDLE live session: SIGTERM + its pane/tab (decide's close)",
         description=(
             "Closes an idle live session from outside it: refused (nothing signalled) "
-            "unless it is live, interactive, one account, not a staff session, registry "
+            "unless it is live, interactive, one account, not a staff session (unless -A "
+            "names its bound agent), registry "
             "idle with no open turn, no picker, no subagent or background shell, no "
             "close in flight, a drained Stop chain and an unchanged transcript over the "
             "stability window. Then SIGTERM (pid identity re-checked on a fresh "
@@ -680,10 +724,19 @@ def _add_transcript_parsers(sub: Any) -> None:
             "tab|pane|tmux|none, status, close_debt}; a refusal's error.code (and "
             "data.reason) is busy|subagents|background_shell|picker_pending|"
             "not_running|background|conflict|stop_chain|identity_changed|staff_bound|"
-            "close_in_flight|stale_evidence|unobservable. Example: ccc close -s ID -j"
+            "close_in_flight|stale_evidence|unobservable. With -A A a session bound to "
+            "staff agent A may close (another or no binding: staff_bound; a re-adopt "
+            "before the signal: identity_changed); A's doorbell (staff wait/watch -a A) "
+            "is then not background work. Example: ccc close -s ID -j"
         ),
     )
     p.add_argument("-s", "--session", required=True, help="Claude session id")
+    p.add_argument(
+        "-A",
+        "--staff-agent",
+        metavar="AGENT",
+        help="close a staff-bound session: the agent it must be bound to (tp#1790)",
+    )
     _json_flag(p)
     p.set_defaults(func=cmd_close)
 

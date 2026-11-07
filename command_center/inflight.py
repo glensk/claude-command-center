@@ -20,8 +20,10 @@ Evidence (pinned by ``tests/fixtures/inflight/``, see ``tests/test_inflight.py``
 
 Unknown is never clear: an unreadable transcript, an unmatched shell or a child
 ``claude`` all keep :attr:`Inventory.clear` false. Keep-warm timers are listed (to be
-stopped) but never block. Stdlib-only at import time: ``cli`` imports this module on
-every invocation, hot paths included.
+stopped) but never block. A caller may name more disposable Bash commands through the
+close-only *disposable_shell* predicate (default ``None``: nothing else is disposable);
+``ccc close -A`` passes :func:`staff_doorbell` (tp#1790). Stdlib-only at import time:
+``cli`` imports this module on every invocation, hot paths included.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 import json
 import os
 import re
+import shlex
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -66,6 +69,20 @@ _EVAL_RE = re.compile(r"\beval '((?:[^']|'\\'')*)' < /dev/null")
 
 # Only the tail is scanned, as in ``adapters.claude.background_work_split``.
 _TAIL_BYTES = 32 * 1024 * 1024
+
+# A staff doorbell (llm-staff's ``keep-warm-guard.py`` ``DOORBELL_RE``, plus ``watch``):
+# ``[VAR=val ...] [cd DIR &&] [VAR=val ...] [path/]staff[.py] wait|watch ARGS
+# [| tail|head COUNT]``, nothing chained after it (``2>&1`` allowed).
+_WORD = r"""(?:"[^"]*"|'[^']*'|[^\s;&|'"])+"""
+_ASSIGN = rf"[A-Za-z_]\w*=(?:{_WORD})?\s+"
+_COUNT_ARG = r"(?:-[nc]\s*\+?\d+|--(?:lines|bytes)=\+?\d+|-\d+)"
+_TRIM_PIPE = rf"(?:\|\s*(?:tail|head)(?:\s+{_COUNT_ARG})*\s*)?"
+_DOORBELL_RE = re.compile(
+    rf"^\s*(?:{_ASSIGN})*(?:cd\s+{_WORD}\s*&&\s*)?(?:{_ASSIGN})*"
+    r"(?:[^\s;&|'\"]*/)?staff(?:\.py)?\s+(?:wait|watch)"
+    r"(?P<args>(?:\s(?:[^;&|\n]|\d?>&\d)*)?)\s*"
+    rf"{_TRIM_PIPE}$"
+)
 
 
 @dataclass
@@ -149,6 +166,7 @@ def background_work(  # pylint: disable=too-many-arguments
     keepwarm: list[str] | None = None,
     subagent_started_at: int | None = None,
     now_ms: int | None = None,
+    disposable_shell: Callable[[str], bool] | None = None,
 ) -> list[str]:
     """Why the session must NOT be relaunched yet: background work still in flight, by evidence.
 
@@ -167,6 +185,8 @@ def background_work(  # pylint: disable=too-many-arguments
     *keepwarm* when the caller passes a list. Only the counter's excess over the transcript's
     running agents counts, and only while the latest SubagentStart (*subagent_started_at*,
     epoch ms) is within :data:`SUBAGENT_COUNTER_GRACE_S` (see :func:`counter_split`).
+    *disposable_shell* (close-only, default ``None``) names more disposable Bash commands,
+    on both signals, handled like keep-warm timers (:func:`staff_doorbell`, tp#1790).
     """
     from .adapters.claude import background_work_split
 
@@ -179,12 +199,15 @@ def background_work(  # pylint: disable=too-many-arguments
     if live_pid > 0:
         if adapter.has_subagent(live_pid, ignore):
             reasons.append("a child claude process (subagent) is running")
-        if adapter.has_background_task(live_pid, ignore, skip_keepwarm=True):
+        # The close-only exemption is passed only when set: every other caller's probe is
+        # exactly today's call (an adapter stub without the parameter keeps working).
+        extra = {"disposable_shell": disposable_shell} if disposable_shell is not None else {}
+        if adapter.has_background_task(live_pid, ignore, skip_keepwarm=True, **extra):
             reasons.append("a background Bash task shell is running")
     if transcript is None:
         reasons.append("the session transcript could not be located — background state unknown")
     else:
-        split = background_work_split(transcript)
+        split = background_work_split(transcript, disposable_shell)
         if split is None:
             reasons.append(
                 "the session transcript is unreadable/malformed — background state unknown"
@@ -196,6 +219,51 @@ def background_work(  # pylint: disable=too-many-arguments
             if keepwarm is not None:
                 keepwarm.extend(timers)
     return reasons
+
+
+def doorbell_agent(command: str) -> str | None:
+    """The agent a staff doorbell command (``staff wait|watch -a A``) waits for, else ``None``.
+
+    Anchored on the command word like llm-staff's ``keep-warm-guard.py``: ``echo staff
+    wait`` or a chained command is no doorbell. The agent must be named explicitly (``-a A``,
+    ``-aA``, ``--agent A``, ``--agent=A``; the last one wins, as in argparse) — a doorbell
+    relying on ``$STAFF_AGENT`` names none. A command substitution, a backtick or an
+    unparsable argument list is no doorbell (fail closed).
+    """
+    match = _DOORBELL_RE.match(command)
+    if match is None:
+        return None
+    args = match.group("args")
+    if "`" in args or "$(" in args or "<(" in args or ">(" in args:
+        return None
+    try:
+        words = shlex.split(args)
+    except ValueError:
+        return None
+    agent: str | None = None
+    for index, word in enumerate(words):
+        if word in ("-a", "--agent"):
+            agent = words[index + 1] if index + 1 < len(words) else None
+        elif word.startswith("--agent="):
+            agent = word.split("=", 1)[1]
+        elif word.startswith("-a") and not word.startswith("--"):
+            agent = word[2:]
+    return agent or None
+
+
+def staff_doorbell(agent: str) -> Callable[[str], bool]:
+    """A *disposable_shell* predicate: the Bash command is *agent*'s staff doorbell.
+
+    ``ccc close -A`` (tp#1790) passes it: an idle staff session always holds its
+    doorbell (``staff wait -a A`` / ``staff watch -a A``), which is no work. Another
+    agent's doorbell, or any other shell, still counts.
+    """
+    want = (agent or "").strip()
+
+    def disposable(command: str) -> bool:
+        return bool(want) and doorbell_agent(command) == want
+
+    return disposable
 
 
 def shell_command_from_argv(argv: str) -> str | None:
@@ -285,11 +353,16 @@ def _subagent_meta(transcript: Path, agent_id: str) -> tuple[dict[str, Any], str
     return (meta if isinstance(meta, dict) else {}), (str(jsonl) if jsonl.exists() else "")
 
 
-def _transcript_items(transcript: Path) -> list[Item]:
-    """In-flight items from the transcript (the adapter's verdict, enriched with details)."""
+def _transcript_items(
+    transcript: Path, disposable_shell: Callable[[str], bool] | None = None
+) -> list[Item]:
+    """In-flight items from the transcript (the adapter's verdict, enriched with details).
+
+    A task *disposable_shell* accepts is listed as :data:`KIND_KEEPWARM` (disposable).
+    """
     from .adapters.claude import background_work_split
 
-    split = background_work_split(transcript)
+    split = background_work_split(transcript, disposable_shell)
     if split is None:
         return []
     pending, timers = split
@@ -378,7 +451,7 @@ def _process_items(live_pid: int, ignore: frozenset[int], known: list[Item]) -> 
     return unknown
 
 
-def inventory(
+def inventory(  # pylint: disable=too-many-arguments
     adapter: ClaudeAdapter,
     live_pid: int,
     transcript: Path | None,
@@ -387,9 +460,13 @@ def inventory(
     active_subagents: int = 0,
     subagent_started_at: int | None = None,
     now_ms: int | None = None,
+    disposable_shell: Callable[[str], bool] | None = None,
 ) -> Inventory:
-    """Classify every in-flight item of a session; reasons are :func:`background_work`'s."""
-    items = _transcript_items(transcript) if transcript is not None else []
+    """Classify every in-flight item of a session; reasons are :func:`background_work`'s.
+
+    *disposable_shell* is the close-only exemption (:func:`background_work`).
+    """
+    items = _transcript_items(transcript, disposable_shell) if transcript is not None else []
     items += _process_items(live_pid, ignore, items)
     fresh, stale = counter_split(transcript, active_subagents, subagent_started_at, now_ms)
     if fresh > 0:
@@ -408,6 +485,7 @@ def inventory(
         active_subagents=active_subagents,
         subagent_started_at=subagent_started_at,
         now_ms=now_ms,
+        disposable_shell=disposable_shell,
     )
     return Inventory(items=items, reasons=reasons, stale_counter=stale)
 

@@ -6,7 +6,8 @@ The bridge verb decide's Mac applier calls; built on the hardened handoff closer
 refuses with a machine-readable ``reason`` and NOTHING is signalled:
 
 1. live, ``kind: interactive``, one account (:func:`bridge_target.require_live`:
-   ``not_running`` / ``background`` / ``conflict``), not a staff session (``staff_bound``);
+   ``not_running`` / ``background`` / ``conflict``), not a staff session (``staff_bound``)
+   — unless the caller names the bound agent (``-A A``, below);
 2. the close token: an in-flight token (an armed ``mark-done --close`` firing, another
    closer) or a handoff-owned one refuses ``close_in_flight``;
 3. **idle is mandatory**: registry ``idle``, no pending picker (``picker_pending``), no open
@@ -30,6 +31,15 @@ tab through :func:`terminal.close_iterm_session` (AppleScript ``close`` only —
 (HANDED_OFF for a handed-off row, :func:`models.closed_status`); a close never marks a
 session done. A pane that did not close keeps the debt: a repeated call closes that pane
 only, never signalling again. A session already gone answers ``not_running``.
+
+``ccc close -s ID -A A`` (``--staff-agent``, tp#1790) closes a staff-bound session: only
+when ``staffrole.adopted_role(ID) == A`` (else ``staff_bound``; decide's applier asked
+llm-staff that A has no task first — ccc never calls ``staff``). Both in-flight probes
+then treat A's doorbell shell (``staff wait -a A`` / ``staff watch -a A``,
+:func:`inflight.staff_doorbell`) as disposable, like a keep-warm timer; another agent's
+doorbell or any other shell still refuses ``background_shell``. Inside the tab lock, next
+to the revalidation, the binding is read again: a re-adopt in the window refuses
+``identity_changed``. Without ``-A`` nothing changes.
 """
 
 from __future__ import annotations
@@ -47,6 +57,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 # pylint: disable=protected-access  # the shared close steps live in cli / handoff_close
 
 import dataclasses
+from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
@@ -98,8 +109,19 @@ def _refusal(session_id: str, reason: str, message: str) -> BridgeError:
     )
 
 
-def _probe(adapter: ClaudeAdapter, store: Store, sid: str, pid: int, path: Path | None) -> str:
-    """The ``continue-session`` in-flight probe: ``""``, ``subagents`` or ``background_shell``."""
+def _probe(  # pylint: disable=too-many-arguments
+    adapter: ClaudeAdapter,
+    store: Store,
+    sid: str,
+    pid: int,
+    path: Path | None,
+    *,
+    disposable_shell: Callable[[str], bool] | None = None,
+) -> str:
+    """The ``continue-session`` in-flight probe: ``""``, ``subagents`` or ``background_shell``.
+
+    *disposable_shell* is the close-only exemption (``-A``: the bound agent's doorbell).
+    """
     from . import inflight
 
     inv = inflight.inventory(
@@ -108,6 +130,7 @@ def _probe(adapter: ClaudeAdapter, store: Store, sid: str, pid: int, path: Path 
         path,
         active_subagents=store.active_subagents(sid),
         subagent_started_at=store.subagent_started_at(sid),
+        disposable_shell=disposable_shell,
     )
     if inv.clear:
         return ""
@@ -122,7 +145,14 @@ def _probe(adapter: ClaudeAdapter, store: Store, sid: str, pid: int, path: Path 
     )
 
 
-def _idle_gate(adapter: ClaudeAdapter, sid: str, live: Any) -> None:
+def _disposable(staff_agent: str) -> Callable[[str], bool] | None:
+    """The close-only shell exemption: *staff_agent*'s doorbell, else none."""
+    from . import inflight
+
+    return inflight.staff_doorbell(staff_agent) if staff_agent else None
+
+
+def _idle_gate(adapter: ClaudeAdapter, sid: str, live: Any, staff_agent: str = "") -> None:
     """Idle is mandatory: registry idle, no picker, no open turn, nothing in flight."""
     from .adapters.claude_agents import contract_status
     from .bridge_send import inspect_transcript
@@ -147,7 +177,9 @@ def _idle_gate(adapter: ClaudeAdapter, sid: str, live: Any) -> None:
     if ins.turn_active is not False:
         raise _refusal(sid, "busy", "a turn is open in the transcript")
     with _Store() as store:
-        work = _probe(adapter, store, sid, live.pid, path)
+        work = _probe(
+            adapter, store, sid, live.pid, path, disposable_shell=_disposable(staff_agent)
+        )
     if work:
         raise _refusal(sid, work, f"{work.replace('_', ' ')} still in flight")
 
@@ -227,8 +259,16 @@ def _bound_cfg(cfg: Config) -> Config:
     )
 
 
+def _check_binding(sid: str, staff_agent: str) -> None:
+    """``-A``: the staff binding still names *staff_agent* (else ``identity_changed``)."""
+    from . import staffrole
+
+    if staff_agent and staffrole.adopted_role(sid) != staff_agent:
+        raise hc.Refused(f"the staff binding no longer names {staff_agent}", "identity_changed")
+
+
 def _close_live(  # pylint: disable=too-many-locals
-    deps: BridgeDeps, claim: hc.Claim, own: bool, cfg: Config
+    deps: BridgeDeps, claim: hc.Claim, own: bool, cfg: Config, staff_agent: str = ""
 ) -> dict[str, Any]:
     """Bind, prove stable idle, drain, revalidate under the tab lock, SIGTERM, close."""
     from . import cli, hooks, terminal
@@ -247,7 +287,9 @@ def _close_live(  # pylint: disable=too-many-locals
         if cfg.stop_barrier_enabled:
             hc._drain(bound, _bound_cfg(cfg))
         with deps.store() as store:
-            work = _probe(adapter, store, sid, bound.pid, path)
+            work = _probe(
+                adapter, store, sid, bound.pid, path, disposable_shell=_disposable(staff_agent)
+            )
         if work:
             raise hc.Refused(f"{work.replace('_', ' ')} still in flight", work)
         stored = (row.iterm_session_id or "").strip() if row is not None else ""
@@ -263,6 +305,7 @@ def _close_live(  # pylint: disable=too-many-locals
         lock = tab_lock(deps, iterm) if iterm else nullcontext()
         with lock:
             hc._revalidate(adapter, claim, bound, stamp)
+            _check_binding(sid, staff_agent)
             hc._bind_debt(claim, debt)
             signalled = cli._sigterm(bound.pid)
     except hc.Refused as exc:
@@ -345,11 +388,15 @@ def _retry_debt(sid: str, holder: str) -> dict[str, Any] | None:
     return _settle(claim, debt, kind, _set_closed_status(sid), hooks)
 
 
-def run_close(deps: BridgeDeps, session_id: str) -> dict[str, Any]:
-    """Close *session_id* when it is provably idle; the ``data`` object or a refusal."""
+def run_close(deps: BridgeDeps, session_id: str, staff_agent: str = "") -> dict[str, Any]:
+    """Close *session_id* when it is provably idle; the ``data`` object or a refusal.
+
+    *staff_agent* (``-A``) opts in to closing a session bound to exactly that agent.
+    """
     from . import config, staffrole
 
     sid = (session_id or "").strip()
+    agent = (staff_agent or "").strip()
     if not sid:
         raise BridgeError("usage", "pass -s/--session <id>", 2)
     holder = hc.own_identity()
@@ -363,8 +410,12 @@ def run_close(deps: BridgeDeps, session_id: str) -> dict[str, Any]:
     except BridgeError as exc:
         reason = "conflict" if exc.code == "account_conflict" else exc.code
         raise _refusal(sid, reason, exc.message) from exc
-    if staffrole.adopted_role(sid):
+    role = staffrole.adopted_role(sid)
+    if role and not agent:
         raise _refusal(sid, "staff_bound", "a staff agent's session is closed by its staff")
+    if agent and role != agent:
+        bound_to = f"bound to {role}" if role else "not staff-bound"
+        raise _refusal(sid, "staff_bound", f"-A {agent}: the session is {bound_to}")
     from . import cli
 
     adapter = cli._adapter()
@@ -376,10 +427,10 @@ def run_close(deps: BridgeDeps, session_id: str) -> dict[str, Any]:
             and (not row.close_requested_at or hc.keeps_close_token(store, sid))
         ):
             raise _refusal(sid, "close_in_flight", "another close of this session is in flight")
-    _idle_gate(adapter, sid, live)
+    _idle_gate(adapter, sid, live, agent)
     claim, own = _claim(sid, live.cwd, holder)
     try:
-        return _close_live(deps, claim, own, config.load_config())
+        return _close_live(deps, claim, own, config.load_config(), agent)
     except BridgeError:
         raise
     except Exception:  # pylint: disable=broad-exception-caught

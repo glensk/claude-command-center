@@ -724,7 +724,9 @@ def pending_background_work(transcript: Path) -> list[str] | None:
     return None if split is None else split[0]
 
 
-def background_work_split(transcript: Path) -> tuple[list[str], list[str]] | None:
+def background_work_split(
+    transcript: Path, disposable_shell: Callable[[str], bool] | None = None
+) -> tuple[list[str], list[str]] | None:
     """``(pending, keepwarm)``: in-flight background task ids, keep-warm timers apart.
 
     Claude Code does not expose in-process background work anywhere else on disk, but
@@ -738,13 +740,16 @@ def background_work_split(transcript: Path) -> tuple[list[str], list[str]] | Non
     ``tool_use`` command is a keep-warm timer (``is_keepwarm_command``; the launch
     record's ``tool_result.tool_use_id`` names that ``tool_use``) goes to *keepwarm*
     instead of *pending*; agents and every other Bash task count as before.
+    *disposable_shell* (close-only, tp#1790; default ``None`` = none) names more
+    disposable Bash commands: a task whose launching command satisfies it goes to
+    *keepwarm* too (``ccc close -A``: the bound staff agent's doorbell).
 
     ``None`` means UNKNOWN — the file could not be read, or a record other than the
     (possibly still being written) last line is not JSON — and callers must treat it
     as "refuse", never as "clear". Only the last 32 MB are scanned, which comfortably
     covers any session's background history.
     """
-    scan = background_launch_scan(transcript)
+    scan = background_launch_scan(transcript, disposable_shell)
     return None if scan is None else (scan.pending, scan.keepwarm)
 
 
@@ -770,7 +775,9 @@ class BackgroundScan:
 _AGENT_TOOL_NAMES = frozenset({"Agent", "Task"})
 
 
-def background_launch_scan(transcript: Path) -> BackgroundScan | None:
+def background_launch_scan(
+    transcript: Path, disposable_shell: Callable[[str], bool] | None = None
+) -> BackgroundScan | None:
     """The ONE scan behind :func:`background_work_split` (same contract, same ``None``).
 
     Reads the last 32 MB (dropping a partial first line), and returns the pending and
@@ -816,7 +823,7 @@ def background_launch_scan(transcript: Path) -> BackgroundScan | None:
             )
         if task_id and keepwarm_uses & _tool_result_use_ids(record):
             keepwarm.add(task_id)
-        keepwarm_uses.update(_keepwarm_tool_use_ids(record))
+        keepwarm_uses.update(_keepwarm_tool_use_ids(record, disposable_shell))
         agent_inputs.update(_agent_tool_inputs(record))
         ended.update(_notification_task_ids(record))
         _track_task_stops(record, stops, ended)
@@ -853,8 +860,13 @@ def _content_blocks(record: dict[str, object]) -> list[dict[str, object]]:
     return [block for block in content if isinstance(block, dict)]
 
 
-def _keepwarm_tool_use_ids(record: dict[str, object]) -> set[str]:
-    """Ids of the Bash ``tool_use`` blocks in *record* that launch a keep-warm timer."""
+def _keepwarm_tool_use_ids(
+    record: dict[str, object], disposable_shell: Callable[[str], bool] | None = None
+) -> set[str]:
+    """Ids of the Bash ``tool_use`` blocks in *record* that launch a keep-warm timer.
+
+    A command *disposable_shell* accepts counts as one too (close-only, tp#1790).
+    """
     ids: set[str] = set()
     for block in _content_blocks(record):
         if block.get("type") != "tool_use" or block.get("name") != "Bash":
@@ -862,7 +874,11 @@ def _keepwarm_tool_use_ids(record: dict[str, object]) -> set[str]:
         params = block.get("input")
         command = params.get("command") if isinstance(params, dict) else None
         use_id = block.get("id")
-        if isinstance(command, str) and isinstance(use_id, str) and is_keepwarm_command(command):
+        if not (isinstance(command, str) and isinstance(use_id, str)):
+            continue
+        if is_keepwarm_command(command) or (
+            disposable_shell is not None and disposable_shell(command)
+        ):
             ids.add(use_id)
     return ids
 
@@ -1546,6 +1562,7 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         ignore: frozenset[int] = frozenset(),
         *,
         skip_keepwarm: bool = False,
+        disposable_shell: Callable[[str], bool] | None = None,
     ) -> bool:
         """Best-effort: True if *pid* has a live descendant Bash-tool shell.
 
@@ -1561,12 +1578,22 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         (``is_keepwarm_command`` — the Bash tool embeds the command in the shell's argv as
         ``eval '<command>'``); the switch-account veto passes it, the status display does
         not (an idle session holding only a keep-warm timer still reads SNOOZED).
+        *disposable_shell* (close-only, tp#1790; default ``None``) leaves out a shell whose
+        embedded command (``inflight.shell_command_from_argv``) it accepts; a shell whose
+        command cannot be read is never left out.
         """
 
         def matches(cmd: str) -> bool:
             if _BG_SHELL_SIGNATURE not in cmd:
                 return False
-            return not (skip_keepwarm and is_keepwarm_command(cmd))
+            if skip_keepwarm and is_keepwarm_command(cmd):
+                return False
+            if disposable_shell is not None:
+                from ..inflight import shell_command_from_argv
+
+                shell = shell_command_from_argv(cmd)
+                return not (shell is not None and disposable_shell(shell))
+            return True
 
         return self._descendant_matches(pid, matches, ignore)
 

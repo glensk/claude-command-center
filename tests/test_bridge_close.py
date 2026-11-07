@@ -119,8 +119,6 @@ class World:  # pylint: disable=too-many-instance-attributes
 
 
 def _install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[World, BridgeDeps]:
-    from command_center import config
-
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     cfg = config.load_config()
     cfg.stop_barrier_enabled = True
@@ -382,7 +380,7 @@ def test_stop_chain_not_drained(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     world, deps = _install(tmp_path, monkeypatch)
     world.table[6000] = PsRow(PID, TTY, "S", "python3 /hooks/commit-hook.py")
     monkeypatch.setattr(terminal, "stop_hook_tokens", lambda _cwd: {"commit-hook.py"})
-    monkeypatch.setattr(bridge_close, "_probe", lambda *_a: "")  # the hook is no bg shell
+    monkeypatch.setattr(bridge_close, "_probe", lambda *_a, **_k: "")  # the hook is no bg shell
     _refused(deps, "stop_chain")
     _nothing_signalled(world)
 
@@ -518,3 +516,271 @@ def test_sessions_json_exposes_done(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     entry = bridge_cli.session_entry(live, row, (TAB, True), lambda _d: "a")
     assert entry["done"] is True
     assert bridge_cli.session_entry(live, None, (None, False), lambda _d: "a")["done"] is False
+
+
+# --------------------------------------------------------------------------- tp#1790 -A
+AGENT = "dev-1"
+
+
+def _shell(command: str) -> str:
+    """A Bash-tool shell argv running *command* (``'`` written as ``'\\''``)."""
+    quoted = command.replace("'", "'\\''")
+    return f"/bin/zsh -c source /x/shell-snapshots/snapshot-zsh-1.sh && eval '{quoted}' < /dev/null"
+
+
+def _bg_launch(world: World, use_id: str, task_id: str, command: str) -> None:
+    """A ``run_in_background`` Bash launch of *command* in the transcript (no notification)."""
+    world.append(
+        _record(
+            "assistant",
+            f"a-{use_id}",
+            message={
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": use_id,
+                        "name": "Bash",
+                        "input": {"command": command, "run_in_background": True},
+                    }
+                ],
+                "stop_reason": "tool_use",
+            },
+        )
+    )
+    world.append(
+        _record(
+            "user",
+            f"u-{use_id}",
+            message={
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": use_id, "content": "started"}],
+            },
+            toolUseResult={"backgroundTaskId": task_id},
+        )
+    )
+    world.append(_reply(f"r-{use_id}", "waiting for mail"))
+
+
+def _staff_session(
+    world: World, monkeypatch: pytest.MonkeyPatch, command: str, role: str = AGENT
+) -> None:
+    """An idle staff session bound to *role* holding one background shell running *command*."""
+    monkeypatch.setattr(staffrole, "adopted_role", lambda _sid: role)
+    world.statuses = ["shell"]
+    _bg_launch(world, "toolu_bell", "bell1", command)
+    world.table[5003] = PsRow(PID, TTY, "S", _shell(command))
+
+
+def _staff_refused(deps: BridgeDeps, reason: str, agent: str = AGENT) -> None:
+    with pytest.raises(BridgeError) as err:
+        bridge_close.run_close(deps, SID, agent)
+    assert err.value.code == reason, err.value.message
+    assert err.value.data == {"session_id": SID, "result": "refused", "reason": reason}
+
+
+def test_staff_close_without_flag_is_staff_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    _staff_session(world, monkeypatch, f"staff wait -a {AGENT}")
+    _refused(deps, "staff_bound")
+    _nothing_signalled(world)
+
+
+@pytest.mark.parametrize("role", ["dev-2", None])
+def test_staff_close_other_agent_is_staff_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: str | None
+) -> None:
+    """``-A`` naming another agent than the binding (or a session bound to none) refuses."""
+    world, deps = _install(tmp_path, monkeypatch)
+    monkeypatch.setattr(staffrole, "adopted_role", lambda _sid: role)
+    _staff_refused(deps, "staff_bound")
+    _nothing_signalled(world)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"staff wait -a {AGENT}",
+        f"staff watch -a {AGENT}",
+        f"cd /x && STAFF_HOME=/s ~/bin/staff.py wait --agent={AGENT} -t 0 2>&1 | tail -5",
+        f"staff wait --agent {AGENT}",
+    ],
+)
+def test_staff_close_doorbell_only_passes_both_probes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    _staff_session(world, monkeypatch, command)
+    probes: list[str] = []
+    real = bridge_close._probe
+
+    def _counting(*args: Any, **kwargs: Any) -> str:
+        probes.append(real(*args, **kwargs))
+        return probes[-1]
+
+    monkeypatch.setattr(bridge_close, "_probe", _counting)
+    data = bridge_close.run_close(deps, SID, AGENT)
+    assert data["result"] == "closed"
+    assert probes == ["", ""]  # the idle gate's and _close_live's probe, both clear
+    assert world.killed == [(PID, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "staff wait -a dev-2",  # another agent's doorbell
+        "staff wait",  # no explicit agent ($STAFF_AGENT): not provably this agent's
+        f"staff wait -a {AGENT}; make test",  # a chained command is work
+        f"echo staff wait -a {AGENT}",  # not anchored on the command word
+        f"staff wait -a {AGENT} $(sleep 600)",  # a command substitution
+        "sleep 600",  # any other shell
+    ],
+)
+def test_staff_close_other_shell_is_background_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    _staff_session(world, monkeypatch, command)
+    _staff_refused(deps, "background_shell")
+    _nothing_signalled(world)
+
+
+def test_staff_close_doorbell_plus_other_shell_is_background_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    _staff_session(world, monkeypatch, f"staff wait -a {AGENT}")
+    world.table[5001] = PsRow(PID, TTY, "S", BG_SHELL)
+    _staff_refused(deps, "background_shell")
+    _nothing_signalled(world)
+
+
+def test_staff_close_second_probe_sees_new_shell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real shell appearing after the idle gate is caught by _close_live's probe."""
+    world, deps = _install(tmp_path, monkeypatch)
+    _staff_session(world, monkeypatch, f"staff wait -a {AGENT}")
+    real = bridge_close._idle_gate
+
+    def _gate(*args: Any) -> None:
+        real(*args)
+        world.table[5001] = PsRow(PID, TTY, "S", BG_SHELL)
+
+    monkeypatch.setattr(bridge_close, "_idle_gate", _gate)
+    _staff_refused(deps, "background_shell")
+    _nothing_signalled(world)
+
+
+def test_staff_close_readopt_in_window_is_identity_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    _staff_session(world, monkeypatch, f"staff wait -a {AGENT}")
+    roles = iter([AGENT])  # run_close's check reads AGENT, the re-read under the lock dev-2
+    monkeypatch.setattr(staffrole, "adopted_role", lambda _sid: next(roles, "dev-2"))
+    _staff_refused(deps, "identity_changed")
+    _nothing_signalled(world)
+
+
+def test_staff_close_binding_reread_under_tab_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-read sits inside the tab lock, after the revalidation, before the signal."""
+    world, deps = _install(tmp_path, monkeypatch)
+    _staff_session(world, monkeypatch, f"staff wait -a {AGENT}")
+    order: list[str] = []
+    real_lock = bridge_close.tab_lock
+    real_check = bridge_close._check_binding
+    real_revalidate = handoff_close._revalidate
+
+    class _Lock:
+        def __init__(self, inner: Any) -> None:
+            self.inner = inner
+
+        def __enter__(self) -> Any:
+            order.append("lock")
+            return self.inner.__enter__()
+
+        def __exit__(self, *exc: Any) -> Any:
+            order.append("unlock")
+            return self.inner.__exit__(*exc)
+
+    def _check(*args: Any) -> None:
+        order.append("binding")
+        real_check(*args)
+
+    def _revalidate(*args: Any) -> None:
+        order.append("revalidate")
+        real_revalidate(*args)
+
+    world.on_kill.append(lambda: order.append("kill"))
+    monkeypatch.setattr(bridge_close, "tab_lock", lambda *a: _Lock(real_lock(*a)))
+    monkeypatch.setattr(bridge_close, "_check_binding", _check)
+    monkeypatch.setattr(handoff_close, "_revalidate", _revalidate)
+    assert bridge_close.run_close(deps, SID, AGENT)["result"] == "closed"
+    assert order == ["lock", "revalidate", "binding", "kill", "unlock"]
+
+
+def test_staff_close_cli_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    _staff_session(world, monkeypatch, f"staff wait -a {AGENT}")
+    monkeypatch.setattr(bridge_cli.bridge_target, "default_deps", lambda: deps)
+    assert cli.main(["close", "-s", SID, "-A", "dev-2", "-j"]) == 1
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "staff_bound"
+    assert not world.killed
+    assert cli.main(["close", "-s", SID, "--staff-agent", AGENT, "-j"]) == 0
+    env = json.loads(capsys.readouterr().out)
+    assert env["ok"] is True and env["data"]["result"] == "closed"
+    with pytest.raises(SystemExit) as done:
+        cli.main(["close", "-h"])
+    assert done.value.code == 0
+    assert "--staff-agent" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("tail", "status"),
+    [
+        ("ended", "idle"),  # no open turn: a doorbell-only session is idle
+        ("open", "busy"),  # an open turn
+        ("unknown", "busy"),  # no transcript: unknown stays busy (fail closed)
+    ],
+)
+def test_staff_close_sessions_json_shell_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tail: str, status: str
+) -> None:
+    world, _deps = _install(tmp_path, monkeypatch)
+    if tail == "open":
+        world.append(_prompt("u2", "another one"))
+    live = LiveSession(pid=PID, session_id=SID, cwd="/repo", raw_status="shell", alive=True)
+    adapter = cli.ClaudeAdapter()
+    if tail == "unknown":
+        monkeypatch.setattr(cli.ClaudeAdapter, "transcript_path", lambda *_a, **_k: None)
+    turn = bridge_cli.shell_turn_active(adapter, live, "shell")
+    assert bridge_cli.live_status(live, None, turn) == status
+    entries = bridge_cli.collect_sessions(
+        adapter=_OneLive(adapter, live),  # type: ignore[arg-type]
+        panes_reader=lambda: [],
+        ps_reader=lambda: world.table,
+        account_label=lambda _d: "a",
+        agents_reader=list,
+    )
+    assert [(e["status"], e["raw_status"]) for e in entries] == [(status, "shell")]
+
+
+class _OneLive:
+    """An adapter whose registry is *live* only (the real transcript lookup otherwise)."""
+
+    def __init__(self, inner: Any, live: LiveSession) -> None:
+        self.inner = inner
+        self.live = live
+
+    def discover(self) -> list[LiveSession]:
+        return [self.live]
+
+    def transcript_path(self, *args: Any, **kwargs: Any) -> Path | None:
+        return self.inner.transcript_path(*args, **kwargs)

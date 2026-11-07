@@ -3567,6 +3567,7 @@ echo 'run the tests' | ccc send -s <session-id> -j # type a message into the ses
 echo '{"decision_id": "…", "answers": [{"question_index": 0, "option_indices": [1]}]}' \
   | ccc answer -s <session-id> -j                  # answer its AskUserQuestion picker
 ccc close -s <session-id> -j                       # close an IDLE session (decide's close)
+ccc close -s <session-id> -A <agent> -j            # … a session bound to staff agent <agent>
 ccc lineage -s <session-id> -j                     # its continue-session predecessors
 ccc delivery -i <delivery-id> -j                   # follow one send up
 ccc events -a 0 -l 200 -j                          # the problem stream after a cursor
@@ -3611,7 +3612,8 @@ background jobs from `claude agents --json` too. Headless `claude -p` runs (regi
 | `account_conflict`     | the id is live under two accounts at once (never messaged)                                         |
 | `pid`                  | the claude process                                                                                 |
 | `kind`                 | `interactive` or `background` (background: listed and read, never messaged)                        |
-| `status` / `status_at` | `busy` / `idle` / `waiting` / `blocked` / `unknown` (a registry `shell` = busy)                    |
+| `status` / `status_at` | `busy` / `idle` / `waiting` / `blocked` / `unknown` (a `shell` with no open turn = idle, else busy) |
+| `raw_status`           | the raw word `status` was mapped from (the CLI's view, else the registry's; null when none)        |
 | `aim_short`            | the short AIM label                                                                                |
 | `done`                 | ccc's own DONE flag (`ccc mark-done`), `false` without a ccc row                                   |
 | `tab.iterm_session_id` | the iTerm session of the tab (null for a background job)                                           |
@@ -3746,7 +3748,7 @@ supported. The answer is verified within 10 s through the call's `tool_use_id` a
 `data = {decision_id, tool_use_id, outcome, channel, keys}` (`mismatched_questions` on a
 mismatch); `outcome` `accepted` / `unknown` / `failed`.
 
-### `ccc close` (`-s/--session ID`, `-j/--json`)
+### `ccc close` (`-s/--session ID`, `-A/--staff-agent AGENT`, `-j/--json`)
 
 Closes an IDLE live session from outside it (tp#1481; decide's Mac applier). Code:
 `bridge_close.py`, built on the handoff closer (`handoff_close.py`). Any failed check refuses
@@ -3772,6 +3774,17 @@ session done. `data = {session_id, result: "closed", terminal, status, close_deb
 `close_debt: true` = the pane did not close: a repeated call closes it without signalling
 again. A session already gone answers `not_running`. `ccc mark-done --close` stays the
 in-session path (it arms a close for after the next turn).
+
+A staff-bound session (`staffrole.adopted_role`) closes only with `-A AGENT` naming the agent
+it is bound to (tp#1790; the caller, decide's applier, has asked the staff tool that the agent
+has no task — ccc never runs `staff`). Another agent or no binding refuses `staff_bound`.
+Both in-flight probes then treat that agent's doorbell (`staff wait -a AGENT` / `staff watch
+-a AGENT`, anchored on the command word, no chained command) as disposable, like a keep-warm
+timer; another agent's doorbell or any other shell still refuses `background_shell`. Inside
+the tab lock, next to the revalidation, the binding is read again: a re-adopt in the window
+refuses `identity_changed`. Without `-A` nothing changes. The status gate accepts a
+doorbell-only session: its registry `shell` with no open turn is `idle`, as in `ccc sessions
+-j`.
 
 ### `ccc lineage` (`-s/--session ID`, `-j/--json`)
 

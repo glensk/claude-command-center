@@ -119,6 +119,7 @@ def test_both_accounts_kinds_status_and_names(store: Store) -> None:
         "pid",
         "kind",
         "status",
+        "raw_status",
         "status_at",
         "aim_short",
         "done",

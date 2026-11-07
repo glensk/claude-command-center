@@ -347,3 +347,45 @@ def test_drain_reports_a_stale_counter_once_and_clears(
         on_stale_counter=seen.append,
     )
     assert ok and inv.clear and seen == [1]
+
+
+@pytest.mark.parametrize(
+    ("command", "agent"),
+    [
+        ("staff wait -a dev-1", "dev-1"),
+        ("staff watch -adev-1", "dev-1"),
+        ("STAFF_HOME=/s /x/staff.py wait --agent=dev-1 2>&1 | tail -5", "dev-1"),
+        ("cd /x && staff wait -a dev-2 -a dev-1", "dev-1"),  # the last one wins
+        ("staff wait", None),  # $STAFF_AGENT only: no agent named
+        ("staff wait -a dev-1 && make", None),
+        ("echo staff wait -a dev-1", None),
+        ("staff wait -a `x`", None),
+        ("staff wait -a 'dev-1", None),  # unparsable
+        ("staff status -a dev-1", None),
+    ],
+)
+def test_doorbell_agent_is_anchored_and_explicit(command: str, agent: str | None) -> None:
+    """tp#1790: the doorbell parser behind ``ccc close -A``'s disposable shell."""
+    assert inflight.doorbell_agent(command) == agent
+    assert inflight.staff_doorbell("dev-1")(command) is (agent == "dev-1")
+    assert inflight.staff_doorbell("")(command) is False
+
+
+def test_doorbell_counts_without_the_close_predicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No shared default changes: only an explicit *disposable_shell* exempts a doorbell."""
+    command = "staff wait -a dev-1"
+    shell = (
+        f"/bin/zsh -c source /x/shell-snapshots/snapshot-zsh-1.sh && eval '{command}' < /dev/null"
+    )
+    monkeypatch.setattr(claude_adapter, "_children_map", lambda: {4242: [(5000, shell)]})
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+    adapter = claude_adapter.ClaudeAdapter()
+    assert not inflight.inventory(adapter, 4242, transcript).clear
+    assert inflight.background_work(adapter, 4242, transcript)
+    exempt = inflight.staff_doorbell("dev-1")
+    assert inflight.inventory(adapter, 4242, transcript, disposable_shell=exempt).clear
+    other = inflight.staff_doorbell("dev-2")
+    assert not inflight.inventory(adapter, 4242, transcript, disposable_shell=other).clear
