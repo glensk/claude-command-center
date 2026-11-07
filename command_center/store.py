@@ -64,6 +64,7 @@ from .models import (
     now_ms,
     short_id,
 )
+from .slrender import FIRST_AIM_SELECT
 from .transfer_store import TRANSFER_SCHEMA, TransferStoreMixin
 
 _JOB_TYPES = frozenset(JOB_TYPES)
@@ -482,12 +483,10 @@ CREATE TABLE IF NOT EXISTS staff_close_guard (
 # nothing for set_aim/set_first_aim/set_short_aim to keep in sync; the correlated
 # sub-selects hit idx_aim_history_session and cost nothing at TUI table sizes. Both are
 # NULL for an AIM that predates history tracking — display_aim falls back to the live AIM.
-_SESSION_SELECT = """
+# The two sub-selects are :data:`slrender.FIRST_AIM_SELECT`, shared with the lean status line.
+_SESSION_SELECT = f"""
 SELECT s.*,
-       (SELECT h.aim FROM aim_history h WHERE h.session_id = s.session_id
-         ORDER BY h.created_at, h.id LIMIT 1) AS first_aim,
-       (SELECT h.short_aim FROM aim_history h WHERE h.session_id = s.session_id
-         ORDER BY h.created_at, h.id LIMIT 1) AS first_short_aim
+       {FIRST_AIM_SELECT}
 FROM sessions s
 """
 

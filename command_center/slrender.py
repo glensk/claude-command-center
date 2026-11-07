@@ -102,6 +102,16 @@ STATUS_COLOR: dict[str, str] = {
 _SL_WIDTH = 100  # status-line soft width: only the `/aim (1)` anchor row is clipped to it
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
+#: The ``first_aim`` / ``first_short_aim`` select-list items of a ``FROM sessions s`` query:
+#: revision (1) of the session's AIM and its short label, read straight off ``aim_history``
+#: (NULL for an AIM that predates history tracking). ONE constant shared by
+#: ``store._SESSION_SELECT`` and the lean status line's session read, so both derive them
+#: identically.
+FIRST_AIM_SELECT = """(SELECT h.aim FROM aim_history h WHERE h.session_id = s.session_id
+         ORDER BY h.created_at, h.id LIMIT 1) AS first_aim,
+       (SELECT h.short_aim FROM aim_history h WHERE h.session_id = s.session_id
+         ORDER BY h.created_at, h.id LIMIT 1) AS first_short_aim"""
+
 
 # ---- pure session helpers (re-exported by models) ---------------------------
 
