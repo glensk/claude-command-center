@@ -23,17 +23,32 @@ purpose (``test_tabsymbol``, ``test_tui``) still point the cache at their own
 ``tmp_path`` — that simply re-overrides this default, which is fine.
 """
 
+# pylint: disable=too-many-lines  # the suite-wide isolation fixtures live in this one file
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
+import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 
 import pytest
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the tests-only opt-out markers of the real-machine guards below (tp#1793)."""
+    for line in (
+        "real_signal: opt OUT of the os.kill / os.killpg guard (see _guard_real_signals)",
+        "real_osascript: opt OUT of the osascript guard in tests/conftest.py",
+        "real_iterm: opt OUT of the iTerm Python API guard in tests/conftest.py",
+    ):
+        config.addinivalue_line("markers", line)
 
 
 @pytest.fixture(autouse=True)
@@ -132,6 +147,263 @@ def _guard_real_codex_reads(
 # The developer's REAL home, captured at conftest import — before ``_isolate_home``
 # re-points ``$HOME`` / ``Path.home()`` for the first test.
 _REAL_HOME = Path(os.path.expanduser("~")).resolve()
+
+
+# --------------------------------------------------------------------------- #
+# Kill guard + out-of-tmp audit file (tp#1793)
+#
+# A test that hands a fixture pid (4321, 4242, ...) to an unfaked ``os.kill`` signals
+# whatever process holds that pid right now: under suite load pids wrap every few minutes,
+# so that can be a live claude. Every signal a test sends goes through
+# :func:`_guarded_signal`; one aimed at a live process outside the pytest tree is refused
+# and recorded. The record goes to an audit file OUTSIDE the pytest tmp dir, because
+# ``closelog.log_close`` writes its events.log under the pinned (throwaway) app home.
+# Everything here is captured at conftest import, before any test can patch it.
+# --------------------------------------------------------------------------- #
+_REAL_KILL = os.kill
+_REAL_KILLPG = os.killpg
+_REAL_GETPGRP = os.getpgrp
+_REAL_POPEN = subprocess.Popen
+_ROOT_PID = os.getpid()
+_PS = "/bin/ps" if os.path.exists("/bin/ps") else "ps"  # never a fake ``ps`` on a test PATH
+_WALK_CAP = 64
+_AUDIT_ENV = "CCC_TEST_KILL_AUDIT"
+_STRICT_ENV = "CCC_TEST_KILL_STRICT"
+# The channels instrumented in this run, named in the audit header (B2/B3 append theirs).
+_AUDIT_CHANNELS: list[str] = ["os.kill", "os.killpg", "log_close"]
+_HEADERED: set[str] = set()  # audit files that already got this session's header
+# Pids this session spawned (every ``subprocess.Popen`` child, see _record_popen_child) or
+# proved to be in the pytest tree; they stay here after they die.
+_OWN_PIDS: set[int] = {_ROOT_PID}
+_REAL_EXECUTE_CHILD = subprocess.Popen._execute_child  # type: ignore[attr-defined]  # pylint: disable=no-member
+
+
+def _record_popen_child(self: subprocess.Popen, *args: object, **kwargs: object) -> None:
+    """``Popen._execute_child`` that remembers the child pid in :data:`_OWN_PIDS`."""
+    _REAL_EXECUTE_CHILD(self, *args, **kwargs)
+    _OWN_PIDS.add(self.pid)
+
+
+def _audit_path() -> Path:
+    """``$CCC_TEST_KILL_AUDIT``, else ``~/.cache/ccc-test-kill-audit.log`` of the REAL home."""
+    raw = os.environ.get(_AUDIT_ENV, "")
+    return Path(raw) if raw else _REAL_HOME / ".cache" / "ccc-test-kill-audit.log"
+
+
+def _now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _audit_write(record: dict[str, object]) -> None:
+    """Append *record* (and this session's header first, once per file). Never raises."""
+    path = _audit_path()
+    lines = []
+    if str(path) not in _HEADERED:
+        _HEADERED.add(str(path))
+        header = {
+            "ts": _now(),
+            "event": "header",
+            "pytest_pid": _ROOT_PID,
+            "channels": list(_AUDIT_CHANNELS),
+            "strict": os.environ.get(_STRICT_ENV) == "1",
+        }
+        lines.append(json.dumps(header))
+    if record:
+        lines.append(json.dumps(record))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, ("\n".join(lines) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _ps_field(pid: int, field: str) -> str | None:
+    """``ps -o <field>= -p <pid>`` through the captured Popen; ``None`` on any failure."""
+    try:
+        with _REAL_POPEN(
+            [_PS, "-o", f"{field}=", "-p", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ) as proc:
+            try:
+                out, _ = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                _REAL_KILL(proc.pid, 9)  # our own ps child; never via the guarded os.kill
+                proc.communicate()
+                return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.strip() if proc.returncode == 0 else None
+
+
+def _in_pytest_tree(pid: int) -> bool:
+    """True when *pid* is the pytest process or one of its descendants.
+
+    Walks ``ppid`` links at most :data:`_WALK_CAP` levels; a parse failure, a timeout or
+    hitting the cap answers ``False`` (the caller treats the target as foreign).
+    """
+    current = pid
+    for _ in range(_WALK_CAP):
+        if current == _ROOT_PID:
+            return True
+        if current <= 1:
+            return False
+        parent = _ps_field(current, "ppid")
+        if not parent or not parent.isdigit():
+            return False
+        current = int(parent)
+    return False
+
+
+def _exists(probe: Callable[[int, int], None], pid: int) -> bool:
+    """Signal-0 probe through the REAL kill: ``EPERM`` still means the target exists."""
+    try:
+        probe(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _group_of_own_dead_leader(pgid: int) -> bool:
+    """True for a live group whose leader this session spawned and which has since exited.
+
+    A group outlives its leader (a forked grandchild keeps it), and POSIX never hands the
+    pgid out again while the group exists — so such a group is still the one we created.
+    """
+    return pgid in _OWN_PIDS and not _exists(_REAL_KILL, pgid)
+
+
+def _guarded_signal(nodeid: str, channel: str, target: int, sig: int) -> None:
+    """Deliver ``os.kill`` / ``os.killpg`` unless it would hit a live process outside pytest.
+
+    Rules, in order: signal 0 passes; the own process group (``kill(0)``, ``kill(-own)``,
+    ``killpg(own)``, ``killpg(<=0)``) passes; a target that does not exist goes to the real
+    call (which raises ``ProcessLookupError``) and is logged ``would-hit-on-recycle`` unless
+    it was ours; a target in the pytest tree passes, and so does a live group whose
+    leader we spawned and which has exited (:func:`_group_of_own_dead_leader`); anything else — and
+    ``kill(-1, …)``, "every process I may signal" — is ``foreign``: logged, then refused
+    with ``ProcessLookupError`` (or ``AssertionError`` under ``CCC_TEST_KILL_STRICT=1``).
+    A group (``killpg(g)``, ``kill(-g)``) is judged by its leader pid *g*.
+    """
+    is_group = channel == "os.killpg" or target < 0
+
+    def deliver() -> None:
+        if channel == "os.killpg":
+            _REAL_KILLPG(target, sig)
+        else:
+            _REAL_KILL(target, sig)
+
+    if sig == 0:
+        deliver()
+        return
+    if channel == "os.killpg":
+        leader = target
+        if leader <= 0:  # killpg(0) = own group; a negative one is EINVAL from the real call
+            deliver()
+            return
+    else:
+        leader = -target if target < 0 else target
+        if target == 0:
+            deliver()
+            return
+    if is_group and leader == _REAL_GETPGRP():
+        deliver()
+        return
+    if target != -1:
+        alive = _exists(_REAL_KILLPG if is_group else _REAL_KILL, leader)
+        if not alive:
+            if leader not in _OWN_PIDS:
+                _audit_write(_audit_record(nodeid, channel, target, sig, "would-hit-on-recycle"))
+            deliver()
+            return
+        if _in_pytest_tree(leader) or (is_group and _group_of_own_dead_leader(leader)):
+            _OWN_PIDS.add(leader)
+            deliver()
+            return
+    _audit_write(_audit_record(nodeid, channel, target, sig, "foreign"))
+    if os.environ.get(_STRICT_ENV) == "1":
+        raise AssertionError(f"test signalled a foreign pid {target} (sig {sig}) via {channel}")
+    raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH))
+
+
+def _audit_record(
+    nodeid: str, channel: str, target: int, sig: int | None, verdict: str, **extra: object
+) -> dict[str, object]:
+    """One audit line; *target* is resolved to its ``ps -o comm=`` (a group: its leader's)."""
+    signalled = channel != "log_close" and target not in (0, -1)
+    comm = _ps_field(abs(target), "comm") if signalled else None
+    record: dict[str, object] = {
+        "ts": _now(),
+        "nodeid": nodeid,
+        "channel": channel,
+        "pid": target,
+        "sig": sig,
+        "target": comm or "",
+        "verdict": verdict,
+    }
+    record.update(extra)
+    return record
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _kill_audit_header() -> None:
+    """Write this session's header (the instrumented channels) to the audit file up front."""
+    _audit_write({})
+
+
+@pytest.fixture(autouse=True)
+def _guard_real_signals(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route every ``os.kill`` / ``os.killpg`` through :func:`_guarded_signal` (tp#1793).
+
+    Tests that fake ``os.kill`` themselves simply re-override this (monkeypatch is
+    last-wins). Every ``closelog.log_close`` call is mirrored into the audit file too,
+    then the original still writes the tmp events.log, and every ``subprocess.Popen``
+    child pid is remembered (:data:`_OWN_PIDS`). Opt out of the signal guard (not the
+    mirror or the pid record) with ``@pytest.mark.real_signal``.
+    """
+    nodeid = request.node.nodeid
+    from command_center import closelog  # pylint: disable=import-outside-toplevel
+
+    original_log_close = closelog.log_close
+
+    def mirrored_log_close(
+        session_id: str, pid: int, path: str, *, note: str = "", who: str = ""
+    ) -> None:
+        _audit_write(
+            _audit_record(
+                nodeid,
+                "log_close",
+                pid,
+                None,
+                "log_close",
+                session_id=session_id,
+                path=path,
+                note=note,
+                who=who,
+            )
+        )
+        original_log_close(session_id, pid, path, note=note, who=who)
+
+    monkeypatch.setattr(closelog, "log_close", mirrored_log_close)
+    monkeypatch.setattr(subprocess.Popen, "_execute_child", _record_popen_child)
+    if request.node.get_closest_marker("real_signal"):
+        return
+
+    def guarded_kill(pid: int, sig: int, /) -> None:
+        _guarded_signal(nodeid, "os.kill", pid, sig)
+
+    def guarded_killpg(pgid: int, sig: int, /) -> None:
+        _guarded_signal(nodeid, "os.killpg", pgid, sig)
+
+    monkeypatch.setattr(os, "kill", guarded_kill)
+    monkeypatch.setattr(os, "killpg", guarded_killpg)
 
 
 @pytest.fixture(autouse=True)
