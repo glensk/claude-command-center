@@ -360,10 +360,19 @@ def _bind_debt(claim: Claim, debt: Debt) -> None:
 
 
 def _gone(pid: int, start: str, table: dict[int, Any]) -> bool:
-    """True when the readable *table* no longer holds *pid* with start time *start*."""
+    """True when the readable *table* no longer holds *pid* with start time *start*.
+
+    An empty start stamp (``ps -p`` failed or timed out, or the pid left between the two
+    reads) is never proof of "gone" (tp#1868): the next poll's table decides.
+    """
     from . import terminal
 
-    return bool(table) and (pid not in table or terminal.pid_start(pid) != start)
+    if not table:
+        return False
+    if pid not in table:
+        return True
+    now_start = terminal.pid_start(pid)
+    return bool(now_start) and now_start != start
 
 
 def _wait_exit(pid: int, start: str) -> bool:

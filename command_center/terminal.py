@@ -1652,23 +1652,35 @@ def pid_tty(pid: int, table: dict[int, Any]) -> str:
     return snapshot.normalize_tty(row.tty) if row is not None else ""
 
 
+#: :func:`pid_start`'s budget, and the one retry's after a timeout (tp#1868: load ~40).
+PID_START_TIMEOUT_SEC = 5.0
+PID_START_RETRY_TIMEOUT_SEC = 15.0
+
+
 def pid_start(pid: int) -> str:
     """The process start time of *pid* as ``ps`` prints it (``""`` when gone/unknown).
 
     Captured before a long wait and compared after it: a recycled pid (the process
     exited and the number was handed to a newcomer) shows a different start time, so
-    the newcomer is never signalled.
+    the newcomer is never signalled. A read that TIMES OUT (a loaded machine) is retried
+    once with :data:`PID_START_RETRY_TIMEOUT_SEC` (tp#1868); any other failure is not.
     """
     if pid <= 0:
         return ""
+    argv = ["ps", "-p", str(pid), "-o", "lstart="]
     try:
-        out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "lstart="],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
+        try:
+            out = subprocess.run(
+                argv, capture_output=True, text=True, timeout=PID_START_TIMEOUT_SEC, check=False
+            )
+        except subprocess.TimeoutExpired:
+            out = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=PID_START_RETRY_TIMEOUT_SEC,
+                check=False,
+            )
     except (subprocess.SubprocessError, OSError):
         return ""
     return out.stdout.strip() if out.returncode == 0 else ""
@@ -1700,11 +1712,13 @@ def probe_identity(pid: int, table: dict[int, Any] | None = None) -> Identity:
     """Who is *pid* right now — a FRESH ``ps`` table (unless *table* is given) + start stamp.
 
     ``PS_UNREADABLE`` for an empty table or an empty start stamp of a pid the table
-    lists; ``PID_GONE`` for a non-positive pid or one a readable table does not hold.
+    lists; ``PID_GONE`` for a non-positive pid or one a readable table does not hold. A
+    fresh table that comes back empty (``ps`` failed or timed out under load) is read once
+    more before it answers ``PS_UNREADABLE`` (tp#1868); a given table is never re-read.
     """
     if pid <= 0:
         return Identity(IDENTITY_PID_GONE)
-    rows = ps_table() if table is None else table
+    rows = (ps_table() or ps_table()) if table is None else table
     if not rows:
         return Identity(IDENTITY_PS_UNREADABLE)
     if pid not in rows:

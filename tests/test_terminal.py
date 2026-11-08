@@ -396,3 +396,78 @@ def test_probe_identity_types_every_outcome(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(terminal, "pid_start", lambda _pid: "")
     unreadable = terminal.probe_identity(7, table)
     assert unreadable.kind == terminal.IDENTITY_PS_UNREADABLE and unreadable.token(7) == ""
+
+
+# ---- a slow ps under load (tp#1868) ---------------------------------------
+class _FakePs:
+    """``subprocess.run`` for ``ps -p PID -o lstart=``: each answer a stamp, a return code
+    or ``None`` (= a timeout); records the timeouts it was called with."""
+
+    def __init__(self, *answers: str | int | None) -> None:
+        self.answers = list(answers)
+        self.timeouts: list[float] = []
+
+    def __call__(self, argv: list[str], **kw: object) -> object:
+        import subprocess
+
+        assert argv[0] == "ps" and "lstart=" in argv, argv
+        self.timeouts.append(float(kw["timeout"]))  # type: ignore[arg-type]
+        answer = self.answers.pop(0)
+        if answer is None:
+            raise subprocess.TimeoutExpired(argv, float(kw["timeout"]))  # type: ignore[arg-type]
+        if isinstance(answer, int):
+            return subprocess.CompletedProcess(argv, answer, "", "")
+        return subprocess.CompletedProcess(argv, 0, answer + "\n", "")
+
+
+@pytest.mark.parametrize(
+    ("answers", "start", "timeouts"),
+    [
+        (("Sun Nov  8 04:00:00 2026",), "Sun Nov  8 04:00:00 2026", [5.0]),
+        ((None, "Sun Nov  8 04:00:00 2026"), "Sun Nov  8 04:00:00 2026", [5.0, 15.0]),
+        ((None, None), "", [5.0, 15.0]),
+        ((1,), "", [5.0]),  # gone (or any non-timeout failure): never retried
+    ],
+)
+def test_pid_start_retries_one_timeout_with_a_longer_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    answers: tuple[str | int | None, ...],
+    start: str,
+    timeouts: list[float],
+) -> None:
+    fake = _FakePs(*answers)
+    monkeypatch.setattr(terminal.subprocess, "run", fake)
+    assert terminal.pid_start(4242) == start
+    assert fake.timeouts == timeouts
+
+
+def test_probe_identity_reads_an_empty_fresh_table_once_more(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from command_center.snapshot import PsRow
+
+    table = {7: PsRow(1, "ttys001", "S+", "claude")}
+    monkeypatch.setattr(terminal, "pid_start", lambda _pid: "Tue")
+    reads: list[dict[int, PsRow]] = [{}, table]
+    monkeypatch.setattr(terminal, "ps_table", lambda: reads.pop(0))
+    ok = terminal.probe_identity(7)
+    assert (ok.kind, ok.token(7)) == (terminal.IDENTITY_OK, "7:Tue") and not reads
+    reads[:] = [{}, {}]
+    assert terminal.probe_identity(7).kind == terminal.IDENTITY_PS_UNREADABLE and not reads
+    monkeypatch.setattr(terminal, "ps_table", lambda: pytest.fail("a given table is re-read"))
+    assert terminal.probe_identity(7, {}).kind == terminal.IDENTITY_PS_UNREADABLE
+
+
+def test_gone_never_reads_an_unreadable_start_as_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    from command_center import handoff_close
+    from command_center.snapshot import PsRow
+
+    table = {7: PsRow(1, "ttys001", "S+", "claude")}
+    monkeypatch.setattr(terminal, "pid_start", lambda _pid: "")  # timed out twice
+    assert handoff_close._gone(7, "Tue", table) is False  # pylint: disable=protected-access
+    monkeypatch.setattr(terminal, "pid_start", lambda _pid: "Wed")  # a recycled pid
+    assert handoff_close._gone(7, "Tue", table) is True  # pylint: disable=protected-access
+    monkeypatch.setattr(terminal, "pid_start", lambda _pid: "Tue")
+    assert handoff_close._gone(7, "Tue", table) is False  # pylint: disable=protected-access
+    assert handoff_close._gone(8, "Tue", table) is True  # pylint: disable=protected-access
+    assert handoff_close._gone(7, "Tue", {}) is False  # pylint: disable=protected-access
