@@ -26,7 +26,10 @@ import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -397,7 +400,6 @@ def tmux_landing(session_id: str, wait_s: float | None = None) -> dict[str, Any]
     the pane id (``%12``), and ``attach_argv`` attaches to the session with that window
     selected (``tmux attach -t <session>:<window>``). ``None`` when the pane is not found.
     """
-    import time  # pylint: disable=import-outside-toplevel  # only open-job -j polls
 
     budget = TMUX_LOCATE_WAIT_S if wait_s is None else wait_s
     deadline = time.monotonic() + max(budget, 0.0)
@@ -1518,7 +1520,6 @@ def delivery_channel_health() -> dict[str, Any]:
     :func:`_iterm_reachable_by_apple_event`. Measured by the ``ccc await`` poller (the
     process that delivers) and recorded; views only read the record.
     """
-    import time  # pylint: disable=import-outside-toplevel
 
     error = _probe_python_api()
     return {
@@ -1622,11 +1623,61 @@ def tmux_pane_info(pane_id: str) -> tuple[int, str] | None:
     return int(pid_text), tty.strip()
 
 
+#: The ``ps`` time budget of the running close (tp#1868 B5): a monotonic instant from
+#: :func:`ps_deadline` (``None`` = no budget), and whether a probe may re-read / retry.
+_PS_DEADLINE: ContextVar[float | None] = ContextVar("ccc_ps_deadline", default=None)
+_PS_PATIENT: ContextVar[bool] = ContextVar("ccc_ps_patient", default=True)
+#: The deadline's clock, bound once: a test that fakes ``time.monotonic`` for one module's
+#: window does not move it.
+ps_clock: Callable[[], float] = time.monotonic
+
+
+@contextmanager
+def ps_deadline(seconds: float) -> Iterator[float]:
+    """Run the block under ONE ``ps`` deadline *seconds* from now (an outer one still wins).
+
+    Inside it :func:`ps_table` and :func:`pid_start` cap their ``ps`` timeouts at the time
+    left (none left: they answer "unreadable" without running ``ps``), and once it is
+    spent no probe re-reads a table or retries a start stamp.
+    """
+    at = ps_clock() + seconds
+    outer = _PS_DEADLINE.get()
+    token = _PS_DEADLINE.set(at if outer is None else min(outer, at))
+    try:
+        yield at
+    finally:
+        _PS_DEADLINE.reset(token)
+
+
+def ps_deadline_spent() -> bool:
+    """True inside a :func:`ps_deadline` block whose time is used up."""
+    at = _PS_DEADLINE.get()
+    return at is not None and at - ps_clock() <= 0
+
+
+def _ps_budget(default: float) -> float:
+    """*default*, capped at the time the running :func:`ps_deadline` leaves (``<= 0``: none)."""
+    at = _PS_DEADLINE.get()
+    return default if at is None else min(default, at - ps_clock())
+
+
+def _ps_patient() -> bool:
+    """May a probe spend a second ``ps`` read? Not under ``patient=False``, not when spent."""
+    return _PS_PATIENT.get() and not ps_deadline_spent()
+
+
 def ps_table() -> dict[int, Any]:
-    """One live ``ps`` pass as ``{pid: PsRow(ppid, tty, stat, command)}`` (snapshot's reader)."""
+    """One live ``ps`` pass as ``{pid: PsRow(ppid, tty, stat, command)}`` (snapshot's reader).
+
+    Under a :func:`ps_deadline` the read's timeout is the time left; with none left the
+    answer is an empty timed-out table (:func:`snapshot.ps_timed_out`) and ``ps`` never runs.
+    """
     from . import snapshot  # pylint: disable=import-outside-toplevel
 
-    return snapshot.read_ps()
+    budget = _ps_budget(snapshot.PS_TIMEOUT_SEC)
+    if budget <= 0:
+        return snapshot.PsTimedOut()
+    return snapshot.read_ps(budget)
 
 
 def pid_descends_from(pid: int, ancestor: int, table: dict[int, Any]) -> bool:
@@ -1664,26 +1715,24 @@ def pid_start(pid: int) -> str:
     exited and the number was handed to a newcomer) shows a different start time, so
     the newcomer is never signalled. A read that TIMES OUT (a loaded machine) is retried
     once with :data:`PID_START_RETRY_TIMEOUT_SEC` (tp#1868); any other failure is not.
+    Under a :func:`ps_deadline` each timeout is capped at the time left, and there is no
+    retry once it is spent or inside a ``patient=False`` :func:`probe_identity` (B5).
     """
     if pid <= 0:
         return ""
     argv = ["ps", "-p", str(pid), "-o", "lstart="]
-    try:
+    for attempt, default in enumerate((PID_START_TIMEOUT_SEC, PID_START_RETRY_TIMEOUT_SEC)):
+        budget = _ps_budget(default)
+        if budget <= 0 or (attempt and not _ps_patient()):
+            return ""
         try:
-            out = subprocess.run(
-                argv, capture_output=True, text=True, timeout=PID_START_TIMEOUT_SEC, check=False
-            )
+            out = subprocess.run(argv, capture_output=True, text=True, timeout=budget, check=False)
         except subprocess.TimeoutExpired:
-            out = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=PID_START_RETRY_TIMEOUT_SEC,
-                check=False,
-            )
-    except (subprocess.SubprocessError, OSError):
-        return ""
-    return out.stdout.strip() if out.returncode == 0 else ""
+            continue
+        except (subprocess.SubprocessError, OSError):
+            return ""
+        return out.stdout.strip() if out.returncode == 0 else ""
+    return ""
 
 
 #: :func:`probe_identity` kinds: the probe read a live process (``OK``), ``ps`` itself
@@ -1708,22 +1757,34 @@ class Identity:
         return f"{pid}:{self.start}" if self.kind == IDENTITY_OK and self.start else ""
 
 
-def probe_identity(pid: int, table: dict[int, Any] | None = None) -> Identity:
+def probe_identity(
+    pid: int, table: dict[int, Any] | None = None, *, patient: bool = True
+) -> Identity:
     """Who is *pid* right now — a FRESH ``ps`` table (unless *table* is given) + start stamp.
 
     ``PS_UNREADABLE`` for an empty table or an empty start stamp of a pid the table
     lists; ``PID_GONE`` for a non-positive pid or one a readable table does not hold. A
     fresh table that comes back empty (``ps`` failed or timed out under load) is read once
     more before it answers ``PS_UNREADABLE`` (tp#1868); a given table is never re-read.
+    ``patient=False`` (the Stop hook, a probe held under a tab lock, tp#1868 B5) and a
+    spent :func:`ps_deadline` skip that re-read and :func:`pid_start`'s retry.
     """
     if pid <= 0:
         return Identity(IDENTITY_PID_GONE)
-    rows = (ps_table() or ps_table()) if table is None else table
-    if not rows:
-        return Identity(IDENTITY_PS_UNREADABLE)
-    if pid not in rows:
-        return Identity(IDENTITY_PID_GONE)
-    start = pid_start(pid)
+    token = _PS_PATIENT.set(_PS_PATIENT.get() and patient)
+    try:
+        rows = table
+        if rows is None:
+            rows = ps_table()
+            if not rows and _ps_patient():
+                rows = ps_table()
+        if not rows:
+            return Identity(IDENTITY_PS_UNREADABLE)
+        if pid not in rows:
+            return Identity(IDENTITY_PID_GONE)
+        start = pid_start(pid)
+    finally:
+        _PS_PATIENT.reset(token)
     if not start:
         return Identity(IDENTITY_PS_UNREADABLE)
     return Identity(IDENTITY_OK, start=start, is_claude=pid_is_claude(pid, rows))

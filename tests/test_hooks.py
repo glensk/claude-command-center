@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1075,3 +1076,19 @@ def test_user_prompt_on_a_normal_row_is_not_denied(capsys: pytest.CaptureFixture
     assert "handed off" not in capsys.readouterr().out
     got = Store().get("s1")
     assert got is not None and got.prompt_count == 4  # the normal turn ran
+
+
+def test_stop_hook_identity_probe_is_impatient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """tp#1868 B5: the Stop hook never re-reads a table or retries a start stamp."""
+    from command_center import terminal
+
+    seen: list[bool] = []
+
+    def _probe(pid: int, table: Any = None, *, patient: bool = True) -> terminal.Identity:
+        del pid, table
+        seen.append(patient)
+        return terminal.Identity(terminal.IDENTITY_OK, start="Tue")
+
+    monkeypatch.setattr(terminal, "probe_identity", _probe)
+    assert hooks._own_identity("42") == "42:Tue"  # pylint: disable=protected-access
+    assert seen == [False]

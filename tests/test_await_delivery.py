@@ -27,6 +27,7 @@ from command_center.await_prompt import FRAMING
 from command_center.await_store import SourceSpec
 from command_center.bridge_target import PasteResult, guarded_paste
 from command_center.models import LiveSession
+from command_center.snapshot import PsTimedOut
 from command_center.store import Store
 from command_center.transfer_store import Transfer
 
@@ -741,7 +742,7 @@ def test_paste_guard_await_unreadable_ps_holds_without_an_attempt(wenv: dict[str
     # tp#1868: a timed-out ps under load is a hold, not a failed typer (stale_tab before).
     world: World = wenv["world"]
     gid = _fired(wenv)
-    world.ps_queue = [{}]
+    world.ps_queue = [PsTimedOut()]
     report, _notes = _guarded(wenv)
     group = _group(wenv, gid)
     assert (group.state, group.delivery_attempts, group.held_since) == ("fired", 0, NOW + 200)

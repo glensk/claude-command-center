@@ -65,6 +65,10 @@ STABLE_POLL_SEC = 2.0
 #: How long to wait for the SIGTERM'd process to exit before the terminal close.
 EXIT_WAIT_SEC = 10.0
 EXIT_POLL_SEC = 0.25
+#: The ``ps`` budget of ONE whole close (tp#1868 B5), under decide's 90 s ``ccc close``
+#: timeout: every ``ps`` read inside it is capped at the time left, and once it is spent
+#: the close refuses ``unobservable`` before its next probe (:func:`check_deadline`).
+CLOSE_DEADLINE_SEC = 75.0
 #: ``close_bound`` prefix of a kept close debt (signal sent, terminal close outstanding).
 DEBT_PREFIX = "handoff:"
 
@@ -223,11 +227,24 @@ def _live_entry(adapter: ClaudeAdapter, session_id: str) -> LiveSession:
     return entry
 
 
-def _start_of(pid: int) -> str:
-    """*pid*'s start stamp, when it is a live claude; :class:`Refused` otherwise."""
+def check_deadline() -> None:
+    """:class:`Refused` (``unobservable``) once the close's :data:`CLOSE_DEADLINE_SEC` is spent."""
     from . import terminal
 
-    ident = terminal.probe_identity(pid)
+    if terminal.ps_deadline_spent():
+        raise Refused("the close's time budget is spent (ps too slow under load)", "unobservable")
+
+
+def _start_of(pid: int, *, patient: bool = True) -> str:
+    """*pid*'s start stamp, when it is a live claude; :class:`Refused` otherwise.
+
+    Refuses ``unobservable`` without a probe once the close's deadline is spent;
+    *patient* = False (a probe under the tab lock) neither re-reads nor retries.
+    """
+    from . import terminal
+
+    check_deadline()
+    ident = terminal.probe_identity(pid, patient=patient)
     if ident.kind == terminal.IDENTITY_PS_UNREADABLE:
         raise Refused(f"pid {pid} could not be identified (ps unreadable)", "unobservable")
     if ident.kind != terminal.IDENTITY_OK:
@@ -254,12 +271,14 @@ def _stamp(path: Path | None) -> tuple[int, int, int] | None:
     return (stat.st_ino, stat.st_mtime_ns, stat.st_size) if stat is not None else None
 
 
-def observe(adapter: ClaudeAdapter, session_id: str, bound: Bound) -> tuple[int, int, int]:
+def observe(
+    adapter: ClaudeAdapter, session_id: str, bound: Bound, *, patient: bool = True
+) -> tuple[int, int, int]:
     """One idle proof of the bound process — its transcript identity, or :class:`Refused`.
 
     The same single live entry with the bound pid, registry ``idle``, the same PID start
     time, a readable transcript whose inspection shows no open turn, and an identity that
-    did not move while it was being read.
+    did not move while it was being read. *patient*: :func:`_start_of`'s.
     """
     from .adapters.claude_agents import contract_status
     from .bridge_send import BridgeError, inspect_transcript
@@ -273,7 +292,7 @@ def observe(adapter: ClaudeAdapter, session_id: str, bound: Bound) -> tuple[int,
     # (tp#1662), which the transcript check below enforces (``active is not False``).
     if contract_status(entry.raw_status, False) != "idle":
         raise Refused(f"source busy (registry {entry.raw_status or 'unknown'})", "busy")
-    if _start_of(bound.pid) != bound.start:
+    if _start_of(bound.pid, patient=patient) != bound.start:
         raise Refused(f"pid {bound.pid} was replaced (start time differs)", "identity_changed")
     before = _stamp(bound.transcript)
     if before is None or bound.transcript is None:
@@ -290,11 +309,16 @@ def observe(adapter: ClaudeAdapter, session_id: str, bound: Bound) -> tuple[int,
 
 
 def await_stable(adapter: ClaudeAdapter, session_id: str, bound: Bound) -> tuple[int, int, int]:
-    """Idle proofs across :data:`STABLE_WINDOW_SEC` with ONE transcript identity throughout."""
+    """Idle proofs across :data:`STABLE_WINDOW_SEC` with ONE transcript identity throughout.
+
+    The close's deadline is checked before EACH observation (:func:`check_deadline`).
+    """
+    check_deadline()
     first = observe(adapter, session_id, bound)
     deadline = time.monotonic() + STABLE_WINDOW_SEC
     while True:
         _sleep(max(0.0, min(STABLE_POLL_SEC, deadline - time.monotonic())))
+        check_deadline()
         if observe(adapter, session_id, bound) != first:
             raise Refused("source transcript changed during the stability window", "stale_evidence")
         if time.monotonic() >= deadline:
@@ -314,17 +338,24 @@ def _drain(bound: Bound, cfg: config.Config) -> None:
             f"Stop hooks still running: {names or 'unnamed hook process(es)'}", "stop_chain"
         )
     if state != terminal.DRAIN_DRAINED:
+        check_deadline()  # an unreadable chain past the deadline is the close's budget
         raise Refused(
             "the Stop chain could not be observed (ps unreadable or pid gone)", "stop_chain"
         )
 
 
 def _revalidate(
-    adapter: ClaudeAdapter, claim: Claim, bound: Bound, stamp: tuple[int, int, int]
+    adapter: ClaudeAdapter,
+    claim: Claim,
+    bound: Bound,
+    stamp: tuple[int, int, int],
+    *,
+    patient: bool = True,
 ) -> None:
     """Everything again, immediately before the SIGTERM; :class:`Refused` on any drift.
 
     A claim without a ``transfer_id`` (``ccc close``, tp#1481) has no lineage to recheck.
+    *patient* = False under a tab lock: the probe neither re-reads nor retries (tp#1868 B5).
     """
     with Store() as store:
         reason = (
@@ -340,7 +371,7 @@ def _revalidate(
         or (row.close_holder or "") != claim.holder
     ):
         raise Refused("the close token changed hands", "close_in_flight")
-    if observe(adapter, claim.session_id, bound) != stamp:
+    if observe(adapter, claim.session_id, bound, patient=patient) != stamp:
         raise Refused("source transcript changed before the signal", "stale_evidence")
 
 
@@ -376,14 +407,14 @@ def _gone(pid: int, start: str, table: dict[int, Any]) -> bool:
 
 
 def _wait_exit(pid: int, start: str) -> bool:
-    """Wait (≤ :data:`EXIT_WAIT_SEC`) for the signalled process to be gone."""
+    """Wait (≤ :data:`EXIT_WAIT_SEC`, never past the close's deadline) for *pid* to be gone."""
     from . import terminal
 
     deadline = time.monotonic() + EXIT_WAIT_SEC
     while True:
         if _gone(pid, start, terminal.ps_table()):
             return True
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= deadline or terminal.ps_deadline_spent():
             return False
         _sleep(EXIT_POLL_SEC)
 
@@ -532,6 +563,17 @@ def run(args: argparse.Namespace) -> int:
     if not sid:
         return _refuse(None, "-", tid, "no --session given")
     cfg = config.load_config()
+    from . import terminal
+
+    # ONE ps deadline for the whole close (tp#1868 B5); the Stop-chain drain keeps its own
+    # configured wait on top (D5: it is out of this budget).
+    drain = float(cfg.stop_barrier_wait_sec) if cfg.stop_barrier_enabled else 0.0
+    with terminal.ps_deadline(CLOSE_DEADLINE_SEC + drain):
+        return _run(args, sid, tid, cfg)
+
+
+def _run(args: argparse.Namespace, sid: str, tid: str, cfg: config.Config) -> int:
+    """:func:`run` inside its ``ps`` deadline."""
     holder = ""
     with Store() as store:
         reason = lineage_refusal(store, tid, sid)

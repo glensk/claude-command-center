@@ -160,11 +160,12 @@ def run_send(deps: BridgeDeps, session_id: str, text: str) -> dict[str, Any]:
     A delivery that was attempted but not accepted raises with ``data`` attached, so
     the caller still gets the ``delivery_id`` to follow up.
     """
+    started = deps.monotonic()  # the ps budget of the send (tp#1868 B5)
     validate_message(text)
     live = require_live(deps, session_id)
     tab = tab_for(deps, live)
     with tab_lock(deps, tab):
-        target = revalidate(deps, session_id, tab)
+        target = revalidate(deps, session_id, tab, started=started)
         path, fresh = send_transcript(deps, session_id, target.live.cwd, target.live.config_dir)
         ins = None if fresh else inspect_transcript(path)
         if ins is not None and ins.pending:

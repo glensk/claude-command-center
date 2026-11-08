@@ -22,6 +22,7 @@ from command_center.bridge_target import (
     held_notice,
 )
 from command_center.screenread import ScreenCell, ScreenRead, line_text, rule_rows
+from command_center.snapshot import PsTimedOut
 
 TEXT = "tp1867 pasted prompt"
 #: A screen with no full-width rule: the parser cannot find the box.
@@ -270,10 +271,18 @@ def test_paste_guard_unreadable_ps_is_held_not_stale_tab(
 ) -> None:
     # tp#1868: a timed-out ps (tab_for's read or revalidate's) holds; nothing typed.
     world = _world(tmp_path)
-    world.ps_queue = [world.table()] * unreadable_read + [{}]
+    world.ps_queue = [world.table()] * unreadable_read + [PsTimedOut()]
     result = _paste(world)
     assert result.refusal == "ps_unreadable" and result.held
     assert not world.texts and world.screen_reads == 0
+
+
+def test_paste_guard_failed_ps_is_a_definite_stale_tab(tmp_path: Path) -> None:
+    # tp#1868 B5: a ps that FAILS (a plain {}) is not load: no hold, stale_tab as before.
+    world = _world(tmp_path)
+    world.ps_queue = [{}, {}]
+    result = _paste(world)
+    assert result.refusal == "stale_tab" and not result.held and not world.texts
 
 
 def test_paste_guard_draft_text_appears_nowhere(tmp_path: Path) -> None:

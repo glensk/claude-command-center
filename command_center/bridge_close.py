@@ -312,7 +312,7 @@ def _close_live(  # pylint: disable=too-many-locals
         )
         lock = tab_lock(deps, iterm) if iterm else nullcontext()
         with lock:
-            hc._revalidate(adapter, claim, bound, stamp)
+            hc._revalidate(adapter, claim, bound, stamp, patient=False)  # no retry under the lock
             _check_binding(sid, staff_agent)
             hc._bind_debt(claim, debt)
             signalled = cli._sigterm(bound.pid)
@@ -399,14 +399,24 @@ def _retry_debt(sid: str, holder: str) -> dict[str, Any] | None:
 def run_close(deps: BridgeDeps, session_id: str, staff_agent: str = "") -> dict[str, Any]:
     """Close *session_id* when it is provably idle; the ``data`` object or a refusal.
 
-    *staff_agent* (``-A``) opts in to closing a session bound to exactly that agent.
+    *staff_agent* (``-A``) opts in to closing a session bound to exactly that agent. The
+    whole close runs under ONE ``ps`` deadline (:data:`handoff_close.CLOSE_DEADLINE_SEC`,
+    tp#1868 B5): past it the close refuses ``unobservable`` before its next probe.
     """
-    from . import config, staffrole
+    from . import terminal
 
     sid = (session_id or "").strip()
     agent = (staff_agent or "").strip()
     if not sid:
         raise BridgeError("usage", "pass -s/--session <id>", 2)
+    with terminal.ps_deadline(hc.CLOSE_DEADLINE_SEC):
+        return _run_close(deps, sid, agent)
+
+
+def _run_close(deps: BridgeDeps, sid: str, agent: str) -> dict[str, Any]:
+    """:func:`run_close` inside its ``ps`` deadline."""
+    from . import config, staffrole
+
     holder = hc.own_identity()
     if not holder:
         raise _refusal(sid, "unobservable", "own process could not be identified (ps unreadable)")

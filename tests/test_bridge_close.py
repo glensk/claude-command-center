@@ -712,9 +712,9 @@ def test_staff_close_binding_reread_under_tab_lock(
         order.append("binding")
         real_check(*args)
 
-    def _revalidate(*args: Any) -> None:
+    def _revalidate(*args: Any, **kwargs: Any) -> None:
         order.append("revalidate")
-        real_revalidate(*args)
+        real_revalidate(*args, **kwargs)
 
     world.on_kill.append(lambda: order.append("kill"))
     monkeypatch.setattr(bridge_close, "tab_lock", lambda *a: _Lock(real_lock(*a)))
@@ -883,3 +883,74 @@ class _OneLive:
 
     def transcript_path(self, *args: Any, **kwargs: Any) -> Path | None:
         return self.inner.transcript_path(*args, **kwargs)
+
+
+# ---- a slow ps under load (tp#1868 B5) ------------------------------------
+def test_first_ps_read_timing_out_still_closes_with_one_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bind's probe re-reads ONE timed-out table and the close goes through."""
+    from command_center.snapshot import PsTimedOut
+
+    world, deps = _install(tmp_path, monkeypatch)
+    reads: list[dict[int, Any]] = [PsTimedOut()]
+    monkeypatch.setattr(terminal, "ps_table", lambda: reads.pop(0) if reads else world.table)
+    assert bridge_close.run_close(deps, SID)["result"] == "closed"
+    assert world.killed == [(PID, signal.SIGTERM)] and not reads
+
+
+def test_spent_close_deadline_refuses_unobservable_without_a_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(handoff_close, "CLOSE_DEADLINE_SEC", 0.0)
+
+    def _table() -> dict[int, Any]:
+        calls.append("table")
+        return world.table
+
+    def _start(_pid: int) -> str:
+        calls.append("start")
+        return START
+
+    monkeypatch.setattr(terminal, "ps_table", _table)
+    monkeypatch.setattr(terminal, "pid_start", _start)
+    _refused(deps, "unobservable")
+    _nothing_signalled(world)
+    assert not calls  # no read, no re-read, no retry once the budget is spent
+
+
+def test_stability_window_checks_the_deadline_before_each_observe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    now = [0.0]
+    starts: list[int] = []
+    monkeypatch.setattr(terminal, "ps_clock", lambda: now[0])
+
+    def _start(_pid: int) -> str:
+        starts.append(1)
+        return START
+
+    monkeypatch.setattr(terminal, "pid_start", _start)
+    world.on_sleep.append(lambda: now.__setitem__(0, handoff_close.CLOSE_DEADLINE_SEC + 1))
+    _refused(deps, "unobservable")
+    _nothing_signalled(world)
+    assert len(starts) == 2  # the bind + the first observe; none after the window's sleep
+
+
+def test_revalidation_under_the_tab_lock_is_impatient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    real = terminal.probe_identity
+    patience: list[bool] = []
+
+    def _spy(pid: int, table: Any = None, *, patient: bool = True) -> Any:
+        patience.append(patient)
+        return real(pid, table, patient=patient)
+
+    monkeypatch.setattr(terminal, "probe_identity", _spy)
+    assert bridge_close.run_close(deps, SID)["result"] == "closed"
+    assert patience[-1] is False and all(patience[:-1]) and world.killed

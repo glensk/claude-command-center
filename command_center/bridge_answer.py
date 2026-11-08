@@ -248,11 +248,12 @@ def _verify(
 
 def run_answer(deps: BridgeDeps, session_id: str, raw: Any) -> dict[str, Any]:
     """Answer the pending picker; the ``data`` object (raises :class:`BridgeError`)."""
+    started = deps.monotonic()  # the ps budget of the answer (tp#1868 B5)
     did, answers = parse_payload(raw)
     live = require_live(deps, session_id)
     tab = tab_for(deps, live)
     with tab_lock(deps, tab):
-        target = revalidate(deps, session_id, tab)
+        target = revalidate(deps, session_id, tab, started=started)
         if target.status not in ANSWER_STATUSES:
             raise BridgeError("not_waiting", f"session {session_id} is {target.status}")
         path = transcript_of(deps, session_id, target.live.cwd, target.live.config_dir)

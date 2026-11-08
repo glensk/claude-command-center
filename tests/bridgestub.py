@@ -205,10 +205,12 @@ class World:  # pylint: disable=too-many-instance-attributes  # one fake machine
     input_guard: bool = True
     screen_reads: int = 0
     started_at: int = 0
-    #: tp#1868: answers the ``ps`` seam pops first (``{}`` = an unreadable table, as
-    #: ``snapshot.read_ps`` answers a timeout), then :meth:`table`; ``ps_reads`` counts calls.
+    #: tp#1868: answers the ``ps`` seam pops first (``snapshot.PsTimedOut()`` = a timed-out
+    #: read, ``{}`` = a failed one), then :meth:`table`; ``ps_reads`` counts calls and each
+    #: read advances the fake clock by ``ps_cost`` seconds (a slow ``ps`` under load).
     ps_queue: list[dict[int, Any]] = field(default_factory=list)
     ps_reads: int = 0
+    ps_cost: float = 0.0
 
     def __post_init__(self) -> None:
         self.config_dir = self.tmp / "claude"
@@ -249,6 +251,7 @@ class World:  # pylint: disable=too-many-instance-attributes  # one fake machine
 
     def ps(self) -> dict[int, Any]:
         self.ps_reads += 1
+        self.mono += self.ps_cost
         return self.ps_queue.pop(0) if self.ps_queue else self.table()
 
     def table(self) -> dict[int, Any]:

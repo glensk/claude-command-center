@@ -25,6 +25,7 @@ from command_center import bridge_delivery
 from command_center.adapters import claude_bridge as cb
 from command_center.adapters.claude_agents import AgentEntry
 from command_center.bridge_store import Delivery
+from command_center.snapshot import PsTimedOut
 from command_center.store import Store
 
 
@@ -175,9 +176,9 @@ def test_stale_or_foreign_tab_is_refused(
 def test_unreadable_ps_table_refuses_ps_unreadable_after_one_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # tp#1868: a timed-out ps (read_ps answers {}) is unknown, never "no tty" (stale_tab);
-    # tab_for refuses at once, so a send under load pays ONE full table read.
-    world = _idle_world(tmp_path, ps_queue=[{}])
+    # tp#1868: a timed-out ps (read_ps answers PsTimedOut) is unknown, never "no tty"
+    # (stale_tab); tab_for refuses at once, so a send under load pays ONE full table read.
+    world = _idle_world(tmp_path, ps_queue=[PsTimedOut()])
     rc, env, _err = _send(world, monkeypatch, capsys, "hello")
     assert rc == 1 and env is not None and env["error"]["code"] == "ps_unreadable"
     assert "timed out" in env["error"]["message"]
@@ -188,10 +189,51 @@ def test_ps_unreadable_at_the_revalidation_is_not_stale_tab(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     world = _idle_world(tmp_path)
-    world.ps_queue = [world.table(), {}]  # tab_for reads fine, revalidate's read times out
+    world.ps_queue = [world.table(), PsTimedOut()]  # revalidate's read times out
     rc, env, _err = _send(world, monkeypatch, capsys, "hello")
     assert rc == 1 and env is not None and env["error"]["code"] == "ps_unreadable"
     assert not world.texts and world.ps_reads == 2
+
+
+def test_failed_ps_keeps_stale_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # tp#1868 B5: a ps that FAILS (OSError / non-zero exit: a plain {}) is not load — a
+    # held ps_unreadable would hold forever; the send keeps the pre-tp#1868 stale_tab.
+    world = _idle_world(tmp_path, ps_queue=[{}, {}])
+    rc, env, _err = _send(world, monkeypatch, capsys, "hello")
+    assert rc == 1 and env is not None and env["error"]["code"] == "stale_tab"
+    assert "no tty for pid" in env["error"]["message"]
+    assert not world.texts and world.ps_reads == 2
+
+
+@pytest.mark.parametrize(
+    ("cost", "reads", "code"),
+    [
+        (13.0, 1, "ps_unreadable"),  # 13 s gone before revalidate's read: no second read
+        (7.0, 2, "ps_unreadable"),  # the read itself ended at 14 s: still nothing typed
+        (5.0, 2, ""),  # 10 s: within the 12 s budget, delivered
+    ],
+)
+def test_send_budget_refuses_a_slow_ps_before_decides_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    cost: float,
+    reads: int,
+    code: str,
+) -> None:
+    # tp#1868 B5: revalidate types only when its ps read starts AND ends within 12 s of
+    # the send's start, so a refusal lands before decide's 30 s `ccc send` timeout.
+    world = _idle_world(tmp_path, ps_cost=cost)
+    rc, env, _err = _send(world, monkeypatch, capsys, "hello")
+    assert env is not None and world.ps_reads == reads
+    if code:
+        assert rc == 1 and env["error"]["code"] == code and not world.texts
+        assert "budget spent" in env["error"]["message"]
+    else:
+        assert world.texts
 
 
 def test_readable_table_without_the_pid_stays_stale_tab(

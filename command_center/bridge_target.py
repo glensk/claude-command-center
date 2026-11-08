@@ -71,6 +71,11 @@ LOCK_WAIT_SEC = 3.0
 #: A session whose process started less than this long ago may not have drawn its input
 #: box yet: an unreadable box there is ``input_not_ready``, not a fail-open send (tp#1844).
 INPUT_READY_GRACE_SEC = 30.0
+#: ``ccc send`` / ``ccc answer`` type only when :func:`revalidate`'s ``ps`` read starts AND
+#: ends within this many seconds of the command's start (tp#1868 B5): a 15 s read on top
+#: still refuses before decide's 30 s ``ccc send`` timeout, and a typed send keeps room
+#: for its correlation window.
+SEND_PS_BUDGET_SEC = 12.0
 
 
 def _default_discover() -> list[LiveSession]:
@@ -278,16 +283,24 @@ def resolve_tab(
     return (stored or None), False
 
 
-def ps_unreadable(session_id: str) -> BridgeError:
-    """The refusal for a ``ps`` table that could not be read (failed or timed out, tp#1868).
+def ps_unreadable(session_id: str, why: str = "ps timed out") -> BridgeError:
+    """The refusal for a ``ps`` table that could not be read IN TIME (tp#1868).
 
     Unknown, never "the tab is not this session's" (``stale_tab``): a pasting path holds
-    and retries (:data:`HELD_CODES`); nothing was typed.
+    and retries (:data:`HELD_CODES`); nothing was typed. Only a TIMED-OUT read
+    (:func:`snapshot.ps_timed_out`) or a spent send budget is this; a ``ps`` that failed
+    outright keeps the definite ``stale_tab`` (B5).
     """
     return BridgeError(
         "ps_unreadable",
-        f"session {session_id}: the process table could not be read (ps failed or timed out)",
+        f"session {session_id}: the process table could not be read ({why})",
     )
+
+
+def _timed_out(table: dict[int, Any]) -> bool:
+    from . import snapshot
+
+    return snapshot.ps_timed_out(table)
 
 
 def tab_for(deps: BridgeDeps, live: LiveSession) -> str:
@@ -295,15 +308,16 @@ def tab_for(deps: BridgeDeps, live: LiveSession) -> str:
 
     The stored id when its tab is on the session's tty; else the one tab on that tty
     (:func:`resolve_tab`). When iTerm cannot be listed the stored id is returned as is —
-    :func:`revalidate` checks it right before the first byte either way. An unreadable
-    ``ps`` table refuses at once with ``ps_unreadable`` (tp#1868): a second full read in
-    :func:`revalidate` would double the wait under load.
+    :func:`revalidate` checks it right before the first byte either way. A TIMED-OUT
+    ``ps`` read refuses at once with ``ps_unreadable`` (tp#1868): a second full read in
+    :func:`revalidate` would double the wait under load. A failed one keeps the stored id
+    unvalidated, as before tp#1868.
     """
     with deps.store() as store:
         row = store.get(live.session_id)
     stored = (row.iterm_session_id or "").strip() if row is not None else ""
     table = deps.ps_table()
-    if not table:
+    if _timed_out(table):
         raise ps_unreadable(live.session_id)
     tab, _validated = resolve_tab(stored or None, live.pid, table, deps.panes())
     if not tab:
@@ -322,14 +336,32 @@ class Target:
     raw_status: str = ""  # the registry's own word (busy | shell | idle | waiting | …)
 
 
-def revalidate(deps: BridgeDeps, session_id: str, iterm_session_id: str) -> Target:
-    """Fresh registry + ``ps`` + iTerm reads; a refusal unless the tab is THIS session's."""
+def _check_send_budget(deps: BridgeDeps, session_id: str, started: float | None) -> None:
+    """``ps_unreadable`` once more than :data:`SEND_PS_BUDGET_SEC` of the send passed."""
+    spent = deps.monotonic() - started if started is not None else 0.0
+    if spent > SEND_PS_BUDGET_SEC:
+        raise ps_unreadable(
+            session_id, f"ps too slow: {spent:.0f} s of the {SEND_PS_BUDGET_SEC:g} s budget spent"
+        )
+
+
+def revalidate(
+    deps: BridgeDeps, session_id: str, iterm_session_id: str, *, started: float | None = None
+) -> Target:
+    """Fresh registry + ``ps`` + iTerm reads; a refusal unless the tab is THIS session's.
+
+    *started* (``deps.monotonic()`` at the command's start; ``ccc send`` / ``ccc answer``):
+    ``ps_unreadable`` when the ``ps`` read would start, or ended, more than
+    :data:`SEND_PS_BUDGET_SEC` after it (tp#1868 B5).
+    """
     from . import snapshot, terminal
 
     live = require_live(deps, session_id)
+    _check_send_budget(deps, session_id, started)
     table = deps.ps_table()
-    if not table:  # unknown, not "no tty": ``read_ps`` answers {} on a timeout (tp#1868)
+    if _timed_out(table):  # unknown, not "no tty" (tp#1868); a failed ps stays stale_tab
         raise ps_unreadable(session_id)
+    _check_send_budget(deps, session_id, started)
     want = terminal.pid_tty(live.pid, table)
     if not want:
         raise BridgeError("stale_tab", f"session {session_id}: no tty for pid {live.pid}")

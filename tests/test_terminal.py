@@ -471,3 +471,77 @@ def test_gone_never_reads_an_unreadable_start_as_gone(monkeypatch: pytest.Monkey
     assert handoff_close._gone(7, "Tue", table) is False  # pylint: disable=protected-access
     assert handoff_close._gone(8, "Tue", table) is True  # pylint: disable=protected-access
     assert handoff_close._gone(7, "Tue", {}) is False  # pylint: disable=protected-access
+
+
+# ---- tp#1868 B5: timeout vs failure, the close deadline, impatient probes --
+@pytest.mark.parametrize(
+    ("outcome", "timed_out"),
+    [("timeout", True), ("oserror", False), ("exit1", False)],
+)
+def test_read_ps_tells_a_timeout_from_a_failure(
+    monkeypatch: pytest.MonkeyPatch, outcome: str, timed_out: bool
+) -> None:
+    import subprocess
+
+    from command_center import snapshot
+
+    def _run(argv: list[str], **kw: object) -> object:
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(argv, float(kw["timeout"]))  # type: ignore[arg-type]
+        if outcome == "oserror":
+            raise OSError("no ps")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    monkeypatch.setattr(snapshot.subprocess, "run", _run)
+    table = snapshot.read_ps()
+    assert table == {} and snapshot.ps_timed_out(table) is timed_out
+
+
+def test_ps_reads_are_capped_by_the_close_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    from command_center import snapshot
+
+    now = [100.0]
+    timeouts: list[float] = []
+
+    def _run(argv: list[str], **kw: object) -> object:
+        timeouts.append(float(kw["timeout"]))  # type: ignore[arg-type]
+        return subprocess.CompletedProcess(argv, 0, "Tue\n" if "lstart=" in argv else "", "")
+
+    monkeypatch.setattr(terminal, "ps_clock", lambda: now[0])
+    monkeypatch.setattr(subprocess, "run", _run)
+    with terminal.ps_deadline(4.0):
+        terminal.ps_table()
+        assert terminal.pid_start(7) == "Tue"
+        assert timeouts == [4.0, 4.0] and not terminal.ps_deadline_spent()
+        now[0] = 104.0
+        assert terminal.ps_deadline_spent()
+        assert snapshot.ps_timed_out(terminal.ps_table()) and terminal.pid_start(7) == ""
+        assert len(timeouts) == 2  # nothing ran once the budget was spent
+    assert not terminal.ps_deadline_spent()  # the deadline ends with its block
+
+
+def test_impatient_or_spent_probe_neither_rereads_nor_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from command_center.snapshot import PsRow
+
+    table = {7: PsRow(1, "ttys001", "S+", "claude")}
+    reads: list[dict[int, PsRow]] = []
+    monkeypatch.setattr(terminal, "ps_table", lambda: reads.pop(0))
+    reads[:] = [{}, table]
+    assert terminal.probe_identity(7, patient=False).kind == terminal.IDENTITY_PS_UNREADABLE
+    assert reads == [table]  # no re-read
+    fake = _FakePs(None, "Tue")
+    monkeypatch.setattr(terminal.subprocess, "run", fake)
+    assert terminal.probe_identity(7, table, patient=False).kind == terminal.IDENTITY_PS_UNREADABLE
+    assert fake.timeouts == [5.0]  # no retry
+    assert terminal.pid_start(7) == "Tue"  # outside the impatient probe: the retry is back
+    now = [0.0]
+    monkeypatch.setattr(terminal, "ps_clock", lambda: now[0])
+    reads[:] = [{}, table]
+    with terminal.ps_deadline(1.0):
+        now[0] = 2.0
+        assert terminal.probe_identity(7).kind == terminal.IDENTITY_PS_UNREADABLE
+    assert reads == [table]

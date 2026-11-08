@@ -726,12 +726,15 @@ def handle_stop_failure(payload: dict[str, Any]) -> int:
 
 
 def _own_identity(pid: str) -> str:
-    """This hook's ``"$CLAUDE_PID:start"`` from a FRESH probe (``""`` when unreadable)."""
+    """This hook's ``"$CLAUDE_PID:start"`` from a FRESH probe (``""`` when unreadable).
+
+    Impatient (tp#1868 B5): the Stop hook never re-reads a table or retries a start stamp.
+    """
     if not pid.isdigit():
         return ""
     from . import terminal  # lazy: only an armed close ever probes
 
-    return terminal.probe_identity(int(pid)).token(int(pid))
+    return terminal.probe_identity(int(pid), patient=False).token(int(pid))
 
 
 def _fire_close_claim(store: Store, sid: str, claim: CloseClaim) -> None:

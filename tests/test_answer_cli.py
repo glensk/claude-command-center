@@ -13,6 +13,7 @@ from command_center import bridge_answer
 from command_center.adapters import claude_bridge as cb
 from command_center.adapters.claude_agents import AgentEntry
 from command_center.bridge_json import BridgeError
+from command_center.snapshot import PsTimedOut
 
 COLOUR = question("Which colour?", ["red", "green (Recommended)", "blue"])
 FRUIT = question("Which fruits?", ["apple", "pear", "plum"], multi=True)
@@ -247,7 +248,7 @@ def test_unreadable_ps_table_is_ps_unreadable_and_types_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # tp#1868: a timed-out ps is unknown (retry), never stale_tab.
-    world = _world(tmp_path, [COLOUR], ps_queue=[{}])
+    world = _world(tmp_path, [COLOUR], ps_queue=[PsTimedOut()])
     payload = {
         "decision_id": _decision_id(world),
         "answers": [{"question_index": 0, "option_indices": [0]}],

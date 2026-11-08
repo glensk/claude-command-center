@@ -1336,7 +1336,8 @@ cwd is trusted for that account; and the session has no pending attached prompt
   input-box guard run, and only then is the outbox row claimed. When the input box holds
   text (`input_not_empty`), you are typing in that tab (`user_active`), the box is not
   drawn yet (`input_not_ready`), another delivery holds the tab (`tab_locked`) or `ps`
-  failed or timed out under load (`ps_unreadable`, tp#1868), the delivery is HELD: nothing is typed, no attempt is used, the group stays `fired`, the
+  timed out under load (`ps_unreadable`, tp#1868; a `ps` that fails outright is
+  `stale_tab`), the delivery is HELD: nothing is typed, no attempt is used, the group stays `fired`, the
   pass lists it under `held` (`ccc await -r -j`: `"held": ["7:input_not_empty"]`) and the
   next pass retries. A group held for 10 minutes sends ONE notification ("await group 7
   held: the input box of 1a2b3c4d holds 12 chars — clear it in that tab"; a count, never
@@ -3821,7 +3822,10 @@ bound (pid + start time), proven stably idle with an unchanged transcript
 (`stale_evidence`), its Stop chain drained (≤ 15 s: `stop_chain`), the probe repeated and,
 inside the tab's send lock, everything revalidated on a fresh snapshot (`identity_changed`,
 `stale_evidence`) right before the close debt is bound and the SIGTERM goes out.
-`unobservable` = `ps`, the registry or the transcript could not be read.
+`unobservable` = `ps`, the registry or the transcript could not be read, or the close ran
+past its 75 s budget (tp#1868: one deadline for the whole close, under decide's 90 s; every
+`ps` read inside it is capped at the time left, a probe re-reads an empty table or retries a
+timed-out start stamp only while time is left, never under the tab lock).
 
 The terminal: the hosting tmux pane (`tmux`), else the iTerm pane (`pane`) or tab (`tab`)
 through AppleScript `close` (no `activate`, no selection) — only a tab validated against the
@@ -3881,7 +3885,7 @@ details never carry message text. Code: `invalid_cursor` (a negative cursor, exi
 | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------- | :---------------------------------------------------------------------- |
 | `not_running` / `background` / `account_conflict`                                                                                                                       | send, answer          | not live / a background session (read-only) / live under two accounts   |
 | `no_tab` / `stale_tab` / `foreground_not_claude` / `iterm_unreachable`                                                                                                  | send, answer          | the tab cannot be proven to be this session's claude                    |
-| `ps_unreadable`                                                                                                                                                         | send, answer          | `ps` failed or timed out (load) — nothing typed; retry                  |
+| `ps_unreadable`                                                                                                                                                         | send, answer          | `ps` timed out, or 12 s of the send passed — nothing typed; retry       |
 | `tab_locked`                                                                                                                                                            | send, answer          | another send/answer to this tab is running (3 s wait)                   |
 | `user_active`                                                                                                                                                           | send, answer          | the user is typing into the focused target tab — retry later            |
 | `input_not_empty`                                                                                                                                                       | send                  | the input box already holds text — nothing typed; clear it              |

@@ -19,6 +19,7 @@ from bridgestub import SID, TAB, World, fixture_screen, turn_end, user
 from command_center import cli, config, daemon, park, usage
 from command_center.bridge_target import find_live, guarded_paste, is_live
 from command_center.screenread import ScreenCell, ScreenRead, line_text, rule_rows
+from command_center.snapshot import PsTimedOut
 from command_center.store import Store
 
 NOW = 1_700_000_000
@@ -369,6 +370,21 @@ def test_paste_guard_park_now_draft_parks_with_the_hold_lease(
         assert NOW_PROMPT not in text and _box_draft() not in text
 
 
+def test_paste_guard_park_now_timed_out_ps_parks_held_and_exits_0(
+    pnow: dict[str, Any],
+) -> None:
+    # tp#1868 B5: `park -g -N` on a timed-out ps parks with the hold lease, exit 0.
+    world: World = pnow["world"]
+    world.ps_queue = [PsTimedOut()]
+    assert cli.main(["park", "-g", "-N"]) == 0
+    assert not world.texts
+    row = _pnow_row()
+    lease = daemon.hold_lease(config.load_config(), NOW)
+    assert (row.prompt, row.fire_at, row.prompt_held_since) == (NOW_PROMPT, lease, NOW)
+    [(title, message)] = pnow["notes"]
+    assert title == "⏳ prompt held" and "could not be read (machine under load)" in message
+
+
 def test_paste_guard_park_now_held_prompt_is_silent_on_the_daemons_first_pass(
     pnow: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -696,6 +712,8 @@ def test_paste_guard_attached_held_ten_minutes_notifies_exactly_once_more(
         ("user_active", "you are typing in {short}'s tab — held until the keyboard is idle"),
         ("input_not_ready", "the input box of {short} is not drawn yet"),
         ("tab_locked", "another delivery to {short}'s tab is in progress"),
+        # tp#1868 B5: a timed-out ps holds; no _attached_new_tab (``resumed`` stays empty)
+        ("ps_unreadable", "the process table could not be read (machine under load) for {short}"),
     ],
 )
 def test_paste_guard_attached_held_codes_use_their_own_wording(
@@ -708,6 +726,8 @@ def test_paste_guard_attached_held_codes_use_their_own_wording(
         world.transcript.unlink()
         world.transcript_resolves_missing = True
         world.screen = UNRECOGNIZED
+    elif code == "ps_unreadable":
+        world.ps_queue = [PsTimedOut()]
     fd = -1
     if code == "tab_locked":
         lock = world.tmp / "ccc" / "locks" / f"tab-{TAB.rsplit(':', maxsplit=1)[-1].upper()}.lock"
