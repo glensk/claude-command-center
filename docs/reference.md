@@ -1056,7 +1056,15 @@ it (`fire_window`):
     reset the daemon **types the prompt into that session's tab** (bracketed
     paste + ⏎, same context and billing); if the tab or process is gone it opens
     a resume tab instead (`ccc fire-attached` → `claude --resume <id> "<prompt>"`,
-    double-delivery excluded by a one-shot claim). `-N` delivers into the tab
+    double-delivery excluded by a one-shot claim). The paste goes through the
+    `ccc send` input-box guard (tp#1867): while the session's box holds a draft,
+    you are typing in its tab, the box is not drawn yet or another delivery holds
+    the tab, the prompt is HELD — never a resume tab for a live session — and
+    retried one daemon pass later (`daemon_interval_sec - 60`, at least 60 s),
+    with a notification ("parked prompt held — <why>; retrying at HH:MM") on the
+    first held pass and once more after 10 min held; a paste whose ⏎ did not go
+    out is disarmed with the prompt kept ("press Return in that tab"), never
+    re-pasted. `-N` delivers into the tab
     immediately; `-j/--new-job` forces the detached behaviour below; the session's
     own statusline shows `⏳ parked prompt for THIS session fires …` while armed.
     **Re-edit:** a second q+p over the same session reopens the panel PREFILLED

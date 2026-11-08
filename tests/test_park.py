@@ -1,19 +1,38 @@
 """Parked prompts (park.py + fire_at plumbing): scheduling, claims, dispatch, markers."""
 
+# pylint: disable=too-many-lines  # one module covers park, its fire plumbing and dispatch
+
 from __future__ import annotations
 
 import argparse
+import fcntl
 import io
+import os
 import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
+from bridgestub import SID, TAB, World, fixture_screen, turn_end, user
 
 from command_center import cli, config, daemon, park, usage
+from command_center.bridge_target import find_live, guarded_paste, is_live
+from command_center.screenread import ScreenCell, ScreenRead, line_text, rule_rows
 from command_center.store import Store
 
 NOW = 1_700_000_000
+ATT_PROMPT = "tp1867 attached prompt"
+#: A screen with no full-width rule: the parser cannot find the input box.
+UNRECOGNIZED = ScreenRead(80, (0, 0), ((ScreenCell("x"), ScreenCell("y")),))
+
+
+def _box_draft(name: str = "draft_one_line") -> str:
+    """The masked draft text of a fixture's input box (the lines between the two rules)."""
+    read = fixture_screen(name)
+    rows = rule_rows(read)
+    lines = [line_text(read.lines[y]) for y in range(rows[-2] + 1, rows[-1])]
+    return " ".join(line.replace("\x00", " ").strip(" ❯") for line in lines).strip()
 
 
 def _snapshot(
@@ -295,26 +314,31 @@ def _attached_row(store: Store, fire_at: int) -> None:
 
 
 def test_deliver_attached_injects_into_live_tab(monkeypatch: pytest.MonkeyPatch) -> None:
-    from types import SimpleNamespace
-
-    from command_center import terminal
+    from command_center.bridge_target import PasteResult
+    from command_center.models import LiveSession
 
     _, notified = _daemon_setup(monkeypatch)
     sent: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        terminal,
-        "send_text_to_session",
-        lambda uuid, text: sent.append((uuid, text)) or True,  # type: ignore[func-returns-value]
-    )
+    leases: list[int] = []
     now = int(time.time())
+
+    def paster(target: LiveSession, text: str, claim: Any) -> PasteResult:
+        assert claim()  # the 900 s lease, written by the claim inside the tab lock
+        row = store.get("att-1")
+        assert row is not None
+        leases.append(row.fire_at)
+        sent.append((target.session_id, text))
+        return PasteResult(via="python-api", state="sent", tab="w0t0p0:UUID-ATT")
+
     with Store() as store:
         _attached_row(store, now - 10)
-        live = {"att-1": SimpleNamespace(alive=True)}
+        live = {"att-1": LiveSession(pid=1, session_id="att-1", cwd="/tmp", alive=True)}
         report = daemon.DaemonReport()
         daemon._deliver_attached_prompts(  # pylint: disable=protected-access
-            store, config.load_config(), report, False, live
+            store, config.load_config(), report, False, live, paster=paster
         )
-        assert report.reset_fired == ["att-1"] and sent == [("w0t0p0:UUID-ATT", "attached prompt")]
+        assert report.reset_fired == ["att-1"] and sent == [("att-1", "attached prompt")]
+        assert leases and leases[0] >= now + park.FIRE_RETRY_SEC
         row = store.get("att-1")
         assert row is not None and row.fire_at == 0
     assert notified == ["⏳ parked prompt delivered"]
@@ -343,11 +367,275 @@ def test_deliver_attached_falls_back_to_resume_tab(monkeypatch: pytest.MonkeyPat
     assert notified == ["⏳ parked prompt resuming in a new tab"]
 
 
-def test_fire_attached_claims_and_execs_resume(monkeypatch: pytest.MonkeyPatch) -> None:
-    import os as os_mod
+# ---- daemon delivery of attached prompts: the paste guard (tp#1867 B3) --------------
 
+
+@pytest.fixture(name="att")
+def att_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """An established live session (bridgestub World) whose row carries a due attached
+    prompt; notifications, new tabs and every ``fire_at`` write are recorded."""
+    from command_center import terminal
+
+    world = World(tmp_path)
+    world.write(user("earlier"), *turn_end())
+    store = Store(world.db)
+    now = int(time.time())
+    store.update_fields(SID, prompt=ATT_PROMPT, fire_at=now - 10)
+    notes: list[tuple[str, str]] = []
+    resumed: list[str] = []
+    writes: list[int] = []
+    monkeypatch.setattr(daemon, "notify", lambda title, msg, channels: notes.append((title, msg)))
+    monkeypatch.setattr(usage, "read_usage", lambda label: None)
+    monkeypatch.setattr(
+        terminal,
+        "fire_attached_in_new_tab",
+        lambda sid: resumed.append(sid) or True,  # type: ignore[func-returns-value]
+    )
+    real_update = store.update_fields
+
+    def spy(session_id: str, **fields: Any) -> None:
+        if "fire_at" in fields:
+            writes.append(int(fields["fire_at"]))
+        real_update(session_id, **fields)
+
+    monkeypatch.setattr(store, "update_fields", spy)
+    cfg = config.load_config()
+    cfg.daemon_interval_sec = 300
+    return {
+        "world": world,
+        "store": store,
+        "cfg": cfg,
+        "now": now,
+        "notes": notes,
+        "resumed": resumed,
+        "writes": writes,
+    }
+
+
+def _attached_pass(att: dict[str, Any], *, live: bool = True) -> daemon.DaemonReport:
+    """One attached-prompt pass through the REAL paste guard against the World's tab."""
+    world: World = att["world"]
+    report = daemon.DaemonReport()
+    daemon._deliver_attached_prompts(  # pylint: disable=protected-access
+        att["store"],
+        att["cfg"],
+        report,
+        False,
+        {SID: world.live()} if live else {},
+        paster=lambda target, text, claim: guarded_paste(world.deps(), target, text, claim=claim),
+        still_alive=lambda sid: is_live(find_live(world.deps(), sid)),
+    )
+    return report
+
+
+def _att_row(att: dict[str, Any]) -> Any:
+    row = att["store"].get(SID)
+    assert row is not None
+    return row
+
+
+def _no_retry_lease(att: dict[str, Any]) -> bool:
+    """The 900 s lease was never written this test."""
+    return all(w < att["now"] + park.FIRE_RETRY_SEC - 5 for w in att["writes"])
+
+
+def test_paste_guard_attached_empty_box_types_and_disarms(att: dict[str, Any]) -> None:
+    world: World = att["world"]
+    report = _attached_pass(att)
+    assert world.texts == [ATT_PROMPT] and report.reset_fired == [SID] and not report.attached_held
+    row = _att_row(att)
+    assert (row.fire_at, row.prompt_held_since, row.prompt_held_notice_at) == (0, 0, 0)
+    assert [t for t, _m in att["notes"]] == ["⏳ parked prompt delivered"]
+    assert not att["resumed"]
+
+
+def test_paste_guard_attached_draft_holds_with_one_pass_lease(att: dict[str, Any]) -> None:
+    world: World = att["world"]
+    world.screen = fixture_screen("draft_one_line")
+    report = _attached_pass(att)
+    now = att["now"]
+    short = SID[:8]
+    assert not world.texts and not att["resumed"] and not report.reset_fired
+    assert report.attached_held == [f"{short}:input_not_empty"]
+    row = _att_row(att)
+    assert row.fire_at - now in (240, 241) and row.prompt == ATT_PROMPT
+    assert row.prompt_held_since in (now, now + 1) and row.prompt_held_notice_at
+    [(title, message)] = att["notes"]
+    assert title == "⏳ parked prompt held"
+    assert message.startswith(
+        f"parked prompt held — the input box of {short} holds 28 chars — clear it in that tab;"
+        " retrying at "
+    )
+    assert ATT_PROMPT not in message and _box_draft() not in message
+    assert _no_retry_lease(att)
+
+
+def test_paste_guard_attached_hold_lease_floor_at_a_60_s_interval(att: dict[str, Any]) -> None:
+    att["world"].screen = fixture_screen("draft_one_line")
+    att["cfg"].daemon_interval_sec = 60
+    _attached_pass(att)
+    assert _att_row(att).fire_at - att["now"] in (60, 61)
+    assert daemon.hold_lease(att["cfg"], 1000) == 1060
+    att["cfg"].daemon_interval_sec = 300
+    assert daemon.hold_lease(att["cfg"], 1000) == 1240
+
+
+def test_paste_guard_attached_second_held_pass_within_ten_minutes_is_silent(
+    att: dict[str, Any],
+) -> None:
+    att["world"].screen = fixture_screen("draft_one_line")
+    now = att["now"]
+    att["store"].update_fields(
+        SID, fire_at=now - 5, prompt_held_since=now - 300, prompt_held_notice_at=now - 300
+    )
+    report = _attached_pass(att)
+    assert report.attached_held and not att["notes"]
+    row = _att_row(att)
+    assert (row.prompt_held_since, row.prompt_held_notice_at) == (now - 300, now - 300)
+
+
+def test_paste_guard_attached_held_ten_minutes_notifies_exactly_once_more(
+    att: dict[str, Any],
+) -> None:
+    att["world"].screen = fixture_screen("draft_one_line")
+    now = att["now"]
+    att["store"].update_fields(
+        SID, fire_at=now - 5, prompt_held_since=now - 700, prompt_held_notice_at=now - 700
+    )
+    _attached_pass(att)
+    assert len(att["notes"]) == 1
+    row = _att_row(att)
+    assert row.prompt_held_since == now - 700 and row.prompt_held_notice_at >= now
+    att["store"].update_fields(SID, fire_at=now - 5)
+    _attached_pass(att)
+    assert len(att["notes"]) == 1  # the 10-min notice went out once
+    assert not att["world"].texts and not att["resumed"]
+
+
+@pytest.mark.parametrize(
+    ("code", "wording"),
+    [
+        ("user_active", "you are typing in {short}'s tab — held until the keyboard is idle"),
+        ("input_not_ready", "the input box of {short} is not drawn yet"),
+        ("tab_locked", "another delivery to {short}'s tab is in progress"),
+    ],
+)
+def test_paste_guard_attached_held_codes_use_their_own_wording(
+    att: dict[str, Any], code: str, wording: str
+) -> None:
+    world: World = att["world"]
+    if code == "user_active":
+        world.frontmost, world.key_idle, world.focused = True, 1.0, TAB
+    elif code == "input_not_ready":  # opened AIM first: no transcript, box not drawn yet
+        world.transcript.unlink()
+        world.transcript_resolves_missing = True
+        world.screen = UNRECOGNIZED
+    fd = -1
+    if code == "tab_locked":
+        lock = world.tmp / "ccc" / "locks" / f"tab-{TAB.rsplit(':', maxsplit=1)[-1].upper()}.lock"
+        lock.parent.mkdir(parents=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        report = _attached_pass(att)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    short = SID[:8]
+    assert report.attached_held == [f"{short}:{code}"]
+    assert not world.texts and not att["resumed"] and _no_retry_lease(att)
+    [(_title, message)] = att["notes"]
+    assert wording.format(short=short) in message and "chars" not in message
+    assert _att_row(att).fire_at - att["now"] in (240, 241)
+
+
+def test_paste_guard_attached_nothing_typed_while_alive_holds(att: dict[str, Any]) -> None:
+    att["world"].send_result = ("", "none")
+    report = _attached_pass(att)
+    short = SID[:8]
+    assert report.attached_held == [f"{short}:not_typed"] and not att["resumed"]
+    [(_title, message)] = att["notes"]
+    assert f"could not type into {short}'s tab" in message
+    assert _att_row(att).fire_at - att["now"] in (240, 241)
+
+
+def test_paste_guard_attached_partial_disarms_and_keeps_the_prompt(att: dict[str, Any]) -> None:
+    world: World = att["world"]
+    world.send_result = ("", "partial")
+    report = _attached_pass(att)
+    short = SID[:8]
+    assert len(world.texts) == 1 and not att["resumed"] and not report.attached_held
+    row = _att_row(att)
+    assert row.fire_at == 0 and row.prompt == ATT_PROMPT
+    assert att["notes"] == [
+        (
+            "⏳ parked prompt not submitted",
+            f"prompt pasted but not submitted in {short} — press Return in that tab",
+        )
+    ]
+    _attached_pass(att)  # disarmed: never pasted again
+    assert len(world.texts) == 1
+
+
+def test_paste_guard_attached_stale_tab_while_alive_holds(att: dict[str, Any]) -> None:
+    world: World = att["world"]
+    world.tab_tty = "/dev/ttys099"
+    report = _attached_pass(att)
+    short = SID[:8]
+    assert report.attached_held == [f"{short}:stale_tab"]
+    assert not world.texts and not att["resumed"] and world.screen_reads == 0
+    [(_title, message)] = att["notes"]
+    assert f"could not type into {short}'s tab (stale_tab)" in message
+
+
+def test_paste_guard_attached_session_gone_opens_a_new_tab(att: dict[str, Any]) -> None:
+    report = _attached_pass(att, live=False)
+    assert att["resumed"] == [SID] and report.reset_fired == [SID] and not att["world"].texts
+    row = _att_row(att)
+    assert row.fire_at >= att["now"] + park.FIRE_RETRY_SEC and row.prompt_held_since == 0
+    assert [t for t, _m in att["notes"]] == ["⏳ parked prompt resuming in a new tab"]
+
+
+def test_paste_guard_attached_session_left_before_the_lock_opens_a_new_tab(
+    att: dict[str, Any],
+) -> None:
+    world: World = att["world"]
+    seen = world.live()
+    world.registered = False  # the registry read inside the lock no longer lists it
+    report = daemon.DaemonReport()
+    daemon._deliver_attached_prompts(  # pylint: disable=protected-access
+        att["store"],
+        att["cfg"],
+        report,
+        False,
+        {SID: seen},
+        paster=lambda target, text, claim: guarded_paste(world.deps(), target, text, claim=claim),
+        still_alive=lambda sid: is_live(find_live(world.deps(), sid)),
+    )
+    assert att["resumed"] == [SID] and not world.texts and not report.attached_held
+
+
+def test_paste_guard_attached_old_sessions_table_gains_the_hold_columns(tmp_path: Path) -> None:
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, "
+        "cwd TEXT NOT NULL DEFAULT '', agent TEXT NOT NULL DEFAULT 'claude', "
+        "archived INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.execute("INSERT INTO sessions (session_id, cwd) VALUES ('old-1', '/tmp')")
+    conn.commit()
+    conn.close()
+    with Store(db) as store:
+        cols = {row["name"] for row in store.conn.execute("PRAGMA table_info(sessions)")}
+        assert {"prompt_held_since", "prompt_held_notice_at"} <= cols
+        row = store.get("old-1")
+        assert row is not None and (row.prompt_held_since, row.prompt_held_notice_at) == (0, 0)
+
+
+def test_fire_attached_claims_and_execs_resume(monkeypatch: pytest.MonkeyPatch) -> None:
     execs: list[list[str]] = []
-    monkeypatch.setattr(os_mod, "execvp", lambda prog, argv: execs.append(list(argv)))
+    monkeypatch.setattr(os, "execvp", lambda prog, argv: execs.append(list(argv)))
     now = int(time.time())
     with Store() as store:
         _attached_row(store, now + 900)
@@ -363,14 +651,12 @@ def test_fire_attached_claims_and_execs_resume(monkeypatch: pytest.MonkeyPatch) 
 
 def _poll_result(poll: object) -> tuple[str, str]:
     """Drive the deferred-resolution poll like the panel's timer would (bounded)."""
-    import time as time_mod
-
     assert callable(poll)
     for _ in range(500):
         result = poll()
         if result is not None:
             return result
-        time_mod.sleep(0.01)
+        time.sleep(0.01)
     raise AssertionError("grab target resolution never became ready")
 
 
@@ -458,12 +744,10 @@ def test_hooks_announce_armed_parked_prompt(capsys: pytest.CaptureFixture[str]) 
 
 
 def test_fire_attached_rearms_on_exec_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    import os as os_mod
-
     def _boom(prog: str, argv: list[str]) -> None:
         raise OSError("no claude")
 
-    monkeypatch.setattr(os_mod, "execvp", _boom)
+    monkeypatch.setattr(os, "execvp", _boom)
     now = int(time.time())
     with Store() as store:
         _attached_row(store, now - 5)
@@ -576,9 +860,7 @@ def test_new_job_at_reset_fails_loudly_without_usable_reset(
 # ---- start-job --auto ---------------------------------------------------------------
 
 
-def test_start_job_auto_disarms_on_tripped_guard(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_start_job_auto_disarms_on_tripped_guard(capsys: pytest.CaptureFixture[str]) -> None:
     from datetime import date, timedelta
 
     from command_center import accounts

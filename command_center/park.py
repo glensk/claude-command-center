@@ -763,6 +763,9 @@ def grab(  # pylint: disable=too-many-locals,too-many-return-statements,too-many
                 # "" on the retry lease: the fire time has no window provenance, so
                 # the daemon's postpone check must not consult one.
                 fire_window=("" if fire_missing else window),
+                # A re-armed prompt starts a new hold (tp#1867): no inherited hold time.
+                prompt_held_since=0,
+                prompt_held_notice_at=0,
             )
         done = f"for session {short_id(attach.session_id)} — {format_fire(fire_at, now)}"
         notify("⏳ prompt parked", done, cfg.notify)

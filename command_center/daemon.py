@@ -16,8 +16,9 @@ running tool) is alive.
 """
 
 # Lazy `subprocess`/`.llm` imports keep import cost off the fast paths
-# (import-outside-toplevel); the single-pass orchestration is branchy by nature.
-# pylint: disable=import-outside-toplevel,too-many-branches
+# (import-outside-toplevel); the single-pass orchestration is branchy by nature and
+# keeps every pass step in one module (too-many-lines).
+# pylint: disable=import-outside-toplevel,too-many-branches,too-many-lines
 
 from __future__ import annotations
 
@@ -37,16 +38,21 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import config
 from .adapters.claude import ClaudeAdapter
 from .core import headless_leak_ids, orphan_launched_ids, reconcile, spare_background_agents
-from .models import LiveSession, Session, Status, deadline_badge, now_ms
+from .models import LiveSession, Session, Status, deadline_badge, now_ms, short_id
 from .notify import notify
 from .store import Store
+
+if TYPE_CHECKING:
+    from .bridge_target import PasteResult
 
 
 @dataclass
@@ -64,6 +70,9 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
     assessed: list[str] = field(default_factory=list)  # AIM-met self-assessments this pass
     reset_fired: list[str] = field(default_factory=list)  # armed parked prompts dispatched
     reset_postponed: list[str] = field(default_factory=list)  # armed jobs pushed to a later reset
+    # Attached prompts the paste guard HELD this pass, "<short>:<code>" (tp#1867): the box
+    # held a draft, the user was typing, … — retried one daemon pass later, no new tab.
+    attached_held: list[str] = field(default_factory=list)
     copilot_refreshed: bool = False  # routine; deliberately excluded from is_empty()
     claude_refreshed: bool = False  # routine Claude /usage OAuth fetch; excluded from is_empty()
     codex_refreshed: bool = False  # routine live Codex usage fetch; excluded from is_empty()
@@ -100,6 +109,7 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
             or self.assessed
             or self.reset_fired
             or self.reset_postponed
+            or self.attached_held
         )
 
 
@@ -296,7 +306,8 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
         _fire_reset_jobs(store, cfg, report, dry_run)
 
         # Deliver parked prompts ATTACHED to existing sessions (fire_at on a
-        # non-draft row): typed into the live tab, or a resume tab as fallback.
+        # non-draft row): typed into the live tab behind the paste guard (held while
+        # its input box holds a draft), or a resume tab when the session is not alive.
         _deliver_attached_prompts(store, cfg, report, dry_run, live)
 
         # `ccc await` BACKSTOP: the same evaluation pass the 60 s poller runs, so a
@@ -655,24 +666,78 @@ def _fire_reset_jobs(store: Store, cfg: config.Config, report: DaemonReport, dry
         notify("⏳ parked prompt fired", _label(job), cfg.notify)
 
 
-def _deliver_attached_prompts(
-    store: Store, cfg: config.Config, report: DaemonReport, dry_run: bool, live: dict
+#: Pastes an attached prompt into a live session's tab behind the paste guard:
+#: ``(live, text, claim)`` → :class:`bridge_target.PasteResult`. *claim* writes the
+#: :data:`park.FIRE_RETRY_SEC` lease, inside the tab lock after the guards (tp#1867 D5).
+AttachedPaster = Callable[[LiveSession, str, Callable[[], bool]], "PasteResult"]
+#: Re-reads the registry: is the session (still) alive? (a refusal's new-tab decision).
+StillAlive = Callable[[str], bool]
+
+#: A held attached prompt sends one more notice once held this long (tp#1867 D5).
+PROMPT_HELD_NOTICE_SEC = 10 * 60
+
+
+def _default_attached_paster(
+    live: LiveSession, text: str, claim: Callable[[], bool]
+) -> PasteResult:
+    from .bridge_target import default_deps, guarded_paste
+
+    return guarded_paste(default_deps(), live, text, claim=claim)
+
+
+def _default_still_alive(session_id: str) -> bool:
+    from .bridge_target import default_deps, find_live, is_live
+
+    return is_live(find_live(default_deps(), session_id))
+
+
+def hold_lease(cfg: config.Config, now: int) -> int:
+    """The retry time of a HELD attached prompt: one daemon pass ahead (tp#1867 Q4).
+
+    ``daemon_interval_sec - 60`` so launchd jitter and the strict ``fire_at <= now`` test
+    never skip the next pass; never under 60 s.
+    """
+    return now + max(60, int(cfg.daemon_interval_sec) - 60)
+
+
+def _deliver_attached_prompts(  # pylint: disable=too-many-arguments
+    store: Store,
+    cfg: config.Config,
+    report: DaemonReport,
+    dry_run: bool,
+    live: dict[str, LiveSession],
+    *,
+    paster: AttachedPaster | None = None,
+    still_alive: StillAlive | None = None,
 ) -> None:
     """Deliver parked prompts ATTACHED to existing sessions (``fire_at`` on a non-draft row).
 
     The "opened the session with its AIM first, defined the real prompt with qp"
     workflow: at fire time the prompt is TYPED into the session's live iTerm tab
-    (bracketed paste + CR — same context, same billing, no new session). When the
-    tab or process is gone, a new tab resumes the session WITH the prompt
-    (``ccc fire-attached`` → ``claude --resume <id> "<prompt>"``). Same
-    re-arm-forward lease as :func:`_fire_reset_jobs`; the injection path zeroes
-    ``fire_at`` on success and ``fire-attached`` claims it with the one-shot
-    conditional update, so nothing delivers twice. No grace offset: no foreground
-    waiter ever competes for an attached prompt.
+    (bracketed paste + CR — same context, same billing, no new session) through the
+    paste guard (:func:`bridge_target.guarded_paste`, tp#1867): tab → per-tab lock →
+    revalidate → typing guard → input-box guard → the claim (the
+    :data:`park.FIRE_RETRY_SEC` lease, written inside the lock after the guards) → paste.
+    When the session is not alive, a new tab resumes it WITH the prompt
+    (``ccc fire-attached`` → ``claude --resume <id> "<prompt>"``) under the same lease;
+    ``fire-attached`` claims it with the one-shot conditional update, so nothing delivers
+    twice. No grace offset: no foreground waiter ever competes for an attached prompt.
+
+    A session that is alive never gets a new tab (a second ``claude --resume`` of a live
+    session). A HELD paste (the box holds a draft, the user is typing, the box is not
+    drawn yet, another delivery holds the tab) and any other refusal or an untyped paste
+    while the session is alive keep the prompt with the hold lease (:func:`hold_lease`,
+    never the 900 s one), stamp ``prompt_held_since`` on the first held pass and notify
+    on that pass and once more after :data:`PROMPT_HELD_NOTICE_SEC`
+    (``DaemonReport.attached_held``, ``"<short>:<code>"``). A paste whose Return did not
+    go out (sender state ``partial``) is never re-pasted: ``fire_at = 0``, the prompt is
+    kept, and a "press Return" notice goes out.
     """
-    from . import accounts, park, terminal, usage
+    from . import accounts, park, usage
 
     now = int(time.time())
+    paste = paster or _default_attached_paster
+    alive_now = still_alive or _default_still_alive
     due = [
         s
         for s in store.list_sessions()
@@ -692,24 +757,114 @@ def _deliver_attached_prompts(
                     cfg.notify,
                 )
             continue
-        report.reset_fired.append(job.session_id)
         if dry_run:
+            report.reset_fired.append(job.session_id)
             continue
-        store.update_fields(job.session_id, fire_at=now + park.FIRE_RETRY_SEC)  # lease
         live_session = live.get(job.session_id)
-        if (
-            live_session is not None
-            and getattr(live_session, "alive", False)
-            and job.iterm_session_id
-            and terminal.send_text_to_session(job.iterm_session_id, (job.prompt or "").strip())
-        ):
-            store.update_fields(job.session_id, fire_at=0)
-            notify("⏳ parked prompt delivered", _label(job), cfg.notify)
+        if live_session is None or not live_session.alive:
+            _attached_new_tab(store, cfg, report, job, now)
             continue
-        # Tab/process gone (or injection failed): resume WITH the prompt in a new
-        # tab; fire-attached consumes the lease via its one-shot claim.
-        terminal.fire_attached_in_new_tab(job.session_id)
-        notify("⏳ parked prompt resuming in a new tab", _label(job), cfg.notify)
+        _paste_attached(store, cfg, report, job, live_session, now, paste, alive_now)
+
+
+def _attached_new_tab(
+    store: Store, cfg: config.Config, report: DaemonReport, job: Session, now: int
+) -> None:
+    """Session not alive: resume it WITH the prompt in a new tab under the 900 s lease;
+    ``fire-attached`` consumes the lease via its one-shot claim."""
+    from . import park, terminal
+
+    report.reset_fired.append(job.session_id)
+    store.update_fields(
+        job.session_id,
+        fire_at=now + park.FIRE_RETRY_SEC,
+        prompt_held_since=0,
+        prompt_held_notice_at=0,
+    )
+    terminal.fire_attached_in_new_tab(job.session_id)
+    notify("⏳ parked prompt resuming in a new tab", _label(job), cfg.notify)
+
+
+def _paste_attached(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    store: Store,
+    cfg: config.Config,
+    report: DaemonReport,
+    job: Session,
+    live_session: LiveSession,
+    now: int,
+    paste: AttachedPaster,
+    alive_now: StillAlive,
+) -> None:
+    """A live session: paste behind the guard; D3's P2 column for every outcome."""
+    from . import park
+    from .bridge_target import held_notice
+
+    def claim() -> bool:
+        store.update_fields(job.session_id, fire_at=now + park.FIRE_RETRY_SEC)  # lease
+        return True
+
+    short = short_id(job.session_id).strip()
+    result = paste(live_session, (job.prompt or "").strip(), claim)
+    code = result.refusal
+    if code == "claim_lost":
+        return  # the claim is a plain write; defensive only
+    if code:
+        if result.held or code == "account_conflict" or alive_now(job.session_id):
+            _hold_attached(
+                store, cfg, report, job, now, code, held_notice(code, result.data, short)
+            )
+        else:  # the session left between the registry read and the lock
+            _attached_new_tab(store, cfg, report, job, now)
+        return
+    if result.state == "sent":
+        report.reset_fired.append(job.session_id)
+        store.update_fields(job.session_id, fire_at=0, prompt_held_since=0, prompt_held_notice_at=0)
+        notify("⏳ parked prompt delivered", _label(job), cfg.notify)
+        return
+    if result.state == "partial":
+        # The paste went out, its Return did not: the prompt sits in the box. Never
+        # re-paste (it would hold forever, or deliver twice once Return is pressed).
+        report.reset_fired.append(job.session_id)
+        store.update_fields(job.session_id, fire_at=0, prompt_held_since=0, prompt_held_notice_at=0)
+        notify(
+            "⏳ parked prompt not submitted",
+            f"prompt pasted but not submitted in {short} — press Return in that tab",
+            cfg.notify,
+        )
+        return
+    # Nothing typed into a live session: hold, never a second process for it.
+    _hold_attached(store, cfg, report, job, now, "not_typed", f"could not type into {short}'s tab")
+
+
+def _hold_attached(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    store: Store,
+    cfg: config.Config,
+    report: DaemonReport,
+    job: Session,
+    now: int,
+    code: str,
+    wording: str,
+) -> None:
+    """Keep a held attached prompt with the hold lease; notice on the first held pass and
+    once more after :data:`PROMPT_HELD_NOTICE_SEC` held (never the prompt's text)."""
+    lease = hold_lease(cfg, now)
+    since = job.prompt_held_since or now
+    notice = not job.prompt_held_since or (
+        now - since >= PROMPT_HELD_NOTICE_SEC
+        and job.prompt_held_notice_at < since + PROMPT_HELD_NOTICE_SEC
+    )
+    fields: dict[str, int] = {"fire_at": lease, "prompt_held_since": since}
+    if notice:
+        fields["prompt_held_notice_at"] = now
+    store.update_fields(job.session_id, **fields)
+    report.attached_held.append(f"{short_id(job.session_id).strip()}:{code}")
+    if notice:
+        retry = time.strftime("%H:%M", time.localtime(lease))
+        notify(
+            "⏳ parked prompt held",
+            f"parked prompt held — {wording}; retrying at {retry}",
+            cfg.notify,
+        )
 
 
 def _run_await_backstop(store: Store, report: DaemonReport, dry_run: bool) -> None:

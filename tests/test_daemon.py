@@ -140,6 +140,7 @@ def test_report_empty() -> None:
     assert DaemonReport().is_empty()
     assert not DaemonReport(reaped=["x"]).is_empty()
     assert not DaemonReport(pruned=["x"]).is_empty()
+    assert not DaemonReport(attached_held=["x:input_not_empty"]).is_empty()  # tp#1867
     # A pure-housekeeping pass stays "empty" so it is not reported as activity.
     assert DaemonReport(temps_swept=3).is_empty()
 

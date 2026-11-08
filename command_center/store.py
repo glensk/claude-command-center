@@ -186,6 +186,8 @@ _SESSION_COLUMNS = (
     "start_date",
     "fire_at",
     "fire_window",
+    "prompt_held_since",
+    "prompt_held_notice_at",
     "depends_on",
     "job_type",
     "no_codex",
@@ -319,6 +321,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     start_date        TEXT,
     fire_at           INTEGER NOT NULL DEFAULT 0,
     fire_window       TEXT    NOT NULL DEFAULT '',
+    prompt_held_since INTEGER NOT NULL DEFAULT 0,
+    prompt_held_notice_at INTEGER NOT NULL DEFAULT 0,
     depends_on        TEXT,
     job_type          TEXT    NOT NULL DEFAULT 'claude',
     no_codex          INTEGER NOT NULL DEFAULT 0,
@@ -629,6 +633,12 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         # touch them) — arming is a CLI/daemon concern, not a file-editable field.
         "fire_at": "INTEGER NOT NULL DEFAULT 0",
         "fire_window": "TEXT NOT NULL DEFAULT ''",
+        # The paste-guard hold of an ATTACHED prompt (tp#1867): epoch seconds of the first
+        # daemon pass that held it (the input box held a draft, the user was typing, …) and
+        # of its last held notice. 0 = not held / no notice, which is what every row
+        # written before the columns existed correctly means.
+        "prompt_held_since": "INTEGER NOT NULL DEFAULT 0",
+        "prompt_held_notice_at": "INTEGER NOT NULL DEFAULT 0",
         "depends_on": "TEXT",
         "job_type": "TEXT NOT NULL DEFAULT 'claude'",
         # Per-session Codex opt-out: CCC_NO_CODEX=1 in every launch/resume env.

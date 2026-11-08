@@ -627,6 +627,12 @@ class Session:
     # Store.claim_draft on launch; not mirrored into the Obsidian job file.
     fire_at: int = 0
     fire_window: str = ""
+    # The paste-guard hold of an ATTACHED prompt (``daemon._deliver_attached_prompts``,
+    # tp#1867): epoch seconds of the first daemon pass that held it (input box not empty,
+    # user typing, box not drawn yet, …) and of its last held notice; 0 = not held.
+    # Cleared on delivery, on the new-tab path and when ``ccc park`` re-arms the row.
+    prompt_held_since: int = 0
+    prompt_held_notice_at: int = 0
     # The full session UUID of another job this one depends on finishing first (NULL/'' =
     # none; a single dependency). Drives the red |--> marker + hoisting (see deps.py) and
     # the launch guard; round-trips through the future-job file + all three mirrors.
