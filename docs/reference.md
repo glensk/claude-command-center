@@ -3598,8 +3598,11 @@ travels on stdin only, never in argv (readable by every `ps`).
 
 ### `ccc sessions` (`-j/--json`)
 
-Lists the interactive and background Claude Code sessions of every configured account —
-background jobs from `claude agents --json` too. Headless `claude -p` runs (registry
+Lists the live interactive and background Claude Code sessions of every configured account.
+Live means what `ccc inspect` calls `live`: an alive registry entry (a running process). A
+background job that only `claude agents --json` still lists — no running worker, no pid,
+e.g. a stale `blocked` job — is not live and not listed (tp#1857); `claude agents --json`
+only supplies the status of listed sessions. Headless `claude -p` runs (registry
 `entrypoint` `sdk-cli`) are never listed. `data.sessions[]`:
 
 | Field                  | Meaning                                                                                            |

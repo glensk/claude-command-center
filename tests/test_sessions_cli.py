@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from command_center import bridge_cli, cli
+from command_center import bridge_cli, bridge_inspect, bridge_target, cli
 from command_center.adapters import claude_agents
 from command_center.adapters.claude_agents import AgentEntry
 from command_center.models import LiveSession
@@ -170,26 +170,60 @@ def test_sdk_cli_and_dead_entries_are_excluded(store: Store) -> None:
 
 
 # --------------------------------------------------------------------------- D4 background
-def test_background_job_from_claude_agents_is_listed(store: Store) -> None:
-    """A ``claude --bg`` job with no worker: no registry entry, only the CLI roster has it."""
+@pytest.mark.parametrize("state", ["done", "blocked", "working", "failed", "stopped"])
+def test_roster_only_background_job_is_not_listed(store: Store, state: str) -> None:
+    """tp#1857: a ``claude --bg`` job with no worker (no registry entry, pid None) — only the
+    CLI roster still has it, e.g. a June job left ``blocked`` — is not live: not listed."""
     job = AgentEntry(
         config_dir=PRIV,
         session_id="e38e3586-23f9",
         kind="background",
         cwd="/r/voice",
         name="claude agents explanation",
-        state="blocked",
-        started_at=1_791_000_000_000,
+        state=state,
+        started_at=1_782_133_793_580,
     )
-    out = {e["session_id"]: e for e in _collect(store, [_live("a1", 11)], {}, [], [job])}
-    entry = out["e38e3586-23f9"]
-    assert entry["kind"] == "background" and entry["status"] == "blocked"
-    assert entry["pid"] is None and entry["account"] == "private"
-    assert entry["tab"] == {"iterm_session_id": None, "validated": False}
-    assert entry["status_at"] == "2026-10-03T04:00:00Z"
-    # ccc generates no names (tp#1808), so listing creates no ccc row for it either
-    assert entry["name"] is None and entry["name_origin"] is None
-    assert store.get("e38e3586-23f9") is None
+    entries = _collect(store, [_live("a1", 11)], {}, [], [job])
+    assert [e["session_id"] for e in entries] == ["a1"]
+    assert store.get("e38e3586-23f9") is None  # listing creates no ccc row for it either
+
+
+def test_sessions_and_inspect_share_one_liveness_rule(store: Store, tmp_path: Path) -> None:
+    """tp#1857: every listed session is one ``ccc inspect`` calls live, and the roster-only
+    ghost it calls not live is not listed; a running background job (worker in the
+    registry) is listed and live."""
+    ghost = AgentEntry(config_dir=PRIV, session_id="ghost", kind="background", state="done")
+    running = AgentEntry(
+        config_dir=PRIV, session_id="bg2", kind="background", pid=22, status="busy", state="working"
+    )
+    lives = [_live("a1", 11), _live("bg2", 22, kind="bg", raw_status="busy")]
+    entries = _collect(store, lives, {}, [], [ghost, running])
+    listed = {e["session_id"]: e for e in entries}
+    assert set(listed) == {"a1", "bg2"}
+    assert listed["bg2"]["kind"] == "background" and listed["bg2"]["pid"] == 22
+    assert listed["bg2"]["status"] == "busy"
+
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}) + "\n",
+        encoding="utf-8",
+    )
+    db = tmp_path / "inspect.db"
+    with Store(db) as seed:
+        for sid in ("a1", "bg2", "ghost"):
+            seed.ensure(sid, cwd="/r/voice")
+    deps = bridge_target.BridgeDeps(
+        discover=lambda: lives,
+        agents=lambda: [ghost, running],
+        transcript=lambda _cwd, _sid, _cfg: transcript,
+        store=lambda: Store(db),
+    )
+    live = {
+        sid: bridge_inspect.run_inspect(deps, sid, use_llm=False)["live"]
+        for sid in ("a1", "bg2", "ghost")
+    }
+    assert live == {"a1": True, "bg2": True, "ghost": False}
+    assert {sid for sid, on in live.items() if on} == set(listed)
 
 
 @pytest.mark.parametrize(
@@ -197,8 +231,8 @@ def test_background_job_from_claude_agents_is_listed(store: Store) -> None:
     [("working", "busy"), ("blocked", "blocked"), ("failed", "blocked"), ("done", "idle")],
 )
 def test_background_state_maps_to_status(store: Store, state: str, status: str) -> None:
-    job = AgentEntry(config_dir=WORK, session_id="bg1", kind="background", state=state)
-    entries = _collect(store, [], {}, [], [job])
+    job = AgentEntry(config_dir=WORK, session_id="bg1", kind="background", pid=7, state=state)
+    entries = _collect(store, [_live("bg1", 7, WORK, kind="bg")], {}, [], [job])
     assert [(e["status"], e["account"]) for e in entries] == [(status, "work")]
 
 

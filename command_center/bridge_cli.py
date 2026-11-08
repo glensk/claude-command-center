@@ -12,13 +12,15 @@ live in :mod:`command_center.bridge_json`:
 * times are ISO-8601 UTC; unknown input (arguments, fields) is a usage error (2) — with
   ``-j`` an argv error is an envelope too (:func:`dispatch`).
 
-``ccc sessions -j`` lists the interactive and background Claude Code sessions of EVERY
-configured account with their hand-set name (if any), status and iTerm tab — background jobs
-from the CLI's own ``claude agents --json`` roster too (a job whose worker is not running
-has no registry entry), with a null, unvalidated tab. The status is the CLI's view mapped
-to §6 (:mod:`command_center.adapters.claude_agents`), with ``raw_status`` (that raw word)
-beside it: an interactive ``shell`` reads ``idle`` when its transcript shows no open turn
-(``livestatus.effective_status``, tp#1790 — an idle staff session holding its doorbell),
+``ccc sessions -j`` lists the live interactive and background Claude Code sessions of EVERY
+configured account with their hand-set name (if any), status and iTerm tab (a background
+one with a null, unvalidated tab). Live is :func:`bridge_target.is_live`, the rule ``ccc
+inspect`` uses too: an alive registry entry — a background job only the CLI's ``claude
+agents --json`` roster lists (no running worker) is not listed (tp#1857). The status is
+the CLI's view mapped to §6 (:mod:`command_center.adapters.claude_agents`), with
+``raw_status`` (that raw word) beside it: an interactive ``shell`` reads ``idle`` when its
+transcript shows no open turn (``livestatus.effective_status``, tp#1790 — an idle staff
+session holding its doorbell),
 else ``busy`` (an open or unknown turn: fail closed). The CLI reports a registry ``shell``
 as ``busy``, so a CLI ``busy`` over a registry ``shell`` is read as ``shell``. The tab is
 ``validated`` only when the registry pid's controlling tty is the tab's tty (spike
@@ -86,7 +88,7 @@ from .bridge_json import (
     run_json,
     usage,
 )
-from .bridge_target import resolve_tab
+from .bridge_target import is_live, resolve_tab
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -282,35 +284,6 @@ def live_status(
     return contract_status(raw, turn_active)
 
 
-def _background_live(agent: AgentEntry) -> LiveSession:
-    """A registry-shaped row for a background job only ``claude agents`` lists (no worker)."""
-    from .models import LiveSession as _Live
-
-    return _Live(
-        pid=agent.pid,
-        session_id=agent.session_id,
-        cwd=agent.cwd,
-        kind="bg",
-        raw_status=agent.status,
-        name=agent.name or None,
-        started_at=agent.started_at,
-        updated_at=agent.started_at,
-        alive=True,
-        config_dir=agent.config_dir,
-    )
-
-
-def _merge_lives(lives: list[LiveSession], agents: list[AgentEntry]) -> list[LiveSession]:
-    """*lives* plus every background session only the ``claude agents`` roster knows (D4)."""
-    seen = {live.session_id for live in lives}
-    out = list(lives)
-    for agent in agents:
-        if agent.background and agent.session_id not in seen:
-            out.append(_background_live(agent))
-            seen.add(agent.session_id)
-    return out
-
-
 def _attach_subagents(
     entries: list[dict[str, Any]],
     lives: list[LiveSession],
@@ -348,9 +321,10 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
 ) -> list[dict[str, Any]]:
     """Every Claude Code session of every account, shaped for ``ccc sessions -j``.
 
-    Live registry sessions (interactive and ``bg``) plus every background session the
-    CLI's ``claude agents --json`` lists (D4: a job whose worker is not running has no
-    registry entry). The status prefers the CLI's view. Background sessions never get a
+    Live registry sessions (interactive and ``bg``, :func:`is_live`); the CLI's
+    ``claude agents --json`` roster only supplies their status — a background job only the
+    roster lists (no running worker, no registry entry) is not live and not listed
+    (tp#1857). The status prefers the CLI's view. Background sessions never get a
     tab (``iterm_session_id`` null, not validated). Every collaborator is injectable so
     tests never touch iTerm, ``ps``, ``claude`` or the real registries.
 
@@ -367,7 +341,7 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
     registry = [
         live
         for live in adapter.discover()
-        if live.alive
+        if is_live(live)
         and not str(live.entrypoint).startswith("sdk")
         and live.kind in claude_agents.SESSION_KINDS
     ]
@@ -375,7 +349,7 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
     by_sid: dict[str, AgentEntry] = {}
     for roster in agents:
         by_sid.setdefault(roster.session_id, roster)
-    lives = _merge_lives(registry, agents)
+    lives = registry
     order = {label: i for i, label in enumerate(config.claude_config_dirs())}
     label_of = account_label or accounts.account_label
     ps = (ps_reader or terminal.ps_table)() if registry else {}

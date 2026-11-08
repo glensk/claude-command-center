@@ -56,7 +56,7 @@ from .adapters import claude_bridge as cb
 from .adapters.claude_agents import contract_status
 from .bridge_json import BridgeError
 from .bridge_send import inspect_transcript
-from .bridge_target import find_live
+from .bridge_target import find_live, is_live
 
 if TYPE_CHECKING:
     from .bridge_target import BridgeDeps
@@ -177,7 +177,7 @@ def run_inspect(deps: BridgeDeps, session_id: str, *, use_llm: bool = True) -> d
     if path is None or not path.is_file():
         raise BridgeError("transcript_missing", f"no transcript found for session {session_id}")
     ins = inspect_transcript(path)
-    alive = bool(live and live.alive)
+    alive = is_live(live)
     # the registry's own word (diagnostics) and its §6 mapping (``shell`` — a shell tool
     # running, or an idle session holding a background task — is ``busy``)
     raw_status = (live.raw_status or None) if live is not None and alive else None

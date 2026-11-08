@@ -5,8 +5,9 @@
 (:func:`revalidate`, called inside the per-tab mutation lock):
 
 1. the session is in the live registry, alive, interactive (``bg`` / ``fleet`` sessions
-   — and background jobs only ``claude agents --json`` lists — are listed and read, never
-   messaged: code ``background``), and not live under two accounts at once;
+   are listed and read, never messaged: code ``background``; so is a background job only
+   ``claude agents --json`` lists, which is not live and not listed), and not live under
+   two accounts at once;
 2. the tab (the stored iTerm session id, or — when that one is missing or wrong — the
    ONE iTerm session on the registry pid's tty, spike S-IDENT, :func:`resolve_tab`) has
    the registry pid's tty, and its foreground job (``jobPid``) is that claude process or
@@ -48,7 +49,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from .bridge_json import BridgeError
 
@@ -210,6 +211,13 @@ def default_deps() -> BridgeDeps:
     return BridgeDeps()
 
 
+def is_live(live: LiveSession | None) -> TypeGuard[LiveSession]:
+    """THE liveness rule of ``ccc sessions`` and ``ccc inspect`` (tp#1857): an alive registry
+    entry. A background job only the ``claude agents`` roster lists has no running worker
+    (no registry entry, no pid): not live, so ``ccc sessions`` does not list it."""
+    return live is not None and bool(live.alive)
+
+
 def find_live(deps: BridgeDeps, session_id: str) -> LiveSession | None:
     """The registry entry of *session_id* (``None`` when it is not registered)."""
     return next((s for s in deps.discover() if s.session_id == session_id), None)
@@ -218,7 +226,7 @@ def find_live(deps: BridgeDeps, session_id: str) -> LiveSession | None:
 def require_live(deps: BridgeDeps, session_id: str) -> LiveSession:
     """The live, interactive, unambiguous registry entry of *session_id* — or a refusal."""
     live = find_live(deps, session_id)
-    if live is None or not live.alive:
+    if not is_live(live):
         # A background job whose worker is not running has no registry entry: only the
         # CLI's roster knows it — still a background session, never messaged (D4).
         if any(a.background and a.session_id == session_id for a in deps.agents()):
