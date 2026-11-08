@@ -6791,7 +6791,12 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         help="take the prompt from the clipboard (pbpaste)",
     )
     p_park.add_argument(
-        "-N", "--now", action="store_true", help="skip the wait — launch immediately"
+        "-N",
+        "--now",
+        action="store_true",
+        help="skip the wait — launch immediately (with -g over a live session: paste into "
+        "its tab now; while its input box holds a draft, is not drawn yet or another "
+        "delivery holds the tab, the prompt is parked for the next daemon pass, exit 0)",
     )
     p_park.add_argument(
         "-n",

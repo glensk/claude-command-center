@@ -1065,7 +1065,14 @@ it (`fire_window`):
     first held pass and once more after 10 min held; a paste whose ⏎ did not go
     out is disarmed with the prompt kept ("press Return in that tab"), never
     re-pasted. `-N` delivers into the tab
-    immediately; `-j/--new-job` forces the detached behaviour below; the session's
+    immediately through the same guard, minus the typing check (the tab is the one
+    you just pressed the chord in): while the box holds a draft, is not drawn yet
+    or another delivery holds the tab, the prompt is NOT lost — it is parked on the
+    session with that one-pass retry lease ("<why> — prompt parked, retrying at
+    HH:MM", exit 0) and the daemon delivers it once the box is empty; a paste whose
+    ⏎ did not go out exits 1 ("press Return in that tab") and is not re-parked;
+    a session that left or a tab that cannot be typed into exits 1 as before.
+    `-j/--new-job` forces the detached behaviour below; the session's
     own statusline shows `⏳ parked prompt for THIS session fires …` while armed.
     **Re-edit:** a second q+p over the same session reopens the panel PREFILLED
     with the armed prompt — ⌘↵ overwrites prompt + fire time. **"continue" works:**

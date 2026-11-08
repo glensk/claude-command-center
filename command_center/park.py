@@ -62,6 +62,8 @@ from .slrender import (  # noqa: F401  # pylint: disable=unused-import  # re-exp
 from .store import Store
 
 if TYPE_CHECKING:  # the seam's type only — importing peek eagerly would cost every `ccc`
+    from .bridge_target import BridgeDeps
+    from .models import Session
     from .peek import Frontmost
 
 WINDOW_CHOICES = ("five_hour", "seven_day")
@@ -565,6 +567,7 @@ def grab(  # pylint: disable=too-many-locals,too-many-return-statements,too-many
     *,
     frontmost: Frontmost | None = None,
     capture: Any = None,
+    deps: BridgeDeps | None = None,
 ) -> int:
     """Global-chord mode (``ccc park -g``, the Karabiner q+p): panel over any tab.
 
@@ -585,7 +588,8 @@ def grab(  # pylint: disable=too-many-locals,too-many-return-statements,too-many
     ON that session — ``prompt`` + ``fire_at`` on its row, no new job — and at the
     reset the daemon delivers it INTO the session (typed into its tab; a resume tab
     with the prompt when the tab died). This is the "open the session with its AIM
-    first, define the real prompt with qp" workflow; ``-N`` delivers immediately,
+    first, define the real prompt with qp" workflow; ``-N`` delivers immediately
+    (:func:`_park_now`, through the paste guard; *deps* is its seam),
     ``-j/--new-job`` forces the detached-job behaviour instead.
 
     **Detached (any other tab, or ``-j``):** an ARMED future job for the tab's repo
@@ -624,9 +628,12 @@ def grab(  # pylint: disable=too-many-locals,too-many-return-statements,too-many
             with Store() as store:
                 session = peek._session_for_uuid(store, tab_uuid)  # pylint: disable=protected-access
         attach = None
+        live = None
         if session is not None and not session.draft and not opts.new_job:
             from .adapters.claude import ClaudeAdapter
 
+            # The ONE registry read of the panel path: `-N` pastes into this LiveSession
+            # (tp#1867 D6), so it never re-reads the registry to find it.
             live = next(
                 (ls for ls in ClaudeAdapter().discover() if ls.session_id == session.session_id),
                 None,
@@ -672,6 +679,7 @@ def grab(  # pylint: disable=too-many-locals,too-many-return-statements,too-many
             timing = format_fire(fire_at, now) if fire_at else "immediately"
         resolved.update(
             attach=attach,
+            live=live if attach is not None else None,
             cwd=cwd,
             config_dir=config_dir,
             fire_at=fire_at,
@@ -746,15 +754,7 @@ def grab(  # pylint: disable=too-many-locals,too-many-return-statements,too-many
 
     if attach is not None:
         if not fire_at:  # -N: deliver straight into the live session's tab
-            if terminal.send_text_to_session(attach.iterm_session_id or "", prompt):
-                message = f"delivered into session {short_id(attach.session_id)}"
-                notify("⏳ prompt delivered", message, cfg.notify)
-                print(message)
-                return 0
-            message = f"could not type into session {short_id(attach.session_id)}'s tab"
-            notify("⏳ park failed", message, cfg.notify)
-            print(f"error: {message}", file=sys.stderr)
-            return 1
+            return _park_now(cfg, attach, resolved.get("live"), prompt, now, deps)
         with Store() as store:
             store.update_fields(
                 attach.session_id,
@@ -812,3 +812,91 @@ def grab(  # pylint: disable=too-many-locals,too-many-return-statements,too-many
     notify("⏳ prompt parked", done, cfg.notify)
     print(f"parked: {done}")
     return 0
+
+
+#: Refusals that mean the session left (not live any more) between the panel and the paste.
+_NOT_LIVE_CODES = frozenset({"not_running", "background", "account_conflict"})
+
+
+def _park_now(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements  # one exit per D3 outcome
+    cfg: config.Config,
+    attach: Session,
+    live: object,
+    prompt: str,
+    now: int,
+    deps: BridgeDeps | None,
+) -> int:
+    """``ccc park -g -N`` over a live session: paste *prompt* into its tab NOW (tp#1867 D6).
+
+    Through :func:`bridge_target.guarded_paste` with the typing guard OFF (the target is
+    the focused tab the chord was just pressed in) and the resolver's *live* (the one
+    registry read of the panel path; :func:`bridge_target.find_live` only when it carries
+    none). Per outcome: sent → exit 0; HELD (a draft in the box, the box not drawn yet,
+    another delivery holds the tab) → the prompt is parked on the row with the daemon's
+    hold lease, ``prompt_held_since`` / ``prompt_held_notice_at = now`` (the daemon's
+    first held pass stays silent), notice "<why> — prompt parked, retrying at HH:MM",
+    exit 0; ``partial`` (pasted, Return not sent) → exit 1 "press Return", NOT re-parked;
+    anything else → exit 1, as before. Never the prompt's text in a message.
+    """
+    from . import bridge_target, daemon
+    from .models import LiveSession as _LiveSession
+    from .models import short_id
+    from .notify import notify
+
+    paste_deps = deps or bridge_target.default_deps()
+    short = short_id(attach.session_id).strip()
+    target: _LiveSession | None = live if isinstance(live, _LiveSession) else None
+    if target is None:
+        target = bridge_target.find_live(paste_deps, attach.session_id)
+    if not bridge_target.is_live(target):
+        return _park_now_failed(cfg, f"session {short} is no longer live — prompt not delivered")
+    result = bridge_target.guarded_paste(paste_deps, target, prompt, typing_guard=False)
+    code = result.refusal
+    if result.held:
+        lease = daemon.hold_lease(cfg, now)
+        with Store() as store:
+            store.update_fields(
+                attach.session_id,
+                prompt=prompt,
+                fire_at=lease,
+                fire_window="",  # a retry lease has no window provenance
+                prompt_held_since=now,
+                prompt_held_notice_at=now,
+            )
+        retry = time.strftime("%H:%M", time.localtime(lease))
+        message = (
+            f"{bridge_target.held_notice(code, result.data, short)} — prompt parked, "
+            f"retrying at {retry}"
+        )
+        notify("⏳ prompt held", message, cfg.notify)
+        print(message)
+        return 0
+    if code in _NOT_LIVE_CODES:
+        return _park_now_failed(
+            cfg, f"session {short} is no longer live ({code}) — prompt not delivered"
+        )
+    if code:
+        return _park_now_failed(cfg, f"could not type into session {short}'s tab ({code})")
+    if result.state == "sent":
+        message = f"delivered into session {short}"
+        notify("⏳ prompt delivered", message, cfg.notify)
+        print(message)
+        return 0
+    if result.state == "partial":
+        # The paste went out, its Return did not: the prompt sits in the box. Not
+        # re-parked — a later paste would hold on it forever or deliver it twice.
+        return _park_now_failed(
+            cfg,
+            f"prompt pasted but not submitted in {short} — press Return in that tab",
+            title="⏳ prompt not submitted",
+        )
+    return _park_now_failed(cfg, f"could not type into session {short}'s tab")
+
+
+def _park_now_failed(cfg: config.Config, message: str, *, title: str = "⏳ park failed") -> int:
+    """Notify + stderr for a ``-g -N`` paste that did not deliver; exit 1."""
+    from .notify import notify
+
+    notify(title, message, cfg.notify)
+    print(f"error: {message}", file=sys.stderr)
+    return 1

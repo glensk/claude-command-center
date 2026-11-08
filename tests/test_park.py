@@ -281,22 +281,200 @@ def test_grab_new_job_flag_skips_attach(monkeypatch: pytest.MonkeyPatch) -> None
         assert job.prompt == "detached prompt"
 
 
-def test_grab_attach_now_delivers_into_the_tab(monkeypatch: pytest.MonkeyPatch) -> None:
-    from command_center import terminal
+# ---- `ccc park -g -N` into the attached live tab: the paste guard (tp#1867 B4) -------
 
-    sent: list[tuple[str, str]] = []
-    _attach_setup(monkeypatch, "say hallo")
+NOW_PROMPT = "tp1867 park now prompt"
 
-    def _fake_send(uuid: str, text: str) -> bool:
-        sent.append((uuid, text))
-        return True
 
-    monkeypatch.setattr(terminal, "send_text_to_session", _fake_send)
-    assert cli.main(["park", "-g", "-N"]) == 0
-    assert sent == [("w0t0p0:UUID-LIVE", "say hallo")]
+@pytest.fixture(name="pnow")
+def pnow_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """The frontmost tab is an established live session (bridgestub World, whose store is
+    the default one ``grab`` opens); the panel returns :data:`NOW_PROMPT`; the resolver's
+    adapter and the paste deps each count their registry reads."""
+    import dataclasses
+
+    from command_center import bridge_target, peek
+    from command_center.adapters import claude as claude_adapter
+
+    _grab_setup(monkeypatch, NOW_PROMPT)
+    world = World(tmp_path)
+    world.write(user("earlier"), *turn_end())
+    world.db = config.db_path()
     with Store() as store:
-        row = store.get("live-1")
-        assert row is not None and row.fire_at == 0  # delivered, nothing armed
+        store.ensure(SID, cwd="/repo")
+        store.update_fields(SID, iterm_session_id=TAB, config_dir=str(world.config_dir))
+    monkeypatch.setattr(peek, "frontmost_iterm_uuid", lambda: TAB.rsplit(":", maxsplit=1)[-1])
+    monkeypatch.setattr(peek, "_session_for_uuid", lambda store, uuid: store.get(SID))
+    reads = {"adapter": 0, "deps": 0}
+
+    class _CountingAdapter:
+        def discover(self) -> list[Any]:
+            reads["adapter"] += 1
+            return [world.live()]
+
+    def _deps_discover() -> list[Any]:
+        reads["deps"] += 1
+        return world.discover()
+
+    monkeypatch.setattr(claude_adapter, "ClaudeAdapter", _CountingAdapter)
+    deps = dataclasses.replace(world.deps(), discover=_deps_discover)
+    monkeypatch.setattr(bridge_target, "default_deps", lambda: deps)
+    notes: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "command_center.notify.notify", lambda title, msg, channels: notes.append((title, msg))
+    )
+    return {"world": world, "reads": reads, "notes": notes, "deps": deps}
+
+
+def _pnow_row() -> Any:
+    with Store() as store:
+        row = store.get(SID)
+    assert row is not None
+    return row
+
+
+def test_paste_guard_park_now_empty_box_types_and_exits_0(
+    pnow: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    world: World = pnow["world"]
+    assert cli.main(["park", "-g", "-N"]) == 0
+    assert world.texts == [NOW_PROMPT]
+    row = _pnow_row()
+    assert row.fire_at == 0 and row.prompt is None  # delivered, nothing armed
+    assert pnow["notes"] == [("⏳ prompt delivered", f"delivered into session {SID[:8]}")]
+    assert f"delivered into session {SID[:8]}" in capsys.readouterr().out
+
+
+def test_paste_guard_park_now_draft_parks_with_the_hold_lease(
+    pnow: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    world: World = pnow["world"]
+    world.screen = fixture_screen("draft_one_line")
+    assert cli.main(["park", "-g", "-N"]) == 0
+    assert not world.texts
+    row = _pnow_row()
+    lease = daemon.hold_lease(config.load_config(), NOW)
+    assert lease == NOW + 240
+    assert (row.prompt, row.fire_at, row.fire_window) == (NOW_PROMPT, lease, "")
+    assert (row.prompt_held_since, row.prompt_held_notice_at) == (NOW, NOW)
+    retry = time.strftime("%H:%M", time.localtime(lease))
+    want = (
+        f"the input box of {SID[:8]} holds 28 chars — clear it in that tab — prompt parked, "
+        f"retrying at {retry}"
+    )
+    assert pnow["notes"] == [("⏳ prompt held", want)]
+    out = capsys.readouterr().out
+    assert want in out
+    for text in (want, out):
+        assert NOW_PROMPT not in text and _box_draft() not in text
+
+
+def test_paste_guard_park_now_held_prompt_is_silent_on_the_daemons_first_pass(
+    pnow: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The park notice already went out: the daemon's next held pass does not repeat it."""
+    world: World = pnow["world"]
+    world.screen = fixture_screen("draft_one_line")
+    assert cli.main(["park", "-g", "-N"]) == 0
+    daemon_notes: list[str] = []
+    monkeypatch.setattr(daemon, "notify", lambda title, msg, channels: daemon_notes.append(title))
+    monkeypatch.setattr(usage, "read_usage", lambda label: None)
+    monkeypatch.setattr(time, "time", lambda: NOW + 300)
+    report = daemon.DaemonReport()
+    with Store() as store:
+        daemon._deliver_attached_prompts(  # pylint: disable=protected-access
+            store,
+            config.load_config(),
+            report,
+            False,
+            {SID: world.live()},
+            paster=lambda target, text, claim: guarded_paste(
+                pnow["deps"], target, text, claim=claim
+            ),
+            still_alive=lambda sid: True,
+        )
+    assert report.attached_held == [f"{SID[:8]}:input_not_empty"] and not daemon_notes
+    world.screen = fixture_screen("empty_idle")
+    monkeypatch.setattr(time, "time", lambda: NOW + 600)
+    with Store() as store:
+        daemon._deliver_attached_prompts(  # pylint: disable=protected-access
+            store,
+            config.load_config(),
+            daemon.DaemonReport(),
+            False,
+            {SID: world.live()},
+            paster=lambda target, text, claim: guarded_paste(
+                pnow["deps"], target, text, claim=claim
+            ),
+            still_alive=lambda sid: True,
+        )
+    assert world.texts == [NOW_PROMPT] and daemon_notes == ["⏳ parked prompt delivered"]
+
+
+def test_paste_guard_park_now_types_although_a_key_was_just_pressed(
+    pnow: dict[str, Any],
+) -> None:
+    world: World = pnow["world"]
+    world.frontmost, world.key_idle, world.focused = True, 1.0, TAB
+    assert cli.main(["park", "-g", "-N"]) == 0
+    assert world.texts == [NOW_PROMPT] and world.focus_reads == 0
+
+
+def test_paste_guard_park_now_panel_path_reads_the_registry_once(pnow: dict[str, Any]) -> None:
+    assert cli.main(["park", "-g", "-N"]) == 0
+    # The resolver's one read; the paste's only read is revalidate's, inside the tab lock.
+    assert pnow["reads"] == {"adapter": 1, "deps": 1}
+
+
+def test_paste_guard_park_now_falls_back_to_find_live_without_a_resolved_live(
+    pnow: dict[str, Any],
+) -> None:
+    world: World = pnow["world"]
+    cfg = config.load_config()
+    code = park._park_now(  # pylint: disable=protected-access
+        cfg, _pnow_row(), None, NOW_PROMPT, NOW, pnow["deps"]
+    )
+    assert code == 0 and world.texts == [NOW_PROMPT]
+    assert pnow["reads"]["deps"] == 2  # find_live, then revalidate
+
+
+def test_paste_guard_park_now_partial_exits_1_and_is_not_reparked(
+    pnow: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    world: World = pnow["world"]
+    world.send_result = ("", "partial")
+    assert cli.main(["park", "-g", "-N"]) == 1
+    assert world.texts == [NOW_PROMPT]
+    row = _pnow_row()
+    assert row.prompt is None and row.fire_at == 0 and row.prompt_held_since == 0
+    want = f"prompt pasted but not submitted in {SID[:8]} — press Return in that tab"
+    assert pnow["notes"] == [("⏳ prompt not submitted", want)]
+    assert f"error: {want}" in capsys.readouterr().err
+
+
+def test_paste_guard_park_now_session_gone_exits_1(
+    pnow: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    world: World = pnow["world"]
+    world.registered = False  # left between the panel's registry read and the lock
+    assert cli.main(["park", "-g", "-N"]) == 1
+    assert not world.texts
+    row = _pnow_row()
+    assert row.prompt is None and row.fire_at == 0
+    err = capsys.readouterr().err
+    assert f"session {SID[:8]} is no longer live (not_running)" in err
+    assert [t for t, _m in pnow["notes"]] == ["⏳ park failed"]
+
+
+def test_paste_guard_park_now_stale_tab_exits_1(
+    pnow: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    world: World = pnow["world"]
+    world.tab_tty = "/dev/ttys099"
+    assert cli.main(["park", "-g", "-N"]) == 1
+    assert not world.texts and world.screen_reads == 0
+    assert _pnow_row().fire_at == 0
+    assert f"could not type into session {SID[:8]}'s tab" in capsys.readouterr().err
 
 
 # ---- daemon delivery of attached prompts ---------------------------------------------
