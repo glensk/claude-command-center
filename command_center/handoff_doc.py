@@ -30,7 +30,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
     _direct_run(__file__)
 
-# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
+# pylint: disable=wrong-import-position,ungrouped-imports,too-many-lines  # shim first; one module
 
 import hashlib
 import json
@@ -157,23 +157,29 @@ def validate(raw: bytes | str, *, scrub_policy: str | None = None) -> HandoffDoc
             return HandoffDoc(errors=[f"handoff is not valid UTF-8 (byte {exc.start})"])
     else:
         text = raw
+    return _validated(text, scrub_policy)[0]
+
+
+def _validated(text: str, scrub_policy: str | None) -> tuple[HandoffDoc, int]:
+    """:func:`validate` of *text* plus the scrubbed size in bytes (``-1`` = never scrubbed)."""
     errors = check_structure(text)
     if errors:
-        return HandoffDoc(errors=errors)
+        return HandoffDoc(errors=errors), -1
     from . import config, scrub  # local: scrub resolution spawns a probe
 
     policy = config.load_config().mirror_scrub_cmd if scrub_policy is None else scrub_policy
     resolution = scrub.resolve_scrubber(policy)
     if resolution.scrubber is None:
-        return HandoffDoc(errors=[f"credential scrub withheld: {resolution.reason}"])
+        return HandoffDoc(errors=[f"credential scrub withheld: {resolution.reason}"]), -1
     result = scrub.scrub(resolution.scrubber, text)
     if not result.ok:
-        return HandoffDoc(errors=[f"credential scrub withheld: {result.reason}"])
+        return HandoffDoc(errors=[f"credential scrub withheld: {result.reason}"]), -1
+    size = len(result.text.encode("utf-8"))
     errors = check_structure(result.text)
     if errors:
-        return HandoffDoc(errors=["after scrubbing: " + e for e in errors])
+        return HandoffDoc(errors=["after scrubbing: " + e for e in errors]), size
     digest = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
-    return HandoffDoc(text=result.text, sha256=digest, labels=result.labels)
+    return HandoffDoc(text=result.text, sha256=digest, labels=result.labels), size
 
 
 # ------------------------------------------------------------------ model part + compose
@@ -850,6 +856,145 @@ def compose(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     return Composed("\n".join(parts).rstrip("\n") + "\n", level, cut)
 
 
+def _bytes(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _cut_body(body: str, limit: int, model_path: str) -> str:
+    """A generated body cut to *limit* bytes: banner and transcript line kept, middle cut."""
+    if _bytes(body) <= limit:
+        return body
+    pointer = f"… cut — full original: {model_path}"
+    lines = body.splitlines()
+    tail = lines[-1:] if len(lines) > 1 and lines[-1].startswith("Predecessor transcript") else []
+    rest = lines[: len(lines) - len(tail)]
+    head = rest[:1] if rest and _bytes(rest[0]) <= TAIL_MAX_BYTES else []
+    middle = "\n".join(rest[len(head) :])
+    avail = limit - _bytes("\n".join([*head, pointer, *tail])) - 1
+    kept = _cut_to(middle, avail).strip() if avail > 0 else ""
+    return "\n".join([*head, *([kept] if kept else []), pointer, *tail])
+
+
+def _cut_model(model: ModelPart, room: int, model_path: str) -> ModelPart | None:
+    """The generated *model* with its bodies inside *room* bytes (``None``: impossible).
+
+    Current state is cut first, then Decisions; First steps (a short fixed list) never.
+    """
+    bodies = {t: b.strip() for t, b in model.sections.items()}
+    state, decisions = (
+        bodies.get(MODEL_SECTIONS[0], ""),
+        bodies.get(MODEL_SECTIONS[1], ""),
+    )
+    left = room - _bytes(bodies.get(MODEL_SECTIONS[2], ""))
+    need = _bytes(state) + _bytes(decisions) - left
+    floor = _bytes(_cut_body(state, 0, model_path))
+    state = _cut_body(state, max(floor, _bytes(state) - max(0, need)), model_path)
+    decisions = _cut_body(decisions, max(0, left - _bytes(state)), model_path)
+    if not decisions or _bytes(state) + _bytes(decisions) > left:
+        return None
+    cut = {**bodies, MODEL_SECTIONS[0]: state, MODEL_SECTIONS[1]: decisions}
+    return ModelPart(sections=cut, raw=model.raw, sha256=model.sha256)
+
+
+@dataclass
+class _Fit:
+    """One fitting pass: the composition, the bytes beside the model bodies, the budget."""
+
+    composed: Composed
+    facts: int
+    budget: int
+    model_bytes: int
+
+    @property
+    def size(self) -> int:
+        """The composed size in bytes."""
+        return _bytes(self.composed.text)
+
+    @property
+    def room(self) -> int:
+        """Body bytes the model part may have beside these facts."""
+        return self.budget - self.facts
+
+
+def _fit(  # pylint: disable=too-many-arguments
+    model: ModelPart,
+    doc: dict[str, Any],
+    budget: int,
+    *,
+    ref: str,
+    model_path: str,
+    generated: bool,
+) -> _Fit:
+    """Raise the cut tier until the text fits *budget*; a generated part is cut to fit.
+
+    Tier 11 applies the hard guard (``facts_cap = budget - FACTS_FLOOR_RESERVE``). A
+    generated part (facts-only / capped) has its bodies cut at tier 10 already when the
+    compact facts leave it at least :data:`FACTS_FLOOR_RESERVE` bytes, else at tier 11.
+    """
+    facts_cap = budget - FACTS_FLOOR_RESERVE
+    model_bytes = sum(_bytes(b.strip()) for b in _fit_model(model, model_path)[0].values())
+
+    def at(level: int, part: ModelPart = model) -> Composed:
+        cap = facts_cap if level >= MAX_LEVEL else None
+        return compose(part, doc, level=level, ref=ref, model_path=model_path, facts_cap=cap)
+
+    def fitted(composed: Composed) -> _Fit:
+        return _Fit(composed, _bytes(composed.text) - model_bytes, budget, model_bytes)
+
+    def cut_generated(current: _Fit, min_room: int) -> _Fit | None:
+        room = current.room
+        if room < min_room:
+            return None
+        for _ in range(3):  # bounded: each retry removes the measured overshoot
+            part = _cut_model(model, room, model_path)
+            if part is None:
+                return None
+            composed = at(current.composed.level, part)
+            over = _bytes(composed.text) - budget
+            if over <= 0:
+                return _Fit(
+                    Composed(composed.text, composed.level, True),
+                    current.facts,
+                    budget,
+                    0,
+                )
+            room -= over
+        return None
+
+    level = 0
+    current = fitted(at(level))
+    while current.size > budget and level < MAX_LEVEL:
+        if generated and level == COLLAPSE_LEVEL:
+            done = cut_generated(current, FACTS_FLOOR_RESERVE)
+            if done is not None:
+                return done
+        level += 1
+        current = fitted(at(level))
+    if current.size > budget and generated:
+        return cut_generated(current, 1) or current
+    return current
+
+
+def _defect(fit: _Fit, generated: bool) -> str:
+    out = (
+        f"facts alone are {fit.facts} bytes after every cut (cap {fit.budget}); this is a "
+        "ccc defect, not the model part — file it"
+    )
+    return out if generated else out + "; relay with --facts-only"
+
+
+def _room_refusal(fit: _Fit, overshoot: int = 0) -> str:
+    room = min(fit.room - overshoot, MODEL_MAX_BYTES)
+    return (
+        f"the model part is {fit.model_bytes} bytes; beside the facts ({fit.facts} bytes at "
+        f"the deepest cut) it may have at most {room} bytes — shorten it to ≤ {room}"
+    )
+
+
+def _cap_error(doc: HandoffDoc) -> bool:
+    return any("the cap is" in e for e in doc.errors)
+
+
 def compose_checked(  # pylint: disable=too-many-arguments
     model: ModelPart,
     doc: dict[str, Any],
@@ -857,27 +1002,35 @@ def compose_checked(  # pylint: disable=too-many-arguments
     ref: str,
     model_path: str,
     scrub_policy: str | None = None,
+    generated: bool = False,
 ) -> tuple[HandoffDoc, Composed]:
-    """Compose at the smallest cut tier that fits, :func:`validate` it, and re-cut once.
+    """Compose at the smallest cut tier that fits, :func:`validate` it, and re-fit once.
 
-    The scrubber may lengthen the text, so a document that validates too big gets ONE more
-    tier (two validate passes at most); then the refusal names the sizes.
+    *generated* (facts-only / capped): the model bodies are cut to what the facts leave, so
+    the text always fits. A model-written part that does not fit is refused with the body
+    bytes it may have (``A``, at most :data:`MODEL_MAX_BYTES`). Facts that overflow alone
+    get their own message. When the scrubber lengthens the text past the cap, ONE more pass
+    budgets for the measured growth (``budget - growth - 256``): two validate passes at most.
     """
     budget = MAX_BYTES - SCRUB_MARGIN
-    level = 0
-    composed = compose(model, doc, level=level, ref=ref, model_path=model_path)
-    while len(composed.text.encode("utf-8")) > budget and level < MAX_LEVEL:
-        level += 1
-        composed = compose(model, doc, level=level, ref=ref, model_path=model_path)
-    sizes = [len(composed.text.encode("utf-8"))]
-    result = validate(composed.text, scrub_policy=scrub_policy)
-    if not result.ok and any("the cap is" in e for e in result.errors) and level < MAX_LEVEL:
-        composed = compose(model, doc, level=level + 1, ref=ref, model_path=model_path)
-        sizes.append(len(composed.text.encode("utf-8")))
-        result = validate(composed.text, scrub_policy=scrub_policy)
-    if not result.ok and any("the cap is" in e for e in result.errors):
-        result.errors.append(
-            f"composed handoff sizes {sizes} bytes after the cuts; the cap is {MAX_BYTES} — "
-            "shorten the model part"
-        )
-    return result, composed
+    kw = {"ref": ref, "model_path": model_path, "generated": generated}
+    fit = _fit(model, doc, budget, **kw)  # type: ignore[arg-type]
+    if fit.room <= 0 or (generated and fit.size > budget):
+        return HandoffDoc(errors=[_defect(fit, generated)]), fit.composed
+    result, scrubbed = _validated(fit.composed.text, scrub_policy)
+    if result.ok or not _cap_error(result):
+        return result, fit.composed
+    growth = max(0, scrubbed - fit.size) if scrubbed >= 0 else 0
+    fit = _fit(model, doc, budget - growth - 256, **kw)  # type: ignore[arg-type]
+    if fit.room <= 0 or (generated and fit.size > fit.budget):
+        return HandoffDoc(errors=[_defect(fit, generated)]), fit.composed
+    if fit.size > fit.budget:
+        return HandoffDoc(errors=[_room_refusal(fit)]), fit.composed
+    result, scrubbed = _validated(fit.composed.text, scrub_policy)
+    if not result.ok and _cap_error(result):
+        overshoot = max(0, scrubbed - MAX_BYTES)
+        if generated:
+            result.errors.append(_defect(fit, generated))
+        else:
+            result.errors.append(_room_refusal(fit, overshoot + 256))
+    return result, fit.composed

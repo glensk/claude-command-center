@@ -1997,10 +1997,19 @@ relay requests) lives outside ccc.
 three model section names (`validate_model_part`); the composed document is strict UTF-8,
 ≤ 24 KB, no control characters but newline and tab, every template section present and
 non-empty, credential shapes scrubbed through the fail-closed `mirror_scrub_cmd` gate
-(`scrub.py`; no scrubber = rejected), sha256 recorded; when the scrubber lengthens the text
-past 24 KB, compose cuts one more priority tier (at most two passes, then refuses naming the
-sizes). Every persisted facts file is scrubbed the same way, and a scrub failure on any of
-them refuses `start`. A rejected handoff changes nothing.
+(`scrub.py`; no scrubber = rejected), sha256 recorded. Compose takes the smallest cut tier
+whose facts leave room for the model part within 22 KB (24 KB minus a 2 KB scrub margin).
+A code-generated part (`--facts-only`, `--capped`) never fails for its size: its bodies are
+cut to what the facts leave, keeping the banner and the predecessor-transcript line, with a
+`… cut — full original: <path>` pointer to `handoffs/facts/<sid>/<snapshot>.model.md`. A
+model-written part (`-f`) that does not fit is refused with the room it has: `… it may have
+at most A bytes — shorten it to ≤ A` (A ≤ 10 KB). Facts that overflow alone after every cut
+get their own message (`… this is a ccc defect, not the model part — file it`, plus `relay
+with --facts-only` for a written part). When the scrubber lengthens the text past 24 KB,
+compose fits once more with the budget less the measured growth and 256 B (at most two
+validate passes). `tools/replay_handoff_snapshots.py` replays stored snapshots through the
+facts-only path (read-only; absent snapshots are skipped). Every persisted facts file is
+scrubbed the same way, and a scrub failure on any of them refuses `start`. A rejected handoff changes nothing.
 
 **The transfer** (`transfers` table, `transfer_store.py`; one active transfer per source;
 every transition a compare-and-set):

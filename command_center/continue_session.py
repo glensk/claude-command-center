@@ -951,14 +951,22 @@ def _snapshot(
 
 
 def _finish(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    model: Any, snap_doc: dict[str, Any], snapshot: str, sid: str, args: Any
+    model: Any,
+    snap_doc: dict[str, Any],
+    snapshot: str,
+    sid: str,
+    args: Any,
+    generated: bool = False,
 ) -> _Composed:
-    """Compose the model part with the snapshot (D1, D9) and keep a cut original."""
+    """Compose the model part with the snapshot (D1, D9) and keep a cut original.
+
+    *generated* (facts-only / capped) lets compose cut the model bodies to fit (tp#1835).
+    """
     from . import handoff_doc, handoff_facts
 
     model_path = handoff_facts.facts_dir(sid) / f"{snapshot[:12]}.model.md"
     doc, composed = handoff_doc.compose_checked(
-        model, snap_doc, ref=sid, model_path=str(model_path)
+        model, snap_doc, ref=sid, model_path=str(model_path), generated=generated
     )
     if not doc.ok:
         raise StartRefused("handoff rejected — " + "; ".join(doc.errors))
@@ -1000,7 +1008,7 @@ def _compose_generated(
     model = handoff_doc.validate_model_part(text)
     if not model.ok:  # code-written text is valid by construction; never ship a bad one
         raise StartRefused("handoff rejected — " + "; ".join(model.errors))
-    return _finish(model, snap_doc, snapshot, src.session_id, args)
+    return _finish(model, snap_doc, snapshot, src.session_id, args, generated=True)
 
 
 def _compose(  # pylint: disable=too-many-arguments,too-many-positional-arguments

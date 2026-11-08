@@ -1580,6 +1580,26 @@ def test_facts_only_start_runs_no_model_and_no_router(
     assert harness.launches == [transfer.target_session]
 
 
+def test_facts_only_start_fits_a_big_snapshot(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#1835: an oversized snapshot is cut to fit, never refused for its size."""
+    import bigsnap  # pylint: disable=import-outside-toplevel,import-error
+
+    from command_center import handoff_facts  # pylint: disable=import-outside-toplevel
+
+    doc = bigsnap.big_snapshot(held=200, title_bytes=200)
+    doc["session_id"] = SID
+    monkeypatch.setattr(handoff_facts, "collect", lambda *_a, **_k: doc)
+    argv = ["continue-session", "start", "--facts-only", "-A", "private", "-s", SID]
+    assert cli.main(argv) == 0
+    assert "refused" not in capsys.readouterr().err
+    stored, transfer = _stored_text()
+    assert len(stored.encode()) <= handoff_doc.MAX_BYTES
+    assert handoff_doc.validate(stored).ok and transfer.state == "finalized"
+    assert harness.launches == [transfer.target_session]
+
+
 def test_facts_only_refuses_a_file_or_capped(
     harness: _Harness, capsys: pytest.CaptureFixture[str]
 ) -> None:

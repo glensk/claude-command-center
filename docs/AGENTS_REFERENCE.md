@@ -444,8 +444,10 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
   `escape_headings`, because `sections()` keeps the FIRST `##` and ignores fences.
 - **Fail closed on scrub, never on size**: every persisted facts file (snapshot, capture,
   agent spec/result) goes through `mirror_scrub_cmd`; a scrub failure refuses `start`. Size
-  is solved by priority cuts with a `continue-session facts` pointer (never the three model
-  sections, the AIM, held ids, questions, restarts, spec paths, warnings).
+  is solved by priority cuts with a `continue-session facts` pointer (never the AIM, held
+  ids, questions, restarts, spec paths, warnings). A code-generated model part is cut to
+  fit (`… cut — full original:`); a model-written one is refused with the bytes it may have
+  (tp#1835).
 - **Context-relay files are read, never imported** (`relay_state.py`, tp#1536): a subagent
   with an unconsumed relaunch record (`<CC_RELAY_STATE_DIR>/relaunch/<sid>/<agent>.json`,
   version 1) hands over its capsule as `result` plus `capsule_path` and `relaunch` = the

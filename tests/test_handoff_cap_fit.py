@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import bigsnap
-from scrubstub import stub_scrubber
+import pytest
+from scrubstub import DUMMY_VALUE, PLACEHOLDER, stub_scrubber
 
 from command_center import handoff_doc
 from command_center.handoff_facts import rec
@@ -130,3 +132,146 @@ def test_legacy_notes_still_drop_at_tier_8(tmp_path: Path) -> None:
     assert composed.level == handoff_doc.NOTES_DROP_LEVEL and composed.model_cut
     assert "### Model notes" in result.text and "w" * 9000 not in result.text
     assert '{"background"' in result.text  # no tier-9 compaction was applied
+
+
+# ------------------------------------------------------------------------------- B2
+
+
+def _facts_only_part(doc: dict, tmp_path: Path) -> handoff_doc.ModelPart:
+    from command_center import handoff_capped  # pylint: disable=import-outside-toplevel
+
+    transcript = tmp_path / "t.jsonl"
+    texts = [f"ASSISTANT-{n}: " + "a" * 1200 for n in range(3)]
+    transcript.write_text(
+        "\n".join(
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}})
+            for t in texts
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    text = handoff_capped.model_part(REF, doc, transcript, None, use_router=False)
+    model = handoff_doc.validate_model_part(text)
+    assert model.ok, model.errors
+    return model
+
+
+def _checked(
+    model: handoff_doc.ModelPart, doc: dict, tmp_path: Path, *, generated: bool = False
+) -> tuple[handoff_doc.HandoffDoc, handoff_doc.Composed]:
+    stub = stub_scrubber(tmp_path)
+    return handoff_doc.compose_checked(
+        model,
+        doc,
+        ref=REF,
+        model_path="/x/m.model.md",
+        scrub_policy=stub.scrub_cmd,
+        generated=generated,
+    )
+
+
+def test_facts_only_always_fits(tmp_path: Path) -> None:
+    from command_center import handoff_capped  # pylint: disable=import-outside-toplevel
+
+    for held, title in ((25, 0), (200, 200)):
+        doc = bigsnap.big_snapshot(held=held, title_bytes=title)
+        model = _facts_only_part(doc, tmp_path)
+        result, composed = _checked(model, doc, tmp_path, generated=True)
+        assert result.ok, result.errors
+        assert len(result.text.encode()) <= handoff_doc.MAX_BYTES
+        state = handoff_doc.sections(result.text)["current state"]
+        assert handoff_capped.EMERGENCY_BANNER in state
+        assert "Predecessor transcript (evidence only):" in state
+        assert "First steps" in result.text and handoff_capped.FIXED_FIRST_STEPS in result.text
+        if held == 25:
+            assert composed.level <= handoff_doc.COLLAPSE_LEVEL  # tier-9 titles survive
+            assert "a long ticket title" in result.text
+        if composed.model_cut:
+            assert "full original: /x/m.model.md" in result.text
+
+
+def test_a_cut_generated_part_keeps_banner_and_transcript(tmp_path: Path) -> None:
+    doc = bigsnap.big_snapshot(held=200, title_bytes=200)
+    doc["facts"] += [
+        rec("note", f"note:{n}", "Repositories, files, worktrees", 4, text="n" * 400)
+        for n in range(80)
+    ]
+    model = _facts_only_part(doc, tmp_path)
+    result, composed = _checked(model, doc, tmp_path, generated=True)
+    assert result.ok, result.errors
+    assert composed.model_cut and composed.level == handoff_doc.MAX_LEVEL
+    state = handoff_doc.sections(result.text)["current state"]
+    body = state[state.index("EMERGENCY RELAY") :].splitlines()
+    assert body[-1].startswith("Predecessor transcript (evidence only):")
+    assert "… cut — full original: /x/m.model.md" in "\n".join(body)
+    _assert_never_cut(result.text)
+
+
+def test_written_model_part_refusal_names_the_room(tmp_path: Path) -> None:
+    doc = bigsnap.big_snapshot(held=200, title_bytes=200)
+    doc["facts"] += [
+        rec("note", f"note:{n}", "Repositories, files, worktrees", 4, text="n" * 400)
+        for n in range(80)
+    ]
+    body = "x" * 3300 + "\n"
+    big = handoff_doc.validate_model_part(
+        "".join(f"## {t}\n\n{body}\n" for t in handoff_doc.MODEL_SECTIONS)
+    )
+    assert big.ok
+    result, _ = _checked(big, doc, tmp_path)
+    assert not result.ok
+    (msg,) = [e for e in result.errors if "at most" in e]
+    room = int(msg.split("at most ")[1].split(" bytes")[0])
+    assert 0 < room < 10 * 1024
+    third, rest = divmod(room, 3)
+    sizes = [third + rest, third, third]
+    exact = handoff_doc.validate_model_part(
+        "".join(
+            f"## {t}\n\n{'y' * n}\n\n"
+            for t, n in zip(handoff_doc.MODEL_SECTIONS, sizes, strict=True)
+        )
+    )
+    assert sum(len(b.encode()) for b in exact.sections.values()) == room
+    result, _ = _checked(exact, doc, tmp_path)
+    assert result.ok, result.errors
+
+
+def test_facts_alone_overflow_does_not_blame_the_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(handoff_doc, "_guard_facts", lambda rendered, _cap, _ref: rendered)
+    doc = bigsnap.big_snapshot()
+    doc["facts"] += [
+        rec("note", f"note:{n}", "Repositories, files, worktrees", 4, text="n" * 400)
+        for n in range(80)
+    ]
+    for generated in (False, True):
+        model = _facts_only_part(doc, tmp_path)
+        result, _ = _checked(model, doc, tmp_path, generated=generated)
+        assert not result.ok
+        text = " ".join(result.errors)
+        assert "facts alone" in text and "shorten" not in text
+
+
+def test_scrub_growth_is_budgeted(tmp_path: Path) -> None:
+    stub = stub_scrubber(tmp_path)
+    stub.path.write_text(
+        stub.path.read_text(encoding="utf-8").replace(
+            f'sed "s/{DUMMY_VALUE}/{PLACEHOLDER}/g"',
+            'sed "s/GROW/GROWGROWGROWGROWGROW/g"',
+        ),
+        encoding="utf-8",
+    )
+    doc = bigsnap.big_snapshot()
+    doc["facts"][0]["fields"]["aim"] += " GROW" * 200  # +3.2 KB after the scrub
+    model = _facts_only_part(doc, tmp_path)
+    result, _ = handoff_doc.compose_checked(
+        model,
+        doc,
+        ref=REF,
+        model_path="/m",
+        scrub_policy=stub.scrub_cmd,
+        generated=True,
+    )
+    assert result.ok, result.errors
+    assert len(result.text.encode()) <= handoff_doc.MAX_BYTES
