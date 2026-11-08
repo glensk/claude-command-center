@@ -3806,9 +3806,9 @@ Both in-flight probes then treat that agent's doorbell (`staff wait -a AGENT` / 
 -a AGENT`, anchored on the command word, no chained command) as disposable, like a keep-warm
 timer; another agent's doorbell or any other shell still refuses `background_shell`. Inside
 the tab lock, next to the revalidation, the binding is read again: a re-adopt in the window
-refuses `identity_changed`. Without `-A` nothing changes. The status gate accepts a
-doorbell-only session: its registry `shell` with no open turn is `idle`, as in `ccc sessions
--j`.
+refuses `identity_changed`. A close without `-A` re-reads it there too: a session adopted
+in the window refuses `staff_bound` (tp#1845). The status gate accepts a doorbell-only
+session: its registry `shell` with no open turn is `idle`, as in `ccc sessions -j`.
 
 ### `ccc lineage` (`-s/--session ID`, `-j/--json`)
 

@@ -39,7 +39,8 @@ then treat A's doorbell shell (``staff wait -a A`` / ``staff watch -a A``,
 :func:`inflight.staff_doorbell`) as disposable, like a keep-warm timer; another agent's
 doorbell or any other shell still refuses ``background_shell``. Inside the tab lock, next
 to the revalidation, the binding is read again: a re-adopt in the window refuses
-``identity_changed``. Without ``-A`` nothing changes.
+``identity_changed``. A plain close re-reads it there too: a session adopted in the window
+refuses ``staff_bound`` (tp#1845).
 """
 
 from __future__ import annotations
@@ -260,11 +261,18 @@ def _bound_cfg(cfg: Config) -> Config:
 
 
 def _check_binding(sid: str, staff_agent: str) -> None:
-    """``-A``: the staff binding still names *staff_agent* (else ``identity_changed``)."""
+    """The staff binding re-read under the tab lock, right before the signal.
+
+    ``-A``: it still names *staff_agent* (else ``identity_changed``). A plain close: the
+    session is still unbound (an adopt in the window refuses ``staff_bound``, tp#1845).
+    """
     from . import staffrole
 
-    if staff_agent and staffrole.adopted_role(sid) != staff_agent:
+    role = staffrole.adopted_role(sid)
+    if staff_agent and role != staff_agent:
         raise hc.Refused(f"the staff binding no longer names {staff_agent}", "identity_changed")
+    if not staff_agent and role:
+        raise hc.Refused(f"the session was adopted by staff agent {role}", "staff_bound")
 
 
 def _close_live(  # pylint: disable=too-many-locals

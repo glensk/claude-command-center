@@ -724,6 +724,60 @@ def test_staff_close_binding_reread_under_tab_lock(
     assert order == ["lock", "revalidate", "binding", "kill", "unlock"]
 
 
+def test_plain_close_adopt_in_window_is_staff_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1845: unbound at run_close's check, adopted by the under-lock re-read: refused."""
+    world, deps = _install(tmp_path, monkeypatch)
+    reads: list[str | None] = []
+    roles = iter([None])  # run_close's check reads no binding, the re-read under the lock dev-1
+
+    def _role(_sid: str) -> str | None:
+        reads.append(next(roles, "dev-1"))
+        return reads[-1]
+
+    monkeypatch.setattr(staffrole, "adopted_role", _role)
+    _refused(deps, "staff_bound")
+    _nothing_signalled(world)
+    assert reads == [None, "dev-1"]
+
+
+def test_plain_close_unbound_throughout_rereads_and_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    reads: list[str] = []
+    monkeypatch.setattr(staffrole, "adopted_role", reads.append)  # None: unbound
+    assert bridge_close.run_close(deps, SID)["result"] == "closed"
+    assert reads == [SID, SID]  # the pre-lock check and the re-read under the tab lock
+    assert world.killed == [(PID, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize("agent", ["", AGENT])
+def test_binding_reread_that_raises_signals_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, agent: str
+) -> None:
+    """An under-lock re-read that raises: the error propagates, the arm is retired, no signal.
+
+    The same for a plain close and ``-A`` (``adopted_role`` itself never raises).
+    """
+    world, deps = _install(tmp_path, monkeypatch)
+    if agent:
+        _staff_session(world, monkeypatch, f"staff wait -a {agent}")
+    roles = iter([agent or None])
+
+    def _role(_sid: str) -> str | None:
+        try:
+            return next(roles)
+        except StopIteration:
+            raise OSError("binding unreadable") from None
+
+    monkeypatch.setattr(staffrole, "adopted_role", _role)
+    with pytest.raises(OSError, match="binding unreadable"):
+        bridge_close.run_close(deps, SID, agent)
+    _nothing_signalled(world)
+
+
 def test_staff_close_cli_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
