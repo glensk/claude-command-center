@@ -25,6 +25,12 @@
    Code's input box already holds text, ``input_not_ready`` when a fresh or just-started
    session's box cannot be read yet. The draft itself is never logged or reported.
 
+:func:`guarded_paste` (tp#1867) runs the same checks for the other paths that paste into a
+live composer (``ccc await`` live delivery, the daemon's attached-prompt fire, ``ccc park
+-g -N``): tab → lock → revalidate → typing guard → input guard → the caller's claim → send,
+and returns a :class:`PasteResult` instead of raising. :func:`held_notice` is the per-code
+wording of a held paste every such path shows.
+
 Every collaborator that touches the machine (registry, ``ps``, iTerm, the clock, the
 sender) is a field of :class:`BridgeDeps`, so tests drive the whole path with fakes.
 """
@@ -450,3 +456,90 @@ def tab_lock(deps: BridgeDeps, iterm_session_id: str) -> Iterator[None]:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+#: Refusals a pasting path HOLDS on: retry later, no attempt consumed, no new-tab fallback.
+HELD_CODES = frozenset({"user_active", "input_not_empty", "input_not_ready", "tab_locked"})
+
+
+@dataclass(frozen=True)
+class PasteResult:
+    """What :func:`guarded_paste` did (never the pasted or the drafted text).
+
+    ``refusal``: the :class:`BridgeError` code that stopped it (``""`` when it reached the
+    sender); ``data``: that error's data (``input_chars`` / ``input_mode`` for
+    ``input_not_empty``); ``via``: the sender's channel; ``state``: the sender's state
+    (``sent`` | ``partial`` — text out, Return not — | ``none``; ``""`` when nothing was
+    attempted); ``input_check``: the input guard's note (``unrecognized`` / ``unreadable``)
+    or ``None``; ``tab``: the iTerm session id it resolved (``""`` when none).
+    """
+
+    refusal: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+    via: str = ""
+    state: str = ""
+    input_check: str | None = None
+    tab: str = ""
+
+    @property
+    def held(self) -> bool:
+        """True when the caller should hold and retry later (:data:`HELD_CODES`)."""
+        return self.refusal in HELD_CODES
+
+
+def guarded_paste(
+    deps: BridgeDeps,
+    live: LiveSession,
+    text: str,
+    *,
+    claim: Callable[[], bool] | None = None,
+    typing_guard: bool = True,
+) -> PasteResult:
+    """Paste *text* into *live*'s tab behind the ``ccc send`` checks (tp#1867 D2).
+
+    Order, as :func:`bridge_send.run_send`: :func:`tab_for` (the lock key), then inside
+    :func:`tab_lock`: :func:`revalidate` (the guards use its fresh ``live``),
+    :func:`guard_user_active` when *typing_guard*, :func:`guard_input_empty` (``fresh`` =
+    no transcript yet), the optional *claim* (``False`` → ``claim_lost``, nothing typed),
+    then ``deps.send_text``. A :class:`BridgeError` before the send becomes ``refusal`` /
+    ``data``; nothing is typed. Not a CLI: no envelope, no exit code.
+    """
+    tab = ""
+    try:
+        tab = tab_for(deps, live)
+        with tab_lock(deps, tab):
+            target = revalidate(deps, live.session_id, tab)
+            if typing_guard:
+                guard_user_active(deps, tab)
+            current = target.live
+            fresh = deps.transcript(current.cwd, current.session_id, current.config_dir) is None
+            input_check = guard_input_empty(deps, tab, current, fresh)
+            if claim is not None and not claim():
+                return PasteResult(refusal="claim_lost", tab=tab, input_check=input_check)
+            via, state = deps.send_text(tab, text)
+    except BridgeError as exc:
+        return PasteResult(refusal=exc.code, data=dict(exc.data or {}), tab=tab)
+    return PasteResult(via=via or "", state=state or "", input_check=input_check, tab=tab)
+
+
+_HELD_WORDING = {
+    "user_active": "you are typing in {short}'s tab — held until the keyboard is idle",
+    "input_not_ready": "the input box of {short} is not drawn yet",
+    "tab_locked": "another delivery to {short}'s tab is in progress",
+    "no_tab": "no iTerm tab is known for {short}",
+}
+
+
+def held_notice(code: str, data: dict[str, Any] | None, short: str) -> str:
+    """The notice wording for a paste into *short* that stopped on *code* (tp#1867 D3).
+
+    Only ``input_not_empty`` names a count (``data["input_chars"]``); no wording ever
+    carries the draft or the pasted text.
+    """
+    if code == "input_not_empty":
+        chars = int((data or {}).get("input_chars") or 0)
+        return f"the input box of {short} holds {chars} chars — clear it in that tab"
+    wording = _HELD_WORDING.get(code)
+    if wording is not None:
+        return wording.format(short=short)
+    return f"could not type into {short}'s tab ({code})"
