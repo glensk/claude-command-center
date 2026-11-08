@@ -1,8 +1,10 @@
 """Delivering a fired await group: preflight, the live-session matrix, the outbox,
 ``ccc fire-await`` and ``accounts.pin_environ``.
 
-Every launcher, typer and ``os.execvp`` is a recording fake — no tab opens, nothing is
-typed into a real terminal, no ``claude`` runs.
+Every launcher, paster and ``os.execvp`` is a recording fake — no tab opens, nothing is
+typed into a real terminal, no ``claude`` runs. The ``test_paste_guard_await_*`` tests run
+the real paste guard (:func:`bridge_target.guarded_paste`) against a
+:class:`bridgestub.World` (tp#1867).
 """
 
 # pylint: disable=unbalanced-tuple-unpacking  # `[(x, _)] = …` asserts exactly one
@@ -11,15 +13,19 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
 import pytest
+from bridgestub import SID as WORLD_SID
+from bridgestub import TAB, World, fixture_screen, turn_end, user
 
 from command_center import accounts, await_delivery, cli
 from command_center.await_eval import PassReport
 from command_center.await_prompt import FRAMING
 from command_center.await_store import SourceSpec
+from command_center.bridge_target import PasteResult, guarded_paste
 from command_center.models import LiveSession
 from command_center.store import Store
 from command_center.transfer_store import Transfer
@@ -50,7 +56,7 @@ def env_fixture(tmp_path: Path) -> dict[str, Any]:
     store = Store(tmp_path / "state.db")
     store.ensure(SID, cwd=str(cwd))
     store.update_fields(SID, config_dir=str(acct), iterm_session_id="w0t0p0:ABC")
-    return {"store": store, "acct": str(acct), "cwd": str(cwd), "tmp": tmp_path}
+    return {"store": store, "acct": str(acct), "cwd": str(cwd), "tmp": tmp_path, "sid": SID}
 
 
 def _fired(env: dict[str, Any], *, no_codex: bool = False, fresh: bool = False) -> int:
@@ -62,7 +68,7 @@ def _fired(env: dict[str, Any], *, no_codex: bool = False, fresh: bool = False) 
 def _armed(env: dict[str, Any], *, no_codex: bool = False, fresh: bool = False) -> int:
     store: Store = env["store"]
     return store.arm_await(
-        SID,
+        env["sid"],
         config_dir=env["acct"],
         cwd=env["cwd"],
         no_codex=no_codex,
@@ -105,6 +111,25 @@ def _live(env: dict[str, Any], **over: Any) -> LiveSession:
     return LiveSession(**base)
 
 
+def _fake_paster(
+    env: dict[str, Any], typed: list[Any], typer_ok: bool = True
+) -> await_delivery.Paster:
+    """The paste guard's contract without its checks: the stored tab (``no_tab`` when
+    there is none), the claim, then a typer that succeeds (``sent``) or not (``none``)."""
+
+    def paster(live: LiveSession, text: str, claim: Any) -> PasteResult:
+        row = env["store"].get(live.session_id)
+        tab = (row.iterm_session_id or "") if row is not None else ""
+        if not tab:
+            return PasteResult(refusal="no_tab")
+        if not claim():
+            return PasteResult(refusal="claim_lost", tab=tab)
+        typed.append((tab, text))
+        return PasteResult(state="sent" if typer_ok else "none", tab=tab)
+
+    return paster
+
+
 def _deliver(
     env: dict[str, Any],
     *,
@@ -112,15 +137,12 @@ def _deliver(
     typer_ok: bool = True,
     launcher_ok: bool = True,
     now: int = NOW + 200,
+    paster: await_delivery.Paster | None = None,
 ) -> tuple[PassReport, list[Any], list[Any], Notes]:
     typed: list[Any] = []
     launched: list[Any] = []
     notes = Notes()
     report = PassReport()
-
-    def typer(tab: str, text: str) -> bool:
-        typed.append((tab, text))
-        return typer_ok
 
     def launcher(group_id: int, token: str) -> bool:
         launched.append((group_id, token))
@@ -132,7 +154,7 @@ def _deliver(
         report=report,
         notifier=notes,
         discover=lambda: list(live or []),
-        typer=typer,
+        paster=paster or _fake_paster(env, typed, typer_ok),
         launcher=launcher,
     )
     return report, typed, launched, notes
@@ -555,10 +577,6 @@ def test_fresh_group_needs_no_old_transcript_nor_registry(env: dict[str, Any]) -
     def broken() -> list[LiveSession]:
         raise RuntimeError("registry unreadable")
 
-    def typer(tab: str, text: str) -> bool:
-        typed.append((tab, text))
-        return True
-
     def launcher(group_id: int, token: str) -> bool:
         launched.append((group_id, token))
         return True
@@ -569,7 +587,7 @@ def test_fresh_group_needs_no_old_transcript_nor_registry(env: dict[str, Any]) -
         report=PassReport(),
         notifier=Notes(),
         discover=broken,
-        typer=typer,
+        paster=_fake_paster(env, typed),
         launcher=launcher,
     )
     assert not typed and [g for g, _t in launched] == [gid]
@@ -588,7 +606,7 @@ def test_resume_group_still_fails_closed_on_a_broken_registry(env: dict[str, Any
         report=report,
         notifier=Notes(),
         discover=broken,
-        typer=lambda *_a: pytest.fail("typed"),
+        paster=lambda *_a: pytest.fail("typed"),
         launcher=lambda *_a: pytest.fail("launched"),
     )
     assert report.waiting == [gid] and _state(env, gid) == "fired"
@@ -627,3 +645,205 @@ def test_fire_await_resume_argv(env: dict[str, Any], monkeypatch: pytest.MonkeyP
     [(_cwd, argv, _kw)] = calls
     assert argv[:4] == ["claude", "--resume", SID, "--"] and len(argv) == 5
     assert argv[4].startswith(FRAMING) and "NEW session" not in argv[4]
+
+
+# --------------------------------------------------------------------------- paste guard (tp#1867)
+@pytest.fixture(name="wenv")
+def wenv_fixture(tmp_path: Path) -> dict[str, Any]:
+    """The :func:`env_fixture` shape around a :class:`bridgestub.World`: its live session,
+    tab and transcript (one finished turn: an established session), a trusted cwd."""
+    world = World(tmp_path)
+    world.write(user("earlier"), *turn_end())
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    (world.config_dir / ".claude.json").write_text(
+        json.dumps({"projects": {str(cwd.resolve()): {"hasTrustDialogAccepted": True}}})
+    )
+    return {
+        "store": Store(world.db),
+        "acct": str(world.config_dir),
+        "cwd": str(cwd),
+        "tmp": tmp_path,
+        "sid": WORLD_SID,
+        "world": world,
+    }
+
+
+def _guarded(
+    wenv: dict[str, Any],
+    *,
+    now: int = NOW + 200,
+    live: LiveSession | None = None,
+    before_paste: Any = None,
+) -> tuple[PassReport, Notes]:
+    """One delivery pass through the REAL paste guard against the World's tab."""
+    world: World = wenv["world"]
+    seen = live if live is not None else world.live()
+    notes = Notes()
+    report = PassReport()
+
+    def paster(target: LiveSession, text: str, claim: Any) -> PasteResult:
+        if before_paste is not None:
+            before_paste()
+        return guarded_paste(world.deps(), target, text, claim=claim)
+
+    await_delivery.deliver_pending(
+        wenv["store"],
+        now=now,
+        report=report,
+        notifier=notes,
+        discover=lambda: [seen],
+        paster=paster,
+        launcher=lambda *_a: pytest.fail("a new tab for a live session"),
+    )
+    return report, notes
+
+
+def _group(wenv: dict[str, Any], gid: int) -> Any:
+    group = wenv["store"].get_await_group(gid)
+    assert group is not None
+    return group
+
+
+def test_paste_guard_await_draft_holds_then_an_empty_box_delivers(wenv: dict[str, Any]) -> None:
+    world: World = wenv["world"]
+    gid = _fired(wenv)
+    world.screen = fixture_screen("draft_one_line")
+    report, notes = _guarded(wenv)
+    group = _group(wenv, gid)
+    assert (group.state, group.delivery_attempts, group.held_since) == ("fired", 0, NOW + 200)
+    assert report.held == [f"{gid}:input_not_empty"] and report.waiting == [gid]
+    assert not world.texts and not notes.messages and not report.delivered
+    world.screen = fixture_screen("empty_idle")
+    report, notes = _guarded(wenv, now=NOW + 260)
+    group = _group(wenv, gid)
+    assert (group.state, group.held_since, group.held_notice_at) == ("delivered", 0, 0)
+    assert report.delivered == [gid] and not report.held
+    [text] = world.texts
+    assert text.startswith(FRAMING)
+    [message] = notes.messages
+    assert "event typed into the live session via python-api" in message
+
+
+def test_paste_guard_await_typing_user_holds_without_reading_the_box(
+    wenv: dict[str, Any],
+) -> None:
+    world: World = wenv["world"]
+    gid = _fired(wenv)
+    world.frontmost, world.key_idle, world.focused = True, 1.0, TAB
+    report, _notes = _guarded(wenv)
+    assert report.held == [f"{gid}:user_active"] and world.screen_reads == 0
+    group = _group(wenv, gid)
+    assert (group.state, group.delivery_attempts) == ("fired", 0) and not world.texts
+
+
+def test_paste_guard_await_held_ten_minutes_notifies_once_and_delivery_still_notifies(
+    wenv: dict[str, Any],
+) -> None:
+    world: World = wenv["world"]
+    gid = _fired(wenv)
+    world.screen = fixture_screen("draft_one_line")
+    messages: list[str] = []
+    for now in (NOW + 200, NOW + 500, NOW + 800, NOW + 900):
+        _report, notes = _guarded(wenv, now=now)
+        messages.extend(notes.messages)
+    short = WORLD_SID[:8]
+    # Exactly this wording: the count of the draft, never its text.
+    assert messages == [
+        f"await group {gid} held: the input box of {short} holds 28 chars — clear it in that tab"
+    ]
+    group = _group(wenv, gid)
+    assert (group.held_since, group.held_notice_at, group.notified_at) == (NOW + 200, NOW + 800, 0)
+    world.screen = fixture_screen("empty_idle")
+    report, notes = _guarded(wenv, now=NOW + 1000)
+    assert report.delivered == [gid]
+    [message] = notes.messages  # the held notice did not consume `notified_at`
+    assert "event typed into the live session" in message
+    assert (_group(wenv, gid).held_since, _group(wenv, gid).held_notice_at) == (0, 0)
+
+
+def test_paste_guard_await_partial_blocks_at_once_and_never_pastes_again(
+    wenv: dict[str, Any],
+) -> None:
+    world: World = wenv["world"]
+    gid = _fired(wenv)
+    world.send_result = ("", "partial")
+    report, notes = _guarded(wenv)
+    short = WORLD_SID[:8]
+    group = _group(wenv, gid)
+    assert (group.state, group.delivery_attempts) == ("blocked", 1)
+    assert group.blocked_reason == f"prompt pasted but not submitted in {short}"
+    assert report.blocked_groups == [gid] and not report.delivered
+    assert notes.messages == [
+        f"await group {gid} blocked: prompt pasted but not submitted in {short}"
+        " — press Return in that tab"
+    ]
+    assert len(world.texts) == 1
+    _guarded(wenv, now=NOW + 260)
+    assert len(world.texts) == 1 and _group(wenv, gid).state == "blocked"
+
+
+def test_paste_guard_await_stale_tab_counts_an_attempt(wenv: dict[str, Any]) -> None:
+    world: World = wenv["world"]
+    gid = _fired(wenv)
+    world.tab_tty = "/dev/ttys099"
+    report, _notes = _guarded(wenv)
+    group = _group(wenv, gid)
+    assert (group.state, group.delivery_attempts) == ("fired", 1)
+    assert not world.texts and world.screen_reads == 0 and not report.held
+
+
+def test_paste_guard_await_session_gone_waits_without_an_attempt(wenv: dict[str, Any]) -> None:
+    world: World = wenv["world"]
+    gid = _fired(wenv)
+    seen = world.live()  # the pass's registry read still listed it ...
+    world.registered = False  # ... the one inside the lock does not
+    report, notes = _guarded(wenv, live=seen)
+    group = _group(wenv, gid)
+    assert (group.state, group.delivery_attempts, group.held_since) == ("fired", 0, 0)
+    assert report.waiting == [gid] and not report.held
+    assert not world.texts and not notes.messages
+
+
+def test_paste_guard_await_claim_lost_types_nothing(wenv: dict[str, Any]) -> None:
+    world: World = wenv["world"]
+    gid = _fired(wenv)
+    token = _group(wenv, gid).delivery_token
+
+    def other_deliverer() -> None:
+        assert Store(world.db).mark_delivering(gid, token, NOW + 199)
+
+    report, notes = _guarded(wenv, before_paste=other_deliverer)
+    group = _group(wenv, gid)
+    assert (group.state, group.delivery_attempts) == ("delivering", 0)
+    assert not world.texts and not notes.messages
+    assert not report.delivered and not report.waiting and not report.held
+
+
+def test_paste_guard_await_old_await_groups_table_gains_the_hold_columns(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "old.db"
+    with Store(db) as store:
+        store.ensure(SID, cwd="/repo")
+        gid = store.arm_await(
+            SID,
+            config_dir="",
+            cwd="/repo",
+            no_codex=False,
+            prompt_template="t {event}",
+            until_epoch=NOW + 3600,
+            sources=[SourceSpec(kind="zoho-reply", spec={}, watermark="w")],
+            now=NOW,
+        )
+    conn = sqlite3.connect(db)
+    for column in ("held_since", "held_notice_at"):
+        conn.execute(f"ALTER TABLE await_groups DROP COLUMN {column}")
+    conn.commit()
+    conn.close()
+    for _ in range(2):  # idempotent: a second open adds nothing and fails nothing
+        with Store(db) as store:
+            cols = {r["name"] for r in store.conn.execute("PRAGMA table_info(await_groups)")}
+            assert {"held_since", "held_notice_at"} <= cols
+            group = store.get_await_group(gid)
+            assert group is not None and (group.held_since, group.held_notice_at) == (0, 0)

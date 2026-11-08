@@ -127,7 +127,9 @@ CREATE TABLE IF NOT EXISTS await_groups (
     items              TEXT    NOT NULL DEFAULT '[]',
     fresh              INTEGER NOT NULL DEFAULT 0,
     launch_profile     TEXT    NOT NULL DEFAULT '',
-    transfer_id        TEXT
+    transfer_id        TEXT,
+    held_since         INTEGER NOT NULL DEFAULT 0,
+    held_notice_at     INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_await_groups_active
     ON await_groups(session_id) WHERE state IN {_ACTIVE_SQL};
@@ -247,6 +249,11 @@ class AwaitGroup:  # pylint: disable=too-many-instance-attributes  # one row, fl
     fresh: bool = False  # deliver into a NEW session, never resume (``ccc await -F``)
     launch_profile: str = ""  # config label the armed session ran under; re-resolved at delivery
     transfer_id: str = ""  # the handoff transfer this group is reserved under; "" = none
+    #: First pass a live delivery was HELD by the paste guard (input box not empty, user
+    #: typing, …; tp#1867); 0 = not held. Cleared by the claim and by ``delivered``.
+    held_since: int = 0
+    #: When the one "held for 10 min" notice went out (0 = not yet); cleared with it.
+    held_notice_at: int = 0
 
     def items_list(self) -> list[str]:
         """The parsed ``items`` JSON (``[]`` when unreadable)."""
@@ -870,13 +877,14 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
 
     # ------------------------------------------------------------------ delivery outbox
     def mark_delivering(self, group_id: int, token: str, now: int) -> bool:
-        """CAS ``fired → delivering`` under *token* (one deliverer wins).
+        """CAS ``fired → delivering`` under *token* (one deliverer wins); clears the hold.
 
         A group reserved by a pending handoff is never claimed: it stays ``fired`` until
         the transfer is accepted (rebound to the successor) or fails (released).
         """
         cur = self.conn.execute(
-            "UPDATE await_groups SET state = 'delivering', updated_at = ? "
+            "UPDATE await_groups SET state = 'delivering', held_since = 0, held_notice_at = 0, "
+            "updated_at = ? "
             f"WHERE id = ? AND state = 'fired' AND delivery_token = ? AND NOT {_RESERVED_SQL}",
             (now, group_id, token),
         )
@@ -884,9 +892,11 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
         return cur.rowcount == 1
 
     def mark_delivered(self, group_id: int, token: str, now: int) -> bool:
-        """CAS ``delivering → delivered`` under *token* (``fire-await``'s claim)."""
+        """CAS ``delivering → delivered`` under *token* (``fire-await``'s claim); clears the
+        hold (``held_since`` / ``held_notice_at``)."""
         cur = self.conn.execute(
-            "UPDATE await_groups SET state = 'delivered', updated_at = ? "
+            "UPDATE await_groups SET state = 'delivered', held_since = 0, held_notice_at = 0, "
+            "updated_at = ? "
             "WHERE id = ? AND state = 'delivering' AND delivery_token = ?",
             (now, group_id, token),
         )
@@ -926,6 +936,34 @@ class AwaitStoreMixin:  # pylint: disable=too-many-public-methods  # one per tra
                 ),
             )
         return state
+
+    def mark_group_held(self, group_id: int, now: int) -> int:
+        """A live delivery of a ``fired`` group was HELD this pass (tp#1867): stamp
+        ``held_since`` on the first held pass; return it (``0`` when the group is no longer
+        ``fired``). The state, the token and ``delivery_attempts`` stay as they are."""
+        self.conn.execute(
+            "UPDATE await_groups SET held_since = ? "
+            "WHERE id = ? AND state = 'fired' AND held_since = 0",
+            (now, group_id),
+        )
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT held_since FROM await_groups WHERE id = ? AND state = 'fired'", (group_id,)
+        ).fetchone()
+        return int(row[0] or 0) if row is not None else 0
+
+    def claim_held_notice(self, group_id: int, now: int) -> bool:
+        """The one "held" notice of a hold: ``True`` for the first claimer only.
+
+        Separate from :meth:`claim_group_notice` (``notified_at``), which ``delivered`` does
+        not reset: a held notice there would swallow the later delivered notice."""
+        cur = self.conn.execute(
+            "UPDATE await_groups SET held_notice_at = ? "
+            "WHERE id = ? AND state = 'fired' AND held_since > 0 AND held_notice_at = 0",
+            (now, group_id),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
 
     def stale_deliveries(self, now: int, stale_sec: int) -> list[AwaitGroup]:
         """``delivering`` groups untouched for *stale_sec*: the deliverer crashed between

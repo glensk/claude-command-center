@@ -80,6 +80,9 @@ class PassReport:  # pylint: disable=too-many-instance-attributes  # a flat tall
     waiting: list[int] = dataclasses.field(default_factory=list)
     #: ``"<group>:<channel>"`` per live-tab delivery (``python-api`` / ``applescript``).
     typed_via: list[str] = dataclasses.field(default_factory=list)
+    #: ``"<group>:<code>"`` per live delivery the paste guard HELD this pass (the input box
+    #: holds text, the user is typing, …; tp#1867). Also in ``waiting``; no attempt used.
+    held: list[str] = dataclasses.field(default_factory=list)
     #: The channel health this pass measured (empty = not due, see CHANNEL_HEALTH_EVERY_SEC).
     channels: dict[str, object] = dataclasses.field(default_factory=dict)
 

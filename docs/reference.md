@@ -1316,7 +1316,22 @@ cwd is trusted for that account; and the session has no pending attached prompt
 
 - **live, idle, interactive, same account, no conflict** → the prompt is typed into the
   tab (at-least-once: a crash between the keystrokes and the mark can repeat it) — see
-  "Live-tab delivery channels" below;
+  "Live-tab delivery channels" below. The paste goes through the same checks as `ccc send`
+  (tp#1867): inside the per-tab lock the tab is revalidated, then the typing guard and the
+  input-box guard run, and only then is the outbox row claimed. When the input box holds
+  text (`input_not_empty`), you are typing in that tab (`user_active`), the box is not
+  drawn yet (`input_not_ready`) or another delivery holds the tab (`tab_locked`), the
+  delivery is HELD: nothing is typed, no attempt is used, the group stays `fired`, the
+  pass lists it under `held` (`ccc await -r -j`: `"held": ["7:input_not_empty"]`) and the
+  next pass retries. A group held for 10 minutes sends ONE notification ("await group 7
+  held: the input box of 1a2b3c4d holds 12 chars — clear it in that tab"; a count, never
+  the draft), separate from the fired/delivered notice, which still follows. A paste
+  whose Return did not go out (`partial`) is never re-pasted — the text may sit in the
+  box: the group blocks at once ("prompt pasted but not submitted in 1a2b3c4d — press
+  Return in that tab"). A stale tab, a foreign foreground process, an unreachable iTerm
+  or a paste that typed nothing count an attempt (blocked after 3); a session that left
+  the registry, or one with no known tab, waits. `bridge_input_guard = false` turns the
+  box check off;
 - **live but busy / waiting / another account** → wait for the next pass;
 - **closed** → a new tab runs `ccc fire-await <group> <token>`, which claims the outbox
   row by its token BEFORE `claude --resume` (at-most-once). A launcher that fails hands

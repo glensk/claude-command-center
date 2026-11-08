@@ -778,6 +778,9 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         # The handoff transfer the group is reserved under (NULL = not reserved, which is
         # what every group armed before reservations existed correctly means).
         "transfer_id": "TEXT",
+        # The paste-guard hold of a live delivery (tp#1867; 0 = not held / no notice yet).
+        "held_since": "INTEGER NOT NULL DEFAULT 0",
+        "held_notice_at": "INTEGER NOT NULL DEFAULT 0",
     }
 
     _ADDED_TRANSFER_COLUMNS = {"launch_profile": "TEXT", "facts_snapshot": "TEXT"}

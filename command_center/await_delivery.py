@@ -13,9 +13,22 @@ The group is an outbox row keyed by its ``delivery_token``:
   BLOCKS the group with a reason and one notification; ``ccc await -R`` recovers it.
 * **Live session** — typed into its tab only when it is alive, interactive, not a
   D9 conflict, under the snapshot account and ``idle``; any other live state leaves the
-  group ``fired`` for the next pass. CAS ``fired → delivering``, type, ``delivered``.
-  Typing is ``terminal.send_text_via``: the iTerm2 Python API, falling back to
-  AppleScript; the channel that delivered lands in ``PassReport.typed_via`` (the
+  group ``fired`` for the next pass. The paste goes through the paste guard
+  (:func:`bridge_target.guarded_paste`, tp#1867, the :data:`Paster` seam): tab → per-tab
+  lock → revalidate → typing guard → input-box guard → the CAS ``fired → delivering``
+  (the *claim*, so it happens inside the lock after the guards) → paste → ``delivered``.
+  A HELD paste (``input_not_empty`` — the box holds a draft —, ``user_active``,
+  ``input_not_ready``, ``tab_locked``) types nothing and consumes no attempt: the group
+  stays ``fired`` (``PassReport.waiting`` + ``PassReport.held``, ``"<group>:<code>"``),
+  ``held_since`` is stamped on its first held pass, and after :data:`HELD_NOTICE_SEC`
+  held ONE notice goes out through the notifier directly (never ``notified_at``, whose
+  dedup would swallow the later delivered notice). A paste whose Return did not go out
+  (sender state ``partial``) is never re-pasted: the attempt counts and the group blocks
+  at once ("prompt pasted but not submitted in <short>"). A stale tab, a foreign
+  foreground process, an unreachable iTerm or a sender that typed nothing count an
+  attempt like a failed typer; a session that left the registry, or one with no known
+  tab, waits. Typing is ``terminal.send_text_detailed``: the iTerm2 Python API, falling
+  back to AppleScript; the channel that delivered lands in ``PassReport.typed_via`` (the
   poller log's ``typed_via=['7:applescript']``).
   AT-LEAST-ONCE: a crash between the keystrokes and the mark can repeat the text
   (the stale-delivery reclaim re-sends it).
@@ -66,6 +79,8 @@ from typing import TYPE_CHECKING
 from . import accounts
 from .await_prompt import delivery_prompt
 from .await_store import AwaitGroup
+from .bridge_target import PasteResult, default_deps, guarded_paste, held_notice
+from .models import short_id
 
 if TYPE_CHECKING:
     from .await_eval import Notifier, PassReport
@@ -74,10 +89,13 @@ if TYPE_CHECKING:
 
 MAX_ATTEMPTS = 3
 STALE_DELIVERY_SEC = 15 * 60
+#: A live delivery held this long by the paste guard sends ONE notice (tp#1867 D4).
+HELD_NOTICE_SEC = 10 * 60
 
-#: Types into a live tab: truthy on success — the channel name (``python-api`` /
-#: ``applescript``) when known, else ``True``.
-Typer = Callable[[str, str], bool | str]
+#: Pastes into a live session's tab behind the paste guard: ``(live, text, claim)`` →
+#: :class:`bridge_target.PasteResult`. *claim* is the ``fired → delivering`` CAS, run
+#: inside the tab lock after the guards; ``False`` there means nothing was typed.
+Paster = Callable[["LiveSession", str, Callable[[], bool]], PasteResult]
 Launcher = Callable[[int, str], bool]
 Discover = Callable[[], list["LiveSession"]]
 
@@ -152,10 +170,8 @@ def _default_discover() -> list[LiveSession]:
     return list(ClaudeAdapter().discover())
 
 
-def _default_typer(iterm_session_id: str, text: str) -> str:
-    from . import terminal  # pylint: disable=import-outside-toplevel
-
-    return terminal.send_text_via(iterm_session_id, text)
+def _default_paster(live: LiveSession, text: str, claim: Callable[[], bool]) -> PasteResult:
+    return guarded_paste(default_deps(), live, text, claim=claim)
 
 
 def _default_launcher(group_id: int, token: str) -> bool:
@@ -172,7 +188,7 @@ class _Ctx:
     now: int
     report: PassReport
     notifier: Notifier
-    typer: Typer
+    paster: Paster
     launcher: Launcher
 
     def notify(self, group_id: int, message: str) -> None:
@@ -213,35 +229,108 @@ def _deliver_one(ctx: _Ctx, group: AwaitGroup, live: LiveSession | None) -> None
         return
     assert session is not None  # preflight refused a missing row
     verdict = live_verdict(group, live)
-    tab = session.iterm_session_id or ""
-    if verdict == "wait" or (verdict == "type" and not tab):
+    if verdict == "wait":
         ctx.report.waiting.append(group.id)
+        return
+    if verdict == "type":
+        assert live is not None  # live_verdict types only into a live entry
+        _paste_live(ctx, group, live)
         return
     token = group.delivery_token
     if not ctx.store.mark_delivering(group.id, token, ctx.now):
         return  # another deliverer took it
     kind = _winner_kind(ctx.store, group)
-    if verdict == "type":
-        via = ctx.typer(tab, delivery_prompt(group))
-        if via and ctx.store.mark_delivered(group.id, token, ctx.now):
-            ctx.report.delivered.append(group.id)
-            channel = f" via {via}" if isinstance(via, str) else ""
-            if channel:
-                ctx.report.typed_via.append(f"{group.id}:{via}")
-            ctx.notify(
-                group.id,
-                f"await group {group.id} fired ({kind}); event typed into the live "
-                f"session{channel}",
-            )
-        else:
-            ctx.fail(group, token, "typing into the live tab failed")
-        return
     if ctx.launcher(group.id, token):
         ctx.report.launched.append(group.id)
         what = "a new session starting" if group.fresh else "session resuming"
         ctx.notify(group.id, f"await group {group.id} fired ({kind}); {what} in a new tab")
     else:
         ctx.fail(group, token, "no terminal tab could be opened")
+
+
+#: Paste-guard refusals after which the session is not (or no longer) typeable: the next
+#: pass routes it again through :func:`live_verdict`; no attempt is consumed.
+_WAIT_CODES = frozenset({"no_tab", "not_running", "background", "account_conflict"})
+
+
+def _paste_live(  # pylint: disable=too-many-return-statements  # one per D3 outcome
+    ctx: _Ctx, group: AwaitGroup, live: LiveSession
+) -> None:
+    """Verdict ``type``: paste the prompt behind the paste guard (tp#1867 D3/D4, P1)."""
+    token = group.delivery_token
+    claimed: list[bool] = []
+
+    def claim() -> bool:
+        if not ctx.store.mark_delivering(group.id, token, ctx.now):
+            return False
+        claimed.append(True)
+        return True
+
+    try:
+        result = ctx.paster(live, delivery_prompt(group), claim)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        # The guard returns its refusals; an exception is a seam that broke. Claimed: the
+        # paste may or may not have gone out — a failed typer. Not claimed: nothing typed.
+        if claimed:
+            ctx.fail(group, token, "typing into the live tab failed")
+        else:
+            ctx.report.waiting.append(group.id)
+        return
+    short = short_id(group.session_id).strip()
+    if result.held:
+        _hold(ctx, group, result, short)
+        return
+    code = result.refusal
+    if code == "claim_lost":
+        return  # another deliverer took it
+    if code in _WAIT_CODES:
+        ctx.report.waiting.append(group.id)
+        return
+    if code:
+        # stale_tab / foreground_not_claude / iterm_unreachable (or an unknown code):
+        # nothing typed, but the tab is wrong — count an attempt like a failed typer.
+        if ctx.store.mark_delivering(group.id, token, ctx.now):
+            ctx.fail(group, token, f"typing into the live tab failed ({code})")
+        return
+    if result.state == "partial":
+        # The paste went out, its Return did not: ccc's own text sits in the box. Never
+        # re-paste (it would hold forever, or deliver twice once Return is pressed).
+        reason = f"prompt pasted but not submitted in {short}"
+        state = ctx.store.revert_delivery(group.id, token, ctx.now, max_attempts=1, reason=reason)
+        if state == "blocked":
+            ctx.report.blocked_groups.append(group.id)
+            ctx.notify(
+                group.id, f"await group {group.id} blocked: {reason} — press Return in that tab"
+            )
+        return
+    if result.state == "sent" and ctx.store.mark_delivered(group.id, token, ctx.now):
+        kind = _winner_kind(ctx.store, group)
+        ctx.report.delivered.append(group.id)
+        channel = f" via {result.via}" if result.via else ""
+        if channel:
+            ctx.report.typed_via.append(f"{group.id}:{result.via}")
+        ctx.notify(
+            group.id,
+            f"await group {group.id} fired ({kind}); event typed into the live session{channel}",
+        )
+        return
+    ctx.fail(group, token, "typing into the live tab failed")  # state none: nothing typed
+
+
+def _hold(ctx: _Ctx, group: AwaitGroup, result: PasteResult, short: str) -> None:
+    """A held paste: the group stays ``fired``, no attempt; one notice after 10 min held."""
+    ctx.report.waiting.append(group.id)
+    ctx.report.held.append(f"{group.id}:{result.refusal}")
+    since = ctx.store.mark_group_held(group.id, ctx.now)
+    if (
+        since
+        and ctx.now - since >= HELD_NOTICE_SEC
+        and ctx.store.claim_held_notice(group.id, ctx.now)
+    ):
+        ctx.notifier(
+            "ccc await",
+            f"await group {group.id} held: {held_notice(result.refusal, result.data, short)}",
+        )
 
 
 def deliver_pending(  # pylint: disable=too-many-arguments
@@ -251,7 +340,7 @@ def deliver_pending(  # pylint: disable=too-many-arguments
     report: PassReport,
     notifier: Notifier,
     discover: Discover | None = None,
-    typer: Typer | None = None,
+    paster: Paster | None = None,
     launcher: Launcher | None = None,
 ) -> None:
     """Reclaim stale deliveries, then try every ``fired`` group once."""
@@ -260,7 +349,7 @@ def deliver_pending(  # pylint: disable=too-many-arguments
         now=now,
         report=report,
         notifier=notifier,
-        typer=typer or _default_typer,
+        paster=paster or _default_paster,
         launcher=launcher or _default_launcher,
     )
     for stale in store.stale_deliveries(now, STALE_DELIVERY_SEC):

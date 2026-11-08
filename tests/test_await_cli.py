@@ -384,6 +384,14 @@ def test_run_dry_run_probes_nothing(env: dict[str, Any], capsys: Any) -> None:
     assert json.loads(capsys.readouterr().out)["would_probe"] == []  # not due yet
 
 
+def test_paste_guard_await_run_json_carries_held(env: dict[str, Any], capsys: Any) -> None:
+    """``ccc await -r -j`` prints the whole PassReport: the paste guard's ``held`` too."""
+    _armed(env)
+    capsys.readouterr()
+    assert _run("-r", "-n", "-j", runner=Runner({})) == 0
+    assert json.loads(capsys.readouterr().out)["held"] == []
+
+
 def test_parse_until_forms() -> None:
     now = 1_800_000_000.0
     assert await_cli.parse_until("30m", now) == int(now) + 1800
