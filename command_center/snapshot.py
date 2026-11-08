@@ -1833,9 +1833,11 @@ def _connect(coro_factory: Callable[[Any], Awaitable[Any]]) -> Any:
     except ImportError as exc:  # pragma: no cover - iterm2 is a hard dependency
         raise RuntimeError(_API_HINT) from exc
 
+    from .iterm_conn import open_connection  # pylint: disable=import-outside-toplevel
+
     async def _go() -> Any:
-        connection = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=10)
-        return await coro_factory(connection)
+        async with open_connection(iterm2, 10) as connection:
+            return await coro_factory(connection)
 
     try:
         return asyncio.run(_go())

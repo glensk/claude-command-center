@@ -995,25 +995,27 @@ def _iterm_api_tab(command: str) -> bool:
 
         import iterm2  # pylint: disable=import-outside-toplevel
 
+        from .iterm_conn import open_connection  # pylint: disable=import-outside-toplevel
+
         async def _go() -> bool:
-            conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
-            app = await iterm2.async_get_app(conn, create_if_needed=True)
-            if app is None:
-                return False
-            window = app.current_terminal_window
-            if window is None:
-                window = await iterm2.Window.async_create(conn)
-                tab = window.current_tab if window else None
-            else:
-                tab = await window.async_create_tab()
-            if tab is None:
-                return False
-            session = tab.current_session
-            if session is None:
-                return False
-            await session.async_send_text(command + "\n")
-            await app.async_activate()
-            return True
+            async with open_connection(iterm2, 8) as conn:
+                app = await iterm2.async_get_app(conn, create_if_needed=True)
+                if app is None:
+                    return False
+                window = app.current_terminal_window
+                if window is None:
+                    window = await iterm2.Window.async_create(conn)
+                    tab = window.current_tab if window else None
+                else:
+                    tab = await window.async_create_tab()
+                if tab is None:
+                    return False
+                session = tab.current_session
+                if session is None:
+                    return False
+                await session.async_send_text(command + "\n")
+                await app.async_activate()
+                return True
 
         return bool(asyncio.run(_go()))
     except Exception:  # pylint: disable=broad-exception-caught
@@ -1064,23 +1066,25 @@ def _send_text_python_api(uuid: str, text: str) -> str:
 
         import iterm2  # pylint: disable=import-outside-toplevel
 
+        from .iterm_conn import open_connection  # pylint: disable=import-outside-toplevel
+
         async def _go() -> bool:
             nonlocal sent_paste
             # The process-wide App singleton is bound to the first connection; a
             # second send in the same process would use its dead socket (tp#70 V16).
             iterm2.app.invalidate_app()
-            conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
-            app = await iterm2.async_get_app(conn)
-            if app is None:
-                return False
-            session = app.get_session_by_id(uuid)
-            if session is None:
-                return False
-            await session.async_send_text("\x1b[200~" + text + "\x1b[201~")
-            sent_paste = True
-            await asyncio.sleep(0.4)
-            await session.async_send_text("\r")
-            return True
+            async with open_connection(iterm2, 8) as conn:
+                app = await iterm2.async_get_app(conn)
+                if app is None:
+                    return False
+                session = app.get_session_by_id(uuid)
+                if session is None:
+                    return False
+                await session.async_send_text("\x1b[200~" + text + "\x1b[201~")
+                sent_paste = True
+                await asyncio.sleep(0.4)
+                await session.async_send_text("\r")
+                return True
 
         if asyncio.run(_go()):
             return _API_SENT
@@ -1236,23 +1240,25 @@ def send_keys_via(iterm_session_id: str, keys: Sequence[str], *, delay: float = 
 
         import iterm2  # pylint: disable=import-outside-toplevel
 
+        from .iterm_conn import open_connection  # pylint: disable=import-outside-toplevel
+
         async def _go() -> None:
             nonlocal sent
             iterm2.app.invalidate_app()
-            conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
-            app = await iterm2.async_get_app(conn)
-            if app is None:
-                return
-            session = app.get_session_by_id(uuid)
-            if session is None:
-                return
-            for token, payload in payloads:
-                if token.startswith("wait:"):
-                    await asyncio.sleep(float(token[5:]))
-                    continue
-                await session.async_send_text(payload, suppress_broadcast=True)
-                sent += 1
-                await asyncio.sleep(delay)
+            async with open_connection(iterm2, 8) as conn:
+                app = await iterm2.async_get_app(conn)
+                if app is None:
+                    return
+                session = app.get_session_by_id(uuid)
+                if session is None:
+                    return
+                for token, payload in payloads:
+                    if token.startswith("wait:"):
+                        await asyncio.sleep(float(token[5:]))
+                        continue
+                    await session.async_send_text(payload, suppress_broadcast=True)
+                    sent += 1
+                    await asyncio.sleep(delay)
 
         asyncio.run(_go())
     except Exception:  # pylint: disable=broad-exception-caught
@@ -1281,18 +1287,20 @@ def iterm_session_vars(
 
         import iterm2  # pylint: disable=import-outside-toplevel
 
+        from .iterm_conn import open_connection  # pylint: disable=import-outside-toplevel
+
         async def _go() -> dict[str, str]:
             iterm2.app.invalidate_app()
-            conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
-            app = await iterm2.async_get_app(conn)
-            session = app.get_session_by_id(uuid) if app is not None else None
-            if session is None:
-                return {}
-            out: dict[str, str] = {}
-            for name in names:
-                value = await session.async_get_variable(name)
-                out[name] = "" if value is None else str(value)
-            return out
+            async with open_connection(iterm2, 8) as conn:
+                app = await iterm2.async_get_app(conn)
+                session = app.get_session_by_id(uuid) if app is not None else None
+                if session is None:
+                    return {}
+                out: dict[str, str] = {}
+                for name in names:
+                    value = await session.async_get_variable(name)
+                    out[name] = "" if value is None else str(value)
+                return out
 
         return asyncio.run(_go())
     except Exception:  # pylint: disable=broad-exception-caught
@@ -1356,21 +1364,23 @@ def iterm_screen_tail(iterm_session_id: str, lines: int = SCREEN_TAIL_LINES) -> 
 
         import iterm2  # pylint: disable=import-outside-toplevel
 
+        from .iterm_conn import open_connection  # pylint: disable=import-outside-toplevel
+
         async def _go() -> ScreenRead | None:
             iterm2.app.invalidate_app()
-            conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
-            app = await iterm2.async_get_app(conn)
-            session = app.get_session_by_id(uuid) if app is not None else None
-            if session is None:
-                return None
-            contents = await session.async_get_screen_contents()
-            cols = int(session.grid_size.width)
-            total = int(contents.number_of_lines)
-            start = max(0, total - max(1, lines))
-            rows = tuple(_screen_cells(contents.line(i), cols) for i in range(start, total))
-            cursor = contents.cursor_coord
-            y = int(cursor.y) - start
-            return ScreenRead(cols, (int(cursor.x), y if 0 <= y < len(rows) else -1), rows)
+            async with open_connection(iterm2, 8) as conn:
+                app = await iterm2.async_get_app(conn)
+                session = app.get_session_by_id(uuid) if app is not None else None
+                if session is None:
+                    return None
+                contents = await session.async_get_screen_contents()
+                cols = int(session.grid_size.width)
+                total = int(contents.number_of_lines)
+                start = max(0, total - max(1, lines))
+                rows = tuple(_screen_cells(contents.line(i), cols) for i in range(start, total))
+                cursor = contents.cursor_coord
+                y = int(cursor.y) - start
+                return ScreenRead(cols, (int(cursor.x), y if 0 <= y < len(rows) else -1), rows)
 
         return asyncio.run(_go())
     except Exception:  # pylint: disable=broad-exception-caught
@@ -1450,16 +1460,18 @@ def iterm_focused_session() -> str | None:
 
         import iterm2  # pylint: disable=import-outside-toplevel
 
+        from .iterm_conn import open_connection  # pylint: disable=import-outside-toplevel
+
         async def _go() -> str:
             iterm2.app.invalidate_app()
-            conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
-            app = await iterm2.async_get_app(conn)
-            if app is None:
-                raise RuntimeError("no iTerm app")
-            window = app.current_terminal_window
-            tab = window.current_tab if window is not None else None
-            session = tab.current_session if tab is not None else None
-            return str(session.session_id) if session is not None else ""
+            async with open_connection(iterm2, 8) as conn:
+                app = await iterm2.async_get_app(conn)
+                if app is None:
+                    raise RuntimeError("no iTerm app")
+                window = app.current_terminal_window
+                tab = window.current_tab if window is not None else None
+                session = tab.current_session if tab is not None else None
+                return str(session.session_id) if session is not None else ""
 
         return asyncio.run(_go())
     except Exception:  # pylint: disable=broad-exception-caught
@@ -1496,13 +1508,12 @@ def _probe_python_api() -> str:
 
         import iterm2  # pylint: disable=import-outside-toplevel
 
+        from .iterm_conn import open_connection  # pylint: disable=import-outside-toplevel
+
         async def _go() -> None:
-            conn = await asyncio.wait_for(
-                iterm2.Connection.async_create(), timeout=CHANNEL_PROBE_TIMEOUT
-            )
-            websocket = getattr(conn, "websocket", None)
-            if websocket is not None:
-                await websocket.close()
+            # Connect and close again: the reader task first, then the socket (tp#1875).
+            async with open_connection(iterm2, CHANNEL_PROBE_TIMEOUT):
+                pass
 
         asyncio.run(_go())
     except Exception as exc:  # pylint: disable=broad-exception-caught

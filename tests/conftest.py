@@ -307,8 +307,8 @@ def _guard_real_spawns(
 def _guard_real_iterm_api(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     """Refuse the iTerm Python API: ``snapshot._connect`` and ``iterm2.Connection.async_create``.
 
-    ``terminal`` builds its connections inline (no ``_connect`` helper), as does
-    ``iterm_api.ItermLink``, so the shared ``iterm2.Connection.async_create`` is stubbed.
+    ``terminal`` connects through ``iterm_conn.open_connection`` and ``iterm_api.ItermLink``
+    inline, so the shared ``iterm2.Connection.async_create`` is stubbed.
     Tests that fake iTerm (their own ``sys.modules["iterm2"]``, their own
     ``async_create`` or ``snapshot._connect``) re-override this. Opt out with
     ``@pytest.mark.real_iterm``.
