@@ -59,8 +59,18 @@ MODEL_SECTIONS = ("Current state", "Decisions and constraints", "First steps")
 CODE_SECTIONS = tuple(t for t in REQUIRED_SECTIONS if t not in MODEL_SECTIONS)
 MODEL_MAX_BYTES = 10 * 1024  # D9: the model part (and a legacy document's model share)
 SCRUB_MARGIN = 2 * 1024  # D9: composition budgets MAX_BYTES - this; the scrubber may lengthen
-MAX_LEVEL = 8  # compose cut tiers (0 = nothing cut)
+MAX_LEVEL = 11  # compose cut tiers (0 = nothing cut; 11 = the floor + the hard guard)
+NOTES_DROP_LEVEL = 8  # a legacy document's model notes become a pointer from this tier on
+COMPACT_LEVEL = 9  # held tp items as one line each
+COLLAPSE_LEVEL = 10  # the remaining fact lists become one pointer line each
+FACTS_FLOOR_RESERVE = 2048  # bytes the hard guard keeps free for the model part
 RESTART_LINES = 5  # commits kept per repo from cut tier 2 on
+TITLE_MAX_BYTES = 80  # tier 9: a held item's title
+BLOCKED_MAX_BYTES = 100  # tier 9: a held item's blocked reason
+TAIL_MAX_BYTES = 120  # tier 9: a held item's remaining fields
+FLOOR_LINE_BYTES = 240  # tier 11: one question, You line or warning
+SHELL_LINE_BYTES = 300  # tier 11: one shell restart line
+FLOOR_WRAP_BYTES = 100  # tier 11: the comma-joined held ids wrap at about this width
 
 _HEADING_RE = re.compile(r"^##[ \t]+(.+?)[ \t]*$", re.MULTILINE)
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -371,8 +381,92 @@ def _box_ids(boxes: Any) -> list[str]:
     return out
 
 
+def _clip(text: str, limit: int, suffix: str = "…") -> str:
+    """*text* cut to at most *limit* UTF-8 bytes, ending in *suffix* when it was cut."""
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    room = max(0, limit - len(suffix.encode("utf-8")))
+    return text.encode("utf-8")[:room].decode("utf-8", "ignore").rstrip() + suffix
+
+
+#: Tier 9 renders these fields of a held item itself (or drops them).
+_TP_COMPACT_FIELDS = (
+    "tp_id",
+    "title",
+    "state",
+    "repo",
+    "tp_priority",
+    "plan_path",
+    "boxes_done",
+    "boxes_total",
+    "next_open_boxes",
+    "decisions",
+    "blocked",
+    "hold",
+    "assumptions",
+    "start_condition",
+    "awaiting_pickup",
+    "candidate",
+    "open_follow_ups",
+    "headless_runs",
+)
+
+
+def _released(f: dict[str, Any]) -> bool:
+    """A ``tp release``d item: the record stays, claim, drive and role are all off."""
+    hold = f.get("hold")
+    return isinstance(hold, dict) and not any(hold.get(k) for k in ("claim", "drive", "role"))
+
+
+def _tp_compact(f: dict[str, Any]) -> str:
+    """Tier 9: one line per held item (title, plan, blocked kind + reason, assumptions)."""
+    line = f"- tp#{f.get('tp_id')} [{_one(f.get('state'))}] "
+    line += _clip(_one(f.get("title")), TITLE_MAX_BYTES)
+    where = [x for x in (_one(f.get("repo")), _one(f.get("tp_priority"))) if x]
+    if where:
+        line += f" ({', '.join(where)})"
+    if _released(f):
+        line += " — record only"
+    if f.get("plan_path"):
+        line += f"; plan {_one(f['plan_path'])} {f.get('boxes_done')}/{f.get('boxes_total')}"
+    blocked = f.get("blocked")
+    if isinstance(blocked, dict) and blocked:
+        reason = _clip(_one(blocked.get("reason")), BLOCKED_MAX_BYTES)
+        line += f"; blocked: {_one(blocked.get('kind')) or '?'} — {reason}"
+    elif blocked:
+        line += f"; blocked: {_clip(_one(blocked), BLOCKED_MAX_BYTES)}"
+    assumptions = f.get("assumptions")
+    if assumptions:
+        count = len(assumptions) if isinstance(assumptions, list) else 1
+        line += f"; {count} assumption{'s' if count != 1 else ''}"
+    rest, blocks = _kv(f, _TP_COMPACT_FIELDS)
+    tail = ", ".join(x for x in (rest, *(b.strip() for b in blocks)) if x)
+    if tail:
+        line += "; " + _clip(" ".join(tail.split()), TAIL_MAX_BYTES)
+    return line
+
+
+def _tp_floor(held: list[dict[str, Any]]) -> list[str]:
+    """Tier 11: the held ids with their state, comma-joined and wrapped (never dropped)."""
+    out: list[str] = []
+    line = ""
+    for f in held:
+        tag = f"{_one(f.get('state'))}, record" if _released(f) else _one(f.get("state"))
+        entry = f"tp#{f.get('tp_id')} [{tag}]"
+        if line and len(f"{line}, {entry}".encode()) > FLOOR_WRAP_BYTES:
+            out.append(f"- {line}")
+            line = entry
+        else:
+            line = f"{line}, {entry}" if line else entry
+    if line:
+        out.append(f"- {line}")
+    return out
+
+
 def _tp_item(fact: dict[str, Any], level: int) -> list[str]:
     f = fact["fields"]
+    if level >= COMPACT_LEVEL:
+        return [_tp_compact(f)]
     head = f"- tp#{f.get('tp_id')} [{_one(f.get('state'))}] {_one(f.get('title'))}"
     if f.get("repo") or f.get("tp_priority"):
         head += f" ({_one(f.get('repo'))}, {_one(f.get('tp_priority'))})"
@@ -416,6 +510,18 @@ def _agent(fact: dict[str, Any], level: int, ref: str) -> list[str]:
     ]
     relaunch = f.get("relaunch")
     finished = f.get("status") == "finished" and not relaunch
+    if level >= MAX_LEVEL:  # the floor: id, status and spec path; the rest is one pointer
+        out[0] = _clip(out[0], TAIL_MAX_BYTES)
+        if f.get("spec_path"):
+            out.append(f"  spec_path: {_one(f['spec_path'])}")
+        if relaunch or f.get("result_inline"):
+            what = (
+                "relaunch + result"
+                if relaunch and f.get("result_inline")
+                else ("relaunch (Agent call)" if relaunch else "result")
+            )
+            out.append(f"  {what}: ccc continue-session facts {ref} -k {fact['key']}")
+        return out
     if finished and level >= 3:  # history, already delivered: a pointer, not the result
         if f.get("result_path"):
             out.append(f"  result_path: {_one(f['result_path'])}")
@@ -438,24 +544,27 @@ def _agent(fact: dict[str, Any], level: int, ref: str) -> list[str]:
     return out
 
 
-def _shell_lines(shells: list[dict[str, Any]]) -> list[str]:
+def _shell_lines(shells: list[dict[str, Any]], level: int = 0) -> list[str]:
     declared = [s for s in shells if s["fields"].get("classification") == "declared-restartable"]
     other = [s for s in shells if s not in declared]
+    limit = SHELL_LINE_BYTES if level >= MAX_LEVEL else 0
     out: list[str] = []
     for fact in declared:
         f = fact["fields"]
-        out.append(
+        line = (
             f"- restart: `{_one(f.get('command'))}` (cwd {_one(f.get('cwd'))}) — "
             f"{_one(f.get('reason'))}"
         )
+        out.append(_clip(line, limit) if limit else line)
     if other:
         out.append("Decide before restarting (evidence only — judge each; do not blindly re-run):")
         for fact in other:
             f = fact["fields"]
-            out.append(
+            line = (
                 f"- `{_one(f.get('command'))}` (cwd {_one(f.get('cwd'))}); "
                 f"{_one(f.get('description'))}; {_one(f.get('reason'))}"
             )
+            out.append(_clip(line, limit) if limit else line)
     return out
 
 
@@ -498,12 +607,44 @@ def _render_plain(  # pylint: disable=too-many-return-statements
     return _generic(fact)
 
 
+def _floor_cut(lines: list[str], key: str) -> list[str]:
+    """Tier 11: a question / You line / warning as ONE line of at most 240 bytes."""
+    line = " ".join(" ".join(lines).split())
+    return [_clip(line, FLOOR_LINE_BYTES, f" … -k {key}")]
+
+
 _COLLAPSE = {  # kind -> (cut tier, noun)
     "tp_filed": (1, "filed (not held) items"),
     "wait": (6, "waits/schedules"),
     "schedule": (6, "waits/schedules"),
     "schedule_unknown": (6, "waits/schedules"),
 }
+#: Tier 10: these lists become ONE bare pointer line each (no ``-k``: a list is no one key).
+_COLLAPSE_LISTS = {
+    "worktree": "worktrees",
+    "plan": "plans",
+    "commit": "commits",
+    "owned_file": "owned files",
+    "keepwarm": "keep-warm entries",
+    "keepwarm_timer": "keep-warm timers",
+    "relay_latch": "relay latches",
+    "headless_run": "headless runs",
+    "todo_list": "to-do lists",
+    "debate_pause": "debate pauses",
+    "cron": "cron jobs",
+    "await": "awaits",
+    "subgoal": "sub-goals",
+}
+#: The never-cut sections: the hard guard cuts them last, and never their protected lines.
+_PROTECTED_SECTIONS = (
+    "Goal and done-condition",
+    "tp ownership",
+    "Background restarts",
+    "Open items and questions",
+    "Subagent continuations",
+)
+_FLOOR_KINDS = ("question", "you_line", "warning")
+Rendered = dict[str, list[tuple[str, bool]]]  # section -> [(line, protected)]
 
 
 def _section_of(fact: dict[str, Any]) -> str:
@@ -511,18 +652,81 @@ def _section_of(fact: dict[str, Any]) -> str:
     return title if title in REQUIRED_SECTIONS else "Open items and questions"
 
 
-def _facts_lines(  # pylint: disable=too-many-locals,too-many-branches
-    doc: dict[str, Any], level: int, ref: str
+def _protected(kind: str, line: str) -> bool:
+    """Is *line* (rendered from a fact of *kind*) on the never-cut list?"""
+    if kind in ("tp_item", "shell", *_FLOOR_KINDS):
+        return True
+    if kind == "session":
+        return line.startswith(("AIM ", "Deadline:"))
+    if kind == "agent":
+        return line.startswith("- agent ") or line.lstrip().startswith("spec_path:")
+    return False
+
+
+def _size_of(rendered: Rendered) -> int:
+    return sum(len(ln.encode("utf-8")) + 1 for lines in rendered.values() for ln, _ in lines)
+
+
+def _guard_facts(rendered: Rendered, cap: int, ref: str) -> Rendered:
+    """The hard guard of tier 11: cut unprotected lines until the facts fit *cap*.
+
+    Sections are cut from the last to the first, the never-cut sections last; a protected
+    line (AIM, held ids, questions, ``You`` lines, warnings, restarts, agent ids and spec
+    paths) is never cut. Each cut section ends with ONE ``… cut — full:`` pointer.
+    """
+    total = _size_of(rendered)
+    if total <= cap:
+        return rendered
+    pointer = f"… cut — full: ccc continue-session facts {ref}"
+    order = [t for t in reversed(REQUIRED_SECTIONS) if t not in _PROTECTED_SECTIONS]
+    order += [t for t in reversed(REQUIRED_SECTIONS) if t in _PROTECTED_SECTIONS]
+    out = dict(rendered)
+    for title in order:
+        if total <= cap:
+            break
+        lines = out[title]
+        free = [i for i, (_ln, keep) in enumerate(lines) if not keep]
+        if not free:
+            continue
+        total += len(pointer.encode("utf-8")) + 1
+        dropped: set[int] = set()
+        for i in reversed(free):
+            if total <= cap:
+                break
+            dropped.add(i)
+            total -= len(lines[i][0].encode("utf-8")) + 1
+        out[title] = [x for i, x in enumerate(lines) if i not in dropped] + [(pointer, False)]
+    return out
+
+
+def _facts_lines(
+    doc: dict[str, Any], level: int, ref: str, facts_cap: int | None = None
 ) -> dict[str, list[str]]:
-    """Render the snapshot's facts per section at cut tier *level* (code facts only)."""
+    """Render the snapshot's facts per section at cut tier *level* (code facts only).
+
+    At :data:`MAX_LEVEL` a *facts_cap* (bytes) applies the hard guard (:func:`_guard_facts`).
+    """
+    rendered = _render_facts(doc, level, ref)
+    if facts_cap is not None and level >= MAX_LEVEL:
+        rendered = _guard_facts(rendered, facts_cap, ref)
+    return {title: [ln for ln, _keep in lines] for title, lines in rendered.items()}
+
+
+def _render_facts(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+    doc: dict[str, Any], level: int, ref: str
+) -> Rendered:
+    """:func:`_facts_lines` with a never-cut flag on every line (the guard's input)."""
     facts = sorted(
         enumerate(doc.get("facts", [])), key=lambda p: (int(p[1].get("priority", 4)), p[0])
     )
-    out: dict[str, list[str]] = {t: [] for t in REQUIRED_SECTIONS}
+    out: Rendered = {t: [] for t in REQUIRED_SECTIONS}
     shells: list[dict[str, Any]] = []
     cut: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    lists: dict[tuple[str, str], int] = {}  # tier 10: (section, noun) -> count
     commits: dict[str, int] = {}
     owned: dict[str, int] = {}
+    held: list[dict[str, Any]] = []
+    tp_slot: tuple[str, int] | None = None  # where the first held item sits
     seen_msgs = {_one(f["fields"].get("message")) for _, f in facts if f.get("kind") == "warning"}
     for _, fact in facts:
         kind, section = fact["kind"], _section_of(fact)
@@ -533,6 +737,16 @@ def _facts_lines(  # pylint: disable=too-many-locals,too-many-branches
         if collapse and level >= collapse[0]:
             cut.setdefault((section, collapse[1]), []).append(fact)
             continue
+        if kind in _COLLAPSE_LISTS and level >= COLLAPSE_LEVEL:
+            bucket = (section, _COLLAPSE_LISTS[kind])
+            lists[bucket] = lists.get(bucket, 0) + 1
+            continue
+        if kind == "tp_item" and level >= COMPACT_LEVEL:
+            if tp_slot is None:
+                tp_slot = (section, len(out[section]))
+            held.append(fact["fields"])
+            if level >= MAX_LEVEL:
+                continue
         if (
             kind == "agent"
             and level >= 5
@@ -553,19 +767,40 @@ def _facts_lines(  # pylint: disable=too-many-locals,too-many-branches
                 cut.setdefault((section, "owned files"), []).append(fact)
                 continue
         lines = _render_plain(fact, level, ref)
-        if kind == "tp_filed" and not any(ln.startswith("Filed, not held") for ln in out[section]):
-            out[section].append("Filed, not held (this session filed them; accept moves nothing):")
-        out[section] += lines
+        if level >= MAX_LEVEL and kind in _FLOOR_KINDS:
+            lines = _floor_cut(lines, str(fact["key"]))
+        if kind == "tp_filed" and not any(
+            ln.startswith("Filed, not held") for ln, _keep in out[section]
+        ):
+            out[section].append(
+                ("Filed, not held (this session filed them; accept moves nothing):", False)
+            )
+        out[section] += [(ln, _protected(kind, ln)) for ln in lines]
     for text in doc.get("warnings", []):
         if _one(text) not in seen_msgs:
-            out["Open items and questions"].append(f"⚠ {_one(text)}")
+            line = f"⚠ {_one(text)}"
+            if level >= MAX_LEVEL:
+                line = _clip(line, FLOOR_LINE_BYTES)
+            out["Open items and questions"].append((line, True))
     if shells:
-        out["Background restarts"] += _shell_lines(shells)
+        out["Background restarts"] += [(ln, True) for ln in _shell_lines(shells, level)]
+    if tp_slot is not None:
+        section, index = tp_slot
+        if level >= MAX_LEVEL:
+            out[section][index:index] = [(ln, True) for ln in _tp_floor(held)]
+        out[section].append(
+            (f"… per-item fields cut — full: ccc continue-session facts {ref}", False)
+        )
     for (section, noun), gone in cut.items():
         first = gone[0]["key"]
         out[section].append(
-            f"… {len(gone)} more {noun} — full: ccc continue-session facts {ref} -k {first}"
+            (
+                f"… {len(gone)} more {noun} — full: ccc continue-session facts {ref} -k {first}",
+                False,
+            )
         )
+    for (section, noun), count in lists.items():
+        out[section].append((f"… {count} {noun} — full: ccc continue-session facts {ref}", False))
     return out
 
 
@@ -576,17 +811,25 @@ def compose(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     level: int = 0,
     ref: str = "<source-session>",
     model_path: str = "<stored original>",
+    facts_cap: int | None = None,
 ) -> Composed:
     """The handoff text from the model part and the facts snapshot *doc* (D1, D9, D16).
 
     Code facts come first in every section; *level* (0..:data:`MAX_LEVEL`) is the cut tier
     (``compose_checked`` raises it until the text fits *budget*, then once more if the
-    scrubber lengthens it). Never cut: the AIM, held tp ids with state, open questions,
-    background restarts, agent spec paths and warning lines. Every inserted free text goes
-    through :func:`escape_headings`; the three model sections are copied verbatim.
+    scrubber lengthens it). Tiers 1-8 cut lowest priority first (filed items, older commits,
+    box texts, result capsules, worktree details, waits, owned files; legacy model notes at
+    :data:`NOTES_DROP_LEVEL`); tier 9 renders each held item as one line; tier 10 collapses
+    the remaining fact lists into one pointer each; tier 11 is the floor (held items as
+    ``tp#N [state]``, questions / ``You`` lines / warnings ≤ 240 B, restarts ≤ 300 B, agents
+    as id + status + spec path) and, with *facts_cap*, the hard guard that cuts the other
+    lines until the facts fit. Never cut: the AIM, held tp ids with state, open questions,
+    ``You`` lines, background restarts, agent spec paths and warning lines. Every inserted
+    free text goes through :func:`escape_headings`; the three model sections are copied
+    verbatim.
     """
     bodies, notes, cut = _fit_model(model, model_path)
-    lines = _facts_lines(doc, level, ref)
+    lines = _facts_lines(doc, level, ref, facts_cap)
     parts = ["# Handoff", ""]
     for title in REQUIRED_SECTIONS:
         parts += [f"## {title}", ""]
@@ -597,12 +840,12 @@ def compose(  # pylint: disable=too-many-arguments,too-many-positional-arguments
             parts += [bodies[title].strip(), ""]
         note = notes.get(title)
         if note:
-            if level >= MAX_LEVEL:
+            if level >= NOTES_DROP_LEVEL:
                 parts += ["### Model notes", "", f"… cut — full original: {model_path}", ""]
                 cut = True
             else:
                 parts += ["### Model notes", "", escape_headings(note), ""]
-        if not code and title not in bodies and not (note and level < MAX_LEVEL):
+        if not code and title not in bodies and not (note and level < NOTES_DROP_LEVEL):
             parts += ["none", ""]
     return Composed("\n".join(parts).rstrip("\n") + "\n", level, cut)
 

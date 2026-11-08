@@ -1946,10 +1946,22 @@ final agent results attached, the providers re-run), freezes them into a snapsho
 `<app_home>/handoffs/facts/<source_sid>/<snap12>.json` (id = sha256 of its canonical JSON,
 stored in the transfer's `facts_snapshot` column) and composes: code facts first in every
 section, budgeted against 24 KB minus a 2 KB scrub margin, truncated lowest priority first
-(filed-not-held items, older commits, box texts, result capsules, worktree details,
-waits/schedules, owned files, legacy model notes), each cut ending with `… N more — full: ccc
-continue-session facts <transfer> #/<key>`. Never cut: the AIM, held tracker ids with their
-state, open questions and `You` lines, background restarts, agent spec paths, warning lines.
+in cut tiers 1-8 (filed-not-held items, older commits, box texts, result capsules, worktree
+details, waits/schedules, owned files, legacy model notes), each cut ending with `… N more —
+full: ccc continue-session facts <transfer> -k <key>`. Tier 9 renders each held item as ONE
+line (`tp#N [state] <title ≤ 80 B> (repo, prio); plan <path> d/t; blocked: <kind> — <reason
+≤ 100 B>; <n> assumptions`; hold, start condition, pickup and follow-ups dropped; a released
+item stays, tagged `record only`). Tier 10 collapses the remaining lists (worktrees, plans,
+commits, owned files, keep-warm entries and timers, relay latches, headless runs, to-do
+lists, debate pauses, cron jobs, awaits, sub-goals) into one `… N <noun> — full: ccc
+continue-session facts <transfer>` line each (no `-k`: a list is not one key). Tier 11 is the
+floor: held items become comma-joined `tp#N [state]` (`tp#N [state, record]` when
+released), each question, `You` line and warning is cut to 240 B ending in `… -k <key>`,
+each restart line to 300 B, and each agent keeps id, status and spec path (its relaunch call
+and result become one `-k <key>` pointer). A hard guard then cuts the remaining unprotected
+lines, last section first and the never-cut sections last, until the facts leave 2 KB for
+the model part. Never cut: the AIM, held tracker ids with their state, open questions and
+`You` lines, background restarts, agent spec paths, warning lines.
 Subagent specs are copied verbatim from the agent transcript into
 `handoffs/facts/<sid>/agents/<id>.spec.md`, their last result into `<id>.result.md` (≤ 3 KB
 inline). Pending shells are classified, never inferred: `declared-restartable` (a
