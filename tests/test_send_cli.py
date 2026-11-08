@@ -172,6 +172,40 @@ def test_stale_or_foreign_tab_is_refused(
     assert not world.texts
 
 
+def test_unreadable_ps_table_refuses_ps_unreadable_after_one_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # tp#1868: a timed-out ps (read_ps answers {}) is unknown, never "no tty" (stale_tab);
+    # tab_for refuses at once, so a send under load pays ONE full table read.
+    world = _idle_world(tmp_path, ps_queue=[{}])
+    rc, env, _err = _send(world, monkeypatch, capsys, "hello")
+    assert rc == 1 and env is not None and env["error"]["code"] == "ps_unreadable"
+    assert "timed out" in env["error"]["message"]
+    assert not world.texts and world.ps_reads == 1
+
+
+def test_ps_unreadable_at_the_revalidation_is_not_stale_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = _idle_world(tmp_path)
+    world.ps_queue = [world.table(), {}]  # tab_for reads fine, revalidate's read times out
+    rc, env, _err = _send(world, monkeypatch, capsys, "hello")
+    assert rc == 1 and env is not None and env["error"]["code"] == "ps_unreadable"
+    assert not world.texts and world.ps_reads == 2
+
+
+def test_readable_table_without_the_pid_stays_stale_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A READABLE table that lacks the pid is a definite answer: stale_tab as before.
+    world = _idle_world(tmp_path)
+    without = {pid: row for pid, row in world.table().items() if pid == 1}
+    world.ps_queue = [without, without]
+    rc, env, _err = _send(world, monkeypatch, capsys, "hello")
+    assert rc == 1 and env is not None and env["error"]["code"] == "stale_tab"
+    assert "no tty for pid" in env["error"]["message"] and not world.texts
+
+
 def test_child_of_claude_in_the_foreground_is_accepted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

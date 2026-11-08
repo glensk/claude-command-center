@@ -252,7 +252,28 @@ def test_paste_guard_held_notice_wording() -> None:
     for code in HELD_CODES - {"input_not_empty"}:
         assert "28" not in held_notice(code, data, "s1")
     assert held_notice("no_tab", None, "s1") == "no iTerm tab is known for s1"
-    assert HELD_CODES == {"user_active", "input_not_empty", "input_not_ready", "tab_locked"}
+    assert held_notice("ps_unreadable", data, "s1") == (
+        "the process table could not be read (machine under load) for s1"
+    )
+    assert HELD_CODES == {
+        "user_active",
+        "input_not_empty",
+        "input_not_ready",
+        "tab_locked",
+        "ps_unreadable",
+    }
+
+
+@pytest.mark.parametrize("unreadable_read", [0, 1])
+def test_paste_guard_unreadable_ps_is_held_not_stale_tab(
+    tmp_path: Path, unreadable_read: int
+) -> None:
+    # tp#1868: a timed-out ps (tab_for's read or revalidate's) holds; nothing typed.
+    world = _world(tmp_path)
+    world.ps_queue = [world.table()] * unreadable_read + [{}]
+    result = _paste(world)
+    assert result.refusal == "ps_unreadable" and result.held
+    assert not world.texts and world.screen_reads == 0
 
 
 def test_paste_guard_draft_text_appears_nowhere(tmp_path: Path) -> None:

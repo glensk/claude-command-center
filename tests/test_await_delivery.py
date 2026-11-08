@@ -737,6 +737,19 @@ def test_paste_guard_await_typing_user_holds_without_reading_the_box(
     assert (group.state, group.delivery_attempts) == ("fired", 0) and not world.texts
 
 
+def test_paste_guard_await_unreadable_ps_holds_without_an_attempt(wenv: dict[str, Any]) -> None:
+    # tp#1868: a timed-out ps under load is a hold, not a failed typer (stale_tab before).
+    world: World = wenv["world"]
+    gid = _fired(wenv)
+    world.ps_queue = [{}]
+    report, _notes = _guarded(wenv)
+    group = _group(wenv, gid)
+    assert (group.state, group.delivery_attempts, group.held_since) == ("fired", 0, NOW + 200)
+    assert report.held == [f"{gid}:ps_unreadable"] and not world.texts
+    report, _notes = _guarded(wenv, now=NOW + 260)
+    assert report.delivered == [gid] and len(world.texts) == 1
+
+
 def test_paste_guard_await_held_ten_minutes_notifies_once_and_delivery_still_notifies(
     wenv: dict[str, Any],
 ) -> None:

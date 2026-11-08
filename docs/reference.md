@@ -1335,8 +1335,8 @@ cwd is trusted for that account; and the session has no pending attached prompt
   (tp#1867): inside the per-tab lock the tab is revalidated, then the typing guard and the
   input-box guard run, and only then is the outbox row claimed. When the input box holds
   text (`input_not_empty`), you are typing in that tab (`user_active`), the box is not
-  drawn yet (`input_not_ready`) or another delivery holds the tab (`tab_locked`), the
-  delivery is HELD: nothing is typed, no attempt is used, the group stays `fired`, the
+  drawn yet (`input_not_ready`), another delivery holds the tab (`tab_locked`) or `ps`
+  failed or timed out under load (`ps_unreadable`, tp#1868), the delivery is HELD: nothing is typed, no attempt is used, the group stays `fired`, the
   pass lists it under `held` (`ccc await -r -j`: `"held": ["7:input_not_empty"]`) and the
   next pass retries. A group held for 10 minutes sends ONE notification ("await group 7
   held: the input box of 1a2b3c4d holds 12 chars — clear it in that tab"; a count, never
@@ -3881,6 +3881,7 @@ details never carry message text. Code: `invalid_cursor` (a negative cursor, exi
 | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------- | :---------------------------------------------------------------------- |
 | `not_running` / `background` / `account_conflict`                                                                                                                       | send, answer          | not live / a background session (read-only) / live under two accounts   |
 | `no_tab` / `stale_tab` / `foreground_not_claude` / `iterm_unreachable`                                                                                                  | send, answer          | the tab cannot be proven to be this session's claude                    |
+| `ps_unreadable`                                                                                                                                                         | send, answer          | `ps` failed or timed out (load) — nothing typed; retry                  |
 | `tab_locked`                                                                                                                                                            | send, answer          | another send/answer to this tab is running (3 s wait)                   |
 | `user_active`                                                                                                                                                           | send, answer          | the user is typing into the focused target tab — retry later            |
 | `input_not_empty`                                                                                                                                                       | send                  | the input box already holds text — nothing typed; clear it              |

@@ -243,6 +243,20 @@ def test_not_waiting_is_refused(
     assert code == 1 and env is not None and env["error"]["code"] == "not_waiting"
 
 
+def test_unreadable_ps_table_is_ps_unreadable_and_types_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # tp#1868: a timed-out ps is unknown (retry), never stale_tab.
+    world = _world(tmp_path, [COLOUR], ps_queue=[{}])
+    payload = {
+        "decision_id": _decision_id(world),
+        "answers": [{"question_index": 0, "option_indices": [0]}],
+    }
+    code, env, _err = _answer(world, monkeypatch, capsys, payload)
+    assert code == 1 and env is not None and env["error"]["code"] == "ps_unreadable"
+    assert not world.keys
+
+
 @pytest.mark.parametrize("registered", [True, False])
 def test_background_session_is_refused(
     tmp_path: Path,

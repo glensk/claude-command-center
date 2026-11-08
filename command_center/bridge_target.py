@@ -278,17 +278,34 @@ def resolve_tab(
     return (stored or None), False
 
 
+def ps_unreadable(session_id: str) -> BridgeError:
+    """The refusal for a ``ps`` table that could not be read (failed or timed out, tp#1868).
+
+    Unknown, never "the tab is not this session's" (``stale_tab``): a pasting path holds
+    and retries (:data:`HELD_CODES`); nothing was typed.
+    """
+    return BridgeError(
+        "ps_unreadable",
+        f"session {session_id}: the process table could not be read (ps failed or timed out)",
+    )
+
+
 def tab_for(deps: BridgeDeps, live: LiveSession) -> str:
     """The iTerm session id to type into for *live* (refusal when none can be found).
 
     The stored id when its tab is on the session's tty; else the one tab on that tty
     (:func:`resolve_tab`). When iTerm cannot be listed the stored id is returned as is —
-    :func:`revalidate` checks it right before the first byte either way.
+    :func:`revalidate` checks it right before the first byte either way. An unreadable
+    ``ps`` table refuses at once with ``ps_unreadable`` (tp#1868): a second full read in
+    :func:`revalidate` would double the wait under load.
     """
     with deps.store() as store:
         row = store.get(live.session_id)
     stored = (row.iterm_session_id or "").strip() if row is not None else ""
-    tab, _validated = resolve_tab(stored or None, live.pid, deps.ps_table(), deps.panes())
+    table = deps.ps_table()
+    if not table:
+        raise ps_unreadable(live.session_id)
+    tab, _validated = resolve_tab(stored or None, live.pid, table, deps.panes())
     if not tab:
         raise BridgeError("no_tab", f"no iTerm tab is known for session {live.session_id}")
     return tab
@@ -311,7 +328,9 @@ def revalidate(deps: BridgeDeps, session_id: str, iterm_session_id: str) -> Targ
 
     live = require_live(deps, session_id)
     table = deps.ps_table()
-    want = terminal.pid_tty(live.pid, table) if table else ""
+    if not table:  # unknown, not "no tty": ``read_ps`` answers {} on a timeout (tp#1868)
+        raise ps_unreadable(session_id)
+    want = terminal.pid_tty(live.pid, table)
     if not want:
         raise BridgeError("stale_tab", f"session {session_id}: no tty for pid {live.pid}")
     tab = deps.tab_vars(iterm_session_id)
@@ -459,7 +478,9 @@ def tab_lock(deps: BridgeDeps, iterm_session_id: str) -> Iterator[None]:
 
 
 #: Refusals a pasting path HOLDS on: retry later, no attempt consumed, no new-tab fallback.
-HELD_CODES = frozenset({"user_active", "input_not_empty", "input_not_ready", "tab_locked"})
+HELD_CODES = frozenset(
+    {"user_active", "input_not_empty", "input_not_ready", "tab_locked", "ps_unreadable"}
+)
 
 
 @dataclass(frozen=True)
@@ -527,6 +548,7 @@ _HELD_WORDING = {
     "input_not_ready": "the input box of {short} is not drawn yet",
     "tab_locked": "another delivery to {short}'s tab is in progress",
     "no_tab": "no iTerm tab is known for {short}",
+    "ps_unreadable": "the process table could not be read (machine under load) for {short}",
 }
 
 
