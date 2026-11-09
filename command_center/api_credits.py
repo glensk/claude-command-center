@@ -650,9 +650,9 @@ def with_spend(
 # --- Measured balance (balance_json) ----------------------------------------------------
 
 # A reading older than this is not shown as the balance (the estimate takes over and the
-# reading's age is said). The writer is expected to run every 30-60 min, so three hours
+# reading's age is said). The writer runs every 4 h, so nine hours
 # tolerate two missed runs.
-BALANCE_FRESH_SEC = 3 * 3600
+BALANCE_FRESH_SEC = 9 * 3600
 _BALANCE_KIND = "balance_json"
 
 

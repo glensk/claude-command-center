@@ -3266,7 +3266,7 @@ is true when `limit − spent` is smaller than promo remaining + purchased balan
 would stop the org before the money runs out); otherwise the money is the limit and the
 cap row would say nothing. A missing, never-good or stale file
 falls back to the estimate below, and the line says why (`no Console reading`,
-`Console read failed: logged_out`, `Console reading 7h old`); a stale cap draws no row.
+`Console read failed: logged_out`, `Console reading 10h old`); a stale cap draws no row.
 
 **Spend estimate — `claude_api_credit_spend`.** No API exposes the remaining balance, but the
 spend since the grant landed can be read, so the grant minus that spend is shown as an
@@ -3314,7 +3314,7 @@ spent ÷ limit, the renew column its reset, detail `$153.89 of $500 monthly spen
 A reading with a `cloud_credit` adds a row `<name> cloud` (`api cloud`, bar `CLOUD` = used ÷
 granted, the renew column its expiry, detail `$118.40 of $250 left (claude.ai, measured 12m
 ago) · expires 5.11. (in 7d) · one-time Claude Code cloud-session credit`) before the cap
-row; the credit has its own freshness (its `measured_at`, same 3 h rule) and drops out
+row; the credit has its own freshness (its `measured_at`, same 9 h rule) and drops out
 when expired.
 
 Without a spend source the bar reads `API n/a` with no percentage (a `0%` would claim an

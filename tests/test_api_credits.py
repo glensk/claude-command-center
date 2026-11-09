@@ -571,14 +571,14 @@ def test_fresh_reading_replaces_the_estimate_and_the_dates(tmp_path: Path) -> No
 def test_stale_or_failed_reading_falls_back_to_the_estimate(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path / "runs.jsonl", [{"ts": "2026-10-10T10:00:00+02:00", "cost_usd": 50}])
     spend = [f"private=runs_jsonl:{ledger}"]
-    stale = _balance_file(tmp_path / "stale.json", measured_at=NOW - 7 * 3600)
+    stale = _balance_file(tmp_path / "stale.json", measured_at=NOW - 10 * 3600)
     row = api_credits.statuses_with_spend(
         [PRIVATE], [*spend, f"private=balance_json:{stale}"], TODAY, now=NOW
     )[0]
     assert row.get("balance_source") == "n/a" and row["balance_usd"] is None
     assert row["est_left_usd"] == 150 and "cap_used_pct" not in row
-    assert row["balance_note"] == "Console reading 7h old"
-    assert api_credits.describe(row, TODAY).endswith("· Console reading 7h old")
+    assert row["balance_note"] == "Console reading 10h old"
+    assert api_credits.describe(row, TODAY).endswith("· Console reading 10h old")
     # Never read: the status says so, nothing is invented.
     never = _balance_file(tmp_path / "never.json", measured_at=None, status="logged_out")
     row = api_credits.statuses_with_spend(
@@ -589,6 +589,23 @@ def test_stale_or_failed_reading_falls_back_to_the_estimate(tmp_path: Path) -> N
         [PRIVATE], [f"private=balance_json:{tmp_path / 'nope.json'}"], TODAY, now=NOW
     )[0]
     assert missing["balance_note"] == "no Console reading" and missing["balance_usd"] is None
+
+
+def test_balance_reading_fresh_up_to_nine_hours(tmp_path: Path) -> None:
+    """The balance job runs every 4 h: an 8h59m reading is shown, a 9h01m one is stale."""
+    assert api_credits.BALANCE_FRESH_SEC == 9 * 3600
+    ledger = _ledger(tmp_path / "runs.jsonl", [{"ts": "2026-10-10T10:00:00+02:00", "cost_usd": 50}])
+    spend = [f"private=runs_jsonl:{ledger}"]
+    fresh = _balance_file(tmp_path / "fresh.json", measured_at=NOW - 9 * 3600 + 60)
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [*spend, f"private=balance_json:{fresh}"], TODAY, now=NOW
+    )[0]
+    assert row.get("balance_source") != "n/a" and row["balance_usd"] is not None
+    old = _balance_file(tmp_path / "old.json", measured_at=NOW - 9 * 3600 - 60)
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [*spend, f"private=balance_json:{old}"], TODAY, now=NOW
+    )[0]
+    assert row["balance_usd"] is None and row["balance_note"] == "Console reading 9h old"
 
 
 def test_failed_latest_attempt_keeps_a_fresh_reading(tmp_path: Path) -> None:
@@ -659,7 +676,7 @@ def test_card_row_says_why_the_reading_is_not_used(tmp_path: Path) -> None:
     from command_center import usage
 
     ledger = _ledger(tmp_path / "runs.jsonl", [{"ts": "2026-10-10T10:00:00+02:00", "cost_usd": 50}])
-    stale = _balance_file(tmp_path / "s.json", measured_at=NOW - 7 * 3600)
+    stale = _balance_file(tmp_path / "s.json", measured_at=NOW - 10 * 3600)
     row = api_credits.statuses_with_spend(
         [PRIVATE],
         [f"private=runs_jsonl:{ledger}", f"private=balance_json:{stale}"],
@@ -667,7 +684,7 @@ def test_card_row_says_why_the_reading_is_not_used(tmp_path: Path) -> None:
         now=NOW,
     )[0]
     promo, note = usage.render_api_credit_row(row).plain.splitlines()
-    assert promo.startswith("API PROMO: ≈$150 left →26.10.") and note == "Console reading 7h old"
+    assert promo.startswith("API PROMO: ≈$150 left →26.10.") and note == "Console reading 10h old"
 
 
 def test_report_draws_measured_and_cap_rows(
@@ -733,7 +750,7 @@ def test_cloud_credit_present_absent_stale_expired(tmp_path: Path) -> None:
     for over in ({"cloud_credit": None}, {}):
         assert not [k for k in _cloud_row(tmp_path, **over) if k.startswith("cloud_")]
     # Its own reading aged out (the claude.ai read kept failing), or the credit expired.
-    old = dict(CLOUD, measured_at=NOW - 4 * 3600)
+    old = dict(CLOUD, measured_at=NOW - 10 * 3600)
     assert "cloud_left_usd" not in _cloud_row(tmp_path, cloud_credit=old)
     gone = dict(CLOUD, expires_at="2026-10-01T00:00:00Z")
     assert "cloud_left_usd" not in _cloud_row(tmp_path, cloud_credit=gone)
@@ -742,7 +759,7 @@ def test_cloud_credit_present_absent_stale_expired(tmp_path: Path) -> None:
         assert "cloud_left_usd" not in _cloud_row(tmp_path, cloud_credit=bad)
     # A stale Console reading shows no cloud row either (the same freshness rule).
     assert "cloud_left_usd" not in _cloud_row(
-        tmp_path, cloud_credit=CLOUD, measured_at=NOW - 7 * 3600
+        tmp_path, cloud_credit=CLOUD, measured_at=NOW - 10 * 3600
     )
 
 
