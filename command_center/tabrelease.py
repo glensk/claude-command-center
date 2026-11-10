@@ -19,6 +19,11 @@ Two proofs are needed per row:
 ``closed_at``, ``last_response_at`` and file mtimes are deliberately not used for the
 grace: they say when the process went, not when the tab did. Releasing never marks a row
 ``done`` — the row stays and is resumable; the next hook event in a new tab re-stamps it.
+
+The badge cache gets the same treatment (:func:`sweep_badges`): a ``<slug>`` file whose
+UUID is gone past the grace and that no alive-or-unknown row protects is removed with its
+``.dir`` sidecar, under the ``.lock`` :func:`tabsymbol.assign` takes, so its palette slot is
+free again instead of ``assign`` stealing a live tab's badge.
 """
 
 from __future__ import annotations
@@ -35,8 +40,10 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 # pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import contextlib
+import fcntl
 import json
 import os
+import re
 import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
@@ -198,3 +205,116 @@ def iter_uuids(rows: Iterable[TabbedRow]) -> Iterator[str]:
         uuid = uuid_of(row.iterm_session_id)
         if uuid:
             yield uuid
+
+
+def protected_uuids(
+    rows: Iterable[TabbedRow], live_ids: set[str], alive: Callable[[int], bool] | None = None
+) -> set[str]:
+    """Tab UUIDs some row still guards: its process is alive, live or unknown (not dead)."""
+    probe = alive or _default_alive
+    return {
+        uuid_of(row.iterm_session_id)
+        for row in rows
+        if uuid_of(row.iterm_session_id) and not pid_dead(row, live_ids, probe)
+    }
+
+
+# ---- badge cache sweep ---------------------------------------------------------------
+# A badge file is ``<slug>`` = ``$ITERM_SESSION_ID`` with ``:`` → ``_`` (``w0t1p0_UUID``),
+# with an optional ``<slug>.dir`` folder sidecar (see :mod:`tabsymbol`). Only names of
+# exactly that shape are ever touched; ``.lock`` and anything else is left alone.
+_BADGE_NAME_RE = re.compile(
+    r"^[^_./]+_([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$"
+)
+
+
+def badge_uuid(name: str) -> str | None:
+    """The upper-cased tab UUID of badge file *name*, or ``None`` for any other name."""
+    match = _BADGE_NAME_RE.match(name)
+    return match.group(1).upper() if match else None
+
+
+def badge_files(directory: Path) -> dict[str, list[Path]]:
+    """``tab UUID → badge files`` in *directory* (sidecars, ``.lock`` and odd names skipped)."""
+    out: dict[str, list[Path]] = {}
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return out
+    for entry in entries:
+        uuid = badge_uuid(entry.name)
+        if uuid is None or not entry.is_file():
+            continue
+        out.setdefault(uuid, []).append(entry)
+    return out
+
+
+def stale_badge_files(
+    directory: Path,
+    missing: dict[str, int],
+    protected: set[str],
+    now_ms: int,
+    grace_ms: int = TAB_GONE_GRACE_MS,
+) -> list[Path]:
+    """The badge files whose tab is gone past the grace and that no row protects.
+
+    A file of a present pane (never in *missing*, row or not) is never listed.
+    """
+    guarded = {uuid_of(u) for u in protected}
+    return [
+        path
+        for uuid, paths in badge_files(directory).items()
+        if uuid not in guarded and is_gone(uuid, missing, now_ms, grace_ms)
+        for path in paths
+    ]
+
+
+@contextlib.contextmanager
+def _badge_lock(directory: Path) -> Iterator[bool]:
+    """Hold the badge cache's ``.lock`` (the one ``tabsymbol.assign`` takes); yields success."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        lock = (directory / ".lock").open("w", encoding="utf-8")
+    except OSError:
+        yield False
+        return
+    with lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def sweep_badges(
+    directory: Path,
+    missing: dict[str, int],
+    protected: set[str],
+    now_ms: int,
+    grace_ms: int = TAB_GONE_GRACE_MS,
+) -> list[Path]:
+    """Unlink every :func:`stale_badge_files` entry (and its ``.dir``) under the ``.lock``.
+
+    The stale set is recomputed while the lock is held, so a concurrent ``assign`` never
+    sees a half-swept cache. Returns the badge files removed; no lock → nothing removed.
+    """
+    if not directory.is_dir():
+        return []
+    removed: list[Path] = []
+    with _badge_lock(directory) as locked:
+        if not locked:
+            return []
+        for path in stale_badge_files(directory, missing, protected, now_ms, grace_ms):
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed.append(path)
+            with contextlib.suppress(OSError):
+                path.with_name(path.name + ".dir").unlink()
+    return removed
