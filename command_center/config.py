@@ -86,6 +86,9 @@ DEFAULTS: dict[str, object] = {
     "switch_intercept": True,
     "aim_on_main_line": False,  # `ccc aim --format bar` prefixes "🎯 <aim>" (status-line row 1)
     "aim_in_tab_title": False,  # iTerm tab title "<badge> <AIM words>" (no tp#N run)
+    # UserPromptSubmit asks Claude Code to name the session (its peer name) after the
+    # user's AIM words (hook `sessionTitle`; INERT: off, renames running sessions)
+    "peer_name_from_aim": False,
     "aim_score": True,  # NN% AIM-specificity chip + daemon backfill (False = none)
     "aim_score_threshold": 50,  # AIM specificity < this (0..100) => vague: red tag
     "aim_score_on_set": False,  # refine the AIM score with an LLM call when the AIM changes (INERT)
@@ -527,6 +530,7 @@ INERT_DEFAULT_KEYS: tuple[str, ...] = (
     "verify_subgoals_llm",  # no per-sub-goal LLM verification (already off; kept for the contract)
     "handoff_hooks",  # no command runs on a continue-session accept ([] = falsy)
     "handoff_facts",  # no fact provider runs on a continue-session collect/start ([] = falsy)
+    "peer_name_from_aim",  # no running Claude session is renamed (hook sessionTitle)
 )
 
 
@@ -1127,6 +1131,7 @@ class Config:
     switch_intercept: bool = True
     aim_on_main_line: bool = False
     aim_in_tab_title: bool = False
+    peer_name_from_aim: bool = False
     aim_score: bool = True
     aim_score_threshold: int = 50
     aim_score_on_set: bool = False

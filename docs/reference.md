@@ -1635,6 +1635,20 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   intercept, and kept converged by the daemon / TUI title sync. A session name (`ccc name`)
   is never shown (ccc generates no names, tp#1808); an AIM of ids only falls back to
   `<badge> <folder leaf>`.
+- **`peer_name_from_aim = true`** (default off, inert) names each interactive session — its
+  Claude Code peer name, the one `ListAgents` / `SendMessage` use — after the AIM the user
+  set: the `UserPromptSubmit` hook adds `sessionTitle` to its one `hookSpecificOutput`, and
+  Claude Code renames the session (registry `nameSource: "hook"`). The name is the AIM words
+  as typed (the latest `user` AIM, its trailing `: tp#N` run dropped; spaces, `:` and `#`
+  kept), clipped at a word boundary to 40 chars; a name another live session already holds
+  gets `2`, `3` … (Claude Code applies a hook title verbatim: it neither clips nor
+  dedupes). A hand-set `ccc name` wins; staff-bound sessions keep their names; nothing is
+  sent when the name equals the current `session_title`. Never on `SessionStart` (a title
+  set there does not reach the peer name). The rename lands with the next prompt Claude Code
+  hands the hook: a blocked `/aim` (`aim_intercept_block = true`) and a bash-mode `!aim` do
+  not apply it, the following prompt does. A relayed successor takes the name on its first
+  prompt (suffixed while the retiring source still holds it, unsuffixed once it closed).
+  `ccc sessions -j` reports the current name as `peer_name`.
 - **Staff sessions are named after their agent.** A session bound to an llm-staff role
   (`staff adopt -a <agent>`: tp's `session-role/<sid>` binding) gets the agent.yaml
   `tab_name` (default: the agent id) as its WHOLE tab title, prefixed by its `symbol` (`<symbol> <tab_name>`, no badge, no AIM); its

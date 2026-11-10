@@ -14,6 +14,9 @@ automatic namer and its ``session_names`` key are gone, tp#1808). What stays:
   an older ccc that adopted hand-typed tab titles) and unfreezes the tab title.
 * **Tab-title bookkeeping** for :mod:`command_center.tabsymbol`: what ccc last wrote
   (:func:`record_title_write`) and whether a tab is frozen (:func:`titles_frozen`).
+* **Peer names that follow the AIM** (opt-in ``peer_name_from_aim``, tp#1989): the name
+  the ``UserPromptSubmit`` hook asks Claude Code for as ``sessionTitle``
+  (:func:`peer_name`, :func:`dedupe_peer_name`). ccc still writes no registry file.
 
 Import-light: the store and config layers are imported lazily where used.
 """
@@ -39,7 +42,9 @@ import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .models import Session
+    from collections.abc import Callable, Iterable
+
+    from .models import LiveSession, Session
     from .store import Store
 
 ORIGIN_MANUAL = "manual"
@@ -137,6 +142,106 @@ def reset_name(store: Store, session_id: str) -> str | None:
     )
     store.conn.commit()
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Peer names that follow the AIM (tp#1989, opt-in ``peer_name_from_aim``)
+# --------------------------------------------------------------------------- #
+#: Longest peer name ccc asks Claude Code for. Claude Code applies a hook ``sessionTitle``
+#: verbatim (no clipping, no dedupe), so ccc clips and dedupes itself.
+PEER_NAME_MAX = 40
+
+#: What a clipped name must not end in (a cut ``fix decide: x`` reads ``fix decide``).
+_PEER_TRAIL = " \t:;,.—–-·"
+
+
+def aim_peer_words(aim: str | None) -> str:
+    """The naming rule: the words of *aim* a peer name is made of (``""`` when none).
+
+    The AIM's first line without its trailing ``: tp#N, #M`` run (:func:`aimtext.words`),
+    words as typed (spaces, ``:`` and ``#`` survive). The ONE place the rule lives, so a
+    different rule (e.g. an AIM improver) replaces this function alone.
+    """
+    from . import aimtext
+
+    return aimtext.words(aim)
+
+
+def clip_words(text: str, width: int) -> str:
+    """*text* cut to at most *width* chars at a word boundary (a single long word is cut)."""
+    if len(text) <= width:
+        return text
+    cut = text[: width + 1].rfind(" ")
+    head = text[:cut] if cut > 0 else text[:width]
+    return head.rstrip(_PEER_TRAIL) or text[:width].rstrip()
+
+
+def peer_name(session: Session | None, user_aim: str | None) -> str | None:
+    """The peer name *session* should carry, or ``None`` (Claude Code keeps its own name).
+
+    A hand-set ``canonical_name`` (origin ``manual``) wins; else the naming rule
+    (:func:`aim_peer_words`) over *user_aim* (:meth:`Store.latest_user_aim`'s text),
+    control characters removed, whitespace collapsed, clipped at a word boundary to
+    :data:`PEER_NAME_MAX`. Empty → ``None``.
+    """
+    if session is not None and session.canonical_name_origin == ORIGIN_MANUAL:
+        manual = clean_manual(session.canonical_name or "")
+        if manual:
+            return clip_words(manual, PEER_NAME_MAX)
+    # Whitespace (a tab too) becomes one space BEFORE the control characters go.
+    spaced = _WS_RE.sub(" ", aim_peer_words(user_aim))
+    text = _WS_RE.sub(" ", _CONTROL_RE.sub("", spaced)).strip()
+    if not text:
+        return None
+    return clip_words(text, PEER_NAME_MAX) or None
+
+
+def dedupe_peer_name(name: str, taken: set[str]) -> str:
+    """*name*, or ``<name> 2``, ``<name> 3`` … — the first one no other live peer holds.
+
+    *taken* holds the other live sessions' peer names, casefolded. The base is re-clipped
+    so a suffixed name still fits :data:`PEER_NAME_MAX`.
+    """
+    if _key(name) not in taken:
+        return name
+    for n in range(2, 100):
+        suffix = f" {n}"
+        candidate = clip_words(name, PEER_NAME_MAX - len(suffix)) + suffix
+        if _key(candidate) not in taken:
+            return candidate
+    return name
+
+
+def hook_title(
+    store: Store,
+    session_id: str,
+    current: str | None,
+    live_sessions: Callable[[], Iterable[LiveSession]],
+) -> str | None:
+    """The ``sessionTitle`` a ``UserPromptSubmit`` hook asks for, or ``None``.
+
+    *current* is the hook input's ``session_title`` (``None`` when absent: the registry
+    name is compared instead). Nothing when the name equals it — checked before the
+    registry is read, so a settled session pays one small query. *live_sessions* is read
+    only then: the session must be a registered interactive one, and the name is deduped
+    against every OTHER live session's peer name.
+    """
+    latest = store.latest_user_aim(session_id)
+    base = peer_name(store.get(session_id), latest[0] if latest else None)
+    if not base or base == current:
+        return None
+    lives = list(live_sessions())
+    own = next((ls for ls in lives if ls.session_id == session_id), None)
+    if own is None or own.kind != "interactive":
+        return None
+    taken = {
+        _key(name)
+        for ls in lives
+        if ls.session_id != session_id and ls.alive and (name := (ls.name or "").strip())
+    }
+    wanted = dedupe_peer_name(base, taken)
+    held = current if current is not None else (own.name or "").strip()
+    return None if wanted == held else wanted
 
 
 # --------------------------------------------------------------------------- #

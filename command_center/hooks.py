@@ -13,7 +13,7 @@ Claude ask for (or be reminded of) the session's done-condition.
 """
 
 # Handlers lazy-import heavier deps (adapter, spawn) to keep the hook path light.
-# pylint: disable=import-outside-toplevel
+# pylint: disable=import-outside-toplevel,too-many-lines
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from typing import Any
 
 from . import closelog, config, switch_intercept
@@ -39,6 +40,7 @@ from .models import (
     AIM_SET_BY_LAUNCH,
     AIM_SET_BY_USER,
     CloseClaim,
+    LiveSession,
     Session,
     SwitchClaim,
     closed_status,
@@ -291,13 +293,57 @@ def _todos_from_payload(payload: dict[str, Any]) -> list[tuple[str, str]] | None
 
 
 def _emit_context(event: str, context: str | None) -> None:
-    if not context:
+    _emit_output(event, context)
+
+
+def _emit_output(event: str, context: str | None, title: str | None = None) -> None:
+    """Print the ONE ``hookSpecificOutput`` document (a hook prints one JSON document).
+
+    *title* adds ``sessionTitle`` (tp#1989: Claude Code renames the session, its peer name,
+    on ``UserPromptSubmit``). Nothing to say → nothing printed.
+    """
+    if not context and not title:
         return
-    json.dump(
-        {"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}},
-        sys.stdout,
-    )
+    spec: dict[str, str] = {"hookEventName": event}
+    if context:
+        spec["additionalContext"] = context
+    if title:
+        spec["sessionTitle"] = title
+    json.dump({"hookSpecificOutput": spec}, sys.stdout)
     sys.stdout.write("\n")
+
+
+def _live_sessions() -> list[LiveSession]:
+    """Every registry entry :class:`ClaudeAdapter` discovers. Fail-open: error → ``[]``."""
+    try:
+        from .adapters.claude import ClaudeAdapter
+
+        return list(ClaudeAdapter().discover())
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return []
+
+
+def _peer_title(store: Store, sid: str, payload: dict[str, Any], cfg: config.Config) -> str | None:
+    """The ``sessionTitle`` this ``UserPromptSubmit`` asks for, or ``None`` (tp#1989).
+
+    Only with ``peer_name_from_aim`` on, never for a staff-bound session (staff peers keep
+    their names) nor ccc's own ``claude -p``; the rest is :func:`session_names.hook_title`
+    (interactive only, deduped, nothing when equal to the input's ``session_title``).
+    Never ``SessionStart``: a title set there never reaches the registry name and makes a
+    later equal ``UserPromptSubmit`` title a no-op. Fail-open: any error → ``None``.
+    """
+    if not cfg.peer_name_from_aim or os.environ.get("CCC_INTERNAL"):
+        return None
+    try:
+        from . import session_names, staffrole
+
+        if staffrole.adopted_role(sid):
+            return None
+        given = payload.get("session_title")
+        current = given.strip() if isinstance(given, str) else None
+        return session_names.hook_title(store, sid, current, _live_sessions)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return None
 
 
 def _lock_path(payload: dict[str, Any]) -> str | None:
@@ -457,12 +503,22 @@ _AIM_REPLY = (
 )
 
 
-def _intercept_aim(store: Store, sid: str, current: str | None, text: str, block: bool) -> None:
+def _intercept_aim(
+    store: Store,
+    sid: str,
+    current: str | None,
+    text: str,
+    block: bool,
+    *,
+    peer: Callable[[], str | None] | None = None,
+) -> None:
     """Set (``/aim <text>``) or show (bare ``/aim``) the AIM at once.
 
     *block* swallows the prompt (no model turn, but Claude Code labels it "operation blocked
     by hook"); otherwise the prompt goes on with a one-line-reply instruction, so the status
-    line redraws immediately and no error-looking label appears.
+    line redraws immediately and no error-looking label appears. *peer* (asked after the
+    AIM is set) gives the ``sessionTitle`` of the non-blocking reply; a blocked prompt never
+    applies one (tp#1989 canary), so its rename lands with the next prompt.
     """
     if text:
         store.set_aim(sid, text, set_by=AIM_SET_BY_USER)
@@ -476,7 +532,8 @@ def _intercept_aim(store: Store, sid: str, current: str | None, text: str, block
         _block_prompt(f"🎯 /aim: {aim}")
     else:
         store.update_fields(sid, aim_prev=None)  # announced right now: end the transition
-        _emit_context("UserPromptSubmit", _AIM_REPLY.format(aim=aim))
+        title = peer() if peer is not None else None
+        _emit_output("UserPromptSubmit", _AIM_REPLY.format(aim=aim), title)
 
 
 _HANDED_OFF_REASON = (
@@ -512,7 +569,14 @@ def _handle_user_prompt_turn(payload: dict[str, Any], sid: str, cfg: config.Conf
         if cfg.aim_intercept and aim_text is not None:
             # `/aim <text>` is set here, programmatically. Blocking costs no model turn (the
             # agent is not told); non-blocking costs one tiny reply.
-            _intercept_aim(store, sid, session.aim, aim_text, cfg.aim_intercept_block)
+            _intercept_aim(
+                store,
+                sid,
+                session.aim,
+                aim_text,
+                cfg.aim_intercept_block,
+                peer=lambda: _peer_title(store, sid, payload, cfg),
+            )
             return 0
         count = session.prompt_count + 1
         # A new turn begins: clear any "AIM just changed" marker so the status-line
@@ -565,8 +629,7 @@ def _handle_user_prompt_turn(payload: dict[str, Any], sid: str, cfg: config.Conf
         parked = _parked_prompt_notice(session)
         if parked:
             parts.append(parked)
-        if parts:
-            _emit_context("UserPromptSubmit", "\n\n".join(parts))
+        _emit_output("UserPromptSubmit", "\n\n".join(parts), _peer_title(store, sid, payload, cfg))
     return 0
 
 

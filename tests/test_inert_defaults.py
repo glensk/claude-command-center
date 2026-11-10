@@ -43,6 +43,7 @@ _EXPECTED_INERT_KEYS = {  # alphabetical, unlike config's grouped tuple
     "mirror_done",
     "mirror_running",
     "mirror_sessions",
+    "peer_name_from_aim",
     "reap",
     "resume_halted",
     "short_aim",

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from command_center import hooks, switch_intercept
-from command_center.models import Status
+from command_center.models import Status, now_ms
 from command_center.store import Store
 
 
@@ -1092,3 +1092,318 @@ def test_stop_hook_identity_probe_is_impatient(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(terminal, "probe_identity", _probe)
     assert hooks._own_identity("42") == "42:Tue"  # pylint: disable=protected-access
     assert seen == [False]
+
+
+# --------------------------------------------------------------------------- #
+# tp#1989 B4: the peer name follows the AIM (hook `sessionTitle`, opt-in)
+# --------------------------------------------------------------------------- #
+def _live(
+    sid: str = "s1", name: str | None = "repo-ab", *, kind: str = "interactive", alive: bool = True
+) -> Any:
+    from command_center.models import LiveSession  # pylint: disable=import-outside-toplevel
+
+    return LiveSession(pid=1, session_id=sid, cwd="/repo", kind=kind, name=name, alive=alive)
+
+
+def _registry(monkeypatch: pytest.MonkeyPatch, *entries: Any) -> list[int]:
+    """Stub the live registry; returns a call counter."""
+    calls: list[int] = []
+
+    def fake() -> list[Any]:
+        calls.append(1)
+        return list(entries)
+
+    monkeypatch.setattr(hooks, "_live_sessions", fake)
+    return calls
+
+
+def _user_aim(aim: str, sid: str = "s1") -> Store:
+    from command_center.models import AIM_SET_BY_USER  # pylint: disable=import-outside-toplevel
+
+    store = Store()
+    store.ensure(sid, cwd="/repo")
+    store.set_aim(sid, aim, set_by=AIM_SET_BY_USER)
+    store.update_fields(sid, aim_prev=None)
+    return store
+
+
+def _docs(out: str) -> list[dict[str, Any]]:
+    import json  # pylint: disable=import-outside-toplevel
+
+    return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+
+def _prompt(prompt: str = "go on", **extra: Any) -> None:
+    hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo", "prompt": prompt, **extra})
+
+
+@pytest.fixture()
+def peer_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``peer_name_from_aim`` on, in an isolated ``CLAUDE_HOME``, no staff binding."""
+    from command_center import staffrole  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_SESSION_AIM", raising=False)
+    monkeypatch.delenv("CCC_INTERNAL", raising=False)
+    monkeypatch.setattr(staffrole, "adopted_role", lambda _sid: None)
+    _set_cfg(peer_name_from_aim=True)
+
+
+@pytest.mark.usefixtures("home")
+def test_peer_name_off_by_default_output_is_byte_identical(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json  # pylint: disable=import-outside-toplevel
+
+    def boom() -> list[Any]:
+        raise AssertionError("the registry is not read while the flag is off")
+
+    monkeypatch.setattr(hooks, "_live_sessions", boom)
+    _user_aim("decide relay information")
+    capsys.readouterr()
+    _prompt(session_title="repo-ab")
+    assert capsys.readouterr().out == ""  # a quiet turn prints nothing, as before
+    Store().update_fields("s1", aim="")  # no AIM → the nudge, in today's exact form
+    Store().update_fields("s1", prompt_count=0)
+    _prompt(session_title="repo-ab")
+    out = capsys.readouterr().out
+    context = _docs(out)[0]["hookSpecificOutput"]["additionalContext"]
+    expected = {
+        "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}
+    }
+    assert out == json.dumps(expected) + "\n"
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_on_quiet_turn_emits_only_the_title(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _registry(monkeypatch, _live())
+    _user_aim("decide relay information: tp#1989")
+    capsys.readouterr()
+    _prompt(session_title="repo-ab")
+    assert _docs(capsys.readouterr().out) == [
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "sessionTitle": "decide relay information",
+            }
+        }
+    ]
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_on_one_document_with_context_and_title(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _registry(monkeypatch, _live())
+    store = _user_aim("ship the thing")
+    store.update_fields("s1", prompt="parked text", fire_at=now_ms() + 3_600_000)
+    capsys.readouterr()
+    _prompt(session_title="repo-ab")
+    docs = _docs(capsys.readouterr().out)
+    assert len(docs) == 1
+    spec = docs[0]["hookSpecificOutput"]
+    assert "parked text" in spec["additionalContext"] and spec["sessionTitle"] == "ship the thing"
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_not_sent_when_it_equals_the_session_title(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _registry(monkeypatch, _live(name="ship the thing"))
+    _user_aim("ship the thing")
+    capsys.readouterr()
+    _prompt(session_title="ship the thing")
+    assert capsys.readouterr().out == ""
+    assert not calls  # the equal-title check needs no registry read
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_without_session_title_compares_the_registry_name(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _registry(monkeypatch, _live(name="ship the thing"))
+    _user_aim("ship the thing")
+    capsys.readouterr()
+    _prompt()
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_manual_canonical_name_wins(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _registry(monkeypatch, _live())
+    store = _user_aim("ship the thing")
+    store.update_fields("s1", canonical_name="my name", canonical_name_origin="manual")
+    capsys.readouterr()
+    _prompt(session_title="repo-ab")
+    assert _docs(capsys.readouterr().out)[0]["hookSpecificOutput"]["sessionTitle"] == "my name"
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_skips_staff_sessions(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import staffrole  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(staffrole, "adopted_role", lambda _sid: "ops")
+    _registry(monkeypatch, _live())
+    _user_aim("ship the thing")
+    capsys.readouterr()
+    _prompt(session_title="repo-ab")
+    assert "sessionTitle" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("entries", [[_live(kind="bg")], [], [_live(sid="other")]])
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_skips_background_and_unregistered_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    entries: list[Any],
+) -> None:
+    _registry(monkeypatch, *entries)
+    _user_aim("ship the thing")
+    capsys.readouterr()
+    _prompt(session_title="repo-ab")
+    assert "sessionTitle" not in capsys.readouterr().out
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_skipped_inside_ccc_internal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("CCC_INTERNAL", "1")
+    _registry(monkeypatch, _live())
+    _user_aim("ship the thing")
+    capsys.readouterr()
+    _prompt(session_title="repo-ab")
+    assert "sessionTitle" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("aim", ["tp#1989", ""])
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_none_for_an_ids_only_or_empty_aim(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], aim: str
+) -> None:
+    _registry(monkeypatch, _live())
+    Store().ensure("s1", cwd="/repo")
+    if aim:
+        _user_aim(aim)
+    capsys.readouterr()
+    _prompt(session_title="repo-ab")
+    assert "sessionTitle" not in capsys.readouterr().out
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_is_clipped_at_a_word_boundary(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _registry(monkeypatch, _live())
+    _user_aim("decide relay information and a lot more words that go on and on")
+    capsys.readouterr()
+    _prompt(session_title="repo-ab")
+    title = _docs(capsys.readouterr().out)[0]["hookSpecificOutput"]["sessionTitle"]
+    assert title == "decide relay information and a lot more"
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_dedupes_against_other_live_sessions(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _registry(
+        monkeypatch,
+        _live(),
+        _live(sid="a", name="Ship The Thing"),
+        _live(sid="b", name="ship the thing 2"),
+        _live(sid="c", name="ship the thing 3", alive=False),  # a dead entry holds nothing
+    )
+    _user_aim("ship the thing")
+    capsys.readouterr()
+    _prompt(session_title="repo-ab")
+    title = _docs(capsys.readouterr().out)[0]["hookSpecificOutput"]["sessionTitle"]
+    assert title == "ship the thing 3"
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_suffixed_name_is_kept_while_the_other_holds_it(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _registry(monkeypatch, _live(name="ship the thing 2"), _live(sid="a", name="ship the thing"))
+    _user_aim("ship the thing")
+    capsys.readouterr()
+    _prompt(session_title="ship the thing 2")
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_unsuffixed_once_the_other_closed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _registry(monkeypatch, _live(name="ship the thing 2"))
+    _user_aim("ship the thing")
+    capsys.readouterr()
+    _prompt(session_title="ship the thing 2")
+    title = _docs(capsys.readouterr().out)[0]["hookSpecificOutput"]["sessionTitle"]
+    assert title == "ship the thing"
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_blocked_aim_carries_no_title_next_prompt_does(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _registry(monkeypatch, _live())
+    _user_aim("old aim")
+    capsys.readouterr()
+    _prompt("/aim new aim words", session_title="old aim")
+    out = capsys.readouterr().out
+    assert '"decision": "block"' in out and "sessionTitle" not in out
+    _prompt(session_title="old aim")
+    title = _docs(capsys.readouterr().out)[0]["hookSpecificOutput"]["sessionTitle"]
+    assert title == "new aim words"
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_non_blocking_aim_carries_the_new_title(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _set_cfg(aim_intercept_block=False)
+    _registry(monkeypatch, _live())
+    _user_aim("old aim")
+    capsys.readouterr()
+    _prompt("/aim new aim words: tp#7", session_title="old aim")
+    docs = _docs(capsys.readouterr().out)
+    assert len(docs) == 1
+    spec = docs[0]["hookSpecificOutput"]
+    assert "new aim words" in spec["additionalContext"]
+    assert spec["sessionTitle"] == "new aim words"
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_never_on_session_start(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _registry(monkeypatch, _live())
+    _user_aim("ship the thing")
+    capsys.readouterr()
+    hooks.handle_session_start({"session_id": "s1", "cwd": "/repo"})
+    out = capsys.readouterr().out
+    assert "additionalContext" in out and "sessionTitle" not in out
+
+
+@pytest.mark.usefixtures("peer_on")
+def test_peer_name_registry_error_fails_open(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+
+    def boom() -> list[Any]:
+        raise RuntimeError("registry unreadable")
+
+    monkeypatch.setattr(hooks, "_live_sessions", boom)
+    store = _user_aim("ship the thing")
+    store.update_fields("s1", prompt="parked text", fire_at=now_ms() + 3_600_000)
+    capsys.readouterr()
+    _prompt(session_title="repo-ab")
+    docs = _docs(capsys.readouterr().out)
+    assert len(docs) == 1 and "sessionTitle" not in docs[0]["hookSpecificOutput"]
