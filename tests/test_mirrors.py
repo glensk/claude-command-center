@@ -938,6 +938,47 @@ def test_byte_stable_noop_with_prompts_and_aim_history(env: Env) -> None:
     assert path.stat().st_mtime_ns == mtime  # unchanged session → byte-identical no-op
 
 
+@pytest.mark.parametrize("unscrubbed", [False, True])
+def test_bare_carriage_return_prompt_is_a_noop_second_pass(
+    env: Env,  # pylint: disable=redefined-outer-name  # the pytest fixture
+    unscrubbed: bool,
+) -> None:
+    """A prompt holding a bare ``\\r`` must not make every pass rewrite its cards.
+
+    Regression: the disk copy was read in text mode, whose universal newlines turned the
+    ``\\r`` into ``\\n``, so it never matched the vouched bytes and every daemon pass
+    re-wrote the SESSION + DONE cards byte-identically (new inode, Syncthing churn).
+    """
+    env.cfg.mirror_allow_unscrubbed = unscrubbed
+    cwd = str(env.git_base / "home" / "ccc")
+    sid = _running_session(env, "Carriage return prompt")
+    _write_transcript(env, cwd, sid, ["pasted\rterminal\r\noutput"])
+    _mark_done(env, sid)
+
+    r1 = mirrors.run_mirrors(env.store, env.cfg)
+    assert r1.written == [sid, sid]  # its SESSION and DONE cards
+    cards = sorted(env.running.parent.rglob("*.md"))
+    assert len(cards) == 2 and all(b"\r" in p.read_bytes() for p in cards)
+    before = {p: (p.stat().st_ino, p.stat().st_mtime_ns, p.read_bytes()) for p in cards}
+    calls = len(env.scrubber.calls)
+
+    mirrors._VIEW_CACHE.clear()  # pylint: disable=protected-access
+    r2 = mirrors.run_mirrors(env.store, env.cfg)
+    assert r2.changed() == 0 and not r2.vouched and not r2.withheld
+    assert len(env.scrubber.calls) == calls  # no scrubber call for an unchanged card
+    assert before == {p: (p.stat().st_ino, p.stat().st_mtime_ns, p.read_bytes()) for p in cards}
+
+
+def test_read_disk_keeps_carriage_returns(tmp_path: Path) -> None:
+    """``_read_disk`` returns the exact bytes on disk (no newline translation)."""
+    path = tmp_path / "card.md"
+    path.write_bytes(b"a\rb\r\nc\n")
+    assert mirrors._read_disk(str(path)) == "a\rb\r\nc\n"  # pylint: disable=protected-access
+    path.write_bytes(b"\xff\xfe")
+    assert mirrors._read_disk(str(path)) is None  # pylint: disable=protected-access
+    assert mirrors._read_disk(str(tmp_path / "missing.md")) is None  # pylint: disable=protected-access
+
+
 # ---------------------------------------------------------------------------
 # SESSION mirrors (full-conversation tree; PLAN_session-mirrors.md)
 # ---------------------------------------------------------------------------

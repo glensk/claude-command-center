@@ -327,10 +327,17 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 def _read_disk(path: str) -> str | None:
-    """Current text of the mirror at *path*, or ``None`` when it is absent/unreadable."""
+    """Current text of the mirror at *path*, or ``None`` when it is absent/unreadable.
+
+    Read as raw bytes, NOT via :meth:`Path.read_text`: text mode's universal newlines turn
+    a bare ``\\r`` (a pasted prompt can carry one) into ``\\n``, so the disk copy would never
+    equal the bytes :func:`_atomic_write` wrote and every pass would rewrite an unchanged
+    card (byte-identical, new inode — pure sync churn). Undecodable bytes read as ``None``
+    so the card is regenerated rather than crashing the pass.
+    """
     try:
-        return Path(path).read_text(encoding="utf-8")
-    except OSError:
+        return Path(path).read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
         return None
 
 
