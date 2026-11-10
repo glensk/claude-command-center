@@ -779,6 +779,28 @@ def _print_thread_aims(session_id: str, as_json: bool) -> int:
     return 0
 
 
+def _resolve_session_arg(store: Store, given: str) -> str | None:
+    """Resolve an explicit ``-s`` (full id or unique id prefix) to a full session id.
+
+    Uses :func:`store.resolve_job_id`. An id with no session row but with AIM history is
+    kept as given (the full-sid behaviour before tp#2020). On an ambiguous or unknown
+    prefix prints an error to stderr and returns ``None``.
+    """
+    from .store import AmbiguousJobId, resolve_job_id
+
+    try:
+        resolved = resolve_job_id(store, given)
+    except AmbiguousJobId as exc:
+        print(str(exc).replace("ambiguous job id", "ambiguous session id"), file=sys.stderr)
+        return None
+    if resolved is not None:
+        return resolved
+    if store.list_aim_history(given):
+        return given
+    print(f"error: no such session {given}", file=sys.stderr)
+    return None
+
+
 def cmd_aim_history(args: argparse.Namespace) -> int:
     """Print the session's AIM progression — every (re)definition, first to current."""
     from datetime import datetime
@@ -789,6 +811,12 @@ def cmd_aim_history(args: argparse.Namespace) -> int:
     if not session_id:
         print("error: could not resolve a session (pass --session <id>)", file=sys.stderr)
         return 1
+    if args.session:  # an explicit -s may be a unique id prefix (tp#2020)
+        with Store() as store:
+            resolved = _resolve_session_arg(store, session_id)
+        if resolved is None:
+            return 1
+        session_id = resolved
     if getattr(args, "thread", False) or getattr(args, "json", False):
         return _print_thread_aims(session_id, bool(getattr(args, "json", False)))
     with Store() as store:
@@ -6464,7 +6492,9 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_aimhist = sub.add_parser(
         "aim-history", help="show the session's AIM progression (first→current)"
     )
-    p_aimhist.add_argument("-s", "--session", help="session id (default: the current session)")
+    p_aimhist.add_argument(
+        "-s", "--session", help="session id or unique prefix (default: the current session)"
+    )
     p_aimhist.add_argument(
         "-t",
         "--thread",

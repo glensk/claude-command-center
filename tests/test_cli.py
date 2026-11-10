@@ -534,6 +534,36 @@ def test_b5_aim_history_prints_set_by(
     assert "·  tool    tool aim  ← current" in lines[2]
 
 
+def test_tp2020_aim_history_resolves_a_sid_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``aim-history -s <prefix>`` shows the full sid's history; unknown/ambiguous exit 1."""
+    db = _b5_home(tmp_path, monkeypatch)
+    full = "abcd1234-0000-4000-8000-000000000001"
+    with Store(db) as store:
+        for sid in (
+            full,
+            "ffee0001-0000-4000-8000-000000000002",
+            "ffee0002-0000-4000-8000-0000003",
+        ):
+            store.ensure(sid, cwd="/repo")
+        store.set_aim(full, "the real aim", set_by=models.AIM_SET_BY_USER)
+    capsys.readouterr()
+    assert cli.main(["aim-history", "-s", full]) == 0
+    expected = capsys.readouterr().out
+    assert "the real aim" in expected
+    assert cli.main(["aim-history", "-s", "abcd1234"]) == 0
+    assert capsys.readouterr().out == expected
+    assert cli.main(["aim-history", "-s", "abcd1234", "-j"]) == 0
+    assert "the real aim" in capsys.readouterr().out
+    assert cli.main(["aim-history", "-s", "deadbeef"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "" and "no such session deadbeef" in captured.err
+    assert cli.main(["aim-history", "-s", "ffee"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "" and "ambiguous session id ffee" in captured.err
+
+
 def _sg_args(items: list[str], **kw: object) -> argparse.Namespace:
     base: dict[str, object] = {
         "session": "s1",

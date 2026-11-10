@@ -44,7 +44,8 @@ flags. Grouped by what they do:
   revision with its `set_by` stamp: `user`, `launch`, `tool`, `relay`, or `-` for a legacy
   row; see "Who wrote each AIM row" below).
   `ccc aim-history -s ID -t` shows the whole **thread** instead (every continue-session hop,
-  root first; see "Thread AIM history" below), `-j` the same as JSON.
+  root first; see "Thread AIM history" below), `-j` the same as JSON. `-s` takes a full id
+  or a unique id prefix; an unknown or ambiguous prefix is an error (exit 1).
 - `ccc strip-aim-runs` (`-a/--all` | `-s/--session`, `-n/--dry-run`) — one-time cleanup from
   when a tracker still rewrote AIMs: a non-archived, not-done session whose one-line AIM ends
   in a `: tp#N, #M` run with words before it gets the words alone (`Store.rewrite_aim_text`,
