@@ -12,6 +12,9 @@ decided for tp#1986, used by ``ccc sessions -j`` ``user_aim``, ``ccc lineage -j`
    ``by`` and ``at`` unknown, tier ``unstamped``;
 4. else ``None``: a ``tool`` row never answers, however new.
 
+:func:`stamp_row` is the D2 match rule both :meth:`Store.stamp_of` and ``ccc
+restamp-aims`` use: which of a session's rows a carried AIM text came from.
+
 A relay successor's carried anchor (its FIRST row, a copy of the source's first row that
 ``Store.carry_first_aim`` backdates) is skipped: it would otherwise let the root's first
 AIM beat the successor's own newer rows. :meth:`Store.latest_user_aim` stays the HANDOVER
@@ -32,12 +35,13 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 # pylint: disable=wrong-import-position  # the direct-run shim comes first
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
-from .models import AIM_SET_BY_LAUNCH, AIM_SET_BY_RELAY, AIM_SET_BY_USER
+from . import aimtext
+from .models import AIM_SET_BY_LAUNCH, AIM_SET_BY_RELAY, AIM_SET_BY_TOOL, AIM_SET_BY_USER
 
-__all__ = ["TIER_UNSTAMPED", "TIER_USER", "AimRow", "HandAim", "hand_set_aim"]
+__all__ = ["TIER_UNSTAMPED", "TIER_USER", "AimRow", "HandAim", "hand_set_aim", "stamp_row"]
 
 #: The tier of a row a person set (``user``, ``launch``).
 TIER_USER = "user"
@@ -82,3 +86,31 @@ def hand_set_aim(
             if hit:
                 return HandAim(aim, by, int(at or 0) or None, tier)
     return None
+
+
+def stamp_row(aims: Sequence[str], stamps: Sequence[str | None], text: str) -> int | None:
+    """The index of the row whose stamp a carried *text* takes, or ``None`` (no match).
+
+    *aims* / *stamps* are one session's rows oldest first (``created_at``, then ``id``).
+    The match is the newest row holding *text* exactly, else the newest equal to it after
+    :func:`aimtext.words` on both sides. A ``tool`` row that only stripped the trailing id
+    run off the row before it (``ccc strip-aim-runs``) is looked through: the words are
+    that earlier row's, so the earlier row's index is answered (tp#1991).
+    """
+    match = next((i for i in reversed(range(len(aims))) if aims[i] == text), None)
+    key = aimtext.words(text).strip()
+    if match is None and key:
+        match = next(
+            (i for i in reversed(range(len(aims))) if aimtext.words(aims[i]).strip() == key),
+            None,
+        )
+    while match is not None and match > 0:
+        rewrite = (
+            stamps[match] == AIM_SET_BY_TOOL
+            and aims[match - 1] != aims[match]
+            and aimtext.strip_tail_run(aims[match - 1]) == aims[match]
+        )
+        if not rewrite:
+            break
+        match -= 1
+    return match

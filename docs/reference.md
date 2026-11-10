@@ -52,6 +52,22 @@ flags. Grouped by what they do:
   none — the words stay their author's; sub-goals, score, DONE verdict, grading offset and the
   `old ====> new` transition are left as they are). A run-only AIM is listed, not touched.
   Run `-n` first: it prints each session's id, old and new AIM and writes nothing.
+- `ccc restamp-aims` (`-a/--apply`, `-r/--revert LOG`) — one-off backfill of `set_by` for AIM
+  rows written before every writer stamped (internal-style, no TUI key; code: `restamp.py`).
+  Only rows with `set_by IS NULL` change: ccc's own template texts (`continue the work handed
+  over by session <8hex>`, the removed `handoff accepted by session <8hex>`) become `tool`; a
+  relay successor's (`handed_off_from`) row whose text matches a row of its source (the
+  `Store.stamp_of` rule: newest exact match, else equal after `aimtext.words`, a
+  `strip-aim-runs` `tool` row looked through) copies that row's stamp, in chain order (root
+  first) to a fixpoint (≤ 50 passes), so A→B→C stamps B from A, then C from B; only after the
+  fixpoint a row whose matching source row is still unstamped becomes `relay`. Roots,
+  pre-history seeds and unmatched rows keep NULL. Default: a read-only dry run printing counts
+  per `old → new`. `-a` first copies `state.db` with the sqlite backup API to
+  `backups/state-pre-restamp-<YYYYmmdd-HHMMSS>.db` beside it (0600; nothing to change → no
+  backup), then re-plans and writes in one `BEGIN IMMEDIATE` transaction (any failure rolls
+  it back) and writes a 0600 JSON log `(id, old, new)` next to the backup. `-r LOG -a` undoes
+  an apply, only on rows still holding the logged stamp (`-r LOG` alone: dry run).
+  Idempotent: a second `-a` changes 0 rows.
 - `ccc set-next` · `ccc set-blocked` · `ccc set-deadline` · `ccc set-donecheck` — the other job fields.
 - `ccc subgoals "step" …` (`--list`, `--adaptive`, `--merge`) — the progress checklist.
 - `ccc check <N>` (`--uncheck`) · `ccc subgoal-check <N> "<cmd>"` — tick an item / attach a shell predicate.
@@ -2119,6 +2135,9 @@ tp#1991):
 | `tool`   | `ccc set-aim --by tool` or under `AI_AUTOMATED`, a job an automated caller registered, the generic successor AIM, `strip-aim-runs` on an unstamped row |
 | `relay`  | a handoff copy whose source row is unstamped (successor AIM, `/aim (1)` anchor): author unknown                                                        |
 | NULL     | a pre-history seed (an AIM that predates the history table) and rows written before every writer stamped                                               |
+
+`ccc restamp-aims` backfills the old NULL rows of relay successors (and ccc's template rows)
+by these rules; roots and seeds keep NULL.
 
 `relay` and NULL both mean "author unknown"; ccc's own handover reads only `user` rows as the
 user's AIM. The naming rule (`ccc sessions -j` `user_aim`, the hand-set AIM) counts `launch`

@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from . import aimtext, automated, config
-from .aimprov import HandAim
+from .aimprov import HandAim, stamp_row
 from .aimscore import score_aim_lexical
 from .await_store import AWAIT_SCHEMA, AwaitStoreMixin
 from .bridge_store import (
@@ -2855,25 +2855,9 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             (session_id,),
         ).fetchall()
         aims = [str(r["aim"]) for r in rows]
-        match = next((i for i in reversed(range(len(aims))) if aims[i] == text), None)
-        key = aimtext.words(text).strip()
-        if match is None and key:
-            match = next(
-                (i for i in reversed(range(len(aims))) if aimtext.words(aims[i]).strip() == key),
-                None,
-            )
-        while match is not None:
-            stamp = rows[match]["set_by"]
-            rewrite = (
-                stamp == AIM_SET_BY_TOOL
-                and match > 0
-                and aims[match - 1] != aims[match]
-                and aimtext.strip_tail_run(aims[match - 1]) == aims[match]
-            )
-            if not rewrite:
-                return str(stamp) if stamp else None
-            match -= 1
-        return None
+        match = stamp_row(aims, [r["set_by"] for r in rows], text)
+        stamp = rows[match]["set_by"] if match is not None else None
+        return str(stamp) if stamp else None
 
     def count_aim_history(self, session_id: str) -> int:
         """Number of recorded AIM revisions (the current AIM's 1-based running index).

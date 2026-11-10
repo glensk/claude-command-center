@@ -6503,6 +6503,10 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     )
     p_strip.set_defaults(func=cmd_strip_aim_runs)
 
+    from . import restamp  # no store/TUI import: cheap to register
+
+    restamp.add_parser(sub)
+
     p_handoff = sub.add_parser(
         "handoff", help="commit+push a locked file, then release it for a waiting session"
     )
