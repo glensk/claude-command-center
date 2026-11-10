@@ -174,12 +174,19 @@ def _sync_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[Any]:
     monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "badges"))
     monkeypatch.setattr(config, "load_config", lambda: config.Config(aim_in_tab_title=False))
     writes: list[Any] = []
-    monkeypatch.setattr(
-        terminal, "set_session_titles_preserving", lambda c, marker="": writes.append(("plain", c))
-    )
-    monkeypatch.setattr(
-        tab_titles, "set_titles_cas", lambda e, marker="": writes.append(("cas", e))
-    )
+
+    def _plain(cores: dict[str, str], marker: str = "") -> dict[str, str]:
+        del marker
+        writes.append(("plain", cores))
+        return {tab_titles.uuid_of(iid): core for iid, core in cores.items()}  # it landed
+
+    def _cas(entries: dict[str, tuple[str, str]], marker: str = "") -> dict[str, str]:
+        del marker
+        writes.append(("cas", entries))
+        return {tab_titles.uuid_of(iid): core for iid, (_exp, core) in entries.items()}
+
+    monkeypatch.setattr(terminal, "set_session_titles_preserving", _plain)
+    monkeypatch.setattr(tab_titles, "set_titles_cas", _cas)
 
     def _no_read() -> None:
         raise AssertionError("the title sync reads no live titles")

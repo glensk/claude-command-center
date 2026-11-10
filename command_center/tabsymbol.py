@@ -440,32 +440,56 @@ def _write_titles(
     cas: dict[str, tuple[str, str]],
     marker: str,
     bare: dict[str, str] | None = None,
-) -> None:
-    """Dispatch one batch of title writes: unconditional *plain* cores, compare-and-swap *cas*.
+) -> dict[str, str]:
+    """Run one batch of title writes: unconditional *plain* cores, compare-and-swap *cas*.
 
     *bare* holds staff tabs (tp#1366): their whole title is forced to the agent's
     ``tab_name``, which also drops the red wait *marker* the hooks put in front.
+    Returns ``{UUID: name read back after the write}`` for every tab iTerm answered for
+    (empty when it could not be run) — the only evidence :func:`_record_writes` accepts.
     """
     from . import tab_titles, terminal  # lazy: AppleScript layer, not needed on the read path
 
+    seen: dict[str, str] = {}
     if bare:
-        terminal.set_session_titles(bare)
+        seen.update(terminal.set_session_titles(bare) or {})
     if plain:
-        terminal.set_session_titles_preserving(plain, marker=marker)
+        seen.update(terminal.set_session_titles_preserving(plain, marker=marker) or {})
     if cas:
-        tab_titles.set_titles_cas(cas, marker=marker)
+        seen.update(tab_titles.set_titles_cas(cas, marker=marker) or {})
+    return seen
 
 
-def _record_writes(store: object, writes: list[tuple[str, str]]) -> None:
-    """Stamp ``title_written``/``title_generation`` for each ``(session_id, core)`` written.
+def _shows(name: str | None, core: str, marker: str) -> bool:
+    """True when the tab *name* read back is *core*, a leading wait *marker* aside."""
+    if name is None:
+        return False
+    if name == core:
+        return True
+    return bool(marker) and name.startswith(marker) and name[len(marker) :] == core
 
+
+def _record_writes(
+    store: object,
+    writes: list[tuple[str, str, str]],
+    seen: dict[str, str] | None = None,
+    marker: str = "",
+) -> None:
+    """Stamp ``title_written``/``title_generation`` for each ``(session_id, core, iid)``.
+
+    Only a write the read-back *seen* (``{UUID: name}``) confirms is recorded (tp#1988):
+    a compare-and-swap that did not fire, a timed-out or failed osascript leave the row's
+    ``title_written`` as it was, so it never claims a title the tab does not show.
     Tolerates stand-in stores without a connection (unit tests of the title sync).
     """
     if not writes or getattr(store, "conn", None) is None:
         return
-    from . import session_names  # lazy
+    from . import session_names, tab_titles  # lazy
 
-    for session_id, core in writes:
+    names = seen or {}
+    for session_id, core, iid in writes:
+        if not _shows(names.get(tab_titles.uuid_of(iid)), core, marker):
+            continue
         session_names.record_title_write(store, session_id, core)  # type: ignore[arg-type]
 
 
@@ -474,32 +498,37 @@ def _plan_write(
     core: str,
     plain: dict[str, str],
     cas: dict[str, tuple[str, str]],
-    writes: list[tuple[str, str]],
+    writes: list[tuple[str, str, str]],
     *,
     bare: dict[str, str] | None = None,
+    force: bool = False,
 ) -> None:
     """File *session*'s *core* as an unconditional first write or a compare-and-swap.
 
     Once ccc has written a title (``title_written``) every later write is conditional on
     the tab still showing it — a title the user typed meanwhile is never replaced.
+    *force* (an explicit AIM change by the user, tp#1988) writes unconditionally: the
+    new AIM is the user's own intent, so it re-titles even a drifted tab.
     *bare*: when given, a staff session's core (exactly its ``tab_name``) goes there instead
     — written whole, wait marker included, so a staff tab never shows one (tp#1366).
     """
     iid = session.iterm_session_id or ""
     if bare is not None and core == staff_title(session):
         bare[iid] = core
-    elif session.title_written:
+    elif session.title_written and not force:
         cas[iid] = (session.title_written, core)
     else:
         plain[iid] = core
     if core != session.title_written:
-        writes.append((session.session_id, core))
+        writes.append((session.session_id, core, iid))
 
 
 def push_title(session: Session, *, marker: str | None = None) -> None:
     """Re-title ONE session's tab now (after its AIM changed). No-op without a tab/badge.
 
-    Never touches a frozen tab (``session_names.titles_frozen``).
+    The user just changed the AIM (``ccc set-aim`` / ``/aim``), so the write is
+    unconditional (tp#1988): a tab whose title drifted from ``title_written`` is
+    re-titled too. Never touches a frozen tab (``session_names.titles_frozen``).
     """
     iid = session.iterm_session_id
     if session.done or not iid:
@@ -514,16 +543,17 @@ def push_title(session: Session, *, marker: str | None = None) -> None:
     core = _session_core(session, badge, config.load_config())
     plain: dict[str, str] = {}
     cas: dict[str, tuple[str, str]] = {}
-    writes: list[tuple[str, str]] = []
+    writes: list[tuple[str, str, str]] = []
     bare: dict[str, str] = {}
-    _plan_write(session, core, plain, cas, writes, bare=bare)
-    _write_titles(plain, cas, _wait_marker(marker), bare)
+    _plan_write(session, core, plain, cas, writes, bare=bare, force=True)
+    wait_marker = _wait_marker(marker)
+    seen = _write_titles(plain, cas, wait_marker, bare)
     if writes:
         from .store import Store  # lazy: the hook / CLI callers hold no store here
 
         try:
             with Store() as store:
-                _record_writes(store, writes)
+                _record_writes(store, writes, seen, wait_marker)
         except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             pass  # bookkeeping only: the next sync re-records
 
@@ -562,7 +592,7 @@ def seed_title(
     core = _session_core(titled, shown, cfg)  # tp#1366: a staff tab_name, the AIM words, the name
     plain: dict[str, str] = {}
     cas: dict[str, tuple[str, str]] = {}
-    writes: list[tuple[str, str]] = []
+    writes: list[tuple[str, str, str]] = []
     seeded = (
         session
         if session.iterm_session_id == iterm_session_id
@@ -570,9 +600,10 @@ def seed_title(
     )
     bare: dict[str, str] = {}
     _plan_write(seeded, core, plain, cas, writes, bare=bare)
-    _write_titles(plain, cas, _wait_marker(marker), bare)
+    wait_marker = _wait_marker(marker)
+    seen = _write_titles(plain, cas, wait_marker, bare)
     if store is not None:
-        _record_writes(store, writes)
+        _record_writes(store, writes, seen, wait_marker)
     return badge
 
 
@@ -616,17 +647,24 @@ def sync_live(store: Store, *, marker: str | None = None) -> list[str]:
     is never written. Returns the session ids that were badged.
     """
     from . import config, session_names  # lazy
+    from .store import pid_alive  # lazy
 
     cfg = config.load_config()
     owners = tab_owners(s for s in store.list_sessions() if not s.done and s.iterm_session_id)
     wait_marker = _wait_marker(marker)
     plain: dict[str, str] = {}
     cas: dict[str, tuple[str, str]] = {}
-    writes: list[tuple[str, str]] = []
+    writes: list[tuple[str, str, str]] = []
     bare: dict[str, str] = {}
     badged: list[str] = []
     for session in owners:
         if session_names.titles_frozen(session):
+            continue
+        dead = bool(session.last_seen_pid) and not pid_alive(session.last_seen_pid)
+        if dead and not read(session.iterm_session_id):
+            # tp#1988: a row whose process is gone (its tab most likely closed) never
+            # claims a NEW badge. Dozens of such rows outnumbered the palette, so every
+            # pass stole the oldest live tab's badge and all tab titles kept rotating.
             continue
         badge = badge_for(session)
         if not badge:
@@ -634,8 +672,8 @@ def sync_live(store: Store, *, marker: str | None = None) -> list[str]:
         core = _session_core(session, badge, cfg)
         _plan_write(session, core, plain, cas, writes, bare=bare)
         badged.append(session.session_id)
-    _write_titles(plain, cas, wait_marker, bare)
-    _record_writes(store, writes)
+    seen = _write_titles(plain, cas, wait_marker, bare)
+    _record_writes(store, writes, seen, wait_marker)
     return badged
 
 

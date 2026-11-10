@@ -153,19 +153,25 @@ def cas_script_checks(entries: dict[str, tuple[str, str]], marker: str) -> str:
     return "\n".join(blocks)
 
 
-def set_titles_cas(entries: dict[str, tuple[str, str]], marker: str = "🔴 ") -> None:
+def set_titles_cas(
+    entries: dict[str, tuple[str, str]], marker: str = "🔴 "
+) -> dict[str, str] | None:
     """Compare-and-swap tab titles: write *core* only where the body still is *expected*.
 
-    Detached, like every ccc title write (see ``terminal._dispatch_title_script``).
+    Waits for the write and returns the read-back ``{UUID: name}`` (``None`` when iTerm
+    could not be run), so the caller records only a title that is really on the tab.
     """
     if not entries or not shutil.which("osascript"):
-        return
+        return None
     checks = cas_script_checks(entries, marker)
     if not checks:
-        return
+        return None
     from .terminal import (  # pylint: disable=import-outside-toplevel,protected-access
         _as_quote,
         _dispatch_title_script,
     )
 
-    _dispatch_title_script(checks, setup=f'set mlen to (count of "{_as_quote(marker)}")')
+    targets = [uuid_of(iid) for iid in entries if uuid_of(iid)]
+    return _dispatch_title_script(
+        checks, setup=f'set mlen to (count of "{_as_quote(marker)}")', targets=targets
+    )

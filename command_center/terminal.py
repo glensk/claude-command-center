@@ -99,55 +99,107 @@ def _as_quote(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _dispatch_title_script(checks: str, *, setup: str = "") -> None:
-    """Run a fire-and-forget AppleScript that walks every iTerm session and applies
-    *checks* (a body keyed on the per-session ``sid``). *setup* runs once up front."""
+# Field / record separators of the read-back (ASCII unit / record separators).
+_TITLE_FS = "\x1f"
+_TITLE_RS = "\x1e"
+TITLE_WRITE_TIMEOUT_SEC = 4.0
+
+
+def parse_title_readback(raw: str) -> dict[str, str]:
+    """``{UUID: name}`` from a title script's read-back (pure, for tests)."""
+    names: dict[str, str] = {}
+    for record in raw.split(_TITLE_RS):
+        record = record.strip("\r\n")
+        uuid, sep, name = record.partition(_TITLE_FS)
+        if sep and uuid.strip():
+            names[uuid.strip().upper()] = name
+    return names
+
+
+def _dispatch_title_script(
+    checks: str, *, setup: str = "", targets: Sequence[str] = ()
+) -> dict[str, str] | None:
+    """Apply *checks* (a body keyed on ``sid`` / ``s``) to each iTerm session in *targets*.
+
+    The session ids are read in ONE bulk Apple event and only the *targets* (UUIDs) are
+    addressed, then each target's resulting name is read back. Waits for the script
+    (bounded by :data:`TITLE_WRITE_TIMEOUT_SEC`) and returns ``{UUID: name after the
+    write}`` — the caller records a title only once it is really on the tab (tp#1988) —
+    or ``None`` when iTerm could not be run or read. *setup* runs once up front.
+    """
+    wanted = ", ".join(f'"{_as_quote(t)}"' for t in targets)
     script = f"""
     tell application "iTerm2"
         {setup}
-        repeat with w in windows
-            repeat with t in tabs of w
-                repeat with s in sessions of t
-                    set sid to id of s
-                    {checks}
+        set targets to {{{wanted}}}
+        set fs to (character id 31)
+        set rs to (character id 30)
+        set out to ""
+        set ids to id of every session of every tab of every window
+        repeat with w from 1 to count of ids
+            set wi to item w of ids
+            repeat with t from 1 to count of wi
+                set ti to item t of wi
+                repeat with k from 1 to count of ti
+                    set sid to item k of ti
+                    if sid is in targets then
+                        set s to session k of tab t of window w
+                        if (id of s) is sid then
+                            {checks}
+                            set out to out & sid & fs & (name of s) & rs
+                        end if
+                    end if
                 end repeat
             end repeat
         end repeat
+        return out
     end tell
     """
     try:
-        # Detached, output discarded: fire-and-forget so the refresh never stalls.
-        subprocess.Popen(  # noqa: S603  # pylint: disable=consider-using-with
+        proc = subprocess.Popen(  # noqa: S603  # pylint: disable=consider-using-with
             ["osascript", "-e", script],
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            text=True,
         )
     except (OSError, ValueError):
-        pass
+        return None
+    communicate = getattr(proc, "communicate", None)
+    if communicate is None:  # a test's stand-in Popen
+        return None
+    try:
+        out, _err = communicate(timeout=TITLE_WRITE_TIMEOUT_SEC)
+    except (subprocess.SubprocessError, OSError):
+        return None  # still running: it may land, but nothing is recorded as written
+    if getattr(proc, "returncode", 1) != 0:
+        return None
+    return parse_title_readback(out or "")
 
 
-def set_session_titles(titles: dict[str, str]) -> None:
+def set_session_titles(titles: dict[str, str]) -> dict[str, str] | None:
     """Set each iTerm session's tab name (sticky, beats claude/codex OSC titles).
 
     *titles* maps ``$ITERM_SESSION_ID`` (e.g. ``w0t1p0:UUID``) to the desired tab
     title. Setting the name via AppleScript persists where a shell-set OSC title is
-    clobbered by the CLI running in the tab. Only changed names are written, and the
-    whole thing runs detached so it never blocks the TUI. macOS / iTerm2 only.
+    clobbered by the CLI running in the tab. Only changed names are written. Returns
+    the read-back ``{UUID: name}`` (see :func:`_dispatch_title_script`). macOS / iTerm2 only.
     """
     pairs = [(sid.split(":")[-1].strip(), title) for sid, title in titles.items()]
     pairs = [(uuid, title) for uuid, title in pairs if uuid]
     if not pairs or not shutil.which("osascript"):
-        return
+        return None
     checks = "\n".join(
         f'if sid is "{_as_quote(uuid)}" then\n'
         f'  if name of s is not "{_as_quote(title)}" then set name of s to "{_as_quote(title)}"\n'
         f"end if"
         for uuid, title in pairs
     )
-    _dispatch_title_script(checks)
+    return _dispatch_title_script(checks, targets=[uuid for uuid, _ in pairs])
 
 
-def set_session_titles_preserving(cores: dict[str, str], marker: str = "🔴 ") -> None:
+def set_session_titles_preserving(
+    cores: dict[str, str], marker: str = "🔴 "
+) -> dict[str, str] | None:
     """Set each tab's title to ``[marker]<core>``, preserving a leading wait marker.
 
     Like :func:`set_session_titles`, but instead of forcing the whole title it only
@@ -158,12 +210,13 @@ def set_session_titles_preserving(cores: dict[str, str], marker: str = "🔴 ") 
     marker-strip mirrors that script's: count characters, slice past the marker.
 
     *cores* maps ``$ITERM_SESSION_ID`` to the desired core. Idempotent — only tabs
-    whose current core differs are rewritten. Detached. macOS / iTerm2 only.
+    whose current core differs are rewritten. Returns the read-back ``{UUID: name}``.
+    macOS / iTerm2 only.
     """
     pairs = [(sid.split(":")[-1].strip(), core) for sid, core in cores.items()]
     pairs = [(uuid, core) for uuid, core in pairs if uuid]
     if not pairs or not shutil.which("osascript"):
-        return
+        return None
     marker_q = _as_quote(marker)
     checks = "\n".join(
         f'if sid is "{_as_quote(uuid)}" then\n'
@@ -182,7 +235,11 @@ def set_session_titles_preserving(cores: dict[str, str], marker: str = "🔴 ") 
         f"end if"
         for uuid, core in pairs
     )
-    _dispatch_title_script(checks, setup=f'set mlen to (count of "{marker_q}")')
+    return _dispatch_title_script(
+        checks,
+        setup=f'set mlen to (count of "{marker_q}")',
+        targets=[uuid for uuid, _ in pairs],
+    )
 
 
 def reset_tab_color() -> None:

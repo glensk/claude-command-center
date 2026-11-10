@@ -30,9 +30,13 @@ from pathlib import Path
 # shapes (circle / square / diamond / triangle / heart / star) before any shape
 # repeats, the first 8 are 8 well-separated, high-contrast colors before any hue
 # repeats, with only ONE red and ONE warm-yellow up front (the look-alike glyphs
-# — extra reds 🔴🔻🟥, warm 🟨🟧🧡, dark ⚫ — are pushed to the tail). No two
+# — extra reds 🔻🟥, warm 🟨🟧🧡, dark ⚫ — are pushed to the tail). No two
 # adjacent badges share a shape or a color family. Width-2 emoji throughout
 # (uniform cell width); only widely-supported, no-variation-selector glyphs.
+#
+# Never 🔴 (tp#1988): it IS the wait marker ("🔴 ") that set-iterm-wait-marker.sh
+# strips from the front of a title, so a 🔴-badged tab lost its badge on the next
+# prompt and every later compare-and-swap took the badge for the marker.
 #
 # Each entry is (emoji, shape, color-family); ``color`` groups look-alike hues
 # ("warm" = yellow/gold/orange) so the ordering rules are testable.
@@ -57,7 +61,6 @@ BADGES: tuple[tuple[str, str, str], ...] = (
     ("🤍", "heart", "white"),
     ("🟤", "circle", "brown"),
     ("🟦", "square", "blue"),
-    ("🔴", "circle", "red"),
     ("🧡", "heart", "warm"),
     ("⚫", "circle", "black"),
     ("💚", "heart", "green"),

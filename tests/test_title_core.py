@@ -153,7 +153,7 @@ def test_manual_tab_is_never_overwritten(writes: list[Any]) -> None:
     assert writes == []
 
 
-def test_a_later_write_is_compare_and_swap(writes: list[Any]) -> None:
+def test_a_later_sync_write_is_compare_and_swap(writes: list[Any]) -> None:
     session = Session(
         session_id="s",
         cwd="/Users/x/repo",
@@ -161,9 +161,28 @@ def test_a_later_write_is_compare_and_swap(writes: list[Any]) -> None:
         iterm_session_id="w0t0p0:U",
         title_written="🟧 old core",
     )
-    tabsymbol.push_title(session)
+
+    class _Store:
+        def list_sessions(self) -> list[Session]:
+            return [session]
+
+    tabsymbol.sync_live(_Store())  # type: ignore[arg-type]
     [(kind, entries)] = writes
     assert kind == "cas" and entries["w0t0p0:U"][0] == "🟧 old core"
+
+
+def test_an_explicit_aim_change_rewrites_a_drifted_tab(writes: list[Any]) -> None:
+    """tp#1988: `ccc set-aim` / `/aim` re-titles even when the tab drifted from title_written."""
+    session = Session(
+        session_id="s",
+        cwd="/Users/x/repo",
+        aim="decide history improvements",
+        iterm_session_id="w0t0p0:U",
+        title_written="🟫 decide history improvements",  # the tab shows "random" instead
+    )
+    tabsymbol.push_title(session)
+    [(kind, cores)] = writes
+    assert kind == "plain" and cores["w0t0p0:U"].endswith(" decide history improvements")
 
 
 def test_cas_script_only_replaces_the_expected_body() -> None:
@@ -258,7 +277,7 @@ def test_a_staff_tab_is_written_whole_so_no_wait_marker_survives(
     )
     plain: dict[str, str] = {}
     cas: dict[str, tuple[str, str]] = {}
-    writes: list[tuple[str, str]] = []
+    writes: list[tuple[str, str, str]] = []
     bare: dict[str, str] = {}
     for sid, iid in (("staff-sid", "w0t0p0:AAA"), ("other", "w0t1p0:BBB")):
         session = Session(session_id=sid, cwd="/Users/x/repo", iterm_session_id=iid)

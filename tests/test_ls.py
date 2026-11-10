@@ -273,7 +273,7 @@ class _FakeAdapter:
     def __init__(self, path: Path | None) -> None:
         self._path = path
 
-    def transcript_path(
+    def transcript_path(  # pylint: disable=unused-argument  # mirrors the Adapter signature
         self, cwd: str, session_id: str, config_dir: str | None = None
     ) -> Path | None:
         return self._path
@@ -322,6 +322,8 @@ def test_render_row_draft_id_cell_matches_live_id_width() -> None:
     Regression: the draft branch emitted the bare hash, so every column after the id sat 4
     screen columns left of the live rows' — the whole line was misaligned.
     """
+    from command_center import tabsymbol
+
     sid = "01a1f554-c8a7-446f-82d5-a0a0a0000000"
     lines = [
         ls_view._render_row(
@@ -332,7 +334,8 @@ def test_render_row_draft_id_cell_matches_live_id_width() -> None:
         )[0]
         for draft, st in ((False, Status.PARKED), (True, Status.PARKED))
     ]
-    assert len({line.index("🟦") for line in lines}) == 1, lines
+    glyph = tabsymbol.symbol_for_repo("/repo")  # a hash into the palette: never hardcode it
+    assert len({line.index(glyph) for line in lines}) == 1, lines
 
 
 def test_render_row_cache_countdown_is_play_icon_while_working(tmp_path: Path) -> None:
