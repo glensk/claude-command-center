@@ -13,7 +13,12 @@ import pytest
 
 from command_center import cli, continue_session, handoff_doc, inflight
 from command_center.adapters import claude as claude_adapter
-from command_center.models import AIM_SET_BY_TOOL, AIM_SET_BY_USER, LiveSession
+from command_center.models import (
+    AIM_SET_BY_LAUNCH,
+    AIM_SET_BY_TOOL,
+    AIM_SET_BY_USER,
+    LiveSession,
+)
 from command_center.store import Store
 
 FIXTURES = Path(__file__).parent / "fixtures" / "inflight"
@@ -814,6 +819,89 @@ def test_b6_reconcile_successor_aim_is_idempotent(harness: _Harness) -> None:
         assert store.count_aim_history(transfer.target_session) == rows
         successor = store.get(transfer.target_session)
         assert successor is not None and successor.aim == "changed after start"
+
+
+def _successor_stamps(new: str) -> list[tuple[str, str | None]]:
+    with Store() as store:
+        return [(r.aim, r.set_by) for r in store.list_aim_history(new)]
+
+
+def _null_rows() -> int:
+    with Store() as store:
+        row = store.conn.execute(
+            "SELECT COUNT(*) AS n FROM aim_history WHERE set_by IS NULL"
+        ).fetchone()
+    return int(row["n"])
+
+
+@pytest.mark.parametrize(
+    ("revisions", "expected"),
+    [
+        (
+            (("A", AIM_SET_BY_LAUNCH), ("B", AIM_SET_BY_LAUNCH)),
+            [("A", "launch"), ("B", "launch")],
+        ),
+        ((("A", None), ("B", None)), [("A", "relay"), ("B", "relay")]),
+        ((("A", AIM_SET_BY_LAUNCH), ("B", AIM_SET_BY_TOOL)), [("A", "launch"), ("B", "tool")]),
+    ],
+    ids=["launch-only-source", "null-only-source", "tool-current-aim"],
+)
+def test_tp1991_successor_rows_carry_the_source_stamp(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    revisions: tuple[tuple[str, str | None], ...],
+    expected: list[tuple[str, str | None]],
+) -> None:
+    """Without a ``user`` row the successor's rows take the matching source row's stamp;
+    an unstamped source row becomes ``relay`` — never NULL."""
+    _source_aims(*revisions)
+    _, new = _accepted_successor(harness, monkeypatch)
+    assert _successor_stamps(new) == expected
+
+
+def test_tp1991_fallback_aims_are_stamped() -> None:
+    """The recorded ``source_aim`` without a matching row → ``relay``; the generic pointer
+    (ccc's own text) → ``tool``."""
+    seed = continue_session._successor_aim  # pylint: disable=protected-access
+    with Store() as store:
+        store.ensure("bare", cwd="/repo")
+        recorded = SimpleNamespace(source_session="bare", source_aim="recorded at start")
+        assert seed(store, recorded) == ("recorded at start", "relay")
+        pointer = SimpleNamespace(source_session="bare0000-0000", source_aim="")
+        assert seed(store, pointer) == (
+            "continue the work handed over by session bare0000",
+            "tool",
+        )
+
+
+def test_tp1991_accept_resync_keeps_the_resolved_stamp(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The source's AIM changes between ``start`` and ``accept`` (no ``user`` row): the
+    re-synced successor row carries the stamp of the source row holding it."""
+    _source_aims(("A", None))
+    tid = _opened_transfer(harness)
+    with Store() as store:
+        store.set_aim(SID, "changed after start", set_by=AIM_SET_BY_LAUNCH)
+    new = _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    assert _successor_stamps(new) == [("A", "relay"), ("changed after start", "launch")]
+
+
+def test_tp1991_relay_round_trip_writes_no_null_row(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """start → accept → duplicate accept on a stamped source: no NULL row anywhere in
+    ``aim_history``, and the duplicate accept writes no AIM row at all."""
+    assert _null_rows() == 0
+    tid, new = _accepted_successor(harness, monkeypatch)
+    assert _null_rows() == 0
+    rows = _successor_stamps(new)
+    assert rows and all(by for _aim, by in rows)
+    assert cli.main(["continue-session", "accept", tid]) == 0  # the duplicate accept
+    assert _successor_stamps(new) == rows
+    assert _null_rows() == 0
 
 
 @pytest.mark.parametrize(

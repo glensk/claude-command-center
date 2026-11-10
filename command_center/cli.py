@@ -65,6 +65,7 @@ from .inflight import background_work as _background_work
 from .inflight import counter_split as _counter_split
 from .models import (
     AIM_SET_BY_CLI_CHOICES,
+    AIM_SET_BY_TOOL,
     AIM_SET_BY_USER,
     BUSY_RAW_STATUSES,
     DEFAULT_LLM,
@@ -310,8 +311,13 @@ def cmd_set_aim(args: argparse.Namespace) -> int:
             "error: --first cannot empty the first AIM (pass the corrected text)", file=sys.stderr
         )
         return 1
-    # Who wrote this revision (aim_history.set_by, tp#1566): the user unless a tool says so.
-    set_by = getattr(args, "by", None) or AIM_SET_BY_USER
+    # Who wrote this revision (aim_history.set_by, tp#1566): an explicit --by wins; else a
+    # tool under AI_AUTOMATED, else the user (tp#1991).
+    from . import automated  # pylint: disable=import-outside-toplevel
+
+    set_by = getattr(args, "by", None) or (
+        AIM_SET_BY_TOOL if automated.is_automated() else AIM_SET_BY_USER
+    )
     with Store() as store:
         store.ensure(session_id, cwd=os.getcwd())
         if first:
@@ -818,11 +824,12 @@ def cmd_strip_aim_runs(args: argparse.Namespace) -> int:
     and kept rewriting it; a stale run keeps binding a session to an item it released. For
     every non-archived, not-done session (``-a``) or one session (``-s``) whose one-line AIM
     ends in such a run with words before it, the AIM becomes the words alone through
-    ``Store.rewrite_aim_text`` (stamped ``tool``; nothing else reset). A run-only AIM is
+    ``Store.rewrite_aim_text`` (the rewritten row's stamp kept, ``tool`` only when it has
+    none, tp#1991; nothing else reset). A run-only AIM is
     listed and left untouched. ``-n`` prints the plan and writes nothing.
     """
     from . import aimtext
-    from .models import AIM_SET_BY_TOOL, short_id
+    from .models import short_id
 
     dry_run = bool(getattr(args, "dry_run", False))
     with Store() as store:
@@ -6302,9 +6309,10 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "-b",
         "--by",
         choices=AIM_SET_BY_CLI_CHOICES,
-        default=AIM_SET_BY_USER,
-        help="who sets this AIM, stamped on its history row (default: user; a tool "
-        "passes 'tool' so the handover never carries it as the user's AIM)",
+        default=None,
+        help="who sets this AIM, stamped on its history row (default: tool under "
+        "AI_AUTOMATED, else user; a tool passes 'tool' so the handover never carries it "
+        "as the user's AIM)",
     )
     p_set_aim.set_defaults(func=cmd_set_aim)
 

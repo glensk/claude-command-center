@@ -32,7 +32,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
-from . import aimtext, config
+from . import aimtext, automated, config
 from .aimscore import score_aim_lexical
 from .await_store import AWAIT_SCHEMA, AwaitStoreMixin
 from .bridge_store import (
@@ -42,6 +42,7 @@ from .bridge_store import (
     BridgeStoreMixin,
 )
 from .models import (
+    AIM_SET_BY_RELAY,
     AIM_SET_BY_TOOL,
     AIM_SET_BY_USER,
     DEFAULT_LLM,
@@ -1267,7 +1268,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         fire_at: int = 0,
         fire_window: str = "",
         idempotency_key: str = "",
-        aim_set_by: str | None = AIM_SET_BY_USER,
+        aim_set_by: str | None = "",
         registered_by: str = "",
     ) -> Session:
         """Register a *future job*: a draft row holding an AIM + prompt, launched on demand.
@@ -1296,8 +1297,10 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         the atomic claim itself is :meth:`claim_idempotency_key`.
         *registered_by* is ``"automated"`` for a job an ``AI_AUTOMATED`` caller registered
         (never auto-started, see automated.py); ``""`` = the user.
-        *aim_set_by* stamps the AIM's history row (``aim_history.set_by``, tp#1566): job
-        creation is the user's own act, so it defaults to ``user``.
+        *aim_set_by* stamps the AIM's history row (``aim_history.set_by``, tp#1566): an
+        explicit stamp wins; ``""`` (not given) resolves to ``tool`` for an automated
+        registration (``registered_by = automated``, tp#1991) and ``user`` otherwise, since
+        job creation is the user's own act.
         """
         job_type = job_type if job_type in _JOB_TYPES else "claude"
         conflict = no_codex_conflict(job_type, no_codex)
@@ -1324,6 +1327,9 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             registered_by=registered_by.strip(),
             status=Status.PARKED.value,
         )
+        if aim_set_by == "":
+            by_tool = registered_by.strip() == automated.REGISTERED_BY_AUTOMATED
+            aim_set_by = AIM_SET_BY_TOOL if by_tool else AIM_SET_BY_USER
         self.set_aim(session_id, aim, set_by=aim_set_by)
         got = self.get(session_id)
         assert got is not None
@@ -2455,7 +2461,9 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         self.conn.commit()
         return cur.rowcount > 0
 
-    def set_aim(self, session_id: str, aim: str | None, set_by: str | None = None) -> bool:
+    def set_aim(
+        self, session_id: str, aim: str | None, set_by: str | None = AIM_SET_BY_USER
+    ) -> bool:
         """Set the AIM through the single chokepoint; return whether it changed.
 
         On a real change this also (a) drops the auto-derived checklist and resets
@@ -2464,8 +2472,9 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         blank — an async LLM refine can overwrite the score later, and (c) clears the
         stale ``short_aim`` label so the column shows the new full AIM until the cheap
         codex generator (spawned by ``cmd_set_aim``) backfills a fresh short label.
-        *set_by* stamps the new history row (``models.AIM_SET_BY_*``, tp#1566; ``None``
-        leaves it NULL); a seeded pre-history original stays NULL.
+        *set_by* stamps the new history row (``models.AIM_SET_BY_*``, tp#1566; default
+        ``user``, and every production caller passes it explicitly, tp#1991; ``None`` leaves
+        it NULL); a seeded pre-history original stays NULL.
         """
         current = self.get(session_id)
         old = current.aim if current else None
@@ -2492,7 +2501,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         )
         self.clear_auto_subgoals(session_id)
         if new is not None:
-            self._record_aim_history(session_id, old, current, new, set_by)
+            self._record_aim_history(session_id, old, current, new, set_by=set_by)
         return True
 
     def rewrite_aim_text(
@@ -2504,10 +2513,12 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         change the goal, so unlike :meth:`set_aim` nothing derived from the AIM is reset —
         no auto-sub-goal clear, and ``aim_met``, ``context_offset``, ``aim_score``,
         ``aim_prev`` and ``short_aim`` stay as they are. It updates ``sessions.aim`` and
-        appends ONE history row stamped *set_by* (its lexical score, the session's
-        ``short_aim`` carried); a session whose AIM predates history first gets its
-        original seeded (unstamped), as in :meth:`set_aim`. Empty *text* or a session
-        without an AIM is refused (``False``).
+        appends ONE history row (its lexical score, the session's ``short_aim`` carried); a
+        session whose AIM predates history first gets its original seeded (unstamped), as in
+        :meth:`set_aim`. The new row inherits the stamp of the row it rewrites (the newest
+        row holding the current AIM; the words are still that author's, tp#1991); *set_by*
+        only when that row has none. Empty *text* or a session without an AIM is refused
+        (``False``).
         """
         current = self.get(session_id)
         new = (text or "").strip()
@@ -2519,16 +2530,27 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         ).fetchone()
         if has_history is None:
             seeded_at = current.aim_changed_at or current.created_at or 0
-            self._insert_aim_history(
-                session_id, current.aim, current.aim_score, seeded_at, current.short_aim
+            self._insert_aim_history(  # the seed: author unknown, predates history
+                session_id,
+                current.aim,
+                current.aim_score,
+                seeded_at,
+                current.short_aim,
+                set_by=None,
             )
+        rewritten = self.conn.execute(
+            "SELECT set_by FROM aim_history WHERE session_id = ? AND aim = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (session_id, current.aim),
+        ).fetchone()
+        inherited = rewritten["set_by"] if rewritten is not None else None
         self._insert_aim_history(
             session_id,
             new,
             score_aim_lexical(new),
             now_ms(),
             short_aim=current.short_aim,
-            set_by=set_by,
+            set_by=inherited or set_by,
         )
         self.conn.commit()
         return True
@@ -2594,7 +2616,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         the copy is stamped no later than the target's own first row so it sorts first.
         A no-op when the source has no recorded history or the target already starts with
         that AIM (idempotent: a re-run accept, or a source whose AIM never changed). The
-        copy keeps the source row's ``set_by`` stamp (tp#1566).
+        copy keeps the source row's ``set_by`` stamp (tp#1566); an unstamped source row is
+        written ``relay`` (a handoff copied it, its author is unknown; tp#1991).
         """
         query = (
             "SELECT aim, score, short_aim, created_at, set_by FROM aim_history "
@@ -2611,7 +2634,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             int(src["score"]),
             created_at,
             src["short_aim"],
-            set_by=src["set_by"],
+            set_by=src["set_by"] or AIM_SET_BY_RELAY,
         )
         self.conn.commit()
         return True
@@ -2679,14 +2702,16 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         old: str | None,
         current: Session | None,
         new: str,
-        set_by: str | None = None,
+        *,
+        set_by: str | None,
     ) -> None:
         """Append *new* to the AIM history (the full first→current progression).
 
         Seeds the pre-existing original once, so a session whose AIM predates this
         table still shows where it started rather than only its post-upgrade life.
-        Only the appended row carries *set_by*; the seeded original stays NULL (who
-        wrote it is unknown).
+        Only the appended row carries *set_by* (required: no writer leaves it NULL by
+        accident, tp#1991); the seeded original stays NULL (author unknown, it predates
+        history).
         """
         empty = (
             self.conn.execute(
@@ -2698,8 +2723,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             seeded_at = current.aim_changed_at or current.created_at or 0
             # Carry the prior short label onto the seeded original row (set_aim already
             # cleared it off the session) so the original's short-aim shows in history.
-            self._insert_aim_history(
-                session_id, old, current.aim_score, seeded_at, current.short_aim
+            self._insert_aim_history(  # the seed: author unknown, predates history
+                session_id, old, current.aim_score, seeded_at, current.short_aim, set_by=None
             )
         self._insert_aim_history(session_id, new, score_aim_lexical(new), now_ms(), set_by=set_by)
         self.conn.commit()
@@ -2711,8 +2736,10 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         score: int,
         created_at: int,
         short_aim: str | None = None,
-        set_by: str | None = None,
+        *,
+        set_by: str | None,
     ) -> None:
+        """Insert one ``aim_history`` row; *set_by* is required (``None`` only for a seed)."""
         self.conn.execute(
             "INSERT INTO aim_history (session_id, aim, score, short_aim, created_at, set_by) "
             "VALUES (?, ?, ?, ?, ?, ?)",
@@ -2774,7 +2801,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
 
         1. the newest ``aim_history`` row stamped ``user`` (its stamp);
         2. else — legacy history with no ``user`` stamp — the CURRENT ``sessions.aim``
-           with its trailing tp id run stripped (:func:`aimtext.words`), stamp ``None``:
+           with its trailing tp id run stripped (:func:`aimtext.words`), stamped with the
+           matching row's stamp (:meth:`stamp_of`; ``None`` when no row matches, tp#1991):
            keeps an AIM the user set with ``!aim`` before the stamp existed. A multi-line
            AIM is kept whole (``aimtext`` reads only the first line);
         3. else — no current AIM, or one that is only an id run — the FIRST row, the
@@ -2792,7 +2820,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         current = ((session.aim if session else None) or "").strip()
         text = current if "\n" in current else aimtext.words(current).strip()
         if text:
-            return text, None
+            return text, self.stamp_of(session_id, text)
         row = self.conn.execute(
             "SELECT aim, set_by FROM aim_history WHERE session_id = ? "
             "ORDER BY created_at, id LIMIT 1",
@@ -2800,6 +2828,39 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         ).fetchone()
         if row is not None and str(row["aim"]).strip():
             return str(row["aim"]), row["set_by"]
+        return None
+
+    def stamp_of(self, session_id: str, text: str) -> str | None:
+        """The ``set_by`` stamp of *session_id*'s newest row holding *text* (tp#1991).
+
+        Matches exactly, else after :func:`aimtext.words` on both sides; ``None`` when no
+        row matches or the matching row is unstamped. A ``tool`` row that only stripped
+        the trailing id run off the row before it (``ccc strip-aim-runs``) is never the
+        answer: the words are that earlier row's, so its stamp is returned instead.
+        """
+        rows = self.conn.execute(
+            "SELECT aim, set_by FROM aim_history WHERE session_id = ? ORDER BY created_at, id",
+            (session_id,),
+        ).fetchall()
+        aims = [str(r["aim"]) for r in rows]
+        match = next((i for i in reversed(range(len(aims))) if aims[i] == text), None)
+        key = aimtext.words(text).strip()
+        if match is None and key:
+            match = next(
+                (i for i in reversed(range(len(aims))) if aimtext.words(aims[i]).strip() == key),
+                None,
+            )
+        while match is not None:
+            stamp = rows[match]["set_by"]
+            rewrite = (
+                stamp == AIM_SET_BY_TOOL
+                and match > 0
+                and aims[match - 1] != aims[match]
+                and aimtext.strip_tail_run(aims[match - 1]) == aims[match]
+            )
+            if not rewrite:
+                return str(stamp) if stamp else None
+            match -= 1
         return None
 
     def count_aim_history(self, session_id: str) -> int:

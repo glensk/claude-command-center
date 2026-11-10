@@ -247,8 +247,9 @@ class AimRevision:
     score: int  # the AIM's specificity score when it became current (-1 if unknown)
     created_at: int  # epoch ms when this AIM became current (0 = unknown)
     short_aim: str | None = None  # the cheap-model short label for this AIM (None = not generated)
-    # Who wrote this revision (``aim_history.set_by``, tp#1566): one of AIM_SET_BY_USER,
-    # AIM_SET_BY_LAUNCH, AIM_SET_BY_TOOL; None for a row written before the stamp existed.
+    # Who wrote this revision (``aim_history.set_by``, tp#1566, tp#1991): one of
+    # AIM_SET_BY_USER, AIM_SET_BY_LAUNCH, AIM_SET_BY_TOOL, AIM_SET_BY_RELAY; None for a
+    # pre-history seed or a row written before every writer stamped (author unknown).
     set_by: str | None = None
 
 
@@ -257,8 +258,13 @@ class AimRevision:
 AIM_SET_BY_USER = "user"
 #: … the launcher, through ``CLAUDE_SESSION_AIM`` at session start …
 AIM_SET_BY_LAUNCH = "launch"
-#: … or a tool (``ccc set-aim --by tool``, a one-time cleanup). No agent writes the AIM.
+#: … or a tool (``ccc set-aim --by tool`` or under ``AI_AUTOMATED``, an automated job
+#: registration, ccc's own generic successor AIM, a cleanup of an unstamped row) …
 AIM_SET_BY_TOOL = "tool"
+#: … or a handoff that copied an AIM whose first author is unknown (tp#1991): a successor's
+#: carried AIM or ``/aim (1)`` anchor when the source row is unstamped. Readers treat it
+#: like NULL (author unknown), never like ``user``.
+AIM_SET_BY_RELAY = "relay"
 #: The stamps ``ccc set-aim -b/--by`` accepts (``launch`` is the hook's own).
 AIM_SET_BY_CLI_CHOICES = (AIM_SET_BY_USER, AIM_SET_BY_TOOL)
 

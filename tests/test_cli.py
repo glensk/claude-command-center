@@ -459,6 +459,7 @@ def test_set_aim_first_rewrites_revision_one_without_adding_one(
 
 def _b5_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.delenv("AI_AUTOMATED", raising=False)  # set-aim's default stamp reads it
     cfg = _no_score_cfg()
     setattr(cfg, "short_aim", False)  # noqa: B010 — no detached label generator in the test
     monkeypatch.setattr("command_center.cli.config.load_config", lambda: cfg)
@@ -484,13 +485,28 @@ def test_b5_set_aim_by_defaults_to_user_and_accepts_tool(
         cli.main(["set-aim", "x", "--session", "s1", "--by", "launch"])
 
 
+def test_tp1991_set_aim_under_ai_automated_defaults_to_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``AI_AUTOMATED`` and without ``--by`` the row is ``tool``; ``--by user`` wins."""
+    db = _b5_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("AI_AUTOMATED", "1")
+    assert cli.main(["set-aim", "an agent's aim", "--session", "s1"]) == 0
+    assert cli.main(["set-aim", "told it is mine", "--session", "s1", "--by", "user"]) == 0
+    with Store(db) as store:
+        assert [(r.aim, r.set_by) for r in store.list_aim_history("s1")] == [
+            ("an agent's aim", "tool"),
+            ("told it is mine", "user"),
+        ]
+
+
 def test_b5_set_aim_first_passes_by_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``ccc set-aim --first`` stamps the row it rewrites with ``--by`` (default ``user``)."""
     db = _b5_home(tmp_path, monkeypatch)
     with Store(db) as store:
         store.ensure("s1", cwd="/repo")
-        store.set_aim("s1", "launched aim")  # unstamped
-        store.set_aim("s1", "second aim")
+        store.set_aim("s1", "launched aim", set_by=None)  # unstamped
+        store.set_aim("s1", "second aim", set_by=None)
     assert cli.main(["set-aim", "restated", "--session", "s1", "--first"]) == 0
     with Store(db) as store:
         assert store.list_aim_history("s1")[0].set_by == "user"
@@ -507,7 +523,7 @@ def test_b5_aim_history_prints_set_by(
     db = _b5_home(tmp_path, monkeypatch)
     with Store(db) as store:
         store.ensure("s1", cwd="/repo")
-        store.set_aim("s1", "legacy aim")
+        store.set_aim("s1", "legacy aim", set_by=None)
         store.set_aim("s1", "user aim", set_by=models.AIM_SET_BY_USER)
         store.set_aim("s1", "tool aim", set_by=models.AIM_SET_BY_TOOL)
     capsys.readouterr()
@@ -2586,7 +2602,7 @@ def _b9_seed(db: Path) -> None:
             ("eeee5555-archived", "archived thing: tp#10"),
         ):
             store.ensure(sid, cwd="/repo")
-            store.set_aim(sid, aim)
+            store.set_aim(sid, aim, set_by=None)  # the old tracker rewrite: unstamped
         store.set_subgoals("aaaa1111-strip", ["derived step"], source="auto")
         store.update_fields(
             "aaaa1111-strip",

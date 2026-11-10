@@ -36,6 +36,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 # Lazy imports of the heavy view/terminal layers (import-outside-toplevel) keep the demo
 # seed cheap and avoid a cli → demo → views import cycle.
 # pylint: disable=import-outside-toplevel
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import json
 import os
 import shutil
@@ -46,7 +47,7 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from . import config
-from .models import Status, aim_column_first, now_ms
+from .models import AIM_SET_BY_USER, Status, aim_column_first, now_ms
 from .store import Store
 
 _DAY_MS = 86_400_000
@@ -487,7 +488,7 @@ def _seed_session(store: Store, home: Path, spec: DemoSession) -> str:
     cwd = _cwd_for(home, spec.category, spec.repo)
     now = now_ms()
     store.ensure(session_id, cwd=cwd)
-    store.set_aim(session_id, spec.aim)  # records AIM history + a lexical score
+    store.set_aim(session_id, spec.aim, set_by=AIM_SET_BY_USER)  # history + a lexical score
     store.set_short_aim(session_id, spec.short_aim)
     fields: dict[str, object] = {
         "aim_score": spec.aim_score,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import sqlite3
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 
 from command_center.models import (
     AIM_SET_BY_LAUNCH,
+    AIM_SET_BY_RELAY,
     AIM_SET_BY_TOOL,
     AIM_SET_BY_USER,
     DEFAULT_LLM,
@@ -1883,19 +1885,22 @@ def _stamps(store: Store, sid: str) -> list[tuple[str, str | None]]:
     return [(rev.aim, rev.set_by) for rev in store.list_aim_history(sid)]
 
 
-def test_b5_set_aim_stamps_the_new_row_and_defaults_to_null(tmp_path: Path) -> None:
-    """``set_aim`` stamps only the row it appends; no stamp leaves it NULL."""
+def test_b5_set_aim_stamps_the_new_row_and_defaults_to_user(tmp_path: Path) -> None:
+    """``set_aim`` stamps only the row it appends; no stamp is ``user`` (tp#1991), an
+    explicit ``None`` leaves it NULL."""
     with _store(tmp_path) as store:
         store.ensure("s1", cwd="/repo")
         store.set_aim("s1", "first", set_by=AIM_SET_BY_LAUNCH)
         store.set_aim("s1", "second", set_by=AIM_SET_BY_USER)
         store.set_aim("s1", "third", set_by=AIM_SET_BY_TOOL)
         store.set_aim("s1", "fourth")
+        store.set_aim("s1", "fifth", set_by=None)
         assert _stamps(store, "s1") == [
             ("first", "launch"),
             ("second", "user"),
             ("third", "tool"),
-            ("fourth", None),
+            ("fourth", "user"),
+            ("fifth", None),
         ]
 
 
@@ -1915,6 +1920,19 @@ def test_b5_create_draft_stamps_user_by_default(tmp_path: Path) -> None:
         store.create_draft("j2", "/repo", "carried aim", aim_set_by=None)
         assert _stamps(store, "j1") == [("ship the job", "user")]
         assert _stamps(store, "j2") == [("carried aim", None)]
+
+
+def test_tp1991_create_draft_stamps_an_automated_registration_tool(tmp_path: Path) -> None:
+    """An automated registration stamps ``tool``; an explicit ``aim_set_by`` still wins."""
+    with _store(tmp_path) as store:
+        store.create_draft("j1", "/repo", "agent job", registered_by="automated")
+        store.create_draft(
+            "j2", "/repo", "told so", registered_by="automated", aim_set_by=AIM_SET_BY_USER
+        )
+        store.create_draft("j3", "/repo", "user job", registered_by="")
+        assert _stamps(store, "j1") == [("agent job", "tool")]
+        assert _stamps(store, "j2") == [("told so", "user")]
+        assert _stamps(store, "j3") == [("user job", "user")]
 
 
 def test_b5_set_first_aim_stamps_the_row_it_rewrites(tmp_path: Path) -> None:
@@ -1963,7 +1981,7 @@ def test_b5_latest_user_aim_picks_the_newest_user_row(tmp_path: Path) -> None:
         store.set_aim("s1", "A", set_by=AIM_SET_BY_USER)
         store.set_aim("s1", "B", set_by=AIM_SET_BY_USER)
         store.set_aim("s1", "B: tp#1", set_by=AIM_SET_BY_TOOL)
-        store.set_aim("s1", "handoff accepted by session 12345678")
+        store.set_aim("s1", "handoff accepted by session 12345678", set_by=None)
         assert store.latest_user_aim("s1") == ("B", "user")
 
 
@@ -1971,8 +1989,8 @@ def test_b5_latest_user_aim_falls_back_to_the_stripped_current_aim(tmp_path: Pat
     """Legacy history (no ``user`` row): the current AIM without its tp id run, stamp None."""
     with _store(tmp_path) as store:
         store.ensure("s1", cwd="/repo")
-        store.set_aim("s1", "A")
-        store.set_aim("s1", "B: tp#5, #6")
+        store.set_aim("s1", "A", set_by=None)
+        store.set_aim("s1", "B: tp#5, #6", set_by=None)
         assert store.latest_user_aim("s1") == ("B", None)
         # An AIM with no history rows at all (predates tracking) works the same way.
         store.ensure("s2", cwd="/repo")
@@ -1989,13 +2007,101 @@ def test_b5_latest_user_aim_falls_back_to_the_first_row(tmp_path: Path) -> None:
     with _store(tmp_path) as store:
         store.ensure("s1", cwd="/repo")
         store.set_aim("s1", "A", set_by=AIM_SET_BY_LAUNCH)
-        store.set_aim("s1", "tp#5")
+        store.set_aim("s1", "tp#5", set_by=None)
         assert store.latest_user_aim("s1") == ("A", "launch")
         store.update_fields("s1", aim=None)
         assert store.latest_user_aim("s1") == ("A", "launch")
         store.ensure("empty", cwd="/repo")
         assert store.latest_user_aim("empty") is None
         assert store.latest_user_aim("unknown") is None
+
+
+def test_tp1991_latest_user_aim_step_two_returns_the_matching_rows_stamp(
+    tmp_path: Path,
+) -> None:
+    """No ``user`` row: the current AIM carries the stamp of the row holding it."""
+    with _store(tmp_path) as store:
+        store.ensure("s1", cwd="/repo")
+        store.set_aim("s1", "launched goal", set_by=AIM_SET_BY_LAUNCH)
+        assert store.latest_user_aim("s1") == ("launched goal", "launch")
+        store.set_aim("s1", "tool goal: tp#4", set_by=AIM_SET_BY_TOOL)
+        assert store.latest_user_aim("s1") == ("tool goal", "tool")  # words match
+
+
+def test_tp1991_stamp_of_matches_exact_then_words(tmp_path: Path) -> None:
+    """``stamp_of``: the newest exact match, else a words match, else ``None``."""
+    with _store(tmp_path) as store:
+        store.ensure("s1", cwd="/repo")
+        store.set_aim("s1", "goal", set_by=AIM_SET_BY_LAUNCH)
+        store.set_aim("s1", "other", set_by=AIM_SET_BY_USER)
+        store.set_aim("s1", "goal", set_by=AIM_SET_BY_TOOL)
+        store.set_aim("s1", "words: tp#3", set_by=AIM_SET_BY_USER)
+        store.set_aim("s1", "unknown author", set_by=None)
+        assert store.stamp_of("s1", "goal") == "tool"  # the newest of two exact rows
+        assert store.stamp_of("s1", "words") == "user"  # words match
+        assert store.stamp_of("s1", "unknown author") is None
+        assert store.stamp_of("s1", "never written") is None
+        assert store.stamp_of("nobody", "goal") is None
+
+
+def test_tp1991_stamp_of_looks_through_a_strip_rewrite(tmp_path: Path) -> None:
+    """A ``tool`` row that only stripped the id run off the row before it is never the
+    answer: the earlier row's stamp is (NULL stays ``None``)."""
+    with _store(tmp_path) as store:
+        conn = store.conn
+        for sid, first in (("s1", AIM_SET_BY_LAUNCH), ("s2", None)):
+            store.ensure(sid, cwd="/repo")
+            for at, (aim, by) in enumerate((("fix it: tp#7", first), ("fix it", "tool"))):
+                conn.execute(
+                    "INSERT INTO aim_history (session_id, aim, score, created_at, set_by) "
+                    "VALUES (?, ?, 0, ?, ?)",
+                    (sid, aim, at + 1, by),
+                )
+        conn.commit()
+        assert store.stamp_of("s1", "fix it") == "launch"
+        assert store.stamp_of("s2", "fix it") is None
+        # A tool row that is NOT such a rewrite keeps its stamp.
+        store.ensure("s3", cwd="/repo")
+        store.set_aim("s3", "fix it: tp#7", set_by=AIM_SET_BY_USER)
+        store.set_aim("s3", "a new goal", set_by=AIM_SET_BY_TOOL)
+        assert store.stamp_of("s3", "a new goal") == "tool"
+
+
+def test_tp1991_carry_first_aim_stamps_an_unstamped_anchor_relay(tmp_path: Path) -> None:
+    """``carry_first_aim`` keeps a stamped anchor's stamp; a NULL anchor becomes ``relay``."""
+    with _store(tmp_path) as store:
+        for sid, by in (("root-null", None), ("root-launch", AIM_SET_BY_LAUNCH)):
+            store.ensure(sid, cwd="/repo")
+            store.set_aim(sid, f"anchor of {sid}", set_by=by)
+        for target, source in (("t1", "root-null"), ("t2", "root-launch")):
+            store.ensure(target, cwd="/repo")
+            store.set_aim(target, "successor goal", set_by=AIM_SET_BY_RELAY)
+            assert store.carry_first_aim(target, source)
+        assert _stamps(store, "t1")[0] == ("anchor of root-null", "relay")
+        assert _stamps(store, "t2")[0] == ("anchor of root-launch", "launch")
+
+
+def _call_name(node: ast.Call) -> str:
+    func = node.func
+    return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+
+
+def test_tp1991_every_production_aim_writer_passes_set_by() -> None:
+    """Every ``set_aim`` / ``_record_aim_history`` / ``_insert_aim_history`` call in the
+    package names its stamp: no writer leaves ``aim_history.set_by`` NULL by default."""
+    package = Path(__file__).resolve().parent.parent / "command_center"
+    writers = {"set_aim", "_record_aim_history", "_insert_aim_history"}
+    missing: list[str] = []
+    seen = 0
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _call_name(node) in writers:
+                seen += 1
+                if not any(kw.arg == "set_by" for kw in node.keywords):
+                    missing.append(f"{path.name}:{node.lineno}")
+    assert seen >= 10  # the scan really found the writers
+    assert not missing
 
 
 # ---- B9 (tp#1566): Store.rewrite_aim_text — the one-time strip's write path --------------
@@ -2007,7 +2113,7 @@ def test_b9_rewrite_aim_text_keeps_everything_but_the_text(tmp_path: Path) -> No
         store.ensure("s1", cwd="/repo")
         store.set_aim("s1", "fix decide", set_by=AIM_SET_BY_USER)
         # The old tracker rewrite (unstamped).
-        store.set_aim("s1", "fix decide: tp#7, #8")
+        store.set_aim("s1", "fix decide: tp#7, #8", set_by=None)
         # Auto sub-goals: set_aim would clear these, rewrite_aim_text must not.
         store.set_subgoals("s1", ["derived step", "second step"], source="auto")
         store.update_fields(
@@ -2064,6 +2170,19 @@ def test_b9_rewrite_aim_text_seeds_a_pre_history_original(tmp_path: Path) -> Non
         assert store.rewrite_aim_text("s1", "  ") is False
         assert store.rewrite_aim_text("unknown", "x") is False
         assert store.list_aim_history("bare") == []
+
+
+def test_tp1991_rewrite_aim_text_inherits_the_rewritten_rows_stamp(tmp_path: Path) -> None:
+    """``strip-aim-runs`` keeps the author: the rewrite carries the stamp of the row it
+    rewrites, ``tool`` (the fallback) only when that row has none."""
+    with _store(tmp_path) as store:
+        store.ensure("s1", cwd="/repo")
+        store.set_aim("s1", "the user's goal: tp#7", set_by=AIM_SET_BY_USER)
+        assert store.rewrite_aim_text("s1", "the user's goal", set_by=AIM_SET_BY_TOOL)
+        assert _stamps(store, "s1") == [
+            ("the user's goal: tp#7", "user"),
+            ("the user's goal", "user"),
+        ]
 
 
 _TAB = "w0t1p0:44444444-0000-4000-8000-000000000004"

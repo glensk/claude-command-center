@@ -32,21 +32,24 @@ flags. Grouped by what they do:
 
 - `ccc set-aim "<done-when>"` — set the done-condition (the single chokepoint for CLI/TUI/hook);
   `-f/--first` instead rewrites the FIRST recorded AIM (`/aim (1)`) in place, adding no revision;
-  `-b/--by {user,tool}` (default `user`) stamps who wrote it on the history row (`set_by`), so a
-  tool that writes an AIM passes `--by tool` and the handover never carries it as the user's AIM.
+  `-b/--by {user,tool}` stamps who wrote it on the history row (`set_by`; default `tool` when
+  `AI_AUTOMATED` is set, else `user`), so a tool that writes an AIM passes `--by tool` and the
+  handover never carries it as the user's AIM.
   The AIM is static: only the user sets it (`!aim`, `/aim`, the TUI); no agent and no tracker
   rewrites it, and a change is not announced to the agent (no "AIM changed" notice).
 - `ccc set-aim-eta [ETA]` (`-s/--session`, `-c/--clear`, `-g/--get`) — store the session's estimated time of done
   BESIDE the AIM (one line, ≤ 40 chars: `17:30`, `45 min`, `tomorrow`, `?`); never touches the AIM or anything
   derived from it. `-g` prints it back (empty line when none); the TUI detail pane shows it as `· ~<eta>`.
 - `ccc aim` · `ccc aim-history` — the current AIM / its first→current progression (each
-  revision with its `set_by` stamp: `user`, `launch`, `tool`, or `-` for a legacy row).
+  revision with its `set_by` stamp: `user`, `launch`, `tool`, `relay`, or `-` for a legacy
+  row; see "Who wrote each AIM row" below).
   `ccc aim-history -s ID -t` shows the whole **thread** instead (every continue-session hop,
   root first; see "Thread AIM history" below), `-j` the same as JSON.
 - `ccc strip-aim-runs` (`-a/--all` | `-s/--session`, `-n/--dry-run`) — one-time cleanup from
   when a tracker still rewrote AIMs: a non-archived, not-done session whose one-line AIM ends
   in a `: tp#N, #M` run with words before it gets the words alone (`Store.rewrite_aim_text`,
-  one history row stamped `tool`; sub-goals, score, DONE verdict, grading offset and the
+  one history row keeping the stamp of the row it rewrites, `tool` only when that row has
+  none — the words stay their author's; sub-goals, score, DONE verdict, grading offset and the
   `old ====> new` transition are left as they are). A run-only AIM is listed, not touched.
   Run `-n` first: it prints each session's id, old and new AIM and writes nothing.
 - `ccc set-next` · `ccc set-blocked` · `ccc set-deadline` · `ccc set-donecheck` — the other job fields.
@@ -2095,12 +2098,30 @@ lineage (`Store.latest_user_aim`): the newest `aim_history` row stamped `set_by 
 without one (legacy, unstamped history) the source's current AIM with its trailing tp id run
 stripped (`aimtext.words`); when that is empty (no AIM, or a run-only AIM) the source's first
 AIM; and only when the source has no AIM at all the `transfer.source_aim` recorded at `start`,
-then a generic `continue the work handed over by session <old8>`. The carried row keeps its
-stamp, so a chain A→B→C still finds the AIM the user set in B. `accept` copies the source's
-first AIM in as the successor's `/aim (1)` (`carry_first_aim`, stamp kept) and then
-reconciles once (`_reconcile_successor_aim`, idempotent): an AIM the user changed in the
-source between `start` and `accept` replaces the draft's. `transfer.source_aim` keeps the
-source's actual AIM at `start` for audit.
+then a generic `continue the work handed over by session <old8>`. The carried row keeps the
+stamp of the source row holding that text (`Store.stamp_of`), `relay` when that row is
+unstamped, `tool` for the generic pointer, so a chain A→B→C still finds the AIM the user set
+in B and no successor row is NULL. `accept` copies the source's first AIM in as the
+successor's `/aim (1)` (`carry_first_aim`, stamp kept, an unstamped one written `relay`) and
+then reconciles once (`_reconcile_successor_aim`, idempotent, same stamps): an AIM the user
+changed in the source between `start` and `accept` replaces the draft's. A duplicate `accept`
+re-runs neither (it never overwrites an AIM the successor changed since). `transfer.source_aim`
+keeps the source's actual AIM at `start` for audit.
+
+**Who wrote each AIM row (`aim_history.set_by`).** Every writer stamps its row (tp#1566,
+tp#1991):
+
+| Stamp    | Written by                                                                                                                                             |
+| :------- | :----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `user`   | `/aim`, `!aim` / `ccc set-aim` (default), `ccc set-aim -f`, TUI AIM edits, job file sync, job creation                                                 |
+| `launch` | the launcher's start AIM (`CLAUDE_SESSION_AIM`, first hook event)                                                                                      |
+| `tool`   | `ccc set-aim --by tool` or under `AI_AUTOMATED`, a job an automated caller registered, the generic successor AIM, `strip-aim-runs` on an unstamped row |
+| `relay`  | a handoff copy whose source row is unstamped (successor AIM, `/aim (1)` anchor): author unknown                                                        |
+| NULL     | a pre-history seed (an AIM that predates the history table) and rows written before every writer stamped                                               |
+
+`relay` and NULL both mean "author unknown"; ccc's own handover reads only `user` rows as the
+user's AIM. A `strip-aim-runs` row keeps the stamp of the row it rewrote, and `Store.stamp_of`
+looks through an older `tool` row of that kind to the row before it.
 
 Finalize does NOT touch the source's AIM (it stays exactly as the user set it, history
 included); the handoff shows as status `handed_off` + `handed_off_to`
@@ -3952,7 +3973,7 @@ entry (the `/aim (1)` anchor `accept` carries) and any row equal to the previous
 not on the path. Entry: `at` ISO-8601 UTC (null when unknown), `aim` the first line (≤ 300
 chars), `aim_full_len` the full text's length, `by` = `user` (`!aim`, `/aim`, TUI, job AIM,
 default `ccc set-aim`) / `launch` (the launcher's start AIM) / `tool` (`ccc set-aim --by
-tool`) / null (legacy row), `hop` the session's 0-based position on the path. At most the 50
+tool`, ccc's own text) / `relay` (a handoff copy of unknown origin) / null (legacy row), `hop` the session's 0-based position on the path. At most the 50
 newest entries; `truncated` when cut. `current_aim` is the session's AIM (first line, ≤ 300),
 `user_aim` its latest user-set AIM (first line, ≤ 200; the newest `user` row, else the current
 AIM without its trailing tp-id run, else the first row). Read-only, computed on read: no

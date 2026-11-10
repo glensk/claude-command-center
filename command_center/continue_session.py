@@ -519,19 +519,38 @@ def _candidate(  # pylint: disable=too-many-arguments,too-many-positional-argume
     )
 
 
-def _successor_aim(store: Store, transfer: Any) -> tuple[str, str | None]:
+def _carried_aim(store: Store, transfer: Any) -> tuple[str, str] | None:
+    """The source's latest user AIM (``Store.latest_user_aim``) with a non-NULL stamp.
+
+    Its stamp is carried so a chain A→B→C still finds it in B; an unknown author is
+    stamped ``relay`` (a handoff copied it, tp#1991), so no successor row is NULL.
+    """
+    from .models import AIM_SET_BY_RELAY
+
+    carried = store.latest_user_aim(transfer.source_session)
+    if carried is None:
+        return None
+    text, set_by = carried
+    return text, set_by or AIM_SET_BY_RELAY
+
+
+def _successor_aim(store: Store, transfer: Any) -> tuple[str, str]:
     """The AIM a successor starts with and its ``aim_history.set_by`` stamp (tp#1566).
 
-    The latest AIM the user set in the source (``Store.latest_user_aim``, its stamp
-    carried so a chain A→B→C still finds it in B); else the source's recorded AIM at
-    ``start``; else a generic pointer at the source. The fallbacks carry no stamp.
+    The latest AIM the user set in the source (:func:`_carried_aim`); else the source's
+    recorded AIM at ``start`` (the stamp of the source row holding it, else ``relay``);
+    else a generic pointer at the source, stamped ``tool`` (ccc wrote it, tp#1991).
     """
-    carried = store.latest_user_aim(transfer.source_session)
+    from .models import AIM_SET_BY_RELAY, AIM_SET_BY_TOOL
+
+    carried = _carried_aim(store, transfer)
     if carried is not None:
         return carried
     if transfer.source_aim:
-        return transfer.source_aim, None
-    return f"continue the work handed over by session {transfer.source_session[:8]}", None
+        stamp = store.stamp_of(transfer.source_session, transfer.source_aim)
+        return transfer.source_aim, stamp or AIM_SET_BY_RELAY
+    pointer = f"continue the work handed over by session {transfer.source_session[:8]}"
+    return pointer, AIM_SET_BY_TOOL
 
 
 def _reconcile_successor_aim(store: Store, transfer: Any) -> bool:
@@ -539,9 +558,9 @@ def _reconcile_successor_aim(store: Store, transfer: Any) -> bool:
 
     ``accept`` calls this once, after ``carry_first_aim``: it covers the user changing the
     source's AIM between ``start`` and ``accept``. Idempotent — a target that already holds
-    that AIM is left alone (no new history row).
+    that AIM is left alone (no new history row). Stamped like :func:`_carried_aim`.
     """
-    carried = store.latest_user_aim(transfer.source_session)
+    carried = _carried_aim(store, transfer)
     target = store.get(transfer.target_session)
     if carried is None or target is None:
         return False
