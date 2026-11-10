@@ -2064,3 +2064,90 @@ def test_b9_rewrite_aim_text_seeds_a_pre_history_original(tmp_path: Path) -> Non
         assert store.rewrite_aim_text("s1", "  ") is False
         assert store.rewrite_aim_text("unknown", "x") is False
         assert store.list_aim_history("bare") == []
+
+
+_TAB = "w0t1p0:44444444-0000-4000-8000-000000000004"
+_TAB_PID = 4_000_002
+
+
+def _tabbed(store: Store, sid: str, iid: str | None = _TAB, pid: int | None = _TAB_PID) -> None:
+    store.ensure(sid, cwd="/repo")
+    store.conn.execute(
+        "UPDATE sessions SET iterm_session_id = ?, last_seen_pid = ?, status = 'parked', "
+        "title_written = 'old title', title_generation = 3, title_written_at = 123 "
+        "WHERE session_id = ?",
+        (iid, pid, sid),
+    )
+    store.conn.commit()
+
+
+def test_list_tabbed_sessions_selects_non_draft_rows_with_a_tab_id(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _tabbed(store, "open")
+    _tabbed(store, "done")
+    store.update_fields("done", done=True)
+    _tabbed(store, "arch")
+    store.update_fields("arch", archived=True)
+    _tabbed(store, "nopid", pid=None)
+    _tabbed(store, "blank", iid="  ")
+    _tabbed(store, "null", iid=None)
+    store.create_draft("draft", "/repo", "a future job")
+    store.update_fields("draft", iterm_session_id=_TAB)
+    rows = {r.session_id: r for r in store.list_tabbed_sessions()}
+    assert set(rows) == {"open", "done", "arch", "nopid"}
+    assert rows["open"].iterm_session_id == _TAB and rows["open"].last_seen_pid == _TAB_PID
+    assert rows["open"].status == "parked" and not rows["open"].draft
+    assert rows["done"].done and rows["arch"].archived
+    assert rows["nopid"].last_seen_pid is None
+
+
+def _tab_cols(store: Store, sid: str) -> tuple:
+    return tuple(
+        store.conn.execute(
+            "SELECT iterm_session_id, title_written, title_written_at, title_generation, "
+            "updated_at, status FROM sessions WHERE session_id = ?",
+            (sid,),
+        ).fetchone()
+    )
+
+
+def test_release_tab_clears_tab_and_title_state_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("command_center.store.pid_alive", lambda _pid: False)
+    store = _store(tmp_path)
+    _tabbed(store, "s1")
+    before = _tab_cols(store, "s1")
+    assert store.release_tab("s1", _TAB, _TAB_PID) is True
+    after = _tab_cols(store, "s1")
+    assert after[:3] == (None, None, 0)
+    assert after[3:] == before[3:]  # title_generation, updated_at, status untouched
+    assert store.release_tab("s1", _TAB, _TAB_PID) is False  # already released
+    assert not store.list_tabbed_sessions()
+
+
+def test_release_tab_refuses_on_changed_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alive = {"now": False}
+    monkeypatch.setattr("command_center.store.pid_alive", lambda _pid: alive["now"])
+    store = _store(tmp_path)
+    _tabbed(store, "s1")
+    before = _tab_cols(store, "s1")
+    assert store.release_tab("s1", "w0t2p0:55555555-0000-4000-8000-000000000005", _TAB_PID) is False
+    assert store.release_tab("s1", _TAB, _TAB_PID + 1) is False  # pid changed
+    assert store.release_tab("s1", _TAB, 0) is False  # never a non-positive pid
+    assert store.release_tab("missing", _TAB, _TAB_PID) is False
+    alive["now"] = True  # the pid came alive between the read and the write
+    assert store.release_tab("s1", _TAB, _TAB_PID) is False
+    assert _tab_cols(store, "s1") == before
+
+
+def test_release_tab_refuses_a_row_without_a_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("command_center.store.pid_alive", lambda _pid: False)
+    store = _store(tmp_path)
+    _tabbed(store, "nopid", pid=None)
+    assert store.release_tab("nopid", _TAB, _TAB_PID) is False
+    assert _tab_cols(store, "nopid")[0] == _TAB

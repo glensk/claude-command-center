@@ -173,6 +173,23 @@ class CloseClaim:
     bound: str = ""
 
 
+@dataclass(frozen=True)
+class TabbedRow:
+    """The few columns of a non-draft row bound to an iTerm tab (``Store.list_tabbed_sessions``).
+
+    Just what the dead-tab release rule needs (tp#1990), so the daemon pass never
+    materialises every :class:`Session`.
+    """
+
+    session_id: str
+    iterm_session_id: str
+    last_seen_pid: int | None = None
+    status: str = ""
+    done: bool = False
+    archived: bool = False
+    draft: bool = False
+
+
 @dataclass
 class LiveSession:
     """A session currently registered in ``~/.claude/sessions/<pid>.json``."""

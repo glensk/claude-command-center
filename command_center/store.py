@@ -59,6 +59,7 @@ from .models import (
     Subgoal,
     SubgoalRevision,
     SwitchClaim,
+    TabbedRow,
     TranscriptScan,
     no_codex_conflict,
     now_ms,
@@ -1019,6 +1020,75 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             )
         )
         return matches[0]
+
+    def list_tabbed_sessions(self) -> list[TabbedRow]:
+        """Every non-draft row (open, done or archived) still bound to an iTerm tab (tp#1990).
+
+        A narrow SELECT of the columns the dead-tab release rule reads — no
+        :data:`_SESSION_SELECT` (its correlated ``aim_history`` sub-queries) and no
+        :class:`Session` materialisation, so the daemon pass stays cheap.
+        """
+        rows = self.conn.execute(
+            "SELECT session_id, iterm_session_id, last_seen_pid, status, done, archived, draft "
+            "FROM sessions WHERE draft = 0 AND iterm_session_id IS NOT NULL "
+            "AND TRIM(iterm_session_id) != '' ORDER BY session_id"
+        ).fetchall()
+        return [
+            TabbedRow(
+                session_id=str(r[0]),
+                iterm_session_id=str(r[1]),
+                last_seen_pid=int(r[2]) if r[2] is not None else None,
+                status=str(r[3] or ""),
+                done=bool(r[4]),
+                archived=bool(r[5]),
+                draft=bool(r[6]),
+            )
+            for r in rows
+        ]
+
+    def release_tab(self, session_id: str, expected_iid: str, expected_pid: int) -> bool:
+        """Unbind *session_id* from its gone iTerm tab — a compare-and-swap (tp#1990).
+
+        One ``BEGIN IMMEDIATE``: the row must still be a non-draft row carrying
+        *expected_iid* and the same positive *expected_pid*, and that pid must still be dead
+        (re-probed right before the write). Then ``iterm_session_id`` and the tab-scoped
+        title CAS state (``title_written`` → NULL, ``title_written_at`` → 0, the schema
+        defaults) are cleared, so a resume in a new tab writes its first title
+        unconditionally. ``title_generation``, status, ``closed_at``, AIM and ``updated_at``
+        stay untouched. Any changed evidence → False, nothing written.
+        """
+        if not expected_iid or not expected_pid or expected_pid <= 0:
+            return False
+        if self.conn.in_transaction:
+            self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT iterm_session_id, last_seen_pid, draft FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            same = (
+                row is not None
+                and row[0] == expected_iid
+                and row[1] is not None
+                and int(row[1]) == expected_pid
+                and not row[2]
+            )
+            released = False
+            if same and not pid_alive(expected_pid):
+                cur = self.conn.execute(
+                    "UPDATE sessions SET iterm_session_id = NULL, title_written = NULL, "
+                    "title_written_at = 0 "
+                    "WHERE session_id = ? AND iterm_session_id = ? AND last_seen_pid = ? "
+                    "AND draft = 0",
+                    (session_id, expected_iid, expected_pid),
+                )
+                released = cur.rowcount == 1
+        except sqlite3.Error:
+            self.conn.rollback()
+            raise
+        self.conn.commit()
+        return released
 
     def delete(self, session_id: str) -> None:
         """Remove a session, its sub-goals (FK cascade) and its transcript-scan row.
