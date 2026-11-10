@@ -478,3 +478,65 @@ def release_gone(  # pylint: disable=too-many-arguments,too-many-locals
     guarded |= set(iter_uuids(result.refused))
     result.removed = sweep_badges(cache, missing, guarded, stamp)
     return result
+
+
+# ---- ``ccc tab-symbol -g/--gone`` (preview) and ``-G/--release-gone`` (run now) --------
+def _age(missing_ms: int | None) -> str:
+    """``12m`` / ``3h05m`` for a missing age; ``-`` for a present tab."""
+    if missing_ms is None:
+        return "-"
+    minutes = missing_ms // 60_000
+    return f"{minutes // 60}h{minutes % 60:02d}m" if minutes >= 60 else f"{minutes}m"
+
+
+def report_lines(result: ReleaseResult) -> list[str]:
+    """The human report of one :func:`release_gone` pass (short ids only, never AIM text).
+
+    One line per row whose tab is missing (released / releasable, or why it is kept), then
+    a counts line. Rows on a present tab are only counted.
+    """
+    from .models import short_id  # lazy
+
+    if result.skipped:
+        return [f"skipped: {result.skipped} (fail closed: nothing judged or written)"]
+    refused = {r.session_id for r in result.refused}
+    lines: list[str] = []
+    for verdict in result.verdicts:
+        if verdict.reason == KEEP_PRESENT:
+            continue
+        row = verdict.row
+        reason = verdict.reason
+        if row.session_id in refused:
+            reason = "refused (evidence changed)"
+        elif verdict.release:
+            reason = "would release" if result.dry_run else "released"
+        lines.append(
+            f"{short_id(row.session_id)}  {row.status or '-':<13}  "
+            f"{uuid_of(row.iterm_session_id)[:8]}  missing {_age(verdict.missing_ms):>6}  {reason}"
+        )
+    present = sum(1 for v in result.verdicts if v.reason == KEEP_PRESENT)
+    verb = "would release" if result.dry_run else "released"
+    removed = "would remove" if result.dry_run else "removed"
+    lines.append(
+        f"{verb} {len(result.released)} tab binding(s), {removed} {len(result.removed)} "
+        f"badge file(s); {len(result.refused)} refused, {present} row(s) on a present tab"
+    )
+    return lines
+
+
+def cli_report(*, release: bool) -> int:
+    """``ccc tab-symbol -g`` (``release=False``) / ``-G`` (``release=True``); always exit 0.
+
+    ``-g`` is a preview: it writes neither the DB nor the badge cache, but DOES record the
+    pane read in the missing log, so two previews ≥ the grace apart show what ``-G`` (or
+    the daemon) would release. ``-G`` runs the release now, exactly like a daemon pass.
+    """
+    from .adapters.claude import ClaudeAdapter  # lazy
+    from .store import Store  # lazy
+
+    live = {ls.session_id: ls for ls in ClaudeAdapter().discover()}
+    with Store() as store:
+        result = release_gone(store, live, dry_run=not release, record=True)
+    for line in report_lines(result):
+        print(line)
+    return 0

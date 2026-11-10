@@ -5993,7 +5993,7 @@ def _add_panel_server(sub: Any) -> None:
     parser.set_defaults(func=cmd_panel_server)
 
 
-def cmd_tab_symbol(args: argparse.Namespace) -> int:
+def cmd_tab_symbol(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements  # one exit per mode
     """Claim/read this iTerm tab's badge, or print a path's deterministic repo symbol.
 
     Three modes:
@@ -6008,6 +6008,8 @@ def cmd_tab_symbol(args: argparse.Namespace) -> int:
       title override hides the session name ccc sets); once, or every 2 s.
     * ``--palette`` — print the per-tab badge pool, space-separated (llm-staff's lint keeps
       agent symbols out of it, tp#1288).
+    * ``--gone`` / ``--release-gone`` — preview / run the dead-tab release
+      (:mod:`command_center.tabrelease`, tp#1990).
     * default — claim (or ``--read``) this iTerm tab's unique badge keyed by
       ``$ITERM_SESSION_ID`` and print it (the macOS zsh ``chpwd`` hook path).
 
@@ -6036,6 +6038,11 @@ def cmd_tab_symbol(args: argparse.Namespace) -> int:
             badged = tabsymbol.sync_live(store)
         print(f"synced {len(badged)} tab title(s)")
         return 0
+
+    if getattr(args, "gone", False) or getattr(args, "release_gone", False):
+        from . import tabrelease  # lazy: off the per-`cd` hot path
+
+        return tabrelease.cli_report(release=bool(getattr(args, "release_gone", False)))
 
     if getattr(args, "watch", False):
         return tabsymbol.watch()
@@ -6167,6 +6174,22 @@ def _add_tab_symbol(sub: Any) -> None:
         "--palette",
         action="store_true",
         help="print the per-tab badge pool, space-separated (staff agent symbols must avoid it)",
+    )
+    gone = p_sym.add_mutually_exclusive_group()
+    gone.add_argument(
+        "-g",
+        "--gone",
+        action="store_true",
+        help="preview the rows whose iTerm tab is gone (missing >= 10 min) and whose process "
+        "is dead: short id, status, tab, missing age, release or keep reason; writes no row "
+        "or badge (only the missing-since log)",
+    )
+    gone.add_argument(
+        "-G",
+        "--release-gone",
+        action="store_true",
+        help="release those rows' tab binding and badge now (what each daemon pass does); "
+        "the rows stay, resumable",
     )
     p_sym.set_defaults(func=cmd_tab_symbol)
 

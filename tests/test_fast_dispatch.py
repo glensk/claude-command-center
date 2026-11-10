@@ -31,6 +31,10 @@ _HOT_ARGVS: list[list[str]] = [
     ["tab-symbol", "--print", "/tmp/x"],
     ["tab-symbol"],
     ["tab-symbol", "--print", "--color", "/tmp/x"],
+    ["tab-symbol", "-g"],
+    ["tab-symbol", "--gone"],
+    ["tab-symbol", "-G"],
+    ["tab-symbol", "--release-gone"],
     ["mem-token"],
 ]
 

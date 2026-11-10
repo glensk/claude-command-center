@@ -2472,7 +2472,24 @@ ccc tab-symbol --sync     # ensure every tracked live tab has a badge AND its ti
 ccc tab-symbol --heal     # prefix the badge onto every tab title renamed in iTerm (one pass)
 ccc tab-symbol --watch    # --heal every 2 s until killed (the <prefix>.ccc-tab-watch agent)
 ccc tab-symbol --palette  # print the badge pool (llm-staff's lint keeps agent symbols out of it)
+ccc tab-symbol -g         # --gone: preview the dead rows on gone tabs (no row or badge written)
+ccc tab-symbol -G         # --release-gone: release them now (what every daemon pass does)
 ```
+
+**Dead rows on gone tabs release their tab** (tp#1990). A row keeps its tab id after the tab
+closes, so parked rows used to hold tab ids and, through them, badge files (palette slots).
+Each daemon pass (its own step, not gated by `sync_tab_titles`) and `-G` release a row's
+binding only on **two proofs**: its process is dead (a positive `last_seen_pid` that is not
+running and not alive in the live registry; a NULL/0 pid is unknown and keeps the row) and
+its tab is gone (absent from every reliable pane read for at least 10 minutes). The first
+absence is stamped in `~/.claude/command-center/tab-missing.json`; seeing the pane again drops
+the stamp, so a partial restore snapshot releases nothing. Pane reads fail closed: iTerm not
+running, a failed read or an empty pane list skip the pass with nothing written. A release
+is a compare-and-swap that clears only the tab id and its title state; the row stays with
+its status, AIM and `closed_at`, resumable, and the next hook event in a new tab re-stamps it
+(its first title write there is unconditional). `-g` lists each row on a missing tab (short
+id, status, tab, missing age, release or keep reason) and writes only the missing-since
+stamps; `ccc daemon -v` prints a `tab-release:` line per released row.
 
 **Staff agents wear their own symbol** (tp#1288). A session that ran `staff adopt -a
 <agent>` (tp's binding `~/.cache/tp/session-role/<sid>`, the same one behind the status
@@ -2518,6 +2535,11 @@ tab under `~/.cache/iterm-tab-symbol/<ITERM_SESSION_ID>` — mirroring the sibli
 to the title it already sets; with `ccc` absent the title is simply left
 un-badged. Colored emoji are used (not ANSI-styled glyphs) so the exact same
 character renders identically in the terminal table and the tab title.
+The same release pass sweeps this cache under the `.lock` `assign` takes: a badge file
+(and its `.dir` sidecar) whose tab is gone past the grace and that no alive-or-unknown row
+protects is removed, so its slot is free instead of `assign` stealing a live tab's badge.
+Files of present panes (shell tabs without a row included), `.lock` and other names are
+never touched.
 
 The `chpwd` hook only fires on `cd`, which never happens while `claude` holds the
 foreground — so a badge **assigned mid-session** (e.g. a tab opened before the

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import iterm_api, tab_titles, tabrelease, tabsymbol
+from command_center import cli, iterm_api, tab_titles, tabrelease, tabsymbol
 from command_center.models import LiveSession, TabbedRow
 from command_center.store import Store
 from command_center.tab_titles import ItermPane
@@ -447,3 +447,81 @@ def test_release_cas_refusal_keeps_the_binding_and_the_badge(
     assert not result.released and [r.session_id for r in result.refused] == ["dead"]
     assert _iid(store, "dead") == f"w0t1p0:{_GONE}"
     assert not result.removed and len(_names(directory) - {".lock"}) == 4
+
+
+# ---- B4: ``ccc tab-symbol -g/--gone`` and ``-G/--release-gone`` ----------------------
+
+
+@pytest.fixture(name="cli_world")
+def _cli_world(monkeypatch: pytest.MonkeyPatch) -> Iterator[Store]:
+    """The default store (temp CLAUDE_HOME) with a gone dead row, its clock past the grace."""
+    monkeypatch.setattr("command_center.store.pid_alive", lambda _pid: False)
+    _Iterm(monkeypatch, [_PRESENT])
+    store = Store()
+    _store_row(store, "deadbeef-row", _GONE, _DEAD_PID)
+    _store_row(store, "here", _PRESENT, _DEAD_PID)
+    _badge(tabsymbol.cache_dir(), _GONE.upper(), tabsymbol.PALETTE[0])
+    MissingLog().save({_GONE.upper(): 1})  # missing since the epoch: far past the grace
+    yield store
+    store.close()
+
+
+@pytest.mark.parametrize("flag", ["-g", "--gone"])
+def test_cli_gone_previews_and_writes_no_row_or_badge(
+    cli_world: Store, capsys: pytest.CaptureFixture[str], flag: str
+) -> None:
+    assert cli.main(["tab-symbol", flag]) == 0
+    out = capsys.readouterr().out
+    assert "deadbeef  parked" in out and "11111111" in out and "would release" in out
+    assert "here" not in out  # a row on a present tab is only counted
+    assert "would release 1 tab binding(s), would remove 1 badge file(s)" in out
+    assert _iid(cli_world, "deadbeef-row") == f"w0t1p0:{_GONE}"
+    assert any(badge_uuid(n) == _GONE.upper() for n in _names(tabsymbol.cache_dir()))
+
+
+@pytest.mark.parametrize("flag", ["-G", "--release-gone"])
+def test_cli_release_gone_releases_now(
+    cli_world: Store, capsys: pytest.CaptureFixture[str], flag: str
+) -> None:
+    assert cli.main(["tab-symbol", flag]) == 0
+    out = capsys.readouterr().out
+    assert "released 1 tab binding(s), removed 1 badge file(s); 0 refused" in out
+    assert _iid(cli_world, "deadbeef-row") is None
+    assert _iid(cli_world, "here") == f"w0t1p0:{_PRESENT}"
+    assert cli.main(["tab-symbol", "-G"]) == 0  # a second run releases nothing
+    assert "released 0 tab binding(s), removed 0 badge file(s)" in capsys.readouterr().out
+
+
+def test_cli_gone_without_iterm_says_skipped(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _Iterm(monkeypatch, [_PRESENT]).running = False
+    assert cli.main(["tab-symbol", "-g"]) == 0
+    assert "skipped: iTerm not running" in capsys.readouterr().out
+
+
+def test_cli_gone_flags_are_exclusive_and_documented(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["tab-symbol", "-g", "-G"])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["tab-symbol", "-h"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "-g, --gone" in out and "-G, --release-gone" in out
+
+
+def test_report_lines_formats_ages_and_reasons() -> None:
+    rows = [_row("aaaaaaaa1", pid=None), _row("bbbbbbbb2")]
+    result = ReleaseResult(
+        dry_run=True,
+        verdicts=[
+            tabrelease.RowVerdict(rows[0], tabrelease.KEEP_PID_UNKNOWN, 3 * 3_600_000),
+            tabrelease.RowVerdict(rows[1], tabrelease.RELEASE, 12 * 60_000),
+        ],
+        released=[rows[1]],
+    )
+    lines = tabrelease.report_lines(result)
+    assert "3h00m" in lines[0] and "pid unknown" in lines[0]
+    assert "12m" in lines[1] and "would release" in lines[1]
+    assert lines[-1].startswith("would release 1 tab binding(s)")
