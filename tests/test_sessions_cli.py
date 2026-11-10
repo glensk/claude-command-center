@@ -130,6 +130,9 @@ def test_both_accounts_kinds_status_and_names(store: Store) -> None:
         "peer_name",
         "user_aim",
         "aims_n",
+        "user_aim_by",
+        "user_aim_tier",
+        "user_aim_at",
     }
     assert out["a1"]["display_name"] == "parser" and out["a1"]["staff_agent"] is None
     assert out["b2"]["display_name"] is None  # no AIM, no hand-set name
@@ -546,6 +549,8 @@ def test_thread_fields_are_null_safe_for_a_session_ccc_never_saw(store: Store) -
     entry = _only(_collect(store, [_live("zz9", 11, name="repo-zz")], {}, None))
     assert entry["thread_id"] == "zz9" and entry["peer_name"] == "repo-zz"
     assert entry["user_aim"] is None and entry["aims_n"] == 0
+    assert entry["user_aim_by"] is None and entry["user_aim_tier"] is None
+    assert entry["user_aim_at"] is None
 
 
 def test_a_failed_thread_read_leaves_the_fields_null(
@@ -560,3 +565,79 @@ def test_a_failed_thread_read_leaves_the_fields_null(
     store.ensure("a1", cwd="/r/voice")
     entry = _only(_collect(store, [_live("a1", 11)], {}, None))
     assert entry["thread_id"] is None and entry["user_aim"] is None and entry["aims_n"] is None
+    assert entry["user_aim_by"] is None and entry["user_aim_tier"] is None
+
+
+# ---- hand-set AIM provenance (tp#1991) -----------------------------------------------
+
+#: Every key ``sessions -j`` emitted before tp#1991, with its value for :func:`_golden_store`.
+GOLDEN_OLD_KEYS: dict[str, Any] = {
+    "session_id": "g1",
+    "name": None,
+    "name_origin": None,
+    "display_name": "ship the thing",
+    "staff_agent": None,
+    "account": "private",
+    "account_conflict": False,
+    "launch_profile": None,
+    "pid": 11,
+    "kind": "interactive",
+    "status": "idle",
+    "raw_status": "idle",
+    "status_at": "2026-10-03T04:00:00Z",
+    "aim_short": "the thing",
+    "done": False,
+    "tab": {"iterm_session_id": "w0t0p0:UG", "validated": True},
+    "thread_id": "g1",
+    "peer_name": "repo-gg",
+    "user_aim": "ship the thing",
+    "aims_n": 1,
+}
+
+
+def _golden_store(store: Store) -> None:
+    store.ensure("g1", cwd="/r/voice")
+    store.set_aim("g1", "ship the thing", set_by="user")
+    store.update_fields("g1", short_aim="the thing", iterm_session_id="w0t0p0:UG")
+
+
+def test_the_old_keys_are_unchanged_and_the_new_ones_follow(store: Store) -> None:
+    _golden_store(store)
+    ps = {11: PsRow(1, "ttys001")}
+    panes = [ItermPane("UG", "/dev/ttys001", "x")]
+    entry = _only(_collect(store, [_live("g1", 11, name="repo-gg")], ps, panes))
+    assert {k: entry[k] for k in GOLDEN_OLD_KEYS} == GOLDEN_OLD_KEYS
+    assert set(entry) - set(GOLDEN_OLD_KEYS) == {"user_aim_by", "user_aim_tier", "user_aim_at"}
+    assert entry["user_aim_by"] == "user" and entry["user_aim_tier"] == "user"
+    assert str(entry["user_aim_at"]).endswith("Z")
+
+
+def test_the_hand_set_aim_tiers_on_sessions_j(store: Store) -> None:
+    for sid in ("l1", "t1", "r1", "p1"):
+        store.ensure(sid, cwd="/r/voice")
+    store.set_aim("l1", "typed", set_by="user")
+    store.set_aim("l1", "launched goal", set_by="launch")
+    store.set_aim("t1", "typed goal", set_by="user")
+    store.set_aim("t1", "the tool's rewrite", set_by="tool")
+    store.set_aim("r1", "copied over", set_by="relay")
+    store.update_fields("p1", aim="pre-history goal")
+    lives = [_live(sid, 11 + i) for i, sid in enumerate(("l1", "t1", "r1", "p1"))]
+    out = {e["session_id"]: e for e in _collect(store, lives, {}, None)}
+    got = {
+        sid: (e["user_aim"], e["user_aim_by"], e["user_aim_tier"], e["user_aim_at"] is None)
+        for sid, e in out.items()
+    }
+    assert got == {
+        "l1": ("launched goal", "launch", "user", False),
+        "t1": ("typed goal", "user", "user", False),
+        "r1": ("copied over", "relay", "unstamped", False),
+        "p1": ("pre-history goal", None, "unstamped", True),
+    }
+
+
+def test_a_session_with_only_tool_rows_has_no_user_aim(store: Store) -> None:
+    store.ensure("t2", cwd="/r/voice")
+    store.set_aim("t2", "the tool's", set_by="tool")
+    entry = _only(_collect(store, [_live("t2", 11)], {}, None))
+    assert entry["user_aim"] is None and entry["user_aim_tier"] is None
+    assert entry["display_name"] == "the tool's"  # the old field is untouched

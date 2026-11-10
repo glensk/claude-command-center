@@ -13,7 +13,9 @@ call, not a few per session and hop.
 
 The thread's AIM history is computed on read from the per-session ``aim_history`` rows of
 the path root → session, dropping the rows ccc itself copied at a relay
-(:func:`carry_entries`). Read-only: this module only SELECTs.
+(:func:`carry_entries`). A session's ``user_aim`` is its hand-set AIM
+(:func:`aimprov.hand_set_aim`, tp#1991), fed from the same batched rows. Read-only: this
+module only SELECTs.
 """
 
 from __future__ import annotations
@@ -32,14 +34,23 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from . import aimtext
+from . import aimprov
+from .aimprov import AimRow, HandAim
 from .bridge_json import iso
-from .models import AIM_SET_BY_USER
 
 if TYPE_CHECKING:
     import sqlite3
 
-__all__ = ["MAX_HOPS", "AimEntry", "ThreadFacts", "ThreadPath", "facts", "thread_aims", "walk"]
+__all__ = [
+    "MAX_HOPS",
+    "AimEntry",
+    "ThreadFacts",
+    "ThreadPath",
+    "facts",
+    "hand_set_aims",
+    "thread_aims",
+    "walk",
+]
 
 #: Max characters of a ``user_aim`` (the tp#1986 naming rule).
 USER_AIM_MAX = 200
@@ -178,20 +189,18 @@ def walk(conn: sqlite3.Connection, session_id: str) -> ThreadPath:
     return paths.get(session_id) or ThreadPath(session_id, [session_id], session_id, False)
 
 
-def _history(
-    conn: sqlite3.Connection, ids: Iterable[str]
-) -> dict[str, list[tuple[str, int, str | None]]]:
-    """``aim_history`` rows ``(aim, created_at, set_by)`` per session, oldest first."""
-    out: dict[str, list[tuple[str, int, str | None]]] = {}
+def _history(conn: sqlite3.Connection, ids: Iterable[str]) -> dict[str, list[AimRow]]:
+    """``aim_history`` rows ``(aim, created_at, set_by, id)`` per session, oldest first."""
+    out: dict[str, list[AimRow]] = {}
     for batch in _chunks(ids):
         rows = conn.execute(
-            "SELECT session_id, aim, created_at, set_by FROM aim_history "
+            "SELECT session_id, aim, created_at, set_by, id FROM aim_history "
             f"WHERE session_id IN ({_marks(batch)}) ORDER BY session_id, created_at, id",
             batch,
         ).fetchall()
         for r in rows:
             out.setdefault(str(r["session_id"]), []).append(
-                (str(r["aim"]), int(r["created_at"] or 0), r["set_by"])
+                (str(r["aim"]), int(r["created_at"] or 0), r["set_by"], int(r["id"] or 0))
             )
     return out
 
@@ -199,13 +208,13 @@ def _history(
 def _session_entries(
     sid: str,
     hop: int,
-    history: dict[str, list[tuple[str, int, str | None]]],
+    history: dict[str, list[AimRow]],
     rows: dict[str, sqlite3.Row],
 ) -> list[AimEntry]:
     """*sid*'s own revisions; a session with an AIM but no rows gets one synthesized entry."""
     revisions = history.get(sid)
     if revisions:
-        return [AimEntry(at, aim, by, sid, hop) for aim, at, by in revisions]
+        return [AimEntry(at, aim, by, sid, hop) for aim, at, by, _id in revisions]
     row = rows.get(sid)
     aim = str((row["aim"] if row is not None else "") or "")
     if not aim.strip() or row is None:
@@ -216,7 +225,7 @@ def _session_entries(
 
 def carry_entries(
     path: list[str],
-    history: dict[str, list[tuple[str, int, str | None]]],
+    history: dict[str, list[AimRow]],
     rows: dict[str, sqlite3.Row],
 ) -> list[AimEntry]:
     """The thread's real AIM changes along *path* (oldest first), relay copies dropped.
@@ -248,22 +257,40 @@ def first_line(text: str | None, limit: int) -> str | None:
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
-def user_aim_text(revisions: list[tuple[str, int, str | None]], current: str | None) -> str | None:
-    """The full text :meth:`Store.latest_user_aim` answers, from already-read rows.
+def _source(row: sqlite3.Row | None) -> str:
+    return str((row["handed_off_from"] if row is not None else "") or "").strip()
 
-    The newest ``user`` row; else the current AIM (its trailing tp-id run stripped unless
-    multi-line); else the first row; else None.
+
+def _hand_aim(
+    sid: str, history: dict[str, list[AimRow]], rows: dict[str, sqlite3.Row]
+) -> HandAim | None:
+    """*sid*'s hand-set AIM from already-read rows (None for a session ccc never saw)."""
+    row = rows.get(sid)
+    if row is None:
+        return None
+    source = history.get(_source(row)) if _source(row) else None
+    return aimprov.hand_set_aim(
+        history.get(sid, []), str(row["aim"] or ""), source[0][0] if source else None
+    )
+
+
+def hand_set_aims(conn: sqlite3.Connection, session_ids: Iterable[str]) -> dict[str, HandAim]:
+    """Every id's hand-set AIM (:func:`aimprov.hand_set_aim`), batched and chunked.
+
+    One ``sessions`` read (current AIM, ``handed_off_from``) and one ``aim_history`` read
+    for the ids and their relay sources (the carried-anchor check), each in chunks of
+    ≤ 500 ids. Ids without an answer are absent. Read-only.
     """
-    users = [aim for aim, _at, by in revisions if by == AIM_SET_BY_USER]
-    if users:
-        return users[-1]
-    cur = (current or "").strip()
-    text = cur if "\n" in cur else aimtext.words(cur).strip()
-    if text:
-        return text
-    if revisions and revisions[0][0].strip():
-        return revisions[0][0]
-    return None
+    ids = list(dict.fromkeys(s for s in session_ids if s))
+    rows = _session_rows(conn, ids)
+    sources = [src for sid in ids if (src := _source(rows.get(sid)))]
+    history = _history(conn, dict.fromkeys(ids + sources))
+    out: dict[str, HandAim] = {}
+    for sid in ids:
+        hand = _hand_aim(sid, history, rows)
+        if hand is not None:
+            out[sid] = hand
+    return out
 
 
 @dataclass(frozen=True)
@@ -271,24 +298,29 @@ class ThreadFacts:
     """The per-session thread fields ``ccc sessions -j`` reports."""
 
     thread_id: str
-    user_aim: str | None  # first line, ≤ USER_AIM_MAX
+    user_aim: str | None  # the hand-set AIM's first line, ≤ USER_AIM_MAX
     aims_n: int  # the number of the thread's real AIM changes (before any truncation)
+    user_aim_by: str | None = None  # its stamp: user / launch / relay / None
+    user_aim_tier: str | None = None  # user / unstamped / None (no hand-set AIM)
+    user_aim_at: str | None = None  # ISO UTC the row was written; None when unknown
 
 
 def facts(conn: sqlite3.Connection, session_ids: list[str]) -> dict[str, ThreadFacts]:
     """:class:`ThreadFacts` of every id, batched (the walk, then ONE ``aim_history`` read)."""
     paths, rows = _walk(conn, session_ids)
     members = dict.fromkeys(sid for p in paths.values() for sid in p.path)
+    members.update(dict.fromkeys(src for sid in paths if (src := _source(rows.get(sid)))))
     history = _history(conn, members)
     out: dict[str, ThreadFacts] = {}
     for sid, path in paths.items():
-        row = rows.get(sid)
-        current = str((row["aim"] if row is not None else "") or "")
-        user = user_aim_text(history.get(sid, []), current) if row is not None else None
+        hand = _hand_aim(sid, history, rows)
         out[sid] = ThreadFacts(
             thread_id=path.thread_id,
-            user_aim=first_line(user, USER_AIM_MAX),
+            user_aim=first_line(hand.text, USER_AIM_MAX) if hand else None,
             aims_n=len(carry_entries(path.path, history, rows)),
+            user_aim_by=hand.by if hand else None,
+            user_aim_tier=hand.tier if hand else None,
+            user_aim_at=iso(hand.at_ms) if hand and hand.at_ms else None,
         )
     return out
 
@@ -310,21 +342,23 @@ def thread_aims(conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:
 
     ``{thread_id, thread_exact, current_aim, user_aim, aims: [entry…], truncated}``:
     ``aims`` oldest first, the :data:`MAX_ENTRIES` newest (``truncated`` when cut);
-    ``current_aim`` the session's AIM and ``user_aim`` the latest one the user set (first
-    lines, ≤ :data:`AIM_MAX` / :data:`USER_AIM_MAX`; null when none). Read-only.
+    ``current_aim`` the session's AIM and ``user_aim`` its hand-set AIM
+    (:func:`aimprov.hand_set_aim`; first lines, ≤ :data:`AIM_MAX` / :data:`USER_AIM_MAX`;
+    null when none). Read-only.
     """
     paths, rows = _walk(conn, [session_id])
     path = paths.get(session_id) or ThreadPath(session_id, [session_id], session_id, False)
-    history = _history(conn, path.path)
+    source = _source(rows.get(session_id))
+    history = _history(conn, dict.fromkeys(path.path + ([source] if source else [])))
     entries = carry_entries(path.path, history, rows)
     row = rows.get(session_id)
     current = str((row["aim"] if row is not None else "") or "")
-    user = user_aim_text(history.get(session_id, []), current) if row is not None else None
+    hand = _hand_aim(session_id, history, rows)
     return {
         "thread_id": path.thread_id,
         "thread_exact": path.exact,
         "current_aim": first_line(current, AIM_MAX),
-        "user_aim": first_line(user, USER_AIM_MAX),
+        "user_aim": first_line(hand.text, USER_AIM_MAX) if hand else None,
         "aims": [entry_json(e) for e in entries[-MAX_ENTRIES:]],
         "truncated": len(entries) > MAX_ENTRIES,
     }

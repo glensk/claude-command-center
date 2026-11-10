@@ -198,7 +198,9 @@ def session_entry(
     """One ``sessions[]`` item of the §6 contract (*status* defaults to the registry's).
 
     ``raw_status`` is the raw word *status* was mapped from (default: the registry's).
-    *thread* fills ``thread_id`` / ``user_aim`` / ``aims_n`` (tp#1989; null when unknown).
+    *thread* fills ``thread_id`` / ``user_aim`` / ``aims_n`` (tp#1989) and ``user_aim_by`` /
+    ``user_aim_tier`` / ``user_aim_at`` (the hand-set AIM's provenance, tp#1991); null
+    when unknown.
     """
     from .adapters.claude_agents import contract_status
 
@@ -225,6 +227,9 @@ def session_entry(
         "peer_name": peer or None,
         "user_aim": thread.user_aim if thread else None,
         "aims_n": thread.aims_n if thread else None,
+        "user_aim_by": thread.user_aim_by if thread else None,
+        "user_aim_tier": thread.user_aim_tier if thread else None,
+        "user_aim_at": thread.user_aim_at if thread else None,
     }
 
 

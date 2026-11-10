@@ -1510,8 +1510,11 @@ def _run_hooks_with_retry(  # pylint: disable=too-many-return-statements,too-man
 def _accept_again(store: Store, transfer: Any, as_json: bool) -> int:
     """A duplicate ``accept`` (``accepted``/``finalized``): no hook runs again; it heals a
     crash after the accepted CAS (finalize + closer, both idempotent and token-scoped) and
-    records the thread id a crash before it skipped (tp#1989, idempotent)."""
+    re-runs the idempotent steps a crash before it skipped: the lineage anchor
+    (``carry_first_aim``) and the thread id (tp#1989). Never ``_reconcile_successor_aim``:
+    it would overwrite an AIM the successor changed since (tp#1991)."""
     before = transfer.state
+    store.carry_first_aim(transfer.target_session, transfer.source_session)
     store.record_thread(transfer.target_session, transfer.source_session)
     source = _finalize_after_accept(store, transfer)
     if as_json:

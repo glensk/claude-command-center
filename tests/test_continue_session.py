@@ -714,6 +714,37 @@ def test_a_duplicate_accept_records_the_thread_a_crash_skipped(
         assert successor is not None and successor.thread_id == SID
 
 
+def test_a_duplicate_accept_carries_the_anchor_a_crash_skipped_and_never_reconciles(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1991: a crash right after the accepted CAS skipped ``carry_first_aim``; the
+    duplicate accept re-runs it (once), but never ``_reconcile_successor_aim``: an AIM the
+    successor changed since stays, and a source AIM changed since is not pulled in."""
+    from command_center.transfer_store import ACCEPTED  # pylint: disable=C0415
+
+    with Store() as store:
+        store.set_aim(SID, "build B2: tp#1", set_by=AIM_SET_BY_USER)
+    tid = _opened_transfer(harness)
+    new = _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    with Store() as store:
+        assert store.transition_transfer(tid, ACCEPTED, 1)  # the crash right after the CAS
+        assert [r.aim for r in store.list_aim_history(new)] == ["build B2: tp#1"]
+        store.set_aim(new, "the successor's own goal", set_by=AIM_SET_BY_USER)
+        store.set_aim(SID, "source changed later", set_by=AIM_SET_BY_USER)
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    with Store() as store:
+        assert [(r.aim, r.set_by) for r in store.list_aim_history(new)] == [
+            ("tp#1 shipped", "user"),
+            ("build B2: tp#1", "user"),
+            ("the successor's own goal", "user"),
+        ]
+        successor = store.get(new)
+        assert successor is not None and successor.aim == "the successor's own goal"
+        assert successor.first_aim == "tp#1 shipped"
+
+
 def test_carry_first_aim_passes_the_root_down_the_chain() -> None:
     with Store() as store:
         for sid, aims in (("root", ["goal", "box 1"]), ("mid", ["box 2"]), ("leaf", ["box 3"])):

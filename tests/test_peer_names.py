@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from command_center import session_names
-from command_center.models import Session
+from command_center.models import LiveSession, Session
 from command_center.session_names import (
     PEER_NAME_MAX,
     aim_peer_words,
@@ -13,6 +15,7 @@ from command_center.session_names import (
     dedupe_peer_name,
     peer_name,
 )
+from command_center.store import Store
 
 
 def _session(name: str = "", origin: str = "") -> Session:
@@ -88,3 +91,39 @@ def test_dedupe_keeps_a_suffixed_name_within_the_max() -> None:
     base = clip_words("word " * 20, PEER_NAME_MAX)
     got = dedupe_peer_name(base, {base.casefold()})
     assert got.endswith(" 2") and len(got) <= PEER_NAME_MAX
+
+
+# ---- hook_title names by the hand-set AIM (tp#1991) ---------------------------------
+
+
+def _hook_store(tmp_path: Path, *rows: tuple[str, str | None]) -> Store:
+    store = Store(tmp_path / "ccc.db")
+    store.ensure("s1", cwd="/repo")
+    for i, (aim, by) in enumerate(rows):
+        store.conn.execute(
+            "INSERT INTO aim_history (session_id, aim, score, created_at, set_by) "
+            "VALUES (?,?,?,?,?)",
+            ("s1", aim, -1, 1_800_000_000_000 + i, by),
+        )
+        store.update_fields("s1", aim=aim)
+    store.conn.commit()
+    return store
+
+
+def _lives() -> list[LiveSession]:
+    return [LiveSession(pid=1, session_id="s1", cwd="/repo", kind="interactive", name="repo-ab")]
+
+
+def test_hook_title_ignores_a_newer_tool_row(tmp_path: Path) -> None:
+    store = _hook_store(tmp_path, ("ship the thing: tp#7", "user"), ("tool rewrite", "tool"))
+    assert session_names.hook_title(store, "s1", "repo-ab", _lives) == "ship the thing"
+
+
+def test_hook_title_counts_a_launch_row_and_names_nothing_from_tool_rows_only(
+    tmp_path: Path,
+) -> None:
+    launched = _hook_store(tmp_path, ("typed", "user"), ("launched goal", "launch"))
+    assert session_names.hook_title(launched, "s1", "repo-ab", _lives) == "launched goal"
+    launched.close()
+    tooled = _hook_store(tmp_path / "t", ("tool only", "tool"))
+    assert session_names.hook_title(tooled, "s1", "repo-ab", _lives) is None

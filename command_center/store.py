@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from . import aimtext, automated, config
+from .aimprov import HandAim
 from .aimscore import score_aim_lexical
 from .await_store import AWAIT_SCHEMA, AwaitStoreMixin
 from .bridge_store import (
@@ -2649,6 +2650,17 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         from . import thread  # pylint: disable=import-outside-toplevel  # thread reads the store
 
         return thread.walk(self.conn, session_id).thread_id
+
+    def hand_set_aims(self, session_ids: Iterable[str]) -> dict[str, HandAim]:
+        """Every id's hand-set AIM (the naming rule, :func:`aimprov.hand_set_aim`, tp#1991).
+
+        One batched ``sessions`` and ``aim_history`` read (chunks of ≤ 500 ids,
+        :func:`thread.hand_set_aims`); ids without a hand-set AIM are absent. Not the
+        handover rule — that is :meth:`latest_user_aim`.
+        """
+        from . import thread  # pylint: disable=import-outside-toplevel  # thread reads the store
+
+        return thread.hand_set_aims(self.conn, session_ids)
 
     def record_thread(self, target_id: str, source_id: str) -> bool:
         """Copy *source_id*'s thread id onto its successor *target_id*; True if written.

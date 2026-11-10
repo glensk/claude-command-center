@@ -180,7 +180,7 @@ def peer_name(session: Session | None, user_aim: str | None) -> str | None:
     """The peer name *session* should carry, or ``None`` (Claude Code keeps its own name).
 
     A hand-set ``canonical_name`` (origin ``manual``) wins; else the naming rule
-    (:func:`aim_peer_words`) over *user_aim* (:meth:`Store.latest_user_aim`'s text),
+    (:func:`aim_peer_words`) over *user_aim* (the hand-set AIM, :meth:`Store.hand_set_aims`),
     control characters removed, whitespace collapsed, clipped at a word boundary to
     :data:`PEER_NAME_MAX`. Empty → ``None``.
     """
@@ -226,8 +226,8 @@ def hook_title(
     only then: the session must be a registered interactive one, and the name is deduped
     against every OTHER live session's peer name.
     """
-    latest = store.latest_user_aim(session_id)
-    base = peer_name(store.get(session_id), latest[0] if latest else None)
+    hand = store.hand_set_aims([session_id]).get(session_id)
+    base = peer_name(store.get(session_id), hand.text if hand else None)
     if not base or base == current:
         return None
     lives = list(live_sessions())

@@ -2105,7 +2105,8 @@ in B and no successor row is NULL. `accept` copies the source's first AIM in as 
 successor's `/aim (1)` (`carry_first_aim`, stamp kept, an unstamped one written `relay`) and
 then reconciles once (`_reconcile_successor_aim`, idempotent, same stamps): an AIM the user
 changed in the source between `start` and `accept` replaces the draft's. A duplicate `accept`
-re-runs neither (it never overwrites an AIM the successor changed since). `transfer.source_aim`
+re-runs only `carry_first_aim` (idempotent: heals a crash between the accepted CAS and the
+anchor copy), never the reconcile (it would overwrite an AIM the successor changed since). `transfer.source_aim`
 keeps the source's actual AIM at `start` for audit.
 
 **Who wrote each AIM row (`aim_history.set_by`).** Every writer stamps its row (tp#1566,
@@ -2120,7 +2121,8 @@ tp#1991):
 | NULL     | a pre-history seed (an AIM that predates the history table) and rows written before every writer stamped                                               |
 
 `relay` and NULL both mean "author unknown"; ccc's own handover reads only `user` rows as the
-user's AIM. A `strip-aim-runs` row keeps the stamp of the row it rewrote, and `Store.stamp_of`
+user's AIM. The naming rule (`ccc sessions -j` `user_aim`, the hand-set AIM) counts `launch`
+like `user` and never takes a `tool` row. A `strip-aim-runs` row keeps the stamp of the row it rewrote, and `Store.stamp_of`
 looks through an older `tool` row of that kind to the row before it.
 
 Finalize does NOT touch the source's AIM (it stays exactly as the user set it, history
@@ -3734,15 +3736,28 @@ only supplies the status of listed sessions. Headless `claude -p` runs (registry
 | `tab.validated`        | the registry pid's controlling tty is the tab's tty                                                |
 | `thread_id`            | the thread: the session's handoff chain's root session id (its own id when never handed over)      |
 | `peer_name`            | the name Claude Code gave the process (registry `name`, e.g. `repo-ab`), null when unknown         |
-| `user_aim`             | the latest AIM the user set (first line, ≤ 200 chars; `ccc aim-history` fallbacks), null when none |
+| `user_aim`             | the hand-set AIM (first line, ≤ 200 chars; the rule below), null when none                         |
 | `aims_n`               | the number of the thread's real AIM changes (`ccc aim-history -t`), a cheap change signal          |
+| `user_aim_by`          | the `user_aim` row's `set_by`: `user` / `launch` / `relay` / null (unstamped or pre-history)       |
+| `user_aim_tier`        | `user` (`user`/`launch` row) / `unstamped` (`relay`/NULL row, or a pre-history AIM) / null         |
+| `user_aim_at`          | ISO-8601 UTC the `user_aim` row was written, null when unknown (a pre-history AIM)                 |
 | `agents`               | optional, `-j` only: the session's running background subagents (below)                            |
 
 The thread id (tp#1989) is `sessions.thread_id`, which `continue-session accept` copies from
 the source onto the successor (a failed or never-accepted draft keeps none); without it the
 root is found by the `ccc lineage` walk, so relays from before the column need no backfill.
-`thread_id`, `user_aim` and `aims_n` come from one batched read per call; a failed read leaves
-all three null. A session ccc never saw is its own thread (`aims_n` 0, `user_aim` null).
+`thread_id`, `user_aim`, `aims_n` and the three `user_aim_*` fields come from one batched read
+per call; a failed read leaves all of them null. A session ccc never saw is its own thread
+(`aims_n` 0, `user_aim` and the `user_aim_*` fields null).
+
+**The hand-set AIM** (tp#1991, `aimprov.hand_set_aim`; also `ccc lineage -j`
+`data.thread.user_aim` and the peer name): the newest `aim_history` row stamped `user` or
+`launch` (tier `user`); else the newest row stamped `relay` or unstamped (tier `unstamped`);
+else, for a session with no rows at all, its current AIM (tier `unstamped`, `by` and `at`
+null); else null. A `tool` row never names a session, however new. A relay successor's
+`/aim (1)` anchor (its first row, the copy of the source's first row) is skipped when later
+rows exist, so the root's first AIM never beats the successor's own. This is the naming rule;
+the handover rule (what a successor starts with) stays `Store.latest_user_aim`.
 
 `agents` lists the subagents the session launched in the background that still run, in launch
 order, at most 20. "Running" is the in-flight definition: an `async_launched` agent launch
@@ -3975,8 +3990,9 @@ chars), `aim_full_len` the full text's length, `by` = `user` (`!aim`, `/aim`, TU
 default `ccc set-aim`) / `launch` (the launcher's start AIM) / `tool` (`ccc set-aim --by
 tool`, ccc's own text) / `relay` (a handoff copy of unknown origin) / null (legacy row), `hop` the session's 0-based position on the path. At most the 50
 newest entries; `truncated` when cut. `current_aim` is the session's AIM (first line, ≤ 300),
-`user_aim` its latest user-set AIM (first line, ≤ 200; the newest `user` row, else the current
-AIM without its trailing tp-id run, else the first row). Read-only, computed on read: no
+`user_aim` its hand-set AIM (first line, ≤ 200; the rule under `ccc sessions`: the newest
+`user`/`launch` row, else the newest `relay`/NULL row, else a row-less session's current AIM,
+never a `tool` row). Read-only, computed on read: no
 schema change. `ccc sessions -j` `aims_n` counts these entries (before the 50 cut).
 
 ### `ccc delivery` (`-i/--id ID`, `-j/--json`)

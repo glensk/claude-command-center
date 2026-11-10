@@ -181,3 +181,42 @@ def test_aim_history_thread_text_and_json(
     assert doc["thread_id"] == "root" and len(doc["aims"]) == 3
     assert cli.main(["aim-history", "--session", "s4"]) == 0  # the per-session view stays
     assert "revision" in capsys.readouterr().out
+
+
+# ---- user_aim is the hand-set AIM (tp#1991) ------------------------------------------
+
+
+def test_user_aim_counts_a_newer_launch_row_and_never_a_tool_row(store: Store) -> None:
+    store.ensure("a", cwd="/repo")
+    _row(store, "a", "typed", T0, "user")
+    _row(store, "a", "launched", T0 + 1, "launch")
+    _row(store, "a", "the tool's", T0 + 2, "tool")
+    assert thread.thread_aims(store.conn, "a")["user_aim"] == "launched"
+    hand = thread.facts(store.conn, ["a"])["a"]
+    assert (hand.user_aim, hand.user_aim_by, hand.user_aim_tier) == ("launched", "launch", "user")
+    assert hand.user_aim_at == bridge_lineage.iso(T0 + 1)
+
+
+def test_user_aim_of_only_tool_rows_is_null_not_the_current_aim(store: Store) -> None:
+    store.ensure("a", cwd="/repo")
+    _row(store, "a", "the tool's", T0, "tool")
+    doc = thread.thread_aims(store.conn, "a")
+    assert doc["user_aim"] is None and doc["current_aim"] == "the tool's"
+    hand = thread.facts(store.conn, ["a"])["a"]
+    assert hand.user_aim is None and hand.user_aim_tier is None and hand.user_aim_by is None
+
+
+def test_a_successors_relay_rows_beat_its_carried_anchor(store: Store) -> None:
+    store.ensure("root", cwd="/repo")
+    _row(store, "root", "root goal", T0, "launch")
+    store.ensure("next", cwd="/repo")
+    store.update_fields("next", handed_off_from="root")
+    _row(store, "next", "handed over", T0 + HOUR, "relay")
+    assert store.carry_first_aim("next", "root")  # the backdated launch-stamped anchor
+    assert thread.thread_aims(store.conn, "next")["user_aim"] == "handed over"
+    hand = thread.facts(store.conn, ["next"])["next"]
+    assert (hand.user_aim, hand.user_aim_by, hand.user_aim_tier) == (
+        "handed over",
+        "relay",
+        "unstamped",
+    )
