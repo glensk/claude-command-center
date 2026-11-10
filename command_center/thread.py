@@ -189,12 +189,18 @@ def walk(conn: sqlite3.Connection, session_id: str) -> ThreadPath:
     return paths.get(session_id) or ThreadPath(session_id, [session_id], session_id, False)
 
 
-def _history(conn: sqlite3.Connection, ids: Iterable[str]) -> dict[str, list[AimRow]]:
-    """``aim_history`` rows ``(aim, created_at, set_by, id)`` per session, oldest first."""
+def _history(
+    conn: sqlite3.Connection, ids: Iterable[str], *, set_by: bool = True
+) -> dict[str, list[AimRow]]:
+    """``aim_history`` rows ``(aim, created_at, set_by, id)`` per session, oldest first.
+
+    *set_by* False reads a store from before the ``set_by`` column: every stamp is None.
+    """
+    stamp = "set_by" if set_by else "NULL AS set_by"
     out: dict[str, list[AimRow]] = {}
     for batch in _chunks(ids):
         rows = conn.execute(
-            "SELECT session_id, aim, created_at, set_by, id FROM aim_history "
+            f"SELECT session_id, aim, created_at, {stamp}, id FROM aim_history "
             f"WHERE session_id IN ({_marks(batch)}) ORDER BY session_id, created_at, id",
             batch,
         ).fetchall()
@@ -274,17 +280,20 @@ def _hand_aim(
     )
 
 
-def hand_set_aims(conn: sqlite3.Connection, session_ids: Iterable[str]) -> dict[str, HandAim]:
+def hand_set_aims(
+    conn: sqlite3.Connection, session_ids: Iterable[str], *, set_by: bool = True
+) -> dict[str, HandAim]:
     """Every id's hand-set AIM (:func:`aimprov.hand_set_aim`), batched and chunked.
 
     One ``sessions`` read (current AIM, ``handed_off_from``) and one ``aim_history`` read
     for the ids and their relay sources (the carried-anchor check), each in chunks of
-    ≤ 500 ids. Ids without an answer are absent. Read-only.
+    ≤ 500 ids. Ids without an answer are absent. Read-only. *set_by* False: the store has
+    no ``set_by`` column yet (every row reads unstamped).
     """
     ids = list(dict.fromkeys(s for s in session_ids if s))
     rows = _session_rows(conn, ids)
     sources = [src for sid in ids if (src := _source(rows.get(sid)))]
-    history = _history(conn, dict.fromkeys(ids + sources))
+    history = _history(conn, dict.fromkeys(ids + sources), set_by=set_by)
     out: dict[str, HandAim] = {}
     for sid in ids:
         hand = _hand_aim(sid, history, rows)

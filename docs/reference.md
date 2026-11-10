@@ -83,7 +83,7 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 - `ccc rm` · `ccc prune` — drop a tracked row / delete leftovers (contentless, headless `claude -p`, and dead-launched jobs that never had a turn).
 - `ccc peek` (`--print`) · `ccc jump` — the macOS peek panel / the ccc↔session toggle.
 - `ccc snapshot` (`-l/--list`, `-n/--dry-run`) · `ccc restore-snapshot [name]` (`-n/--dry-run`, `-y/--yes`) — save the whole iTerm layout before a reboot, rebuild it afterwards.
-- `ccc sessions` · `ccc inspect` · `ccc send` · `ccc answer` · `ccc close` · `ccc lineage` · `ccc delivery` · `ccc events` · `ccc name` (all `-j`) — the voice-bridge JSON CLI: list, read, message, answer and close live sessions, list a session's predecessors; see "The voice-bridge JSON CLI" below.
+- `ccc sessions` · `ccc inspect` · `ccc send` · `ccc answer` · `ccc close` · `ccc lineage` · `ccc user-aims` · `ccc delivery` · `ccc events` · `ccc name` (all `-j`) — the voice-bridge JSON CLI: list, read, message, answer and close live sessions, list a session's predecessors, every session's hand-set AIM and done flag; see "The voice-bridge JSON CLI" below.
 
 **Obsidian & mirrors**
 
@@ -3670,7 +3670,7 @@ converge via `observed_at` ordering.
 Machine-facing commands (no TUI key) that the mac-voice Claude bridge (my-stt-tts
 `claude_sessions.py` / `attention.py`) and other agents drive to list, read, message and
 answer live Claude Code sessions. Code: `command_center/bridge_cli.py` and the
-`bridge_{json,target,inspect,send,answer,close,lineage,delivery,events,store}.py` modules beside it.
+`bridge_{json,target,inspect,send,answer,close,lineage,aims,delivery,events,store}.py` modules beside it.
 
 ```commands
 ccc sessions -j                                    # every live session of every account
@@ -3682,6 +3682,8 @@ echo '{"decision_id": "…", "answers": [{"question_index": 0, "option_indices":
 ccc close -s <session-id> -j                       # close an IDLE session (decide's close)
 ccc close -s <session-id> -A <agent> -j            # … a session bound to staff agent <agent>
 ccc lineage -s <session-id> -j                     # its continue-session predecessors
+ccc user-aims -j -d 400                            # every session's hand-set AIM + done flag
+ccc user-aims -j -s <session-id> -s <session-id>   # … of just these sessions
 ccc delivery -i <delivery-id> -j                   # follow one send up
 ccc events -a 0 -l 200 -j                          # the problem stream after a cursor
 ```
@@ -3994,6 +3996,34 @@ newest entries; `truncated` when cut. `current_aim` is the session's AIM (first 
 `user`/`launch` row, else the newest `relay`/NULL row, else a row-less session's current AIM,
 never a `tool` row). Read-only, computed on read: no
 schema change. `ccc sessions -j` `aims_n` counts these entries (before the 50 cut).
+
+### `ccc user-aims` (`-d/--days N`, default 400; `-s/--session SID`, repeatable; `-j/--json`)
+
+Every session's hand-set AIM and done flag, closed sessions included (tp#1991; the bulk read
+decide's relay backfill uses instead of reading `state.db`). Code: `bridge_aims.py`.
+Read-only in every sense: its own `sqlite3` connection on a `file:…?mode=ro` URI (2 s busy
+timeout), never the migrating `Store`; a missing `state.db` answers an empty list. Window:
+the sessions whose `updated_at` lies in the last `-d` days (1 ≤ N ≤ 3650); `-s` (full ids, at
+most 200, more is a usage error, exit 2) overrides the window. Newest `updated_at` first; an
+unknown `-s` id comes last with every field null and `known: false`. A session with neither a
+hand-set nor a current AIM is still listed (nulls; its `done` counts). `data = {sessions:
+[...], as_of}`, each item:
+
+| Field           | Meaning                                                                                  |
+| :-------------- | :--------------------------------------------------------------------------------------- |
+| `session_id`    | the Claude session id                                                                    |
+| `known`         | `true` for a ccc row; `false` for an `-s` id ccc has no row for (every other field null)  |
+| `user_aim`      | the hand-set AIM (first line, ≤ 200 chars; the rule under `ccc sessions`), null when none |
+| `user_aim_by`   | its row's `set_by`: `user` / `launch` / `relay` / null (unstamped or pre-history)        |
+| `user_aim_tier` | `user` / `unstamped` / null (no hand-set AIM: only `tool` rows, or no AIM at all)         |
+| `user_aim_at`   | ISO-8601 UTC the row was written, null when unknown                                      |
+| `current_aim`   | the session's current AIM (first line, ≤ 300 chars), null when none                      |
+| `done`          | ccc's DONE flag (`true` / `false`)                                                       |
+| `updated_at`    | ISO-8601 UTC of the row's last update                                                    |
+
+`as_of` is the ISO-8601 UTC time of the read. A store from before the `set_by` column reads
+every row unstamped (`user_aim_by` null). Without `-j`: one line per session, `sid8  tier
+by  done  aim`. Example: `ccc user-aims -j -s <session-id>`.
 
 ### `ccc delivery` (`-i/--id ID`, `-j/--json`)
 

@@ -45,6 +45,9 @@ A staff-bound session closes only with ``-A/--staff-agent A`` naming its bound a
 ``ccc lineage -s ID -j`` lists a session's continue-session predecessors, newest first
 (tp#1481, :mod:`command_center.bridge_lineage`; read-only, ≤ 50 hops, cycle guard).
 
+``ccc user-aims -j`` lists every session's hand-set AIM and done flag, closed ones too
+(tp#1991, :mod:`command_center.bridge_aims`; read-only ``mode=ro`` connection).
+
 ``inspect`` / ``send`` / ``answer`` / ``delivery`` / ``events`` read a session's
 transcript, type into its tab and follow deliveries up (``bridge_inspect`` …
 ``bridge_events``). Message text travels on stdin only. Without ``-j`` the same data is
@@ -107,7 +110,18 @@ if TYPE_CHECKING:
 
 # Subcommands whose argv errors are answered with an envelope (see :func:`dispatch`).
 JSON_COMMANDS: frozenset[str] = frozenset(
-    {"sessions", "name", "inspect", "send", "answer", "delivery", "events", "close", "lineage"}
+    {
+        "sessions",
+        "name",
+        "inspect",
+        "send",
+        "answer",
+        "delivery",
+        "events",
+        "close",
+        "lineage",
+        "user-aims",
+    }
 )
 
 _AIM_SHORT_MAX = 80
@@ -661,6 +675,10 @@ def add_parsers(sub: Any) -> None:
     p_name.set_defaults(func=_name_entry)
 
     _add_transcript_parsers(sub)
+
+    from . import bridge_aims
+
+    bridge_aims.add_parser(sub)
 
 
 def _name_entry(args: argparse.Namespace) -> int:
