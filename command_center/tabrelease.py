@@ -24,6 +24,10 @@ The badge cache gets the same treatment (:func:`sweep_badges`): a ``<slug>`` fil
 UUID is gone past the grace and that no alive-or-unknown row protects is removed with its
 ``.dir`` sidecar, under the ``.lock`` :func:`tabsymbol.assign` takes, so its palette slot is
 free again instead of ``assign`` stealing a live tab's badge.
+
+The tab colour cache (``~/.cache/iterm-tab-rgb/``, :func:`sweep_rgb`, tp#1992) follows the
+same rule: a colour file and its ``.manual`` marker go once their UUID is gone past the
+grace and unprotected. Its shell writers take no lock, so a fresh-mtime guard replaces one.
 """
 
 from __future__ import annotations
@@ -492,6 +496,7 @@ class ReleaseResult:
     released: list[TabbedRow] = field(default_factory=list)  # unbound (dry: would be)
     refused: list[TabbedRow] = field(default_factory=list)  # the CAS saw changed evidence
     removed: list[Path] = field(default_factory=list)  # badge files removed (dry: would be)
+    removed_rgb: list[Path] = field(default_factory=list)  # colour files + markers (ditto)
 
 
 def _live_ids(live: Mapping[str, LiveSession] | Iterable[str]) -> set[str]:
@@ -530,17 +535,21 @@ def release_gone(  # pylint: disable=too-many-arguments,too-many-locals
     now: int | None = None,
     alive: Callable[[int], bool] | None = None,
     directory: Path | None = None,
+    rgb_directory: Path | None = None,
     log: MissingLog | None = None,
 ) -> ReleaseResult:
     """Release the tab binding and badge of every row whose tab is gone and process dead.
 
     Fail closed: no reliable pane read → ``skipped`` and nothing written (DB, badge cache,
-    missing log). Otherwise the read is folded into the missing log (when *record*, which
-    defaults to ``not dry_run``), each tabbed row gets a :class:`RowVerdict`, releasable rows
-    go through :meth:`Store.release_tab` (a CAS that re-probes the pid) and the badge cache
-    is swept under its ``.lock``. *dry_run* writes neither the DB nor the cache and reports
-    what would happen. The rows themselves always stay (parked rows stay resumable).
+    colour cache, missing log). Otherwise the read is folded into the missing log (when
+    *record*, which defaults to ``not dry_run``), each tabbed row gets a
+    :class:`RowVerdict`, releasable rows go through :meth:`Store.release_tab` (a CAS that
+    re-probes the pid), the badge cache is swept under its ``.lock`` and the tab colour
+    cache (*rgb_directory*, default :func:`colors.tab_rgb_dir`) by the same rule plus the
+    fresh-mtime guard. *dry_run* writes neither the DB nor a cache and reports what would
+    happen. The rows themselves always stay (parked rows stay resumable).
     """
+    from .colors import tab_rgb_dir  # lazy
     from .models import now_ms as _now_ms  # lazy
     from .tabsymbol import cache_dir  # lazy
 
@@ -552,9 +561,10 @@ def release_gone(  # pylint: disable=too-many-arguments,too-many-locals
     stamp = _now_ms() if now is None else now
     probe = alive or _default_alive
     cache = cache_dir() if directory is None else directory
+    rgb_dir = tab_rgb_dir() if rgb_directory is None else rgb_directory
     live_ids = _live_ids(live)
     rows = store.list_tabbed_sessions()
-    referenced = set(iter_uuids(rows)) | set(badge_files(cache))
+    referenced = set(iter_uuids(rows)) | set(badge_files(cache)) | set(rgb_files(rgb_dir))
     missing = (log or MissingLog()).observe(
         referenced, present, stamp, write=(not dry_run) if record is None else record
     )
@@ -564,6 +574,7 @@ def release_gone(  # pylint: disable=too-many-arguments,too-many-locals
         result.released = releasable
         guarded = protected_uuids(rows, live_ids, probe)
         result.removed = stale_badge_files(cache, missing, guarded, stamp)
+        result.removed_rgb = stale_rgb_files(rgb_dir, missing, guarded, stamp)
         return result
     for row in releasable:
         pid = row.last_seen_pid or 0
@@ -572,10 +583,11 @@ def release_gone(  # pylint: disable=too-many-arguments,too-many-locals
         else:
             result.refused.append(row)
     # Re-read after the CAS writes: a row that re-bound or came alive meanwhile protects
-    # its badge, and so does every refused row (its evidence changed under us).
+    # its badge and colour file, and so does every refused row (its evidence changed).
     guarded = protected_uuids(store.list_tabbed_sessions(), live_ids, probe)
     guarded |= set(iter_uuids(result.refused))
     result.removed = sweep_badges(cache, missing, guarded, stamp)
+    result.removed_rgb = sweep_rgb(rgb_dir, missing, guarded, stamp)
     return result
 
 
@@ -618,7 +630,8 @@ def report_lines(result: ReleaseResult) -> list[str]:
     removed = "would remove" if result.dry_run else "removed"
     lines.append(
         f"{verb} {len(result.released)} tab binding(s), {removed} {len(result.removed)} "
-        f"badge file(s); {len(result.refused)} refused, {present} row(s) on a present tab"
+        f"badge file(s) and {len(result.removed_rgb)} colour file(s); "
+        f"{len(result.refused)} refused, {present} row(s) on a present tab"
     )
     return lines
 
@@ -626,9 +639,10 @@ def report_lines(result: ReleaseResult) -> list[str]:
 def cli_report(*, release: bool) -> int:
     """``ccc tab-symbol -g`` (``release=False``) / ``-G`` (``release=True``); always exit 0.
 
-    ``-g`` is a preview: it writes neither the DB nor the badge cache, but DOES record the
-    pane read in the missing log, so two previews ≥ the grace apart show what ``-G`` (or
-    the daemon) would release. ``-G`` runs the release now, exactly like a daemon pass.
+    ``-g`` is a preview: it writes neither the DB nor a cache (badge, colour), but DOES
+    record the pane read in the missing log, so two previews ≥ the grace apart show what
+    ``-G`` (or the daemon) would release or remove. ``-G`` runs the release now, exactly
+    like a daemon pass.
     """
     from .adapters.claude import ClaudeAdapter  # lazy
     from .store import Store  # lazy

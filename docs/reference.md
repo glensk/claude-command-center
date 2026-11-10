@@ -2495,8 +2495,8 @@ ccc tab-symbol --sync     # ensure every tracked live tab has a badge AND its ti
 ccc tab-symbol --heal     # prefix the badge onto every tab title renamed in iTerm (one pass)
 ccc tab-symbol --watch    # --heal every 2 s until killed (the <prefix>.ccc-tab-watch agent)
 ccc tab-symbol --palette  # print the badge pool (llm-staff's lint keeps agent symbols out of it)
-ccc tab-symbol -g         # --gone: preview the dead rows on gone tabs (no row or badge written)
-ccc tab-symbol -G         # --release-gone: release them now (what every daemon pass does)
+ccc tab-symbol -g         # --gone: preview dead rows + cache files of gone tabs (nothing removed)
+ccc tab-symbol -G         # --release-gone: release/remove them now (what every daemon pass does)
 ```
 
 **Dead rows on gone tabs release their tab** (tp#1990). A row keeps its tab id after the tab
@@ -2511,8 +2511,11 @@ running, a failed read or an empty pane list skip the pass with nothing written.
 is a compare-and-swap that clears only the tab id and its title state; the row stays with
 its status, AIM and `closed_at`, resumable, and the next hook event in a new tab re-stamps it
 (its first title write there is unconditional). `-g` lists each row on a missing tab (short
-id, status, tab, missing age, release or keep reason) and writes only the missing-since
-stamps; `ccc daemon -v` prints a `tab-release:` line per released row.
+id, status, tab, missing age, release or keep reason), then a counts line with the badge and
+colour files that would go, and writes only the missing-since stamps; `ccc daemon -v` prints a
+`tab-release:` line per released row. The same pass also sweeps the badge cache and the tab
+colour cache `~/.cache/iterm-tab-rgb/` (tp#1992; both below): every UUID a row, a badge file
+or a colour file names gets a missing clock, so a shell tab without a row is judged too.
 
 **Staff agents wear their own symbol** (tp#1288). A session that ran `staff adopt -a
 <agent>` (tp's binding `~/.cache/tp/session-role/<sid>`, the same one behind the status
@@ -2563,6 +2566,19 @@ The same release pass sweeps this cache under the `.lock` `assign` takes: a badg
 protects is removed, so its slot is free instead of `assign` stealing a live tab's badge.
 Files of present panes (shell tabs without a row included), `.lock` and other names are
 never touched.
+The pass sweeps the `~/.cache/iterm-tab-rgb/` colour cache by the same rule (tp#1992): a
+colour file `<slug>` and its `<slug>.manual` marker go once their tab is gone past the grace
+and no alive-or-unknown row (nor a row whose release the compare-and-swap refused) protects
+it. The shell writers (`chpwd` hook, the manual colour helper, the status line) take no lock, so
+there is none here either; instead a **fresh-mtime guard** keeps a UUID's files whenever any
+of them was modified within the last 10 minutes (all-or-nothing per UUID, so a marker never
+outlives its colour file; the colour file is unlinked first). Odd names (no tab UUID), temp
+files and directories are never touched, a missing directory is never created, and a file
+recreated after a sweep (e.g. by a TUI colour dedupe from a stale snapshot) is kept one more
+grace, then removed. A missing colour file costs at most one fallback render (repo colour).
+Accepted risk: an iTerm session the pane read does not list (a buried session, reachable only
+through its window) counts as gone, so after the grace it loses its badge (since tp#1990) and
+its `.manual` colour pin; its colour file comes back on its next `cd`, the pin does not.
 
 The `chpwd` hook only fires on `cd`, which never happens while `claude` holds the
 foreground — so a badge **assigned mid-session** (e.g. a tab opened before the

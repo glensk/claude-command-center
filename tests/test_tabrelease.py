@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -639,6 +640,125 @@ def test_release_cas_refusal_keeps_the_binding_and_the_badge(
     assert not result.removed and len(_names(directory) - {".lock"}) == 4
 
 
+# ---- tp#1992 B2: the colour cache inside the effectful pass -----------------------------
+@pytest.mark.parametrize(("running", "panes"), [(False, [_PRESENT]), (True, None), (True, [])])
+def test_release_rgb_unreliable_read_removes_no_colour_file_and_keeps_the_log(
+    world: tuple[Store, MissingLog, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    running: bool,
+    panes: list[str] | None,
+) -> None:
+    store, log, _directory = world
+    files = [*_rgb(_GONE, manual=True), *_rgb(_OTHER)]
+    log.save({_GONE.upper(): _T0, _OTHER.upper(): _T0})  # clocks already past the grace
+    before = log.path.read_text(encoding="utf-8")
+    _Iterm(monkeypatch, panes).running = running
+    result = _run(store, log, _T0 + _GRACE)
+    assert result.skipped and not result.removed_rgb
+    assert all(p.exists() for p in files)
+    assert log.path.read_text(encoding="utf-8") == before
+
+
+def test_release_rgb_stamps_unreferenced_colour_uuids_then_removes_them(
+    world: tuple[Store, MissingLog, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, log, _directory = world
+    gone = _rgb(_OTHER, manual=True)  # a shell tab without a row or badge
+    kept = _rgb(_PRESENT, manual=True)  # the present pane's own colour
+    _Iterm(monkeypatch, [_PRESENT])
+    first = _run(store, log, _T0)
+    assert not first.removed_rgb and all(p.exists() for p in gone)
+    assert log.load() == {_GONE.upper(): _T0, _OTHER.upper(): _T0}  # not pruned
+    second = _run(store, log, _T0 + _GRACE)
+    assert second.removed_rgb == gone and not any(p.exists() for p in gone)
+    assert all(p.exists() for p in kept)
+    third = _run(store, log, _T0 + 2 * _GRACE)
+    assert not third.removed_rgb
+    assert not log.load()  # nothing references either UUID any more: pruned
+    assert _names(colors.tab_rgb_dir()) == {p.name for p in kept}
+
+
+def test_release_rgb_dry_run_lists_and_deletes_nothing(
+    world: tuple[Store, MissingLog, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, log, _directory = world
+    files = [*_rgb(_GONE, manual=True), *_rgb(_OTHER)]
+    kept = _rgb(_PRESENT)
+    log.save({_GONE.upper(): _T0, _OTHER.upper(): _T0})
+    _Iterm(monkeypatch, [_PRESENT])
+    result = _run(store, log, _T0 + _GRACE, dry_run=True)
+    assert sorted(result.removed_rgb) == sorted(files)
+    assert all(p.exists() for p in files + kept)
+    assert (
+        "would remove 1 badge file(s) and 3 colour file(s)" in tabrelease.report_lines(result)[-1]
+    )
+
+
+def test_release_rgb_explicit_directory_is_swept(
+    world: tuple[Store, MissingLog, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store, log, _directory = world
+    other_dir = tmp_path / "elsewhere-rgb"
+    other_dir.mkdir()
+    colour = other_dir / f"w0t1p0_{_OTHER}"
+    colour.write_text("1;2;3\n", encoding="utf-8")
+    _set_mtime(colour, _OLD)
+    default = _rgb(_OTHER)  # the default dir is not consulted when one is given
+    log.save({_OTHER.upper(): _T0})
+    _Iterm(monkeypatch, [_PRESENT])
+    result = release_gone(
+        store, {}, dry_run=False, now=_T0 + _GRACE, alive=_dead, log=log, rgb_directory=other_dir
+    )
+    assert result.removed_rgb == [colour] and not colour.exists()
+    assert all(p.exists() for p in default)
+
+
+def test_release_rgb_cas_refused_row_protects_its_colour_file(
+    world: tuple[Store, MissingLog, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, log, _directory = world
+    files = _rgb(_GONE, manual=True)
+    log.save({_GONE.upper(): _T0})
+    _Iterm(monkeypatch, [_PRESENT])
+    # The pass probe says dead (releasable); the CAS re-probe says alive (refused). The
+    # re-read protection uses the pass probe, so only the refused-row guard keeps the file.
+    monkeypatch.setattr("command_center.store.pid_alive", lambda _pid: True)
+    result = _run(store, log, _T0 + _GRACE)
+    assert [r.session_id for r in result.refused] == ["dead"]
+    assert not result.removed_rgb and all(p.exists() for p in files)
+
+
+def test_release_rgb_recreated_file_is_kept_one_grace_then_removed(
+    world: tuple[Store, MissingLog, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, log, _directory = world
+    _rgb(_OTHER, manual=True)
+    _Iterm(monkeypatch, [_PRESENT])
+    _run(store, log, _T0)  # starts the clock
+    assert len(_run(store, log, _T0 + _GRACE).removed_rgb) == 2
+    # A stale TUI dedupe snapshot writes the colour file and marker again right after.
+    again = _rgb(_OTHER, manual=True, mtime_ms=_T0 + _GRACE + 1)
+    kept = _run(store, log, _T0 + 2 * _GRACE)
+    assert not kept.removed_rgb and all(p.exists() for p in again)  # fresh: kept
+    assert log.load().get(_OTHER.upper()) == _T0  # still referenced, clock unchanged
+    later = _run(store, log, _T0 + 3 * _GRACE)
+    assert later.removed_rgb == again and not any(p.exists() for p in again)
+
+
+def test_report_lines_count_colour_files_in_both_wordings() -> None:
+    files = [Path("w0t1p0_x"), Path("w0t1p0_x.manual"), Path("w1t1p0_y")]
+    dry = ReleaseResult(dry_run=True, removed=[Path("b")], removed_rgb=files)
+    assert tabrelease.report_lines(dry)[-1] == (
+        "would release 0 tab binding(s), would remove 1 badge file(s) and 3 colour file(s); "
+        "0 refused, 0 row(s) on a present tab"
+    )
+    real = ReleaseResult(dry_run=False, removed_rgb=files[:1])
+    assert tabrelease.report_lines(real)[-1] == (
+        "released 0 tab binding(s), removed 0 badge file(s) and 1 colour file(s); "
+        "0 refused, 0 row(s) on a present tab"
+    )
+
+
 # ---- B4: ``ccc tab-symbol -g/--gone`` and ``-G/--release-gone`` ----------------------
 
 
@@ -651,6 +771,10 @@ def _cli_world(monkeypatch: pytest.MonkeyPatch) -> Iterator[Store]:
     _store_row(store, "deadbeef-row", _GONE, _DEAD_PID)
     _store_row(store, "here", _PRESENT, _DEAD_PID)
     _badge(tabsymbol.cache_dir(), _GONE.upper(), tabsymbol.PALETTE[0])
+    # The CLI runs on the real clock, so the colour files get mtimes one day before it.
+    old = time.time_ns() // 1_000_000 - 86_400_000
+    _rgb(_GONE, manual=True, mtime_ms=old)
+    _rgb(_PRESENT, mtime_ms=old)  # the present pane's colour: never touched
     MissingLog().save({_GONE.upper(): 1})  # missing since the epoch: far past the grace
     yield store
     store.close()
@@ -664,9 +788,14 @@ def test_cli_gone_previews_and_writes_no_row_or_badge(
     out = capsys.readouterr().out
     assert "deadbeef  parked" in out and "11111111" in out and "would release" in out
     assert "here" not in out  # a row on a present tab is only counted
-    assert "would release 1 tab binding(s), would remove 1 badge file(s)" in out
+    assert (
+        "would release 1 tab binding(s), would remove 1 badge file(s) and 2 colour file(s); "
+        "0 refused" in out
+    )
     assert _iid(cli_world, "deadbeef-row") == f"w0t1p0:{_GONE}"
     assert any(badge_uuid(n) == _GONE.upper() for n in _names(tabsymbol.cache_dir()))
+    assert {rgb_uuid(n) for n in _names(colors.tab_rgb_dir())} == {_GONE.upper(), _PRESENT.upper()}
+    assert len(_names(colors.tab_rgb_dir())) == 3  # colour file + marker + present: all kept
 
 
 @pytest.mark.parametrize("flag", ["-G", "--release-gone"])
@@ -675,11 +804,17 @@ def test_cli_release_gone_releases_now(
 ) -> None:
     assert cli.main(["tab-symbol", flag]) == 0
     out = capsys.readouterr().out
-    assert "released 1 tab binding(s), removed 1 badge file(s); 0 refused" in out
+    assert (
+        "released 1 tab binding(s), removed 1 badge file(s) and 2 colour file(s); 0 refused" in out
+    )
     assert _iid(cli_world, "deadbeef-row") is None
     assert _iid(cli_world, "here") == f"w0t1p0:{_PRESENT}"
+    assert {rgb_uuid(n) for n in _names(colors.tab_rgb_dir())} == {_PRESENT.upper()}
     assert cli.main(["tab-symbol", "-G"]) == 0  # a second run releases nothing
-    assert "released 0 tab binding(s), removed 0 badge file(s)" in capsys.readouterr().out
+    assert (
+        "released 0 tab binding(s), removed 0 badge file(s) and 0 colour file(s)"
+        in capsys.readouterr().out
+    )
 
 
 def test_cli_gone_without_iterm_says_skipped(
@@ -699,6 +834,7 @@ def test_cli_gone_flags_are_exclusive_and_documented(capsys: pytest.CaptureFixtu
     assert exc.value.code == 0
     out = capsys.readouterr().out
     assert "-g, --gone" in out and "-G, --release-gone" in out
+    assert "colour" in out and ".manual" in out  # tp#1992: the colour cache sweep
 
 
 def test_report_lines_formats_ages_and_reasons() -> None:

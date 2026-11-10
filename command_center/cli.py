@@ -6188,15 +6188,17 @@ def _add_tab_symbol(sub: Any) -> None:
         "--gone",
         action="store_true",
         help="preview the rows whose iTerm tab is gone (missing >= 10 min) and whose process "
-        "is dead: short id, status, tab, missing age, release or keep reason; writes no row "
-        "or badge (only the missing-since log)",
+        "is dead: short id, status, tab, missing age, release or keep reason, plus the "
+        "badge and tab colour cache files (~/.cache/iterm-tab-rgb/, colour + .manual) of "
+        "gone tabs that would go; writes no row, badge or colour file (only the "
+        "missing-since log)",
     )
     gone.add_argument(
         "-G",
         "--release-gone",
         action="store_true",
-        help="release those rows' tab binding and badge now (what each daemon pass does); "
-        "the rows stay, resumable",
+        help="release those rows' tab binding and badge now and remove the gone tabs' colour "
+        "cache files (what each daemon pass does); the rows stay, resumable",
     )
     p_sym.set_defaults(func=cmd_tab_symbol)
 
