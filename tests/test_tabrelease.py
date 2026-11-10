@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import cli, iterm_api, tab_titles, tabrelease, tabsymbol
+from command_center import cli, colors, iterm_api, tab_titles, tabrelease, tabsymbol
 from command_center.models import LiveSession, TabbedRow
 from command_center.store import Store
 from command_center.tab_titles import ItermPane
@@ -20,8 +20,12 @@ from command_center.tabrelease import (
     gone_rows,
     protected_uuids,
     release_gone,
+    rgb_files,
+    rgb_uuid,
     stale_badge_files,
+    stale_rgb_files,
     sweep_badges,
+    sweep_rgb,
     update_missing,
 )
 
@@ -282,6 +286,192 @@ def test_sweep_frees_slots_so_assign_does_not_steal_a_live_badge() -> None:
 def test_sweep_of_a_missing_cache_dir_is_a_noop(tmp_path: Path) -> None:
     assert not sweep_badges(tmp_path / "nope", {_GONE.upper(): _T0}, set(), _T0 + _GRACE)
     assert not (tmp_path / "nope").exists()
+
+
+# ---- tp#1992 B1: the tab colour cache sweep ------------------------------------------
+# Every rgb file gets an explicit mtime relative to the injected clock (never its real
+# creation time, which would make the fresh-mtime guard depend on the calendar date).
+_OLD = _T0 - 2 * _GRACE  # an mtime well past the grace at ``_T0 + _GRACE``
+_NOW = _T0 + _GRACE  # the gone UUIDs below have been missing exactly one grace
+_PRESENT_RGB = "44444444-0000-4000-8000-000000000004"  # a present pane: never in the log
+
+
+def _set_mtime(path: Path, mtime_ms: int) -> None:
+    os.utime(path, ns=(mtime_ms * 1_000_000, mtime_ms * 1_000_000))
+
+
+def _rgb(
+    uuid: str,
+    *,
+    window: int = 0,
+    manual: bool = False,
+    colour: bool = True,
+    mtime_ms: int = _OLD,
+    marker_mtime_ms: int | None = None,
+) -> list[Path]:
+    directory = colors.tab_rgb_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    slug = directory / f"w{window}t1p0_{uuid}"
+    made: list[Path] = []
+    if colour:
+        slug.write_text("10;20;30\n", encoding="utf-8")
+        _set_mtime(slug, mtime_ms)
+        made.append(slug)
+    if manual:
+        marker = slug.with_name(slug.name + ".manual")
+        marker.write_text("", encoding="utf-8")
+        _set_mtime(marker, mtime_ms if marker_mtime_ms is None else marker_mtime_ms)
+        made.append(marker)
+    return made
+
+
+def test_rgb_dir_is_redirected_under_tmp_path(tmp_path: Path) -> None:
+    assert colors.tab_rgb_dir() == tmp_path / "iterm-tab-rgb"
+    assert not colors.tab_rgb_dir().exists()  # the redirect does not create it
+
+
+def test_rgb_uuid_parses_colour_files_and_markers_only() -> None:
+    assert rgb_uuid(f"w0t1p0_{_GONE}") == _GONE.upper()
+    assert rgb_uuid(f"w0t1p0_{_GONE.lower()}.manual") == _GONE.upper()
+    odd = (
+        "w9t9p9_PATHTEST",
+        f"w0t1p0_{_GONE}.tmp",
+        f"w0t1p0_{_GONE}.manual.tmp",
+        f".w0t1p0_{_GONE}",
+        _GONE,
+        "notes.txt",
+    )
+    for name in odd:
+        assert rgb_uuid(name) is None
+
+
+def test_rgb_sweep_removes_gone_colour_file_and_marker_past_grace() -> None:
+    files = _rgb(_GONE, manual=True)
+    removed = sweep_rgb(colors.tab_rgb_dir(), {_GONE.upper(): _T0}, set(), _NOW)
+    assert removed == files  # the colour file goes first, then its .manual
+    assert files[1].name.endswith(".manual")
+    assert not any(p.exists() for p in files)
+
+
+def test_rgb_sweep_removes_an_orphan_marker_of_a_gone_uuid() -> None:
+    files = _rgb(_GONE, manual=True, colour=False)
+    assert [p.name.endswith(".manual") for p in files] == [True]
+    assert sweep_rgb(colors.tab_rgb_dir(), {_GONE.upper(): _T0}, set(), _NOW) == files
+    assert not files[0].exists()
+
+
+def test_rgb_sweep_keeps_present_inside_grace_and_protected_files() -> None:
+    directory = colors.tab_rgb_dir()
+    kept = [
+        *_rgb(_PRESENT_RGB, manual=True),  # a present pane, no row: never in the log
+        *_rgb(_OTHER, manual=True),  # missing for less than one grace
+        *_rgb(_GONE, manual=True),  # gone, but a row protects it
+    ]
+    missing = {_OTHER.upper(): _T0 + 1, _GONE.upper(): _T0}
+    assert not stale_rgb_files(directory, missing, {_GONE.upper()}, _NOW)
+    assert not sweep_rgb(directory, missing, {_GONE.upper()}, _NOW)
+    assert all(p.exists() for p in kept)
+
+
+@pytest.mark.parametrize(
+    ("pid", "alive", "live_ids"),
+    [
+        (None, _dead, set()),  # unknown pid
+        (0, _dead, set()),  # unknown pid
+        (_DEAD_PID, _alive, set()),  # pid alive
+        (_DEAD_PID, _dead, {"s1"}),  # alive in the live registry
+    ],
+)
+def test_rgb_gone_file_whose_row_is_alive_or_unknown_is_kept(
+    pid: int | None, alive: Callable[[int], bool], live_ids: set[str]
+) -> None:
+    files = _rgb(_GONE, manual=True)
+    rows = [_row("dead", pid=_DEAD_PID, uuid=_GONE), _row("s1", pid=pid)]
+    protected = protected_uuids(rows, live_ids, alive=alive)
+    assert not sweep_rgb(colors.tab_rgb_dir(), {_GONE.upper(): _T0}, protected, _NOW)
+    assert all(p.exists() for p in files)
+
+
+def test_rgb_a_dead_pid_row_does_not_protect_its_colour_file() -> None:
+    files = _rgb(_GONE, manual=True)
+    protected = protected_uuids([_row("s1")], set(), alive=_dead)
+    assert sweep_rgb(colors.tab_rgb_dir(), {_GONE.upper(): _T0}, protected, _NOW) == files
+
+
+def test_rgb_fresh_colour_file_keeps_its_marker_all_or_nothing() -> None:
+    directory = colors.tab_rgb_dir()
+    files = _rgb(_GONE, manual=True, mtime_ms=_NOW - _GRACE + 1, marker_mtime_ms=_OLD)
+    missing = {_GONE.upper(): _T0}
+    assert not stale_rgb_files(directory, missing, set(), _NOW)
+    assert not sweep_rgb(directory, missing, set(), _NOW)
+    assert all(p.exists() for p in files)
+    later = _NOW + _GRACE  # one grace later the colour file is old too: both go
+    assert sweep_rgb(directory, missing, set(), later) == files
+
+
+def test_rgb_fresh_marker_keeps_its_colour_file() -> None:
+    files = _rgb(_GONE, manual=True, mtime_ms=_OLD, marker_mtime_ms=_NOW - 1)
+    assert not sweep_rgb(colors.tab_rgb_dir(), {_GONE.upper(): _T0}, set(), _NOW)
+    assert all(p.exists() for p in files)
+
+
+def test_rgb_file_exactly_one_grace_old_is_stale() -> None:
+    files = _rgb(_GONE, mtime_ms=_NOW - _GRACE)
+    assert sweep_rgb(colors.tab_rgb_dir(), {_GONE.upper(): _T0}, set(), _NOW) == files
+
+
+def test_rgb_file_with_a_future_mtime_is_kept() -> None:
+    files = _rgb(_GONE, manual=True, mtime_ms=_NOW + 10 * _GRACE)  # clock skew: fresh
+    assert not sweep_rgb(colors.tab_rgb_dir(), {_GONE.upper(): _T0}, set(), _NOW)
+    assert all(p.exists() for p in files)
+
+
+def test_rgb_two_slugs_of_one_uuid_are_both_removed() -> None:
+    first = _rgb(_GONE, window=0, manual=True)
+    second = _rgb(_GONE, window=1)
+    removed = sweep_rgb(colors.tab_rgb_dir(), {_GONE.upper(): _T0}, set(), _NOW)
+    assert sorted(removed) == sorted(first + second)
+    assert [p.name.endswith(".manual") for p in removed] == [False, False, True]
+
+
+def test_rgb_sweep_never_touches_odd_names_temp_files_or_directories() -> None:
+    directory = colors.tab_rgb_dir()
+    directory.mkdir(parents=True)
+    odd = ["w9t9p9_PATHTEST", f"w0t1p0_{_GONE}.tmp", "notes.txt"]
+    for name in odd:
+        (directory / name).write_text("1;2;3", encoding="utf-8")
+        _set_mtime(directory / name, _OLD)
+    folder = directory / f"w0t2p0_{_GONE}"
+    folder.mkdir()
+    _set_mtime(folder, _OLD)
+    missing = {_GONE.upper(): _T0}
+    assert not stale_rgb_files(directory, missing, set(), _NOW)
+    assert not sweep_rgb(directory, missing, set(), _NOW)
+    assert _names(directory) == set(odd) | {folder.name}
+
+
+def test_rgb_sweep_of_a_missing_dir_is_a_noop_and_creates_nothing() -> None:
+    directory = colors.tab_rgb_dir()
+    assert not rgb_files(directory)
+    assert not stale_rgb_files(directory, {_GONE.upper(): _T0}, set(), _NOW)
+    assert not sweep_rgb(directory, {_GONE.upper(): _T0}, set(), _NOW)
+    assert not directory.exists()
+
+
+def test_rgb_second_sweep_removes_nothing() -> None:
+    _rgb(_GONE, manual=True)
+    kept = _rgb(_PRESENT_RGB)
+    directory = colors.tab_rgb_dir()
+    missing = {_GONE.upper(): _T0}
+    assert len(sweep_rgb(directory, missing, set(), _NOW)) == 2
+    assert not sweep_rgb(directory, missing, set(), _NOW)
+    assert _names(directory) == {p.name for p in kept}
+
+
+def test_rgb_files_groups_colour_files_before_markers() -> None:
+    files = _rgb(_GONE, manual=True)
+    other = _rgb(_OTHER)
+    assert rgb_files(colors.tab_rgb_dir()) == {_GONE.upper(): files, _OTHER.upper(): other}
 
 
 # ---- B3: the effectful pass ----------------------------------------------------------

@@ -508,8 +508,13 @@ def _isolate_relay_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 
 @pytest.fixture(autouse=True)
 def _isolate_tab_symbol_side_effects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep every test off the real badge cache and the real iTerm session."""
+    """Keep every test off the real badge and tab colour caches and the real iTerm session.
+
+    The colour cache dir is NOT created; setting ``CCC_TAB_RGB_DIR`` also makes
+    ``tabcolor`` skip its tty repaints (sandboxed), the desired test behaviour.
+    """
     monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))
+    monkeypatch.setenv("CCC_TAB_RGB_DIR", str(tmp_path / "iterm-tab-rgb"))
     monkeypatch.setenv("CCC_ROLE_MARK_DIR", str(tmp_path / "ccc-role-mark"))
     monkeypatch.delenv("ITERM_SESSION_ID", raising=False)
 

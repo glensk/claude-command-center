@@ -325,6 +325,105 @@ def sweep_badges(
     return removed
 
 
+# ---- tab colour cache sweep (tp#1992) ------------------------------------------------
+# A colour file is ``<slug>`` (one ``R;G;B`` line, same slug shape as a badge file) with an
+# optional empty ``<slug>.manual`` override marker (see :mod:`command_center.colors`). The
+# shell writers take no lock, so instead of one a fresh-mtime guard keeps any file written
+# within the grace. Only names of exactly those two shapes are ever touched.
+_RGB_NAME_RE = re.compile(
+    r"^[^_./]+_([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})"
+    r"(\.manual)?$"
+)
+_RGB_MARKER_SUFFIX = ".manual"
+
+
+def rgb_uuid(name: str) -> str | None:
+    """The upper-cased tab UUID of colour file or ``.manual`` marker *name*, else ``None``."""
+    match = _RGB_NAME_RE.match(name)
+    return match.group(1).upper() if match else None
+
+
+def rgb_files(directory: Path) -> dict[str, list[Path]]:
+    """``tab UUID → colour files and markers`` in *directory* (regular files only).
+
+    Odd names, temp files and directories are skipped; a missing directory is ``{}``.
+    Per UUID the colour files come first, then the ``.manual`` markers.
+    """
+    out: dict[str, list[Path]] = {}
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return out
+    for entry in entries:
+        uuid = rgb_uuid(entry.name)
+        if uuid is None or not entry.is_file():
+            continue
+        out.setdefault(uuid, []).append(entry)
+    for paths in out.values():
+        paths.sort(key=lambda p: (p.name.endswith(_RGB_MARKER_SUFFIX), p.name))
+    return out
+
+
+def _fresh(path: Path, now_ms: int, grace_ms: int) -> bool:
+    """True when *path* was modified within *grace_ms* of *now_ms* (or later, or unstatable)."""
+    try:
+        mtime_ms = path.stat().st_mtime_ns // 1_000_000
+    except OSError:
+        return True  # fail closed: an unreadable mtime is never "old"
+    return now_ms - mtime_ms < grace_ms
+
+
+def stale_rgb_files(
+    directory: Path,
+    missing: dict[str, int],
+    protected: set[str],
+    now_ms: int,
+    grace_ms: int = TAB_GONE_GRACE_MS,
+) -> list[Path]:
+    """The colour files and markers whose tab is gone past the grace and no row protects.
+
+    All-or-nothing per UUID: its files are listed only when EVERY one of them is older than
+    *grace_ms*, so a marker never outlives its colour file through a half-sweep. A file of
+    a present pane (never in *missing*) is never listed.
+    """
+    guarded = {uuid_of(u) for u in protected}
+    out: list[Path] = []
+    for uuid, paths in rgb_files(directory).items():
+        if uuid in guarded or not is_gone(uuid, missing, now_ms, grace_ms):
+            continue
+        if any(_fresh(path, now_ms, grace_ms) for path in paths):
+            continue
+        out.extend(paths)
+    return out
+
+
+def sweep_rgb(
+    directory: Path,
+    missing: dict[str, int],
+    protected: set[str],
+    now_ms: int,
+    grace_ms: int = TAB_GONE_GRACE_MS,
+) -> list[Path]:
+    """Unlink every :func:`stale_rgb_files` entry; returns the files removed.
+
+    Colour files go before ``.manual`` markers (a racing reader then sees "no cached
+    colour" and ignores the marker). A file that cannot be unlinked is skipped. A missing
+    directory removes nothing and is never created.
+    """
+    if not directory.is_dir():
+        return []
+    stale = stale_rgb_files(directory, missing, protected, now_ms, grace_ms)
+    ordered = sorted(stale, key=lambda p: p.name.endswith(_RGB_MARKER_SUFFIX))
+    removed: list[Path] = []
+    for path in ordered:
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed.append(path)
+    return removed
+
+
 # ---- the effectful pass (daemon housekeeping step, ``ccc tab-symbol -g/-G``) ---------
 #: :attr:`RowVerdict.reason` of a row whose tab binding is released (else: why it is kept).
 RELEASE = "gone"
