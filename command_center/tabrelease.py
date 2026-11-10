@@ -45,11 +45,16 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from .models import TabbedRow
+from .models import LiveSession, TabbedRow
 from .tab_titles import uuid_of
+
+if TYPE_CHECKING:
+    from .store import Store
 
 #: How long a tab UUID must stay absent from reliable pane reads before it counts as gone.
 TAB_GONE_GRACE_SEC = 600
@@ -318,3 +323,158 @@ def sweep_badges(
             with contextlib.suppress(OSError):
                 path.with_name(path.name + ".dir").unlink()
     return removed
+
+
+# ---- the effectful pass (daemon housekeeping step, ``ccc tab-symbol -g/-G``) ---------
+#: :attr:`RowVerdict.reason` of a row whose tab binding is released (else: why it is kept).
+RELEASE = "gone"
+KEEP_PRESENT = "tab present"
+KEEP_GRACE = "missing < grace"
+KEEP_DRAFT = "draft"
+KEEP_PID_UNKNOWN = "pid unknown"
+KEEP_LIVE = "live in registry"
+KEEP_PID_ALIVE = "pid alive"
+
+#: :attr:`ReleaseResult.skipped` reasons: no reliable pane read, so nothing is judged.
+SKIP_NOT_RUNNING = "iTerm not running"
+SKIP_READ_FAILED = "iTerm pane read failed"
+SKIP_EMPTY_READ = "iTerm listed no panes"
+
+
+@dataclass(frozen=True)
+class RowVerdict:
+    """One tabbed row's outcome: :data:`RELEASE` or the keep reason, plus its missing age."""
+
+    row: TabbedRow
+    reason: str
+    missing_ms: int | None = None  # how long the tab has been missing; None = present
+
+    @property
+    def release(self) -> bool:
+        """True when the row's tab binding is (or, dry, would be) released."""
+        return self.reason == RELEASE
+
+
+def row_verdict(  # pylint: disable=too-many-arguments,too-many-return-statements
+    row: TabbedRow,
+    missing: dict[str, int],
+    live_ids: set[str],
+    now_ms: int,
+    grace_ms: int = TAB_GONE_GRACE_MS,
+    *,
+    alive: Callable[[int], bool] | None = None,
+) -> RowVerdict:
+    """Pure (given *alive*): the same rule as :func:`gone_rows`, with the reason spelled out."""
+    first = missing.get(uuid_of(row.iterm_session_id))
+    age = None if first is None else max(0, now_ms - first)
+    if row.draft or not uuid_of(row.iterm_session_id):
+        return RowVerdict(row, KEEP_DRAFT, age)
+    if age is None:
+        return RowVerdict(row, KEEP_PRESENT, age)
+    if age < grace_ms:
+        return RowVerdict(row, KEEP_GRACE, age)
+    pid = row.last_seen_pid
+    if pid is None or pid <= 0:
+        return RowVerdict(row, KEEP_PID_UNKNOWN, age)
+    if row.session_id in live_ids:
+        return RowVerdict(row, KEEP_LIVE, age)
+    if (alive or _default_alive)(pid):
+        return RowVerdict(row, KEEP_PID_ALIVE, age)
+    return RowVerdict(row, RELEASE, age)
+
+
+@dataclass
+class ReleaseResult:
+    """What one :func:`release_gone` pass decided and (unless dry) did."""
+
+    skipped: str = ""  # a SKIP_* reason: no reliable pane read, nothing judged or written
+    dry_run: bool = False
+    verdicts: list[RowVerdict] = field(default_factory=list)
+    released: list[TabbedRow] = field(default_factory=list)  # unbound (dry: would be)
+    refused: list[TabbedRow] = field(default_factory=list)  # the CAS saw changed evidence
+    removed: list[Path] = field(default_factory=list)  # badge files removed (dry: would be)
+
+
+def _live_ids(live: Mapping[str, LiveSession] | Iterable[str]) -> set[str]:
+    """Session ids alive in the registry (a mapping of :class:`LiveSession` or bare ids)."""
+    if isinstance(live, Mapping):
+        return {sid for sid, entry in live.items() if getattr(entry, "alive", True)}
+    return set(live)
+
+
+def _reliable_panes() -> tuple[set[str], str]:
+    """``(present tab UUIDs, "")`` from ONE reliable pane read, else ``(set(), SKIP_*)``.
+
+    iTerm's running state is checked first WITHOUT an Apple event: ``tell application``
+    would launch an absent iTerm. A failed read and an empty pane list (iTerm starting or
+    restoring windows) are both unknown, never "every tab is gone".
+    """
+    from . import iterm_api, tab_titles  # lazy
+
+    if not iterm_api.iterm_running():
+        return set(), SKIP_NOT_RUNNING
+    panes = tab_titles.read_panes()
+    if panes is None:
+        return set(), SKIP_READ_FAILED
+    present = {u for u in (uuid_of(p.uuid) for p in panes) if u}
+    if not present:
+        return set(), SKIP_EMPTY_READ
+    return present, ""
+
+
+def release_gone(  # pylint: disable=too-many-arguments,too-many-locals
+    store: Store,
+    live: Mapping[str, LiveSession] | Iterable[str],
+    *,
+    dry_run: bool,
+    record: bool | None = None,
+    now: int | None = None,
+    alive: Callable[[int], bool] | None = None,
+    directory: Path | None = None,
+    log: MissingLog | None = None,
+) -> ReleaseResult:
+    """Release the tab binding and badge of every row whose tab is gone and process dead.
+
+    Fail closed: no reliable pane read → ``skipped`` and nothing written (DB, badge cache,
+    missing log). Otherwise the read is folded into the missing log (when *record*, which
+    defaults to ``not dry_run``), each tabbed row gets a :class:`RowVerdict`, releasable rows
+    go through :meth:`Store.release_tab` (a CAS that re-probes the pid) and the badge cache
+    is swept under its ``.lock``. *dry_run* writes neither the DB nor the cache and reports
+    what would happen. The rows themselves always stay (parked rows stay resumable).
+    """
+    from .models import now_ms as _now_ms  # lazy
+    from .tabsymbol import cache_dir  # lazy
+
+    result = ReleaseResult(dry_run=dry_run)
+    present, skipped = _reliable_panes()
+    if skipped:
+        result.skipped = skipped
+        return result
+    stamp = _now_ms() if now is None else now
+    probe = alive or _default_alive
+    cache = cache_dir() if directory is None else directory
+    live_ids = _live_ids(live)
+    rows = store.list_tabbed_sessions()
+    referenced = set(iter_uuids(rows)) | set(badge_files(cache))
+    missing = (log or MissingLog()).observe(
+        referenced, present, stamp, write=(not dry_run) if record is None else record
+    )
+    result.verdicts = [row_verdict(row, missing, live_ids, stamp, alive=probe) for row in rows]
+    releasable = [v.row for v in result.verdicts if v.release]
+    if dry_run:
+        result.released = releasable
+        guarded = protected_uuids(rows, live_ids, probe)
+        result.removed = stale_badge_files(cache, missing, guarded, stamp)
+        return result
+    for row in releasable:
+        pid = row.last_seen_pid or 0
+        if store.release_tab(row.session_id, row.iterm_session_id, pid):
+            result.released.append(row)
+        else:
+            result.refused.append(row)
+    # Re-read after the CAS writes: a row that re-bound or came alive meanwhile protects
+    # its badge, and so does every refused row (its evidence changed under us).
+    guarded = protected_uuids(store.list_tabbed_sessions(), live_ids, probe)
+    guarded |= set(iter_uuids(result.refused))
+    result.removed = sweep_badges(cache, missing, guarded, stamp)
+    return result

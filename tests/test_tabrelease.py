@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 
-from command_center import tabrelease, tabsymbol
-from command_center.models import TabbedRow
+from command_center import iterm_api, tab_titles, tabrelease, tabsymbol
+from command_center.models import LiveSession, TabbedRow
+from command_center.store import Store
+from command_center.tab_titles import ItermPane
 from command_center.tabrelease import (
     MissingLog,
+    ReleaseResult,
     badge_uuid,
     gone_rows,
     protected_uuids,
+    release_gone,
     stale_badge_files,
     sweep_badges,
     update_missing,
@@ -278,3 +282,168 @@ def test_sweep_frees_slots_so_assign_does_not_steal_a_live_badge() -> None:
 def test_sweep_of_a_missing_cache_dir_is_a_noop(tmp_path: Path) -> None:
     assert not sweep_badges(tmp_path / "nope", {_GONE.upper(): _T0}, set(), _T0 + _GRACE)
     assert not (tmp_path / "nope").exists()
+
+
+# ---- B3: the effectful pass ----------------------------------------------------------
+_PRESENT = "55555555-0000-4000-8000-000000000005"
+
+
+def _store_row(store: Store, sid: str, uuid: str, pid: int | None) -> None:
+    store.ensure(sid, cwd="/repo")
+    store.conn.execute(
+        "UPDATE sessions SET iterm_session_id = ?, last_seen_pid = ?, status = 'parked', "
+        "title_written = 'old title', title_written_at = 123 WHERE session_id = ?",
+        (f"w0t1p0:{uuid}", pid, sid),
+    )
+    store.conn.commit()
+
+
+def _iid(store: Store, sid: str) -> str | None:
+    got = store.get(sid)
+    assert got is not None
+    return got.iterm_session_id
+
+
+class _Iterm:
+    """Fake iTerm: running state and the pane read, counting reads."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, panes: list[str] | None) -> None:
+        self.running = True
+        self.panes = panes
+        self.reads = 0
+        monkeypatch.setattr(iterm_api, "iterm_running", lambda: self.running)
+        monkeypatch.setattr(tab_titles, "read_panes", self._read)
+
+    def _read(self, *_a: object, **_k: object) -> list[ItermPane] | None:
+        self.reads += 1
+        if self.panes is None:
+            return None
+        return [ItermPane(uuid=u, tty="/dev/ttys001", name="x") for u in self.panes]
+
+
+@pytest.fixture(name="world")
+def _world(tmp_path: Path) -> Iterator[tuple[Store, MissingLog, Path]]:
+    """A store with a dead-pid row on a gone tab (badged) and one on a present tab."""
+    store = Store(tmp_path / "state.db")
+    _store_row(store, "dead", _GONE, _DEAD_PID)
+    _store_row(store, "here", _PRESENT, _DEAD_PID)
+    directory = tabsymbol.cache_dir()
+    _badge(directory, _GONE.upper(), tabsymbol.PALETTE[0])
+    _badge(directory, _PRESENT.upper(), tabsymbol.PALETTE[1])
+    yield store, MissingLog(tmp_path / "tab-missing.json"), directory
+    store.close()
+
+
+def _run(
+    store: Store,
+    log: MissingLog,
+    now: int,
+    *,
+    dry_run: bool = False,
+    live: dict[str, LiveSession] | None = None,
+) -> ReleaseResult:
+    return release_gone(store, live or {}, dry_run=dry_run, now=now, alive=_dead, log=log)
+
+
+def test_release_skips_without_iterm_and_never_reads(
+    world: tuple[Store, MissingLog, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, log, directory = world
+    fake = _Iterm(monkeypatch, [_PRESENT])
+    fake.running = False
+    result = _run(store, log, _T0)
+    assert result.skipped == tabrelease.SKIP_NOT_RUNNING and fake.reads == 0
+    assert not log.path.exists() and _iid(store, "dead") and len(_names(directory) - {".lock"}) == 4
+
+
+@pytest.mark.parametrize("panes", [None, []])
+def test_release_skips_on_an_unreliable_read_and_writes_nothing(
+    world: tuple[Store, MissingLog, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    panes: list[str] | None,
+) -> None:
+    store, log, directory = world
+    log.save({_GONE.upper(): _T0})  # a clock already past the grace
+    before = log.path.read_text(encoding="utf-8")
+    _Iterm(monkeypatch, panes)
+    result = _run(store, log, _T0 + _GRACE)
+    assert result.skipped and not result.released and not result.removed
+    assert log.path.read_text(encoding="utf-8") == before
+    assert _iid(store, "dead") == f"w0t1p0:{_GONE}" and len(_names(directory) - {".lock"}) == 4
+
+
+def test_release_starts_the_clock_then_releases_past_the_grace(
+    world: tuple[Store, MissingLog, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, log, directory = world
+    _Iterm(monkeypatch, [_PRESENT])
+    first = _run(store, log, _T0)
+    assert not first.released and not first.removed
+    assert log.load() == {_GONE.upper(): _T0}  # the first pass only starts the clock
+    assert {v.row.session_id: v.reason for v in first.verdicts} == {
+        "dead": tabrelease.KEEP_GRACE,
+        "here": tabrelease.KEEP_PRESENT,
+    }
+    second = _run(store, log, _T0 + _GRACE)
+    assert [r.session_id for r in second.released] == ["dead"]
+    assert [badge_uuid(p.name) for p in second.removed] == [_GONE.upper()]
+    got = store.get("dead")
+    assert got is not None and got.iterm_session_id is None
+    assert got.status == "parked" and got.title_written is None  # the row stays, resumable
+    assert _iid(store, "here") == f"w0t1p0:{_PRESENT}"
+    assert {badge_uuid(n) for n in _names(directory)} >= {_PRESENT.upper()}
+    third = _run(store, log, _T0 + 2 * _GRACE)
+    assert not third.released and not third.removed  # a second run releases nothing
+    assert not log.load()  # nothing references the gone UUID any more: pruned
+
+
+def test_release_dry_run_reports_and_writes_nothing(
+    world: tuple[Store, MissingLog, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, log, directory = world
+    log.save({_GONE.upper(): _T0})
+    before = log.path.read_text(encoding="utf-8")
+    _Iterm(monkeypatch, [_PRESENT])
+    result = _run(store, log, _T0 + _GRACE, dry_run=True)
+    assert [r.session_id for r in result.released] == ["dead"] and len(result.removed) == 1
+    assert _iid(store, "dead") == f"w0t1p0:{_GONE}" and len(_names(directory) - {".lock"}) == 4
+    assert log.path.read_text(encoding="utf-8") == before
+
+
+def test_release_dry_run_without_a_log_never_creates_one(
+    world: tuple[Store, MissingLog, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, log, _directory = world
+    _Iterm(monkeypatch, [_PRESENT])
+    _run(store, log, _T0, dry_run=True)
+    assert not log.path.exists()
+    release_gone(store, (), dry_run=True, record=True, now=_T0, alive=_dead, log=log)
+    assert log.load() == {_GONE.upper(): _T0}  # `-g` records the clock, still no release
+
+
+def test_release_keeps_a_live_registry_row(
+    world: tuple[Store, MissingLog, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, log, directory = world
+    log.save({_GONE.upper(): _T0})
+    _Iterm(monkeypatch, [_PRESENT])
+    live = {"dead": LiveSession(pid=_DEAD_PID, session_id="dead", cwd="/repo", alive=True)}
+    result = _run(store, log, _T0 + _GRACE, live=live)
+    assert not result.released and not result.removed
+    assert [v.reason for v in result.verdicts if v.row.session_id == "dead"] == [
+        tabrelease.KEEP_LIVE
+    ]
+    assert len(_names(directory) - {".lock"}) == 4
+
+
+def test_release_cas_refusal_keeps_the_binding_and_the_badge(
+    world: tuple[Store, MissingLog, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, log, directory = world
+    log.save({_GONE.upper(): _T0})
+    _Iterm(monkeypatch, [_PRESENT])
+    monkeypatch.setattr("command_center.store.pid_alive", lambda _pid: True)  # came alive
+    result = _run(store, log, _T0 + _GRACE)
+    assert not result.released and [r.session_id for r in result.refused] == ["dead"]
+    assert _iid(store, "dead") == f"w0t1p0:{_GONE}"
+    assert not result.removed and len(_names(directory) - {".lock"}) == 4

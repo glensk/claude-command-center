@@ -1407,3 +1407,54 @@ def test_peer_name_registry_error_fails_open(
     _prompt(session_title="repo-ab")
     docs = _docs(capsys.readouterr().out)
     assert len(docs) == 1 and "sessionTitle" not in docs[0]["hookSpecificOutput"]
+
+
+# ---- tp#1990: resuming a row whose dead tab was released ---------------------------------
+_DEAD_TAB = "w0t1p0:11111111-0000-4000-8000-000000000001"
+_NEW_TAB = "w0t5p0:66666666-0000-4000-8000-000000000006"
+
+
+def _parked_on_dead_tab(store: Store, sid: str) -> None:
+    store.ensure(sid, cwd="/repo")
+    store.conn.execute(
+        "UPDATE sessions SET iterm_session_id = ?, last_seen_pid = 4000001, status = 'parked', "
+        "title_written = 'dead tab title', title_written_at = 123 WHERE session_id = ?",
+        (_DEAD_TAB, sid),
+    )
+    store.conn.commit()
+
+
+def _capture_title_writes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[dict, dict]]:
+    from command_center import tabsymbol  # pylint: disable=import-outside-toplevel
+
+    writes: list[tuple[dict, dict]] = []
+
+    def _record(plain: dict, cas: dict, *_a: object, **_k: object) -> dict[str, str]:
+        writes.append((dict(plain), dict(cas)))
+        return {}
+
+    monkeypatch.setattr(tabsymbol, "_write_titles", _record)
+    return writes
+
+
+@pytest.mark.usefixtures("home")
+@pytest.mark.parametrize("released", [True, False])
+def test_session_start_on_a_released_row_restamps_and_writes_unconditionally(
+    monkeypatch: pytest.MonkeyPatch, released: bool
+) -> None:
+    monkeypatch.setattr("command_center.store.pid_alive", lambda _pid: False)
+    store = Store()
+    _parked_on_dead_tab(store, "s1")
+    if released:
+        assert store.release_tab("s1", _DEAD_TAB, 4000001) is True
+    writes = _capture_title_writes(monkeypatch)
+    monkeypatch.setenv("ITERM_SESSION_ID", _NEW_TAB)
+    hooks.handle_session_start({"session_id": "s1", "cwd": "/repo", "source": "resume"})
+    got = Store().get("s1")
+    assert got is not None and got.iterm_session_id == _NEW_TAB  # re-stamped
+    assert len(writes) == 1
+    plain, cas = writes[0]
+    if released:  # no CAS against the dead tab's title: the first write is unconditional
+        assert _NEW_TAB in plain and not cas
+    else:  # without the release the dead tab's title would gate the new tab's first write
+        assert not plain and cas[_NEW_TAB][0] == "dead tab title"

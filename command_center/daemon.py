@@ -89,6 +89,8 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
     handoff_closers: list[str] = field(default_factory=list)
     handoff_reclaimed: list[str] = field(default_factory=list)
     handoff_errors: list[str] = field(default_factory=list)
+    # tp#1990: "<short id> <short tab UUID>" per row whose gone tab's binding was released.
+    tabs_released: list[str] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not (
@@ -110,6 +112,7 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
             or self.reset_fired
             or self.reset_postponed
             or self.attached_held
+            or self.tabs_released
         )
 
 
@@ -341,6 +344,11 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
         # noise every pass); skipped on dry-run since it assigns badges + sets titles.
         # tp#1697 B14: work a router SKIPPED waits on the pending queue; this loop is its tick.
         _drain_llm_pending(store, cfg, live, dry_run)
+
+        # tp#1990: release the tab binding + badge of rows whose iTerm tab is gone and whose
+        # process is proven dead, BEFORE the title sync so freed palette slots are not
+        # re-stolen. Its own isolated step, not gated by `sync_tab_titles`; dry-run reports.
+        _run_tab_release(store, live, report, dry_run)
 
         if cfg.sync_tab_titles and not dry_run:
             from . import tabsymbol
@@ -881,6 +889,28 @@ def _run_await_backstop(store: Store, report: DaemonReport, dry_run: bool) -> No
         print(f"ccc daemon: await pass failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return
     report.awaited.extend(result.fired)
+
+
+def _run_tab_release(
+    store: Store, live: dict[str, LiveSession], report: DaemonReport, dry_run: bool
+) -> None:
+    """One ``tabrelease.release_gone`` pass (dry: decides, writes nothing); never raises.
+
+    Fills ``report.tabs_released`` with ``"<short id> <short tab UUID>"`` per released
+    (dry: releasable) row — never AIM text.
+    """
+    from . import tabrelease  # pylint: disable=import-outside-toplevel  # module convention
+    from .tab_titles import uuid_of  # pylint: disable=import-outside-toplevel
+
+    try:
+        result = tabrelease.release_gone(store, live, dry_run=dry_run)
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        print(f"ccc daemon: tab release failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return
+    report.tabs_released.extend(
+        f"{short_id(row.session_id).rstrip()} {uuid_of(row.iterm_session_id)[:8]}"
+        for row in result.released
+    )
 
 
 def _run_handoff_finalize(

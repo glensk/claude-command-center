@@ -495,3 +495,99 @@ def test_daemon_pass_keeps_the_aim_of_a_job_parked_at_a_dialog(
     with Store() as store:
         kept = store.get("waiting")
         assert kept is not None and kept.aim == "tp1512 trust canary"
+
+
+# ---- tp#1990: the dead-tab release step -------------------------------------------------
+
+
+def _tab_steps(
+    monkeypatch: pytest.MonkeyPatch, *, sync_titles: bool, raises: bool = False
+) -> list[str]:
+    """Record the release step and the title sync; pin ``sync_tab_titles``."""
+    from command_center import tabrelease, tabsymbol
+    from command_center.tabrelease import ReleaseResult
+
+    calls: list[str] = []
+    real_load = config.load_config
+
+    def _load() -> config.Config:
+        cfg = real_load()
+        cfg.sync_tab_titles = sync_titles
+        return cfg
+
+    def _release(_store: object, _live: object, *, dry_run: bool) -> ReleaseResult:
+        calls.append(f"release dry={dry_run}")
+        if raises:
+            raise OSError("disk full")
+        return ReleaseResult(dry_run=dry_run)
+
+    def _sync(_store: object) -> list[str]:
+        calls.append("sync")
+        return []
+
+    monkeypatch.setattr(config, "load_config", _load)
+    monkeypatch.setattr(tabrelease, "release_gone", _release)
+    monkeypatch.setattr(tabsymbol, "sync_live", _sync)
+    return calls
+
+
+def _pass(dry_run: bool = False) -> DaemonReport:
+    return run_once(
+        dry_run=dry_run, do_reap=False, do_summary=False, do_progress=False, do_alerts=False
+    )
+
+
+def test_tab_release_runs_without_sync_tab_titles(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _tab_steps(monkeypatch, sync_titles=False)
+    _pass()
+    assert calls == ["release dry=False"]  # not gated by sync_tab_titles; no sync_live
+
+
+def test_tab_release_runs_before_the_title_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _tab_steps(monkeypatch, sync_titles=True)
+    _pass()
+    assert calls == ["release dry=False", "sync"]
+
+
+def test_tab_release_dry_run_is_passed_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _tab_steps(monkeypatch, sync_titles=True)
+    _pass(dry_run=True)
+    assert calls == ["release dry=True"]  # dry: decides only; the title sync is skipped
+
+
+def test_a_raising_tab_release_does_not_stop_the_title_sync(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _tab_steps(monkeypatch, sync_titles=True, raises=True)
+    report = _pass()
+    assert calls == ["release dry=False", "sync"]
+    assert not report.tabs_released
+    assert "tab release failed: OSError: disk full" in capsys.readouterr().err
+
+
+def test_tab_release_fills_the_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    from command_center import tabrelease
+    from command_center.models import TabbedRow
+    from command_center.tabrelease import ReleaseResult
+
+    row = TabbedRow("abcdef1234567890", "w0t1p0:11111111-0000-4000-8000-000000000001", 4_000_001)
+    monkeypatch.setattr(tabrelease, "release_gone", lambda *_a, **_k: ReleaseResult(released=[row]))
+    report = _pass()
+    assert report.tabs_released == ["abcdef12 11111111"]
+    assert not report.is_empty()
+
+
+def test_cmd_daemon_prints_tabs_released(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import cli, daemon
+
+    report = DaemonReport(tabs_released=["abcdef12 11111111", "fedcba98 22222222"])
+    monkeypatch.setattr(daemon, "run_once", lambda **_k: report)
+    assert cli.main(["daemon"]) == 0
+    out = capsys.readouterr().out
+    assert "tabs_released=2" in out and "tab-release:" not in out
+    assert cli.main(["daemon", "-v"]) == 0
+    out = capsys.readouterr().out
+    assert "  tab-release: abcdef12 11111111" in out
+    assert "  tab-release: fedcba98 22222222" in out
