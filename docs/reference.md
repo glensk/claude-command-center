@@ -721,14 +721,18 @@ future job), **cancelled** (the dependency was `mark-done`-on-draft or `delete-j
   byte-identical.
 
 Each future job also picks **which models it runs on**: `-O/--overseer` and `-E/--executor`
-(choices `opus-5` / `opus-4.8` / `opus-4.8-1m` / `sonnet-5` / `haiku-4.5`, both defaulting to
-`opus-5`; `opus-4.8-1m` is the 1M-context Opus, launched as `claude-opus-4-8[1m]` and delegating
+(choices `opus-5.5` / `opus-4.8` / `opus-4.8-1m` / `sonnet-5` / `haiku-4.5`, both defaulting to
+`opus-5.5`; `opus-4.8-1m` is the 1M-context Opus, launched as `claude-opus-4-8[1m]` and delegating
 to plain `opus` — sonnet-5 is natively 1M). At launch the session
 runs on the **overseer's** model (`claude --model …`) with an **explicit reasoning effort**
 (`claude --effort <level>`, config key `launch_effort`, default `xhigh`; set it to `""` to omit the
 flag and let `~/.claude/settings.json`'s `effortLevel` decide — whose own absence means `high`).
-Jobs stored with the retired `fable-5` choice are resolved to `opus-5` at launch, with one notice
-on stderr; the retired model is never passed to Claude or offered by a model selector.
+Jobs stored with a retired choice are resolved through one table
+(`models.RETIRED_LLM_REPLACEMENTS`: `fable-5` and `opus-5` → `opus-5.5`) at launch, with one
+notice on stderr; the retired model is never passed to Claude or offered by a model selector.
+The same table covers raw ids: `claude_argv` never emits `--model claude-opus-5`, and a
+`continue-session` successor never inherits its predecessor's retired observed model — a
+chain started on Opus 5 moves to `claude-opus-5-5` at its next relay (tp#2032).
 If the **executor** differs, the launch
 prompt tells the overseer to delegate implementation to Agent-tool subagents on the executor's model
 (e.g. Opus oversees, Sonnet executes) while keeping planning, review and integration itself. Both fields
@@ -867,16 +871,16 @@ byte-stable (rewritten only on a real change — the only timestamps are `create
 `done_at` as ISO dates, so routine passes are no-ops), and cleaned up only via the `ccc_mirror`
 marker — a file without it is never touched. Every mirror also carries **`model:`** and
 **`effort:`** frontmatter keys — the model that **actually answered** (the last real
-`message.model` in the transcript, mapped to a ccc short name like `opus-5`; `""` until a turn
+`message.model` in the transcript, mapped to a ccc short name like `opus-5.5`; `""` until a turn
 exists — read from the transcript's tail and persisted per session in the `transcript_scan`
 table keyed by the file's mtime/size, so a frozen transcript is never re-read) and the observed reasoning effort (captured while the session is live: an explicit
 `--effort` launch flag is authoritative, else the global `effortLevel` from
 `~/.claude/settings.json` fills it once; `""` for a session never observed live — a historical
 parked session is never backfilled with today's default). Trust them over
-`llm_overseer`/`llm_exec`, which are job *config* with an `opus-5` database default — for a session
+`llm_overseer`/`llm_exec`, which are job *config* with an `opus-5.5` database default — for a session
 never launched as a ccc future job those are defaults, not observations. The same observed pair
 renders in ccc itself as the **`model` column** (right before `/aim`, in both the TUI and
-`ccc ls`, e.g. `opus-5·xhigh`; a draft never ran, so its cell shows the CONFIGURED
+`ccc ls`, e.g. `opus-5.5·xhigh`; a draft never ran, so its cell shows the CONFIGURED
 `overseer ▸ executor` pair instead — compacted to the single name when both are equal). The top **`## AIM (1)`** section always shows the
 session's *first* recorded AIM (the original done-condition — never the latest sharpened revision),
 with the current revision's short label appended (`↳ short (current): …`) once available. Each body
@@ -2067,7 +2071,8 @@ differing fields. The prompt sha256 binds sha256(model part) and the facts snaps
 the composed text, and a re-run on an active `prepared`/`opened` transfer reuses its STORED
 snapshot and composed handoff without recollecting — so `start` → exit 3 → a ledger change
 → the same `start` still reuses the transfer. The successor is a draft job (`create_draft`: the source's latest user AIM — see below —, cwd,
-`no_codex`, the observed model unless `-O`/`-E` say otherwise, the unchecked sub-goals)
+`no_codex`, the observed model unless `-O`/`-E` say otherwise — a retired one such as `opus-5`
+is replaced through `models.RETIRED_LLM_REPLACEMENTS`, tp#2032 —, the unchecked sub-goals)
 launched through `start-job` in a new tab; its prompt is a short preamble (take over from
 session X, transfer T, FIRST run `ccc continue-session accept T`, then relaunch the agents
 from their capsules, restart only the `restart:` shells, judge the `Decide before

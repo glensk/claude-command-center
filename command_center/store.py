@@ -331,8 +331,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     job_type          TEXT    NOT NULL DEFAULT 'claude',
     no_codex          INTEGER NOT NULL DEFAULT 0,
     launch_profile    TEXT,
-    llm_overseer      TEXT    NOT NULL DEFAULT 'opus-5',
-    llm_exec          TEXT    NOT NULL DEFAULT 'opus-5',
+    llm_overseer      TEXT    NOT NULL DEFAULT 'opus-5.5',
+    llm_exec          TEXT    NOT NULL DEFAULT 'opus-5.5',
     model             TEXT    NOT NULL DEFAULT '',
     effort            TEXT    NOT NULL DEFAULT '',
     idempotency_key   TEXT,
@@ -651,8 +651,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         # Opaque launch-profile label (config ``claude_launch_profiles``): the session's
         # interactive claude starts through that profile's executable; NULL = bare claude.
         "launch_profile": "TEXT",
-        "llm_overseer": "TEXT NOT NULL DEFAULT 'opus-5'",
-        "llm_exec": "TEXT NOT NULL DEFAULT 'opus-5'",
+        "llm_overseer": "TEXT NOT NULL DEFAULT 'opus-5.5'",
+        "llm_exec": "TEXT NOT NULL DEFAULT 'opus-5.5'",
         # OBSERVED runtime values (distinct from the llm_overseer/llm_exec job config):
         # the model the session actually ran on + its --effort reasoning level.
         "model": "TEXT NOT NULL DEFAULT ''",

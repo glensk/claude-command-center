@@ -64,8 +64,8 @@ def test_roundtrip_minimal_job() -> None:
         status="draft",  # serialize's default
         repo="",
         job_type="claude",  # serialize's default
-        llm_overseer="opus-5",  # serialize's default
-        llm_exec="opus-5",  # serialize's default
+        llm_overseer="opus-5.5",  # serialize's default
+        llm_exec="opus-5.5",  # serialize's default
         start_when="",
         deadline="",
         created="",
@@ -138,10 +138,10 @@ def test_roundtrip_start_when_with_quotes() -> None:
 def test_serialize_emits_llm_keys_and_default_is_opus() -> None:
     # Defaults: serialize with no llm args emits both keys as the active default.
     text = future_files.serialize(session_id=_UUID, aim="x", repo="home/ccc")
-    assert 'llm_overseer: "opus-5"' in text
-    assert 'llm_exec: "opus-5"' in text
+    assert 'llm_overseer: "opus-5.5"' in text
+    assert 'llm_exec: "opus-5.5"' in text
     job = future_files.parse_job_file(text)
-    assert job.llm_overseer == "opus-5" and job.llm_exec == "opus-5"
+    assert job.llm_overseer == "opus-5.5" and job.llm_exec == "opus-5.5"
 
 
 def test_missing_llm_keys_parse_to_default() -> None:
@@ -155,7 +155,7 @@ def test_missing_llm_keys_parse_to_default() -> None:
         "---\n\n## AIM\n\nDo it\n\n## Prompt\n\n"
     )
     job = future_files.parse_job_file(text)
-    assert job.llm_overseer == "opus-5" and job.llm_exec == "opus-5"
+    assert job.llm_overseer == "opus-5.5" and job.llm_exec == "opus-5.5"
 
 
 def test_controls_block_lists_model_selects() -> None:
@@ -499,8 +499,8 @@ def test_validate_depends_on(tmp_path: Path) -> None:
         status="ready",
         repo="home/repo",
         job_type="claude",
-        llm_overseer="opus-5",
-        llm_exec="opus-5",
+        llm_overseer="opus-5.5",
+        llm_exec="opus-5.5",
         start_when="",
         deadline="",
         created="",

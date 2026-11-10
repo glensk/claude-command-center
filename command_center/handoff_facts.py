@@ -779,6 +779,7 @@ def _spec_for(  # pylint: disable=too-many-locals
     hands over its capsule as the ``result`` plus ``capsule_path`` and ``relaunch`` — the
     record's Agent call, verbatim; a missing or corrupt record changes nothing."""
     from . import inflight, relay_state
+    from .models import current_model
 
     launches, uses = inflight._launch_details(records)
     launch = launches.get(agent_id)
@@ -807,7 +808,7 @@ def _spec_for(  # pylint: disable=too-many-locals
         "agent_type": str(meta.get("agentType") or params.get("subagent_type") or ""),
         "description": str(meta.get("description") or params.get("description") or ""),
         "cwd": launch.cwd if launch else "",
-        "model": str(params.get("model") or ""),  # meta.json has none
+        "model": current_model(str(params.get("model") or "")),  # meta.json has none; tp#2032
         "isolation": str(params.get("isolation") or meta.get("isolation") or ""),
         "transcript": str(jsonl) if jsonl else "",
         "spec": spec,

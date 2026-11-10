@@ -393,13 +393,12 @@ class MirrorHealth:
 # told to delegate implementation to Agent-tool subagents on the executor's model.
 LLM_CHOICES: tuple[str, ...] = (
     "opus-5.5",
-    "opus-5",
     "opus-4.8",
     "opus-4.8-1m",
     "sonnet-5",
     "haiku-4.5",
 )
-DEFAULT_LLM = "opus-5"
+DEFAULT_LLM = "opus-5.5"
 # Kept as named CLI constants because the new-job parser imports this public surface. All
 # job-creation/edit surfaces now share the same retired-model-free choices and default.
 NEW_JOB_LLM_CHOICES: tuple[str, ...] = LLM_CHOICES
@@ -408,7 +407,6 @@ NEW_JOB_DEFAULT_LLM = DEFAULT_LLM
 # ``opus-4.8-1m`` is the 1M-context beta form; sonnet-5 is natively 1M.
 LLM_MODEL_IDS: dict[str, str] = {
     "opus-5.5": "claude-opus-5-5",
-    "opus-5": "claude-opus-5",
     "opus-4.8": "claude-opus-4-8",
     "opus-4.8-1m": "claude-opus-4-8[1m]",
     "sonnet-5": "claude-sonnet-5",
@@ -418,23 +416,24 @@ LLM_MODEL_IDS: dict[str, str] = {
 # The enum has no 1M variant, so opus-4.8-1m delegates to plain "opus".
 LLM_AGENT_ALIAS: dict[str, str] = {
     "opus-5.5": "opus",
-    "opus-5": "opus",
     "opus-4.8": "opus",
     "opus-4.8-1m": "opus",
     "sonnet-5": "sonnet",
     "haiku-4.5": "haiku",
 }
-# Rows written before Fable's retirement remain readable, but this compatibility value is
-# deliberately absent from every executable choice/id/alias map above. Launch resolution
-# maps it to the current default before an argv or delegation prompt is built.
-RETIRED_LLM_REPLACEMENTS: dict[str, str] = {"fable-5": DEFAULT_LLM}
+# THE superseded-model table (tp#2032): a retired choice → the current one it launches as.
+# Rows written before a retirement remain readable, but a retired value is deliberately
+# absent from every executable choice/id/alias map above. Launch resolution maps it to its
+# replacement before an argv or delegation prompt is built — a stored job, a relay
+# successor inheriting its predecessor's observed model, and a raw transcript id alike.
+RETIRED_LLM_REPLACEMENTS: dict[str, str] = {"fable-5": DEFAULT_LLM, "opus-5": "opus-5.5"}
 
 # Historical transcripts may name a retired raw model. Reverse-map those observations for
 # display without putting the raw id back into the executable ``LLM_MODEL_IDS`` map.
-_RETIRED_MODEL_LABELS: dict[str, str] = {"claude-fable-5": "fable-5"}
+_RETIRED_MODEL_LABELS: dict[str, str] = {"claude-fable-5": "fable-5", "claude-opus-5": "opus-5"}
 # Shorthands whose prefix match is genuinely ambiguous and so must be pinned explicitly.
-# ``"opus"`` prefixes four choices (opus-5.5, opus-5, opus-4.8, opus-4.8-1m) and the shortest
-# of them (opus-5) is not a prefix of the 4.8 ones, so :func:`expand_llm_choice`'s
+# ``"opus"`` prefixes three choices (opus-5.5, opus-4.8, opus-4.8-1m) and the shortest of
+# them (opus-5.5) is not a prefix of the 4.8 ones, so :func:`expand_llm_choice`'s
 # shortest-wins rule cannot decide and would reject the input. Bare ``"opus"`` means the
 # CURRENT Opus generation; an older generation needs its version (``"opus-4"`` → opus-4.8).
 LLM_PREFIX_ALIASES: dict[str, str] = {"opus": "opus-5.5"}
@@ -477,7 +476,7 @@ def model_effort_cell(model: str, effort: str) -> str:
 def expand_llm_choice(value: str) -> str | None:
     """Canonicalize a model choice, accepting a unique prefix.
 
-    ``"opus"`` → ``"opus-5"``, ``"sonnet"`` → ``"sonnet-5"``;
+    ``"opus"`` → ``"opus-5.5"``, ``"sonnet"`` → ``"sonnet-5"``;
     an exact choice passes through unchanged. When one choice is itself a prefix of the
     others it matches (``"opus-4"`` hits both ``opus-4.8`` and ``opus-4.8-1m``), the shortest
     wins — the longer variant needs its own longer prefix (``"opus-4.8-"``). Shorthands whose
@@ -508,7 +507,8 @@ def resolve_job_llm(value: str | None) -> tuple[str, bool]:
     """Return a launchable job model and whether a retired value was replaced.
 
     Unknown/corrupt values use :data:`DEFAULT_LLM`, as before. A persisted pre-retirement
-    ``fable-5`` value also resolves to that default, but reports ``True`` so the launch
+    value (``fable-5``, ``opus-5``) resolves to its :data:`RETIRED_LLM_REPLACEMENTS`
+    entry, but reports ``True`` so the launch
     boundary can emit exactly one notice even when both job fields contain it.
     """
     candidate = (value or "").strip().lower()
@@ -518,6 +518,25 @@ def resolve_job_llm(value: str | None) -> tuple[str, bool]:
     if candidate in LLM_MODEL_IDS:
         return candidate, False
     return DEFAULT_LLM, False
+
+
+def current_model(model: str | None) -> str:
+    """*model* with a superseded value replaced by its current one, in the same form.
+
+    A retired ccc choice (``"opus-5"``) → its replacement choice (``"opus-5.5"``); a retired
+    raw ``claude --model`` id (``"claude-opus-5"``) → the replacement's raw id
+    (``"claude-opus-5-5"``). Both go through :data:`RETIRED_LLM_REPLACEMENTS`, the one
+    table. Anything else (current, unknown, ``""``) passes through unchanged. Every launch
+    path that re-uses a STORED or OBSERVED model (relay successor, job launch, handoff
+    facts) calls this first, so a chain started on a retired model never stays on it.
+    """
+    value = model or ""
+    if value in RETIRED_LLM_REPLACEMENTS:
+        return RETIRED_LLM_REPLACEMENTS[value]
+    label = _RETIRED_MODEL_LABELS.get(value)
+    if label is not None and label in RETIRED_LLM_REPLACEMENTS:
+        return LLM_MODEL_IDS[RETIRED_LLM_REPLACEMENTS[label]]
+    return value
 
 
 @dataclass
@@ -1019,12 +1038,12 @@ def short_date_label(when: date) -> str:
 def models_readout(session: Session) -> str:
     """Plain model label of a draft's configured pair for the ``model`` column.
 
-    When overseer and executor are the same model (the common case — ``opus-5 ▸ opus-5``
+    When overseer and executor are the same model (the common case — ``opus-5.5 ▸ opus-5.5``
     is redundant noise in a narrow column) the single name is returned; otherwise the
     ``<overseer> ▸ <executor>`` pair. Shown in the ``model`` column for future-job (draft)
     rows — the TUI colour-codes each model name per
     :data:`command_center.views.tui._LLM_STYLE`; ``ccc ls`` renders it plain. Both names
-    come straight from the row (default ``opus-5`` for each).
+    come straight from the row (default ``opus-5.5`` for each).
     """
     if session.llm_overseer == session.llm_exec:
         return session.llm_overseer

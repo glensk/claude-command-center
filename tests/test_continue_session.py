@@ -78,7 +78,8 @@ def test_state_json_reports_everything_the_handoff_needs(
     assert data["live_pid"] == 4242
     assert data["aim"] == "tp#1 shipped" and data["aim_rev"] == 1
     assert data["subgoals"] == {"unchecked": ["test", "ship"], "checked": ["build"]}
-    assert data["no_codex"] is True and data["model"] == "opus-5"
+    # tp#2032: the source observed the retired opus-5; the handoff carries its successor.
+    assert data["no_codex"] is True and data["model"] == "opus-5.5"
     assert data["active_transfer"] is None
     inv = data["inflight"]
     assert inv["clear"] is False
@@ -289,7 +290,9 @@ def test_start_hands_off_to_a_new_session_and_finalizes(
         job = store.get(target)
         assert job is not None and job.draft and job.no_codex
         assert job.config_dir == str(harness.private)
-        assert job.aim == "tp#1 shipped" and job.llm_overseer == "opus-5"
+        # tp#2032: a predecessor on the retired opus-5 never hands it to its successor.
+        assert job.aim == "tp#1 shipped" and job.llm_overseer == "opus-5.5"
+        assert job.llm_exec == "opus-5.5"
         assert job.handed_off_from == SID
         assert (job.prompt or "").startswith("[handoff] You take over")
         assert f"ccc continue-session accept {transfer.transfer_id}" in (job.prompt or "")

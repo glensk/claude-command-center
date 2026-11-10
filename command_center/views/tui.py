@@ -338,7 +338,8 @@ _CACHE_STYLE = {
 _DRAFT_BLUE = "#5fafff"  # FUTURE (draft) jobs: section header, ✎ icon, prompt preview
 # Per-model colours for the draft `<overseer> ▸ <executor>` readout (the /next-step cell).
 _LLM_STYLE: dict[str, str] = {
-    "opus-5": "#2ecc71",  # green
+    "opus-5.5": "#2ecc71",  # green
+    "opus-5": "#2ecc71",  # green (retired, tp#2032: old rows still render)
     "opus-4.8": "#2ecc71",  # green
     "sonnet-5": "#5fafff",  # blue
 }

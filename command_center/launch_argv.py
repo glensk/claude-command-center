@@ -145,6 +145,8 @@ def claude_argv(  # pylint: disable=too-many-arguments
     parsed as an unknown option and claude exits at once, and a variadic option in
     *extra* (``--add-dir <dirs...>``) would otherwise swallow the prompt.
     A *launch_profile* swaps ``claude`` for that profile's executable (:func:`profile_argv`).
+    A superseded *model* id (``claude-opus-5``) launches as its replacement
+    (:func:`command_center.models.current_model`, tp#2032).
     """
     if name is None:
         name = lookup_name(resume or session_id)
@@ -156,7 +158,9 @@ def claude_argv(  # pylint: disable=too-many-arguments
     elif continue_last:
         argv.append("--continue")
     if model:
-        argv += ["--model", model]
+        from .models import current_model  # tp#2032: never launch a superseded model id
+
+        argv += ["--model", current_model(model)]
     if not resume and session_id:
         argv += ["--session-id", session_id]
     if effort:

@@ -119,6 +119,14 @@ def test_builder_shapes() -> None:
     ]
 
 
+def test_builder_never_emits_a_superseded_model_id() -> None:
+    """tp#2032: ``--model claude-opus-5`` launches as ``claude-opus-5-5``, on every path."""
+    argv = launch_argv.claude_argv(session_id="s1", model="claude-opus-5", name="")
+    assert argv == ["claude", "--model", "claude-opus-5-5", "--session-id", "s1"]
+    kept = launch_argv.claude_argv(session_id="s1", model="claude-opus-4-8", name="")
+    assert kept[:3] == ["claude", "--model", "claude-opus-4-8"]
+
+
 def test_builder_looks_the_name_up_from_the_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

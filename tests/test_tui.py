@@ -2130,7 +2130,7 @@ def test_draft_next_step_cell_shows_models_readout(
     """
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     store = Store(tmp_path / "command-center" / "state.db")
-    store.create_draft("job-models", "/Users/x/repo", "Migrate tickets")  # both default opus-5
+    store.create_draft("job-models", "/Users/x/repo", "Migrate tickets")  # both default opus-5.5
     mixed = "job-mixed"
     store.create_draft(mixed, "/Users/x/repo", "Ship it")
     store.update_fields(mixed, llm_overseer="opus-4.8", llm_exec="sonnet-5")
@@ -2149,7 +2149,7 @@ def test_draft_next_step_cell_shows_models_readout(
             assert isinstance(cell, Text)
             # Equal overseer/executor: single green name, no arrow.
             assert "▸" not in cell.plain
-            assert _styled_fragments(cell, "#2ecc71") == ["opus-5"]
+            assert _styled_fragments(cell, "#2ecc71") == ["opus-5.5"]
             # The pair moved OUT of the /next-step cell (draft has no next-step → "—").
             next_cell = models_row[_NEXT_COL]
             assert isinstance(next_cell, Text)
@@ -2171,7 +2171,7 @@ def test_inline_edit_models_selects_save_through_commit(
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     draft_sid = "draft-models-edit"
     store = Store(tmp_path / "command-center" / "state.db")
-    store.create_draft(draft_sid, "/Users/x/repo", "Prepare draft")  # both default opus-5
+    store.create_draft(draft_sid, "/Users/x/repo", "Prepare draft")  # both default opus-5.5
     store.close()
 
     from textual.widgets import Select
@@ -2195,7 +2195,7 @@ def test_inline_edit_models_selects_save_through_commit(
             assert app.query_one("#edit-executor-row").styles.display == "block"
             overseer = app.query_one("#edit-overseer", Select)
             executor = app.query_one("#edit-executor", Select)
-            assert overseer.value == "opus-5"
+            assert overseer.value == "opus-5.5"
             assert "fable-5" not in {str(value) for _prompt, value in overseer._options}
 
             # Picking new choices from the dropdowns (invalid input is impossible).

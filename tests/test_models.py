@@ -10,6 +10,7 @@ from command_center.models import (
     LLM_AGENT_ALIAS,
     LLM_CHOICES,
     LLM_MODEL_IDS,
+    RETIRED_LLM_REPLACEMENTS,
     LiveSession,
     Session,
     Status,
@@ -17,6 +18,7 @@ from command_center.models import (
     aim_column_first,
     aim_score_badge,
     aim_score_pct,
+    current_model,
     deadline_badge,
     derive_status,
     display_aim,
@@ -51,10 +53,10 @@ def test_expand_llm_choice() -> None:
     makes invalid input impossible in the TUI, but the function must stay correct.
     """
     assert expand_llm_choice("opus-4.8") == "opus-4.8"  # exact
-    assert expand_llm_choice("opus-5") == "opus-5"  # exact
+    assert expand_llm_choice("opus-5") == "opus-5.5"  # retired: the prefix hits 5.5 only
     assert expand_llm_choice("fable") is None  # retired models cannot be selected
     assert expand_llm_choice("SONNET") == "sonnet-5"  # case-insensitive
-    # Bare "opus" prefixes opus-5.5, opus-5, opus-4.8 AND opus-4.8-1m, so shortest-wins
+    # Bare "opus" prefixes opus-5.5, opus-4.8 AND opus-4.8-1m, so shortest-wins
     # cannot decide it — LLM_PREFIX_ALIASES pins it to the current Opus generation.
     assert expand_llm_choice("  opus ") == "opus-5.5"  # trimmed; explicit alias
     assert expand_llm_choice("opus-5.") == "opus-5.5"  # unique prefix
@@ -101,6 +103,7 @@ def test_models_readout_compacts_on_equal() -> None:
 def test_model_label() -> None:
     """A raw model id reverse-maps to its ccc choice; unknown → unchanged; empty → ""."""
     assert model_label("claude-fable-5") == "fable-5"
+    assert model_label("claude-opus-5") == "opus-5"  # retired: display stays truthful
     assert model_label("claude-opus-4-8") == "opus-4.8"
     assert model_label("claude-opus-4-8[1m]") == "opus-4.8-1m"
     assert model_label("claude-brand-new-9") == "claude-brand-new-9"  # unknown → unchanged
@@ -449,3 +452,23 @@ def test_days_until_start() -> None:
     assert days_until_start(Session("s", draft=True, start_date="2026-01-01"), today=today) is None
     assert days_until_start(Session("s", draft=True), today=today) is None
     assert days_until_start(Session("s", draft=False, start_date="2026-08-11"), today=today) is None
+
+
+def test_current_model_replaces_superseded_ids() -> None:
+    """tp#2032: one table maps a retired choice or raw id to the current one, same form."""
+    assert "opus-5" not in LLM_CHOICES
+    assert "claude-opus-5" not in LLM_MODEL_IDS.values()
+    assert RETIRED_LLM_REPLACEMENTS["opus-5"] == "opus-5.5"
+    assert current_model("opus-5") == "opus-5.5"  # ccc choice form
+    assert current_model("claude-opus-5") == "claude-opus-5-5"  # raw --model form
+    assert current_model("fable-5") == "opus-5.5"
+    assert current_model("claude-fable-5") == "claude-opus-5-5"
+    # Current, unknown and empty values pass through unchanged.
+    assert current_model("opus-5.5") == "opus-5.5"
+    assert current_model("claude-opus-5-5") == "claude-opus-5-5"
+    assert current_model("claude-opus-4-8") == "claude-opus-4-8"
+    assert current_model("claude-brand-new-9") == "claude-brand-new-9"
+    assert current_model("") == ""
+    assert current_model(None) == ""
+    # Every replacement is itself launchable (no chain ends on a retired value).
+    assert set(RETIRED_LLM_REPLACEMENTS.values()) <= set(LLM_CHOICES)

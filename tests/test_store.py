@@ -73,16 +73,16 @@ def test_create_draft_stores_llm_models_and_defaults(tmp_path: Path) -> None:
     # Explicit valid choices are stored verbatim.
     s = store.create_draft("jobllm", "/repo", "Do it", llm_overseer="opus-4.8", llm_exec="sonnet-5")
     assert s.llm_overseer == "opus-4.8" and s.llm_exec == "sonnet-5"
-    # Default when omitted is opus-5 on both.
+    # Default when omitted is opus-5.5 on both.
     d = store.create_draft("jobdef", "/repo", "Do it")
-    assert d.llm_overseer == "opus-5" and d.llm_exec == "opus-5"
+    assert d.llm_overseer == "opus-5.5" and d.llm_exec == "opus-5.5"
     # A retired or bogus value falls back to the active default.
     b = store.create_draft("jobbad", "/repo", "Do it", llm_overseer="gpt-9", llm_exec="")
-    assert b.llm_overseer == "opus-5" and b.llm_exec == "opus-5"
+    assert b.llm_overseer == "opus-5.5" and b.llm_exec == "opus-5.5"
     retired = store.create_draft(
         "jobretired", "/repo", "Do it", llm_overseer="fable-5", llm_exec="fable-5"
     )
-    assert retired.llm_overseer == "opus-5" and retired.llm_exec == "opus-5"
+    assert retired.llm_overseer == "opus-5.5" and retired.llm_exec == "opus-5.5"
 
 
 def test_clear_draft_promotes_to_real_session(tmp_path: Path) -> None:

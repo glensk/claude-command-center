@@ -87,6 +87,7 @@ def resolve_source(
     registry/store and no process ancestry is ignored.
     """
     from . import accounts, terminal
+    from .models import current_model
 
     if outside and not explicit:
         return None
@@ -107,7 +108,8 @@ def resolve_source(
         else ((live.config_dir if live else "") or (stored.config_dir if stored else ""))
     )
     cwd = (live.cwd if live else "") or (stored.cwd if stored else "") or os.getcwd()
-    model = (stored.model if stored else "") or (getattr(live, "model", "") or "")
+    # tp#2032: a superseded observed model (opus-5) is never carried into the successor.
+    model = current_model((stored.model if stored else "") or (getattr(live, "model", "") or ""))
     ignore = terminal.pid_ancestry(os.getpid(), terminal.ps_table()) if inside else frozenset()
     return Source(
         session_id=sid,

@@ -68,7 +68,6 @@ from .models import (
     AIM_SET_BY_TOOL,
     AIM_SET_BY_USER,
     BUSY_RAW_STATUSES,
-    DEFAULT_LLM,
     EFFORT_LEVELS,
     JOB_TYPES,
     LLM_AGENT_ALIAS,
@@ -3712,9 +3711,10 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
         overseer, retired_overseer = resolve_job_llm(session.llm_overseer)
         executor, retired_executor = resolve_job_llm(session.llm_exec)
         if retired_overseer or retired_executor:
+            retired = session.llm_overseer if retired_overseer else session.llm_exec
             print(
-                f"notice: job {args.session_id} requested retired model fable-5; "
-                f"launching on {DEFAULT_LLM} instead",
+                f"notice: job {args.session_id} requested retired model {retired}; "
+                f"launching on {overseer if retired_overseer else executor} instead",
                 file=sys.stderr,
             )
         # (decision 14) Resume-aware: check ONLY the exact project dir derived from the
