@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     from .models import LiveSession, Session
     from .store import Store
     from .tab_titles import ItermPane
+    from .thread import ThreadFacts
 
     #: ``session_agents.inventory``'s shape: targets ``(sid, transcript)`` → known agents.
     SubagentsReader = Callable[
@@ -192,14 +193,17 @@ def session_entry(
     status: str | None = None,
     *,
     raw_status: str | None = None,
+    thread: ThreadFacts | None = None,
 ) -> dict[str, Any]:
     """One ``sessions[]`` item of the §6 contract (*status* defaults to the registry's).
 
     ``raw_status`` is the raw word *status* was mapped from (default: the registry's).
+    *thread* fills ``thread_id`` / ``user_aim`` / ``aims_n`` (tp#1989; null when unknown).
     """
     from .adapters.claude_agents import contract_status
 
     shown, staff_agent = display_name(live.session_id, row)
+    peer = (live.name or "").strip() or ((row.observed_runtime_name or "").strip() if row else "")
     return {
         "session_id": live.session_id,
         "name": (row.canonical_name or None) if row else None,
@@ -217,6 +221,10 @@ def session_entry(
         "aim_short": _aim_short(row),
         "done": bool(row.done) if row else False,
         "tab": {"iterm_session_id": tab[0], "validated": tab[1]},
+        "thread_id": thread.thread_id if thread else None,
+        "peer_name": peer or None,
+        "user_aim": thread.user_aim if thread else None,
+        "aims_n": thread.aims_n if thread else None,
     }
 
 
@@ -309,6 +317,16 @@ def _attach_subagents(
             entry["agents"] = agents
 
 
+def _thread_facts(db: Store, session_ids: list[str]) -> dict[str, ThreadFacts]:
+    """Every live id's thread fields in one batched read; any error leaves them all null."""
+    from . import thread
+
+    try:
+        return thread.facts(db.conn, session_ids)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return {}
+
+
 def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
     *,
     adapter: ClaudeAdapter | None = None,
@@ -358,6 +376,7 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
     own_store = store is None
     db = store if store is not None else _Store()
     try:
+        threads = _thread_facts(db, [live.session_id for live in lives])
         for live in lives:
             agent = _agent_for(live, by_sid)
             background = live.kind != "interactive" or (agent is not None and agent.background)
@@ -369,7 +388,13 @@ def collect_sessions(  # pylint: disable=too-many-arguments,too-many-locals
             raw = live_raw_status(live, agent)
             turn = None if background else shell_turn_active(adapter, live, raw)
             entry = session_entry(
-                live, row, tab, label_of, live_status(live, agent, turn), raw_status=raw
+                live,
+                row,
+                tab,
+                label_of,
+                live_status(live, agent, turn),
+                raw_status=raw,
+                thread=threads.get(live.session_id),
             )
             if background:
                 entry["kind"] = "background"

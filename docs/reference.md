@@ -3673,7 +3673,17 @@ only supplies the status of listed sessions. Headless `claude -p` runs (registry
 | `done`                 | ccc's own DONE flag (`ccc mark-done`), `false` without a ccc row                                   |
 | `tab.iterm_session_id` | the iTerm session of the tab (null for a background job)                                           |
 | `tab.validated`        | the registry pid's controlling tty is the tab's tty                                                |
+| `thread_id`            | the thread: the session's handoff chain's root session id (its own id when never handed over)      |
+| `peer_name`            | the name Claude Code gave the process (registry `name`, e.g. `repo-ab`), null when unknown         |
+| `user_aim`             | the latest AIM the user set (first line, ≤ 200 chars; `ccc aim-history` fallbacks), null when none |
+| `aims_n`               | the number of the thread's real AIM changes (`ccc aim-history -t`), a cheap change signal          |
 | `agents`               | optional, `-j` only: the session's running background subagents (below)                            |
+
+The thread id (tp#1989) is `sessions.thread_id`, which `continue-session accept` copies from
+the source onto the successor (a failed or never-accepted draft keeps none); without it the
+root is found by the `ccc lineage` walk, so relays from before the column need no backfill.
+`thread_id`, `user_aim` and `aims_n` come from one batched read per call; a failed read leaves
+all three null. A session ccc never saw is its own thread (`aims_n` 0, `user_aim` null).
 
 `agents` lists the subagents the session launched in the background that still run, in launch
 order, at most 20. "Running" is the in-flight definition: an `async_launched` agent launch

@@ -690,6 +690,11 @@ class Session:
     handed_off_to: str | None = None
     handed_off_from: str | None = None
     handed_off_at: int | None = None
+    # The thread this session belongs to: its handoff chain's root session id, copied onto
+    # the successor by ``continue-session accept`` (tp#1989). NULL = not recorded (the
+    # session is its own root, or a relay before the column existed): ``Store.thread_of``
+    # then walks ``handed_off_from``.
+    thread_id: str | None = None
     # --- session names (session_names.py) ---------------------------------------------
     # A name set by hand with `ccc name` (origin "manual"); ccc generates none (tp#1808).
     # Older builds also stored "llm" / "fallback" names and adopted hand-typed tab titles

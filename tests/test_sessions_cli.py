@@ -126,6 +126,10 @@ def test_both_accounts_kinds_status_and_names(store: Store) -> None:
         "display_name",
         "staff_agent",
         "tab",
+        "thread_id",
+        "peer_name",
+        "user_aim",
+        "aims_n",
     }
     assert out["a1"]["display_name"] == "parser" and out["a1"]["staff_agent"] is None
     assert out["b2"]["display_name"] is None  # no AIM, no hand-set name
@@ -499,3 +503,60 @@ def test_internal_error_exits_3(
     assert cli.main(["sessions", "-j"]) == 3
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is False and out["error"]["code"] == "internal"
+
+
+# ---- thread fields (tp#1989) ------------------------------------------------------
+
+
+def _only(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    assert len(entries) == 1
+    return entries[0]
+
+
+def _relayed(store: Store) -> None:
+    """root → mid → leaf, accepted: the leaf repeats the carried rows ccc copies."""
+    for sid in ("root", "mid", "leaf"):
+        store.ensure(sid, cwd="/r/voice")
+    store.set_aim("root", "first goal", set_by="launch")
+    store.set_aim("root", "sharper goal: tp#7", set_by="user")
+    for source, target in (("root", "mid"), ("mid", "leaf")):
+        store.update_fields(target, handed_off_from=source)
+        store.set_aim(target, "sharper goal: tp#7", set_by="user")
+        store.carry_first_aim(target, source)
+        store.record_thread(target, source)
+        store.set_handoff_lineage(source, target, 1_791_000_000_000)
+
+
+def test_thread_fields_of_a_relayed_session(store: Store) -> None:
+    _relayed(store)
+    store.update_fields("leaf", observed_runtime_name="voice-ab")
+    lives = [_live("leaf", 11, name="voice-cd"), _live("root", 12)]
+    out = {e["session_id"]: e for e in _collect(store, lives, {}, None)}
+    assert out["leaf"]["thread_id"] == "root" and out["root"]["thread_id"] == "root"
+    assert out["leaf"]["peer_name"] == "voice-cd"  # the registry's name wins
+    assert out["leaf"]["user_aim"] == "sharper goal: tp#7"
+    assert out["leaf"]["aims_n"] == 2  # the carried copies are not changes
+    assert out["root"]["aims_n"] == 2 and out["root"]["peer_name"] is None
+    lives = [_live("leaf", 11)]
+    entry = _only(_collect(store, lives, {}, None))
+    assert entry["peer_name"] == "voice-ab"  # else the observed one ccc stored
+
+
+def test_thread_fields_are_null_safe_for_a_session_ccc_never_saw(store: Store) -> None:
+    entry = _only(_collect(store, [_live("zz9", 11, name="repo-zz")], {}, None))
+    assert entry["thread_id"] == "zz9" and entry["peer_name"] == "repo-zz"
+    assert entry["user_aim"] is None and entry["aims_n"] == 0
+
+
+def test_a_failed_thread_read_leaves_the_fields_null(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center import thread  # pylint: disable=import-outside-toplevel
+
+    def boom(*_a: Any) -> Any:
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(thread, "facts", boom)
+    store.ensure("a1", cwd="/r/voice")
+    entry = _only(_collect(store, [_live("a1", 11)], {}, None))
+    assert entry["thread_id"] is None and entry["user_aim"] is None and entry["aims_n"] is None

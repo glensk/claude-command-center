@@ -217,6 +217,7 @@ _SESSION_COLUMNS = (
     "handed_off_to",
     "handed_off_from",
     "handed_off_at",
+    "thread_id",
 )
 _BOOL_COLUMNS = frozenset(
     {
@@ -353,7 +354,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     aim_eta_set_at    INTEGER,
     handed_off_to     TEXT,
     handed_off_from   TEXT,
-    handed_off_at     INTEGER
+    handed_off_at     INTEGER,
+    thread_id         TEXT
 );
 CREATE TABLE IF NOT EXISTS subgoals (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -741,6 +743,10 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         "handed_off_to": "TEXT",
         "handed_off_from": "TEXT",
         "handed_off_at": "INTEGER",
+        # The thread id (the handoff chain's root session id), written by `accept`
+        # (tp#1989). NULL = not recorded: `thread_of` walks `handed_off_from` instead, so
+        # legacy chains need no backfill.
+        "thread_id": "TEXT",
     }
     # Same, for the subgoals table (auto-progress marks its rows source='auto').
     _ADDED_SUBGOAL_COLUMNS = {
@@ -2539,6 +2545,34 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         )
         self.conn.commit()
         return True
+
+    def thread_of(self, session_id: str) -> str:
+        """*session_id*'s thread id: its handoff chain's root session id (tp#1989).
+
+        The recorded ``thread_id`` column when set (on the session or the nearest ancestor
+        that has it); else the oldest id the ``handed_off_from`` walk reaches (the rule of
+        ``ccc lineage``: ≤ 50 hops, cycle guard; :func:`thread.walk`); else *session_id*.
+        """
+        from . import thread  # pylint: disable=import-outside-toplevel  # thread reads the store
+
+        return thread.walk(self.conn, session_id).thread_id
+
+    def record_thread(self, target_id: str, source_id: str) -> bool:
+        """Copy *source_id*'s thread id onto its successor *target_id*; True if written.
+
+        ``continue-session accept`` calls this next to :meth:`carry_first_aim` (and its
+        duplicate-accept path, which heals a crash after the accepted CAS). Idempotent: a
+        recorded id is never overwritten, so a re-run writes nothing and the thread id
+        stays stable even if an ancestor row is later deleted.
+        """
+        thread_id = self.thread_of(source_id)
+        cur = self.conn.execute(
+            "UPDATE sessions SET thread_id = ? WHERE session_id = ? "
+            "AND COALESCE(thread_id, '') = ''",
+            (thread_id, target_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
 
     def _mirror_first_aim_onto_session(self, session_id: str, new: str) -> None:
         """Copy a rewritten first AIM onto the session (it is also the current AIM)."""

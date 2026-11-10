@@ -1490,8 +1490,10 @@ def _run_hooks_with_retry(  # pylint: disable=too-many-return-statements,too-man
 
 def _accept_again(store: Store, transfer: Any, as_json: bool) -> int:
     """A duplicate ``accept`` (``accepted``/``finalized``): no hook runs again; it heals a
-    crash after the accepted CAS (finalize + closer, both idempotent and token-scoped)."""
+    crash after the accepted CAS (finalize + closer, both idempotent and token-scoped) and
+    records the thread id a crash before it skipped (tp#1989, idempotent)."""
     before = transfer.state
+    store.record_thread(transfer.target_session, transfer.source_session)
     source = _finalize_after_accept(store, transfer)
     if as_json:
         print(
@@ -1559,6 +1561,8 @@ def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-ret
         steps += moved
         # The lineage's first AIM becomes this session's `/aim (1)` anchor (tp#1553).
         store.carry_first_aim(transfer.target_session, transfer.source_session)
+        # …it joins the source's thread: one id across every relay (tp#1989)…
+        store.record_thread(transfer.target_session, transfer.source_session)
         # …and its current AIM is the latest one the user set in the source (tp#1566).
         _reconcile_successor_aim(store, transfer)
         _mark_retired(transfer)

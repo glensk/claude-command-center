@@ -671,6 +671,44 @@ def test_accept_carries_the_lineages_first_aim_as_the_anchor(
         assert successor.aim == "build B2: tp#1" and successor.first_aim == "tp#1 shipped"
 
 
+def test_accept_records_the_sources_thread_on_the_successor(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1989: accept copies the thread id (the source's root) onto the successor; the
+    draft carries none before accept, and a second accept changes nothing."""
+    tid = _opened_transfer(harness)
+    new = _as_successor(monkeypatch, harness, tid)
+    with Store() as store:
+        draft = store.get(new)
+        assert draft is not None and draft.thread_id is None
+        store.update_fields(SID, thread_id="root-0")  # the source is itself a successor
+    _hooks(monkeypatch)
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    with Store() as store:
+        successor = store.get(new)
+        assert successor is not None and successor.thread_id == "root-0"
+        assert store.thread_of(new) == "root-0"
+
+
+def test_a_duplicate_accept_records_the_thread_a_crash_skipped(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center.transfer_store import ACCEPTED  # pylint: disable=C0415
+
+    tid = _opened_transfer(harness)
+    new = _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch)
+    with Store() as store:
+        assert store.transition_transfer(tid, ACCEPTED, 1)  # the crash right after the CAS
+        draft = store.get(new)
+        assert draft is not None and draft.thread_id is None
+    assert cli.main(["continue-session", "accept", tid]) == 0
+    with Store() as store:
+        successor = store.get(new)
+        assert successor is not None and successor.thread_id == SID
+
+
 def test_carry_first_aim_passes_the_root_down_the_chain() -> None:
     with Store() as store:
         for sid, aims in (("root", ["goal", "box 1"]), ("mid", ["box 2"]), ("leaf", ["box 3"])):
