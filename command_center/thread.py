@@ -30,18 +30,25 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 # pylint: disable=wrong-import-position  # the direct-run shim comes first
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import aimtext
+from .bridge_json import iso
 from .models import AIM_SET_BY_USER
 
 if TYPE_CHECKING:
     import sqlite3
 
-#: Upper bound of the hops one walk follows (the ``ccc lineage`` bound).
-MAX_HOPS = 50
+__all__ = ["MAX_HOPS", "AimEntry", "ThreadFacts", "ThreadPath", "facts", "thread_aims", "walk"]
+
 #: Max characters of a ``user_aim`` (the tp#1986 naming rule).
 USER_AIM_MAX = 200
+#: Max characters of an entry's ``aim`` and of ``current_aim`` (first line).
+AIM_MAX = 300
+#: Upper bound of the hops one walk follows (``bridge_lineage.MAX_HOPS``, pinned by a test).
+MAX_HOPS = 50
+#: The newest entries one thread view keeps (``truncated`` when more exist).
+MAX_ENTRIES = 50
 #: Ids per ``IN (…)`` list (well under SQLite's bound-parameter limit).
 _CHUNK = 500
 
@@ -284,3 +291,40 @@ def facts(conn: sqlite3.Connection, session_ids: list[str]) -> dict[str, ThreadF
             aims_n=len(carry_entries(path.path, history, rows)),
         )
     return out
+
+
+def entry_json(entry: AimEntry) -> dict[str, Any]:
+    """One ``aims[]`` item: ``{at, aim, aim_full_len, by, session_id, hop}``."""
+    return {
+        "at": iso(entry.at_ms) if entry.at_ms > 0 else None,
+        "aim": first_line(entry.aim, AIM_MAX) or "",
+        "aim_full_len": len(entry.aim),
+        "by": entry.by,
+        "session_id": entry.session_id,
+        "hop": entry.hop,
+    }
+
+
+def thread_aims(conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:
+    """*session_id*'s thread and its AIM history (``ccc lineage -j`` ``data.thread``).
+
+    ``{thread_id, thread_exact, current_aim, user_aim, aims: [entry…], truncated}``:
+    ``aims`` oldest first, the :data:`MAX_ENTRIES` newest (``truncated`` when cut);
+    ``current_aim`` the session's AIM and ``user_aim`` the latest one the user set (first
+    lines, ≤ :data:`AIM_MAX` / :data:`USER_AIM_MAX`; null when none). Read-only.
+    """
+    paths, rows = _walk(conn, [session_id])
+    path = paths.get(session_id) or ThreadPath(session_id, [session_id], session_id, False)
+    history = _history(conn, path.path)
+    entries = carry_entries(path.path, history, rows)
+    row = rows.get(session_id)
+    current = str((row["aim"] if row is not None else "") or "")
+    user = user_aim_text(history.get(session_id, []), current) if row is not None else None
+    return {
+        "thread_id": path.thread_id,
+        "thread_exact": path.exact,
+        "current_aim": first_line(current, AIM_MAX),
+        "user_aim": first_line(user, USER_AIM_MAX),
+        "aims": [entry_json(e) for e in entries[-MAX_ENTRIES:]],
+        "truncated": len(entries) > MAX_ENTRIES,
+    }

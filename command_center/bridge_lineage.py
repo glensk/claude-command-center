@@ -22,6 +22,9 @@ truncated}``; ``at`` is ISO-8601 UTC (when the successor took over: accepted, el
 finalized / opened / created; ``null`` when unknown), ``state`` the transfer state
 (``prepared`` / ``opened`` / ``accepted`` / ``finalized``) or ``null`` for a hop known only
 from ``handed_off_from``.
+
+``ccc lineage -j`` adds ``data.thread`` (tp#1989, :func:`thread.thread_aims`): the thread
+id, whether it is exact, the current and the user's AIM and the thread's real AIM changes.
 """
 
 from __future__ import annotations
@@ -133,5 +136,9 @@ def run_lineage(deps: BridgeDeps, session_id: str) -> dict[str, Any]:
     sid = (session_id or "").strip()
     if not sid:
         raise BridgeError("usage", "pass -s/--session <full session id>", EXIT_USAGE)
+    from . import thread  # pylint: disable=import-outside-toplevel  # only this verb needs it
+
     with deps.store() as store:
-        return lineage(store, sid)
+        data = lineage(store, sid)
+        data["thread"] = thread.thread_aims(store.conn, sid)  # additive (tp#1989)
+        return data

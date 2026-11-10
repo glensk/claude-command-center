@@ -736,6 +736,43 @@ def cmd_codex_usage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_thread_aims(session_id: str, as_json: bool) -> int:
+    """``ccc aim-history -t`` / ``-j``: the thread's real AIM changes (tp#1989)."""
+    from datetime import datetime
+
+    from . import thread
+    from .models import short_id
+
+    with Store() as store:
+        doc = thread.thread_aims(store.conn, session_id)
+    if as_json:
+        print(json.dumps(doc, ensure_ascii=False, indent=2))
+        return 0
+    aims = doc["aims"]
+    exact = "" if doc["thread_exact"] else " ≈"
+    plural = "y" if len(aims) == 1 else "ies"
+    print(
+        f"AIM history — thread {short_id(doc['thread_id'])}{exact}  "
+        f"({len(aims)} entr{plural}, session {short_id(session_id)})"
+    )
+    if doc["truncated"]:
+        print(f"  (older entries not kept: the {thread.MAX_ENTRIES} newest are shown)")
+    if not aims:
+        print("  (no AIM set in this thread yet)")
+    for index, entry in enumerate(aims, 1):
+        when = (
+            datetime.fromisoformat(entry["at"]).astimezone().strftime("%Y-%m-%d %H:%M")
+            if entry["at"]
+            else "—"
+        )
+        by = entry["by"] or "-"  # "-" = a legacy, unstamped row
+        marker = "  ← current" if index == len(aims) and entry["aim"] == doc["current_aim"] else ""
+        print(f"  {index}. {when}  ·  {by:<6}  ·  hop {entry['hop']}  {entry['aim']}{marker}")
+    if doc["user_aim"] and doc["user_aim"] != doc["current_aim"]:
+        print(f"  ✋ your latest AIM: {doc['user_aim']}")
+    return 0
+
+
 def cmd_aim_history(args: argparse.Namespace) -> int:
     """Print the session's AIM progression — every (re)definition, first to current."""
     from datetime import datetime
@@ -746,6 +783,8 @@ def cmd_aim_history(args: argparse.Namespace) -> int:
     if not session_id:
         print("error: could not resolve a session (pass --session <id>)", file=sys.stderr)
         return 1
+    if getattr(args, "thread", False) or getattr(args, "json", False):
+        return _print_thread_aims(session_id, bool(getattr(args, "json", False)))
     with Store() as store:
         session = store.get(session_id)
         revisions = store.list_aim_history(session_id)
@@ -6390,7 +6429,21 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_aimhist = sub.add_parser(
         "aim-history", help="show the session's AIM progression (first→current)"
     )
-    p_aimhist.add_argument("--session")
+    p_aimhist.add_argument("-s", "--session", help="session id (default: the current session)")
+    p_aimhist.add_argument(
+        "-t",
+        "--thread",
+        action="store_true",
+        help="the whole thread (every relay hop) instead of one session: its real AIM "
+        "changes, numbered, with who set each (user/launch/tool) and its hop",
+    )
+    p_aimhist.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help="print the thread view as JSON: {thread_id, thread_exact, current_aim, "
+        "user_aim, aims: [{at, aim, aim_full_len, by, session_id, hop}], truncated}",
+    )
     p_aimhist.set_defaults(func=cmd_aim_history)
 
     p_strip = sub.add_parser(

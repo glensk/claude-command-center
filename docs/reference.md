@@ -41,6 +41,8 @@ flags. Grouped by what they do:
   derived from it. `-g` prints it back (empty line when none); the TUI detail pane shows it as `· ~<eta>`.
 - `ccc aim` · `ccc aim-history` — the current AIM / its first→current progression (each
   revision with its `set_by` stamp: `user`, `launch`, `tool`, or `-` for a legacy row).
+  `ccc aim-history -s ID -t` shows the whole **thread** instead (every continue-session hop,
+  root first; see "Thread AIM history" below), `-j` the same as JSON.
 - `ccc strip-aim-runs` (`-a/--all` | `-s/--session`, `-n/--dry-run`) — one-time cleanup from
   when a tracker still rewrote AIMs: a non-archived, not-done session whose one-line AIM ends
   in a `: tp#N, #M` run with words before it gets the words alone (`Store.rewrite_aim_text`,
@@ -3891,6 +3893,30 @@ hop. At most 50 hops; an id already in the chain (or the session itself) cuts th
 (exit 0). `data = {session_id, chain: [{session_id, at, via: "continue-session", state}],
 truncated}`; `at` = ISO-8601 UTC when the successor took over (accepted, else finalized /
 opened / created; `null` when unknown).
+
+`data.thread` (tp#1989, additive; `thread.py`) is the session's thread and its AIM history:
+`{thread_id, thread_exact, current_aim, user_aim, aims: [{at, aim, aim_full_len, by,
+session_id, hop}], truncated}`. See "Thread AIM history" below.
+
+#### Thread AIM history
+
+A thread is every session one piece of work ran in across continue-session relays; its id is
+the chain root's session id (`sessions.thread_id`, written by `accept`; else the walk above).
+`thread_exact` is false when the walk was cut (cycle, > 50 hops) or a session row on the path
+is gone and no recorded `thread_id` vouches for the id. `aims` lists the real AIM changes on
+the path root → session, oldest first: each session's `aim_history` rows (a session with an
+AIM but no rows contributes one synthesized entry), minus the rows ccc itself copied at a
+relay — on every session after the root, its FIRST row when it equals the thread's first
+entry (the `/aim (1)` anchor `accept` carries) and any row equal to the previous kept entry
+(the carried current AIM). A real change back to an older wording is kept. Fork siblings are
+not on the path. Entry: `at` ISO-8601 UTC (null when unknown), `aim` the first line (≤ 300
+chars), `aim_full_len` the full text's length, `by` = `user` (`!aim`, `/aim`, TUI, job AIM,
+default `ccc set-aim`) / `launch` (the launcher's start AIM) / `tool` (`ccc set-aim --by
+tool`) / null (legacy row), `hop` the session's 0-based position on the path. At most the 50
+newest entries; `truncated` when cut. `current_aim` is the session's AIM (first line, ≤ 300),
+`user_aim` its latest user-set AIM (first line, ≤ 200; the newest `user` row, else the current
+AIM without its trailing tp-id run, else the first row). Read-only, computed on read: no
+schema change. `ccc sessions -j` `aims_n` counts these entries (before the 50 cut).
 
 ### `ccc delivery` (`-i/--id ID`, `-j/--json`)
 
