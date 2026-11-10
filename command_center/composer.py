@@ -5,7 +5,9 @@ The box is the lines strictly between the last two full-width ``─`` rules on t
 (Claude Code 2.1.319: no rounded frame; the status line and footer hints lie below the bottom
 rule, queued messages and menus above the top rule). Its first line opens with a prompt glyph:
 ``❯`` (``>`` on older builds) in prompt mode, ``!`` in bash mode, ``#`` in memory mode (not in
-2.1.319, where ``#`` is plain text).
+2.1.319, where ``#`` is plain text). Once a session has a title (a hook ``sessionTitle`` or
+``/rename``, Claude Code 2.1.322) the top rule carries it (``────…── <title> ─``); such a rule
+counts only as the top rule right above the box (:func:`screenread.rule_rows`).
 
 ``chars`` counts the cells inside the box after the glyph that are neither blank nor dim. Dim
 is the cell's ``faint`` flag: the placeholder and queued-turn hint text are faint in the

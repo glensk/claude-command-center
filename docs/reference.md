@@ -3815,7 +3815,11 @@ Right after the typing guard, still inside the lock, comes the **input-box guard
 one read-only iTerm2 Python-API screen read of the tab (`async_get_screen_contents`, the
 bottom 60 lines, cell by cell). Claude Code's input box is the lines between the last two
 full-width `─` rules; its first line opens with the prompt glyph (`❯`, `>` on older builds,
-`!` in bash mode). Content is every cell after the glyph that is neither blank nor faint, so
+`!` in bash mode). Once the session has a title (a hook `sessionTitle` or `/rename`, Claude
+Code 2.1.322) the top rule carries it (`──…── <title> ─`); such a titled rule counts only as
+the top rule right above the box (the first rule-shaped line above the plain bottom rule,
+followed by a prompt glyph), so a transcript line of `─` plus words is never taken for it
+(tp#1989). Content is every cell after the glyph that is neither blank nor faint, so
 the dim placeholder and suggestion text do not count, while a typed draft, a single stray
 character, a `[Pasted text #1 +N lines]` marker or a slash command do. The cursor cell is not
 content when Ink draws it inverse on the first letter of a faint placeholder (every later cell

@@ -19,8 +19,16 @@ non-dim, non-blank cells after the prompt glyph on the lines between the last tw
 | `bash_mode.json` | 2.1.319 | text | 0 | bash | `!` replaces `❯`, rules turn pink (`rgb:fd5db1`) |
 | `busy_queued.json` | 2.1.319 | empty | 0 | prompt | busy turn with one queued message: the queued text renders ABOVE the top rule (`❯` + grey `rgb:999999`), the box holds only a faint placeholder with the cursor on its first cell |
 | `slash_menu.json` | 2.1.319 | text | 1 | prompt | `/` typed; the command menu renders above the box |
+| `titled_rule_short.json` | 2.1.322 | empty | 0 | prompt | after `/rename` (10-char title): the top rule reads `──…── <title> ─`, 204 columns |
+| `titled_rule_long.json` | 2.1.322 | empty | 0 | prompt | 102-char title with `:` and `#` in the top rule |
+| `titled_rule_draft.json` | 2.1.322 | text | 16 | prompt | one-line draft under the long titled rule |
 
 Findings: the dim rule is the `faint` flag (placeholder text inside the box, fg default); grey
 `rgb:999999` marks hint/queued text outside the box and the rules are `rgb:888888`. The prompt
 glyph is `❯` followed by U+00A0. There is no `#` memory mode in this build (`#` is plain text).
 `cursor_coord` can point past the screen after a resize (stored as `y == -1`).
+
+2.1.322 (tp#1989 B1b): once a session has a title (hook `sessionTitle` or `/rename`) the TOP
+rule carries it right-aligned, `──…── <title> ─` (one `─` after the title, all cells in the rule
+colour); the bottom rule stays plain. A titled rule counts only as the top rule right above the
+box (`screenread.rule_rows`).

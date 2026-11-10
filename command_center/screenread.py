@@ -23,6 +23,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
 
 # pylint: disable=wrong-import-position  # the direct-run shim comes first
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -72,9 +73,54 @@ def is_full_rule(cells: Sequence[ScreenCell], cols: int) -> bool:
     return bool(text) and set(text) == {RULE} and len(text) >= cols - 2
 
 
+#: The rule with a session title drawn into it (Claude Code 2.1.322, a hook ``sessionTitle``
+#: or ``/rename``): ``────…──── <title> ─`` — a long run of ``─``, one blank, the title, one
+#: blank, a short ``─`` tail (one cell observed; up to three accepted).
+_TITLED_RULE = re.compile(rf"^{RULE}{{2,}} (\S(?:.*\S)?) {RULE}{{1,3}}$")
+
+
+def is_titled_rule(cells: Sequence[ScreenCell], cols: int) -> bool:
+    """True when the line is a rule carrying a session title (:data:`_TITLED_RULE`), at least
+    ``cols - 2`` wide.
+
+    The shape alone is not enough to tell a rule from a transcript line of ``─`` plus words:
+    :func:`rule_rows` accepts it only as the top rule right above the box (see there).
+    """
+    text = line_text(cells).strip()
+    return len(text) >= cols - 2 and _TITLED_RULE.match(text) is not None
+
+
+def _opens_with_prompt_glyph(cells: Sequence[ScreenCell]) -> bool:
+    """True when the line's first non-blank cell is a prompt / input-mode glyph."""
+    for cell in cells:
+        if all(c.isspace() or c == "\x00" for c in cell.ch):
+            continue
+        return cell.ch in PROMPT_GLYPHS
+    return False
+
+
 def rule_rows(read: ScreenRead) -> list[int]:
-    """Indices of the full-width rule lines, top to bottom."""
-    return [i for i, cells in enumerate(read.lines) if is_full_rule(cells, read.cols)]
+    """Indices of the full-width rule lines, top to bottom.
+
+    A plain rule (:func:`is_full_rule`) counts anywhere. A titled rule (:func:`is_titled_rule`)
+    counts only as the input box's TOP rule: it must be the first rule-shaped line above the
+    last plain rule (the box's bottom rule, which never carries a title) and the line right
+    under it must open with a prompt glyph. A ``─``-plus-words line in the transcript sits
+    above the box's own top rule and is never reached; one inside a draft taller than the
+    screen is not followed by a prompt glyph.
+    """
+    rows = [i for i, cells in enumerate(read.lines) if is_full_rule(cells, read.cols)]
+    if not rows:
+        return rows
+    for y in range(rows[-1] - 1, -1, -1):
+        cells = read.lines[y]
+        if is_full_rule(cells, read.cols):
+            break
+        if is_titled_rule(cells, read.cols):
+            if y + 1 < rows[-1] and _opens_with_prompt_glyph(read.lines[y + 1]):
+                rows.insert(len(rows) - 1, y)
+            break
+    return rows
 
 
 #: The ASCII prompt/mode glyphs are kept only in the first columns of a line (where the box

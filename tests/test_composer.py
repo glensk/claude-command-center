@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import composer
+from command_center import composer, screenread
 from command_center.composer import Composer, parse_screen, read_composer
 from command_center.screenread import ScreenCell, ScreenRead, from_json
 
@@ -57,7 +57,7 @@ def _screen(*lines: tuple[ScreenCell, ...], cursor: tuple[int, int] = (2, -1)) -
 def test_input_guard_parse_readme_lists_every_fixture() -> None:
     names = {p.stem for p in _FIXTURES.glob("*.json")}
     assert names == {row[0] for row in _README}
-    assert len(names) == 11
+    assert len(names) == 14
 
 
 @pytest.mark.parametrize(("name", "state", "chars", "mode"), _README, ids=[r[0] for r in _README])
@@ -220,6 +220,112 @@ def test_input_guard_parse_exception_is_typed_and_never_leaks_text(
     result = parse_screen(_load("draft_one_line"))
     assert result == Composer("unreadable", 0, "unknown", "ValueError")
     assert secret not in repr(result)
+
+
+def _titled(title: str, cols: int = _COLS) -> str:
+    """Claude Code 2.1.322's titled top rule: ``─`` run, `` <title> ``, one ``─``."""
+    return "─" * (cols - len(title) - 3) + f" {title} ─"
+
+
+@pytest.mark.parametrize(
+    "title",
+    ["b1b", "tp1989: canary #42", "t" * 25],
+    ids=["short", "colon_hash", "near_full_width"],
+)
+def test_titled_rule_is_the_top_rule(title: str) -> None:
+    """tp#1989 B1b: a rule with a session title drawn into it is the box's top rule."""
+    read = _screen(_line("transcript"), _line(_titled(title)), _line("❯ "), _line(_RULE))
+    assert screenread.rule_rows(read) == [1, 3]
+    assert read_composer(read) == Composer("empty", 0, "prompt")
+
+
+def test_titled_rule_100_char_title() -> None:
+    cols = 120
+    title = "tp1989: b1b #42 " + "a" * 84
+    assert len(title) == 100
+    rule = "─" * cols
+    read = ScreenRead(
+        cols,
+        (2, 1),
+        (_line(_titled(title, cols), cols=cols), _line("❯ ", cols=cols), _line(rule, cols=cols)),
+    )
+    assert read_composer(read) == Composer("empty", 0, "prompt")
+    draft = ScreenRead(
+        cols,
+        (5, 1),
+        (_line(_titled(title, cols), cols=cols), _line("❯ abc", cols=cols), _line(rule, cols=cols)),
+    )
+    assert read_composer(draft) == Composer("text", 3, "prompt")
+
+
+def test_titled_rule_bash_mode_and_multi_line_draft() -> None:
+    bash = _screen(_line(_titled("x")), _line("! "), _line(_RULE))
+    assert read_composer(bash) == Composer("text", 0, "bash")
+    multi = _screen(_line(_titled("x")), _line("❯ ab"), _line("  cd"), _line(_RULE))
+    assert read_composer(multi) == Composer("text", 4, "prompt")
+
+
+def test_untitled_rule_pair_unchanged() -> None:
+    read = _screen(_line(_RULE), _line("❯ "), _line(_RULE))
+    assert screenread.rule_rows(read) == [0, 2]
+    assert read_composer(read) == Composer("empty", 0, "prompt")
+
+
+def test_titled_rule_shape() -> None:
+    assert screenread.is_titled_rule(_line(_titled("b1b")), _COLS)
+    assert not screenread.is_titled_rule(_line(_RULE), _COLS)
+    assert not screenread.is_titled_rule(_line("── short ──"), _COLS)  # not full width
+    # ccc's own status row: no blank after the run, a long tail
+    status = "──/aim: x" + "─" * (_COLS - 9)
+    assert not screenread.is_titled_rule(_line(status), _COLS)
+    long_tail = "──── title " + "─" * (_COLS - 11)
+    assert not screenread.is_titled_rule(_line(long_tail), _COLS)
+
+
+def test_titled_shaped_prose_in_transcript_is_not_a_rule() -> None:
+    """A transcript line of ``─`` plus words, even followed by an echoed prompt, sits above the
+    box's own top rule and is never taken as the rule."""
+    read = _screen(
+        _line(_titled("Summary")),
+        _line("❯ an echoed earlier prompt"),
+        _line("⏺ answer"),
+        _line(_RULE),
+        _line("❯ "),
+        _line(_RULE),
+    )
+    assert screenread.rule_rows(read) == [3, 5]
+    assert read_composer(read) == Composer("empty", 0, "prompt")
+    titled_box = _screen(
+        _line(_titled("Summary")),
+        _line("❯ an echoed earlier prompt"),
+        _line(_titled("b1b")),
+        _line("❯ "),
+        _line(_RULE),
+    )
+    assert screenread.rule_rows(titled_box) == [2, 4]
+    assert read_composer(titled_box) == Composer("empty", 0, "prompt")
+
+
+def test_titled_shaped_line_inside_tall_draft_is_not_a_rule() -> None:
+    """Top rule scrolled off: a ``─``-plus-words draft line not followed by a prompt glyph
+    keeps the lower-bound ``text`` reading."""
+    read = _screen(_line("  ab"), _line(_titled("cd")), _line("  ef"), _line(_RULE))
+    assert screenread.rule_rows(read) == [3]
+    assert read_composer(read).state == "text"
+
+
+def test_titled_shaped_line_below_the_bottom_rule_is_ignored() -> None:
+    read = _screen(_line(_titled("b1b")), _line("❯ "), _line(_RULE), _line(_titled("st")))
+    assert screenread.rule_rows(read) == [0, 2]
+
+
+def test_tail_from_top_rule_keeps_the_titled_rule() -> None:
+    read = _screen(
+        _line("a"), _line("b"), _line(_titled("t")), _line("❯ "), _line(_RULE), cursor=(2, 3)
+    )
+    tail = screenread.tail_from_top_rule(read, 1)
+    assert [screenread.line_text(c).strip()[:1] for c in tail.lines] == ["b", "─", "❯", "─"]
+    assert tail.cursor == (2, 2)
 
 
 def test_input_guard_parse_malformed_read_is_unreadable() -> None:
