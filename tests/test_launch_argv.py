@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,9 @@ def _capture_exec(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     def fake_exec(_file: str, argv: list[str]) -> None:
         seen["argv"] = list(argv)
         seen["env"] = dict(os.environ)
+        info = os.fstat(0)  # start-job's first prompt rides on stdin (tp#1681 L23)
+        regular = stat.S_ISREG(info.st_mode) and not info.st_nlink
+        seen["stdin"] = os.pread(0, info.st_size, 0).decode("utf-8") if regular else ""
         raise SystemExit(0)
 
     monkeypatch.setattr(os, "execvp", fake_exec)
@@ -243,7 +247,7 @@ def test_l5_cmd_start_job(
         cli.cmd_start_job(argparse.Namespace(session_id=job, force=True, auto=False))
     argv = seen["argv"]
     assert spy and _has_name(argv) and "--session-id" in argv and "--model" in argv
-    assert argv[-1].endswith("aim")  # the prompt stays the LAST argument
+    assert seen["stdin"].endswith("aim") and "--" not in argv  # prompt on stdin (L23)
     assert seen["env"][accounts.TITLE_VAR] == "1"
 
 
@@ -330,8 +334,9 @@ def test_start_job_with_a_frontmatter_prompt_execs_it_after_the_marker(
     with pytest.raises(SystemExit):
         cli.cmd_start_job(argparse.Namespace(session_id=job, force=True, auto=False))
     argv = seen["argv"]
-    assert spy and argv[-2] == "--" and argv[-1].endswith(FRONTMATTER_PROMPT)
-    assert argv.count("--") == 1
+    # stdin carries the prompt (tp#1681 L23): a leading `---` can never be read as an option
+    assert spy and "--" not in argv and seen["stdin"].endswith(FRONTMATTER_PROMPT)
+    assert not any(FRONTMATTER_PROMPT in part for part in argv)
 
 
 def _fake_log_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:

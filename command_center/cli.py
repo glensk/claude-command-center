@@ -2758,13 +2758,18 @@ def _profile_argv(session: object, **kwargs: Any) -> list[str] | None:
         return None
 
 
-def _exec_in(cwd: str, argv: list[str], *, strict: bool = False) -> None:
+def _exec_in(
+    cwd: str, argv: list[str], *, strict: bool = False, stdin_prompt: str | None = None
+) -> None:
     """``os.execvp(argv)`` from inside *cwd*, leaving this process's cwd untouched if it returns.
 
     The ``chdir`` happens immediately before the exec and is undone when the exec raises
     (or, in tests, is mocked and returns), so an in-process caller whose launch does not
     happen is never left in the session's directory (tp#689). A missing or non-directory
     *cwd* is skipped, unless *strict*: then the ``chdir`` itself raises ``OSError``.
+    A *stdin_prompt* becomes the exec'd ``claude``'s stdin — its first prompt, kept out of
+    argv (:func:`launch_argv.prompt_stdin_fd`, tp#1681 L23); fd 0 is restored when the
+    exec does not happen.
     """
     try:
         prev: str | None = os.getcwd()
@@ -2772,9 +2777,22 @@ def _exec_in(cwd: str, argv: list[str], *, strict: bool = False) -> None:
         prev = None
     if strict or (cwd and os.path.isdir(cwd)):
         os.chdir(cwd)
+    saved_stdin: int | None = None
     try:
+        if stdin_prompt is not None:
+            prompt_fd = launch_argv.prompt_stdin_fd(stdin_prompt)
+            try:
+                with contextlib.suppress(OSError):  # a closed fd 0 has nothing to restore
+                    saved_stdin = os.dup(0)
+                os.dup2(prompt_fd, 0)  # inheritable: the exec'd claude reads it
+            finally:
+                os.close(prompt_fd)
         os.execvp(argv[0], argv)  # replaces this process on success
     finally:
+        if saved_stdin is not None:
+            with contextlib.suppress(OSError):
+                os.dup2(saved_stdin, 0)
+            os.close(saved_stdin)
         if prev is not None:
             with contextlib.suppress(OSError):
                 os.chdir(prev)
@@ -3772,16 +3790,18 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
                 f"'{LLM_AGENT_ALIAS[executor]}'; keep planning, review, verification and "
                 f"integration yourself. " + prompt
             )
-        launch_prompt = job_launch_prefix(job_type) + prompt  # single argv element — no quoting
+        launch_prompt = job_launch_prefix(job_type) + prompt
     # The original prompt of a resumed job was already submitted; a bare resume continues
     # it (NO prompt argument). --model + --resume is accepted by the CLI (smoke-checked).
-    # A first launch runs ON the overseer's model with the prompt sent.
+    # A first launch runs ON the overseer's model with the prompt sent — on claude's STDIN,
+    # never in argv (tp#1681 L23): argv shows in `ps` for the session's whole life, and a
+    # -P/-p first prompt may carry a relay handover. Interactive claude reads a non-TTY
+    # stdin as its first prompt and takes the keyboard from /dev/tty.
     argv = launch_argv.claude_argv(
         resume=args.session_id if resume else "",
         session_id="" if resume else args.session_id,
         model=LLM_MODEL_IDS[overseer],
         effort=effort,
-        prompt=launch_prompt,
         launch_profile=profile,
     )
     _spawn_sync_mirrors(cfg)  # (BEFORE execvp: the success path replaces this process)
@@ -3794,7 +3814,7 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
     # launch must never grant trust. The trust gate above already settled the job's cwd.
     accounts.pin_environ(config_dir, no_codex, profile)
     try:
-        _exec_in(cwd, argv)  # replaces this process on success
+        _exec_in(cwd, argv, stdin_prompt=launch_prompt)  # replaces this process on success
     except OSError as exc:  # (d) launch failed — undo the promotion so the job survives
         with Store() as store:
             store.update_fields(args.session_id, draft=True)

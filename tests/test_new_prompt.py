@@ -8,6 +8,7 @@ resolve the same paths the setup uses; ``CCC_INTERNAL`` suppresses detached ``cc
 from __future__ import annotations
 
 import argparse
+import os
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -125,12 +126,17 @@ def test_start_job_imports_edits_archives_and_clears(
     )
 
     captured: list[list[str]] = []
-    monkeypatch.setattr(cli.os, "execvp", lambda _prog, argv: captured.append(argv))
+
+    def _capture(_prog: str, argv: list[str]) -> None:
+        info = os.fstat(0)  # the first prompt rides on stdin, not argv (tp#1681 L23)
+        captured.append([*argv, os.pread(0, info.st_size, 0).decode("utf-8")])
+
+    monkeypatch.setattr(cli.os, "execvp", _capture)
     monkeypatch.setattr(cli.os, "chdir", lambda _p: None)  # don't move the test's cwd
 
     assert cli.cmd_start_job(argparse.Namespace(session_id=sid)) == 0
-    # Targeted import ran → the edited prompt reached the launch argv AND the DB.
-    assert captured and any("brand new prompt" in a for a in captured[0])
+    # Targeted import ran → the edited prompt reached the launch stdin AND the DB.
+    assert captured and captured[0][-1].endswith("brand new prompt")
     with Store(env.db) as store:
         session = store.get(sid)
     assert session is not None and session.draft is False and session.prompt == "brand new prompt"

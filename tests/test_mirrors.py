@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -490,6 +491,9 @@ def _no_execvp(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
 
     def _cap(_file: str, argv: list[str]) -> None:
         captured["argv"] = argv
+        info = os.fstat(0)  # start-job's first prompt rides on stdin (tp#1681 L23)
+        regular = stat.S_ISREG(info.st_mode) and not info.st_nlink
+        captured["stdin"] = [os.pread(0, info.st_size, 0).decode("utf-8") if regular else ""]
         raise _StopExec
 
     monkeypatch.setattr("command_center.cli.os.execvp", _cap)
@@ -581,9 +585,8 @@ def test_start_job_first_launch_when_transcript_only_in_other_project_dir(
         sid,
         "--effort",
         "xhigh",
-        "--",
-        "run it",
     ]
+    assert captured["stdin"] == ["run it"]  # the first prompt rides on stdin (tp#1681 L23)
 
 
 # ---------------------------------------------------------------------------

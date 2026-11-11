@@ -223,6 +223,33 @@ def read_prompt_file(path: str | PathLike[str]) -> str:
     return text
 
 
+def prompt_stdin_fd(prompt: str) -> int:
+    """A read fd at offset 0 holding *prompt*, for the launched ``claude``'s stdin (tp#1681 L23).
+
+    An interactive ``claude`` whose stdin is not a TTY reads stdin as its FIRST prompt and
+    takes the keyboard from ``/dev/tty`` instead (smoke-checked on 2.1.322: the TUI stays
+    interactive and submits the text exactly as the positional prompt would) — so a job's
+    first prompt never has to ride in argv, where ``ps`` shows it for the session's life.
+    The backing file is created 0600 in the temp dir and unlinked before this returns: no
+    path ever names it, and the kernel frees it once ``claude`` closes its stdin or exits.
+    """
+    import os
+    import tempfile
+
+    fd, path = tempfile.mkstemp(prefix="ccc-prompt-")  # O_EXCL, mode 0600
+    try:
+        os.unlink(path)
+        data = prompt.encode("utf-8")
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+        os.lseek(fd, 0, os.SEEK_SET)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def claude_command(
     target: SessionLaunch, argv: Sequence[str], *, cwd: str = "", subshell: bool = False
 ) -> str:

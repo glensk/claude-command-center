@@ -200,6 +200,17 @@ class _StopExec(Exception):
     """Sentinel raised in place of os.execvp so the test can inspect the built argv."""
 
 
+def _exec_stdin() -> str:
+    """The first prompt start-job left on fd 0 for the exec'd claude (tp#1681 L23), or ""."""
+    import os
+    import stat
+
+    info = os.fstat(0)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink:
+        return ""
+    return os.pread(0, info.st_size, 0).decode("utf-8")
+
+
 def _start_job_argv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -210,6 +221,26 @@ def _start_job_argv(
     config_toml: str = "",
 ) -> list[str]:
     """Build a draft with the given models, run cmd_start_job, and capture the exec argv."""
+    return _start_job_launch(
+        tmp_path,
+        monkeypatch,
+        overseer=overseer,
+        executor=executor,
+        job_type=job_type,
+        config_toml=config_toml,
+    )[0]
+
+
+def _start_job_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    overseer: str,
+    executor: str,
+    job_type: str = "claude",
+    config_toml: str = "",
+) -> tuple[list[str], str]:
+    """``(argv, stdin prompt)`` of cmd_start_job's exec for a draft with the given models."""
     from command_center.cli import cmd_start_job
 
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
@@ -237,20 +268,22 @@ def _start_job_argv(
 
     def _capture(_file: str, argv: list[str]) -> None:
         captured["argv"] = argv
+        captured["stdin"] = [_exec_stdin()]
         raise _StopExec
 
     monkeypatch.setattr("command_center.cli.os.execvp", _capture)
     with pytest.raises(_StopExec):
         cmd_start_job(argparse.Namespace(session_id="job-x"))
-    return captured["argv"]
+    return captured["argv"], captured["stdin"][0]
 
 
 def test_start_job_argv_default_models_no_delegation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    argv = _start_job_argv(tmp_path, monkeypatch, overseer="opus-4.8", executor="opus-4.8")
+    argv, stdin = _start_job_launch(tmp_path, monkeypatch, overseer="opus-4.8", executor="opus-4.8")
     # Runs on the overseer's model; equal exec/overseer → no delegation prefix. Effort is
-    # always explicit (launch_effort default xhigh) so settings.json never decides it.
+    # always explicit (launch_effort default xhigh) so settings.json never decides it. The
+    # prompt rides on stdin, never in argv (tp#1681 L23).
     assert argv == [
         "claude",
         "--model",
@@ -259,16 +292,17 @@ def test_start_job_argv_default_models_no_delegation(
         "job-x",
         "--effort",
         "xhigh",
-        "--",
-        "run it",
     ]
+    assert stdin == "run it"
 
 
 def test_start_job_argv_delegates_when_exec_differs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    argv = _start_job_argv(tmp_path, monkeypatch, overseer="opus-5.5", executor="sonnet-5")
-    assert argv[:7] == [
+    argv, prompt = _start_job_launch(
+        tmp_path, monkeypatch, overseer="opus-5.5", executor="sonnet-5"
+    )
+    assert argv == [
         "claude",
         "--model",
         "claude-opus-5-5",
@@ -277,8 +311,6 @@ def test_start_job_argv_delegates_when_exec_differs(
         "--effort",
         "xhigh",
     ]
-    assert argv[7] == "--"
-    prompt = argv[8]
     assert prompt.startswith("[orchestration] You are the overseer running as opus-5.")
     assert "model 'sonnet'" in prompt  # Agent-tool alias for the executor
     assert prompt.endswith("run it")
@@ -287,14 +319,14 @@ def test_start_job_argv_delegates_when_exec_differs(
 def test_start_job_argv_codex_keeps_model_but_no_delegation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    argv = _start_job_argv(
+    argv, prompt = _start_job_launch(
         tmp_path, monkeypatch, overseer="opus-5.5", executor="opus-4.8", job_type="codex"
     )
     # --model still applies (Claude oversees), but a codex job gets no delegation prefix —
     # instead the job_launch_prefix routes it into /codex-implement-task-and-claude-review.
     assert argv[:3] == ["claude", "--model", "claude-opus-5-5"]
-    assert argv[7] == "--" and "[orchestration]" not in argv[8]
-    assert argv[8].startswith("/codex-implement-task-and-claude-review ")
+    assert "--" not in argv and "[orchestration]" not in prompt
+    assert prompt.startswith("/codex-implement-task-and-claude-review ")
 
 
 def test_start_job_legacy_fable_row_maps_once_to_opus(
@@ -953,6 +985,7 @@ def test_start_job_resolves_a_unique_id_prefix(
 
     def _capture(_file: str, argv: list[str]) -> None:
         captured["argv"] = argv
+        captured["stdin"] = [_exec_stdin()]
         raise _StopExec
 
     monkeypatch.setattr("command_center.cli.os.execvp", _capture)
@@ -1006,12 +1039,13 @@ def test_start_job_force_overrides_start_date(
 
     def _capture(_file: str, argv: list[str]) -> None:
         captured["argv"] = argv
+        captured["stdin"] = [_exec_stdin()]
         raise _StopExec
 
     monkeypatch.setattr("command_center.cli.os.execvp", _capture)
     with pytest.raises(_StopExec):
         cmd_start_job(argparse.Namespace(session_id="job-sched", force=True))
-    assert captured["argv"][-1] == "run it"
+    assert captured["stdin"] == ["run it"] and "run it" not in captured["argv"]
 
 
 def test_start_job_tty_yes_launches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1026,12 +1060,13 @@ def test_start_job_tty_yes_launches(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
     def _capture(_file: str, argv: list[str]) -> None:
         captured["argv"] = argv
+        captured["stdin"] = [_exec_stdin()]
         raise _StopExec
 
     monkeypatch.setattr("command_center.cli.os.execvp", _capture)
     with pytest.raises(_StopExec):
         cmd_start_job(argparse.Namespace(session_id="job-sched"))
-    assert captured["argv"][-1] == "run it"
+    assert captured["stdin"] == ["run it"] and "run it" not in captured["argv"]
 
 
 def test_start_job_tty_no_aborts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1062,12 +1097,13 @@ def test_start_job_past_start_date_needs_no_confirmation(
 
     def _capture(_file: str, argv: list[str]) -> None:
         captured["argv"] = argv
+        captured["stdin"] = [_exec_stdin()]
         raise _StopExec
 
     monkeypatch.setattr("command_center.cli.os.execvp", _capture)
     with pytest.raises(_StopExec):
         cmd_start_job(argparse.Namespace(session_id="job-sched"))
-    assert captured["argv"][-1] == "run it"
+    assert captured["stdin"] == ["run it"] and "run it" not in captured["argv"]
 
 
 # ---- done-job / delete-job / restore-job ------------------------------------
