@@ -373,6 +373,16 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
   `handed_off_to`, never on `done`): `core.reconcile_pass` closes it as done (one
   `handoff_done_sources` query per pass) once its transfer is `accepted`/`finalized` AND its
   process is gone, and `set_handoff_lineage` never lifts a done source back out.
+- **SessionStart auto-accept** (tp#1681 L18, `handoff_auto_accept`, default on; `false` is
+  the rollback): `hooks._auto_accept` runs `continue_session.accept_as` (the ONE accept
+  core; the CLI passes its env session, the hook its payload id) on the single inbound
+  `prepared`/`opened` transfer (`inbound_transfers`) before the AIM context is built — never
+  on `compact`/`clear` or under `CCC_INTERNAL`. One attempt, hooks bounded by
+  `min(accept_hook_timeout_sec, 45 s)` in all, accept's output captured (the hook prints ONE
+  JSON document), a ≤ 200-byte note (`AUTO_ACCEPT_NOTE`; the preamble names
+  `AUTO_ACCEPT_HEAD`). Several inbound or an unreadable row accept none; a refusal leaves
+  the transfer as it was; both name the recovery command. Already accepted on resume: no
+  row matches, silent. Manual `accept` is unchanged.
 - **The handoff closer is the only thing that closes a handed-off source**
   (`handoff_close.py`): it claims the source's close token, binds ONE live process (PID +
   start time), requires 10 s of stable idle (one transcript identity throughout), drains the

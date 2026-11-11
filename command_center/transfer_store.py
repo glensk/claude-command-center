@@ -291,6 +291,32 @@ class TransferStoreMixin:
         ).fetchall()
         return [_row_to_transfer(row) for row in rows]
 
+    def inbound_transfers(self, target_session: str) -> tuple[list[Transfer], int]:
+        """The ``prepared`` / ``opened`` transfers whose successor is *target_session*
+        (oldest first), and how many such rows are unreadable (tp#1681 L18).
+
+        A row is unreadable when it does not build a :class:`Transfer` or lacks its id, its
+        source or its target account — the SessionStart auto-accept never acts on it.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM transfers WHERE target_session = ? "
+            "AND state IN ('prepared', 'opened') ORDER BY created_at, transfer_id",
+            (target_session,),
+        ).fetchall()
+        found: list[Transfer] = []
+        corrupt = 0
+        for row in rows:
+            try:
+                transfer = _row_to_transfer(row)
+            except (TypeError, ValueError):
+                corrupt += 1
+                continue
+            if transfer.transfer_id and transfer.source_session and transfer.target_config_dir:
+                found.append(transfer)
+            else:
+                corrupt += 1
+        return found, corrupt
+
     def transition_transfer(
         self, transfer_id: str, to_state: str, now: int, *, failure: str = ""
     ) -> bool:

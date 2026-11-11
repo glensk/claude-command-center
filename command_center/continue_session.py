@@ -395,16 +395,19 @@ def preamble(transfer: Any, source_label: str, transcript: str) -> str:
 
     tp#1681 L3c: cut facts are fetched by KEY only (``facts <src> -k <key>``, the key each
     ``… cut`` line names), never as the whole snapshot; nothing here asks to re-claim work
-    (ownership moves on ``accept`` through ``handoff_hooks``).
+    (ownership moves on ``accept`` through ``handoff_hooks``). tp#1681 L18: the successor's
+    SessionStart hook may already have accepted; its note starts with ``AUTO_ACCEPT_HEAD``.
     """
+    accepted_note = AUTO_ACCEPT_HEAD.format(transfer=transfer.transfer_id)
     return (
         f"[handoff] You take over the work of session {transfer.source_session} "
         f"(account {source_label or '?'}), transfer {transfer.transfer_id}. The handoff "
         f"below is also stored at {transfer.handoff_path}"
         + (f"; the old session's transcript is {transcript} (evidence only)" if transcript else "")
         + ".\n"
-        f"FIRST run (pass the Bash tool timeout 600000: under load accept retries a slow "
-        f"handoff hook itself for up to ~8 min): ccc continue-session accept "
+        f"FIRST, unless a SessionStart note reads `{accepted_note}` (the hook already "
+        f"accepted it), run (pass the Bash tool timeout 600000: under load accept retries a "
+        f"slow handoff hook itself for up to ~8 min): ccc continue-session accept "
         f"{transfer.transfer_id}\n"
         "Only after it succeeds: relaunch every agent under 'Subagent continuations' as a NEW "
         "Agent from its capsule (old agent ids cannot be resumed across sessions), restart "
@@ -1559,63 +1562,137 @@ def _accept_again(store: Store, transfer: Any, as_json: bool) -> int:
     return 0
 
 
-def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
+def cmd_accept(args: argparse.Namespace) -> int:
     """``continue-session accept``: the successor takes the work over (hooks, then CAS
     plus the await rebind in one transaction)."""
-    from . import accounts, config
-    from .models import now_ms
+    from . import config
     from .store import Store
-    from .transfer_store import ACCEPTED, FINALIZED, OPENED, PREPARED
 
     with Store() as store:
-        transfer = store.get_transfer(args.transfer)
-        if transfer is None:
-            print(f"error: no such transfer {args.transfer}", file=sys.stderr)
-            return 1
-        caller = _env_session()
-        if caller != transfer.target_session:
-            print(
-                f"error: accept must run inside the successor session "
-                f"{transfer.target_session}, not {caller or 'an outside shell'}",
-                file=sys.stderr,
-            )
-            return 1
-        if not accounts.same_config_dir(accounts.env_config_dir(), transfer.target_config_dir):
-            print(
-                f"error: this session does not bill the {transfer.target_label!r} account the "
-                "transfer was made for — refusing",
-                file=sys.stderr,
-            )
-            return 1
-        if transfer.state in (ACCEPTED, FINALIZED):
-            return _accept_again(store, transfer, bool(args.json))
-        if transfer.state not in (PREPARED, OPENED):
-            print(
-                f"error: transfer {transfer.transfer_id} is {transfer.state}: "
-                f"{transfer.failure or 'no longer acceptable'}",
-                file=sys.stderr,
-            )
-            return 1
-        cfg = config.load_config()
-        hooks = _run_hooks_with_retry(store, transfer, cfg.handoff_hooks, cfg)
-        if isinstance(hooks, int):
-            return hooks
-        transfer, steps = hooks
-        moved = _accept_and_rebind(store, transfer)
-        if moved is None:
-            return 1
-        steps += moved
-        # The lineage's first AIM becomes this session's `/aim (1)` anchor (tp#1553).
-        store.carry_first_aim(transfer.target_session, transfer.source_session)
-        # …it joins the source's thread: one id across every relay (tp#1989)…
-        store.record_thread(transfer.target_session, transfer.source_session)
-        # …and its current AIM is the latest one the user set in the source (tp#1566).
-        _reconcile_successor_aim(store, transfer)
-        _mark_retired(transfer)
-        store.note_transfer(transfer.transfer_id, now_ms(), failure="")
-        # accept is the primary finalizer (tp#1582): an idle source never runs it itself.
-        source = _finalize_after_accept(store, transfer)
-    if args.json:
+        return accept_as(
+            store, args.transfer, _env_session(), bool(args.json), config.load_config()
+        )
+
+
+def accept_as(  # pylint: disable=too-many-return-statements
+    store: Store, transfer_id: str, caller: str, as_json: bool, cfg: Any
+) -> int:
+    """The ``accept`` core with the caller's session id passed in: the CLI passes its
+    session env, the SessionStart hook (which may lack it) its payload id (tp#1681 L18)."""
+    from . import accounts
+    from .models import now_ms
+    from .transfer_store import ACCEPTED, FINALIZED, OPENED, PREPARED
+
+    transfer = store.get_transfer(transfer_id)
+    if transfer is None:
+        print(f"error: no such transfer {transfer_id}", file=sys.stderr)
+        return 1
+    if caller != transfer.target_session:
+        print(
+            f"error: accept must run inside the successor session "
+            f"{transfer.target_session}, not {caller or 'an outside shell'}",
+            file=sys.stderr,
+        )
+        return 1
+    if not accounts.same_config_dir(accounts.env_config_dir(), transfer.target_config_dir):
+        print(
+            f"error: this session does not bill the {transfer.target_label!r} account the "
+            "transfer was made for — refusing",
+            file=sys.stderr,
+        )
+        return 1
+    if transfer.state in (ACCEPTED, FINALIZED):
+        return _accept_again(store, transfer, as_json)
+    if transfer.state not in (PREPARED, OPENED):
+        print(
+            f"error: transfer {transfer.transfer_id} is {transfer.state}: "
+            f"{transfer.failure or 'no longer acceptable'}",
+            file=sys.stderr,
+        )
+        return 1
+    hooks = _run_hooks_with_retry(store, transfer, cfg.handoff_hooks, cfg)
+    if isinstance(hooks, int):
+        return hooks
+    transfer, steps = hooks
+    moved = _accept_and_rebind(store, transfer)
+    if moved is None:
+        return 1
+    steps += moved
+    # The lineage's first AIM becomes this session's `/aim (1)` anchor (tp#1553).
+    store.carry_first_aim(transfer.target_session, transfer.source_session)
+    # …it joins the source's thread: one id across every relay (tp#1989)…
+    store.record_thread(transfer.target_session, transfer.source_session)
+    # …and its current AIM is the latest one the user set in the source (tp#1566).
+    _reconcile_successor_aim(store, transfer)
+    _mark_retired(transfer)
+    store.note_transfer(transfer.transfer_id, now_ms(), failure="")
+    # accept is the primary finalizer (tp#1582): an idle source never runs it itself.
+    source = _finalize_after_accept(store, transfer)
+    _print_accepted(transfer, steps, source, as_json)
+    return 0
+
+
+AUTO_ACCEPT_HEAD = "handoff {transfer} accepted"  # what the preamble tells the model to look for
+AUTO_ACCEPT_NOTE = AUTO_ACCEPT_HEAD + " (auto)"
+AUTO_ACCEPT_BUDGET_SEC = 45  # under Claude Code's 60 s default SessionStart hook timeout
+AUTO_NOTE_MAX_BYTES = 200
+
+
+def _fit(head: str, middle: str, tail: str) -> str:
+    """``head + middle + tail`` within :data:`AUTO_NOTE_MAX_BYTES`, cutting only *middle*."""
+    room = AUTO_NOTE_MAX_BYTES - len((head + tail).encode())
+    if len(middle.encode()) > room:
+        middle = middle.encode()[: max(0, room - 3)].decode("utf-8", "ignore") + "…"
+    return head + middle + tail
+
+
+def auto_accept(store: Store, session_id: str, inbound: list[Any], corrupt: int, cfg: Any) -> str:
+    """The SessionStart auto-accept (tp#1681 L18): ONE attempt of :func:`accept_as` on the
+    single inbound transfer, its output captured; the ≤ 200-byte note for the context.
+
+    Several inbound transfers or an unreadable row accept none and name the status
+    command. A refusal or a failing hook leaves the transfer as it was and names the
+    manual ``accept``. Hooks get ``min(accept_hook_timeout_sec, 45 s)`` in all, no retry.
+    """
+    import contextlib
+    import dataclasses
+    import io
+
+    if corrupt or len(inbound) != 1:
+        unreadable = f", {corrupt} unreadable" if corrupt else ""
+        return _fit(
+            f"handoff: {len(inbound) + corrupt} inbound transfers{unreadable}, ",
+            "none accepted (auto)",
+            f"; run: ccc continue-session status -s {session_id}",
+        )
+    tid = inbound[0].transfer_id
+    budget = min(int(cfg.accept_hook_timeout_sec or HOOK_TIMEOUT_SEC), AUTO_ACCEPT_BUDGET_SEC)
+    bounded = dataclasses.replace(cfg, accept_hook_timeout_sec=budget, accept_hook_retry_sec=0)
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = accept_as(store, tid, session_id, True, bounded)
+        except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            code = 1
+            print(f"error: {exc}", file=sys.stderr)
+    if code == 0:
+        try:
+            steps = [str(s) for s in json.loads(out.getvalue()).get("next_steps", [])]
+        except (ValueError, AttributeError):
+            steps = []  # a racing accept already won: its text line, no steps
+        middle = "; next: " + "; ".join(steps) if steps else ""
+        return _fit(AUTO_ACCEPT_NOTE.format(transfer=tid), middle, "")
+    errors = [ln for ln in err.getvalue().splitlines() if ln.startswith("error:")]
+    reason = errors[-1].removeprefix("error:").strip() if errors else "accept failed"
+    return _fit(
+        f"handoff {tid} NOT accepted (auto): ",
+        reason,
+        f"; run: ccc continue-session accept {tid}",
+    )
+
+
+def _print_accepted(transfer: Any, steps: list[str], source: dict[str, Any], as_json: bool) -> None:
+    if as_json:
         print(
             json.dumps(
                 {
@@ -1632,11 +1709,10 @@ def cmd_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-ret
             f"{transfer.source_session}. Relaunch the subagents and restart the shells the "
             "handoff lists, then follow its First steps."
         )
-    _say_source(source, transfer.transfer_id, args.json)
-    if not args.json:
+    _say_source(source, transfer.transfer_id, as_json)
+    if not as_json:
         for step in steps:
             print(f"next: {step}")
-    return 0
 
 
 def recovery_step(transfer: Any, target_is_draft: bool) -> str:

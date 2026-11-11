@@ -412,6 +412,30 @@ def _switch_landed_as_expected(store: Store, sid: str) -> bool:
 _CLOSE_KEEPING_SOURCES = frozenset({"compact", "clear"})
 
 
+def _auto_accept(store: Store, sid: str, payload: dict[str, Any]) -> str | None:
+    """The handoff auto-accept note for this start, or ``None`` (tp#1681 L18).
+
+    Only on a new process (never ``compact`` / ``clear``), never inside ccc's own
+    ``claude -p``, and only with ``handoff_auto_accept`` on. One indexed query when there
+    is nothing inbound; ``continue_session`` is imported only when there is. Fail-open:
+    an error → ``None`` (the preamble's manual ``accept`` still applies).
+    """
+    if payload.get("source") in _CLOSE_KEEPING_SOURCES or os.environ.get("CCC_INTERNAL"):
+        return None
+    try:
+        cfg = config.load_config()
+        if not cfg.handoff_auto_accept:
+            return None
+        inbound, corrupt = store.inbound_transfers(sid)
+        if not inbound and not corrupt:
+            return None
+        from . import continue_session  # lazy: only a successor pays for it
+
+        return continue_session.auto_accept(store, sid, inbound, corrupt, cfg)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return None
+
+
 def handle_session_start(payload: dict[str, Any]) -> int:
     sid = _session_id(payload)
     if not sid:
@@ -429,6 +453,10 @@ def handle_session_start(payload: dict[str, Any]) -> int:
             store.disarm_close(sid)
         if switch_warning and _switch_landed_as_expected(store, sid):
             switch_warning = None
+        # tp#1681 L18: accept the inbound handoff FIRST, so the reconciled AIM shows below.
+        handoff_note = _auto_accept(store, sid, payload)
+        if handoff_note:
+            session = store.get(sid) or session
         # The iTerm tab id itself is stamped inside ensure_current_session (every
         # hook event, self-healing) — here we only need the env value for the badge.
         iterm = os.environ.get("ITERM_SESSION_ID")
@@ -464,7 +492,7 @@ def handle_session_start(payload: dict[str, Any]) -> int:
             context = _GROUND.format(aim=session.aim, progress=progress, nxt=nxt)
         # An armed parked prompt must be visible from the first turn — a resumed
         # session otherwise guesses from the AIM while the real prompt sits armed.
-        context = "\n\n".join(filter(None, [context, _parked_prompt_notice(session)]))
+        context = "\n\n".join(filter(None, [handoff_note, context, _parked_prompt_notice(session)]))
         # D11: prepend the account-switch warning (the only guard the native --resume
         # picker reaches) so a session resumed under the wrong account says so up front.
         if switch_warning:

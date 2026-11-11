@@ -2103,6 +2103,22 @@ count and elapsed seconds and says the transfer is still `opened`; the successor
 preamble says accept already retries by itself and lets it run accept once more on
 exactly that error, stopping on any other.
 
+**The successor's SessionStart hook accepts by itself** (tp#1681 L18, config
+`handoff_auto_accept`, default `true`; `false` restores the manual-only flow). On a new
+process (never `compact`/`clear`, never inside ccc's own `claude -p`) the hook looks up the
+`prepared`/`opened` transfers whose target is this session. None: silent. Exactly one: it
+runs the same `accept` (same session and account checks, same accept-prepare, same
+`handoff_hooks`) once, with no retry window and the hooks bounded by
+`min(accept_hook_timeout_sec, 45)` seconds in all (Claude Code's default hook timeout is
+60 s), before the AIM context is built so the reconciled AIM shows. Its output is captured;
+the context gets one note of at most 200 bytes: `handoff T accepted (auto)` (plus the
+hooks' next steps when they fit), or `handoff T NOT accepted (auto): <reason>; run: ccc
+continue-session accept T` with the transfer left as it was. Several inbound transfers or an
+unreadable row accept none and name `ccc continue-session status -s <session>`. A resume
+after the accept finds no `prepared`/`opened` row and stays silent. The preamble tells the
+successor to skip its `accept` when a SessionStart note reads `handoff T accepted`;
+`accept` by hand keeps working and stays idempotent.
+
 Right before the first hook, `accept` moves its OWN process out of darwin background
 (`setpriority(PRIO_DARWIN_PROCESS, 0, 0)` plus `taskpolicy -B -p <pid>`, bounded by 10 s,
 never raising, no-op off macOS), so the hooks inherit normal QoS instead of the Bash

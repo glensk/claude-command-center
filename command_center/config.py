@@ -382,6 +382,11 @@ DEFAULTS: dict[str, object] = {
     # of this many seconds, with a doubling wait (10, 20, 40 s) and at most 4 attempts, each
     # run bounded by what remains. 0 = one attempt; clamped to 0..480.
     "accept_hook_retry_sec": 420,
+    # tp#1681 L18: the successor's SessionStart hook runs `accept` itself on its single
+    # inbound prepared/opened transfer (one attempt, bounded by 45 s). Acts only on a
+    # transfer a `continue-session start` created, so it is ON; false = the model runs
+    # `accept` from its preamble, as before (the rollback).
+    "handoff_auto_accept": True,
     # `ccc continue-session collect|start` (tp#1479): fact PROVIDERS, a list of tables
     # {argv = [...], timeout_s = N, optional = bool, name = "..."}; placeholders {session}
     # {cwd} {transcript} {config_dir} {phase} {tp_ids}. Each prints a typed-record JSON
@@ -1223,6 +1228,7 @@ class Config:
     handoff_hooks: list[list[str]] = field(default_factory=list)  # continue-session accept
     accept_hook_timeout_sec: int = 180  # one accept hook run's budget (10..480)
     accept_hook_retry_sec: int = 420  # accept's hook retry window (0 = off, ≤ 480)
+    handoff_auto_accept: bool = True  # SessionStart runs accept on the inbound transfer
     handoff_facts: list[dict[str, object]] = field(default_factory=list)  # fact providers
     resume_stagger_sec: int = 120
     resume_poll_sec: int = 30
