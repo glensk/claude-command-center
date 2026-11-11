@@ -80,7 +80,7 @@ flags. Grouped by what they do:
 
 **Future jobs**
 
-- `ccc new-job -a "AIM" [-p PROMPT] [-c REPO] [-s YYYY-MM-DD] [-d DEP] [-j codex] [-O overseer] [-E executor]` — park a future job (`-d` = another job it depends on).
+- `ccc new-job -a "AIM" [-p PROMPT] [-c REPO] [-s YYYY-MM-DD] [-d DEP] [-j codex] [-O overseer] [-E executor] [-l]` — park a future job (`-d` = another job it depends on; `-l/--lean-start` exports `CC_LEAN_START=1` into the job's session so it starts lean).
 - `ccc new-prompt [-r cat/repo] [-o]` — a prefilled capture file for a future job.
 - `ccc jobs` — list registered future jobs (drafts).
 - `ccc job-account` — per-account usage urgency + which account a new job will bill to (the `job_account` policy).
@@ -555,7 +555,7 @@ then reads `(fn adds one)`), so `tf` always has at least this one line to toggle
 `claude --session-id <id> "<prompt>"` in the repo, with the AIM already set — the draft simply
 becomes the live session (it reuses the pre-assigned id, so the AIM carries over). Everything
 is also scriptable: `ccc new-job -a "…" [-p "…"] [-c REPO] [-w "during holidays"]
-[-s YYYY-MM-DD] [-O overseer] [-E executor] [-N] [-L LABEL] [-K KEY] [-J]`, `ccc jobs [-j]`,
+[-s YYYY-MM-DD] [-O overseer] [-E executor] [-N] [-L LABEL] [-K KEY] [-J] [-l]`, `ccc jobs [-j]`,
 `ccc start-job <id>`. Future jobs are
 inert until launched — the daemon never reaps, grades, or alerts on them.
 

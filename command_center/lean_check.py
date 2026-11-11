@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """``ccc continue-session lean-check`` — may this session relay by code? (tp#1681 L19c).
 
 Read-only. A relay hook asks it at a seam whether the successor can start from the facts
@@ -26,6 +27,17 @@ Exit 0 when ready, 1 when not (or the session cannot be resolved).
 
 from __future__ import annotations
 
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
+
+
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import json
 import time
 from typing import TYPE_CHECKING, Any
