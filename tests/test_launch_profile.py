@@ -438,7 +438,7 @@ def test_cmd_fire_attached_execs_through_the_profile(
     monkeypatch.setattr(os, "execvp", seen)
     with pytest.raises(SystemExit):
         cli.cmd_fire_attached(argparse.Namespace(session_id=job))
-    assert seen.argv[0] == str(exe) and seen.argv[-2:] == ["--", "go"]
+    assert seen.argv[0] == str(exe) and seen.argv[-2:] == ["--resume", job]  # prompt: stdin
     assert seen.env[accounts.PROFILE_VAR] == LABEL
     assert (seen.env.get("CCC_NO_CODEX") == "1") is no_codex
 

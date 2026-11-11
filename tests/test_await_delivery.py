@@ -478,7 +478,13 @@ def _fire_await(
     execs: list[Any] = []
     _register_env(monkeypatch, env)
     monkeypatch.setattr(cli, "Store", lambda: Store(env["tmp"] / "state.db"))
-    monkeypatch.setattr(os, "execvp", lambda f, a: execs.append((f, a, os.getcwd())))
+
+    def _execvp(prog: str, argv: list[str]) -> None:
+        size = os.fstat(0).st_size  # tp#1681 L24: the delivery prompt rides on stdin
+        stdin = os.pread(0, size + 1, 0).decode("utf-8") if size else ""
+        execs.append((prog, argv, os.getcwd(), stdin))
+
+    monkeypatch.setattr(os, "execvp", _execvp)
     monkeypatch.setattr(accounts, "ensure_trusted", lambda *_a, **_k: pytest.fail("trust granted"))
     code = cli.cmd_fire_await(argparse.Namespace(group_id=gid, token=token))
     return code, execs
@@ -490,9 +496,9 @@ def test_fire_await_claims_then_execs_resume(
     gid, token = _claimable(env, no_codex=True)
     code, execs = _fire_await(monkeypatch, env, gid, token)
     assert code == 0
-    [(prog, argv, cwd)] = execs
-    assert prog == "claude" and argv[:4] == ["claude", "--resume", SID, "--"]
-    assert argv[4].startswith(FRAMING) and "Reply arrived:" in argv[4]
+    [(prog, argv, cwd, stdin)] = execs
+    assert prog == "claude" and argv == ["claude", "--resume", SID]
+    assert stdin.startswith(FRAMING) and "Reply arrived:" in stdin
     assert cwd == str(Path(env["cwd"]).resolve()) or cwd == env["cwd"]
     assert os.environ.get("CCC_NO_CODEX") == "1"
     assert os.environ.get("CLAUDE_CONFIG_DIR") == env["acct"]
@@ -631,10 +637,11 @@ def test_fire_await_fresh_execs_a_new_session(
     code, calls = _fire_await_exec_in(monkeypatch, env, gid, token)
     assert code == 0
     [(cwd, argv, kw)] = calls
-    assert cwd == env["cwd"] and kw == {"strict": True}
-    assert argv[:2] == ["claude", "--"] and len(argv) == 3 and "--resume" not in argv
-    assert argv[2].startswith(f"This is a NEW session started by ccc await group {gid} ")
-    assert f"\n\n{FRAMING}" in argv[2] and "Reply arrived:" in argv[2]
+    assert cwd == env["cwd"] and set(kw) == {"strict", "stdin_prompt"} and kw["strict"]
+    assert argv == ["claude"]  # tp#1681 L24: no prompt in argv
+    prompt = kw["stdin_prompt"]
+    assert prompt.startswith(f"This is a NEW session started by ccc await group {gid} ")
+    assert f"\n\n{FRAMING}" in prompt and "Reply arrived:" in prompt
     assert os.environ.get("CLAUDE_CONFIG_DIR") == env["acct"]
     assert _state(env, gid) == "delivered"
 
@@ -643,9 +650,22 @@ def test_fire_await_resume_argv(env: dict[str, Any], monkeypatch: pytest.MonkeyP
     gid, token = _claimable(env)
     code, calls = _fire_await_exec_in(monkeypatch, env, gid, token)
     assert code == 0
-    [(_cwd, argv, _kw)] = calls
-    assert argv[:4] == ["claude", "--resume", SID, "--"] and len(argv) == 5
-    assert argv[4].startswith(FRAMING) and "NEW session" not in argv[4]
+    [(_cwd, argv, kw)] = calls
+    assert argv == ["claude", "--resume", SID]
+    assert kw["stdin_prompt"].startswith(FRAMING) and "NEW session" not in kw["stdin_prompt"]
+
+
+def test_prompt_argv_fire_await_keeps_the_prompt_out_of_argv(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1681 L24: resume and -F/--fresh deliveries both put the event on stdin only."""
+    for fresh in (False, True):
+        gid, token = _claimable(env, fresh=fresh)
+        code, execs = _fire_await(monkeypatch, env, gid, token)
+        assert code == 0
+        [(_prog, argv, _cwd, stdin)] = execs
+        assert "--" not in argv and not any("Reply arrived" in part for part in argv)
+        assert "Reply arrived:" in stdin
 
 
 # --------------------------------------------------------------------------- paste guard (tp#1867)

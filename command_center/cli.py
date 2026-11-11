@@ -2890,7 +2890,8 @@ def cmd_fire_attached(args: argparse.Namespace) -> int:
     session tab was gone at fire time (see ``daemon._deliver_attached_prompts``).
     Claims the delivery via the one-shot conditional ``fire_at → 0`` update — a
     second tab refuses instead of delivering twice — then pins the session's
-    account and execs ``claude --resume <id> "<prompt>"`` in the session's cwd.
+    account and execs ``claude --resume <id>`` in the session's cwd, the prompt on
+    its stdin, never in argv (tp#1681 L24).
     On an exec failure the fire time is re-armed so the daemon retries.
     """
     import time as _time
@@ -2905,7 +2906,7 @@ def cmd_fire_attached(args: argparse.Namespace) -> int:
         prompt = (session.prompt or "").strip()
         profile = accounts.session_launch_profile(session)
         # Resolved BEFORE the claim: an unresolvable profile refuses with no state change.
-        fire_argv = _profile_argv(session, resume=args.session_id, prompt=prompt)
+        fire_argv = _profile_argv(session, resume=args.session_id)
         if fire_argv is None:
             store.update_fields(args.session_id, fire_at=0)  # no tab-opening retry loop
             return 1
@@ -2920,7 +2921,7 @@ def cmd_fire_attached(args: argparse.Namespace) -> int:
         launch = accounts.LaunchTarget(session.config_dir, bool(session.no_codex), profile)
     accounts.session_apply_to_environ(launch)
     try:
-        _exec_in(cwd, fire_argv)
+        _exec_in(cwd, fire_argv, stdin_prompt=prompt)
     except OSError as exc:
         with Store() as store:  # undo the claim: re-arm so the daemon retries
             store.update_fields(args.session_id, fire_at=int(_time.time()) + 900)
@@ -2938,7 +2939,8 @@ def cmd_fire_await(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     is pinned with ``accounts.pin_environ`` — trust is only CHECKED (it was granted at
     arm time), never granted here. A failed exec (or no terminal) hands the row back
     (``fired`` for a bounded number of retries, then ``blocked``). A ``-F/--fresh``
-    group execs ``claude "<preamble + prompt>"`` instead — a NEW session, no ``--resume``.
+    group execs a bare ``claude`` instead — a NEW session, no ``--resume``. Either way the
+    delivery prompt goes on claude's stdin, never in argv (tp#1681 L24).
     """
     import time as _time
 
@@ -2976,15 +2978,12 @@ def cmd_fire_await(args: argparse.Namespace) -> int:  # pylint: disable=too-many
         profile = group.launch_profile or (
             accounts.session_launch_profile(owner) if owner is not None else ""
         )
+        prompt = delivery_prompt(group)
         try:  # re-resolved from its NAME now, before any state change
             argv = (
-                launch_argv.claude_argv(
-                    name="", prompt=delivery_prompt(group), launch_profile=profile
-                )
+                launch_argv.claude_argv(name="", launch_profile=profile)
                 if group.fresh
-                else launch_argv.claude_argv(
-                    resume=group.session_id, prompt=delivery_prompt(group), launch_profile=profile
-                )
+                else launch_argv.claude_argv(resume=group.session_id, launch_profile=profile)
             )
         except LaunchProfileError as exc:
             store.revert_delivery(
@@ -3001,7 +3000,7 @@ def cmd_fire_await(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     # A -F/--fresh group starts a NEW session (no id yet → no name to carry).
     try:
         accounts.pin_environ(group.config_dir, group.no_codex, profile)
-        _exec_in(group.cwd, argv, strict=True)
+        _exec_in(group.cwd, argv, strict=True, stdin_prompt=prompt)
     except OSError as exc:
         with Store() as store:
             store.revert_delivery(

@@ -794,18 +794,20 @@ def _dry_run(transfer: Any, src: Source, text: str, as_json: bool) -> int:
     from .models import LLM_MODEL_IDS
 
     prompt = preamble(transfer, src.label, str(src.transcript or "")) + text
+    # The successor launches through `ccc start-job`, which feeds this prompt on claude's
+    # STDIN, never in argv (tp#1681 L23/L24): the dry run shows the same split.
     argv = launch_argv.claude_argv(
         session_id="<new session id>",
         model=LLM_MODEL_IDS.get(transfer.llm_overseer, transfer.llm_overseer),
-        prompt=prompt,
         name="",
     )
     if as_json:
-        print(json.dumps({"dry_run": True, "snapshot": transfer.snapshot(), "argv": argv}))
+        doc = {"dry_run": True, "snapshot": transfer.snapshot(), "argv": argv, "stdin": prompt}
+        print(json.dumps(doc))
     else:
         print(f"[dry-run] would hand {src.session_id} to a NEW session on {transfer.target_label}")
-        print("argv: " + " ".join(argv[:-1]) + " <prompt>")
-        print("--- prompt ---")
+        print("argv: " + " ".join(argv) + "  (prompt on stdin)")
+        print("--- prompt (stdin) ---")
         print(prompt)
     return 0
 

@@ -97,3 +97,36 @@ def test_prompt_argv_stdin_fd_round_trip() -> None:
         assert os.read(fd, 1 << 20).decode("utf-8") == "é" * 70000
     finally:
         os.close(fd)
+
+
+def test_prompt_argv_park_now_launches_with_the_prompt_on_stdin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1681 L24: `ccc park` launches through start-job, so its prompt rides on stdin."""
+    from command_center import accounts, park, terminal
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("CCC_INTERNAL", "1")
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setattr(accounts, "grant_registration_trust", lambda *_a, **_k: None)
+    monkeypatch.setattr(accounts, "is_trusted", lambda *_a, **_k: True)  # park's --auto check
+    monkeypatch.setattr(terminal, "set_tab", lambda *_a, **_k: None)
+    monkeypatch.setattr("command_center.cli._start_job_trust_refusal", lambda *_a, **_k: "")
+    seen: dict[str, object] = {}
+
+    def _capture(_file: str, argv: list[str]) -> None:
+        size = os.fstat(0).st_size
+        seen["argv"] = list(argv)
+        seen["stdin"] = os.pread(0, size + 1, 0).decode("utf-8") if size else ""
+        raise _StopExec
+
+    monkeypatch.setattr("command_center.cli.os.execvp", _capture)
+    args = argparse.Namespace(prompt=SECRET, now=True, editor=True, grab=False, aim="")
+    with pytest.raises(_StopExec):
+        park.run_park(args)
+    argv = seen["argv"]
+    assert isinstance(argv, list) and "--" not in argv
+    assert not any("HANDOVER" in part for part in argv)
+    assert str(seen["stdin"]).endswith(SECRET)

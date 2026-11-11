@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -311,13 +313,50 @@ def test_dry_run_uses_session_id_never_resume(
     assert harness.start("-n", "-j") == 0
     data = json.loads(capsys.readouterr().out)
     assert "--session-id" in data["argv"] and "--resume" not in data["argv"]
-    assert data["argv"][-1].startswith("[handoff]")
+    assert data["stdin"].startswith("[handoff]")
     assert harness.launches == []
     with Store() as store:
         assert store.transfers_of(SID) == []
     from command_center import config  # pylint: disable=import-outside-toplevel
 
     assert not (config.app_home() / "handoffs").exists()  # a dry run writes nothing
+
+
+def test_prompt_argv_successor_launch_feeds_the_handover_on_stdin(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1681 L24: the relay successor's tab runs `ccc start-job`, whose exec carries the
+    handover on claude's stdin — never in argv, where `ps` would show it for its life."""
+    assert harness.start() == 0
+    [target] = harness.launches
+    with Store() as store:
+        job = store.get(target)
+    assert job is not None and job.draft and (job.prompt or "").startswith("[handoff]")
+    monkeypatch.setenv("CCC_INTERNAL", "1")  # no detached sync-mirrors spawn
+    monkeypatch.setattr(cli, "_start_job_trust_refusal", lambda *_a, **_k: "")
+    seen: dict[str, Any] = {}
+
+    def _capture(_file: str, argv: list[str]) -> None:
+        size = os.fstat(0).st_size
+        seen["argv"] = list(argv)
+        seen["stdin"] = os.pread(0, size + 1, 0).decode("utf-8") if size else ""
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli.os, "execvp", _capture)
+    with pytest.raises(SystemExit):
+        cli.cmd_start_job(argparse.Namespace(session_id=target))
+    assert "--session-id" in seen["argv"] and "--" not in seen["argv"]
+    assert not any("[handoff]" in part for part in seen["argv"])
+    assert "[handoff]" in seen["stdin"]
+
+
+def test_prompt_argv_dry_run_shows_the_prompt_as_stdin(
+    harness: _Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert harness.start("-n", "-j") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert "--" not in data["argv"] and not any("[handoff]" in p for p in data["argv"])
+    assert data["stdin"].startswith("[handoff]")
 
 
 def test_launcher_failure_leaves_the_source_untouched(harness: _Harness) -> None:

@@ -838,7 +838,7 @@ def test_fire_attached_claims_and_execs_resume(monkeypatch: pytest.MonkeyPatch) 
     with Store() as store:
         _attached_row(store, now + 900)
     assert cli.main(["fire-attached", "att-1"]) == 0
-    assert execs == [["claude", "--resume", "att-1", "--", "attached prompt"]]
+    assert execs == [["claude", "--resume", "att-1"]]  # prompt on stdin (tp#1681 L24)
     with Store() as store:
         row = store.get("att-1")
         assert row is not None and row.fire_at == 0

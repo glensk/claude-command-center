@@ -211,8 +211,27 @@ def test_l3_cmd_fire_attached(
     seen = _capture_exec(monkeypatch)
     with pytest.raises(SystemExit):
         cli.cmd_fire_attached(argparse.Namespace(session_id=job))
-    assert spy and _has_name(seen["argv"]) and seen["argv"][-1] == "go"
+    assert spy and _has_name(seen["argv"]) and seen["argv"][-2:] == ["--resume", job]
+    assert seen["stdin"] == "go"  # tp#1681 L24: the parked prompt rides on stdin
     assert seen["env"][accounts.TITLE_VAR] == "1"
+
+
+def test_prompt_argv_fire_attached_keeps_the_prompt_out_of_argv(
+    spy: list[dict[str, Any]], job: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1681 L24: `ccc fire-attached` resumes with the parked prompt on stdin only."""
+    secret = "HANDOVER: parked state for the resumed session"
+    with Store() as store:
+        store.update_fields(job, draft=False, prompt=secret, fire_at=999)
+    seen = _capture_exec(monkeypatch)
+    before = os.fstat(0)
+    with pytest.raises(SystemExit):
+        cli.cmd_fire_attached(argparse.Namespace(session_id=job))
+    assert spy and "--" not in seen["argv"]
+    assert not any("HANDOVER" in part for part in seen["argv"])
+    assert seen["stdin"] == secret
+    after = os.fstat(0)
+    assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)  # fd 0 restored
 
 
 @pytest.mark.parametrize("fresh", [False, True])
