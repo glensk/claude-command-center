@@ -317,6 +317,13 @@ class StartRefused(Exception):
     """A fail-closed preflight refusal; the message is printed, nothing was written."""
 
 
+EXIT_MODEL_TOO_LONG = 2  # tp#1681 L3c: the model-written part is over MODEL_MAX_CHARS
+
+
+class ModelPartTooLong(StartRefused):
+    """The ``start -f`` model part is over ``handoff_doc.MODEL_MAX_CHARS`` (exit 2)."""
+
+
 def effective_wait(wait: int, drain: int, provider_timeouts: list[float]) -> int:
     """The accept wait clamped so one ``start`` call stays under the Bash tool cap.
 
@@ -384,7 +391,12 @@ def handoff_path(transfer_id: str) -> Path:
 
 
 def preamble(transfer: Any, source_label: str, transcript: str) -> str:
-    """D4: the short instruction block the successor reads before the handoff text."""
+    """D4: the short instruction block the successor reads before the handoff text.
+
+    tp#1681 L3c: cut facts are fetched by KEY only (``facts <src> -k <key>``, the key each
+    ``… cut`` line names), never as the whole snapshot; nothing here asks to re-claim work
+    (ownership moves on ``accept`` through ``handoff_hooks``).
+    """
     return (
         f"[handoff] You take over the work of session {transfer.source_session} "
         f"(account {source_label or '?'}), transfer {transfer.transfer_id}. The handoff "
@@ -398,8 +410,10 @@ def preamble(transfer: Any, source_label: str, transcript: str) -> str:
         "Agent from its capsule (old agent ids cannot be resumed across sessions), restart "
         "ONLY the shells under 'Background restarts' marked `restart:` (declared restartable; "
         "the ones under 'Decide before restarting' are evidence, judge each before re-running "
-        "anything), then follow 'First steps'. Facts cut for size: "
-        f"ccc continue-session facts {transfer.source_session} -j. accept already retries a "
+        "anything), then follow 'First steps'. A fact cut for size: run only "
+        f"`ccc continue-session facts {transfer.source_session} -k <key>` with the key its "
+        "cut line names, once per key you need; never read the whole snapshot. accept "
+        "already retries a "
         "refusing or timed-out hook; if it still fails and the error says the transfer is "
         "still opened, run accept once more; stop and report on any other failure: the old "
         "session stays authoritative until it succeeds.\n"
@@ -1054,10 +1068,9 @@ def _compose(  # pylint: disable=too-many-arguments,too-many-positional-argument
             raise StartRefused("handoff rejected — " + "; ".join(doc.errors))
         return _Composed(doc.text, doc.sha256)
     model = handoff_doc.parse_model_file(raw)
-    if not model.ok:
-        raise StartRefused("handoff rejected — " + "; ".join(model.errors))
     sid = src.session_id
-    if active is not None and active.state in (PREPARED, OPENED):
+    retry = active is not None and active.state in (PREPARED, OPENED)
+    if retry and model.ok:  # the identical re-run of a stored transfer is never re-capped
         digest = handoff_doc.model_digest(model, active.facts_snapshot)
         try:
             stored = Path(active.handoff_path).read_text(encoding="utf-8")
@@ -1065,6 +1078,12 @@ def _compose(  # pylint: disable=too-many-arguments,too-many-positional-argument
             stored = ""
         if stored and digest == active.prompt_sha256:
             return _reused(stored, digest, sid, active.facts_snapshot)
+    too_long = handoff_doc.model_chars_error(raw)
+    if too_long:
+        raise ModelPartTooLong("handoff rejected — " + too_long)
+    if not model.ok:
+        raise StartRefused("handoff rejected — " + "; ".join(model.errors))
+    if retry:
         snap_doc = _stored_snapshot(sid, active.facts_snapshot)
         if snap_doc is None:
             raise StartRefused(f"the stored facts snapshot {active.facts_snapshot[:12]} is gone")
@@ -1143,7 +1162,7 @@ def _start_input(args: argparse.Namespace) -> tuple[bytes, str]:
         return b"", f"cannot read the handoff file: {exc}"
 
 
-def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
+def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements,too-many-branches
     """``continue-session start``: hand this session's work to a NEW session."""
     from .models import now_ms
     from .transfer_store import ACCEPTED
@@ -1190,6 +1209,9 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
             )
         try:
             composed = _compose(adapter, store, src, raw, active, args)
+        except ModelPartTooLong as exc:
+            _fail(args, src.session_id, str(exc))
+            return EXIT_MODEL_TOO_LONG
         except StartRefused as exc:
             return _fail(args, src.session_id, str(exc))
         _say_failed_required(args, src.session_id, composed)

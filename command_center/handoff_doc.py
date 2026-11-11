@@ -58,6 +58,9 @@ REQUIRED_SECTIONS = (
 MODEL_SECTIONS = ("Current state", "Decisions and constraints", "First steps")
 CODE_SECTIONS = tuple(t for t in REQUIRED_SECTIONS if t not in MODEL_SECTIONS)
 MODEL_MAX_BYTES = 10 * 1024  # D9: the model part (and a legacy document's model share)
+#: tp#1681 L3c: a model-WRITTEN part (``start -f``) carries at most this many characters of
+#: section bodies (comments not counted); the facts are ccc's, the model writes pointers.
+MODEL_MAX_CHARS = 2500
 SCRUB_MARGIN = 2 * 1024  # D9: composition budgets MAX_BYTES - this; the scrubber may lengthen
 MAX_LEVEL = 11  # compose cut tiers (0 = nothing cut; 11 = the floor + the hard guard)
 NOTES_DROP_LEVEL = 8  # a legacy document's model notes become a pointer from this tier on
@@ -261,6 +264,32 @@ def validate_model_part(raw: bytes | str) -> ModelPart:
         return ModelPart(errors=errors)
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return ModelPart(sections=bodies, raw=text, sha256=digest)
+
+
+_TITLES = {_norm(t): t for t in REQUIRED_SECTIONS}
+
+
+def model_chars_error(raw: bytes | str) -> str:
+    """Why a model-WRITTEN part is too long (tp#1681 L3c), naming its largest section; ``""``.
+
+    Counts the characters of every section body (HTML comments stripped, so the template's
+    guidance never counts) against :data:`MODEL_MAX_CHARS`. Only the ``start -f`` path
+    applies it: a code-generated part (``--facts-only``, ``--capped``) is cut to fit instead.
+    Undecodable input is left to :func:`parse_model_file` (``""`` here).
+    """
+    text, errors = _decode(raw)
+    if errors:
+        return ""
+    sizes = {title: len(body) for title, body in sections(text).items() if body}
+    total = sum(sizes.values())
+    if total <= MODEL_MAX_CHARS:
+        return ""
+    largest = max(sizes, key=lambda title: sizes[title])
+    return (
+        f"model part is {total} chars; the cap is {MODEL_MAX_CHARS} — shorten "
+        f"## {_TITLES.get(largest, largest)} ({sizes[largest]} chars) first: ccc fills the facts "
+        "itself, so write decisions and next actions, and point to facts instead of copying them"
+    )
 
 
 def parse_model_file(raw: bytes | str) -> ModelPart:

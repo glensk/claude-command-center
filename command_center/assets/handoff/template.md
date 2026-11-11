@@ -1,7 +1,7 @@
 # Handoff
 
 <!-- v2. YOU write ONLY the three sections marked "write this": Current state, Decisions
-     and constraints, First steps (at most 10 KB together; no other `##` heading). Delete the
+     and constraints, First steps (at most 2,500 characters together; no other `##` heading). Delete the
      other six headings or leave them empty: ccc fills them from recorded facts at
      `continue-session start` (AIM, tp ownership, repos/files/worktrees, subagent specs and
      results, background restarts, open items). Run `ccc continue-session collect -m` first

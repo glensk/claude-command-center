@@ -408,10 +408,64 @@ def test_an_eleven_kb_model_part_is_refused_before_anything_is_written(
     harness: _Harness, capsys: pytest.CaptureFixture[str]
 ) -> None:
     harness.file.write_text(_model_file(**{"Current state": "y" * 11000}), encoding="utf-8")
-    assert harness.start() == 1
+    assert harness.start() == continue_session.EXIT_MODEL_TOO_LONG
     assert "the cap is" in capsys.readouterr().err
     with Store() as store:
         assert store.transfers_of(SID) == []
+
+
+def test_handoff_cap_refuses_a_long_model_part_naming_its_largest_section(
+    harness: _Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#1681 L3c: a model-written part over 2,500 chars exits 2 and names the section."""
+    big = "d" * (handoff_doc.MODEL_MAX_CHARS - 10)
+    harness.file.write_text(_model_file(**{"Decisions and constraints": big}), encoding="utf-8")
+    assert harness.start() == 2
+    err = capsys.readouterr().err
+    assert f"the cap is {handoff_doc.MODEL_MAX_CHARS}" in err
+    assert "## Decisions and constraints" in err
+    with Store() as store:
+        assert store.transfers_of(SID) == []
+    assert harness.launches == []
+
+
+def test_handoff_cap_allows_a_part_at_the_cap(harness: _Harness) -> None:
+    room = handoff_doc.MODEL_MAX_CHARS - len("mine: Current state") - len("mine: First steps")
+    harness.file.write_text(
+        _model_file(**{"Decisions and constraints": "d" * room}), encoding="utf-8"
+    )
+    assert harness.start() == 0
+
+
+def test_handoff_cap_never_refuses_the_identical_rerun_of_a_stored_transfer(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transfer stored before the cap (or under a higher one) keeps its exit-3 retry."""
+    harness.file.write_text(_model_file(**{"Current state": "s" * 3000}), encoding="utf-8")
+    monkeypatch.setattr(handoff_doc, "MODEL_MAX_CHARS", 10_000)
+    harness.accept_on_sleep = False
+    assert harness.start("-w", "0") == continue_session.EXIT_WAITING
+    monkeypatch.setattr(handoff_doc, "MODEL_MAX_CHARS", 2500)
+    harness.accept_on_sleep = True
+    assert harness.start() == 0
+
+
+def test_handoff_cap_counts_no_template_comments() -> None:
+    assert (
+        handoff_doc.model_chars_error("<!-- " + "c" * 9000 + " -->\n## First steps\n\nok\n") == ""
+    )
+
+
+def test_preamble_keys_point_to_keyed_facts_only() -> None:
+    """tp#1681 L3c: keyed facts pointers, no unkeyed ``facts -j``, no re-claim instruction."""
+    transfer = type(
+        "T", (), {"source_session": "src-1", "transfer_id": "t9", "handoff_path": "/h.md"}
+    )()
+    flat = " ".join(continue_session.preamble(transfer, "work", "/t.jsonl").split())
+    assert "ccc continue-session facts src-1 -k <key>" in flat
+    assert "facts src-1 -j" not in flat and " -j" not in flat
+    assert "claim" not in flat.lower()
+    assert "ccc continue-session accept t9" in flat
 
 
 def test_waiting_then_a_ledger_change_then_the_same_start_reuses_the_transfer(

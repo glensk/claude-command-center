@@ -1961,7 +1961,7 @@ restartable background shells are stopped; keep-warm timers are stopped and neve
 over; `ccc continue-session drain -t 540` blocks until the detector is clear — exit 1 aborts
 and the source stays authoritative (nothing is `TaskStop`ped for the transfer); the model
 writes ONLY the three model sections of `ccc continue-session template` (`Current state`,
-`Decisions and constraints`, `First steps`; ≤ 10 KB, only what the preview lacks) and runs
+`Decisions and constraints`, `First steps`; ≤ 2,500 characters, only what the preview lacks) and runs
 ONE `ccc continue-session start -A <label> -f <file>` (the `# new-session-ok` marker,
 `new-session-guard.py` treats only `start` as a launch).
 
@@ -2043,7 +2043,11 @@ A code-generated part (`--facts-only`, `--capped`) never fails for its size: its
 cut to what the facts leave, keeping the banner and the predecessor-transcript line, with a
 `… cut — full original: <path>` pointer to `handoffs/facts/<sid>/<snapshot>.model.md`. A
 model-written part (`-f`) that does not fit is refused with the room it has: `… it may have
-at most A bytes — shorten it to ≤ A` (A ≤ 10 KB). Facts that overflow alone after every cut
+at most A bytes — shorten it to ≤ A` (A ≤ 10 KB). A model-written part whose section
+bodies (comments not counted) are over 2,500 characters is refused first, with exit 2,
+naming its largest section (`model part is N chars; the cap is 2500 — shorten ## <section>`;
+tp#1681): ccc carries the facts, the model writes decisions, next actions and pointers. The
+identical re-run of a stored `prepared`/`opened` transfer is never re-capped. Facts that overflow alone after every cut
 get their own message (`… this is a ccc defect, not the model part — file it`, plus `relay
 with --facts-only` for a written part). When the scrubber lengthens the text past 24 KB,
 compose fits once more with the budget less the measured growth and 256 B (at most two
@@ -2076,7 +2080,8 @@ is replaced through `models.RETIRED_LLM_REPLACEMENTS`, tp#2032 —, the unchecke
 launched through `start-job` in a new tab; its prompt is a short preamble (take over from
 session X, transfer T, FIRST run `ccc continue-session accept T`, then relaunch the agents
 from their capsules, restart only the `restart:` shells, judge the `Decide before
-restarting` ones, and fetch cut facts with `ccc continue-session facts`) plus the handoff
+restarting` ones, and fetch a cut fact only by key, `ccc continue-session facts <source> -k
+<key>`, never the whole snapshot; no re-claim instruction) plus the handoff
 text. `accept` refuses unless it runs in the recorded target session under the recorded
 account, runs the accept-prepare transaction, then the `handoff_hooks`, and only then CASes
 `opened → accepted`; a failing hook leaves `opened` and prints why. Each hook run is

@@ -145,6 +145,40 @@ def test_eleven_kb_model_part_is_rejected() -> None:
     assert not part.ok and "the cap is" in part.errors[0]
 
 
+def test_handoff_cap_names_the_largest_section() -> None:
+    raw = _model("x").replace("Current state: x", "Current state: " + "s" * 2600)
+    error = handoff_doc.model_chars_error(raw)
+    assert f"the cap is {handoff_doc.MODEL_MAX_CHARS}" in error
+    assert "## Current state (" in error
+    assert handoff_doc.model_chars_error(_model("x")) == ""
+
+
+def test_minimal_model_part_keeps_decisions_holds_and_start_conditions(tmp_path: Path) -> None:
+    """tp#1681 L3c: a part under the cap still carries decisions; holds come from facts."""
+    from command_center.handoff_facts import rec
+
+    raw = _model("x").replace(
+        "Decisions and constraints: x", "Decisions and constraints: never push to main"
+    )
+    assert handoff_doc.model_chars_error(raw) == ""
+    held = rec(
+        "tp_item",
+        "tp_item:7",
+        "tp ownership",
+        0,
+        tp_id=7,
+        title="mine",
+        state="work",
+        start_condition="after tp#6 lands",
+    )
+    result, _ = _compose(raw, _snap(_session_fact(), held), tmp_path)
+    assert result.ok, result.errors
+    found = handoff_doc.sections(result.text)
+    assert "never push to main" in found["decisions and constraints"]
+    assert "tp#7 [work] mine" in found["tp ownership"]
+    assert "after tp#6 lands" in found["tp ownership"]
+
+
 def test_a_model_part_with_another_heading_is_rejected() -> None:
     part = handoff_doc.validate_model_part(_model(extra="\n## tp ownership\n\nmine\n"))
     assert any(e.startswith("unexpected section: ## tp ownership") for e in part.errors)
