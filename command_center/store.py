@@ -195,6 +195,7 @@ _SESSION_COLUMNS = (
     "job_type",
     "no_codex",
     "launch_profile",
+    "lean_start",
     "llm_overseer",
     "llm_exec",
     "model",
@@ -233,6 +234,7 @@ _BOOL_COLUMNS = frozenset(
         "draft",
         "aim_met",
         "no_codex",
+        "lean_start",
     }
 )
 # Columns the automatic reconcile is allowed to touch (never user-authored fields).
@@ -331,6 +333,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     job_type          TEXT    NOT NULL DEFAULT 'claude',
     no_codex          INTEGER NOT NULL DEFAULT 0,
     launch_profile    TEXT,
+    lean_start        INTEGER NOT NULL DEFAULT 0,
     llm_overseer      TEXT    NOT NULL DEFAULT 'opus-5.5',
     llm_exec          TEXT    NOT NULL DEFAULT 'opus-5.5',
     model             TEXT    NOT NULL DEFAULT '',
@@ -651,6 +654,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         # Opaque launch-profile label (config ``claude_launch_profiles``): the session's
         # interactive claude starts through that profile's executable; NULL = bare claude.
         "launch_profile": "TEXT",
+        # Quiet SessionStart hooks for this launch (tp#1681 L7w): CC_LEAN_START=1.
+        "lean_start": "INTEGER NOT NULL DEFAULT 0",
         "llm_overseer": "TEXT NOT NULL DEFAULT 'opus-5.5'",
         "llm_exec": "TEXT NOT NULL DEFAULT 'opus-5.5'",
         # OBSERVED runtime values (distinct from the llm_overseer/llm_exec job config):
@@ -1271,6 +1276,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         idempotency_key: str = "",
         aim_set_by: str | None = "",
         registered_by: str = "",
+        lean_start: bool = False,
     ) -> Session:
         """Register a *future job*: a draft row holding an AIM + prompt, launched on demand.
 
@@ -1294,6 +1300,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         in its env); it is REFUSED on a codex job type — see :func:`no_codex_conflict`.
         *launch_profile* is the opaque label of a configured launch profile ("" = bare
         ``claude``); it is immutable identity — launch surfaces propagate or refuse it.
+        *lean_start* makes ``start-job`` export ``CC_LEAN_START=1`` (quiet SessionStart
+        hooks; a relay successor or a staff session, tp#1681 L7w).
         *idempotency_key* records the caller-supplied create-or-retrieve key ("" = none);
         the atomic claim itself is :meth:`claim_idempotency_key`.
         *registered_by* is ``"automated"`` for a job an ``AI_AUTOMATED`` caller registered
@@ -1320,6 +1328,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
             job_type=job_type,
             no_codex=bool(no_codex),
             launch_profile=(launch_profile.strip() or None),
+            lean_start=bool(lean_start),
             llm_overseer=_llm_or_default(llm_overseer),
             llm_exec=_llm_or_default(llm_exec),
             fire_at=max(0, int(fire_at)),

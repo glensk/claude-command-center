@@ -609,6 +609,7 @@ class LaunchTarget:
     config_dir: str = ""
     no_codex: bool = False
     launch_profile: str = ""
+    lean_start: bool = False
 
 
 class SessionLaunch(Protocol):
@@ -642,11 +643,14 @@ def session_env_flags(session: SessionLaunch) -> dict[str, str]:
     every Codex integration honours (plan-gate debates, the optional-offload hook,
     ``codex-in-claude``). Entries are only ever ADDED — an ambient ``CCC_NO_CODEX`` from
     the parent shell is left exactly as it was, so a session launched from inside a
-    no-codex shell keeps that inheritance.
+    no-codex shell keeps that inheritance. ``CC_LEAN_START=1`` when the row's
+    ``lean_start`` flag is set (quiet SessionStart hooks, tp#1681 L7w), same add-only rule.
     """
     flags = {TITLE_VAR: "1"}
     if getattr(session, "no_codex", False):
         flags["CCC_NO_CODEX"] = "1"
+    if getattr(session, "lean_start", False):
+        flags[LEAN_START_VAR] = "1"
     profile = session_launch_profile(session)
     if profile:
         flags[PROFILE_VAR] = profile
@@ -655,6 +659,8 @@ def session_env_flags(session: SessionLaunch) -> dict[str, str]:
 
 # The only env a launch profile adds: its opaque label (the profile's executable reads it).
 PROFILE_VAR = "CCC_LAUNCH_PROFILE"
+# Quiet SessionStart hooks for a lean_start job (read by the user's hooks, tp#1681 L7w).
+LEAN_START_VAR = "CC_LEAN_START"
 
 
 def session_launch_profile(session: object) -> str:
@@ -710,7 +716,9 @@ def session_launch_env_prefix(session: SessionLaunch) -> str:
     return prefix + exports
 
 
-def pin_environ(config_dir: str, no_codex: bool, launch_profile: str = "") -> None:
+def pin_environ(
+    config_dir: str, no_codex: bool, launch_profile: str = "", lean_start: bool = False
+) -> None:
     """Pin an account + the session flags into ``os.environ`` WITHOUT granting trust.
 
     The :func:`session_apply_to_environ` rendering for AUTOMATIC recovery surfaces
@@ -725,7 +733,9 @@ def pin_environ(config_dir: str, no_codex: bool, launch_profile: str = "") -> No
     else:
         os.environ[_CONFIG_VAR] = _export_value(config_dir)
     os.environ.pop(PROFILE_VAR, None)
-    os.environ.update(session_env_flags(LaunchTarget(config_dir, no_codex, launch_profile)))
+    os.environ.update(
+        session_env_flags(LaunchTarget(config_dir, no_codex, launch_profile, lean_start))
+    )
     os.environ.update(_mem_env(os.environ))
 
 

@@ -429,6 +429,7 @@ def test_start_composes_a_three_section_model_part_with_the_facts(
         (transfer,) = store.transfers_of(SID)
         stored = Path(transfer.handoff_path).read_text(encoding="utf-8")
         job = store.get(transfer.target_session)
+    assert job is not None and job.lean_start  # tp#1681 L7w: lean_start successor
     found = handoff_doc.sections(stored)
     assert "AIM (done-condition): tp#1 shipped" in found["goal and done-condition"]
     assert "[ ] sub-goal: test" in found["goal and done-condition"]

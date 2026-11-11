@@ -694,6 +694,9 @@ class Session:
     # carries ``CCC_LAUNCH_PROFILE=<label>``. ``None`` = the bare ``claude``. Immutable
     # identity: every launch/resume surface propagates it or refuses (never bare claude).
     launch_profile: str | None = None
+    # Quiet start (tp#1681 L7w): `start-job` exports CC_LEAN_START=1, so the SessionStart
+    # hooks stay quiet — set on a relay successor and a staff session's job.
+    lean_start: bool = False
     # Which models a future job runs on. The session runs ON the overseer's model
     # (`claude --model LLM_MODEL_IDS[llm_overseer]`); when llm_exec differs, the launch
     # prompt tells the overseer to delegate implementation to Agent-tool subagents on the

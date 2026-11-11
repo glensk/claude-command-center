@@ -3286,6 +3286,7 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
             fire_window=fire_window,
             idempotency_key=idempotency_key,
             registered_by=registered_by,
+            lean_start=bool(getattr(args, "lean_start", False)),
         )
     # tp#1512: registration is the deliberate trust grant (narrowed, logged on stderr), so
     # an unattended `start-job --auto` later only CHECKS trust and never parks on the dialog.
@@ -3811,7 +3812,7 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
     # session_apply_to_environ (tp#1512): the latter also trusts os.getcwd() — the
     # LAUNCHER's cwd (the tab's $HOME, launchd's /), not the job's folder — and an --auto
     # launch must never grant trust. The trust gate above already settled the job's cwd.
-    accounts.pin_environ(config_dir, no_codex, profile)
+    accounts.pin_environ(config_dir, no_codex, profile, lean_start=bool(session.lean_start))
     try:
         _exec_in(cwd, argv, stdin_prompt=launch_prompt)  # replaces this process on success
     except OSError as exc:  # (d) launch failed — undo the promotion so the job survives
@@ -7130,6 +7131,13 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         help="start the job's interactive claude through the configured launch profile "
         "LABEL (config claude_launch_profiles); refused when LABEL is not configured or "
         "its executable does not resolve",
+    )
+    p_newjob.add_argument(
+        "-l",
+        "--lean-start",
+        action="store_true",
+        help="quiet SessionStart hooks in the launched session (CC_LEAN_START=1); "
+        "for relay successors and staff sessions",
     )
     p_newjob.add_argument(
         "-K",

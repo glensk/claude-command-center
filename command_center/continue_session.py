@@ -611,6 +611,7 @@ def _create_successor(store: Store, transfer: Any, src: Source, text: str) -> No
         llm_exec=transfer.llm_exec,
         config_dir=transfer.target_config_dir,
         launch_profile=transfer.launch_profile,
+        lean_start=True,  # tp#1681 L7w: the successor starts with quiet SessionStart hooks
     )
     if unchecked:  # Q2: the open sub-goals travel; the checked ones are in the text
         store.set_subgoals(transfer.target_session, unchecked)
