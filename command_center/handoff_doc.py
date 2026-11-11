@@ -498,43 +498,80 @@ def _tp_floor(held: list[dict[str, Any]]) -> list[str]:
     return out
 
 
-def _tp_item(fact: dict[str, Any], level: int) -> list[str]:
-    f = fact["fields"]
-    if level >= COMPACT_LEVEL:
-        return [_tp_compact(f)]
-    head = f"- tp#{f.get('tp_id')} [{_one(f.get('state'))}] {_one(f.get('title'))}"
-    if f.get("repo") or f.get("tp_priority"):
-        head += f" ({_one(f.get('repo'))}, {_one(f.get('tp_priority'))})"
-    out = [head]
-    plan = ""
+def _tp_held_entry(f: dict[str, Any]) -> str:
+    """One item of the ``held:`` line: ``tp#N [state] plan …/<file> d/t next <box>``."""
+    entry = f"tp#{f.get('tp_id')} [{_one(f.get('state'))}]"
+    if _released(f):
+        entry += " record only"
     if f.get("plan_path"):
-        plan = f"plan {f['plan_path']} {f.get('boxes_done')}/{f.get('boxes_total')}"
-        boxes = f.get("next_open_boxes") or []
-        shown = _box_ids(boxes) if level >= 3 else [_one(b) for b in boxes]
-        if shown:
-            plan += "; next open: " + ", ".join(shown)
-    if plan:
-        out.append(f"  {plan}")
-    # Recorded decisions are not repeated in this never-cut line: the facts-only relay
-    # renders them under "Decisions and constraints" (capped there), and the snapshot keeps them.
-    rest, blocks = _kv(
-        f,
+        entry += f" plan …/{_one(f['plan_path']).rsplit('/', 1)[-1]}"
+        if f.get("boxes_done") is not None and f.get("boxes_total") is not None:
+            entry += f" {f.get('boxes_done')}/{f.get('boxes_total')}"
+        boxes = _box_ids(f.get("next_open_boxes"))
+        if boxes:
+            entry += f" next {boxes[0]}"
+    return entry
+
+
+def _tp_held_details(f: dict[str, Any]) -> list[str]:
+    """The indented lines under ``held:`` for ONE item: what a successor must not miss."""
+    tag = f"  tp#{f.get('tp_id')}"
+    out: list[str] = []
+    blocked = f.get("blocked")
+    if isinstance(blocked, dict) and blocked:
+        reason = _clip(_one(blocked.get("reason")), BLOCKED_MAX_BYTES)
+        out.append(f"{tag} blocked: {_one(blocked.get('kind')) or '?'} — {reason}")
+    elif blocked:
+        out.append(f"{tag} blocked: {_clip(_one(blocked), BLOCKED_MAX_BYTES)}")
+    for key, label in (("start_condition", "start"), ("awaiting_pickup", "pickup")):
+        if f.get(key):
+            out.append(f"{tag} {label}: {_clip(_one(f[key]), TAIL_MAX_BYTES)}")
+    hold = f.get("hold")
+    if isinstance(hold, dict) and hold and not _released(f):
+        parts = [
+            k if v is True else f"{k}={_one(v)}"
+            for k, v in hold.items()
+            if k != "id" and v not in (None, False, "", [], {})
+        ]
+        if parts:
+            out.append(f"{tag} hold: {_clip(', '.join(parts), TAIL_MAX_BYTES)}")
+    elif hold and not isinstance(hold, dict):
+        out.append(f"{tag} hold: {_clip(_one(hold), TAIL_MAX_BYTES)}")
+    decisions = f.get("decisions")
+    if decisions:
+        listed = decisions if isinstance(decisions, list) else [decisions]
+        newest = _clip(_one(listed[-1]), TITLE_MAX_BYTES)
+        out.append(f"{tag} decisions: {len(listed)}, newest: {newest}")
+    assumptions = f.get("assumptions")
+    if assumptions:
+        count = len(assumptions) if isinstance(assumptions, list) else 1
+        out.append(f"{tag} {count} assumption{'s' if count != 1 else ''}")
+    return out
+
+
+def _tp_minimal(held: list[dict[str, Any]], keys: list[str], ref: str) -> list[tuple[str, bool]]:
+    """Below tier 9: the held items on ONE ``held:`` line (tp#1681 L3c2).
+
+    Under it one indented line each for a blocked reason, start condition, pickup,
+    non-default hold, decisions (count + newest) and assumptions; then ONE pointer line
+    naming the fact keys (title, repo, follow-ups, … live there).
+    """
+    out = [("- held: " + "; ".join(_tp_held_entry(f) for f in held), True)]
+    for f in held:
+        out += [(ln, True) for ln in _tp_held_details(f)]
+    out.append(
         (
-            "tp_id",
-            "title",
-            "state",
-            "repo",
-            "tp_priority",
-            "plan_path",
-            "boxes_done",
-            "boxes_total",
-            "next_open_boxes",
-            "decisions",
-        ),
+            f"… per-item fields: ccc continue-session facts {ref} -k <key> ({', '.join(keys)})",
+            False,
+        )
     )
-    if rest:
-        out.append(f"  {rest}")
-    return out + blocks
+    return out
+
+
+def _tp_item(fact: dict[str, Any], level: int) -> list[str]:
+    """Tier 9+: one line per held item (below tier 9 :func:`_tp_minimal` renders them)."""
+    del level
+    return [_tp_compact(fact["fields"])]
 
 
 def _agent(fact: dict[str, Any], level: int, ref: str) -> list[str]:
@@ -761,6 +798,7 @@ def _render_facts(  # pylint: disable=too-many-locals,too-many-branches,too-many
     commits: dict[str, int] = {}
     owned: dict[str, int] = {}
     held: list[dict[str, Any]] = []
+    held_keys: list[str] = []
     tp_slot: tuple[str, int] | None = None  # where the first held item sits
     seen_msgs = {_one(f["fields"].get("message")) for _, f in facts if f.get("kind") == "warning"}
     for _, fact in facts:
@@ -776,11 +814,12 @@ def _render_facts(  # pylint: disable=too-many-locals,too-many-branches,too-many
             bucket = (section, _COLLAPSE_LISTS[kind])
             lists[bucket] = lists.get(bucket, 0) + 1
             continue
-        if kind == "tp_item" and level >= COMPACT_LEVEL:
+        if kind == "tp_item":
             if tp_slot is None:
                 tp_slot = (section, len(out[section]))
             held.append(fact["fields"])
-            if level >= MAX_LEVEL:
+            held_keys.append(str(fact["key"]))
+            if level < COMPACT_LEVEL or level >= MAX_LEVEL:
                 continue
         if (
             kind == "agent"
@@ -819,7 +858,10 @@ def _render_facts(  # pylint: disable=too-many-locals,too-many-branches,too-many
             out["Open items and questions"].append((line, True))
     if shells:
         out["Background restarts"] += [(ln, True) for ln in _shell_lines(shells, level)]
-    if tp_slot is not None:
+    if tp_slot is not None and level < COMPACT_LEVEL:
+        section, index = tp_slot
+        out[section][index:index] = _tp_minimal(held, held_keys, ref)
+    elif tp_slot is not None:
         section, index = tp_slot
         if level >= MAX_LEVEL:
             out[section][index:index] = [(ln, True) for ln in _tp_floor(held)]

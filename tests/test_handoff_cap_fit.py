@@ -46,7 +46,7 @@ def _assert_never_cut(text: str) -> None:
 
 
 def test_facts_at_the_floor_fit_the_cap() -> None:
-    doc = bigsnap.big_snapshot()
+    doc = bigsnap.big_snapshot(held=40)  # tp#1681 L3c2: the held line made 25 items fit
     assert _size(handoff_doc._facts_lines(doc, 8, REF)) > BUDGET  # the failing shape
     lines = handoff_doc._facts_lines(doc, handoff_doc.MAX_LEVEL, REF, FACTS_CAP)
     assert _size(lines) <= FACTS_CAP
@@ -94,8 +94,10 @@ def test_released_items_stay_one_line() -> None:
 
 def test_tier_9_drops_blocked_json() -> None:
     doc = bigsnap.big_snapshot()
-    assert '{"background"' in "\n".join(handoff_doc._facts_lines(doc, 8, REF)["tp ownership"])
-    for level in range(9, handoff_doc.MAX_LEVEL + 1):
+    tier8 = "\n".join(handoff_doc._facts_lines(doc, 8, REF)["tp ownership"])
+    assert tier8.startswith("- held: tp#100 [work]")  # tp#1681 L3c2: below tier 9
+    assert "  tp#108 blocked: queue — waiting for the repo lock" in tier8
+    for level in range(8, handoff_doc.MAX_LEVEL + 1):
         body = "\n".join(handoff_doc._facts_lines(doc, level, REF)["tp ownership"])
         assert '{"background"' not in body and '"claim"' not in body
     line = handoff_doc._facts_lines(doc, 9, REF)["tp ownership"][0]
@@ -115,7 +117,7 @@ def test_never_cut_overflow_degrades_to_id_and_state() -> None:
 
 
 def test_legacy_notes_still_drop_at_tier_8(tmp_path: Path) -> None:
-    doc = bigsnap.big_snapshot(held=16)
+    doc = bigsnap.big_snapshot(held=36)
     doc["facts"] = [f for f in doc["facts"] if f["kind"] in ("session", "tp_item")]
     legacy = (
         "# Handoff\n\n## Current state\n\nstate\n\n## Decisions and constraints\n\nnone\n\n"
@@ -131,7 +133,7 @@ def test_legacy_notes_still_drop_at_tier_8(tmp_path: Path) -> None:
     assert result.ok, result.errors
     assert composed.level == handoff_doc.NOTES_DROP_LEVEL and composed.model_cut
     assert "### Model notes" in result.text and "w" * 9000 not in result.text
-    assert '{"background"' in result.text  # no tier-9 compaction was applied
+    assert "- held: tp#100 [work]" in result.text  # no tier-9 compaction was applied
 
 
 # ------------------------------------------------------------------------------- B2

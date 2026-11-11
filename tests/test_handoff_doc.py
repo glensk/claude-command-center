@@ -175,7 +175,7 @@ def test_minimal_model_part_keeps_decisions_holds_and_start_conditions(tmp_path:
     assert result.ok, result.errors
     found = handoff_doc.sections(result.text)
     assert "never push to main" in found["decisions and constraints"]
-    assert "tp#7 [work] mine" in found["tp ownership"]
+    assert "- held: tp#7 [work]" in found["tp ownership"]
     assert "after tp#6 lands" in found["tp ownership"]
 
 
@@ -237,7 +237,7 @@ def test_legacy_document_composes_with_notes_after_code_and_a_cut_pointer(tmp_pa
     assert len(result.text.encode()) <= handoff_doc.MAX_BYTES
     assert composed.model_cut
     body = handoff_doc.sections(result.text)["tp ownership"]
-    assert body.index("tp#7 [work] mine") < body.index("### Model notes")
+    assert body.index("- held: tp#7 [work]") < body.index("### Model notes")
     assert "full original: /x/m.model.md" in result.text
 
 
@@ -291,7 +291,7 @@ def test_forty_kb_of_facts_is_truncated_with_pointers_and_never_cut_blocks_stay(
     assert result.ok, result.errors
     assert composed.level >= 1
     assert "more filed (not held) items — full: ccc continue-session facts sid-x" in result.text
-    assert "tp#5 [work] held" in result.text and "why?" in result.text and "boom" in result.text
+    assert "tp#5 [work]" in result.text and "why?" in result.text and "boom" in result.text
     assert "Decide before restarting" in result.text and "sleep 9" in result.text
     assert "AIM (done-condition): ship tp#9" in result.text
 
@@ -382,3 +382,94 @@ def test_finished_agents_are_cut_in_tiers_and_running_ones_never(tmp_path: Path)
     level5 = handoff_doc.compose(model, snap, level=5, ref="sid-x").text
     assert "30 more finished subagents — full: ccc continue-session facts sid-x -k" in level5
     assert "RESULT-RUN1" in level5
+
+
+# ------------------------------------------------- tp#1681 L3c2: minimal held line
+
+
+def _held_minimal() -> list[dict]:
+    from command_center.handoff_facts import rec
+
+    return [
+        rec(
+            "tp_item",
+            "tp_item:1681",
+            "tp ownership",
+            0,
+            tp_id=1681,
+            title="perf(relay): shrink successor start-up cost",
+            state="plan_wcdx",
+            repo="area/dotfiles",
+            plan_path="/r/plans/PLAN_lean-relay.md",
+            boxes_done=11,
+            boxes_total=24,
+            next_open_boxes=["L16", "L22"],
+            decisions=["2026-11-01: older", "2026-11-10: newest " + "n" * 200],
+            hold={"claim": True, "drive": False, "close_authority": "handoff", "id": 1681},
+            assumptions=["a", "b"],
+        ),
+        rec(
+            "tp_item",
+            "tp_item:2034",
+            "tp ownership",
+            0,
+            tp_id=2034,
+            title="perf(staff): lean profile",
+            state="waiting_dependency",
+            blocked={"kind": "dependency", "reason": "after tp#1681"},
+            start_condition="once L7 landed",
+            awaiting_pickup="staff relay",
+        ),
+    ]
+
+
+def test_minimal_held_items_render_on_one_line() -> None:
+    model = handoff_doc.parse_model_file(_model())
+    text = handoff_doc.compose(model, _snap(_session_fact(), *_held_minimal()), ref="sid-x").text
+    body = handoff_doc.sections(text)["tp ownership"].splitlines()
+    assert body[0] == (
+        "- held: tp#1681 [plan_wcdx] plan …/PLAN_lean-relay.md 11/24 next L16;"
+        " tp#2034 [waiting_dependency]"
+    )
+    assert "  tp#1681 hold: claim, close_authority=handoff" in body
+    assert "  tp#1681 2 assumptions" in body
+    assert "  tp#2034 blocked: dependency — after tp#1681" in body
+    assert "  tp#2034 start: once L7 landed" in body
+    assert "  tp#2034 pickup: staff relay" in body
+    decisions = next(ln for ln in body if ln.startswith("  tp#1681 decisions: 2, newest: "))
+    assert "2026-11-10: newest" in decisions and decisions.endswith("…")
+    assert body[-1] == (
+        "… per-item fields: ccc continue-session facts sid-x -k <key> (tp_item:1681, tp_item:2034)"
+    )
+    assert "shrink successor" not in "\n".join(body)  # the title lives behind the pointer
+
+
+def test_minimal_held_line_drops_absent_box_counts() -> None:
+    """A minimal facts provider drops repo and box counts: no ``None/None``."""
+    from command_center.handoff_facts import rec
+
+    item = rec(
+        "tp_item",
+        "tp_item:9",
+        "tp ownership",
+        0,
+        tp_id=9,
+        state="work",
+        plan_path="/r/PLAN_x.md",
+    )
+    model = handoff_doc.parse_model_file(_model())
+    text = handoff_doc.compose(model, _snap(_session_fact(), item), ref="sid-x").text
+    body = handoff_doc.sections(text)["tp ownership"].splitlines()
+    assert body[0] == "- held: tp#9 [work] plan …/PLAN_x.md"
+    assert len(body) == 2  # held line + pointer, no detail lines
+
+
+def test_minimal_held_line_is_kept_and_tier_nine_is_unchanged() -> None:
+    model = handoff_doc.parse_model_file(_model())
+    snap = _snap(_session_fact(), *_held_minimal())
+    rendered = handoff_doc._render_facts(snap, 0, "sid-x")["tp ownership"]
+    assert all(keep for ln, keep in rendered if not ln.startswith("…"))
+    tier9 = handoff_doc.compose(model, snap, level=handoff_doc.COMPACT_LEVEL, ref="sid-x").text
+    body = handoff_doc.sections(tier9)["tp ownership"]
+    assert "- held:" not in body
+    assert body.startswith("- tp#1681 [plan_wcdx] perf(relay): shrink successor start-up cost")

@@ -1988,7 +1988,13 @@ stored in the transfer's `facts_snapshot` column) and composes: code facts first
 section, budgeted against 24 KB minus a 2 KB scrub margin, truncated lowest priority first
 in cut tiers 1-8 (filed-not-held items, older commits, box texts, result capsules, worktree
 details, waits/schedules, owned files, legacy model notes), each cut ending with `… N more —
-full: ccc continue-session facts <transfer> -k <key>`. Tier 9 renders each held item as ONE
+full: ccc continue-session facts <transfer> -k <key>`. Below tier 9 the held items share ONE
+line, `- held: tp#N [state] plan …/<plan file> d/t next <box>; tp#M [state]` (plan, counts
+and next box only when present), followed by one indented `tp#N <what>:` line each for a
+blocked reason, start condition, pickup, non-default hold, decisions (count + newest, clipped)
+and assumptions, and ONE pointer line `… per-item fields: ccc continue-session facts
+<transfer> -k <key> (tp_item:N, …)` (title, repo, follow-ups live there; tp#1681 L3c2).
+Tier 9 renders each held item as ONE
 line (`tp#N [state] <title ≤ 80 B> (repo, prio); plan <path> d/t; blocked: <kind> — <reason
 ≤ 100 B>; <n> assumptions`; hold, start condition, pickup and follow-ups dropped; a released
 item stays, tagged `record only`). Tier 10 collapses the remaining lists (worktrees, plans,
