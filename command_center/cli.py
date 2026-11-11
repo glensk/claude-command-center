@@ -3129,6 +3129,18 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
     if not aim:
         print("error: --aim is required", file=sys.stderr)
         return 1
+    prompt_file = getattr(args, "prompt_file", None)
+    if prompt_file:
+        # The handoff stays out of argv: read from a private file, refused when wider
+        # than 0600 — before any state change, like every other pre-flight check here.
+        if args.prompt is not None:
+            print("error: -p/--prompt and -P/--prompt-file are exclusive", file=sys.stderr)
+            return 2
+        try:
+            args.prompt = launch_argv.read_prompt_file(prompt_file)
+        except launch_argv.PromptFileError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     job_type = getattr(args, "job_type", "claude") or "claude"
     no_codex = bool(getattr(args, "no_codex", False))
     conflict = no_codex_conflict(job_type, no_codex)
@@ -7026,6 +7038,14 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_newjob.add_argument("-a", "--aim", required=True, help="the done-condition (required)")
     p_newjob.add_argument(
         "-p", "--prompt", default=None, help="prompt to run when started (defaults to the AIM)"
+    )
+    p_newjob.add_argument(
+        "-P",
+        "--prompt-file",
+        default=None,
+        metavar="FILE",
+        help="read the prompt from FILE instead of argv (a handoff never shows in `ps`); "
+        "FILE must be a regular file you own with mode 0600 or narrower; exclusive with -p",
     )
     p_newjob.add_argument(
         "-c", "--cwd", default=None, help="repo working directory (default: current dir)"

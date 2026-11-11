@@ -36,6 +36,8 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from os import PathLike
+
     from .accounts import SessionLaunch
 
 CLAUDE = "claude"
@@ -169,6 +171,56 @@ def claude_argv(  # pylint: disable=too-many-arguments
     if prompt is not None:
         argv += ["--", prompt]
     return profile_argv(argv, launch_profile)
+
+
+class PromptFileError(ValueError):
+    """A ``-P/--prompt-file`` that may not be used: wider than 0600, a symlink, unreadable."""
+
+
+def read_prompt_file(path: str | PathLike[str]) -> str:
+    """The first prompt stored in *path*, a private file (``ccc new-job -P``).
+
+    The counterpart of ``continue_session._write_handoff``: a handoff written 0600 is read
+    back only while it is still 0600, so a prompt that carries a predecessor's state never
+    has to ride in a process's argv. Refused (:class:`PromptFileError`): a symlink (opened
+    with ``O_NOFOLLOW``), anything but a regular file, a file owned by another user, any
+    group/other permission bit, invalid UTF-8, or blank content. The text is returned
+    verbatim; the file is neither changed nor removed.
+    """
+    import os
+    import stat
+
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise PromptFileError(f"prompt file {path}: {exc.strerror or exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise PromptFileError(f"prompt file {path} is not a regular file")
+        if info.st_uid != os.getuid():
+            raise PromptFileError(f"prompt file {path} is not owned by you")
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & 0o077:
+            raise PromptFileError(
+                f"prompt file {path} has mode {mode:04o}, wider than 0600 — "
+                f"`chmod 600 {path}` (a handoff must not be readable by others)"
+            )
+        chunks = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+    except OSError as exc:
+        raise PromptFileError(f"prompt file {path}: {exc.strerror or exc}") from exc
+    finally:
+        os.close(fd)
+    raw = b"".join(chunks)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PromptFileError(f"prompt file {path} is not UTF-8 text") from exc
+    if not text.strip():
+        raise PromptFileError(f"prompt file {path} is empty")
+    return text
 
 
 def claude_command(
