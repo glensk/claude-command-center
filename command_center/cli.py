@@ -4600,6 +4600,55 @@ def _quota_renew(prov: dict[str, Any], now: int) -> tuple[str, int, str]:
     return f"renew {usage._format_age(span)}", at, color  # noqa: SLF001
 
 
+def _quota_pick(args: argparse.Namespace, now: int) -> int:
+    """``ccc quota -n LABEL``: the relay successor's account (``quota.pick_account``).
+
+    One refresh of every Claude account (skipped for an explicit ``-A`` and for a pick
+    already frozen in ``-F FILE``), then the decision as JSON (``-j``) or the line
+    ``successor account: <label> (<decision>: <why>)``. Exit 0 = decided, 1 = decided but
+    the chosen account is itself full (stay: no alternative proven to have room; the
+    document is complete and valid), 2 = no pick (unknown account, unusable frozen file).
+    """
+    from pathlib import Path as _Path
+
+    from . import quota, usage
+
+    if args.next_from is None:
+        print("quota: -A/--account and -F/--freeze need -n/--next-from LABEL", file=sys.stderr)
+        return 2
+    labels = list(config.claude_config_dirs())
+    freeze = _Path(args.freeze).expanduser() if getattr(args, "freeze", None) else None
+    try:
+        base = quota.resolve_account(args.next_from, labels)
+        override = quota.resolve_account(args.account, labels) if args.account else ""
+        doc = quota.read_frozen_pick(freeze) if freeze is not None else None
+        if doc is not None:
+            if doc["base"] != base or (override and doc["account"] != override):
+                raise quota.PickError(
+                    f"frozen pick {freeze} names base {doc['base']} → {doc['account']}, "
+                    f"not this request (base {base}{f', -A {override}' if override else ''})"
+                )
+            doc["frozen"] = True
+        else:
+            if not override or args.refresh:  # the ONE refresh of this pick
+                for label in labels:
+                    usage.fetch_claude_usage(label, now)
+            fresh = quota.pick_account(
+                base, quota.claude_rows(labels, now), now=now, override=override
+            )
+            # A concurrent first pick may have frozen its decision first: that one wins.
+            doc = quota.freeze_pick(freeze, fresh) if freeze is not None else fresh
+            doc["frozen"] = doc is not fresh
+    except (quota.PickError, OSError) as exc:
+        print(f"quota: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(doc, indent=2))
+    else:
+        print(f"successor account: {doc['account']} ({doc['decision']}: {doc['reason']})")
+    return 1 if doc.get("full") else 0
+
+
 def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
     args: argparse.Namespace,
 ) -> int:
@@ -4712,6 +4761,10 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
             "ccc quota -m opencode-free -u <seconds>"
         )
         return quota.EXIT_BLOCKED
+
+    next_from = getattr(args, "next_from", None)
+    if next_from is not None or getattr(args, "account", None) or getattr(args, "freeze", None):
+        return _quota_pick(args, now)
 
     if args.refresh:
         for label in config.claude_config_dirs():
@@ -7361,6 +7414,31 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "(the only meter it has; takes seconds). Asks the first opencode-free rung of "
         "`ai ladders -j`'s cheap ladder (config opencode_free_model without ai.py), writes "
         "a run-ledger row; the hourly quota-probe launchd agent runs it",
+    )
+    p_quota.add_argument(
+        "-n",
+        "--next-from",
+        metavar="LABEL",
+        default=None,
+        help="relay successor account pick from the predecessor's account (label or "
+        "config dir): stay unless it is >= 97%% on a fresh reading and another account is "
+        "fresh and < 97%% on every live window; refreshes once; exit 0 decided, 1 decided "
+        "but the chosen account is full, 2 no pick",
+    )
+    p_quota.add_argument(
+        "-A",
+        "--account",
+        metavar="LABEL",
+        default=None,
+        help="with -n: explicit account override (wins; recorded as decision=override)",
+    )
+    p_quota.add_argument(
+        "-F",
+        "--freeze",
+        metavar="FILE",
+        default=None,
+        help="with -n: freeze the decision + evidence in FILE (0600); a retry with the same "
+        "FILE reuses it and never re-decides",
     )
     p_quota.set_defaults(func=cmd_quota)
 

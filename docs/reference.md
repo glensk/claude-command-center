@@ -3172,7 +3172,27 @@ ccc quota -c claude-priv -O     # observed-only clear: lifts a rejection, never 
 ccc quota -C 15                 # record the OpenCode Zen balance you read in the console
 ccc quota -P                    # ask the OpenCode free tier for one reply (its only meter)
 ccc quota -p muse               # the Muse Code row: muse's own est. cost against muse_budget_usd
+ccc quota -n work -j -F rec.json  # relay successor account pick, frozen in rec.json (0600)
+ccc quota -n work -A private    # explicit override, recorded as decision=override
 ```
+
+### The relay successor's account pick (`-n/--next-from`)
+
+`ccc quota -n LABEL` (a label or that account's config dir) is the ONE account rule every
+successor launcher shares: the successor **stays** on its predecessor's account and
+switches only when the source is proven full — a reading younger than 15 min at or over
+**97.0 %** on a live window, or an observed block (`ccc quota -m`) — AND another configured
+account has a reading younger than 15 min below 97.0 % on every live window (a window
+past its reset is not live). Stale, missing, malformed or unknown evidence, or both
+accounts full, means stay. Each pick refreshes every Claude account ONCE first (skipped for
+`-A` and for a frozen pick). Output: `successor account: <label> (<decision>: <why>)`, or
+with `-j` the document `version`, `base`, `account`, `decision` (`stay`/`switch`/
+`override`), `reason`, `full`, `threshold_pct`, `fresh_within_s`, `decided_at`, `frozen`
+and per-account `evidence` (state, reading age, live windows). `-F FILE` freezes that
+document (0600, create-only; a concurrent first pick reads the winner's), so a retried
+launch reuses the decision and never re-measures; a frozen file for a different base or
+`-A` exits 2. Exit 0 = decided, 1 = decided but the chosen account is itself full (the
+JSON is still complete), 2 = no pick.
 
 ### Two vocabularies: what you read and what machines key on
 

@@ -2517,6 +2517,206 @@ def _rehydrate(raw: dict[str, Any]) -> ProviderQuota:
     )
 
 
+# ── The relay successor's account pick (``ccc quota -n/--next-from``) ────────────
+#
+# The ONE implementation of the account rule every successor launcher shares (the staff
+# relay, the staff start, the ccc relay hook): a successor STAYS on its predecessor's
+# account and switches only when the source is PROVEN full — a fresh reading at/over
+# :data:`PICK_SWITCH_PCT` on a live window, or an observed block — while another account
+# is PROVEN to have room: a fresh reading below the threshold on every live window.
+# Anything unproven (stale, missing, malformed, unknown) or both sides full → stay,
+# because a wrong switch costs the successor its cache and a flap costs a relay. The
+# decision and its evidence can be frozen in a file, so a retried launch never re-decides.
+
+#: Usage at/over this percentage on a live window makes an account "full" for a pick.
+PICK_SWITCH_PCT = 97.0
+#: A reading older than this is stale for a pick (the pick refreshes once first).
+PICK_FRESH_SEC = 15 * 60
+#: Version of the pick document (and of a frozen pick file).
+PICK_VERSION = 1
+STAY, SWITCH, OVERRIDE = "stay", "switch", "override"
+
+
+class PickError(ValueError):
+    """A pick that cannot be made: unknown account, unusable frozen record (exit 2)."""
+
+
+def resolve_account(name: str, labels: Iterable[str]) -> str:
+    """*name* as a configured Claude account label: a label, or that account's config dir.
+
+    Raises :class:`PickError` for anything else — a successor must never launch on an
+    account ccc cannot pin.
+    """
+    known = list(labels)
+    if name in known:
+        return name
+    if name and ("/" in name or name.startswith("~")):
+        from . import accounts  # pylint: disable=import-outside-toplevel
+
+        label = accounts.account_label(name)
+        if label in known:
+            return label
+    raise PickError(f"unknown Claude account {name!r} (configured: {', '.join(known) or '-'})")
+
+
+def _pick_evidence(row: ProviderQuota, now: int) -> dict[str, Any]:
+    """What the pick knew about one account: state, reading age and its live windows."""
+    reading_at = max((w.evidence_at for w in row.windows.values()), default=0)
+    fresh = bool(reading_at) and not row.malformed and now - reading_at <= PICK_FRESH_SEC
+    live = {name: w for name, w in row.windows.items() if not w.stale}
+    return {
+        "state": row.state,
+        "reason": row.reason,
+        "source": row.source,
+        "reading_at": reading_at,
+        "age_s": now - reading_at if reading_at else None,
+        "fresh": fresh,
+        "windows": {
+            name: {"used_pct": w.used_pct, "resets_at": w.resets_at, "live": name in live}
+            for name, w in row.windows.items()
+        },
+        "live_max_pct": max((w.used_pct for w in live.values()), default=None),
+    }
+
+
+def _source_full(ev: dict[str, Any]) -> bool:
+    """True when the evidence PROVES the account full: an observed block, or fresh ≥ 97 %."""
+    if ev["state"] == BLOCKED and ev["source"] in ("cooldown", "hold"):
+        return True
+    top = ev["live_max_pct"]
+    return bool(ev["fresh"]) and top is not None and top >= PICK_SWITCH_PCT
+
+
+def _has_room(ev: dict[str, Any]) -> bool:
+    """True when the evidence PROVES room: available, fresh, every live window < 97 %."""
+    top = ev["live_max_pct"]
+    return (
+        ev["state"] == AVAILABLE
+        and bool(ev["fresh"])
+        and top is not None
+        and (top < PICK_SWITCH_PCT)
+    )
+
+
+def _pct(ev: dict[str, Any]) -> str:
+    top = ev["live_max_pct"]
+    return "no live window" if top is None else f"{top:.1f}%"
+
+
+def pick_account(
+    base: str,
+    rows: dict[str, ProviderQuota],
+    *,
+    now: int,
+    override: str = "",
+) -> dict[str, Any]:
+    """Decide the successor's account from *base* (the predecessor's label).
+
+    *rows* maps every configured label to its resolved Claude quota row, in config order
+    (the first account with room wins a switch). Pure: no clock, no I/O.
+    """
+    evidence = {label: _pick_evidence(row, now) for label, row in rows.items()}
+    full = {label: _source_full(ev) for label, ev in evidence.items()}
+    doc: dict[str, Any] = {
+        "version": PICK_VERSION,
+        "base": base,
+        "threshold_pct": PICK_SWITCH_PCT,
+        "fresh_within_s": PICK_FRESH_SEC,
+        "decided_at": now,
+        "evidence": evidence,
+    }
+    src = evidence[base]
+    if override:
+        account, decision = override, OVERRIDE
+        reason = f"explicit -A {override} (base {base})"
+    elif not full[base]:
+        account, decision = base, STAY
+        if src["state"] == BLOCKED or (src["live_max_pct"] or 0) >= PICK_SWITCH_PCT:
+            reason = f"source {base} evidence stale ({_pct(src)}, not fresh)"
+        elif not src["fresh"]:
+            reason = f"source {base} evidence stale or missing"
+        else:
+            reason = f"source {base} at {_pct(src)} < {PICK_SWITCH_PCT:g}%"
+    else:
+        target = next((lbl for lbl in rows if lbl != base and _has_room(evidence[lbl])), "")
+        if target:
+            account, decision = target, SWITCH
+            why = src["reason"] if src["state"] == BLOCKED else _pct(src)
+            reason = f"source {base} full ({why}); {target} at {_pct(evidence[target])}"
+        else:
+            account, decision = base, STAY
+            others = ", ".join(
+                f"{lbl} {_pct(ev)}{'' if ev['fresh'] else ' stale'} {ev['state']}"
+                for lbl, ev in evidence.items()
+                if lbl != base
+            )
+            reason = f"source {base} full; no alternative proven < {PICK_SWITCH_PCT:g}% ({others})"
+    doc.update(
+        account=account,
+        decision=decision,
+        reason=reason,
+        # True when the chosen account is itself proven full (both full / no proof of
+        # room): the caller launches anyway or defers, but it must know.
+        full=full.get(account, False),
+    )
+    return doc
+
+
+def claude_rows(labels: Iterable[str], now: int) -> dict[str, ProviderQuota]:
+    """The Claude quota row of each label, cache only (no Codex/Copilot work)."""
+    cooldowns = read_cooldowns(now)
+    return {label: _claude_quota(label, now, cooldowns) for label in labels}
+
+
+def read_frozen_pick(path: Path) -> dict[str, Any] | None:
+    """The frozen pick at *path*, ``None`` when there is none; :class:`PickError` if unusable."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PickError(f"frozen pick {path} unreadable: {exc}") from exc
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        raise PickError(f"frozen pick {path} is not JSON: {exc}") from exc
+    if (
+        not isinstance(doc, dict)
+        or doc.get("version") != PICK_VERSION
+        or not isinstance(doc.get("account"), str)
+        or not isinstance(doc.get("base"), str)
+    ):
+        raise PickError(f"frozen pick {path} is malformed")
+    return doc
+
+
+def freeze_pick(path: Path, doc: dict[str, Any]) -> dict[str, Any]:
+    """Write *doc* to *path* (0600) unless a pick is already frozen there; return the winner.
+
+    Create-only via a hard link of a private temp file, so two concurrent first picks
+    agree on ONE decision: the loser reads and returns the winner's.
+    """
+    import os  # pylint: disable=import-outside-toplevel  # the only os use in this module
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(doc, handle, indent=2)
+            handle.write("\n")
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            winner = read_frozen_pick(path)
+            if winner is not None:
+                return winner
+            raise
+    finally:
+        tmp.unlink(missing_ok=True)
+    return doc
+
+
 def main(argv: list[str] | None = None) -> int:
     """``./command_center/quota.py [args]`` — same report and exit codes as ``ccc quota``.
 
@@ -2524,9 +2724,12 @@ def main(argv: list[str] | None = None) -> int:
     ``--provider`` exit codes (0 available / 1 blocked / 2 unknown) are the contract other
     tools depend on, and a second renderer here would drift from it.
     """
-    from .cli import main as _cli_main
+    import importlib  # pylint: disable=import-outside-toplevel
 
-    return _cli_main(["quota", *(sys.argv[1:] if argv is None else argv)])
+    # Resolved at run time, not imported: `cli` imports this module, and a static import
+    # back would make the pair an import cycle for every linter run that sees both.
+    cli_main = importlib.import_module(f"{__package__}.cli").main
+    return int(cli_main(["quota", *(sys.argv[1:] if argv is None else argv)]))
 
 
 if __name__ == "__main__":
