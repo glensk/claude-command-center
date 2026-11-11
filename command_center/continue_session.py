@@ -133,11 +133,11 @@ def _clear_stale_counter(store: Store, session_id: str, stale: int) -> None:
     )
 
 
-def inventory(adapter: ClaudeAdapter, store: Store, src: Source) -> Inventory:
-    """The in-flight inventory of *src* (store counter included)."""
+def peek_inventory(adapter: ClaudeAdapter, store: Store, src: Source) -> Inventory:
+    """The in-flight inventory of *src*, read-only (a stale counter is left as is)."""
     from . import inflight
 
-    inv = inflight.inventory(
+    return inflight.inventory(
         adapter,
         src.pid,
         src.transcript,
@@ -145,6 +145,11 @@ def inventory(adapter: ClaudeAdapter, store: Store, src: Source) -> Inventory:
         active_subagents=store.active_subagents(src.session_id),
         subagent_started_at=store.subagent_started_at(src.session_id),
     )
+
+
+def inventory(adapter: ClaudeAdapter, store: Store, src: Source) -> Inventory:
+    """The in-flight inventory of *src* (store counter included; a stale one is reset)."""
+    inv = peek_inventory(adapter, store, src)
     if inv.stale_counter:
         _clear_stale_counter(store, src.session_id, inv.stale_counter)
     return inv
@@ -1786,9 +1791,11 @@ _VERBS = {
 
 def dispatch(args: argparse.Namespace) -> int:
     """Dispatch ``ccc continue-session <verb>``."""
-    from . import handoff_facts
+    from . import handoff_facts, lean_check
 
     verb = getattr(args, "cs_command", None)
+    if verb == "lean-check":
+        return lean_check.cmd_lean_check(args)
     handler = _VERBS.get(verb or "") or handoff_facts.VERBS.get(verb or "")
     if handler is None:
         args.cs_parser.print_help()
@@ -1811,7 +1818,8 @@ def add_parser(sub: Any) -> None:
             "examples:\n"
             "  ccc continue-session state -j\n"
             "  ccc continue-session template > handoff.md\n"
-            "  ccc continue-session drain -t 540"
+            "  ccc continue-session drain -t 540\n"
+            "  ccc continue-session lean-check -s <sid> -j   # read-only code-relay verdict"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1917,6 +1925,7 @@ def add_parser(sub: Any) -> None:
     p_status.add_argument("-s", "--session", help="list the transfers of this session id")
     p_status.add_argument("-j", "--json", action="store_true", help="JSON output")
 
-    from . import handoff_facts
+    from . import handoff_facts, lean_check
 
     handoff_facts.add_parsers(verbs)
+    lean_check.add_parser(verbs)
