@@ -4398,6 +4398,43 @@ def _pad_cells(text: str, width: int) -> str:
     return text + " " * max(0, width - cell_len(text))
 
 
+def _fit_cells(line: str, cols: int | None) -> str:
+    """*line* clipped to *cols* TERMINAL cells with a trailing ``…``; unchanged for ``None``.
+
+    The ``ccc quota`` report is one line per provider, but its last column is free text
+    (a refusal reason, the last run, the login's e-mail) that ran past the terminal and
+    wrapped onto a second line, breaking the one-row-per-seat reading. Width is measured
+    with the escapes stripped and each character's cell width (the ✅/⛔ marks are double
+    width), the cut never lands inside an escape sequence, and a line that carried colour
+    ends in a reset so a clipped painted span does not bleed into the next line.
+    """
+    if cols is None:
+        return line
+    import re  # pylint: disable=import-outside-toplevel
+
+    from rich.cells import cell_len  # pylint: disable=import-outside-toplevel
+
+    parts = re.split(r"(\x1b\[[0-9;?]*[A-Za-z])", line)
+    if cell_len("".join(parts[0::2])) <= cols:
+        return line
+    budget = max(0, cols - 1)
+    out: list[str] = []
+    used = 0
+    painted = False
+    for index, part in enumerate(parts):
+        if index % 2:
+            out.append(part)
+            painted = True
+            continue
+        for char in part:
+            step = cell_len(char)
+            if used + step > budget:
+                return "".join(out) + "…" + ("\033[0m" if painted else "")
+            out.append(char)
+            used += step
+    return "".join(out)  # pragma: no cover  # unreachable: the line was measured too wide
+
+
 def _quota_last_run_note(prov: dict[str, Any]) -> str:
     """``last run 58m ago · checker · 6s`` from the row's ``last_run`` (Codex seats), or "".
 
@@ -4872,6 +4909,9 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
     ages = {prov["id"]: _quota_age(prov, now) for prov in snap["providers"]}
     age_w = max([len("data age"), *(len(a) for a in ages.values())])
     colorable = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    # One terminal line per row on a TTY: the free-text tail is clipped with `…` rather
+    # than wrapped. Piped output and `-w/--wide` keep the full text.
+    fit = _quota_fit_cols(wide=bool(getattr(args, "wide", False)))
     bars = not args.no_bars
     color = bars and colorable
     # The header is built from the SAME pieces as a row — a blank mark cell, then the
@@ -4956,14 +4996,27 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
             snap, now, width=width, age_w=age_w, bars=bars, color=color, colorable=colorable
         )
     )
-    _print_quota_table(head, body, colorable=colorable)
+    _print_quota_table(head, body, colorable=colorable, fit=fit)
     if snap["best_claude_account"]:
         best = names.get(snap["best_claude_account"]) or quota.display_id(
             snap["best_claude_account"]
         )
-        print(f"best Claude account (spends what resets soonest): {best}")
-    _print_codex_seat_footer(snap, now)
+        print(_fit_cells(f"best Claude account (spends what resets soonest): {best}", fit))
+    _print_codex_seat_footer(snap, now, fit=fit)
     return 0
+
+
+def _quota_fit_cols(*, wide: bool) -> int | None:
+    """The terminal width ``ccc quota`` clips its lines to, or ``None`` for full text.
+
+    ``None`` off a TTY (a pipe or file gets every character, as scripts always have) and
+    under ``-w/--wide``.
+    """
+    if wide or not sys.stdout.isatty():
+        return None
+    import shutil  # pylint: disable=import-outside-toplevel
+
+    return shutil.get_terminal_size().columns
 
 
 def _api_credit_name(row: dict[str, Any]) -> str:
@@ -5097,7 +5150,9 @@ def _api_credit_lines(  # pylint: disable=too-many-arguments,too-many-locals
     return lines
 
 
-def _print_quota_table(head: str, body: list[str], *, colorable: bool) -> None:
+def _print_quota_table(
+    head: str, body: list[str], *, colorable: bool, fit: int | None = None
+) -> None:
     """The provider table: header, a rule as wide as the widest row, then the rows.
 
     Widths are measured in terminal cells with the colour codes stripped — the bars and
@@ -5113,13 +5168,13 @@ def _print_quota_table(head: str, body: list[str], *, colorable: bool) -> None:
     rule = "  " + "─" * max(0, width - 2)
     if colorable:
         head, rule = f"\033[1m{head.rstrip()}\033[0m", f"\033[2m{rule}\033[0m"
-    print(head.rstrip())
+    print(_fit_cells(head.rstrip(), fit))
     print(rule)
     for line in body:
-        print(line)
+        print(_fit_cells(line, fit))
 
 
-def _print_codex_seat_footer(snap: dict[str, Any], now: int) -> None:
+def _print_codex_seat_footer(snap: dict[str, Any], now: int, *, fit: int | None = None) -> None:
     """The Codex seat block: the ranked order, the next attempt, notes and the pin.
 
     One line that answers "which login will the next Codex call bill, and why" —
@@ -5166,15 +5221,18 @@ def _print_codex_seat_footer(snap: dict[str, Any], now: int) -> None:
         when = f" (earliest reset {usage.format_reset(min(resets), now)})" if resets else ""
         tail = f"next attempt: none eligible{when}"
     policy = str(snap.get("codex_seat_policy") or "fill")
-    print(f"codex seats [{policy}]: {ladder or '(none configured)'}     {tail}")
+    print(_fit_cells(f"codex seats [{policy}]: {ladder or '(none configured)'}     {tail}", fit))
     notes = [f"{_seat_name(row)}: {row['note']}" for row in rows if row.get("note")]
     order_tokens = " ".join(str(row.get("label", "")) for row in rows if row.get("label"))
     if notes:
         print(
-            " " * len(f"codex seats [{policy}]: ")
-            + "⚠ "
-            + " · ".join(notes)
-            + f" · change: codex-in-claude order {order_tokens}"
+            _fit_cells(
+                " " * len(f"codex seats [{policy}]: ")
+                + "⚠ "
+                + " · ".join(notes)
+                + f" · change: codex-in-claude order {order_tokens}",
+                fit,
+            )
         )
     pin = snap.get("codex_pin") or {}
     if pin:
@@ -5182,13 +5240,13 @@ def _print_codex_seat_footer(snap: dict[str, Any], now: int) -> None:
         # the same vocabulary as every other line in this block.
         pinned = next((r for r in rows if r.get("label") == pin["account"]), None)
         shown_pin = _seat_name(pinned) if pinned else str(pin["account"])
-        print(f"pin: {shown_pin} until {pin.get('until') or '∞'}")
+        print(_fit_cells(f"pin: {shown_pin} until {pin.get('until') or '∞'}", fit))
     else:
         # No ``codex_pin`` while a row IS flagged pinned means the pin exists but an
         # explicit order overrules it — say so, or the user keeps re-setting a dead knob.
         ignored = next((row for row in rows if row.get("pinned")), None)
         if ignored is not None:
-            print(f"pin: {_seat_name(ignored)} (ignored: explicit order set)")
+            print(_fit_cells(f"pin: {_seat_name(ignored)} (ignored: explicit order set)", fit))
 
 
 def cmd_resume_halted(args: argparse.Namespace) -> int:
@@ -7362,7 +7420,8 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
             "Rows are named the way you would open a session on that seat — "
             "claude-work (cwork), claude-priv (cpriv), codex-work, codex-priv, codex-de. "
             "-p/-m/-c take either that name or the JSON contract's id (claude:work, "
-            "codex, codex:private); the -j payload keeps the ids unchanged."
+            "codex, codex:private); the -j payload keeps the ids unchanged. On a terminal "
+            "each line is clipped to its width with …; `ccc quota -w` prints it in full."
         ),
     )
     p_quota.add_argument(
@@ -7486,6 +7545,13 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         default=None,
         help="with -n: freeze the decision + evidence in FILE (0600); a retry with the same "
         "FILE reuses it and never re-decides",
+    )
+    p_quota.add_argument(
+        "-w",
+        "--wide",
+        action="store_true",
+        help="print every line in full; on a terminal the report otherwise clips each line "
+        "to the terminal width with … (piped output is never clipped)",
     )
     p_quota.set_defaults(func=cmd_quota)
 

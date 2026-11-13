@@ -849,6 +849,7 @@ def _quota_args(**over: str | bool | None) -> argparse.Namespace:
         no_bars=False,
         credit=None,
         probe=False,
+        wide=False,
     )
     base.update(over)
     return argparse.Namespace(**base)
@@ -1881,3 +1882,86 @@ def test_window_live_in_current_month_before_reset() -> None:
 def test_reset_snapshot_never_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(usage, "read_copilot_usage", lambda: _copilot(premium_reset_at=NOW - 1))
     assert quota._copilot_quota(NOW, {}).state != quota.BLOCKED
+
+
+# ── one terminal line per row: clipping to the terminal width ─────────────────────
+
+
+def _cells(line: str) -> int:
+    from rich.cells import cell_len
+
+    return cell_len(re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line))
+
+
+def test_fit_cells_clips_a_long_line_to_the_width_with_an_ellipsis() -> None:
+    from command_center import cli
+
+    line = "  codex-work blocked " + "out of credits " * 20
+    clipped = cli._fit_cells(line, 40)  # noqa: SLF001
+    assert clipped.endswith("…")
+    assert _cells(clipped) == 40
+    assert line.startswith(clipped[:-1])
+    # Short enough already, or full text requested: returned as it came.
+    assert cli._fit_cells("short", 40) == "short"  # noqa: SLF001
+    assert cli._fit_cells(line, None) == line  # noqa: SLF001
+
+
+def test_fit_cells_measures_emoji_and_colour_by_terminal_cells() -> None:
+    """⛔ is two cells and escapes are none: the cut is by display width, never len()."""
+    from command_center import cli
+
+    painted = "  ⛔ \x1b[31mblocked   \x1b[0m " + "x" * 60
+    clipped = cli._fit_cells(painted, 30)  # noqa: SLF001
+    assert _cells(clipped) == 30
+    # Both escapes survive whole, and the clipped line closes its colour.
+    assert "\x1b[31m" in clipped and clipped.endswith("…\x1b[0m")
+    # A cut that falls where an escape starts never leaves a fragment of it behind.
+    for cols in range(1, 20):
+        out = cli._fit_cells("ab\x1b[38;2;1;2;3mcdefghijklmnopqrstuvwxyz", cols)  # noqa: SLF001
+        stripped = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", out)
+        assert "\x1b" not in stripped and _cells(out) <= cols
+    # A double-width glyph that would straddle the edge is dropped, not half-drawn.
+    assert cli._fit_cells("a⛔⛔⛔", 4) == "a⛔…"  # noqa: SLF001
+
+
+def _long_codex_refusal() -> str:
+    reason = "codex exec refused: quota — out of credits " + "(details of the refusal) " * 8
+    quota.record_block(
+        "codex",
+        blocked_until=int(time.time()) + 6 * 3600,
+        observed_at=int(time.time()),
+        reason=reason,
+    )
+    return " ".join(reason.split())
+
+
+def test_quota_report_on_a_tty_is_one_line_per_row(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center import cli
+
+    reason = _long_codex_refusal()
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    monkeypatch.setenv("COLUMNS", "100")
+    assert cli.cmd_quota(_quota_args()) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert all(_cells(line) <= 100 for line in lines), [_cells(ln) for ln in lines]
+    row = next(line for line in lines if "codex-work" in line and "codex seats" not in line)
+    assert "codex ex" in row and row.endswith("…\x1b[0m")  # coloured row: reset closes it
+    assert reason not in "\n".join(lines)
+    # -w/--wide prints the whole reason even on a terminal.
+    assert cli.cmd_quota(_quota_args(wide=True)) == 0
+    assert reason in capsys.readouterr().out
+
+
+def test_quota_report_piped_is_never_clipped(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center import cli
+
+    reason = _long_codex_refusal()
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    monkeypatch.setenv("COLUMNS", "60")
+    assert cli.cmd_quota(_quota_args()) == 0
+    out = capsys.readouterr().out
+    assert reason in out and "…" not in out

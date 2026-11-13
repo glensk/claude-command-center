@@ -3187,6 +3187,7 @@ already-refused request.
 ```commands
 ccc quota                       # human table: provider · state · age · session+week bars · renew
 ccc quota -B                    # the same table without the bars (plain columns)
+ccc quota -w                    # full lines: no clipping to the terminal width
 ccc quota -j                    # versioned JSON contract (for scripts), schema v2
 ccc quota -p codex-priv         # one provider; exit 0=available 1=blocked 2=unknown
 ccc quota -b                    # best CLAUDE account label only
@@ -3202,6 +3203,12 @@ ccc quota -p muse               # the Muse Code row: muse's own est. cost agains
 ccc quota -n work -j -F rec.json  # relay successor account pick, frozen in rec.json (0600)
 ccc quota -n work -A private    # explicit override, recorded as decision=override
 ```
+
+On a terminal the report prints **one line per row**: every table row, API-credit row and
+`codex seats` / `⚠` / `pin` footer line is clipped to the terminal width with a trailing
+`…` (measured in terminal cells, colour codes excluded), so a long refusal reason or
+last-run note never wraps onto a second line. `-w/--wide` prints every line in full; piped
+output and `-j` are never clipped.
 
 ### The relay successor's account pick (`-n/--next-from`)
 
