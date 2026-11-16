@@ -2823,7 +2823,12 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if blockers:
         print(f"error: {blockers[0]}", file=sys.stderr)
         return 1
-    resume_argv = _profile_argv(session, resume=args.session_id)
+    resume_argv = _profile_argv(
+        session,
+        resume=args.session_id,
+        startup_sysprompt=True,  # tp#2168 B10: this execvp bypasses the shell wrapper
+        config_dir=accounts.exec_config_dir(config_dir),
+    )
     if resume_argv is None:  # the profile no longer resolves: refuse, never bare claude
         return 1
     # Terminal guard (same trap as `start-job`): this execs claude IN PLACE, so with no
@@ -2906,7 +2911,12 @@ def cmd_fire_attached(args: argparse.Namespace) -> int:
         prompt = (session.prompt or "").strip()
         profile = accounts.session_launch_profile(session)
         # Resolved BEFORE the claim: an unresolvable profile refuses with no state change.
-        fire_argv = _profile_argv(session, resume=args.session_id)
+        fire_argv = _profile_argv(
+            session,
+            resume=args.session_id,
+            startup_sysprompt=True,  # tp#2168 B10: this execvp bypasses the shell wrapper
+            config_dir=accounts.exec_config_dir(session.config_dir),
+        )
         if fire_argv is None:
             store.update_fields(args.session_id, fire_at=0)  # no tab-opening retry loop
             return 1
@@ -2979,11 +2989,16 @@ def cmd_fire_await(args: argparse.Namespace) -> int:  # pylint: disable=too-many
             accounts.session_launch_profile(owner) if owner is not None else ""
         )
         prompt = delivery_prompt(group)
+        # tp#2168 B10: this execvp bypasses the shell wrapper, so it opts into the startup
+        # system prompt itself, for the group's own seat.
+        seat = accounts.exec_config_dir(group.config_dir)
         try:  # re-resolved from its NAME now, before any state change
-            argv = (
-                launch_argv.claude_argv(name="", launch_profile=profile)
-                if group.fresh
-                else launch_argv.claude_argv(resume=group.session_id, launch_profile=profile)
+            argv = launch_argv.claude_argv(
+                resume="" if group.fresh else group.session_id,
+                name="" if group.fresh else None,
+                launch_profile=profile,
+                startup_sysprompt=True,
+                config_dir=seat,
             )
         except LaunchProfileError as exc:
             store.revert_delivery(
@@ -3803,6 +3818,8 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
         model=LLM_MODEL_IDS[overseer],
         effort=effort,
         launch_profile=profile,
+        startup_sysprompt=True,  # tp#2168 B10: this execvp bypasses the shell wrapper
+        config_dir=accounts.exec_config_dir(config_dir),
     )
     _spawn_sync_mirrors(cfg)  # (BEFORE execvp: the success path replaces this process)
     # Pin the job's OWN Claude account (D8) into os.environ before exec — the default

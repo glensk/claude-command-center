@@ -517,6 +517,31 @@ interactive launch of that session. It is billing-relevant identity, so a surfac
   no personal executable or vault item is ever named in this tree. `tests/test_launch_profile.py`
   enumerates the surfaces; a new launch surface must join it.
 
+## The startup system prompt (`CC_STARTUP_SYSPROMPT`, opt-in)
+
+With `CC_STARTUP_SYSPROMPT=1` the user's shell wrapper adds the flags of an external helper
+(`cc-startup-sysprompt.py -a -c <config dir>`, `external_deps`) so the seat's global
+`CLAUDE.md` block lands in the cached system prompt. A typed launch goes through that wrapper;
+an `execvp` launch does not, so it opts in itself via
+`launch_argv.claude_argv(startup_sysprompt=True, config_dir=accounts.exec_config_dir(<row's
+config_dir>))` — the seat the exec'd `claude` is pinned to, never this process's own
+`$CLAUDE_CONFIG_DIR`. Same rules everywhere: switch unset or not `1` → argv unchanged and the
+helper never runs; a caller argv that already carries `--settings`, `--agents`,
+`--append-system-prompt*` or `--system-prompt*` → no helper flag; helper missing, failing,
+slow (15 s) or malformed → the plain launch.
+
+| Launcher | Route | Startup system prompt |
+|---|---|---|
+| `ccc resume` | `execvp` | opts in, the row's seat |
+| `ccc fire-attached` | `execvp` | opts in, the row's seat |
+| `ccc fire-await` (resume and `-F` fresh) | `execvp` | opts in, the group's seat |
+| `ccc start-job` | `execvp` | opts in, the job's seat |
+| `claude-session-continue` | `execvp` | opts in, the inherited `$CLAUDE_CONFIG_DIR` |
+| tab launches (`resume_in_new_tab`, `relaunch_command`, snapshot restore) | typed | via the shell wrapper (no opt-in) |
+| headless `claude -p` probes, `llm_custom_command` | not `claude_argv` | out |
+
+`tests/test_launch_argv_sysprompt.py` pins the rules and every `execvp` site.
+
 ## `ccc await` — event-triggered resume (do not regress)
 
 `await_store.py` (schema + every transition, a `Store` mixin), `await_probes.py`,

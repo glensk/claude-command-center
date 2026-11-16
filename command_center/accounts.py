@@ -580,6 +580,20 @@ def apply_to_environ(config_dir: str) -> None:
     ensure_trusted(config_dir)
 
 
+def exec_config_dir(config_dir: str) -> str:
+    """The config dir a ``claude`` pinned to *config_dir* runs under, as a path string.
+
+    The value :func:`apply_to_environ` / :func:`pin_environ` export as
+    ``CLAUDE_CONFIG_DIR`` (the configured spelling, :func:`_export_value`), or
+    ``~/.claude`` (expanded) for the default account, whose launch unsets the var. An
+    ``execvp`` site builds its argv BEFORE it pins the account, so it names the seat with
+    this instead of reading this process's own ``$CLAUDE_CONFIG_DIR`` (tp#2168 B10).
+    """
+    if is_default_config_dir(config_dir):
+        return os.path.join(os.path.expanduser("~"), ".claude")
+    return _export_value(config_dir)
+
+
 def launch_env_prefix(config_dir: str) -> str:
     """A POSIX-shell prefix pinning the account for a launcher command *string*.
 

@@ -6,15 +6,29 @@ flags. Pinned: switch off → argv unchanged and the helper never runs; switch o
 flags right before *extra* (and before ``--`` + prompt); a caller's own settings / agents
 / system prompt → no helper flag at all; helper missing / failing / slow / empty /
 malformed → the plain argv; typed commands (no opt-in) never get the flags.
+tp#2168 B10: the other ``execvp`` sites (``resume``, ``fire-attached``, ``fire-await``,
+``start-job``) opt in too, each for the seat its exec is pinned to.
 """
 
 from __future__ import annotations
 
+import argparse
+import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from command_center import launch_argv, session_continue
+# The fire-await site needs a claimed ``ccc await`` group; reuse that module's fixture
+# (importing env_fixture registers it).
+from test_await_delivery import (  # noqa: F401  # pylint: disable=unused-import
+    _claimable,
+    _register_env,
+    env_fixture,
+)
+
+from command_center import accounts, cli, launch_argv, session_continue
+from command_center.store import Store
 
 FLAGS = ["--append-system-prompt-file", "/s/sysprompt.md", "--settings", "/s/settings.json"]
 AGENTS = ["--agents", '{"general-purpose":{"description":"d \\"q\\" $HOME `x`","prompt":"p"}}']
@@ -184,3 +198,133 @@ def test_session_continue_opts_in(helper: Helper) -> None:
         "--",
         session_continue.DEFAULT_PROMPT,
     ]
+
+
+# --------------------------------------------------------------------------- tp#2168 B10
+# The four ccc `execvp` sites (`resume`, `fire-attached`, `fire-await`, `start-job`) opt in
+# like `claude-session-continue`, each for the seat its exec is pinned to — never the
+# ambient `$CLAUDE_CONFIG_DIR` of the launching process (argv is built BEFORE the pin).
+AMBIENT = "/ambient/seat"
+
+
+def _default_seat() -> str:
+    """``~/.claude`` under the per-test HOME (tests/conftest.py isolates it)."""
+    return os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def _pin_registered(monkeypatch: pytest.MonkeyPatch, ambient: str = AMBIENT) -> None:
+    """The exec pin mutates ``os.environ``: register every var it touches for restore."""
+    for var in ("CLAUDE_SECURESTORAGE_CONFIG_DIR", "CCC_NO_CODEX", accounts.TITLE_VAR):
+        monkeypatch.setenv(var, "x")
+        monkeypatch.delenv(var)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", ambient)
+    monkeypatch.setattr(accounts, "ensure_trusted", lambda *_a, **_k: True)
+
+
+def _capture_exec(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    seen: list[list[str]] = []
+
+    def fake_exec(_file: str, argv: list[str]) -> None:
+        seen.append(list(argv))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(os, "execvp", fake_exec)
+    return seen
+
+
+@pytest.fixture(name="job")
+def job_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """A draft job on the default account (``config_dir=""``) in a fresh store."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with Store() as store:
+        store.create_draft("job1", str(repo), "aim")
+        store.update_fields("job1", config_dir="")
+    return "job1"
+
+
+def test_exec_config_dir_names_the_pinned_seat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", AMBIENT)
+    assert accounts.exec_config_dir("") == _default_seat()
+    assert accounts.exec_config_dir(str(tmp_path / "claude")) == _default_seat()
+    assert accounts.exec_config_dir(str(tmp_path / "work")) == str(tmp_path / "work")
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_cmd_resume_opts_in_for_the_rows_seat(
+    helper: Helper, job: str, monkeypatch: pytest.MonkeyPatch, on: bool
+) -> None:
+    from command_center import core
+
+    _pin_registered(monkeypatch)
+    if on:
+        helper.switch()
+    with Store() as store:
+        store.update_fields(job, draft=False)
+    monkeypatch.setattr(core, "resume_blockers", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli, "has_terminal", lambda: True)
+    seen = _capture_exec(monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.cmd_resume(argparse.Namespace(session_id=job))
+    assert seen == [["claude", "--resume", job, *(FLAGS if on else [])]]
+    assert helper.calls() == ([f"-a -c {_default_seat()}"] if on else [])
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_cmd_fire_attached_opts_in_for_the_rows_seat(
+    helper: Helper, job: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, on: bool
+) -> None:
+    _pin_registered(monkeypatch)
+    if on:
+        helper.switch()
+    seat = tmp_path / "work"
+    with Store() as store:
+        store.update_fields(job, draft=False, prompt="go", fire_at=999, config_dir=str(seat))
+    seen = _capture_exec(monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.cmd_fire_attached(argparse.Namespace(session_id=job))
+    assert seen == [["claude", "--resume", job, *(FLAGS if on else [])]]
+    assert helper.calls() == ([f"-a -c {seat}"] if on else [])
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+@pytest.mark.parametrize("on", [False, True])
+def test_cmd_fire_await_opts_in_for_the_groups_seat(
+    helper: Helper, env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, on: bool, fresh: bool
+) -> None:
+    gid, token = _claimable(env, fresh=fresh)
+    _register_env(monkeypatch, env)
+    _pin_registered(monkeypatch)
+    monkeypatch.setattr(cli, "Store", lambda: Store(env["tmp"] / "state.db"))
+    if on:
+        helper.switch()
+    seen: list[list[str]] = []
+    monkeypatch.setattr(os, "execvp", lambda _file, argv: seen.append(list(argv)))
+    assert cli.cmd_fire_await(argparse.Namespace(group_id=gid, token=token)) == 0
+    head = ["claude"] if fresh else ["claude", "--resume", env["sid"]]
+    assert seen == [[*head, *(FLAGS if on else [])]]
+    assert helper.calls() == ([f"-a -c {env['acct']}"] if on else [])
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_cmd_start_job_opts_in_for_the_jobs_seat(
+    helper: Helper, job: str, monkeypatch: pytest.MonkeyPatch, on: bool
+) -> None:
+    _pin_registered(monkeypatch)
+    if on:
+        helper.switch()
+    monkeypatch.setattr(accounts, "is_trusted", lambda *_a, **_k: True)
+    monkeypatch.setenv("CCC_START_JOB_HEADLESS", "1")
+    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
+    seen = _capture_exec(monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.cmd_start_job(argparse.Namespace(session_id=job, force=True, auto=False))
+    assert len(seen) == 1
+    argv = seen[0]
+    assert argv[:1] == ["claude"] and "--session-id" in argv
+    assert (argv[-len(FLAGS) :] == FLAGS) is on and ("--settings" in argv) is on
+    assert helper.calls() == ([f"-a -c {_default_seat()}"] if on else [])
