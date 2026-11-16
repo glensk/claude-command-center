@@ -1432,6 +1432,87 @@ def test_switch_now_notifies_the_manual_command_when_typing_fails(
     assert "claude --resume" in env.notes[0]
 
 
+# ------------------------------------------------------------- input ledger (tp#2170 P9)
+def _input_rows() -> list[dict[str, object]]:
+    """Every ``inputs`` row (the tp#2170 ledger) of the default (test) store."""
+    with Store() as store:
+        cur = store.conn.execute("SELECT * FROM inputs ORDER BY rowid")
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
+
+
+def test_switch_now_ledgers_the_prompt_before_typing_it(
+    tmp_path: Path,
+    two_accounts: tuple[Path, Path],  # pylint: disable=redefined-outer-name
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """P9: one ``switch_resume`` / ``automation`` row of the ``--prompt`` value, written
+    before the relaunch is typed; no column or log line carries the text."""
+    from command_center.input_ledger import content_sha
+
+    _private, work = two_accounts
+    env = _prepare_now(tmp_path, monkeypatch, two_accounts)
+    env.args.prompt = "pick up the quokka re-route"
+    seen: list[int] = []
+
+    def _type_iterm(sid: str, text: str) -> bool:
+        seen.append(len(_input_rows()))
+        env.typed["iterm"].append((sid, text))
+        return True
+
+    monkeypatch.setattr(terminal, "type_into_iterm_session", _type_iterm)
+    assert cli.cmd_switch_now(env.args) == 0
+    assert seen == [1]
+    (row,) = _input_rows()
+    assert (row["kind"], row["origin"], row["state"]) == ("switch_resume", "automation", "pending")
+    assert row["session_id"] == SID and row["content_sha"] == content_sha(env.args.prompt)
+    assert row["alt_sha"] == "" and row["config_dir"] == str(work)
+    assert row["cwd"] == env.args.cwd and str(row["transcript_path"]).endswith(f"{SID}.jsonl")
+    log = (config.app_home() / "events.log").read_text(encoding="utf-8")
+    for blob in [*map(str, row.values()), log, capsys.readouterr().err]:
+        assert "quokka" not in blob
+
+
+def test_switch_now_without_a_prompt_writes_no_ledger_row(
+    tmp_path: Path,
+    two_accounts: tuple[Path, Path],  # pylint: disable=redefined-outer-name
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P9: an empty ``--prompt`` types no prompt, so it leaves no row."""
+    env = _prepare_now(tmp_path, monkeypatch, two_accounts)
+    env.args.prompt = ""
+    assert cli.cmd_switch_now(env.args) == 0
+    assert env.typed["iterm"] and not _input_rows()
+
+
+def test_switch_now_typing_failure_marks_the_ledger_row_failed(
+    tmp_path: Path,
+    two_accounts: tuple[Path, Path],  # pylint: disable=redefined-outer-name
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P9: a relaunch that could not be typed marks its row ``failed`` (a reason code)."""
+    env = _prepare_now(tmp_path, monkeypatch, two_accounts)
+    env.args.prompt = "pick up the quokka re-route"
+    monkeypatch.setattr(terminal, "type_into_iterm_session", lambda _sid, _text: False)
+    assert cli.cmd_switch_now(env.args) == 1
+    (row,) = _input_rows()
+    assert (row["kind"], row["state"], row["reason"]) == ("switch_resume", "failed", "not_typed")
+
+
+def test_switch_now_refused_before_typing_writes_no_ledger_row(
+    tmp_path: Path,
+    two_accounts: tuple[Path, Path],  # pylint: disable=redefined-outer-name
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P9: a guard that aborts before the typing step writes no row at all."""
+    env = _prepare_now(tmp_path, monkeypatch, two_accounts)
+    env.args.prompt = "pick up the quokka re-route"
+    monkeypatch.setattr(terminal, "tty_ready_for_input", lambda *_args: False)
+    assert cli.cmd_switch_now(env.args) == 1
+    assert not _input_rows()
+
+
 def test_switch_now_uses_tmux_send_keys_and_requires_pane_ancestry(
     tmp_path: Path, two_accounts: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
