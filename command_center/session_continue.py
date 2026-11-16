@@ -466,7 +466,12 @@ def resolve_last_session() -> str | None:
 
 
 def build_command(args: argparse.Namespace, session_id: str) -> list[str]:
-    """Assemble the claude CLI invocation (through ccc's one launch builder)."""
+    """Assemble the claude CLI invocation (through ccc's one launch builder).
+
+    The ``execvp`` below bypasses the user's shell wrapper, so this site opts into the
+    startup system prompt itself (``CC_STARTUP_SYSPROMPT=1``; the seat is this process's
+    ``$CLAUDE_CONFIG_DIR``, which the exec inherits).
+    """
     from . import launch_argv  # pylint: disable=import-outside-toplevel
 
     last = session_id.lower() in LAST_SESSION_KEYWORDS
@@ -475,6 +480,7 @@ def build_command(args: argparse.Namespace, session_id: str) -> list[str]:
         continue_last=last,
         extra=() if args.no_skip_permissions else ("--dangerously-skip-permissions",),
         prompt=None if args.no_prompt else args.prompt,
+        startup_sysprompt=True,
     )
 
 

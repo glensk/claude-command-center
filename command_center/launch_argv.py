@@ -47,6 +47,91 @@ APIKEY_EXE_PREFIX = "claude-apikey"
 CLAIM_PURPOSE = "ccc-apikey"
 CLAIM_TIMEOUT_S = 5
 
+#: The opt-in switch for the startup system prompt (the same variable the user's shell
+#: wrapper honours): only ``"1"`` turns it on; unset / anything else launches as before.
+STARTUP_SYSPROMPT_ENV = "CC_STARTUP_SYSPROMPT"
+STARTUP_SYSPROMPT_TIMEOUT_S = 15
+#: A caller argv that already carries one of these keeps its own: no helper flag at all.
+_SYSPROMPT_OWN_FLAGS = ("--settings", "--agents")
+_SYSPROMPT_OWN_PREFIXES = ("--settings=", "--agents=", "--append-system-prompt", "--system-prompt")
+
+
+def has_own_sysprompt_flags(args: Sequence[str]) -> bool:
+    """True when *args* (before a ``--``) already set settings, agents or a system prompt."""
+    for arg in args:
+        if arg == "--":
+            return False
+        if arg in _SYSPROMPT_OWN_FLAGS or arg.startswith(_SYSPROMPT_OWN_PREFIXES):
+            return True
+    return False
+
+
+def _parse_sysprompt_argv(raw: bytes) -> list[str]:
+    """The helper's NUL-separated flags, or ``[]`` unless they have exactly the known shape.
+
+    ``--append-system-prompt-file <f> --settings <f>`` plus an optional ``--agents <json>``
+    pair, every value non-empty — all or none, so a truncated answer adds nothing.
+    """
+    if not raw.endswith(b"\0"):
+        return []
+    try:
+        parts = [part.decode("utf-8") for part in raw[:-1].split(b"\0")]
+    except UnicodeDecodeError:
+        return []
+    keys = parts[0::2]
+    if keys not in (
+        ["--append-system-prompt-file", "--settings"],
+        ["--append-system-prompt-file", "--settings", "--agents"],
+    ):
+        return []
+    if len(parts) != 2 * len(keys) or not all(parts[1::2]):
+        return []
+    return parts
+
+
+def startup_sysprompt_flags(config_dir: str = "") -> list[str]:
+    """The startup-system-prompt flags for the seat *config_dir*, or ``[]``.
+
+    Opt-in (:data:`STARTUP_SYSPROMPT_ENV` ``=1``), fail-open by design: the external
+    ``cc-startup-sysprompt.py -a -c <config dir>`` renders the seat's global ``CLAUDE.md``
+    block into a file and prints ``--append-system-prompt-file <f> --settings <f>
+    [--agents <json>]`` NUL-separated, so the block lands in the CACHED system prefix
+    instead of the first user message. Helper missing, slow (15 s cap), failing, empty or
+    malformed: ``[]`` — the session launches exactly as without the switch. *config_dir*
+    ``""`` means the seat this process is pinned to: ``$CLAUDE_CONFIG_DIR``, else
+    ``~/.claude``.
+    """
+    import os
+    import subprocess
+
+    if os.environ.get(STARTUP_SYSPROMPT_ENV) != "1":
+        return []
+    seat = (
+        config_dir
+        or os.environ.get("CLAUDE_CONFIG_DIR")
+        or os.path.join(os.path.expanduser("~"), ".claude")
+    )
+    try:
+        from extdeps import resolve
+
+        from .external_deps import EXTERNAL_DEPS
+
+        helper = resolve(EXTERNAL_DEPS["cc-startup-sysprompt.py"])
+        if not helper:
+            return []
+        done = subprocess.run(  # noqa: S603
+            [helper, "-a", "-c", seat],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=STARTUP_SYSPROMPT_TIMEOUT_S,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return []
+    if done.returncode != 0:
+        return []
+    return _parse_sysprompt_argv(done.stdout)
+
 
 def claim_apikey_session(session_id: str, exe: str) -> bool:
     """File ``ai-log-call session -s <sid> -j <job> -p ccc-apikey`` for an API-key launch.
@@ -135,6 +220,8 @@ def claude_argv(  # pylint: disable=too-many-arguments
     extra: Sequence[str] = (),
     prompt: str | None = None,
     launch_profile: str = "",
+    startup_sysprompt: bool = False,
+    config_dir: str = "",
 ) -> list[str]:
     """``claude [--name N] [--resume|--continue] [--model] [--session-id] [--effort] … [prompt]``.
 
@@ -149,6 +236,11 @@ def claude_argv(  # pylint: disable=too-many-arguments
     A *launch_profile* swaps ``claude`` for that profile's executable (:func:`profile_argv`).
     A superseded *model* id (``claude-opus-5``) launches as its replacement
     (:func:`command_center.models.current_model`, tp#2032).
+    *startup_sysprompt* (only for an ``execvp`` site that bypasses the user's shell
+    wrapper) inserts :func:`startup_sysprompt_flags` for *config_dir* right before *extra*
+    — nothing when the switch is off, the helper fails, or *extra* already carries its own
+    settings / agents / system prompt (:func:`has_own_sysprompt_flags`). Never for a TYPED
+    command: the shell wrapper adds the same flags itself.
     """
     if name is None:
         name = lookup_name(resume or session_id)
@@ -167,6 +259,8 @@ def claude_argv(  # pylint: disable=too-many-arguments
         argv += ["--session-id", session_id]
     if effort:
         argv += ["--effort", effort]
+    if startup_sysprompt and not has_own_sysprompt_flags(extra):
+        argv += startup_sysprompt_flags(config_dir)
     argv += list(extra)
     if prompt is not None:
         argv += ["--", prompt]

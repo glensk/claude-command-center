@@ -87,6 +87,21 @@ EXTERNAL_DEPS: dict[str, Dep] = {
     # thing: `ai-log-call session -s <sid> -j <job> -p <purpose>`, the claim that makes
     # `ai logs` sum an interactive API-key session's transcripts. Resolved with `resolve`,
     # fail-open: without it the launch simply files no claim.
+    # The startup-system-prompt helper (the dotfiles `bin/cc-startup-sysprompt.py`). ccc
+    # calls it for ONE thing: `-a -c <config dir>`, the NUL-separated launcher flags an
+    # `execvp` site that bypasses the shell wrapper adds (launch_argv.
+    # startup_sysprompt_flags). Only while CC_STARTUP_SYSPROMPT=1; resolved with
+    # `resolve`, fail-open: without it the session launches with the plain autoload.
+    "cc-startup-sysprompt.py": Dep(
+        name="cc-startup-sysprompt.py",
+        command="cc-startup-sysprompt.py",
+        env="CC_STARTUP_SYSPROMPT_BIN",
+        install_hint=(
+            "Put `cc-startup-sysprompt.py` on $PATH, or set CC_STARTUP_SYSPROMPT_BIN to its "
+            "absolute path. Needed only while CC_STARTUP_SYSPROMPT=1; without it the "
+            "session launches with Claude Code's plain CLAUDE.md autoload."
+        ),
+    ),
     "ai-log-call": Dep(
         name="ai-log-call",
         command="ai-log-call",
