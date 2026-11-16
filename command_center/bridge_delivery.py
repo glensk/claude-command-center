@@ -50,7 +50,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 import dataclasses
 from collections.abc import Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from .adapters import claude_bridge as cb
 from .bridge_store import DELIVERY_STATES_OPEN, Delivery
@@ -76,6 +76,16 @@ class Assignment:
     matched: cb.Located | None = None
     matched_kind: str = ""
     consumed: cb.Located | None = None
+
+
+class ShaCarrier(Protocol):
+    """What the text matcher needs of a row: a delivery or an input-ledger row."""
+
+    @property
+    def content_sha(self) -> str: ...
+
+    @property
+    def alt_sha(self) -> str: ...
 
 
 #: The longest run of stray characters a record may carry in front of a delivered message
@@ -107,7 +117,7 @@ def _stray_head(text: str, wanted: set[str]) -> str | None:
     return None
 
 
-def stray_prefix(delivery: Delivery, text: str) -> str | None:
+def stray_prefix(delivery: ShaCarrier, text: str) -> str | None:
     """How the record text proves this delivery: ``""`` exactly, the stray prefix, or None.
 
     Exactly: the text (raw, or with ``<pasted_content>`` wrappers removed) is this
@@ -126,18 +136,20 @@ def stray_prefix(delivery: Delivery, text: str) -> str | None:
     return None
 
 
-def _sha_matches(delivery: Delivery, text: str) -> bool:
+def _sha_matches(delivery: ShaCarrier, text: str) -> bool:
     """The record text is this delivery's message (:func:`stray_prefix`)."""
     return stray_prefix(delivery, text) is not None
 
 
-def _first_unclaimed(
+def first_unclaimed(
     located: list[cb.Located],
-    delivery: Delivery,
+    delivery: ShaCarrier,
     after: int,
     kinds: tuple[str, ...],
     claimed: set[int],
 ) -> tuple[cb.Located, str] | None:
+    """The first record of *kinds* at or after *after*, not in *claimed*, whose text is
+    *delivery*'s message (:func:`stray_prefix`), with its prompt kind; else None."""
     for loc in located:
         if loc.start < after or loc.start in claimed:
             continue
@@ -166,7 +178,7 @@ def assign(deliveries: list[Delivery], located: list[cb.Located]) -> dict[str, A
         )
         has_match = d.matched_offset >= 0
         if not has_match and d.state in ("sending", "unknown"):
-            hit = _first_unclaimed(located, d, d.anchor_offset, PROMPT_KINDS, claimed)
+            hit = first_unclaimed(located, d, d.anchor_offset, PROMPT_KINDS, claimed)
             if hit is not None:
                 a.matched, a.matched_kind = hit
                 claimed.add(hit[0].start)
@@ -176,7 +188,7 @@ def assign(deliveries: list[Delivery], located: list[cb.Located]) -> dict[str, A
                 a.consumed = a.matched
             elif a.matched_kind == cb.KIND_ENQUEUE:
                 after = (a.matched.start if a.matched else d.matched_offset) + 1
-                hit = _first_unclaimed(located, d, after, CONSUME_KINDS, claimed)
+                hit = first_unclaimed(located, d, after, CONSUME_KINDS, claimed)
                 if hit is not None:
                     a.consumed = hit[0]
                     claimed.add(hit[0].start)

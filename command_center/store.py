@@ -39,6 +39,7 @@ from .await_store import AWAIT_SCHEMA, AwaitStoreMixin
 from .bridge_store import (
     ADDED_DELIVERY_COLUMNS,
     ADDED_EVENT_COLUMNS,
+    ADDED_INPUT_COLUMNS,
     BRIDGE_SCHEMA,
     BridgeStoreMixin,
 )
@@ -862,6 +863,7 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         self._ensure_table_columns("transfers", self._ADDED_TRANSFER_COLUMNS)
         self._ensure_table_columns("deliveries", ADDED_DELIVERY_COLUMNS)  # voice bridge
         self._ensure_table_columns("events", ADDED_EVENT_COLUMNS)
+        self._ensure_table_columns("inputs", ADDED_INPUT_COLUMNS)  # input ledger
         # Partial index for the armed-fire scan (statusline chip + daemon dispatch).
         # Created HERE, not in _SCHEMA: an old DB only gains fire_at via the ALTER
         # loop above, and an index referencing a missing column would fail the open.

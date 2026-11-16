@@ -246,7 +246,10 @@ def read_appended(path: Path, inode: int, offset: int) -> list[Located]:
 
 
 def normalise(text: str) -> str:
-    """NFC, CRLF/CR → LF, trailing spaces per line dropped, outer whitespace stripped."""
+    """NFC, CRLF/CR → LF, trailing whitespace per line dropped, outer whitespace stripped.
+
+    The input ledger's ``ccc-text-sha-v1`` contract: changing it is a new ``norm`` value.
+    """
     text = unicodedata.normalize("NFC", text).replace("\r\n", "\n").replace("\r", "\n")
     return "\n".join(line.rstrip() for line in text.split("\n")).strip()
 
