@@ -416,6 +416,53 @@ def account_config_dir(label: str) -> str:
     return str(path) if path is not None else ""
 
 
+def account_unusable_reason(label: str) -> str:
+    """Why account *label* cannot host a session right now, or ``""`` when it can.
+
+    Read-only and local (no network): ``"unknown"`` for a label that is not configured,
+    ``"disabled"`` when it is listed in ``claude_accounts_disabled`` (a seat given up but
+    possibly still logged in), ``"missing"`` when its config dir is gone, ``"logged_out"``
+    when its ``.claude.json`` holds no OAuth account, ``"identity_mismatch"`` when a hard link
+    (``claude_account_emails``) is configured and the dir is logged into another account.
+    A seat that is still logged in but no longer licensed is not detectable here.
+    """
+    path = config.claude_config_dirs().get(label)
+    if path is None:
+        return "unknown"
+    if label in config.claude_disabled_accounts():
+        return "disabled"
+    if not Path(path).expanduser().is_dir():
+        return "missing"
+    email = account_email(str(path))
+    if email is None:
+        return "logged_out"
+    expected = config.claude_account_email_map().get(label)
+    if expected and email != expected:
+        return "identity_mismatch"
+    return ""
+
+
+def transcripts_are_one_file(transcript: Path, session_id: str, *config_dirs: str) -> bool:
+    """True when *transcript* is the very file each account in *config_dirs* resumes from.
+
+    Each account reads ``<dir>/projects/<slug>/<id>.jsonl``; a cross-account resume is
+    safe only when every one of those paths exists and is the SAME file as *transcript*
+    (a shared projects tree, e.g. a symlink). A per-account copy would fork the
+    conversation, so anything else — a missing path, a second file — is ``False``.
+    """
+    slug = transcript.parent.name
+    try:
+        if not transcript.is_file():
+            return False
+        for config_dir in config_dirs:
+            path = Path(config_dir).expanduser() / "projects" / slug / f"{session_id}.jsonl"
+            if not path.is_file() or not path.samefile(transcript):
+                return False
+    except OSError:
+        return False
+    return bool(config_dirs)
+
+
 # The ccc ``model`` column marks each row with a per-account glyph: 🏠 for the ``private``
 # (cpriv) account, 💼 for the ``work`` (cwork) account. Each is a width-2 colored emoji + a
 # trailing space (3 terminal cells, matching the width-2 badge emoji convention in

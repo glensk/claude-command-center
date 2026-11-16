@@ -4381,6 +4381,14 @@ def cmd_job_account(args: argparse.Namespace) -> int:
     ``-p/--pick`` prints ONLY the picked account label (one word, no report) — the
     machine-readable form shell wrappers dispatch on (the ``c()`` launcher resolves its
     account per invocation this way, so a long-lived shell never goes stale).
+
+    ``-j/--json`` lists every configured account (tp#2165): ``{version, pick, accounts:
+    [{label, default, usable, reason, pick}]}``. ``usable`` is the local, network-free
+    :func:`accounts.account_unusable_reason` check (config dir present, logged in, hard-linked
+    identity matches, not listed in ``claude_accounts_disabled``); ``reason`` names the
+    failure (``disabled`` / ``missing`` / ``logged_out`` / ``identity_mismatch``) or is
+    ``null``. A caller offering a resume target defaults a
+    session whose own account is not usable to a usable one.
     """
     import time
 
@@ -4389,6 +4397,22 @@ def cmd_job_account(args: argparse.Namespace) -> int:
     now = int(time.time())
     if getattr(args, "pick", False):
         print(routing.pick_job_account(now)[0])
+        return 0
+    if getattr(args, "json", False):
+        pick_label = routing.pick_job_account(now)[0]
+        rows = []
+        for i, label in enumerate(config.claude_config_dirs()):
+            reason = accounts.account_unusable_reason(label)
+            rows.append(
+                {
+                    "label": label,
+                    "default": i == 0,
+                    "usable": not reason,
+                    "reason": reason or None,
+                    "pick": label == pick_label,
+                }
+            )
+        print(json.dumps({"version": JSON_SCHEMA_VERSION, "pick": pick_label, "accounts": rows}))
         return 0
     scores = routing.score_accounts(now)
     _pick_label, pick_dir = routing.pick_job_account(now)
@@ -5468,7 +5492,7 @@ def cmd_focus_job(args: argparse.Namespace) -> int:
     return 1
 
 
-def cmd_resume_job(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
+def cmd_resume_job(args: argparse.Namespace) -> int:
     """Resume a PARKED session in a NEW iTerm tab — the parked dashboard's ▶ path.
 
     The shell-invokable equivalent of pressing ``r`` in the TUI on a parked row (moon ☾):
@@ -5481,80 +5505,163 @@ def cmd_resume_job(args: argparse.Namespace) -> int:  # pylint: disable=too-many
       * unknown / draft session → error + exit 1 (a draft is a FUTURE job — launch it with
         ``ccc open-job <id>`` instead);
       * LIVE session (in the fresh registry) → never a second REPL on the same transcript;
-        focus the existing tab like ``ccc focus-job`` does;
+        focus the existing tab like ``ccc focus-job`` does (refused under ``-A``/``-P``);
       * no cwd / no recorded conversation → error + exit 1 (it never had a turn, so it can't
         be resumed);
       * otherwise open a new iTerm tab (or tmux window) running ``claude --resume <id>``.
-    """
-    from . import terminal
 
+    tp#2165: ``-A LABEL`` resumes on another configured account (only when the transcript
+    is ONE file under both accounts and the cwd is trusted there); ``-P FILE`` hands a
+    private file's text to claude as its first prompt and always unlinks the file;
+    ``-j`` prints the bridge envelope (:mod:`command_center.bridge_json`).
+    """
+    from . import bridge_json
+
+    prompt_file = str(getattr(args, "prompt_file", None) or "")
+    prompt: str | None = None
+    early: bridge_json.BridgeError | None = None
+    if prompt_file:
+        try:
+            prompt = launch_argv.read_prompt_file(prompt_file)
+        except launch_argv.PromptFileError as exc:
+            early = bridge_json.usage("prompt_file", str(exc))
+        finally:
+            _unlink_own_file(prompt_file)
+
+    def body() -> dict[str, Any]:
+        if early is not None:
+            raise early
+        return _resume_job(args, prompt)
+
+    if getattr(args, "json", False):
+        return bridge_json.run_json(body)
+    try:
+        data = body()
+    except bridge_json.BridgeError as err:
+        if err.code != "automated":  # _automated_start_refused already said why
+            print(f"error: {err.message}", file=sys.stderr)
+        return err.exit_code
+    sid = data["session_id"]
+    if data["result"] == "focused":
+        print(f"{data['focused']}: {sid}")
+    elif getattr(args, "account", None):
+        print(f"resuming in a new tab: {sid} (account: {data['account']})")
+    else:
+        print(f"resuming in a new tab: {sid}")
+    return 0
+
+
+def _unlink_own_file(path: str) -> None:
+    """Remove *path* when it is a file (or symlink) owned by this user; never raises."""
+    with contextlib.suppress(OSError):
+        if os.lstat(path).st_uid == os.getuid():
+            os.unlink(path)
+
+
+def _resume_job(  # pylint: disable=too-many-locals,too-many-branches
+    args: argparse.Namespace, prompt: str | None
+) -> dict[str, Any]:
+    """The checks and the launch of :func:`cmd_resume_job`; refusals raise ``BridgeError``."""
+    from . import accounts, terminal
+    from .bridge_json import BridgeError
+
+    sid = args.session_id
+    label = str(getattr(args, "account", None) or "").strip()
+    target = ""
+    if label:
+        target = accounts.account_config_dir(label)
+        if not target:
+            known = ", ".join(sorted(config.claude_config_dirs())) or "(none)"
+            raise BridgeError(
+                "unknown_account",
+                f"unknown account {label!r} — configured accounts: {known}",
+            )
     adapter = _adapter()
     live_ids = {ls.session_id for ls in adapter.discover() if ls.alive}
     with Store() as store:
-        session = store.get(args.session_id)
+        session = store.get(sid)
     if session is None:
-        print(f"error: no such session {args.session_id}", file=sys.stderr)
-        return 1
+        raise BridgeError("no_session", f"no such session {sid}")
     if session.draft:
-        print(
-            f"error: {args.session_id} is a FUTURE job — launch it with "
-            f"`ccc open-job {args.session_id}` instead",
-            file=sys.stderr,
+        raise BridgeError(
+            "draft",
+            f"{sid} is a FUTURE job — launch it with `ccc open-job {sid}` instead",
         )
-        return 1
-    if args.session_id not in live_ids:  # focusing a live tab starts nothing
-        refused = _automated_start_refused(session, "resume-job")
-        if refused is not None:
-            return refused
-    if args.session_id in live_ids:
+    if sid in live_ids:
+        if label or prompt is not None:
+            raise BridgeError(
+                "live",
+                f"{sid} is live — close its tab first; -A/-P never focus a live session",
+            )
         # Live: don't open a second REPL on the same transcript — focus the existing tab.
+        source_label = accounts.account_label(session.config_dir or "")
         if session.iterm_session_id and terminal.focus_iterm_session(session.iterm_session_id):
-            print(f"focused live tab: {args.session_id}")
-            return 0
-        if terminal.focus_tmux_window(args.session_id):
-            print(f"focused tmux window: {args.session_id}")
-            return 0
-        print(
-            f"error: {args.session_id} is live but its iTerm tab / tmux window can't be "
-            "located — switch to it manually",
-            file=sys.stderr,
+            return _resumed(sid, "focused", source_label, "focused live tab")
+        if terminal.focus_tmux_window(sid):
+            return _resumed(sid, "focused", source_label, "focused tmux window")
+        raise BridgeError(
+            "no_tab",
+            f"{sid} is live but its iTerm tab / tmux window can't be located — "
+            "switch to it manually",
         )
-        return 1
+    refused = _automated_start_refused(session, "resume-job")  # focusing starts nothing
+    if refused is not None:
+        from . import automated  # pylint: disable=import-outside-toplevel
+
+        raise BridgeError("automated", automated.SKIP_MESSAGE, refused)
     if not session.cwd:
-        print(
-            f"error: {args.session_id} has no working directory — cannot resume",
-            file=sys.stderr,
-        )
-        return 1
+        raise BridgeError("no_transcript", f"{sid} has no working directory — cannot resume")
+    source = session.config_dir or ""
     # Fail closed exactly like cmd_resume (D8/R1): this is the Obsidian parked-dashboard
     # ▶ button, so an unknown account must refuse rather than silently bill the default.
-    from . import accounts
+    if not label and not source and accounts.is_multi_account():
+        raise BridgeError(
+            "no_account",
+            f"{sid} has no recorded Claude account (config_dir) and several are configured "
+            "— refusing to resume rather than risk billing the wrong account. Start a turn "
+            "from the intended account (or pass -A LABEL), then retry.",
+        )
+    transcript = adapter.transcript_path(session.cwd, sid, source or target)
+    if transcript is None:
+        raise BridgeError(
+            "no_transcript",
+            f"no recorded conversation for {sid} — it never had a turn (or its transcript "
+            "was deleted), so it cannot be resumed.",
+        )
+    cross = bool(label) and not (source and accounts.same_config_dir(source, target))
+    if cross:
+        shared = [target, source] if source else [target]
+        if not accounts.transcripts_are_one_file(transcript, sid, *shared):
+            raise BridgeError(
+                "not_shared",
+                f"the transcript of {sid} is not one shared file under the {label!r} "
+                "account — a resume there would fork the conversation",
+            )
+    if label:
+        accounts.ensure_trusted(target, session.cwd)
+        if not accounts.is_trusted(target, session.cwd, ancestors=True):
+            raise BridgeError(
+                "untrusted", f"{session.cwd} is not trusted for the {label!r} account"
+            )
+    if not terminal.resume_session_in_new_tab(session, config_dir=target or None, prompt=prompt):
+        manual = (
+            "its launch profile may no longer resolve"
+            if accounts.session_launch_profile(session)
+            else f"run `claude --resume {sid}` manually"
+        )
+        raise BridgeError("no_tab", f"could not open a new tab — {manual}")
+    if cross:
+        with Store() as store:  # the row now bills the account it was resumed on
+            store.update_fields(sid, config_dir=target)
+    return _resumed(sid, "resumed", accounts.account_label(target or source), "")
 
-    if not session.config_dir and accounts.is_multi_account():
-        print(
-            f"error: {args.session_id} has no recorded Claude account (config_dir) and "
-            "several are configured — refusing to resume rather than risk billing the "
-            "wrong account. Start a turn from the intended account, then retry.",
-            file=sys.stderr,
-        )
-        return 1
-    if adapter.transcript_path(session.cwd, args.session_id, session.config_dir) is None:
-        print(
-            f"error: no recorded conversation for {args.session_id} — it never had a turn "
-            "(or its transcript was deleted), so it cannot be resumed.",
-            file=sys.stderr,
-        )
-        return 1
-    if terminal.resume_session_in_new_tab(session):
-        print(f"resuming in a new tab: {args.session_id}")
-        return 0
-    manual = (
-        "its launch profile may no longer resolve"
-        if accounts.session_launch_profile(session)
-        else f"run `claude --resume {args.session_id}` manually"
-    )
-    print(f"error: could not open a new tab — {manual}", file=sys.stderr)
-    return 1
+
+def _resumed(sid: str, result: str, account: str, focused: str) -> dict[str, Any]:
+    """The ``resume-job -j`` data object (``focused`` is the text-mode line, never sent)."""
+    data: dict[str, Any] = {"session_id": sid, "result": result, "account": account}
+    if focused:
+        data["focused"] = focused
+    return data
 
 
 def unlaunch_job(
@@ -7464,8 +7571,36 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_resumejob = sub.add_parser(
         "resume-job",
         help="resume a parked session in a new iTerm tab (focuses the tab if it is live)",
+        description=(
+            "Resume a parked session with `claude --resume` in a new tab, on its own account "
+            "or (-A) another configured one. A live session is focused instead; with -A or "
+            "-P it is refused. Examples: ccc resume-job 1a2b3c4d · ccc resume-job 1a2b3c4d "
+            "-A work -P /path/to/answer.txt -j"
+        ),
     )
     p_resumejob.add_argument("session_id")
+    p_resumejob.add_argument(
+        "-A",
+        "--account",
+        metavar="LABEL",
+        help="resume on this configured account (claude_accounts label); only when the "
+        "transcript is one shared file under both accounts and the cwd is trusted there",
+    )
+    p_resumejob.add_argument(
+        "-P",
+        "--prompt-file",
+        metavar="FILE",
+        help="a private (0600) file whose text is claude's first prompt; the file is "
+        "removed whether or not the resume succeeds",
+    )
+    p_resumejob.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help='print the bridge envelope: data {session_id, result: "resumed", account} or '
+        "error.code (unknown_account, not_shared, untrusted, live, no_transcript, no_tab, "
+        "automated, ...)",
+    )
     p_resumejob.set_defaults(func=cmd_resume_job)
 
     p_unlaunch = sub.add_parser(
@@ -7490,6 +7625,12 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "--pick",
         action="store_true",
         help="print only the picked account label (for shell wrappers)",
+    )
+    p_jobacct.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help="print every configured account as JSON: label, default, usable, reason, pick",
     )
     p_jobacct.set_defaults(func=cmd_job_account)
 

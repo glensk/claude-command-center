@@ -345,7 +345,12 @@ def prompt_stdin_fd(prompt: str) -> int:
 
 
 def claude_command(
-    target: SessionLaunch, argv: Sequence[str], *, cwd: str = "", subshell: bool = False
+    target: SessionLaunch,
+    argv: Sequence[str],
+    *,
+    cwd: str = "",
+    subshell: bool = False,
+    stdin_file: str = "",
 ) -> str:
     """The shell STRING form of *argv*, with the session's env pin in front.
 
@@ -356,6 +361,11 @@ def claude_command(
     ``ccc mem-token`` itself, so the token is never part of the typed text. Every argument
     is shell-quoted; the caller owns rejecting control characters (a newline in a TYPED
     line submits it early).
+
+    A *stdin_file* (a private temp file holding the first prompt, tp#2165) becomes claude's
+    stdin: ``{ rm -f -- F; claude …; } < F`` opens it, unlinks it, then runs claude on the
+    open descriptor — the prompt text never appears in the typed line, the shell history or
+    ``ps`` (the :func:`prompt_stdin_fd` contract, for a command typed into a new tab).
     """
     from .accounts import session_launch_env_prefix, session_launch_profile
     from .mem_token import TYPED_SNIPPET
@@ -366,6 +376,9 @@ def claude_command(
     prefix = session_launch_env_prefix(target) + TYPED_SNIPPET
     cd = f"cd {shlex.quote(cwd)} && " if cwd else ""
     command = shlex.join(profile_argv(argv, session_launch_profile(target)))
+    if stdin_file:
+        quoted = shlex.quote(stdin_file)
+        command = f"{{ rm -f -- {quoted}; {command}; }} < {quoted}"
     if subshell:
         return f"{cd}( {prefix}{command} )"
     return f"{prefix}{cd}{command}"

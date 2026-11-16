@@ -297,6 +297,12 @@ DEFAULTS: dict[str, object] = {
     # even after such a drift. Empty (the default) ⇒ no hard link, today's pure
     # path-based behaviour (see ``accounts.resolve_card_label``).
     "claude_account_emails": [],
+    # Account labels that must no longer host a session (a seat that was given up but may
+    # still be logged in), e.g. ``["work"]``. A listed label stays configured — its old
+    # sessions keep resolving — but ``ccc job-account -j`` reports it ``usable: false``
+    # with ``reason: "disabled"``, so a resume picker defaults its sessions elsewhere.
+    # Empty (the default) ⇒ every configured account is judged by its login alone.
+    "claude_accounts_disabled": [],
     # When each paid subscription renews, so a card can advertise its own cancel-by date:
     # ``"card=YYYY-MM-DD"`` entries over the four cards in ``SUBSCRIPTION_CARDS``, e.g.
     # ``["claude_private=auto", "codex_private=2026-09-30"]``. The date is appended to
@@ -1033,6 +1039,18 @@ def claude_account_email_map() -> dict[str, str]:
     return parse_claude_account_emails(load_config().claude_account_emails)
 
 
+def claude_disabled_accounts() -> set[str]:
+    """The account labels listed in ``claude_accounts_disabled`` (see DEFAULTS)."""
+    return parse_claude_accounts_disabled(load_config().claude_accounts_disabled)
+
+
+def parse_claude_accounts_disabled(entries: object) -> set[str]:
+    """Pure parser behind :func:`claude_disabled_accounts`: valid labels only, never raises."""
+    if not isinstance(entries, list):
+        return set()
+    return {e.strip() for e in entries if isinstance(e, str) and _ACCOUNT_LABEL_RE.match(e.strip())}
+
+
 def parse_claude_account_emails(entries: list[str]) -> dict[str, str]:
     """Pure ``"label=email"`` parser behind :func:`claude_account_email_map`.
 
@@ -1244,6 +1262,7 @@ class Config:
     relay_switch_windows: list[str] = field(default_factory=lambda: ["seven_day"])
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
+    claude_accounts_disabled: list[str] = field(default_factory=list)  # labels given up
     claude_launch_profiles: list[str] = field(default_factory=list)  # "label=executable"
     subscription_ends: list[str] = field(default_factory=list)  # "card=YYYY-MM-DD|auto"
     # "label=usd:N,day:D[,from:YYYY-MM-DD]" per Claude account (API credit grant)

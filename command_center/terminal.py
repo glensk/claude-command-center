@@ -26,11 +26,13 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .screenread import ScreenCell, ScreenRead
@@ -547,6 +549,7 @@ def resume_in_new_tab(
     *,
     no_codex: bool = False,
     launch_profile: str = "",
+    prompt: str | None = None,
 ) -> bool:
     """Open a new terminal tab (or tmux window) in *cwd* running ``claude --resume <id>``.
 
@@ -560,6 +563,11 @@ def resume_in_new_tab(
     *launch_profile* starts the resume through that profile's executable and exports
     ``CCC_LAUNCH_PROFILE``; a profile that no longer resolves returns ``False`` before
     anything is opened or trusted — it never falls back to the bare ``claude``.
+
+    A *prompt* (``resume-job -P``, tp#2165) is claude's FIRST prompt: written to a private
+    (0600) temp file that the typed line feeds to claude's stdin and unlinks before claude
+    starts (:func:`command_center.launch_argv.claude_command` ``stdin_file``), so the text
+    never rides in argv or the shell history. The file is removed here when no tab opened.
     """
     from . import automated, launch_argv
     from .accounts import LaunchTarget, ensure_trusted
@@ -574,26 +582,52 @@ def resume_in_new_tab(
     except LaunchProfileError:
         return False
     ensure_trusted(config_dir, cwd)  # the tab's claude must not park on the trust dialog
+    stdin_file = _write_prompt_file(prompt) if prompt is not None else ""
     if _launcher_mode() == "tmux":
-        return _tmux_window(launch_argv.claude_command(target, argv), cwd=cwd)
-    command = launch_argv.claude_command(target, argv, cwd=cwd)
-    return bool(_open_tab(command, tmux_fallback=False))
+        opened = _tmux_window(
+            launch_argv.claude_command(target, argv, stdin_file=stdin_file), cwd=cwd
+        )
+    else:
+        command = launch_argv.claude_command(target, argv, cwd=cwd, stdin_file=stdin_file)
+        opened = bool(_open_tab(command, tmux_fallback=False))
+    if not opened and stdin_file:
+        Path(stdin_file).unlink(missing_ok=True)
+    return bool(opened)
 
 
-def resume_session_in_new_tab(session: Any) -> bool:
+def _write_prompt_file(prompt: str) -> str:
+    """A new 0600 temp file holding *prompt* (UTF-8); its absolute path."""
+    fd, path = tempfile.mkstemp(prefix="ccc-resume-prompt-")  # O_EXCL, mode 0600
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(prompt.encode("utf-8"))
+    except BaseException:
+        Path(path).unlink(missing_ok=True)
+        raise
+    return path
+
+
+def resume_session_in_new_tab(
+    session: Any, *, config_dir: str | None = None, prompt: str | None = None
+) -> bool:
     """:func:`resume_in_new_tab` for a session ROW: its cwd, account, ``no_codex`` and profile.
 
     The one place the row-based surfaces (the TUI resume key and undo-close, the jump chord,
     the resume-job command) read those four fields, so none of them can drop the profile.
+    *config_dir* resumes on another account (``resume-job -A``; the caller has checked that
+    the transcript is shared and the cwd trusted) — the row's ``no_codex`` and profile still
+    travel. *prompt* is passed through as the first prompt.
     """
     from .accounts import session_launch_profile
 
+    extra: dict[str, Any] = {} if prompt is None else {"prompt": prompt}
     return resume_in_new_tab(
         session.cwd,
         session.session_id,
-        session.config_dir,
+        session.config_dir if config_dir is None else config_dir,
         no_codex=bool(session.no_codex),
         launch_profile=session_launch_profile(session),
+        **extra,
     )
 
 
@@ -1996,8 +2030,6 @@ def stop_hook_tokens(cwd: str) -> set[str]:
 
     Never raises: an unreadable or invalid settings file contributes nothing.
     """
-    from pathlib import Path  # pylint: disable=import-outside-toplevel
-
     from . import install  # pylint: disable=import-outside-toplevel
 
     is_ccc = install._ccc_hook_arg  # pylint: disable=protected-access

@@ -83,7 +83,7 @@ flags. Grouped by what they do:
 - `ccc new-job -a "AIM" [-p PROMPT] [-c REPO] [-s YYYY-MM-DD] [-d DEP] [-j codex] [-O overseer] [-E executor] [-l]` — park a future job (`-d` = another job it depends on; `-l/--lean-start` exports `CC_LEAN_START=1` into the job's session so it starts lean).
 - `ccc new-prompt [-r cat/repo] [-o]` — a prefilled capture file for a future job.
 - `ccc jobs` — list registered future jobs (drafts).
-- `ccc job-account` — per-account usage urgency + which account a new job will bill to (the `job_account` policy).
+- `ccc job-account` — per-account usage urgency + which account a new job will bill to (the `job_account` policy). `-j/--json` lists every configured account as `{label, default, usable, reason, pick}`: `usable` is a local check (not listed in `claude_accounts_disabled`, config dir present, logged in, hard-linked identity matches; `reason` `disabled` · `missing` · `logged_out` · `identity_mismatch`), so a resume picker can default a session whose own account is unusable to a usable one.
 - `ccc quota` — cache-first quota oracle: which provider/account still has tokens, when each allowance renews, and when each blocked one unblocks.
 - `ccc start-job <id>` / `ccc open-job <id>|--file` — launch a saved job (in place / in a new tab, safe from Obsidian). Prefer `open-job` from scripts and agents: `start-job` execs in place and refuses without a TTY (it opens a tab instead) — see "Terminal guard" below.
 - `ccc done-job` · `ccc delete-job` · `ccc restore-job` · `ccc unlaunch` — the lifecycle: done-without-running / trash / restore / back-to-draft.
@@ -94,7 +94,7 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 **Sessions & tabs**
 
 - `ccc resume <id>` — resume a session in this terminal (`execvp`).
-- `ccc resume-job <id>` — resume a parked session in a new tab (focuses it if already live).
+- `ccc resume-job <id> [-A LABEL] [-P FILE] [-j]` — resume a parked session in a new tab (focuses it if already live). `-A/--account` resumes it on another configured account: only when its transcript is one shared file under both accounts (else `not_shared`) and after trusting the cwd for the target (else `untrusted`); the target's env pin comes from `accounts.py`, `no_codex` and the launch profile travel, a live session is refused (`live`, never focused) and the row then records the new account. `-P/--prompt-file` gives claude a first prompt from a private (0600) file, fed on stdin through a temp copy the tab's shell unlinks before claude starts (never argv or shell history); the file is removed whether or not the resume succeeds. `-j/--json` prints the bridge envelope: data `{session_id, result: "resumed", account}`, or `error.code` `unknown_account` · `not_shared` · `untrusted` · `live` · `no_transcript` · `no_tab` · `no_session` · `draft` · `no_account` · `prompt_file` (exit 2) · `automated` (exit 75 under `AI_AUTOMATED`).
 - `ccc focus-job <id>` — bring a live session's tab forward (verifies it is live first).
 - `ccc archive <id>` (`-u/--undo`) — soft-hide a PARKED session (`archived=1`) so it is listed once, on tp's board (`tp import-ccc -a -z` calls this); the row keeps its cwd/account, so `ccc resume <id>` / `ccc resume-job <id>` still work, and the moment the session is seen live again it is un-archived (it parks back into ccc's list until tp re-archives it). Refuses live sessions and FUTURE drafts (`delete-job` is the draft trash).
 - `ccc rm` · `ccc prune` — drop a tracked row / delete leftovers (contentless, headless `claude -p`, and dead-launched jobs that never had a turn).
@@ -3067,6 +3067,14 @@ filenames); malformed entries are skipped.
   **empty** rather than falling back to a path-based guess that could be wrong again.
   Empty (the default) ⇒ no hard link for any label — single-account installs and
   anyone who hasn't hit this drift are completely unaffected.
+- **Retired seats (`claude_accounts_disabled`).** A seat you gave up can still be
+  logged in, so the login check alone would call it usable. List its label:
+  ```toml
+  claude_accounts_disabled = ["work"]
+  ```
+  The account stays configured (its old sessions keep resolving and can be resumed on
+  another account with `-A` of the resume-job command), but `ccc job-account -j` reports
+  it `usable: false`, `reason: "disabled"`. Empty (the default) ⇒ no account is disabled.
 - **Subscription end dates (`subscription_ends`) — the `-> D.M` a card can carry.** A
   paid plan you mean to cancel is only cancellable if you remember it renews. Pin the
   date to the card that bills it and its border title says so:
