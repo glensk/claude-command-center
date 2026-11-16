@@ -1014,9 +1014,9 @@ def test_network_idle_allowance_shrinks(
     """Once codex names the network the generous plain allowance no longer applies."""
     monkeypatch.setenv("CODEX_IN_CLAUDE_NET_IDLE", "2")
     three_seats.scenarios(private="network_dead")
-    started = time.monotonic()
-    assert cic.cmd_run(_run_ns(three_seats, timeout=0, idle_timeout=60)) == cic.EX_NETWORK
-    assert time.monotonic() - started < 15  # the 60s allowance was NOT the one in force
+    # No wall-clock bound (load-flaky): the plain allowance is an hour, so the run can only
+    # end with a network verdict if the shrunken 2s allowance was the one in force.
+    assert cic.cmd_run(_run_ns(three_seats, timeout=0, idle_timeout=3600)) == cic.EX_NETWORK
     assert _envelope(capsys)["error"]["kind"] == "network"
 
 
@@ -1027,9 +1027,9 @@ def test_startup_guard_kills_a_run_without_model_response(
     """`thread.started` + `turn.started` are emitted LOCALLY and prove nothing."""
     monkeypatch.setenv("CODEX_IN_CLAUDE_STARTUP_TIMEOUT", "2")
     three_seats.scenarios(private="silent_after_start")
-    started = time.monotonic()
-    assert cic.cmd_run(_run_ns(three_seats, timeout=0, idle_timeout=60)) == cic.EX_TIMEOUT
-    assert time.monotonic() - started < 15
+    # No wall-clock bound (load-flaky): the idle allowance is an hour, so only the 2s startup
+    # guard can end this run.
+    assert cic.cmd_run(_run_ns(three_seats, timeout=0, idle_timeout=3600)) == cic.EX_TIMEOUT
     error = _envelope(capsys)["error"]
     assert error["kind"] == "startup_timeout"
     assert "model response" in error["message"]
