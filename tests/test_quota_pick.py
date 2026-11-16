@@ -1,10 +1,13 @@
 """The relay successor's account pick (``ccc quota -n/--next-from``).
 
-The rule (Decision 1 of the lean-relay plan): a successor STAYS on its predecessor's
-account. It switches only when a FRESH source reading is at/over 97 % (or the source is
-blocked) AND the other account has a fresh reading below 97 % on every live window.
-Stale, missing or unknown evidence — or both accounts full — means stay. The decision
-and its evidence are frozen, so a retry never changes account.
+The rule (Decision 1 of the lean-relay plan, tp#2149): a successor STAYS on its
+predecessor's account. It switches only when a FRESH source reading of a gate window
+(``relay_switch_windows``, default the weekly ``seven_day`` only) is at/over the threshold
+(``relay_switch_weekly_pct``, default 98 %) or the source is observed blocked, AND the other
+account is available with a fresh reading below the threshold on every live gate window.
+A five-hour window never triggers a switch by default. Stale, missing or unknown evidence —
+or both accounts full — means stay. The decision and its evidence are frozen, so a retry
+never changes account.
 
 Every failure here is silent and expensive: a successor opened on a full account burns a
 request and a relay; one that flaps between accounts on stale numbers loses its cache.
@@ -20,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import cli, quota, usage
+from command_center import cli, config, quota, usage
 
 NOW = 1_800_000_000
 LABELS = {"work": Path("/accounts/work"), "private": Path("/accounts/private")}
@@ -87,27 +90,126 @@ def _pick(capsys: pytest.CaptureFixture[str], **over: object) -> tuple[int, dict
     return code, json.loads(capsys.readouterr().out)
 
 
-# ── the 97 % boundary ────────────────────────────────────────────────────────────
+def _configure(*lines: str) -> None:
+    """Write raw TOML lines to this test's ccc config.toml."""
+    path = config.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    config.invalidate_config_cache()
 
 
-def test_quota_pick_stays_at_96_9(meter: _Usage, capsys: pytest.CaptureFixture[str]) -> None:
-    meter.set("work", 96.9, 50.0)
+# ── the 98 % weekly boundary ─────────────────────────────────────────────────────
+
+
+def test_quota_pick_stays_at_weekly_97_9(meter: _Usage, capsys: pytest.CaptureFixture[str]) -> None:
+    meter.set("work", 20.0, 97.9)
     meter.set("private", 5.0, 5.0)
     code, out = _pick(capsys)
     assert code == 0
     assert (out["account"], out["decision"]) == ("work", "stay")
     assert out["base"] == "work"
+    assert out["full"] is False
 
 
-def test_quota_pick_switches_at_97_0(meter: _Usage, capsys: pytest.CaptureFixture[str]) -> None:
-    meter.set("work", 20.0, 97.0)
+def test_quota_pick_switches_at_weekly_98_0(
+    meter: _Usage, capsys: pytest.CaptureFixture[str]
+) -> None:
+    meter.set("work", 20.0, 98.0)
     meter.set("private", 5.0, 40.0)
     code, out = _pick(capsys)
     assert code == 0
     assert (out["account"], out["decision"]) == ("private", "switch")
-    assert out["threshold_pct"] == 97.0
-    assert out["evidence"]["work"]["live_max_pct"] == 97.0
+    assert out["version"] == 2
+    assert out["threshold_pct"] == 98.0
+    assert out["windows"] == ["seven_day"]
+    assert out["evidence"]["work"]["gate_max_pct"] == 98.0
+    assert out["evidence"]["work"]["live_max_pct"] == 98.0
     assert out["evidence"]["private"]["fresh"] is True
+
+
+def test_quota_pick_full_five_hour_window_never_switches(
+    meter: _Usage, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Source five-hour 99 %, weekly 50 %: the five-hour window is outside the gate."""
+    meter.set("work", 99.0, 50.0)
+    meter.set("private", 5.0, 5.0)
+    code, out = _pick(capsys)
+    assert code == 0
+    assert (out["account"], out["decision"]) == ("work", "stay")
+    assert out["full"] is False
+    assert out["evidence"]["work"]["live_max_pct"] == 99.0
+    assert out["evidence"]["work"]["gate_max_pct"] == 50.0
+
+
+def test_quota_pick_target_at_weekly_98_stays_full(
+    meter: _Usage, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The alternative at the threshold has no room: stay, reported full (exit 1)."""
+    meter.set("work", 10.0, 99.0)
+    meter.set("private", 10.0, 98.0)
+    code, out = _pick(capsys)
+    assert code == 1
+    assert (out["account"], out["decision"]) == ("work", "stay")
+    assert out["full"] is True
+    assert "no alternative" in out["reason"]
+
+
+def test_quota_pick_config_threshold_override(
+    meter: _Usage, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _configure("relay_switch_weekly_pct = 95")
+    meter.set("work", 10.0, 95.0)
+    meter.set("private", 10.0, 94.9)
+    code, out = _pick(capsys)
+    assert code == 0
+    assert (out["account"], out["decision"]) == ("private", "switch")
+    assert out["threshold_pct"] == 95.0
+
+
+def test_quota_pick_config_windows_may_include_five_hour(
+    meter: _Usage, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _configure('relay_switch_windows = ["five_hour", "seven_day"]')
+    meter.set("work", 99.0, 50.0)
+    meter.set("private", 5.0, 5.0)
+    code, out = _pick(capsys)
+    assert code == 0
+    assert (out["account"], out["decision"]) == ("private", "switch")
+    assert out["windows"] == ["five_hour", "seven_day"]
+
+
+@pytest.mark.parametrize(
+    ("line", "key"),
+    [
+        ("relay_switch_weekly_pct = 0", "relay_switch_weekly_pct"),
+        ("relay_switch_weekly_pct = 101", "relay_switch_weekly_pct"),
+        ('relay_switch_weekly_pct = "98"', "relay_switch_weekly_pct"),
+        ("relay_switch_weekly_pct = true", "relay_switch_weekly_pct"),
+        ("relay_switch_windows = []", "relay_switch_windows"),
+        ('relay_switch_windows = "seven_day"', "relay_switch_windows"),
+        ('relay_switch_windows = ["monthly"]', "relay_switch_windows"),
+    ],
+)
+def test_relay_switch_config_validation(
+    meter: _Usage, capsys: pytest.CaptureFixture[str], line: str, key: str
+) -> None:
+    """A bad value fails closed: the policy names the key and the pick exits 2."""
+    _configure(line)
+    with pytest.raises(config.RelaySwitchError, match=key):
+        config.relay_switch_policy()
+    meter.set("work", 10.0, 10.0)
+    assert cli.cmd_quota(_args()) == 2
+    assert key in capsys.readouterr().err
+
+
+def test_relay_switch_config_defaults_and_bounds() -> None:
+    assert config.DEFAULTS["relay_switch_weekly_pct"] == 98
+    assert config.DEFAULTS["relay_switch_windows"] == ["seven_day"]
+    assert config.relay_switch_policy() == (98.0, ("seven_day",))
+    _configure("relay_switch_weekly_pct = 100", 'relay_switch_windows = ["seven_day", "seven_day"]')
+    assert config.relay_switch_policy() == (100.0, ("seven_day",))
+    _configure("relay_switch_weekly_pct = 1")
+    assert config.relay_switch_policy()[0] == 1.0
 
 
 def test_quota_pick_switches_off_a_blocked_source(
@@ -141,7 +243,7 @@ def test_quota_pick_stale_alternative_stays_and_exits_1_with_valid_json(
     meter: _Usage, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Source full, the other side unproven: stay, exit 1, the JSON still parses."""
-    meter.set("work", 98.0, 50.0)
+    meter.set("work", 20.0, 98.0)
     meter.set("private", 5.0, 5.0, age=quota.PICK_FRESH_SEC + 1)
     code, out = _pick(capsys)
     assert code == 1
@@ -160,8 +262,8 @@ def test_quota_pick_unknown_alternative_stays(
 
 
 def test_quota_pick_both_full_stays(meter: _Usage, capsys: pytest.CaptureFixture[str]) -> None:
-    meter.set("work", 99.0, 60.0)
-    meter.set("private", 10.0, 97.5)
+    meter.set("work", 60.0, 99.0)
+    meter.set("private", 10.0, 98.5)
     code, out = _pick(capsys)
     assert code == 1
     assert (out["account"], out["decision"]) == ("work", "stay")
@@ -172,6 +274,7 @@ def test_quota_pick_ignores_a_window_that_already_reset(
     meter: _Usage, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A 99 % five-hour window past its reset is not live: the alternative has room."""
+    _configure('relay_switch_windows = ["five_hour", "seven_day"]')
     meter.set("work", 99.0, 50.0)
     meter.set("private", 99.0, 30.0, five_resets_in=-60)
     code, out = _pick(capsys)
@@ -221,7 +324,7 @@ def test_quota_pick_unknown_base_exits_2(capsys: pytest.CaptureFixture[str]) -> 
 
 
 def test_quota_pick_text_line(meter: _Usage, capsys: pytest.CaptureFixture[str]) -> None:
-    meter.set("work", 98.0, 10.0)
+    meter.set("work", 10.0, 98.0)
     meter.set("private", 1.0, 1.0)
     assert cli.cmd_quota(_args(json=False)) == 0
     out = capsys.readouterr().out.strip()
@@ -235,7 +338,7 @@ def test_quota_pick_retry_reuses_the_frozen_decision(
     meter: _Usage, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     record = tmp_path / "relay" / "account-pick.json"
-    meter.set("work", 98.0, 10.0)
+    meter.set("work", 10.0, 98.0)
     meter.set("private", 1.0, 1.0)
     code, first = _pick(capsys, freeze=str(record))
     assert code == 0 and first["account"] == "private" and first["frozen"] is False
@@ -261,6 +364,38 @@ def test_quota_pick_frozen_record_of_another_base_exits_2(
     _pick(capsys, freeze=str(record))
     assert cli.cmd_quota(_args(next_from="private", freeze=str(record))) == 2
     assert "frozen" in capsys.readouterr().err
+
+
+def test_quota_pick_version_1_frozen_record_is_re_decided(
+    meter: _Usage, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A pick frozen under the old 97 %-any-window rule is replaced by a fresh decision."""
+    record = tmp_path / "account-pick.json"
+    old = {"version": 1, "base": "work", "account": "private", "decision": "switch"}
+    record.write_text(json.dumps(old), encoding="utf-8")
+    assert quota.read_frozen_pick(record) is None
+    meter.set("work", 99.0, 50.0)  # full only under the old rule
+    meter.set("private", 5.0, 5.0)
+    code, out = _pick(capsys, freeze=str(record))
+    assert code == 0
+    assert (out["account"], out["decision"]) == ("work", "stay")
+    assert out["version"] == 2 and out["frozen"] is False
+    assert sorted(meter.fetched) == ["private", "work"]
+    assert json.loads(record.read_text(encoding="utf-8"))["version"] == 2
+    assert not list(tmp_path.glob(".account-pick.json.*"))  # no temp or retired file left
+    code, again = _pick(capsys, freeze=str(record))
+    assert again["frozen"] is True and again["decided_at"] == out["decided_at"]
+
+
+def test_quota_pick_future_version_frozen_record_exits_2(
+    meter: _Usage, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    record = tmp_path / "account-pick.json"
+    doc = {"version": quota.PICK_VERSION + 1, "base": "work", "account": "work"}
+    record.write_text(json.dumps(doc), encoding="utf-8")
+    assert cli.cmd_quota(_args(freeze=str(record))) == 2
+    assert "malformed" in capsys.readouterr().err
+    assert meter.fetched == []
 
 
 def test_quota_pick_malformed_frozen_record_exits_2(

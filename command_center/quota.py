@@ -2521,19 +2521,21 @@ def _rehydrate(raw: dict[str, Any]) -> ProviderQuota:
 #
 # The ONE implementation of the account rule every successor launcher shares (the staff
 # relay, the staff start, the ccc relay hook): a successor STAYS on its predecessor's
-# account and switches only when the source is PROVEN full — a fresh reading at/over
-# :data:`PICK_SWITCH_PCT` on a live window, or an observed block — while another account
-# is PROVEN to have room: a fresh reading below the threshold on every live window.
+# account and switches only when the source is PROVEN full — a fresh reading at/over the
+# configured threshold (``relay_switch_weekly_pct``, default 98) on one of the configured
+# gate windows (``relay_switch_windows``, default the weekly ``seven_day`` only), or an
+# observed block (cooldown/hold) — while another account is PROVEN to have room:
+# available, with a fresh reading below the threshold on every live gate window. A
+# window outside the gate (by default the five-hour one) never triggers a switch.
 # Anything unproven (stale, missing, malformed, unknown) or both sides full → stay,
 # because a wrong switch costs the successor its cache and a flap costs a relay. The
 # decision and its evidence can be frozen in a file, so a retried launch never re-decides.
 
-#: Usage at/over this percentage on a live window makes an account "full" for a pick.
-PICK_SWITCH_PCT = 97.0
 #: A reading older than this is stale for a pick (the pick refreshes once first).
 PICK_FRESH_SEC = 15 * 60
-#: Version of the pick document (and of a frozen pick file).
-PICK_VERSION = 1
+#: Version of the pick document (and of a frozen pick file). 2 (tp#2149): the gate is
+#: the configured windows/threshold (``gate_max_pct``); an older frozen file is re-decided.
+PICK_VERSION = 2
 STAY, SWITCH, OVERRIDE = "stay", "switch", "override"
 
 
@@ -2559,11 +2561,17 @@ def resolve_account(name: str, labels: Iterable[str]) -> str:
     raise PickError(f"unknown Claude account {name!r} (configured: {', '.join(known) or '-'})")
 
 
-def _pick_evidence(row: ProviderQuota, now: int) -> dict[str, Any]:
-    """What the pick knew about one account: state, reading age and its live windows."""
+def _pick_evidence(row: ProviderQuota, now: int, gate: Iterable[str]) -> dict[str, Any]:
+    """What the pick knew about one account: state, reading age and its live windows.
+
+    ``live_max_pct`` is the highest live window of any kind (information only);
+    ``gate_max_pct`` the highest live window among the *gate* windows — the one figure
+    the switch rule reads.
+    """
     reading_at = max((w.evidence_at for w in row.windows.values()), default=0)
     fresh = bool(reading_at) and not row.malformed and now - reading_at <= PICK_FRESH_SEC
     live = {name: w for name, w in row.windows.items() if not w.stale}
+    gated = set(gate)
     return {
         "state": row.state,
         "reason": row.reason,
@@ -2576,51 +2584,71 @@ def _pick_evidence(row: ProviderQuota, now: int) -> dict[str, Any]:
             for name, w in row.windows.items()
         },
         "live_max_pct": max((w.used_pct for w in live.values()), default=None),
+        "gate_max_pct": max(
+            (w.used_pct for name, w in live.items() if name in gated), default=None
+        ),
     }
 
 
-def _source_full(ev: dict[str, Any]) -> bool:
-    """True when the evidence PROVES the account full: an observed block, or fresh ≥ 97 %."""
+def _source_full(ev: dict[str, Any], threshold: float) -> bool:
+    """True when the evidence PROVES the account full: observed block, or fresh ≥ *threshold*.
+
+    "Fresh" is a reading inside :data:`PICK_FRESH_SEC`; only the live gate windows count.
+    """
     if ev["state"] == BLOCKED and ev["source"] in ("cooldown", "hold"):
         return True
-    top = ev["live_max_pct"]
-    return bool(ev["fresh"]) and top is not None and top >= PICK_SWITCH_PCT
+    top = ev["gate_max_pct"]
+    return bool(ev["fresh"]) and top is not None and top >= threshold
 
 
-def _has_room(ev: dict[str, Any]) -> bool:
-    """True when the evidence PROVES room: available, fresh, every live window < 97 %."""
-    top = ev["live_max_pct"]
-    return (
-        ev["state"] == AVAILABLE
-        and bool(ev["fresh"])
-        and top is not None
-        and (top < PICK_SWITCH_PCT)
-    )
+def _has_room(ev: dict[str, Any], threshold: float) -> bool:
+    """True when the evidence PROVES room: available, fresh, each live gate window < *threshold*."""
+    top = ev["gate_max_pct"]
+    return ev["state"] == AVAILABLE and bool(ev["fresh"]) and top is not None and (top < threshold)
 
 
 def _pct(ev: dict[str, Any]) -> str:
-    top = ev["live_max_pct"]
-    return "no live window" if top is None else f"{top:.1f}%"
+    top = ev["gate_max_pct"]
+    return "no live gate window" if top is None else f"{top:.1f}%"
 
 
-def pick_account(
+def relay_switch_settings() -> tuple[float, tuple[str, ...]]:
+    """The configured ``(threshold_pct, gate windows)``; :class:`PickError` when invalid."""
+    try:
+        return config.relay_switch_policy()
+    except config.RelaySwitchError as exc:
+        raise PickError(f"config: {exc}") from exc
+
+
+def pick_account(  # pylint: disable=too-many-arguments,too-many-locals
     base: str,
     rows: dict[str, ProviderQuota],
     *,
     now: int,
     override: str = "",
+    threshold_pct: float | None = None,
+    windows: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Decide the successor's account from *base* (the predecessor's label).
 
     *rows* maps every configured label to its resolved Claude quota row, in config order
-    (the first account with room wins a switch). Pure: no clock, no I/O.
+    (the first account with room wins a switch). *threshold_pct* and *windows* default to
+    the config (``relay_switch_weekly_pct`` / ``relay_switch_windows``; an invalid value
+    raises :class:`PickError`); with both given the function is pure: no clock, no I/O.
     """
-    evidence = {label: _pick_evidence(row, now) for label, row in rows.items()}
-    full = {label: _source_full(ev) for label, ev in evidence.items()}
+    if threshold_pct is None or windows is None:
+        cfg_pct, cfg_windows = relay_switch_settings()
+        threshold_pct = cfg_pct if threshold_pct is None else threshold_pct
+        windows = cfg_windows if windows is None else windows
+    thr, gate = float(threshold_pct), list(windows)
+    on = "/".join(gate)
+    evidence = {label: _pick_evidence(row, now, gate) for label, row in rows.items()}
+    full = {label: _source_full(ev, thr) for label, ev in evidence.items()}
     doc: dict[str, Any] = {
         "version": PICK_VERSION,
         "base": base,
-        "threshold_pct": PICK_SWITCH_PCT,
+        "threshold_pct": thr,
+        "windows": gate,
         "fresh_within_s": PICK_FRESH_SEC,
         "decided_at": now,
         "evidence": evidence,
@@ -2631,17 +2659,20 @@ def pick_account(
         reason = f"explicit -A {override} (base {base})"
     elif not full[base]:
         account, decision = base, STAY
-        if src["state"] == BLOCKED or (src["live_max_pct"] or 0) >= PICK_SWITCH_PCT:
+        if (src["gate_max_pct"] or 0) >= thr:
             reason = f"source {base} evidence stale ({_pct(src)}, not fresh)"
         elif not src["fresh"]:
             reason = f"source {base} evidence stale or missing"
+        elif src["state"] == BLOCKED:
+            # Blocked by a window outside the gate (e.g. the five-hour one): never a switch.
+            reason = f"source {base} at {_pct(src)} < {thr:g}% on {on} ({src['reason']})"
         else:
-            reason = f"source {base} at {_pct(src)} < {PICK_SWITCH_PCT:g}%"
+            reason = f"source {base} at {_pct(src)} < {thr:g}% on {on}"
     else:
-        target = next((lbl for lbl in rows if lbl != base and _has_room(evidence[lbl])), "")
+        target = next((lbl for lbl in rows if lbl != base and _has_room(evidence[lbl], thr)), "")
         if target:
             account, decision = target, SWITCH
-            why = src["reason"] if src["state"] == BLOCKED else _pct(src)
+            why = src["reason"] if src["state"] == BLOCKED else f"{_pct(src)} on {on}"
             reason = f"source {base} full ({why}); {target} at {_pct(evidence[target])}"
         else:
             account, decision = base, STAY
@@ -2650,7 +2681,7 @@ def pick_account(
                 for lbl, ev in evidence.items()
                 if lbl != base
             )
-            reason = f"source {base} full; no alternative proven < {PICK_SWITCH_PCT:g}% ({others})"
+            reason = f"source {base} full; no alternative proven < {thr:g}% on {on} ({others})"
     doc.update(
         account=account,
         decision=decision,
@@ -2680,6 +2711,8 @@ def read_frozen_pick(path: Path) -> dict[str, Any] | None:
         doc = json.loads(raw)
     except ValueError as exc:
         raise PickError(f"frozen pick {path} is not JSON: {exc}") from exc
+    if _outdated_pick(doc):
+        return None  # decided under an older rule: re-decide (freeze_pick replaces it)
     if (
         not isinstance(doc, dict)
         or doc.get("version") != PICK_VERSION
@@ -2690,13 +2723,54 @@ def read_frozen_pick(path: Path) -> dict[str, Any] | None:
     return doc
 
 
+def _outdated_pick(doc: object) -> bool:
+    """True for a frozen pick of an OLDER :data:`PICK_VERSION` (well-formed otherwise)."""
+    if not isinstance(doc, dict):
+        return False
+    version = doc.get("version")
+    return (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and 1 <= version < PICK_VERSION
+        and isinstance(doc.get("account"), str)
+        and isinstance(doc.get("base"), str)
+    )
+
+
+def _retire_outdated_pick(path: Path, aside: Path) -> None:
+    """Move an outdated frozen pick at *path* out of the way so a new one can be linked.
+
+    Renamed (not unlinked) first: when a concurrent re-decider already replaced it, the
+    file just moved is CURRENT and is linked straight back, so its decision still wins.
+    """
+    import os  # pylint: disable=import-outside-toplevel
+
+    try:
+        os.rename(path, aside)
+    except FileNotFoundError:
+        return
+    try:
+        try:
+            moved = read_frozen_pick(aside)
+        except PickError:
+            moved = None
+        if moved is not None:
+            try:
+                os.link(aside, path)
+            except FileExistsError:
+                pass
+    finally:
+        aside.unlink(missing_ok=True)
+
+
 def freeze_pick(path: Path, doc: dict[str, Any]) -> dict[str, Any]:
     """Write *doc* to *path* (0600) unless a pick is already frozen there; return the winner.
 
     Create-only via a hard link of a private temp file, so two concurrent first picks
-    agree on ONE decision: the loser reads and returns the winner's.
+    agree on ONE decision: the loser reads and returns the winner's. A frozen pick of an
+    older :data:`PICK_VERSION` is not a winner: it is retired and replaced once.
     """
-    import os  # pylint: disable=import-outside-toplevel  # the only os use in this module
+    import os  # pylint: disable=import-outside-toplevel  # os is used only by the pick freeze
 
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -2705,16 +2779,18 @@ def freeze_pick(path: Path, doc: dict[str, Any]) -> dict[str, Any]:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(doc, handle, indent=2)
             handle.write("\n")
-        try:
-            os.link(tmp, path)
-        except FileExistsError:
-            winner = read_frozen_pick(path)
-            if winner is not None:
-                return winner
-            raise
+        for _attempt in range(2):
+            try:
+                os.link(tmp, path)
+                return doc
+            except FileExistsError:
+                winner = read_frozen_pick(path)
+                if winner is not None:
+                    return winner
+                _retire_outdated_pick(path, path.with_name(f".{path.name}.{os.getpid()}.old"))
+        raise PickError(f"frozen pick {path} could not be replaced")
     finally:
         tmp.unlink(missing_ok=True)
-    return doc
 
 
 def main(argv: list[str] | None = None) -> int:

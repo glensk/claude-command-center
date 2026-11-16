@@ -3215,18 +3215,28 @@ output and `-j` are never clipped.
 `ccc quota -n LABEL` (a label or that account's config dir) is the ONE account rule every
 successor launcher shares: the successor **stays** on its predecessor's account and
 switches only when the source is proven full — a reading younger than 15 min at or over
-**97.0 %** on a live window, or an observed block (`ccc quota -m`) — AND another configured
-account has a reading younger than 15 min below 97.0 % on every live window (a window
-past its reset is not live). Stale, missing, malformed or unknown evidence, or both
-accounts full, means stay. Each pick refreshes every Claude account ONCE first (skipped for
-`-A` and for a frozen pick). Output: `successor account: <label> (<decision>: <why>)`, or
-with `-j` the document `version`, `base`, `account`, `decision` (`stay`/`switch`/
-`override`), `reason`, `full`, `threshold_pct`, `fresh_within_s`, `decided_at`, `frozen`
-and per-account `evidence` (state, reading age, live windows). `-F FILE` freezes that
-document (0600, create-only; a concurrent first pick reads the winner's), so a retried
-launch reuses the decision and never re-measures; a frozen file for a different base or
-`-A` exits 2. Exit 0 = decided, 1 = decided but the chosen account is itself full (the
-JSON is still complete), 2 = no pick.
+the threshold on a live **gate window**, or an observed block (`ccc quota -m`) — AND another
+configured account is `available` with a reading younger than 15 min below the threshold on
+every live gate window (a window past its reset is not live). The gate is configurable:
+
+```toml
+relay_switch_weekly_pct = 98          # threshold, 1..100 (default 98)
+relay_switch_windows = ["seven_day"]  # gate windows: "seven_day" and/or "five_hour"
+```
+
+By default only the weekly window counts, so a full five-hour window never moves a relay
+(an invalid value makes the pick exit 2, naming the key). Stale, missing, malformed or
+unknown evidence, or both accounts full, means stay. Each pick refreshes every Claude
+account ONCE first (skipped for `-A` and for a frozen pick). Output: `successor account:
+<label> (<decision>: <why>)`, or with `-j` the document `version` (2), `base`, `account`,
+`decision` (`stay`/`switch`/`override`), `reason`, `full`, `threshold_pct`, `windows`,
+`fresh_within_s`, `decided_at`, `frozen` and per-account `evidence` (state, reading age,
+windows, `live_max_pct` over every live window, `gate_max_pct` over the live gate windows —
+the figure the rule reads). `-F FILE` freezes that document (0600, create-only; a concurrent
+first pick reads the winner's), so a retried launch reuses the decision and never
+re-measures; a frozen file of an older `version` is re-decided and replaced, one for a
+different base or `-A` exits 2. Exit 0 = decided, 1 = decided but the chosen account is
+itself full (the JSON is still complete), 2 = no pick.
 
 ### Two vocabularies: what you read and what machines key on
 

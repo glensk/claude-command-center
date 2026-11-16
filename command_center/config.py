@@ -267,6 +267,16 @@ DEFAULTS: dict[str, object] = {
     # ``min(codex_debate_pause_pct, 100 - 1.1 x P95)``. 1..100, validated with the keys
     # above (fail closed).
     "codex_debate_pause_pct": 90,
+    # RELAY ACCOUNT SWITCH (tp#2149): a relay successor (``ccc quota -n``) stays on its
+    # predecessor's Claude account and switches only when that account is PROVEN at/over
+    # ``relay_switch_weekly_pct`` on one of ``relay_switch_windows`` (fresh reading) or
+    # observed blocked, AND another account is available and fresh below the same
+    # threshold on those windows. Default: the weekly window at 98 %, so a full five-hour
+    # window never moves a relay. Percent 1..100; windows a non-empty subset of
+    # ``RELAY_SWITCH_WINDOW_NAMES``. Validated by :func:`relay_switch_policy` (fail closed:
+    # a bad value makes the pick exit 2 instead of guessing).
+    "relay_switch_weekly_pct": 98,
+    "relay_switch_windows": ["seven_day"],
     # Multi-account Claude Code. ``claude_accounts`` maps labels to config dirs, one
     # ``"label=path"`` entry per line (list[str] so save_config round-trips it). Empty
     # (the default) ⇒ a single ``{"private": claude_home()}`` account, i.e. today's
@@ -809,6 +819,43 @@ def codex_debate_policy(cfg: Config | None = None) -> DebateSeatPolicy:  # pylin
     )
 
 
+#: The Claude usage windows a relay account switch may be gated on (``relay_switch_windows``).
+RELAY_SWITCH_WINDOW_NAMES: tuple[str, ...] = ("five_hour", "seven_day")
+
+
+class RelaySwitchError(ValueError):
+    """The ``relay_switch_*`` settings cannot be trusted — the message names the key."""
+
+
+def relay_switch_policy(cfg: Config | None = None) -> tuple[float, tuple[str, ...]]:
+    """``(threshold_pct, windows)`` for the relay successor's account pick (tp#2149).
+
+    Validated like ``codex_debate_pause_pct``: the percentage must be a number in
+    1..100, the windows a non-empty list of :data:`RELAY_SWITCH_WINDOW_NAMES` (deduped,
+    order kept). Anything else raises :class:`RelaySwitchError` naming the key.
+    """
+    cfg = load_config() if cfg is None else cfg
+    key = "relay_switch_weekly_pct"
+    raw = cfg.relay_switch_weekly_pct
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        raise RelaySwitchError(f"{key}: {raw!r} is not a number")
+    pct = float(raw)
+    if not 1 <= pct <= 100:
+        raise RelaySwitchError(f"{key}: {pct:g} is outside 1..100")
+    key = "relay_switch_windows"
+    names = cfg.relay_switch_windows
+    if not isinstance(names, list) or not names:
+        raise RelaySwitchError(f"{key}: expected a non-empty list, got {names!r}")
+    windows: list[str] = []
+    for name in names:
+        if name not in RELAY_SWITCH_WINDOW_NAMES:
+            allowed = ", ".join(RELAY_SWITCH_WINDOW_NAMES)
+            raise RelaySwitchError(f"{key}: {name!r} is not one of {allowed}")
+        if name not in windows:
+            windows.append(name)
+    return pct, tuple(windows)
+
+
 def unknown_config_keys() -> list[str]:
     """Keys in the on-disk ``config.toml`` that :data:`DEFAULTS` does not know, sorted.
 
@@ -1193,6 +1240,8 @@ class Config:
     codex_debate_seat_caps: list[str] = field(default_factory=list)  # "label=strict/default"
     codex_debate_big_repos: list[str] = field(default_factory=list)  # force the strict tier
     codex_debate_pause_pct: float = 90  # mid-debate pause point (tp#620)
+    relay_switch_weekly_pct: int = 98  # relay account switch threshold (tp#2149)
+    relay_switch_windows: list[str] = field(default_factory=lambda: ["seven_day"])
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
     claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
     claude_launch_profiles: list[str] = field(default_factory=list)  # "label=executable"

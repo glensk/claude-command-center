@@ -4676,7 +4676,8 @@ def _quota_pick(args: argparse.Namespace, now: int) -> int:
     already frozen in ``-F FILE``), then the decision as JSON (``-j``) or the line
     ``successor account: <label> (<decision>: <why>)``. Exit 0 = decided, 1 = decided but
     the chosen account is itself full (stay: no alternative proven to have room; the
-    document is complete and valid), 2 = no pick (unknown account, unusable frozen file).
+    document is complete and valid), 2 = no pick (unknown account, unusable frozen file,
+    invalid ``relay_switch_*`` config). A frozen pick of an older version is re-decided.
     """
     from pathlib import Path as _Path
 
@@ -7527,9 +7528,10 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         metavar="LABEL",
         default=None,
         help="relay successor account pick from the predecessor's account (label or "
-        "config dir): stay unless it is >= 97%% on a fresh reading and another account is "
-        "fresh and < 97%% on every live window; refreshes once; exit 0 decided, 1 decided "
-        "but the chosen account is full, 2 no pick",
+        "config dir): stay unless it is >= relay_switch_weekly_pct (default 98%%) on a "
+        "fresh reading of a relay_switch_windows window (default the weekly one only) and "
+        "another account is available and fresh below it there; refreshes once; exit 0 "
+        "decided, 1 decided but the chosen account is full, 2 no pick",
     )
     p_quota.add_argument(
         "-A",
