@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -296,3 +297,124 @@ def test_attended_probe_still_runs_claude(monkeypatch: pytest.MonkeyPatch) -> No
     seen = _fake_probe(monkeypatch, _envelope("Hello!"))
     assert sc.probe_limit() == (False, None)
     assert seen and seen[0][0] == "claude"
+
+
+# ------------------------------ input ledger (tp#2170 P10) ------------------------------ #
+P10_SID = "33333333-4444-5555-6666-777777777777"
+
+
+def _ledger_rows() -> list[dict[str, Any]]:
+    """Every ``inputs`` row (the tp#2170 ledger) of the test store (``CCC_HOME`` is pinned)."""
+    from command_center.store import Store
+
+    with Store() as store:
+        cur = store.conn.execute("SELECT * FROM inputs ORDER BY rowid")
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
+
+
+def _resume_now(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, argv: list[str]
+) -> tuple[int, list[int]]:
+    """Run ``main(argv)`` up to the exec (stubbed); ``(exit, rows seen at the exec)``."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "acct"))
+    monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/true")
+    monkeypatch.setattr(sc, "build_command", lambda _args, sid: ["claude", "--resume", sid])
+    seen: list[int] = []
+    monkeypatch.setattr(sc, "_exec_attested", lambda _cmd: seen.append(len(_ledger_rows())))
+    return sc.main(argv), seen
+
+
+def test_resume_ledgers_the_prompt_before_the_exec(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P10: one ``limit_resume`` / ``automation`` row of ``args.prompt`` before the exec;
+    no column or log line carries the text."""
+    from command_center.input_ledger import content_sha
+
+    prompt = "carry on with the quokka plan"
+    code, seen = _resume_now(monkeypatch, tmp_path, [P10_SID, "now", "-p", prompt])
+    assert code == 1 and seen == [1]  # the stubbed exec returned
+    (row,) = _ledger_rows()
+    assert (row["kind"], row["origin"], row["state"]) == ("limit_resume", "automation", "pending")
+    assert row["session_id"] == P10_SID and row["content_sha"] == content_sha(prompt)
+    assert row["alt_sha"] == "" and row["config_dir"] == str(tmp_path / "acct")
+    assert row["cwd"] == str(Path.cwd()) and str(row["transcript_path"]).endswith(".jsonl")
+    out = capsys.readouterr()
+    for blob in [*map(str, row.values()), out.err]:
+        assert "quokka" not in blob
+
+
+def test_resume_default_prompt_is_ledgered(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from command_center.input_ledger import content_sha
+
+    _resume_now(monkeypatch, tmp_path, [P10_SID, "now"])
+    (row,) = _ledger_rows()
+    assert row["content_sha"] == content_sha(sc.DEFAULT_PROMPT)
+
+
+def test_resume_no_prompt_writes_no_row(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """P10: ``-n/--no-prompt`` sends no prompt, so it writes no row."""
+    code, seen = _resume_now(monkeypatch, tmp_path, [P10_SID, "now", "-n"])
+    assert code == 1 and seen == [0] and not _ledger_rows()
+
+
+def test_resume_dry_run_writes_no_row(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    code, seen = _resume_now(monkeypatch, tmp_path, [P10_SID, "now", "-d"])
+    assert code == 0 and not seen and not _ledger_rows()
+
+
+def test_resume_unresolved_last_writes_an_unbound_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """D5: a ``last`` that resolves to nothing leaves the row unbound (``session_id ''``)."""
+    monkeypatch.setattr(sc, "resolve_last_session", lambda: None)
+    _resume_now(monkeypatch, tmp_path, ["last", "now"])
+    (row,) = _ledger_rows()
+    assert (row["kind"], row["session_id"], row["transcript_path"]) == ("limit_resume", "", "")
+
+
+def test_resume_resolved_last_binds_the_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(sc, "resolve_last_session", lambda: P10_SID)
+    _resume_now(monkeypatch, tmp_path, ["last", "now"])
+    (row,) = _ledger_rows()
+    assert row["session_id"] == P10_SID
+
+
+def test_resume_exec_failure_marks_the_row_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def _boom(_cmd: list[str]) -> None:
+        raise FileNotFoundError("claude")
+
+    _resume_now(monkeypatch, tmp_path, [P10_SID, "now"])  # stubs everything
+    monkeypatch.setattr(sc, "_exec_attested", _boom)
+    with pytest.raises(FileNotFoundError):
+        sc.main([P10_SID, "now"])
+    rows = _ledger_rows()
+    assert [(r["state"], r["reason"]) for r in rows] == [
+        ("pending", ""),
+        ("failed", "exec_failed"),
+    ]
+
+
+def test_session_continue_stays_stdlib_only_at_import() -> None:
+    """P10: the ledger is imported lazily — importing the module pulls in no store/ledger."""
+    probe = (
+        "import sys, command_center.session_continue; "
+        "print(','.join(sorted(m for m in sys.modules if m.startswith('command_center'))))"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True, timeout=60
+    )
+    loaded = set(done.stdout.strip().split(","))
+    assert "command_center.input_ledger" not in loaded
+    assert "command_center.store" not in loaded
+    assert loaded <= {
+        "command_center",
+        "command_center.session_continue",
+        "command_center.brokenpipe",
+    }

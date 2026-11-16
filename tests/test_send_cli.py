@@ -622,3 +622,111 @@ def test_lock_file_is_private(
     _send(world, monkeypatch, capsys, "hello")
     (lock,) = (world.tmp / "ccc" / "locks").iterdir()
     assert lock.stat().st_mode & 0o777 == 0o600
+
+
+# ------------------------------------------------------------- input ledger (tp#2170 P1)
+def _input_rows(world: World) -> list[dict[str, Any]]:
+    """Every ``inputs`` row (the tp#2170 ledger) of the world's store, every column."""
+    with Store(world.db) as store:
+        cur = store.conn.execute("SELECT * FROM inputs ORDER BY rowid")
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
+
+
+def _offset_of(path: Path, uuid: str) -> int:
+    """The byte offset of the transcript line carrying *uuid*."""
+    offset = 0
+    for line in path.read_bytes().splitlines(keepends=True):
+        if uuid.encode() in line:
+            return offset
+        offset += len(line)
+    raise AssertionError(f"no line with uuid {uuid}")
+
+
+#: A message whose text must never show up in a ledger column or a log line.
+LEDGER_TEXT = "ledger canary: deploy the quokka build"
+
+
+def test_ledger_send_accepted_copies_the_consuming_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1: one ``send`` / ``caller`` row carrying the delivery id; an accepted send copies
+    the consuming record's offset and uuid; no column or log line carries the text."""
+    from command_center.input_ledger import content_sha
+
+    world = _idle_world(tmp_path)
+    written: list[dict[str, Any]] = []
+
+    def _claude(w: World, text: str) -> None:
+        written.append(user(text))
+        w.write(task_notice(), written[-1])
+
+    world.on_text = _claude
+    code, env, err = _send(world, monkeypatch, capsys, LEDGER_TEXT)
+    assert code == 0 and env is not None and env["data"]["outcome"] == "accepted"
+    (row,) = _input_rows(world)
+    (d,) = _deliveries(world)
+    assert (row["kind"], row["origin"], row["state"]) == ("send", "caller", "matched")
+    assert row["session_id"] == SID and row["delivery_id"] == d.delivery_id
+    assert row["content_sha"] == content_sha(LEDGER_TEXT) and row["alt_sha"] == ""
+    assert row["line_uuid"] == written[0]["uuid"] and row["line_kind"] == "user"
+    assert row["line_offset"] == _offset_of(world.transcript, written[0]["uuid"])
+    assert row["line_offset"] == d.matched_offset and row["stray_len"] == 0
+    assert row["transcript_path"] == str(world.transcript)
+    for blob in [*map(str, row.values()), err, str(env)]:
+        assert "quokka" not in blob
+
+
+def test_ledger_send_row_exists_before_the_first_byte(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Write-ahead: the ``pending`` row is in the store when the sender is called."""
+    world = _idle_world(tmp_path)
+    seen: list[list[str]] = []
+
+    def _claude(w: World, text: str) -> None:
+        seen.append([str(r["state"]) for r in _input_rows(w)])
+        w.write(user(text))
+
+    world.on_text = _claude
+    _send(world, monkeypatch, capsys, LEDGER_TEXT)
+    assert seen == [["pending"]]
+
+
+def test_ledger_send_nothing_typed_is_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1: a sender state ``none`` marks the row ``failed`` (reason code, no text)."""
+    world = _idle_world(tmp_path)
+    world.send_result = ("", "none")
+    rc, _env, err = _send(world, monkeypatch, capsys, LEDGER_TEXT)
+    assert rc == 1
+    (row,) = _input_rows(world)
+    assert (row["kind"], row["state"], row["reason"]) == ("send", "failed", "not_typed")
+    assert row["line_uuid"] == "" and row["line_offset"] == -1
+    assert "quokka" not in err and not any("quokka" in str(v) for v in row.values())
+
+
+def test_ledger_send_unknown_stays_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A send without a matching record (or a partial paste) leaves the row ``pending``."""
+    world = _idle_world(tmp_path)
+    world.send_result = ("", "partial")
+    rc, _env, _err = _send(world, monkeypatch, capsys, LEDGER_TEXT)
+    assert rc == 1
+    (row,) = _input_rows(world)
+    assert (row["state"], row["line_uuid"]) == ("pending", "")
+
+
+def test_ledger_busy_send_enqueue_leaves_the_row_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An ``enqueue`` carries no uuid: the row waits for its consumer (the daemon matcher)."""
+    world = World(tmp_path, status="busy")
+    world.write(user("long job"))
+    world.on_text = lambda w, text: w.write(enqueue(text))
+    code, env, _err = _send(world, monkeypatch, capsys, LEDGER_TEXT)
+    assert code == 0 and env is not None and env["data"]["outcome"] == "accepted"
+    (row,) = _input_rows(world)
+    assert (row["kind"], row["state"], row["line_uuid"]) == ("send", "pending", "")

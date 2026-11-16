@@ -291,7 +291,8 @@ def _session_transcript(spec: LedgerSpec) -> Path | None:
 def record_exec(
     store_factory: StoreFactory, spec: LedgerSpec, text: str, *, now_ms: int | None = None
 ) -> str | None:
-    """Write the ``pending`` row of a prompt about to be exec'd on claude's stdin (P5/P7/P8).
+    """Write the ``pending`` row of a prompt about to be exec'd on claude's stdin (P5/P7/P8)
+    or launched as claude's positional argv prompt (P9/P10; no paste, so no ``alt_sha``).
 
     ``spec.fresh`` anchors on ``expected_transcript_path`` (the new session's file, inode
     0); otherwise ``take_or_fresh`` on the session's found transcript. Never raises.

@@ -546,7 +546,7 @@ def run_wait_only(args: argparse.Namespace) -> int:
     return 0
 
 
-def _main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-branches
+def _main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-branches,too-many-statements
     """Wait for the session-limit reset, then exec 'claude --resume' here."""
     args = parse_args(argv)
 
@@ -619,8 +619,55 @@ def _main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-bra
     # flush=True: execvp replaces the process without flushing Python's stdio buffers,
     # which would lose this and earlier output when stdout is a file.
     print(f"🚀 {datetime.now():%Y-%m-%d %H:%M:%S} resuming session ...", flush=True)
-    _exec_attested(cmd)
+    input_id = _ledger_record(args, session_id)
+    try:
+        _exec_attested(cmd)
+    except OSError:
+        _ledger_failed(input_id)
+        raise
     return 1  # execvp does not return
+
+
+def _ledger_record(args: argparse.Namespace, session_id: str) -> str | None:
+    """Write the input-ledger row of the resume prompt about to be exec'd (tp#2170 P10).
+
+    Kind ``limit_resume`` / origin ``automation``, the sha of ``args.prompt`` only (never
+    the text); none with ``-n/--no-prompt`` or an empty prompt. A ``last`` id that did not
+    resolve leaves the row unbound (``session_id ''``, D5). The ledger is imported lazily:
+    this module stays stdlib-only at import time. Never raises.
+    """
+    prompt = None if args.no_prompt else args.prompt
+    if not prompt or not prompt.strip():
+        return None
+    unresolved = session_id.lower() in LAST_SESSION_KEYWORDS
+    try:
+        from . import input_ledger  # pylint: disable=import-outside-toplevel
+        from .store import Store  # pylint: disable=import-outside-toplevel
+
+        spec = input_ledger.LedgerSpec(
+            "limit_resume",
+            "automation",
+            "" if unresolved else session_id,
+            os.environ.get("CLAUDE_CONFIG_DIR", ""),
+            os.getcwd(),
+        )
+        return input_ledger.record_exec(Store, spec, prompt)
+    except Exception as exc:  # pylint: disable=broad-exception-caught  # never block a resume
+        print(f"⚠️  input ledger: no row written ({type(exc).__name__})", file=sys.stderr)
+        return None
+
+
+def _ledger_failed(input_id: str | None) -> None:
+    """Mark the row ``failed`` when the exec did not happen (never raises)."""
+    if not input_id:
+        return
+    try:
+        from . import input_ledger  # pylint: disable=import-outside-toplevel
+        from .store import Store  # pylint: disable=import-outside-toplevel
+
+        input_ledger.mark_failed(Store, input_id, input_ledger.REASON_EXEC_FAILED)
+    except Exception as exc:  # pylint: disable=broad-exception-caught  # bookkeeping only
+        print(f"⚠️  input ledger: row not marked failed ({type(exc).__name__})", file=sys.stderr)
 
 
 def _exec_attested(cmd: list[str]) -> None:

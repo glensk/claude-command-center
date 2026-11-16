@@ -305,7 +305,8 @@ def test_cmd_fire_await_opts_in_for_the_groups_seat(
     seen: list[list[str]] = []
     monkeypatch.setattr(os, "execvp", lambda _file, argv: seen.append(list(argv)))
     assert cli.cmd_fire_await(argparse.Namespace(group_id=gid, token=token)) == 0
-    head = ["claude"] if fresh else ["claude", "--resume", env["sid"]]
+    # A fresh group's new session carries its pre-assigned id (tp#2170 B3b).
+    head = ["claude", "--session-id", seen[0][2]] if fresh else ["claude", "--resume", env["sid"]]
     assert seen == [[*head, *(FLAGS if on else [])]]
     assert helper.calls() == ([f"-a -c {env['acct']}"] if on else [])
 

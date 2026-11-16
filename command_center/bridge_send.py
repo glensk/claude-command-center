@@ -37,7 +37,10 @@ or a key pressed into the fresh tab; never typed by ccc, tp#1836) is accepted to
 The outcome — ``accepted`` / ``failed`` (nothing typed) /
 ``unknown`` (typed, but no matching record within :data:`CORRELATE_SEC`, or a paste
 whose submitting CR did not go out) — is known within 8 s and never auto-retried. Every
-send leaves a ``deliveries`` row the state machine (``ccc delivery``) follows up.
+send leaves a ``deliveries`` row the state machine (``ccc delivery``) follows up, and
+an input-ledger row (:mod:`input_ledger`, kind ``send``, never the text) written right
+before the first byte: ``failed`` when nothing was typed, ``matched`` with the
+consuming record's offset and ``uuid`` when accepted, else ``pending``.
 """
 
 from __future__ import annotations
@@ -57,6 +60,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import input_ledger
 from .adapters import claude_bridge as cb
 from .bridge_delivery import assign, finish, stray_prefix
 from .bridge_json import BridgeError, validate_message
@@ -154,7 +158,23 @@ def _correlate(deps: BridgeDeps, d: Delivery, deadline: float) -> tuple[cb.Locat
         deps.sleep(POLL_SEC)
 
 
-def run_send(deps: BridgeDeps, session_id: str, text: str) -> dict[str, Any]:
+def _ledger_match(
+    deps: BridgeDeps, input_id: str | None, loc: cb.Located, kind: str, stray_len: int
+) -> None:
+    """Copy an accepted send's match onto its ``inputs`` row (tp#2170 P1, D4).
+
+    Only a record carrying a ``uuid`` (a ``user`` / ``queued_command`` record) is a
+    consuming record; an ``enqueue`` match leaves the row ``pending`` for the daemon
+    matcher, which follows it to its consumer.
+    """
+    line_uuid = str(loc.record.get("uuid") or "")
+    if kind == cb.KIND_ENQUEUE or not line_uuid:
+        return
+    match = input_ledger.Match(loc.start, line_uuid, kind, stray_len)
+    input_ledger.mark_matched(deps.store, input_id, match, now_ms=deps.now_ms())
+
+
+def run_send(deps: BridgeDeps, session_id: str, text: str) -> dict[str, Any]:  # pylint: disable=too-many-statements
     """Deliver *text*; the §6 ``data`` object (raises :class:`BridgeError` on refusal).
 
     A delivery that was attempted but not accepted raises with ``data`` attached, so
@@ -205,6 +225,20 @@ def run_send(deps: BridgeDeps, session_id: str, text: str) -> dict[str, Any]:
         )
         with deps.store() as store:
             store.insert_delivery(d)
+        # The input ledger's row (tp#2170 P1), written right before the first byte.
+        input_id = input_ledger.record(
+            deps.store,
+            session_id=session_id,
+            kind="send",
+            origin="caller",
+            text=text,
+            config_dir=live.config_dir,
+            cwd=target.live.cwd,
+            transcript=path,
+            paste=True,
+            delivery_id=d.delivery_id,
+            now_ms=deps.now_ms(),
+        )
         deadline = deps.monotonic() + CORRELATE_SEC
         channel, sent = deps.send_text(tab, text)
         data: dict[str, Any] = {
@@ -224,9 +258,14 @@ def run_send(deps: BridgeDeps, session_id: str, text: str) -> dict[str, Any]:
                     deps.now_ms(),
                     columns={"outcome": "failed", "channel": channel},
                 )
+            input_ledger.mark_failed(
+                deps.store, input_id, input_ledger.REASON_NOT_TYPED, now_ms=deps.now_ms()
+            )
             raise BridgeError("delivery_failed", "nothing reached the tab", data=data)
         hit = _correlate(deps, d, deadline)
         done = deps.now_ms()
+        stray = ""
+        reason = "partial_paste" if sent == "partial" else "no_matching_record"
         with deps.store() as store:
             if hit is not None:
                 loc, kind = hit
@@ -249,17 +288,22 @@ def run_send(deps: BridgeDeps, session_id: str, text: str) -> dict[str, Any]:
                 data["outcome"] = "accepted"
                 if stray:
                     data["stray_prefix"] = stray
-                return data
-            reason = "partial_paste" if sent == "partial" else "no_matching_record"
-            store.update_delivery(
-                d.delivery_id,
-                "sending",
-                state="unknown",
-                outcome="unknown",
-                channel=channel,
-                reason=reason,
-                updated_at=done,
-            )
+            else:
+                store.update_delivery(
+                    d.delivery_id,
+                    "sending",
+                    state="unknown",
+                    outcome="unknown",
+                    channel=channel,
+                    reason=reason,
+                    updated_at=done,
+                )
+        if hit is not None:
+            # Outside the delivery's store context: the ledger opens its own connection.
+            _ledger_match(deps, input_id, hit[0], hit[1], len(stray))
+            return data
+        # Not correlated (or a partial paste): the ledger row stays ``pending`` — the
+        # text may still land (Return pressed by hand); the daemon matcher follows it up.
         data["outcome"] = "unknown"
         raise BridgeError(
             "delivery_unknown",

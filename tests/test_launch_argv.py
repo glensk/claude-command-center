@@ -250,7 +250,7 @@ def test_l4_cmd_fire_await(
     monkeypatch.setattr(os, "execvp", fake_exec)
     assert cli.cmd_fire_await(argparse.Namespace(group_id=gid, token=token)) == 0
     assert spy and seen["env"][accounts.TITLE_VAR] == "1"
-    if fresh:  # a NEW session: no id yet, so no name to carry
+    if fresh:  # a NEW session (pre-assigned id, tp#2170 B3b): no name to carry
         assert seen["argv"][0] == "claude" and "--name" not in seen["argv"]
     else:
         assert _has_name(seen["argv"])

@@ -587,18 +587,32 @@ def test_fire_await_ledger_row_before_the_exec(
         assert prompt not in blob and "Reply arrived:" not in blob
 
 
-def test_fire_await_fresh_ledger_row_is_unbound(
-    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+def test_fire_await_fresh_ledger_row_is_bound_to_the_preassigned_id(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """P7 ``-F`` (tp#2170 B3a): ccc does not know the new session's id yet → unbound row."""
+    """P7 ``-F`` (tp#2170 B3b, Q1): the new session's id is pre-assigned with
+    ``--session-id``, so the ``await_resume`` row is bound to it and anchored fresh on
+    its expected transcript (inode 0); no column or log line carries the text."""
+    from command_center.input_ledger import content_sha
+
     gid, token = _claimable(env, fresh=True)
     db = env["tmp"] / "state.db"
     monkeypatch.setattr(cli, "Store", lambda: Store(db))
     _register_env(monkeypatch, env)
-    monkeypatch.setattr(os, "execvp", lambda *_a: None)
+    execs: list[list[str]] = []
+    monkeypatch.setattr(os, "execvp", lambda _prog, argv: execs.append(list(argv)))
     assert cli.cmd_fire_await(argparse.Namespace(group_id=gid, token=token)) == 0
+    [argv] = execs
+    new_sid = argv[argv.index("--session-id") + 1]
+    assert len(new_sid) == 36 and new_sid != SID and "--resume" not in argv
     (row,) = _input_rows(db)
-    assert (row["kind"], row["session_id"], row["transcript_path"]) == ("await_resume", "", "")
+    prompt = delivery_prompt(env["store"].get_await_group(gid))
+    assert (row["kind"], row["origin"], row["state"]) == ("await_resume", "automation", "pending")
+    assert row["session_id"] == new_sid and row["content_sha"] == content_sha(prompt)
+    assert row["transcript_inode"] == 0 and row["transcript_path"].endswith(f"{new_sid}.jsonl")
+    out = capsys.readouterr()
+    for blob in [*map(str, row.values()), out.out, out.err]:
+        assert prompt not in blob and "Reply arrived:" not in blob
 
 
 # --------------------------------------------------------------------------- pin_environ
@@ -691,11 +705,11 @@ def test_fire_await_fresh_execs_a_new_session(
     assert code == 0
     [(cwd, argv, kw)] = calls
     assert cwd == env["cwd"] and set(kw) == {"strict", "stdin_prompt", "ledger"} and kw["strict"]
-    # tp#2170: a -F group's new session id is not known here (B3b binds it): unbound.
+    # tp#2170 B3b: a -F group's new session gets a pre-assigned id; the row is bound to it.
+    assert argv[:2] == ["claude", "--session-id"] and len(argv) == 3  # L24: no prompt
     assert kw["ledger"] == LedgerSpec(
-        "await_resume", "automation", "", env["acct"], env["cwd"], fresh=True
+        "await_resume", "automation", argv[2], env["acct"], env["cwd"], fresh=True
     )
-    assert argv == ["claude"]  # tp#1681 L24: no prompt in argv
     prompt = kw["stdin_prompt"]
     assert prompt.startswith(f"This is a NEW session started by ccc await group {gid} ")
     assert f"\n\n{FRAMING}" in prompt and "Reply arrived:" in prompt

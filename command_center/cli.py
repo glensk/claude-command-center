@@ -2613,12 +2613,25 @@ def cmd_switch_now(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     if invalid:
         return fail(invalid)
     # (10) Deliver into the same pane/tab. No new-tab fallback: a silent tab elsewhere
-    # would contradict what the user asked for.
+    # would contradict what the user asked for. The prompt rides as claude's positional
+    # first prompt: its input-ledger row (tp#2170 P9) is written first; none without one.
+    from . import input_ledger  # pylint: disable=import-outside-toplevel  # startup cost
+
+    input_id = (
+        input_ledger.record_exec(
+            Store,
+            _ledger_spec("switch_resume", "automation", session_id, target, cwd),
+            prompt,
+        )
+        if prompt
+        else None
+    )
     if pane:
         delivered, rung = terminal.tmux_send_keys(pane, manual), "tmux"
     else:
         delivered, rung = terminal.type_into_iterm_session(iterm, manual), "iterm"
     if not delivered:
+        input_ledger.mark_failed(Store, input_id, input_ledger.REASON_NOT_TYPED)
         return fail(f"could not type into the {rung} session")
     log(f"relaunched under {label!r} via {rung}")
     return 0
@@ -2989,6 +3002,7 @@ def cmd_fire_await(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     delivery prompt goes on claude's stdin, never in argv (tp#1681 L24).
     """
     import time as _time
+    import uuid
 
     from . import accounts, await_delivery
     from .await_prompt import delivery_prompt
@@ -3028,9 +3042,13 @@ def cmd_fire_await(args: argparse.Namespace) -> int:  # pylint: disable=too-many
         # tp#2168 B10: this execvp bypasses the shell wrapper, so it opts into the startup
         # system prompt itself, for the group's own seat.
         seat = accounts.exec_config_dir(group.config_dir)
+        # A -F group's new session gets a pre-assigned id (tp#2170 D5/Q1, the flag
+        # start-job uses), so its input-ledger row is bound to the session it starts.
+        new_sid = str(uuid.uuid4()) if group.fresh else ""
         try:  # re-resolved from its NAME now, before any state change
             argv = launch_argv.claude_argv(
                 resume="" if group.fresh else group.session_id,
+                session_id=new_sid,
                 name="" if group.fresh else None,
                 launch_profile=profile,
                 startup_sysprompt=True,
@@ -3048,14 +3066,13 @@ def cmd_fire_await(args: argparse.Namespace) -> int:  # pylint: disable=too-many
                 file=sys.stderr,
             )
             return 1
-    # A -F/--fresh group starts a NEW session (no id yet → no name to carry).
+    # A -F/--fresh group starts a NEW session (its pre-assigned id; no name to carry).
     try:
         accounts.pin_environ(group.config_dir, group.no_codex, profile)
-        # A -F group's new session id is not known here: an unbound row (D5; B3b binds it).
         ledger = _ledger_spec(
             "await_resume",
             "automation",
-            "" if group.fresh else group.session_id,
+            new_sid or group.session_id,
             group.config_dir,
             group.cwd,
             fresh=bool(group.fresh),
