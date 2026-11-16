@@ -61,6 +61,7 @@ from .bridge_json import BridgeError
 
 if TYPE_CHECKING:
     from .adapters.claude_agents import AgentEntry
+    from .input_ledger import LedgerSpec
     from .models import LiveSession
     from .screenread import ScreenRead
     from .store import Store
@@ -545,6 +546,7 @@ def guarded_paste(
     live: LiveSession,
     text: str,
     *,
+    ledger: LedgerSpec,
     claim: Callable[[], bool] | None = None,
     typing_guard: bool = True,
 ) -> PasteResult:
@@ -554,9 +556,14 @@ def guarded_paste(
     :func:`tab_lock`: :func:`revalidate` (the guards use its fresh ``live``),
     :func:`guard_user_active` when *typing_guard*, :func:`guard_input_empty` (``fresh`` =
     no transcript yet), the optional *claim* (``False`` → ``claim_lost``, nothing typed),
-    then ``deps.send_text``. A :class:`BridgeError` before the send becomes ``refusal`` /
-    ``data``; nothing is typed. Not a CLI: no envelope, no exit code.
+    the *ledger* row (tp#2170: ``input_ledger.record`` of ``ledger.kind`` /
+    ``ledger.origin`` against the revalidated session, so a held or refused paste writes
+    none), then ``deps.send_text``; a sender state ``none`` marks the row ``failed``. A
+    :class:`BridgeError` before the send becomes ``refusal`` / ``data``; nothing is typed.
+    Not a CLI: no envelope, no exit code.
     """
+    from . import input_ledger
+
     tab = ""
     try:
         tab = tab_for(deps, live)
@@ -565,11 +572,27 @@ def guarded_paste(
             if typing_guard:
                 guard_user_active(deps, tab)
             current = target.live
-            fresh = deps.transcript(current.cwd, current.session_id, current.config_dir) is None
-            input_check = guard_input_empty(deps, tab, current, fresh)
+            transcript = deps.transcript(current.cwd, current.session_id, current.config_dir)
+            input_check = guard_input_empty(deps, tab, current, transcript is None)
             if claim is not None and not claim():
                 return PasteResult(refusal="claim_lost", tab=tab, input_check=input_check)
+            input_id = input_ledger.record(
+                deps.store,
+                session_id=current.session_id,
+                kind=ledger.kind,
+                origin=ledger.origin,
+                text=text,
+                config_dir=current.config_dir,
+                cwd=current.cwd,
+                transcript=transcript,
+                paste=True,
+                now_ms=deps.now_ms(),
+            )
             via, state = deps.send_text(tab, text)
+            if state == "none":
+                input_ledger.mark_failed(
+                    deps.store, input_id, input_ledger.REASON_NOT_TYPED, now_ms=deps.now_ms()
+                )
     except BridgeError as exc:
         return PasteResult(refusal=exc.code, data=dict(exc.data or {}), tab=tab)
     return PasteResult(via=via or "", state=state or "", input_check=input_check, tab=tab)

@@ -689,8 +689,10 @@ def _default_attached_paster(
     live: LiveSession, text: str, claim: Callable[[], bool]
 ) -> PasteResult:
     from .bridge_target import default_deps, guarded_paste
+    from .input_ledger import LedgerSpec
 
-    return guarded_paste(default_deps(), live, text, claim=claim)
+    ledger = LedgerSpec("attached_paste", "caller")
+    return guarded_paste(default_deps(), live, text, ledger=ledger, claim=claim)
 
 
 def _default_still_alive(session_id: str) -> bool:

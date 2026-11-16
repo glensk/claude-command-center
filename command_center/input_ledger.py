@@ -255,6 +255,67 @@ def record(  # pylint: disable=too-many-arguments
         return None
 
 
+@dataclasses.dataclass(frozen=True)
+class LedgerSpec:
+    """What a choke point records for the text it is about to type or exec (D2, debate O5).
+
+    ``kind`` / ``origin`` are the D2 row labels. ``session_id``, ``config_dir`` and
+    ``cwd`` name the session an exec'd prompt goes to (:func:`record_exec`; ``""``
+    session id = unbound row, D5); ``fresh`` = the exec starts that session, so the anchor
+    is ``expected_transcript_path`` rather than the found transcript. A paste
+    (``bridge_target.guarded_paste``) reads ``kind`` / ``origin`` only: it records against
+    the session it just revalidated.
+    """
+
+    kind: str
+    origin: str
+    session_id: str = ""
+    config_dir: str = ""
+    cwd: str = ""
+    fresh: bool = False
+
+
+#: Reason codes of a ``failed`` row written by a choke point (never text).
+REASON_NOT_TYPED = "not_typed"
+REASON_EXEC_FAILED = "exec_failed"
+
+
+def _session_transcript(spec: LedgerSpec) -> Path | None:
+    """The existing transcript of *spec*'s session, or ``None`` (then :func:`record`
+    anchors on ``expected_transcript_path``)."""
+    from .adapters.claude import ClaudeAdapter  # pylint: disable=import-outside-toplevel
+
+    return ClaudeAdapter().transcript_path(spec.cwd, spec.session_id, spec.config_dir or None)
+
+
+def record_exec(
+    store_factory: StoreFactory, spec: LedgerSpec, text: str, *, now_ms: int | None = None
+) -> str | None:
+    """Write the ``pending`` row of a prompt about to be exec'd on claude's stdin (P5/P7/P8).
+
+    ``spec.fresh`` anchors on ``expected_transcript_path`` (the new session's file, inode
+    0); otherwise ``take_or_fresh`` on the session's found transcript. Never raises.
+    """
+    transcript: Path | None = None
+    if spec.session_id and not spec.fresh:
+        try:
+            transcript = _session_transcript(spec)
+        except Exception:  # pylint: disable=broad-exception-caught  # fall back to the expected path
+            transcript = None
+    return record(
+        store_factory,
+        session_id=spec.session_id,
+        kind=spec.kind,
+        origin=spec.origin,
+        text=text,
+        config_dir=spec.config_dir,
+        cwd=spec.cwd,
+        transcript=transcript,
+        paste=False,
+        now_ms=now_ms,
+    )
+
+
 def mark_failed(
     store_factory: StoreFactory, input_id: str | None, reason: str, *, now_ms: int | None = None
 ) -> bool:

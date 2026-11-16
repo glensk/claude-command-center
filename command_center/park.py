@@ -839,6 +839,7 @@ def _park_now(  # pylint: disable=too-many-arguments,too-many-positional-argumen
     anything else → exit 1, as before. Never the prompt's text in a message.
     """
     from . import bridge_target, daemon
+    from .input_ledger import LedgerSpec
     from .models import LiveSession as _LiveSession
     from .models import short_id
     from .notify import notify
@@ -850,7 +851,11 @@ def _park_now(  # pylint: disable=too-many-arguments,too-many-positional-argumen
         target = bridge_target.find_live(paste_deps, attach.session_id)
     if not bridge_target.is_live(target):
         return _park_now_failed(cfg, f"session {short} is no longer live — prompt not delivered")
-    result = bridge_target.guarded_paste(paste_deps, target, prompt, typing_guard=False)
+    # _park_now is reached only from the park panel (grab): the text is the user's own.
+    ledger = LedgerSpec("park_now", "user")
+    result = bridge_target.guarded_paste(
+        paste_deps, target, prompt, ledger=ledger, typing_guard=False
+    )
     code = result.refusal
     if result.held:
         lease = daemon.hold_lease(cfg, now)

@@ -21,10 +21,13 @@ from command_center.bridge_target import (
     guarded_paste,
     held_notice,
 )
+from command_center.input_ledger import LedgerSpec, content_sha
 from command_center.screenread import ScreenCell, ScreenRead, line_text, rule_rows
 from command_center.snapshot import PsTimedOut
+from command_center.store import Store
 
 TEXT = "tp1867 pasted prompt"
+LEDGER = LedgerSpec("await_paste", "automation")
 #: A screen with no full-width rule: the parser cannot find the box.
 UNRECOGNIZED = ScreenRead(80, (0, 0), ((ScreenCell("x"), ScreenCell("y")),))
 
@@ -47,7 +50,7 @@ def _fresh_world(tmp_path: Path, screen: ScreenRead | None) -> World:
 
 
 def _paste(world: World, **kw: Any) -> PasteResult:
-    return guarded_paste(world.deps(), world.live(), TEXT, **kw)
+    return guarded_paste(world.deps(), world.live(), TEXT, ledger=LEDGER, **kw)
 
 
 def _lock_path(world: World) -> Path:
@@ -236,7 +239,7 @@ def test_paste_guard_not_running_is_refused(tmp_path: Path) -> None:
     world = _world(tmp_path)
     live = world.live()
     world.registered = False
-    result = guarded_paste(world.deps(), live, TEXT)
+    result = guarded_paste(world.deps(), live, TEXT, ledger=LEDGER)
     assert result.refusal == "not_running" and not world.texts
 
 
@@ -296,3 +299,86 @@ def test_paste_guard_draft_text_appears_nowhere(tmp_path: Path) -> None:
     for word in draft.split():
         if len(word) >= 5:
             assert word not in blob
+
+
+# ------------------------------------------------------------------ the input ledger (tp#2170)
+
+
+def _ledger_rows(world: World) -> list[dict[str, Any]]:
+    """Every ``inputs`` row of the World's store, every column."""
+    with Store(world.db) as store:
+        cur = store.conn.execute("SELECT * FROM inputs ORDER BY rowid")
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
+
+
+def _assert_no_text(rows: list[dict[str, Any]], *logs: str) -> None:
+    """Neither a ledger column nor a log line carries the pasted text."""
+    for row in rows:
+        for value in row.values():
+            assert TEXT not in str(value)
+    for log in logs:
+        assert TEXT not in log
+
+
+def test_paste_guard_ledger_row_written_before_the_send(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = _world(tmp_path)
+    anchor = world.transcript.stat().st_size
+    seen: list[list[dict[str, Any]]] = []
+    world.on_text = lambda w, _text: seen.append(_ledger_rows(w))
+    result = _paste(world)
+    assert result.state == "sent"
+    assert len(seen) == 1 and len(seen[0]) == 1  # the row exists when the sender runs
+    rows = _ledger_rows(world)
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["kind"], row["origin"], row["state"]) == ("await_paste", "automation", "pending")
+    assert row["session_id"] == world.live().session_id
+    assert row["content_sha"] == content_sha(TEXT) and row["norm"] == "ccc-text-sha-v1"
+    assert row["transcript_path"] == str(world.transcript)
+    assert row["transcript_inode"] == world.transcript.stat().st_ino
+    assert row["anchor_offset"] == anchor and row["created_at"] == world.clock_ms
+    out = capsys.readouterr()
+    _assert_no_text(rows, out.out, out.err)
+
+
+def test_paste_guard_ledger_fresh_session_anchors_on_the_expected_path(tmp_path: Path) -> None:
+    world = _fresh_world(tmp_path, fixture_screen("empty_idle"))
+    result = _paste(world)
+    assert result.state == "sent"
+    (row,) = _ledger_rows(world)
+    assert row["transcript_inode"] == 0 and row["anchor_offset"] == 0
+    assert row["transcript_path"].endswith(f"{world.live().session_id}.jsonl")
+
+
+@pytest.mark.parametrize("screen", ["draft_one_line", "bash_mode"])
+def test_paste_guard_held_or_refused_paste_writes_no_row(tmp_path: Path, screen: str) -> None:
+    world = _world(tmp_path, screen)
+    assert _paste(world).refusal == "input_not_empty"
+    assert not _ledger_rows(world)
+
+
+def test_paste_guard_lost_claim_writes_no_row(tmp_path: Path) -> None:
+    world = _world(tmp_path)
+    assert _paste(world, claim=lambda: False).refusal == "claim_lost"
+    assert not _ledger_rows(world)
+
+
+def test_paste_guard_untyped_paste_marks_the_row_failed(tmp_path: Path) -> None:
+    world = _world(tmp_path)
+    world.send_result = ("", "none")
+    result = _paste(world)
+    assert result.state == "none"
+    (row,) = _ledger_rows(world)
+    assert (row["state"], row["reason"]) == ("failed", "not_typed")
+    _assert_no_text([row])
+
+
+def test_paste_guard_partial_paste_stays_pending(tmp_path: Path) -> None:
+    world = _world(tmp_path)
+    world.send_result = ("python-api", "partial")
+    assert _paste(world).state == "partial"
+    (row,) = _ledger_rows(world)
+    assert row["state"] == "pending" and row["reason"] == ""

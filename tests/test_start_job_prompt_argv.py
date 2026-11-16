@@ -89,6 +89,51 @@ def test_prompt_argv_resume_sends_no_prompt(
     assert "HANDOVER" not in str(seen["stdin"])
 
 
+def _input_rows() -> list[dict[str, object]]:
+    """Every ``inputs`` row (the tp#2170 ledger) of the default store."""
+    with Store() as store:
+        cur = store.conn.execute("SELECT * FROM inputs ORDER BY rowid")
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
+
+
+def test_start_job_ledger_row_is_a_fresh_anchored_start_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P8 (tp#2170): one ``start_job`` / ``caller`` row of the final launch prompt,
+    anchored on the expected transcript path (inode 0); no column carries the text."""
+    from command_center.input_ledger import content_sha
+
+    seen = _start(tmp_path, monkeypatch)
+    (row,) = _input_rows()
+    assert (row["kind"], row["origin"], row["state"]) == ("start_job", "caller", "pending")
+    assert row["session_id"] == "job-x" and row["content_sha"] == content_sha(str(seen["stdin"]))
+    assert row["transcript_inode"] == 0 and str(row["transcript_path"]).endswith("job-x.jsonl")
+    assert not any("HANDOVER" in str(value) for value in row.values())
+
+
+def test_start_job_handoff_successor_row_is_automation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D2: a handoff successor's first prompt is ``automation`` (``handed_off_from``)."""
+    real = Store.create_draft
+
+    def _draft(self: Store, *a: object, **kw: object) -> object:
+        made = real(self, *a, **kw)  # type: ignore[arg-type]
+        self.update_fields("job-x", handed_off_from="src-1")
+        return made
+
+    monkeypatch.setattr(Store, "create_draft", _draft)
+    _start(tmp_path, monkeypatch)
+    (row,) = _input_rows()
+    assert (row["kind"], row["origin"]) == ("start_job", "automation")
+
+
+def test_start_job_resume_writes_no_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _start(tmp_path, monkeypatch, transcript=True)
+    assert not _input_rows()
+
+
 def test_prompt_argv_stdin_fd_round_trip() -> None:
     fd = launch_argv.prompt_stdin_fd("é" * 70000)  # larger than a pipe buffer
     try:

@@ -18,12 +18,14 @@ from bridgestub import SID, TAB, World, fixture_screen, turn_end, user
 
 from command_center import cli, config, daemon, park, usage
 from command_center.bridge_target import find_live, guarded_paste, is_live
+from command_center.input_ledger import LedgerSpec
 from command_center.screenread import ScreenCell, ScreenRead, line_text, rule_rows
 from command_center.snapshot import PsTimedOut
 from command_center.store import Store
 
 NOW = 1_700_000_000
 ATT_PROMPT = "tp1867 attached prompt"
+LEDGER = LedgerSpec("attached_paste", "caller")
 #: A screen with no full-width rule: the parser cannot find the input box.
 UNRECOGNIZED = ScreenRead(80, (0, 0), ((ScreenCell("x"), ScreenCell("y")),))
 
@@ -346,6 +348,62 @@ def test_paste_guard_park_now_empty_box_types_and_exits_0(
     assert f"delivered into session {SID[:8]}" in capsys.readouterr().out
 
 
+def _input_rows() -> list[dict[str, Any]]:
+    """Every ``inputs`` row (the tp#2170 ledger) of the default store, every column."""
+    with Store() as store:
+        cur = store.conn.execute("SELECT * FROM inputs ORDER BY rowid")
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
+
+
+def test_park_now_ledger_row_is_user_park_now_without_text(
+    pnow: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P3 (tp#2170): the panel-typed prompt gets one ``park_now`` / ``user`` row."""
+    from command_center.input_ledger import content_sha
+
+    world: World = pnow["world"]
+    assert cli.main(["park", "-g", "-N"]) == 0
+    (row,) = _input_rows()
+    assert (row["kind"], row["origin"], row["state"]) == ("park_now", "user", "pending")
+    assert row["session_id"] == SID and row["content_sha"] == content_sha(NOW_PROMPT)
+    assert row["transcript_path"] == str(world.transcript)
+    out = capsys.readouterr()
+    for blob in [*map(str, row.values()), out.out, out.err]:
+        assert NOW_PROMPT not in blob
+
+
+def test_park_now_held_paste_writes_no_row_and_the_daemon_paste_does(
+    pnow: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P3 held → no row; P4 (the daemon's default attached paster) → one
+    ``attached_paste`` / ``caller`` row (tp#2170)."""
+    from command_center.input_ledger import content_sha
+
+    world: World = pnow["world"]
+    world.screen = fixture_screen("draft_one_line")
+    assert cli.main(["park", "-g", "-N"]) == 0
+    assert not _input_rows()
+    world.screen = fixture_screen("empty_idle")
+    monkeypatch.setattr(daemon, "notify", lambda title, msg, channels: None)
+    monkeypatch.setattr(usage, "read_usage", lambda label: None)
+    monkeypatch.setattr(time, "time", lambda: NOW + 600)
+    with Store() as store:
+        daemon._deliver_attached_prompts(  # pylint: disable=protected-access
+            store,
+            config.load_config(),
+            daemon.DaemonReport(),
+            False,
+            {SID: world.live()},
+            still_alive=lambda sid: True,
+        )
+    assert world.texts == [NOW_PROMPT]
+    (row,) = _input_rows()
+    assert (row["kind"], row["origin"], row["state"]) == ("attached_paste", "caller", "pending")
+    assert row["content_sha"] == content_sha(NOW_PROMPT)
+    assert NOW_PROMPT not in repr(row)
+
+
 def test_paste_guard_park_now_draft_parks_with_the_hold_lease(
     pnow: dict[str, Any], capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -405,7 +463,7 @@ def test_paste_guard_park_now_held_prompt_is_silent_on_the_daemons_first_pass(
             False,
             {SID: world.live()},
             paster=lambda target, text, claim: guarded_paste(
-                pnow["deps"], target, text, claim=claim
+                pnow["deps"], target, text, ledger=LEDGER, claim=claim
             ),
             still_alive=lambda sid: True,
         )
@@ -420,7 +478,7 @@ def test_paste_guard_park_now_held_prompt_is_silent_on_the_daemons_first_pass(
             False,
             {SID: world.live()},
             paster=lambda target, text, claim: guarded_paste(
-                pnow["deps"], target, text, claim=claim
+                pnow["deps"], target, text, ledger=LEDGER, claim=claim
             ),
             still_alive=lambda sid: True,
         )
@@ -616,7 +674,9 @@ def _attached_pass(att: dict[str, Any], *, live: bool = True) -> daemon.DaemonRe
         report,
         False,
         {SID: world.live()} if live else {},
-        paster=lambda target, text, claim: guarded_paste(world.deps(), target, text, claim=claim),
+        paster=lambda target, text, claim: guarded_paste(
+            world.deps(), target, text, ledger=LEDGER, claim=claim
+        ),
         still_alive=lambda sid: is_live(find_live(world.deps(), sid)),
     )
     return report
@@ -807,7 +867,9 @@ def test_paste_guard_attached_session_left_before_the_lock_opens_a_new_tab(
         report,
         False,
         {SID: seen},
-        paster=lambda target, text, claim: guarded_paste(world.deps(), target, text, claim=claim),
+        paster=lambda target, text, claim: guarded_paste(
+            world.deps(), target, text, ledger=LEDGER, claim=claim
+        ),
         still_alive=lambda sid: is_live(find_live(world.deps(), sid)),
     )
     assert att["resumed"] == [SID] and not world.texts and not report.attached_held
@@ -839,6 +901,13 @@ def test_fire_attached_claims_and_execs_resume(monkeypatch: pytest.MonkeyPatch) 
         _attached_row(store, now + 900)
     assert cli.main(["fire-attached", "att-1"]) == 0
     assert execs == [["claude", "--resume", "att-1"]]  # prompt on stdin (tp#1681 L24)
+    (ledger_row,) = _input_rows()  # tp#2170 P5: one attached_resume row before the exec
+    assert (ledger_row["kind"], ledger_row["origin"], ledger_row["session_id"]) == (
+        "attached_resume",
+        "caller",
+        "att-1",
+    )
+    assert "attached prompt" not in repr(ledger_row)
     with Store() as store:
         row = store.get("att-1")
         assert row is not None and row.fire_at == 0
@@ -953,6 +1022,7 @@ def test_fire_attached_rearms_on_exec_failure(monkeypatch: pytest.MonkeyPatch) -
     with Store() as store:
         row = store.get("att-1")
         assert row is not None and row.fire_at > now  # re-armed: the daemon retries
+    assert [(r["state"], r["reason"]) for r in _input_rows()] == [("failed", "exec_failed")]
 
 
 # ---- store: columns, index, claim, summary ------------------------------------

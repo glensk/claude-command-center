@@ -103,6 +103,8 @@ from .store import Store
 if TYPE_CHECKING:  # pragma: no cover - pathlib stays a local import at runtime
     from pathlib import Path
 
+    from .input_ledger import LedgerSpec
+
 # Seconds `ccc close-now` waits before reaping/closing when the Stop barrier is OFF
 # (`stop_barrier_enabled = false`, the escape hatch for a machine whose `ps` cannot be
 # read): a bare settle, which proves nothing about the Stop chain. With the barrier on,
@@ -2758,8 +2760,22 @@ def _profile_argv(session: object, **kwargs: Any) -> list[str] | None:
         return None
 
 
+def _ledger_spec(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    kind: str, origin: str, session_id: str, config_dir: str, cwd: str, fresh: bool = False
+) -> LedgerSpec:
+    """The ``inputs`` row spec of an exec'd stdin prompt (tp#2170 D2; lazy import)."""
+    from .input_ledger import LedgerSpec as _Spec  # pylint: disable=import-outside-toplevel
+
+    return _Spec(kind, origin, session_id, config_dir, cwd, fresh)
+
+
 def _exec_in(
-    cwd: str, argv: list[str], *, strict: bool = False, stdin_prompt: str | None = None
+    cwd: str,
+    argv: list[str],
+    *,
+    strict: bool = False,
+    stdin_prompt: str | None = None,
+    ledger: LedgerSpec | None = None,
 ) -> None:
     """``os.execvp(argv)`` from inside *cwd*, leaving this process's cwd untouched if it returns.
 
@@ -2769,8 +2785,12 @@ def _exec_in(
     *cwd* is skipped, unless *strict*: then the ``chdir`` itself raises ``OSError``.
     A *stdin_prompt* becomes the exec'd ``claude``'s stdin — its first prompt, kept out of
     argv (:func:`launch_argv.prompt_stdin_fd`, tp#1681 L23); fd 0 is restored when the
-    exec does not happen.
+    exec does not happen. A *stdin_prompt* needs its *ledger* spec (tp#2170): the
+    ``inputs`` row is written right before the exec (:func:`input_ledger.record_exec`)
+    and marked ``failed`` when the exec raises ``OSError``.
     """
+    if stdin_prompt is not None and ledger is None:
+        raise ValueError("_exec_in: a stdin_prompt needs a ledger spec (tp#2170)")
     try:
         prev: str | None = os.getcwd()
     except OSError:  # our own cwd was deleted: nothing to restore
@@ -2787,7 +2807,16 @@ def _exec_in(
                 os.dup2(prompt_fd, 0)  # inheritable: the exec'd claude reads it
             finally:
                 os.close(prompt_fd)
-        os.execvp(argv[0], argv)  # replaces this process on success
+        from . import input_ledger  # pylint: disable=import-outside-toplevel  # startup cost
+
+        input_id: str | None = None
+        if stdin_prompt is not None and ledger is not None:
+            input_id = input_ledger.record_exec(Store, ledger, stdin_prompt)
+        try:
+            os.execvp(argv[0], argv)  # replaces this process on success
+        except OSError:
+            input_ledger.mark_failed(Store, input_id, input_ledger.REASON_EXEC_FAILED)
+            raise
     finally:
         if saved_stdin is not None:
             with contextlib.suppress(OSError):
@@ -2931,7 +2960,14 @@ def cmd_fire_attached(args: argparse.Namespace) -> int:
         launch = accounts.LaunchTarget(session.config_dir, bool(session.no_codex), profile)
     accounts.session_apply_to_environ(launch)
     try:
-        _exec_in(cwd, fire_argv, stdin_prompt=prompt)
+        _exec_in(
+            cwd,
+            fire_argv,
+            stdin_prompt=prompt,
+            ledger=_ledger_spec(
+                "attached_resume", "caller", args.session_id, session.config_dir or "", cwd
+            ),
+        )
     except OSError as exc:
         with Store() as store:  # undo the claim: re-arm so the daemon retries
             store.update_fields(args.session_id, fire_at=int(_time.time()) + 900)
@@ -3015,7 +3051,16 @@ def cmd_fire_await(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     # A -F/--fresh group starts a NEW session (no id yet → no name to carry).
     try:
         accounts.pin_environ(group.config_dir, group.no_codex, profile)
-        _exec_in(group.cwd, argv, strict=True, stdin_prompt=prompt)
+        # A -F group's new session id is not known here: an unbound row (D5; B3b binds it).
+        ledger = _ledger_spec(
+            "await_resume",
+            "automation",
+            "" if group.fresh else group.session_id,
+            group.config_dir,
+            group.cwd,
+            fresh=bool(group.fresh),
+        )
+        _exec_in(group.cwd, argv, strict=True, stdin_prompt=prompt, ledger=ledger)
     except OSError as exc:
         with Store() as store:
             store.revert_delivery(
@@ -3765,6 +3810,11 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
         # (decision 14) Resume-aware: check ONLY the exact project dir derived from the
         # job's CURRENT cwd (the adapter munged-path convention) — not the glob fallback.
         resume = _cwd_transcript_exists(cwd, args.session_id, config_dir)
+        # The input ledger's origin (tp#2170 D2): a handoff successor's first prompt is
+        # automation — its row links the source, or a transfer names it as the target.
+        handoff_successor = bool(session.handed_off_from) or any(
+            t.target_session == args.session_id for t in store.transfers_of(args.session_id)
+        )
         # (b) promote ATOMICALLY: with several possible launchers (the park waiter, a
         # daemon dispatch tab, a manual start-job) exactly one may pass this line.
         # os.getpid(): _exec_in replaces THIS process with claude, so this pid is the
@@ -3831,7 +3881,19 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
     # launch must never grant trust. The trust gate above already settled the job's cwd.
     accounts.pin_environ(config_dir, no_codex, profile, lean_start=bool(session.lean_start))
     try:
-        _exec_in(cwd, argv, stdin_prompt=launch_prompt)  # replaces this process on success
+        _exec_in(  # replaces this process on success
+            cwd,
+            argv,
+            stdin_prompt=launch_prompt,
+            ledger=_ledger_spec(
+                "start_job",
+                "automation" if handoff_successor else "caller",
+                args.session_id,
+                config_dir or "",
+                cwd,
+                fresh=True,  # a stdin prompt goes only with a first launch (--session-id)
+            ),
+        )
     except OSError as exc:  # (d) launch failed — undo the promotion so the job survives
         with Store() as store:
             store.update_fields(args.session_id, draft=True)

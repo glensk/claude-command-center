@@ -23,9 +23,10 @@ from bridgestub import TAB, World, fixture_screen, turn_end, user
 
 from command_center import accounts, await_delivery, cli
 from command_center.await_eval import PassReport
-from command_center.await_prompt import FRAMING
+from command_center.await_prompt import FRAMING, delivery_prompt
 from command_center.await_store import SourceSpec
 from command_center.bridge_target import PasteResult, guarded_paste
+from command_center.input_ledger import LedgerSpec
 from command_center.models import LiveSession
 from command_center.snapshot import PsTimedOut
 from command_center.store import Store
@@ -33,6 +34,7 @@ from command_center.transfer_store import Transfer
 
 NOW = 1_800_000_000
 SID = "11111111-2222-3333-4444-555555555555"
+LEDGER = LedgerSpec("await_paste", "automation")
 
 
 class Notes:
@@ -546,6 +548,57 @@ def test_fire_await_exec_failure_reverts(
     assert cli.cmd_fire_await(argparse.Namespace(group_id=gid, token=token)) == 1
     group = env["store"].get_await_group(gid)
     assert group.state == "fired" and group.delivery_attempts == 1
+    # tp#2170: the ledger row was written before the exec, then marked failed.
+    (row,) = _input_rows(env["tmp"] / "state.db")
+    assert (row["kind"], row["state"], row["reason"]) == ("await_resume", "failed", "exec_failed")
+
+
+def _input_rows(db: Path) -> list[dict[str, Any]]:
+    """Every ``inputs`` row (the tp#2170 ledger) of *db*, every column."""
+    with Store(db) as store:
+        cur = store.conn.execute("SELECT * FROM inputs ORDER BY rowid")
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
+
+
+def test_fire_await_ledger_row_before_the_exec(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P7 (tp#2170): one ``await_resume`` / ``automation`` row, written before the exec,
+    anchored on the resumed session's transcript path; no column or log carries the text."""
+    from command_center.input_ledger import content_sha
+
+    gid, token = _claimable(env)
+    seen: list[int] = []
+    db = env["tmp"] / "state.db"
+    monkeypatch.setattr(cli, "Store", lambda: Store(db))
+    _register_env(monkeypatch, env)
+    monkeypatch.setattr(os, "execvp", lambda *_a: seen.append(len(_input_rows(db))))
+    assert cli.cmd_fire_await(argparse.Namespace(group_id=gid, token=token)) == 0
+    assert seen == [1]
+    (row,) = _input_rows(db)
+    prompt = delivery_prompt(env["store"].get_await_group(gid))
+    assert (row["kind"], row["origin"], row["state"]) == ("await_resume", "automation", "pending")
+    assert row["session_id"] == SID and row["content_sha"] == content_sha(prompt)
+    assert row["alt_sha"] == "" and row["transcript_path"].endswith(f"{SID}.jsonl")
+    assert row["config_dir"] == env["acct"] and row["cwd"] == env["cwd"]
+    out = capsys.readouterr()
+    for blob in [*map(str, row.values()), out.out, out.err]:
+        assert prompt not in blob and "Reply arrived:" not in blob
+
+
+def test_fire_await_fresh_ledger_row_is_unbound(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P7 ``-F`` (tp#2170 B3a): ccc does not know the new session's id yet → unbound row."""
+    gid, token = _claimable(env, fresh=True)
+    db = env["tmp"] / "state.db"
+    monkeypatch.setattr(cli, "Store", lambda: Store(db))
+    _register_env(monkeypatch, env)
+    monkeypatch.setattr(os, "execvp", lambda *_a: None)
+    assert cli.cmd_fire_await(argparse.Namespace(group_id=gid, token=token)) == 0
+    (row,) = _input_rows(db)
+    assert (row["kind"], row["session_id"], row["transcript_path"]) == ("await_resume", "", "")
 
 
 # --------------------------------------------------------------------------- pin_environ
@@ -637,7 +690,11 @@ def test_fire_await_fresh_execs_a_new_session(
     code, calls = _fire_await_exec_in(monkeypatch, env, gid, token)
     assert code == 0
     [(cwd, argv, kw)] = calls
-    assert cwd == env["cwd"] and set(kw) == {"strict", "stdin_prompt"} and kw["strict"]
+    assert cwd == env["cwd"] and set(kw) == {"strict", "stdin_prompt", "ledger"} and kw["strict"]
+    # tp#2170: a -F group's new session id is not known here (B3b binds it): unbound.
+    assert kw["ledger"] == LedgerSpec(
+        "await_resume", "automation", "", env["acct"], env["cwd"], fresh=True
+    )
     assert argv == ["claude"]  # tp#1681 L24: no prompt in argv
     prompt = kw["stdin_prompt"]
     assert prompt.startswith(f"This is a NEW session started by ccc await group {gid} ")
@@ -706,7 +763,7 @@ def _guarded(
     def paster(target: LiveSession, text: str, claim: Any) -> PasteResult:
         if before_paste is not None:
             before_paste()
-        return guarded_paste(world.deps(), target, text, claim=claim)
+        return guarded_paste(world.deps(), target, text, ledger=LEDGER, claim=claim)
 
     await_delivery.deliver_pending(
         wenv["store"],
@@ -744,6 +801,34 @@ def test_paste_guard_await_draft_holds_then_an_empty_box_delivers(wenv: dict[str
     assert text.startswith(FRAMING)
     [message] = notes.messages
     assert "event typed into the live session via python-api" in message
+
+
+def test_await_default_paster_ledger_row(
+    wenv: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P6 (tp#2170): the production paster records one ``await_paste`` / ``automation``
+    row of the delivery prompt; no column carries the text."""
+    from command_center.input_ledger import content_sha
+
+    world: World = wenv["world"]
+    gid = _fired(wenv)
+    monkeypatch.setattr(await_delivery, "default_deps", world.deps)
+    report = PassReport()
+    await_delivery.deliver_pending(
+        wenv["store"],
+        now=NOW + 200,
+        report=report,
+        notifier=Notes(),
+        discover=lambda: [world.live()],
+        paster=await_delivery._default_paster,  # pylint: disable=protected-access
+        launcher=lambda *_a: pytest.fail("a new tab for a live session"),
+    )
+    assert report.delivered == [gid]
+    [text] = world.texts
+    (row,) = _input_rows(world.db)
+    assert (row["kind"], row["origin"], row["state"]) == ("await_paste", "automation", "pending")
+    assert row["session_id"] == WORLD_SID and row["content_sha"] == content_sha(text)
+    assert text not in repr(row)
 
 
 def test_paste_guard_await_typing_user_holds_without_reading_the_box(

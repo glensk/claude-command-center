@@ -80,6 +80,7 @@ from . import accounts
 from .await_prompt import delivery_prompt
 from .await_store import AwaitGroup
 from .bridge_target import PasteResult, default_deps, guarded_paste, held_notice
+from .input_ledger import LedgerSpec
 from .models import short_id
 
 if TYPE_CHECKING:
@@ -171,7 +172,8 @@ def _default_discover() -> list[LiveSession]:
 
 
 def _default_paster(live: LiveSession, text: str, claim: Callable[[], bool]) -> PasteResult:
-    return guarded_paste(default_deps(), live, text, claim=claim)
+    ledger = LedgerSpec("await_paste", "automation")
+    return guarded_paste(default_deps(), live, text, ledger=ledger, claim=claim)
 
 
 def _default_launcher(group_id: int, token: str) -> bool:
