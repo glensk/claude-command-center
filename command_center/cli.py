@@ -300,6 +300,31 @@ def _set_field(args: argparse.Namespace, field: str, value: object, done: str = 
     return 0
 
 
+AIM_TAB_TITLED = "tab titled: "  # set-aim's stdout prefix when the tab shows the AIM
+
+
+def _retitle_after_aim(session_id: str) -> None:
+    """Re-title *session_id*'s tab (and window title) after ``ccc set-aim`` (tp#2211).
+
+    On every call, an unchanged AIM included: setting the AIM is the user's statement of
+    what the tab must show, so a drifted title is healed by re-setting the same AIM. Not
+    gated on ``aim_in_tab_title`` (the ``/aim`` intercept never was): that key decides
+    only what the title core shows (:func:`tabsymbol._session_core`). When iTerm read the
+    tab back showing the AIM words, prints ``tab titled: <core>`` — the machine-readable
+    confirmation ``iterm-set-tabtitle.py`` waits for before it skips its own title write.
+    """
+    from . import tabsymbol
+
+    with Store() as store:
+        fresh = store.get(session_id)
+    if fresh is None:
+        return
+    core = tabsymbol.push_title(fresh)
+    words = tabsymbol.aim_title_words(fresh.aim)
+    if core and words and words in core:
+        print(f"{AIM_TAB_TITLED}{core}")
+
+
 def cmd_set_aim(args: argparse.Namespace) -> int:
     adapter = _adapter()
     session_id = resolve_session_id(adapter, args.session, None)
@@ -339,16 +364,7 @@ def cmd_set_aim(args: argparse.Namespace) -> int:
             changed = store.set_aim(session_id, args.text, set_by=set_by)
             print(f"aim set for {session_id}")
     cfg = config.load_config()
-    # Re-title the tab (and the window title) even when the AIM text did not change
-    # (tp#2211): setting the AIM is the user's statement of what the tab must show, so a
-    # title that drifted meanwhile is healed by re-setting the same AIM.
-    if getattr(cfg, "aim_in_tab_title", False) or getattr(cfg, "aim_in_window_title", False):
-        from . import tabsymbol
-
-        with Store() as store:
-            fresh = store.get(session_id)
-        if fresh is not None:
-            tabsymbol.push_title(fresh)
+    _retitle_after_aim(session_id)
     # On a real change, detached so we never block the caller: (a) refine the instant
     # lexical AIM score with a cheap LLM call, and (b) regenerate the short-AIM label
     # (cheap codex run — keeps the column scannable without spending Claude tokens).

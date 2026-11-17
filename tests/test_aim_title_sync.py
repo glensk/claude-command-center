@@ -166,18 +166,95 @@ def test_set_aim_retitles_even_when_the_aim_is_unchanged(
     assert pushed == ["ship the parser", "ship the parser"]
 
 
-def test_set_aim_pushes_nothing_with_both_title_keys_off(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.fixture(name="tab")
+def tab_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, list[dict[str, str]]]:
+    """A store with session ``s1`` in tab ``w1t1p0:UUID1``; iTerm reads back each write."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "badges"))
+    (tmp_path / "command-center").mkdir(parents=True)
+    with Store() as store:
+        store.ensure("s1", cwd="/Users/x/repo")
+        store.update_fields("s1", iterm_session_id="w1t1p0:UUID1")
+    writes: list[dict[str, str]] = []
+
+    def plain(cores: dict[str, str], marker: str = "") -> dict[str, str]:
+        del marker
+        writes.append(cores)
+        return {tab_titles.uuid_of(iid): core for iid, core in cores.items()}
+
+    monkeypatch.setattr(terminal, "set_session_titles_preserving", plain)
+    monkeypatch.setattr(tab_titles, "set_titles_cas", lambda *_a, **_k: None)
+    return {"writes": writes}
+
+
+def _set_aim(monkeypatch: pytest.MonkeyPatch, text: str, *, aim_in_tab_title: bool = False) -> int:
+    cfg = config.Config(
+        aim_in_tab_title=aim_in_tab_title,
+        aim_score_on_set=False,
+        short_aim=False,
+        future_files=False,
+    )
+    monkeypatch.setattr("command_center.cli.config.load_config", lambda: cfg)
+    args = argparse.Namespace(text=text, session="s1", first=False, by=None)
+    return cli.cmd_set_aim(args)
+
+
+def test_set_aim_confirms_a_tab_that_shows_the_aim(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tab: dict[str, list[dict[str, str]]],
+) -> None:
+    assert _set_aim(monkeypatch, "ship it", aim_in_tab_title=True) == 0
+    [cores] = tab["writes"]
+    assert cores["w1t1p0:UUID1"].endswith(" ship it")
+    assert f"{cli.AIM_TAB_TITLED}{cores['w1t1p0:UUID1']}" in capsys.readouterr().out.splitlines()
+
+
+def test_set_aim_retitles_with_both_title_keys_off_but_confirms_no_aim(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tab: dict[str, list[dict[str, str]]],
+) -> None:
+    """Not gated on the keys (like the ``/aim`` intercept); the core then shows no AIM."""
+    assert _set_aim(monkeypatch, "ship it") == 0
+    [cores] = tab["writes"]
+    assert cores["w1t1p0:UUID1"].endswith("repo")  # the folder, not the AIM
+    assert "ship it" not in cores["w1t1p0:UUID1"]
+    assert cli.AIM_TAB_TITLED not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("why", ["frozen", "done"])
+def test_set_aim_confirms_nothing_for_a_frozen_or_done_session(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tab: dict[str, list[dict[str, str]]],
+    why: str,
+) -> None:
+    """push_title skips the tab, so the caller (iterm-set-tabtitle.py) must title it."""
+    if why == "frozen":
+        from command_center import session_names
+
+        monkeypatch.setattr(session_names, "titles_frozen", lambda _s: True)
+    else:
+        with Store() as store:
+            store.update_fields("s1", done=True)
+    assert _set_aim(monkeypatch, "ship it", aim_in_tab_title=True) == 0
+    assert tab["writes"] == []
+    assert cli.AIM_TAB_TITLED not in capsys.readouterr().out
+
+
+def test_set_aim_confirms_nothing_when_iterm_does_not_read_back_the_title(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "badges"))
     (tmp_path / "command-center").mkdir(parents=True)
-    cfg = config.Config(aim_score_on_set=False, short_aim=False, future_files=False)
-    monkeypatch.setattr("command_center.cli.config.load_config", lambda: cfg)
-    pushed: list[Session] = []
-    monkeypatch.setattr(tabsymbol, "push_title", lambda s, **_k: pushed.append(s))
-    args = argparse.Namespace(text="ship it", session="s1", first=False, by=None)
-    assert cli.cmd_set_aim(args) == 0
-    assert not pushed
+    with Store() as store:
+        store.ensure("s1", cwd="/Users/x/repo")
+        store.update_fields("s1", iterm_session_id="w1t1p0:UUID1")
+    monkeypatch.setattr(terminal, "set_session_titles_preserving", lambda *_a, **_k: None)
+    assert _set_aim(monkeypatch, "ship it", aim_in_tab_title=True) == 0
+    assert cli.AIM_TAB_TITLED not in capsys.readouterr().out
 
 
 def test_session_start_titles_the_tab_with_the_launch_aim(

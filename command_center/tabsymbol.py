@@ -588,7 +588,7 @@ def _plan_write(
         writes.append((session.session_id, core, iid))
 
 
-def push_title(session: Session, *, marker: str | None = None) -> None:
+def push_title(session: Session, *, marker: str | None = None) -> str | None:
     """Re-title ONE session's tab now (after its AIM changed). No-op without a tab/badge.
 
     The user just changed the AIM (``ccc set-aim`` / ``/aim``), so the write is
@@ -596,14 +596,17 @@ def push_title(session: Session, *, marker: str | None = None) -> None:
     re-titled too. Never touches a frozen tab (``session_names.titles_frozen``).
     With ``aim_in_window_title`` the pane's window title follows the AIM too
     (:func:`push_window_title`, tp#2211).
+    Returns the title core iTerm read back after the write, else None (done session, no
+    tab, frozen tab, no badge, or the write was not confirmed) — so ``ccc set-aim`` can
+    tell its caller whether the tab really shows the AIM (tp#2211).
     """
     iid = session.iterm_session_id
     if session.done or not iid:
-        return
-    from . import config, session_names  # lazy
+        return None
+    from . import config, session_names, tab_titles  # lazy
 
     if session_names.titles_frozen(session):
-        return
+        return None
     cfg = config.load_config()
     if cfg.aim_in_window_title:
         try:
@@ -612,7 +615,7 @@ def push_title(session: Session, *, marker: str | None = None) -> None:
             pass  # the title bar is cosmetic: never fail an AIM change over it
     badge = badge_for(session)
     if not badge:
-        return
+        return None
     core = _session_core(session, badge, cfg)
     plain: dict[str, str] = {}
     cas: dict[str, tuple[str, str]] = {}
@@ -629,6 +632,7 @@ def push_title(session: Session, *, marker: str | None = None) -> None:
                 _record_writes(store, writes, seen, wait_marker)
         except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             pass  # bookkeeping only: the next sync re-records
+    return core if _shows(seen.get(tab_titles.uuid_of(iid)), core, wait_marker) else None
 
 
 def seed_title(

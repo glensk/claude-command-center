@@ -35,6 +35,10 @@ flags. Grouped by what they do:
   `-b/--by {user,tool}` stamps who wrote it on the history row (`set_by`; default `tool` when
   `AI_AUTOMATED` is set, else `user`), so a tool that writes an AIM passes `--by tool` and the
   handover never carries it as the user's AIM.
+  Every call re-titles the session's tab (unless the tab is frozen or the session done);
+  when iTerm reads the tab back showing the AIM words (`aim_in_tab_title`), stdout carries a
+  line `tab titled: <title>` — the confirmation a title-setting script waits for before it
+  leaves the tab to ccc (tp#2211).
   The AIM is static: only the user sets it (`!aim`, `/aim`, the TUI); no agent and no tracker
   rewrites it, and a change is not announced to the agent (no "AIM changed" notice).
 - `ccc set-aim-eta [ETA]` (`-s/--session`, `-c/--clear`, `-g/--get`) — store the session's estimated time of done
@@ -1651,7 +1655,7 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   redraws at once (a blocked prompt does not redraw it until the next `refreshInterval`),
   for the price of one tiny model turn. The zero-token, no-label path is Claude Code's shell
   mode: `!aim <text>` with a tiny `aim` shell script on PATH that calls `ccc set-aim`.
-  `ccc set-aim` re-titles the tab too when `aim_in_tab_title` is on.
+  `ccc set-aim` re-titles the tab too (with `aim_in_tab_title` on, to the AIM words).
 - **`aim_on_main_line = true`** prefixes `ccc aim --format bar` (status-line row 1) with
   `🎯 <aim>` (60 chars; an AIM ending in a work-item run, `<few words>: tp#N, #M`, has its
   words clipped so the run stays whole); **`aim_in_tab_title = true`** makes the iTerm tab
