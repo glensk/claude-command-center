@@ -177,11 +177,21 @@ def project_dir_name(cwd: str) -> str:
     return _NON_ALNUM_RE.sub("-", cwd)
 
 
+def resolve_cwd(cwd: str) -> str:
+    """*cwd* with every symlink resolved, as Claude Code records it; ``""`` stays ``""``.
+
+    ``os.path.realpath("")`` would be the CALLER's cwd, never the session's.
+    """
+    return os.path.realpath(cwd) if cwd else cwd
+
+
 def expected_transcript_path(config_dir: str, cwd: str, session_id: str) -> Path:
     """Where Claude Code WILL write *session_id*'s transcript under account *config_dir*.
 
     A fresh session has no transcript until its first prompt (spike S-SEND); this is the
-    path the file appears at. An empty *config_dir* means the default account.
+    path the file appears at. An empty *config_dir* means the default account. Claude Code
+    names the project folder after the RESOLVED cwd (``/tmp/x`` on macOS lands under
+    ``-private-tmp-x``), so *cwd* goes through :func:`resolve_cwd` first (tp#2170 B6).
     """
     if config_dir:
         home = Path(config_dir).expanduser()
@@ -189,7 +199,7 @@ def expected_transcript_path(config_dir: str, cwd: str, session_id: str) -> Path
         from ..config import claude_home  # pylint: disable=import-outside-toplevel
 
         home = claude_home()
-    return home / "projects" / project_dir_name(cwd) / f"{session_id}.jsonl"
+    return home / "projects" / project_dir_name(resolve_cwd(cwd)) / f"{session_id}.jsonl"
 
 
 @dataclass(frozen=True)

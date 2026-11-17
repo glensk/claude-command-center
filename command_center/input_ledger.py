@@ -220,11 +220,15 @@ def record(  # pylint: disable=too-many-arguments
     *transcript* is the session's transcript; ``None`` with a *session_id* anchors on
     ``expected_transcript_path(config_dir, cwd, session_id)`` (a fresh session), without
     one the row is unbound and unanchored. A missing file is a fresh anchor (inode 0).
+    *cwd* is stored resolved (:func:`claude_bridge.resolve_cwd`).
     Never raises: any failure appends a gap line (*gaps*, default :func:`gap_path`) and
     returns None — the injection must go on.
     """
     at = int(now_ms if now_ms is not None else _now_ms())
     try:
+        # The stored cwd is the one Claude Code writes on the transcript lines and names
+        # the projects/ folder after (symlinks resolved, tp#2170 B6).
+        cwd = cb.resolve_cwd(cwd)
         content, alt = shas(text, paste=paste)
         path = transcript
         if path is None and session_id:

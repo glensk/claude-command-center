@@ -6,6 +6,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import sqlite3
 import stat
 import unicodedata
@@ -263,6 +264,63 @@ def test_record_fresh_session_anchors_on_the_expected_path(db: Path, tmp_path: P
     row = _rows(db)[0]
     assert row.transcript_path == str(cfg / "projects" / "-work-repo" / f"{SID}.jsonl")
     assert (row.transcript_inode, row.anchor_offset, row.alt_sha) == (0, 0, "")
+
+
+def _symlinked_cwd(tmp_path: Path) -> tuple[Path, Path]:
+    """``(link, real)``: a job folder reached through a symlinked parent (macOS /tmp)."""
+    real = tmp_path / "private-tmp"
+    (real / "job").mkdir(parents=True)
+    link = tmp_path / "tmp"
+    os.symlink(real, link)
+    return link / "job", (real / "job").resolve()
+
+
+def test_start_job_row_on_a_symlinked_cwd_anchors_on_the_resolved_path(
+    db: Path, tmp_path: Path
+) -> None:
+    link, real = _symlinked_cwd(tmp_path)
+    cfg = tmp_path / "cfg"
+    spec = input_ledger.LedgerSpec("start_job", "caller", SID, str(cfg), str(link), fresh=True)
+    assert input_ledger.record_exec(_factory(db), spec, TEXT, now_ms=T0)
+    (row,) = _rows(db)
+    expected = cfg / "projects" / cb.project_dir_name(str(real)) / f"{SID}.jsonl"
+    assert row.cwd == str(real)
+    assert row.transcript_path == str(expected)
+    # Claude Code writes the transcript there, its lines carrying the resolved cwd.
+    expected.parent.mkdir(parents=True)
+    _write(expected, user(TEXT, cwd=str(real)), *turn_end())
+    assert set(_match(db, expected)) == {row.input_id}
+
+
+def test_resume_row_on_a_symlinked_cwd_falls_back_to_the_resolved_path(
+    db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    link, real = _symlinked_cwd(tmp_path)
+    cfg = tmp_path / "cfg"
+    monkeypatch.setattr(input_ledger, "_session_transcript", lambda _spec: None)
+    spec = input_ledger.LedgerSpec("resume_prompt", "caller", SID, str(cfg), str(link))
+    assert input_ledger.record_exec(_factory(db), spec, TEXT, now_ms=T0)
+    (row,) = _rows(db)
+    assert row.cwd == str(real)
+    assert row.transcript_path == str(
+        cfg / "projects" / cb.project_dir_name(str(real)) / f"{SID}.jsonl"
+    )
+
+
+def test_paste_row_on_a_symlinked_cwd_stores_the_resolved_cwd(
+    db: Path, tmp_path: Path, transcript: Path
+) -> None:
+    link, real = _symlinked_cwd(tmp_path)
+    _record(db, transcript, cwd=str(link))
+    (row,) = _rows(db)
+    assert (row.cwd, row.transcript_path) == (str(real), str(transcript))
+
+
+def test_expected_transcript_path_resolves_a_symlinked_cwd(tmp_path: Path) -> None:
+    link, real = _symlinked_cwd(tmp_path)
+    path = cb.expected_transcript_path(str(tmp_path), str(link), SID)
+    assert path == tmp_path / "projects" / cb.project_dir_name(str(real)) / f"{SID}.jsonl"
+    assert cb.resolve_cwd("") == ""
 
 
 def test_record_unbound_row(db: Path) -> None:
