@@ -133,6 +133,30 @@ def _default_store() -> Store:
     return Store()
 
 
+def _default_db_path() -> Path:
+    from .config import db_path
+
+    return db_path()
+
+
+def _default_gap_path() -> Path:
+    from .input_ledger import gap_path
+
+    return gap_path()
+
+
+def _default_pid_start(pid: int) -> str:
+    from . import terminal
+
+    return terminal.pid_start(pid)
+
+
+def _default_code_stamp() -> int:
+    from .panelserver import code_stamp
+
+    return code_stamp()
+
+
 def _default_llm(prompt: str, note: str, timeout: float) -> str | None:
     from . import llm
     from .config import load_config
@@ -204,6 +228,14 @@ class BridgeDeps:  # pylint: disable=too-many-instance-attributes  # one seam pe
     send_text: Callable[[str, str], tuple[str, str]] = _default_send_text
     send_keys: Callable[[str, Sequence[str]], str] = _default_send_keys
     store: Callable[[], Store] = _default_store
+    #: The state.db path a read-only reader opens (``mode=ro``; never ``Store()``).
+    db_path: Callable[[], Path] = _default_db_path
+    #: The input ledger's gap file (``input_ledger.gap_path``).
+    gap_path: Callable[[], Path] = _default_gap_path
+    #: ``ps -o lstart=`` of a pid (``terminal.pid_start``; ``""`` when gone/unknown).
+    pid_start: Callable[[int], str] = _default_pid_start
+    #: Max ``mtime_ns`` over the installed package's ``*.py`` (``panelserver.code_stamp``).
+    code_stamp: Callable[[], int] = _default_code_stamp
     llm: Callable[[str, str, float], str | None] = _default_llm
     lock_dir: Callable[[], Path] = _default_lock_dir
     iterm_frontmost: Callable[[], bool | None] = _default_iterm_frontmost

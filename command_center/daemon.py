@@ -93,6 +93,10 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
     handoff_errors: list[str] = field(default_factory=list)
     # tp#1990: "<short id> <short tab UUID>" per row whose gone tab's binding was released.
     tabs_released: list[str] = field(default_factory=list)
+    # tp#2170: input-ledger rows moved this pass (dry: would move), short input ids;
+    # routine bookkeeping, deliberately excluded from is_empty().
+    inputs_matched: list[str] = field(default_factory=list)
+    inputs_unmatched: list[str] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not (
@@ -320,6 +324,10 @@ def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear p
         # missing poller degrades to this cadence instead of to never. Isolated: an await
         # failure must not cost the rest of the housekeeping pass.
         _run_await_backstop(store, report, dry_run)
+
+        # Input ledger (tp#2170): match `pending` rows to their transcript lines, expire
+        # rows unmatched for 6 h. Isolated like the backstop; dry run reports only.
+        _advance_inputs(store, report, dry_run)
 
         # Auto-resume session-limit-halted sessions: spawn the watcher when work exists.
         _spawn_resume_watcher(cfg, report, dry_run)
@@ -894,6 +902,42 @@ def _run_await_backstop(store: Store, report: DaemonReport, dry_run: bool) -> No
         print(f"ccc daemon: await pass failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return
     report.awaited.extend(result.fired)
+
+
+def _advance_inputs(
+    store: Store, report: DaemonReport, dry_run: bool, at_ms: int | None = None
+) -> None:
+    """One input-ledger matcher pass over the sessions with a ``pending`` row; never raises.
+
+    Bounded to ``pending`` rows (``pending_input_sessions``); each session is isolated, so
+    one unreadable transcript costs only its own rows. Dry run: the same plan
+    (``input_ledger.plan_session``), reported, nothing written.
+    """
+    from . import input_ledger  # pylint: disable=import-outside-toplevel  # module convention
+
+    now = int(at_ms if at_ms is not None else now_ms())
+    try:
+        sessions = store.pending_input_sessions()
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        print(f"ccc daemon: input ledger failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return
+    for session_id in sessions:
+        try:
+            if dry_run:
+                rows = store.inputs_for(session_id, 0, 2**62)
+                moves = [(r.input_id, s) for r, s, _m in input_ledger.plan_session(rows, now)]
+            else:
+                moves = input_ledger.advance_session(store, session_id, now)
+        except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            print(
+                f"ccc daemon: input ledger {session_id[:8] or 'unbound'}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        for input_id, state in moves:
+            target = report.inputs_matched if state == "matched" else report.inputs_unmatched
+            target.append(input_id[:8])
 
 
 def _run_tab_release(

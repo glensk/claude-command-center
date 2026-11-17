@@ -432,15 +432,15 @@ def _read_group(path: str, rows: list[Input]) -> tuple[list[Input], list[cb.Loca
     return live, located
 
 
-def advance_session(store: Store, session_id: str, now_ms: int) -> list[tuple[str, str]]:
-    """Persist the matches of *session_id*'s ``pending`` rows; ``[(input_id, new_state)]``.
+def plan_session(rows: list[Input], now_ms: int) -> list[tuple[Input, str, Match | None]]:
+    """What :func:`advance_session` would write for *rows* (ONE session's rows, rowid
+    order): ``[(row, new_state, match)]`` for each ``pending`` row that moves.
 
-    Each transcript is read once from the earliest pending anchor. A match is written by
-    CAS (``pending`` → ``matched``); a row still unmatched :data:`MATCH_WINDOW_MS` after
-    it was written becomes ``unmatched``. Unbound rows (``session_id == ''``) can only
-    expire.
+    Reads each transcript once from its earliest pending anchor; writes nothing (the
+    daemon's dry run and the read-only ``ccc sent`` listing run it in memory). A row
+    matched → ``matched``; a row still unmatched :data:`MATCH_WINDOW_MS` after it was
+    written → ``unmatched``. Unbound rows (no transcript) can only expire.
     """
-    rows = store.inputs_for(session_id, 0, 2**62)
     if not any(r.state == "pending" for r in rows):
         return []
     by_path: dict[str, list[Input]] = {}
@@ -454,21 +454,33 @@ def advance_session(store: Store, session_id: str, now_ms: int) -> list[tuple[st
         live, located = _read_group(path, group)
         if live:
             matches.update(match_session(live, located))
-    changes: list[tuple[str, str]] = []
+    out: list[tuple[Input, str, Match | None]] = []
     for row in rows:
         if row.state != "pending":
             continue
         match = matches.get(row.input_id)
         if match is not None:
-            if store.update_input(row.input_id, "pending", **_matched_changes(match, now_ms)):
-                changes.append((row.input_id, "matched"))
+            out.append((row, "matched", match))
         elif now_ms - row.created_at >= MATCH_WINDOW_MS:
-            if store.update_input(
-                row.input_id,
-                "pending",
-                state="unmatched",
-                reason="match_window",
-                updated_at=now_ms,
-            ):
-                changes.append((row.input_id, "unmatched"))
+            out.append((row, "unmatched", None))
+    return out
+
+
+def advance_session(store: Store, session_id: str, now_ms: int) -> list[tuple[str, str]]:
+    """Persist the matches of *session_id*'s ``pending`` rows; ``[(input_id, new_state)]``.
+
+    The moves are :func:`plan_session`'s, each written by CAS (``pending`` →
+    ``matched`` / ``unmatched``), so a row another process moved first is left alone.
+    """
+    rows = store.inputs_for(session_id, 0, 2**62)
+    changes: list[tuple[str, str]] = []
+    for row, state, match in plan_session(rows, now_ms):
+        if match is not None:
+            moved = store.update_input(row.input_id, "pending", **_matched_changes(match, now_ms))
+        else:
+            moved = store.update_input(
+                row.input_id, "pending", state=state, reason="match_window", updated_at=now_ms
+            )
+        if moved:
+            changes.append((row.input_id, state))
     return changes

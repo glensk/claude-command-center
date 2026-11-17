@@ -48,6 +48,11 @@ A staff-bound session closes only with ``-A/--staff-agent A`` naming its bound a
 ``ccc user-aims -j`` lists every session's hand-set AIM and done flag, closed ones too
 (tp#1991, :mod:`command_center.bridge_aims`; read-only ``mode=ro`` connection).
 
+``ccc sent -s ID [-a SINCE] [-u UNTIL] -j`` lists what ccc typed or launched into a
+session (the input ledger: hashes and transcript facts, never the text) with the coverage
+watermark; ``ccc input-ledger [-S | -A [-F] | -D] [-j]`` shows, arms and disarms that
+watermark (tp#2170, :mod:`command_center.bridge_inputs`; the listing is read-only).
+
 ``inspect`` / ``send`` / ``answer`` / ``delivery`` / ``events`` read a session's
 transcript, type into its tab and follow deliveries up (``bridge_inspect`` …
 ``bridge_events``). Message text travels on stdin only. Without ``-j`` the same data is
@@ -121,6 +126,8 @@ JSON_COMMANDS: frozenset[str] = frozenset(
         "close",
         "lineage",
         "user-aims",
+        "sent",
+        "input-ledger",
     }
 )
 
@@ -638,6 +645,45 @@ def cmd_events(args: argparse.Namespace) -> int:
     return _run(args, lambda deps: run_events(deps, args.after, args.limit))
 
 
+def cmd_sent(args: argparse.Namespace) -> int:
+    """``ccc sent -s ID [-a SINCE] [-u UNTIL] [-j]`` — the session's input-ledger rows."""
+    from . import bridge_inputs
+
+    def body(deps: bridge_target.BridgeDeps) -> dict[str, Any]:
+        sid = bridge_inputs.parse_session(args.session)
+        since, until = bridge_inputs.window(args.after, args.until, int(deps.now_ms()))
+        return bridge_inputs.run_sent(deps, sid, since, until)
+
+    if getattr(args, "json", False):
+        return _run(args, body)
+    try:
+        data = body(bridge_target.default_deps())
+    except BridgeError as err:
+        log(f"❌ {err.code}: {err.message}")
+        return err.exit_code
+    except Exception as exc:  # pylint: disable=broad-exception-caught  # exit 3, never a trace
+        log(f"❌ internal: {type(exc).__name__}: {exc}")
+        return EXIT_INTERNAL
+    print("\n".join(bridge_inputs.sent_lines(data)))
+    return EXIT_OK
+
+
+def cmd_input_ledger(args: argparse.Namespace) -> int:
+    """``ccc input-ledger [-S | -A [-F] | -D] [-j]`` — show, arm or disarm the watermark."""
+    from . import bridge_inputs
+
+    def body(deps: bridge_target.BridgeDeps) -> dict[str, Any]:
+        if args.force and not args.arm:
+            raise BridgeError("usage", "-F/--force only goes with -A/--arm", EXIT_USAGE)
+        if args.arm:
+            return bridge_inputs.arm(deps, force=args.force)
+        if args.disarm:
+            return bridge_inputs.disarm(deps)
+        return bridge_inputs.ledger_status(deps)
+
+    return _run(args, body)
+
+
 # --------------------------------------------------------------------------- #
 # parser wiring
 # --------------------------------------------------------------------------- #
@@ -805,3 +851,74 @@ def _add_transcript_parsers(sub: Any) -> None:
     p.add_argument("-l", "--limit", type=int, default=200, help="max events (200)")
     _json_flag(p)
     p.set_defaults(func=cmd_events)
+
+    _add_input_parsers(sub)
+
+
+def _add_input_parsers(sub: Any) -> None:
+    """Register ``sent`` and ``input-ledger`` (the input ledger, tp#2170)."""
+    p = sub.add_parser(
+        "sent",
+        help="what ccc typed or launched into a session: input-ledger rows (read-only)",
+        description=(
+            "Lists the input-ledger rows of one session: every text ccc typed or launched\n"
+            "into it, as the sha256 of its normalised form (ccc-text-sha-v1) and the\n"
+            "transcript line it matched (line_uuid), never the text. Window [SINCE, UNTIL);\n"
+            "rows written up to 6 h before SINCE are looked at too. A pending row is matched\n"
+            "in memory (the stored row stays pending). Opens state.db read-only (mode=ro).\n"
+            "complete is true iff the ledger is armed (ccc input-ledger -A), its coverage is\n"
+            "current, SINCE >= the watermark and no pending row, unbound row or ledger write\n"
+            "failure falls in the lookback; incomplete_reasons names each failing condition\n"
+            "(not_armed, coverage_stale, before_watermark, pending_match, unbound_rows,\n"
+            "ledger_write_failed). Usage errors (exit 2): invalid_session, invalid_time,\n"
+            "invalid_window. Without -j: a header, then HH:MM:SS  kind  state  sha  uuid."
+        ),
+        epilog=(
+            "examples:\n"
+            "  ccc sent -s SID -a 2026-11-16T15:00:00Z -j\n"
+            "  ccc sent -s SID -a 2026-11-16T16:00:00+01:00 -u 1795316400000 -j\n"
+            "  ccc sent -s SID"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("-s", "--session", required=True, help="full Claude session id (36-char UUID)")
+    p.add_argument(
+        "-a",
+        "--after",
+        metavar="SINCE",
+        help="window start, inclusive: ISO-8601 with Z/offset, or epoch ms (default: 0)",
+    )
+    p.add_argument(
+        "-u",
+        "--until",
+        metavar="UNTIL",
+        help="window end, exclusive: same forms (default: now)",
+    )
+    _json_flag(p)
+    p.set_defaults(func=cmd_sent)
+
+    p = sub.add_parser(
+        "input-ledger",
+        help="show, arm or disarm the input ledger's coverage watermark",
+        description=(
+            "-S (default) prints the watermark (complete_since), the stored and the build\n"
+            "coverage, row counts by state and the ledger-write gap entries (read-only).\n"
+            "-A arms: complete_since = now, coverage = this build's; it refuses, listing\n"
+            "pids only, while a process running ccc code started before the newest *.py\n"
+            "mtime of the installed package lives (except tab-symbol --watch and\n"
+            "resume-halted --watch, which never type); -F arms anyway. Re-arming moves the\n"
+            "watermark to now. -D deletes the watermark (every listing reads not_armed)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
+        "-S", "--status", action="store_true", help="show the watermark and counts (default)"
+    )
+    mode.add_argument("-A", "--arm", action="store_true", help="set the watermark to now")
+    mode.add_argument("-D", "--disarm", action="store_true", help="delete the watermark")
+    p.add_argument(
+        "-F", "--force", action="store_true", help="with -A: arm despite stale ccc processes"
+    )
+    _json_flag(p)
+    p.set_defaults(func=cmd_input_ledger)

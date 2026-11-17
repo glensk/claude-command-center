@@ -220,6 +220,12 @@ def _pick(row: sqlite3.Row, names: tuple[str, ...]) -> dict[str, Any]:
     return {name: row[name] for name in names if name in keys}
 
 
+def input_from_row(row: sqlite3.Row) -> Input:
+    """An :class:`Input` from an ``inputs`` row read by any connection (``sqlite3.Row``
+    rows; unknown columns dropped) — the read-only ``ccc sent`` listing's reader."""
+    return Input(**_pick(row, _INPUT_FIELDS))
+
+
 class BridgeStoreMixin:
     """``deliveries`` / ``events`` / ``inputs`` / ``bridge_meta`` access, mixed into
     :class:`command_center.store.Store`."""
