@@ -443,18 +443,24 @@ def test_arm_refuses_with_an_older_ccc_process_force_overrides_disarm_clears(
         502: PsRow(1, "", "S", "/opt/tool/bin/ccc tab-symbol --watch"),
         503: PsRow(1, "", "S", "/opt/tool/bin/ccc daemon"),
         504: PsRow(1, "ttys002", "S", "claude --resume x"),
+        505: PsRow(1, "ttys003", "S", "claude --append-system-prompt run ccc park -g"),
+        506: PsRow(1, "", "S", "/opt/homebrew/bin/tmux new-session -d -s ccc"),
+        507: PsRow(1, "", "S", "/usr/bin/python3 -I -m command_center.cli send"),
     }
     starts: dict[int, float] = {
         501: stamp_s - 600,
         502: stamp_s - 600,
         503: stamp_s + 5,
         504: stamp_s - 600,
+        505: stamp_s - 600,
+        506: stamp_s - 600,
+        507: stamp_s - 600,
     }
     _stub_processes(monkeypatch, world, table, starts)
 
     code, env, _err = _ledger(world, monkeypatch, capsys, "-A")
     assert code == 1 and env is not None
-    assert env["error"]["code"] == "stale_processes" and env["data"] == {"stale_pids": [501]}
+    assert env["error"]["code"] == "stale_processes" and env["data"] == {"stale_pids": [501, 507]}
     assert "park" not in env["error"]["message"]
     code, env, _err = _ledger(world, monkeypatch, capsys, "-S")
     assert code == 0 and env is not None and env["data"]["armed"] is False
