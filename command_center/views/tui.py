@@ -199,6 +199,8 @@ _CODEX_CARD_SEATS: dict[str, str] = {
 # Cells a card's top border spends on everything that is not the title itself:
 # ``╭─ `` + title + `` ─╮``. A collapsed card is sized to exactly this + its title.
 _CARD_TITLE_BORDER_CELLS = 6
+#: When this process image imported the TUI code (see :func:`run`, ``jumpstate.set_tui_loaded``).
+_CODE_LOADED_AT = _epoch_now()
 # The #usage* cards' CSS min-width, mirrored here because _set_card_expanded has to
 # floor its own computed widths by it. Keep in sync with the CSS rules below.
 _CARD_MIN_WIDTH = 38
@@ -6145,6 +6147,9 @@ def _reexec_in_place() -> None:
 
 def run() -> int:
     """Launch the TUI, re-exec'ing in place if it asked to restart itself."""
+    # An in-place re-exec keeps the pid and its `ps lstart`: stamp when THIS image loaded its
+    # code, so `ccc input-ledger -A` counts a restarted TUI as current (tp#2170 B6).
+    jumpstate.set_tui_loaded(os.getpid(), _CODE_LOADED_AT)
     # `kill -USR1 <pid>` dumps every thread's Python stack to tui-watchdog.log — the
     # on-demand twin of the watchdog's automatic wedge report (see watchdog.py).
     try:

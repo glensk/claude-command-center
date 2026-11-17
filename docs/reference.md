@@ -4315,6 +4315,11 @@ moves the watermark to now.
 
 The stale-process check ignores two long-runners that never type: `ccc tab-symbol -w/--watch`
 and `ccc resume-halted --watch` (the `claude-session-continue` it starts runs fresh code).
+Only the executable position marks a ccc process: `argv[0]`, or the script/module after a
+python interpreter (a `claude` prompt or a `tmux -s ccc` that merely mentions ccc is not one).
+The TUI stamps its code-load time (`tui_loaded`, with its pid) at every (re)exec, so an
+in-place `ccc restart-tui`, which keeps the pid and its start time, counts as current; a stamp
+for another pid is ignored.
 
 **The gap file.** A ledger write that fails (locked database, disk full) does not stop the
 injection: one JSON line `{"at_ms", "session_id", "kind", "error_class"}` is appended to

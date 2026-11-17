@@ -22,6 +22,10 @@ writes never race on a shared blob:
   caller (an automation that changed ccc's code/config) writes it; the TUI's fast poll
   consumes it, exits cleanly and re-execs itself in the same tab. The TUI also clears any
   leftover request on mount so a stale file can never instantly restart a fresh TUI.
+
+One more file is not a signal but a stamp: **loaded** (``tui_loaded``, ``pid|epoch_s``) — when
+the TUI's code was loaded, rewritten at every (re)exec. An in-place restart keeps the pid and
+its ``ps lstart``, so ``ccc input-ledger -A`` reads this to see that the TUI runs current code.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ _REQUEST = "jump_request"
 _TUI = "jump_tui"
 _TOGGLE = "jump_toggle"
 _RESTART = "jump_restart"
+_LOADED = "tui_loaded"
 
 
 def _read(name: str) -> str | None:
@@ -126,6 +131,23 @@ def get_tui() -> tuple[int, str] | None:
 def clear_tui() -> None:
     """Drop the TUI identity (on unmount) so ``ccc jump`` stops using the fast path."""
     _write(_TUI, None)
+
+
+def set_tui_loaded(pid: int, at_s: float) -> None:
+    """Stamp when the TUI process *pid* loaded its code (every exec, incl. in place)."""
+    _write(_LOADED, f"{pid}|{at_s:.3f}")
+
+
+def tui_loaded_at(pid: int) -> float | None:
+    """The code-load epoch seconds stamped for *pid*, or None (no stamp, another pid, garbage)."""
+    raw = _read(_LOADED)
+    if not raw:
+        return None
+    pid_str, _, at_str = raw.partition("|")
+    try:
+        return float(at_str) if int(pid_str) == pid else None
+    except ValueError:
+        return None
 
 
 def request_toggle() -> None:

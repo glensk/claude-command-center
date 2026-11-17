@@ -151,6 +151,12 @@ def _default_pid_start(pid: int) -> str:
     return terminal.pid_start(pid)
 
 
+def _default_exec_stamp(pid: int) -> float | None:
+    from . import jumpstate
+
+    return jumpstate.tui_loaded_at(pid)
+
+
 def _default_code_stamp() -> int:
     from .panelserver import code_stamp
 
@@ -236,6 +242,9 @@ class BridgeDeps:  # pylint: disable=too-many-instance-attributes  # one seam pe
     pid_start: Callable[[int], str] = _default_pid_start
     #: Max ``mtime_ns`` over the installed package's ``*.py`` (``panelserver.code_stamp``).
     code_stamp: Callable[[], int] = _default_code_stamp
+    #: Epoch seconds *pid* last (re)exec'd its ccc code, when stamped (``jumpstate.
+    #: tui_loaded_at``: the TUI's in-place restart keeps pid and lstart); else ``None``.
+    exec_stamp: Callable[[int], float | None] = _default_exec_stamp
     llm: Callable[[str, str, float], str | None] = _default_llm
     lock_dir: Callable[[], Path] = _default_lock_dir
     iterm_frontmost: Callable[[], bool | None] = _default_iterm_frontmost

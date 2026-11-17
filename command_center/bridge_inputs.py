@@ -411,10 +411,21 @@ def _ccc_argv(command: str) -> list[str] | None:
     """The arguments after the ccc executable in *command*, or ``None`` when *command*
     does not run ccc code (``ccc``, ``claude-session-continue``, ``-m command_center``)."""
     tokens = command.split()
-    for i, token in enumerate(tokens):
-        base = os.path.basename(token)
-        if base in _CCC_EXECUTABLES or base.startswith("command_center"):
-            return tokens[i + 1 :] if base == "ccc" else [base, *tokens[i + 1 :]]
+    # Only the executable position counts: argv[0], or the script/module after a python
+    # interpreter and its options. A bare word "ccc" deeper in argv (a claude prompt that
+    # mentions ccc, `tmux new-session -s ccc`) is not ccc code (tp#2170 B6).
+    i = 0
+    if tokens and os.path.basename(tokens[0]).lower().startswith("python"):
+        i = 1
+        while i < len(tokens) and tokens[i].startswith("-") and tokens[i] != "-m":
+            i += 1
+        if i < len(tokens) and tokens[i] == "-m":
+            i += 1
+    if i >= len(tokens):
+        return None
+    base = os.path.basename(tokens[i])
+    if base in _CCC_EXECUTABLES or base.startswith("command_center"):
+        return tokens[i + 1 :] if base == "ccc" else [base, *tokens[i + 1 :]]
     return None
 
 
@@ -443,7 +454,9 @@ def stale_processes(deps: BridgeDeps) -> list[int]:
     stale: fail closed).
 
     Candidates come from ``ps_table`` (pid + command), start times from ``pid_start``
-    (debate A2); this process, its parents and :data:`ARM_ALLOWLIST` entries are skipped.
+    (debate A2), raised to the pid's ``exec_stamp`` when newer (an in-place re-exec — the
+    TUI's ``ccc restart-tui`` — keeps pid and lstart); this process, its parents and
+    :data:`ARM_ALLOWLIST` entries are skipped.
     """
     stamp_s = deps.code_stamp() / 1e9
     table = deps.ps_table()
@@ -456,7 +469,11 @@ def stale_processes(deps: BridgeDeps) -> list[int]:
         if args is None or allowlisted(args) is not None:
             continue
         started = parse_lstart(deps.pid_start(pid))
-        if started is None or started < stamp_s:
+        if started is None:
+            stale.append(pid)
+            continue
+        execed = deps.exec_stamp(pid)
+        if max(started, execed or 0.0) < stamp_s:
             stale.append(pid)
     return stale
 

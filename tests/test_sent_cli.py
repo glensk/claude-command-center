@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 from bridgestub import SID, World, run_cli, turn_end, user
 
-from command_center import bridge_cli, bridge_inputs, cli, input_ledger
+from command_center import bridge_cli, bridge_inputs, cli, config, input_ledger, jumpstate
 from command_center.bridge_target import BridgeDeps
 from command_center.daemon import DaemonReport, _advance_inputs
 from command_center.snapshot import PsRow
@@ -485,6 +485,44 @@ def test_arm_succeeds_when_every_ccc_process_is_fresh(
     assert env["data"]["forced"] is False and env["data"]["stale_pids"] == []
     with Store(world.db) as store:
         assert store.meta_get(input_ledger.META_COMPLETE_SINCE) == str(world.clock_ms)
+
+
+def test_arm_counts_an_in_place_restarted_tui_as_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`ccc restart-tui` re-execs in place (same pid, same lstart): the TUI's per-exec
+    `tui_loaded` stamp makes it current; a stamp names one pid, so another old ccc process
+    (and one with no stamp at all) stays stale."""
+    world = _world(tmp_path)
+    stamp_s = 1_800_000_000
+    table = {
+        801: PsRow(1, "ttys001", "S", "/opt/tool/bin/ccc"),
+        802: PsRow(1, "ttys002", "S", "/opt/tool/bin/ccc tui"),
+    }
+    _stub_processes(monkeypatch, world, table, {801: stamp_s - 600, 802: stamp_s - 600})
+    code, env, _err = _ledger(world, monkeypatch, capsys, "-A")
+    assert code == 1 and env is not None and env["data"] == {"stale_pids": [801, 802]}
+
+    jumpstate.set_tui_loaded(801, stamp_s + 5)
+    assert jumpstate.tui_loaded_at(801) == stamp_s + 5
+    assert jumpstate.tui_loaded_at(802) is None
+    code, env, _err = _ledger(world, monkeypatch, capsys, "-A")
+    assert code == 1 and env is not None and env["data"] == {"stale_pids": [802]}
+
+    jumpstate.set_tui_loaded(801, stamp_s - 60)  # re-exec'd, but before the code changed
+    code, env, _err = _ledger(world, monkeypatch, capsys, "-A")
+    assert code == 1 and env is not None and env["data"] == {"stale_pids": [801, 802]}
+
+
+def test_tui_loaded_stamp_ignores_garbage(tmp_path: Path) -> None:
+    del tmp_path  # CCC_HOME is pinned under it by conftest
+    assert jumpstate.tui_loaded_at(1) is None
+    path = config.app_home() / "tui_loaded"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x|1.0", encoding="utf-8")
+    assert jumpstate.tui_loaded_at(1) is None
+    path.write_text("1|soon", encoding="utf-8")
+    assert jumpstate.tui_loaded_at(1) is None
 
 
 def test_arm_counts_an_unreadable_start_as_stale(
