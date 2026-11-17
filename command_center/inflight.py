@@ -64,8 +64,15 @@ KIND_UNKNOWN = "unknown"
 SUBAGENT_COUNTER_GRACE_S = 120
 
 # The Bash tool's shell embeds the command as ``eval '<command>' < /dev/null && pwd -P …``
-# with every single quote inside written as ``'\''``.
-_EVAL_RE = re.compile(r"\beval '((?:[^']|'\\'')*)' < /dev/null")
+# with every single quote inside written as ``'\''`` (older Claude Code) or ``'"'"'``
+# (current Claude Code, tp#2187).
+_EVAL_RE = re.compile(r"""\beval '((?:[^']|'\\''|'"'"')*)' < /dev/null""")
+_QUOTE_ESCAPE_RE = re.compile(r"""'\\''|'"'"'""")
+
+# A blocking item's command as the drain / ``start`` refusal prints it (tp#2187): one line,
+# at most this wide, every ``NAME=value`` assignment's value masked.
+BRIEF_WIDTH = 100
+_ASSIGNMENT_RE = re.compile(r"""(?<![\w./:?&=-])([A-Za-z_]\w*)=(?:"[^"]*"|'[^']*'|[^\s;&|]*)""")
 
 # Only the tail is scanned, as in ``adapters.claude.background_work_split``.
 _TAIL_BYTES = 32 * 1024 * 1024
@@ -117,6 +124,14 @@ class Inventory:
     def clear(self) -> bool:
         """True when nothing blocks a relaunch or a handoff."""
         return not self.reasons
+
+    def unknown_processes(self) -> list[str]:
+        """``pid:N untracked shell: <command>`` for each unknown process (tp#2187)."""
+        return [
+            f"{item.id} {item_detail(item.to_dict())}"
+            for item in self.items
+            if item.kind == KIND_UNKNOWN and item.pid > 0
+        ]
 
     def to_dict(self) -> dict[str, Any]:
         """JSON shape: ``{"clear", "reasons", "items"}``."""
@@ -271,7 +286,24 @@ def shell_command_from_argv(argv: str) -> str | None:
     match = _EVAL_RE.search(argv)
     if match is None:
         return None
-    return match.group(1).replace("'\\''", "'")
+    return _QUOTE_ESCAPE_RE.sub("'", match.group(1))
+
+
+def brief_command(command: str, width: int = BRIEF_WIDTH) -> str:
+    """*command* on one line, assignment values masked (``NAME=…``), cut to *width* chars."""
+    text = " ".join(_ASSIGNMENT_RE.sub(r"\1=…", command).split())
+    return text if len(text) <= width else text[: max(0, width - 1)] + "…"
+
+
+def item_detail(item: dict[str, Any]) -> str:
+    """How an :meth:`Item.to_dict` is described in a listing.
+
+    An unknown process (an untracked shell, a child claude) also names its command, via
+    :func:`brief_command`, so a blocked session need not run ``ps`` to see it (tp#2187).
+    """
+    if item.get("kind") == KIND_UNKNOWN and item.get("command"):
+        return f"{item.get('description') or 'process'}: {brief_command(str(item['command']))}"
+    return str(item.get("description") or item.get("command") or item.get("agent_type") or "")
 
 
 @dataclass

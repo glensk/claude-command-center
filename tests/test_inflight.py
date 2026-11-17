@@ -583,3 +583,75 @@ def test_c6_drain_first_vetoer_is_the_sessions_own_timed_out_bash(
     stopped = _c6_transcript(tmp_path, *launches, stop)
     monkeypatch.setattr(claude_adapter, "_children_map", lambda: {**tree, 4242: tree[4242][:1]})
     assert inflight.inventory(adapter, 4242, stopped).clear
+
+
+# ---------------------------------------- tp#2187: the drain names the blocking shell
+
+
+def test_drain_and_start_refusal_name_an_untracked_shells_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The listing and the ``start`` refusal show an untracked shell's command.
+
+    Not just ``untracked shell``: one line, cut to :data:`inflight.BRIEF_WIDTH`, every
+    assignment value masked (no env values on screen).
+    """
+    from command_center import continue_session
+
+    orphan = "SECRET_TOKEN=s3cr3t timeout 560 tail -f /private/tmp/claude-501/p/s/tasks/" + (
+        "x" * 120
+    )
+    transcript = _c6_transcript(
+        tmp_path,
+        _c6_bash("bkdcstgmr", _C6_KEEPWARM, "Arm keep-warm timer", background=True),
+    )
+    tree = {4242: [(98000, _c6_shell(_C6_KEEPWARM)), (98628, _c6_shell(orphan))]}
+    monkeypatch.setattr(claude_adapter, "_children_map", lambda: tree)
+    inv = inflight.inventory(claude_adapter.ClaudeAdapter(), 4242, transcript)
+
+    listing = continue_session._render_inflight(inv.to_dict())  # pylint: disable=protected-access
+    line = next(row for row in listing.splitlines() if "pid:98628" in row)
+    assert "untracked shell: SECRET_TOKEN=… timeout 560 tail -f /private/tmp/claude-501/" in line
+    assert "s3cr3t" not in listing
+    brief = line.split("untracked shell: ", 1)[1]
+    assert len(brief) == inflight.BRIEF_WIDTH and brief.endswith("…")
+    assert inv.unknown_processes() == [f"pid:98628 untracked shell: {brief}"]
+
+
+def test_current_quote_style_matches_its_transcript_item_and_the_doorbell_exemption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Current Claude Code writes a quote inside ``eval '…'`` as ``'"'"'`` (live ``ps``).
+
+    tp#2187: the matcher reads it like the older ``'\\''`` style, so the shell matches its
+    transcript item and the close-only doorbell exemption applies to it.
+    """
+    grep_cmd = "grep -n 'drain' /home/user/notes.md"
+    doorbell = "staff wait -a 'dev-1'"
+    argv_grep = _c6_shell("grep -n '\"'\"'drain'\"'\"' /home/user/notes.md")
+    argv_bell = _c6_shell("staff wait -a '\"'\"'dev-1'\"'\"'")
+    assert inflight.shell_command_from_argv(argv_grep) == grep_cmd
+    assert inflight.shell_command_from_argv(argv_bell) == doorbell
+
+    transcript = _c6_transcript(
+        tmp_path,
+        _c6_bash("bgrep0001", grep_cmd, "Find drain notes", background=True),
+        _c6_bash("bbell0001", doorbell, "Doorbell", background=True),
+    )
+    tree = {4242: [(5100, argv_grep), (5200, argv_bell)]}
+    monkeypatch.setattr(claude_adapter, "_children_map", lambda: tree)
+    adapter = claude_adapter.ClaudeAdapter()
+    exempt = inflight.staff_doorbell("dev-1")
+    inv = inflight.inventory(adapter, 4242, transcript, disposable_shell=exempt)
+    kinds = {item.id: (item.kind, item.pid) for item in inv.items}
+    assert kinds == {
+        "bgrep0001": (inflight.KIND_SHELL, 5100),
+        "bbell0001": (inflight.KIND_KEEPWARM, 5200),
+    }
+
+    monkeypatch.setattr(claude_adapter, "_children_map", lambda: {4242: tree[4242][1:]})
+    bell_only = _c6_transcript(
+        tmp_path, _c6_bash("bbell0001", doorbell, "Doorbell", background=True)
+    )
+    assert inflight.inventory(adapter, 4242, bell_only, disposable_shell=exempt).clear
+    assert not inflight.inventory(adapter, 4242, bell_only).clear

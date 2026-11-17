@@ -222,11 +222,13 @@ def _render_state(data: dict[str, Any]) -> str:
 
 
 def _render_inflight(inv: dict[str, Any]) -> str:
+    from .inflight import item_detail
+
     head = "in flight: clear" if inv["clear"] else "in flight: NOT clear"
     lines = [head]
     lines += [f"  reason: {reason}" for reason in inv["reasons"]]
     for item in inv["items"]:
-        detail = item["description"] or item["command"] or item["agent_type"]
+        detail = item_detail(item)
         lines.append(f"  {item['kind']:<9} {item['id']:<18} {detail}")
     return "\n".join(lines)
 
@@ -514,7 +516,7 @@ def _preflight(  # pylint: disable=too-many-arguments
     if not inv.clear:
         raise StartRefused(
             "work is still in flight — drain first (ccc continue-session drain): "
-            + "; ".join(inv.reasons)
+            + "; ".join(inv.reasons + inv.unknown_processes())
         )
     return target
 
