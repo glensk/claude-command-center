@@ -412,10 +412,75 @@ def staff_title(session: Session) -> str | None:
 
 
 def aim_title_words(aim: str | None) -> str:
-    """The AIM words a tab title shows (``fix decide: tp#1363`` → ``fix decide``, tp#1366)."""
+    """The AIM words a tab title shows (``fix decide: tp#1363`` → ``fix decide``, tp#1366).
+
+    An AIM of ids only (``tp#2172``) shows its first line as is (tp#2211): the tab still
+    shows the AIM, never the folder leaf it showed before.
+    """
     from . import aimtext  # lazy
 
-    return aimtext.title_words(aim, _TAB_AIM_W)
+    words = aimtext.title_words(aim, _TAB_AIM_W)
+    if words or not aim or not aim.strip():
+        return words
+    return aimtext.clip(aim.strip(), _TAB_AIM_W).strip()
+
+
+_WINDOW_AIM_W = 80  # chars of the AIM a window title (OSC 2) shows
+
+
+def _title_marker(title: str) -> str:
+    """The leading marker glyph of *title* (``🟧 user@host | ~`` → ``🟧``), else ``""``.
+
+    A marker is a first word of at most three characters that are all symbols (no letter,
+    digit or ASCII punctuation), followed by a space — a shell's work/private category
+    emoji, kept when the window title is replaced by the AIM.
+    """
+    head, sep, _rest = title.partition(" ")
+    if not sep or not head or len(head) > 3:
+        return ""
+    if any(ord(ch) < 0x2000 or ch.isalnum() for ch in head):
+        return ""
+    return head
+
+
+def window_title(current: str | None, aim: str | None) -> str | None:
+    """The window title for *aim*: ``"<marker> <AIM first line>"`` (tp#2211), else None.
+
+    The marker is the one *current* starts with (:func:`_title_marker`); the AIM keeps its
+    work-item ids (the title bar has room) and is clipped to 80 chars.
+    """
+    from . import aimtext  # lazy
+
+    if not aim or not aim.strip():
+        return None
+    line = aimtext.clip(aim.strip(), _WINDOW_AIM_W).strip()
+    marker = _title_marker(current or "")
+    return f"{marker} {line}" if marker else line
+
+
+def push_window_title(session: Session) -> bool:
+    """Set *session*'s window title (OSC 2 to its pane's tty) to its AIM; True if written.
+
+    The tab label is the session name ccc sets via AppleScript; the title bar above the
+    tabs shows the pane's OSC 2 window title, which a shell prompt set before ``claude``
+    started (``user@host | dir``) and nothing refreshes while it runs. Best-effort: no
+    iTerm, no tab or no AIM leaves it alone.
+    """
+    iid = session.iterm_session_id
+    if not iid or not session.aim:
+        return False
+    from . import terminal  # lazy: AppleScript layer
+
+    pane = terminal.read_session_pane(iid)
+    if pane is None:
+        return False
+    tty, current = pane
+    title = window_title(current, session.aim)
+    if not title:
+        return False
+    if title == current:
+        return True
+    return terminal.write_window_title(tty, title)
 
 
 def _session_core(session: Session, badge: str, cfg: Config) -> str:
@@ -529,6 +594,8 @@ def push_title(session: Session, *, marker: str | None = None) -> None:
     The user just changed the AIM (``ccc set-aim`` / ``/aim``), so the write is
     unconditional (tp#1988): a tab whose title drifted from ``title_written`` is
     re-titled too. Never touches a frozen tab (``session_names.titles_frozen``).
+    With ``aim_in_window_title`` the pane's window title follows the AIM too
+    (:func:`push_window_title`, tp#2211).
     """
     iid = session.iterm_session_id
     if session.done or not iid:
@@ -537,10 +604,16 @@ def push_title(session: Session, *, marker: str | None = None) -> None:
 
     if session_names.titles_frozen(session):
         return
+    cfg = config.load_config()
+    if cfg.aim_in_window_title:
+        try:
+            push_window_title(session)
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            pass  # the title bar is cosmetic: never fail an AIM change over it
     badge = badge_for(session)
     if not badge:
         return
-    core = _session_core(session, badge, config.load_config())
+    core = _session_core(session, badge, cfg)
     plain: dict[str, str] = {}
     cas: dict[str, tuple[str, str]] = {}
     writes: list[tuple[str, str, str]] = []

@@ -1658,8 +1658,16 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   title `<badge> <AIM words>` — the AIM without that run (`fix decide: tp#7` → `fix decide`,
   40 chars; the older `tp#N: <words>` form reads the same) — pushed at once by the `/aim`
   intercept, and kept converged by the daemon / TUI title sync. A session name (`ccc name`)
-  is never shown (ccc generates no names, tp#1808); an AIM of ids only falls back to
-  `<badge> <folder leaf>`.
+  is never shown (ccc generates no names, tp#1808); an AIM of ids only shows the ids
+  (`<badge> tp#7`, tp#2211). Every `ccc set-aim` re-titles the tab, even with an unchanged
+  AIM (re-setting the AIM heals a drifted title), and the `SessionStart` hook stores the
+  launcher's `CLAUDE_SESSION_AIM` before it seeds the title, so the first title shows it.
+- **`aim_in_window_title = true`** (default off) makes every AIM change (`ccc set-aim`,
+  `/aim`, the launcher AIM) also set the pane's window title (OSC 2, the title bar above
+  the tabs) to `<marker> <AIM>`: the AIM's first line with its ids, 80 chars, after the
+  symbol glyph the old window title started with (a shell's work/private category emoji).
+  It is written to the pane's tty device (a Claude Code subprocess has no `/dev/tty`); the
+  shell's own prompt hook takes the title back once `claude` exits.
 - **`peer_name_from_aim = true`** (default off, inert) names each interactive session — its
   Claude Code peer name, the one `ListAgents` / `SendMessage` use — after the AIM the user
   set: the `UserPromptSubmit` hook adds `sessionTitle` to its one `hookSpecificOutput`, and

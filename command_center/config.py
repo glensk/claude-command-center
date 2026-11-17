@@ -86,6 +86,8 @@ DEFAULTS: dict[str, object] = {
     "switch_intercept": True,
     "aim_on_main_line": False,  # `ccc aim --format bar` prefixes "🎯 <aim>" (status-line row 1)
     "aim_in_tab_title": False,  # iTerm tab title "<badge> <AIM words>" (no tp#N run)
+    # an AIM change also sets the session's window title (OSC 2): "<marker> <AIM>"
+    "aim_in_window_title": False,
     # UserPromptSubmit asks Claude Code to name the session (its peer name) after the
     # user's AIM words (hook `sessionTitle`; INERT: off, renames running sessions)
     "peer_name_from_aim": False,
@@ -1201,6 +1203,7 @@ class Config:
     switch_intercept: bool = True
     aim_on_main_line: bool = False
     aim_in_tab_title: bool = False
+    aim_in_window_title: bool = False
     peer_name_from_aim: bool = False
     aim_score: bool = True
     aim_score_threshold: int = 50

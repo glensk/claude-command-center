@@ -244,6 +244,83 @@ def set_session_titles_preserving(
     )
 
 
+_TTY_DEVICE_RE = re.compile(r"^/dev/tty[A-Za-z]*[0-9]+$")
+_TITLE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def read_session_pane(iterm_session_id: str) -> tuple[str, str] | None:
+    """``(tty device, window title)`` of the iTerm session *iterm_session_id*, or None.
+
+    The window title is the session's ``terminalWindowName`` (what its last OSC 2 set:
+    the title bar, not the tab label). One bounded ``osascript``; None when iTerm cannot
+    be asked or the session is gone. macOS / iTerm2 only.
+    """
+    uuid = iterm_session_id.split(":")[-1].strip()
+    if not uuid or not shutil.which("osascript"):
+        return None
+    checks = (
+        'set out to out & (tty of s) & fs & (variable s named "session.terminalWindowName") & rs'
+    )
+    script = f"""
+    tell application "iTerm2"
+        set fs to (character id 31)
+        set rs to (character id 30)
+        set out to ""
+        repeat with w in windows
+            repeat with t in tabs of w
+                repeat with s in sessions of t
+                    if (id of s) is "{_as_quote(uuid)}" then
+                        {checks}
+                        return out
+                    end if
+                end repeat
+            end repeat
+        end repeat
+        return out
+    end tell
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603  (fixed argv, no shell)
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=TITLE_WRITE_TIMEOUT_SEC,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return parse_pane_readback(proc.stdout or "")
+
+
+def parse_pane_readback(raw: str) -> tuple[str, str] | None:
+    """``(tty, window title)`` from :func:`read_session_pane`'s output (pure, for tests)."""
+    record = raw.split(_TITLE_RS)[0].strip("\r\n")
+    tty, sep, name = record.partition(_TITLE_FS)
+    if not sep or not _TTY_DEVICE_RE.match(tty.strip()):
+        return None
+    return tty.strip(), name
+
+
+def write_window_title(tty_device: str, title: str) -> bool:
+    """Set the pane's window title (OSC 2) by writing to its *tty_device*; True on success.
+
+    A Claude Code subprocess (``!`` shell mode, hooks, the status line) has no controlling
+    terminal, so ``/dev/tty`` fails there; the pane's device (``/dev/ttysNNN``) is still
+    writable by the same user. Control characters are stripped from *title*.
+    """
+    if not _TTY_DEVICE_RE.match(tty_device):
+        return False
+    clean = _TITLE_CONTROL_RE.sub("", title)
+    try:
+        with open(tty_device, "w", encoding="utf-8") as handle:
+            handle.write(f"\033]2;{clean}\007")
+    except OSError:
+        return False
+    return True
+
+
 def reset_tab_color() -> None:
     """Clear any custom iTerm2 tab color (back to the theme default)."""
     try:

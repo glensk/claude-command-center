@@ -457,20 +457,8 @@ def handle_session_start(payload: dict[str, Any]) -> int:
         handoff_note = _auto_accept(store, sid, payload)
         if handoff_note:
             session = store.get(sid) or session
-        # The iTerm tab id itself is stamped inside ensure_current_session (every
-        # hook event, self-healing) — here we only need the env value for the badge.
-        iterm = os.environ.get("ITERM_SESSION_ID")
-        # Seed this tab's distinctness badge into its title now, so a freshly-launched
-        # (or resumed) session's tab shows the same emoji as its command-center row
-        # without waiting for the next `cd` (zsh hook) or daemon pass. Marker-preserving
-        # and fail-safe (detached AppleScript that swallows its own errors).
-        if iterm:
-            from . import tabsymbol  # lazy: keep the hook import light
-
-            tabsymbol.seed_title(
-                iterm, session.cwd or payload.get("cwd", ""), session=session, store=store
-            )
         env_aim = os.environ.get("CLAUDE_SESSION_AIM")
+        seeded = False
         if env_aim and env_aim.strip() and not session.aim:
             # Go through set_aim (not a bare update_fields) so the AIM is scored on
             # arrival — a bare write left aim_score at -1, so a hook-seeded AIM was
@@ -483,6 +471,25 @@ def handle_session_start(payload: dict[str, Any]) -> int:
 
                 spawn.spawn_ccc(["score-aim", "--session", sid])
             session = store.get(sid) or session
+        # The iTerm tab id itself is stamped inside ensure_current_session (every
+        # hook event, self-healing) — here we only need the env value for the badge.
+        iterm = os.environ.get("ITERM_SESSION_ID")
+        # Seed this tab's distinctness badge into its title now, so a freshly-launched
+        # (or resumed) session's tab shows the same emoji as its command-center row
+        # without waiting for the next `cd` (zsh hook) or daemon pass. Marker-preserving
+        # and fail-safe (detached AppleScript that swallows its own errors). It runs
+        # AFTER the launcher's AIM is stored (tp#2211), so the first title shows it.
+        if iterm:
+            from . import tabsymbol  # lazy: keep the hook import light
+
+            tabsymbol.seed_title(
+                iterm, session.cwd or payload.get("cwd", ""), session=session, store=store
+            )
+            if seeded and config.load_config().aim_in_window_title:
+                try:
+                    tabsymbol.push_window_title(session)
+                except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                    pass  # cosmetic: never fail SessionStart over the title bar
         if not session.aim:
             context = _ASK_AIM.format(sid=sid)
         else:

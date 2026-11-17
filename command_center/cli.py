@@ -338,18 +338,21 @@ def cmd_set_aim(args: argparse.Namespace) -> int:
             # clears stale auto checklist + offset
             changed = store.set_aim(session_id, args.text, set_by=set_by)
             print(f"aim set for {session_id}")
+    cfg = config.load_config()
+    # Re-title the tab (and the window title) even when the AIM text did not change
+    # (tp#2211): setting the AIM is the user's statement of what the tab must show, so a
+    # title that drifted meanwhile is healed by re-setting the same AIM.
+    if getattr(cfg, "aim_in_tab_title", False) or getattr(cfg, "aim_in_window_title", False):
+        from . import tabsymbol
+
+        with Store() as store:
+            fresh = store.get(session_id)
+        if fresh is not None:
+            tabsymbol.push_title(fresh)
     # On a real change, detached so we never block the caller: (a) refine the instant
     # lexical AIM score with a cheap LLM call, and (b) regenerate the short-AIM label
     # (cheap codex run — keeps the column scannable without spending Claude tokens).
     if changed:
-        cfg = config.load_config()
-        if getattr(cfg, "aim_in_tab_title", False):
-            from . import tabsymbol
-
-            with Store() as store:
-                fresh = store.get(session_id)
-            if fresh is not None:
-                tabsymbol.push_title(fresh)
         from .spawn import spawn_ccc
 
         if cfg.aim_score_on_set and rescore:

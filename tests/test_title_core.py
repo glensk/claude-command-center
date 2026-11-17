@@ -220,7 +220,7 @@ def test_one_owner_per_tab_prefers_the_live_pid(monkeypatch: pytest.MonkeyPatch)
         ("fix decide: tp#1363, #1364", "🟧 fix decide"),
         ("tp#1363, #1364: fix decide", "🟧 fix decide"),
         ("review the hook of tp#5: tp#9", "🟧 review the hook of tp#5"),
-        ("tp#1363", f"🟧 {LEAF}"),
+        ("tp#1363", "🟧 tp#1363"),  # tp#2211: an ids-only AIM shows its ids, not the leaf
     ],
 )
 def test_the_tab_shows_the_aim_words_without_the_item_run(aim: str, title: str) -> None:
