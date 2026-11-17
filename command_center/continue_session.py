@@ -12,7 +12,7 @@ it on the named account. Verbs:
 * ``template`` (read-only) — the fixed handoff template;
 * ``drain`` (read-only) — block until the in-flight detector is clear, exit 1 on timeout.
 
-The transfer itself (``start`` / ``accept`` / ``status``) runs the state machine of
+The transfer itself (``start`` / ``accept`` / ``status`` / ``abort``) runs the state machine of
 :mod:`command_center.transfer_store`.
 """
 
@@ -30,6 +30,8 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 # pylint: disable=wrong-import-position,ungrouped-imports,too-many-lines  # shim first; one verb file
 
 import argparse
+import dataclasses
+import hashlib
 import json
 import os
 import sys
@@ -322,11 +324,10 @@ class StartRefused(Exception):
     """A fail-closed preflight refusal; the message is printed, nothing was written."""
 
 
-EXIT_MODEL_TOO_LONG = 2  # tp#1681 L3c: the model-written part is over MODEL_MAX_CHARS
-
-
-class ModelPartTooLong(StartRefused):
-    """The ``start -f`` model part is over ``handoff_doc.MODEL_MAX_CHARS`` (exit 2)."""
+#: tp#1681 L3c: once the exit of a model-written part over MODEL_MAX_CHARS. Never returned
+#: since tp#2172 D1 (the part is cut, the full text kept in a sidecar); kept for the hook's
+#: older texts that still name it.
+EXIT_MODEL_TOO_LONG = 2
 
 
 def effective_wait(wait: int, drain: int, provider_timeouts: list[float]) -> int:
@@ -395,13 +396,39 @@ def handoff_path(transfer_id: str) -> Path:
     return config.app_home() / "handoffs" / f"{transfer_id}.md"
 
 
-def preamble(transfer: Any, source_label: str, transcript: str) -> str:
+MODEL_FULL_SUFFIX = ".model-full.md"  # tp#2172 D1: the uncut model part
+FACTS_REST_SUFFIX = ".facts-rest.md"  # tp#2172 D2: the fact records moved out for size
+
+
+def sidecar_path(transfer: Any, suffix: str) -> Path:
+    """A handoff sidecar of *transfer*: ``<transfer><suffix>`` next to its handoff file."""
+    return Path(transfer.handoff_path).with_name(f"{transfer.transfer_id}{suffix}")
+
+
+def _sidecar_lines(model_full: str, facts_rest: str) -> str:
+    """The preamble's lines naming the sidecars (paths; ``""`` = none)."""
+    out = ""
+    if model_full:
+        out += (
+            f"The model part below was cut for size; its full text is at {model_full}: read "
+            "it only if a section below ends with `continued`.\n"
+        )
+    if facts_rest:
+        out += f"Fact records moved out of the handoff for size are listed at {facts_rest}.\n"
+    return out
+
+
+def preamble(
+    transfer: Any, source_label: str, transcript: str, *, model_full: str = "", facts_rest: str = ""
+) -> str:
     """D4: the short instruction block the successor reads before the handoff text.
 
     tp#1681 L3c: cut facts are fetched by KEY only (``facts <src> -k <key>``, the key each
     ``… cut`` line names), never as the whole snapshot; nothing here asks to re-claim work
     (ownership moves on ``accept`` through ``handoff_hooks``). tp#1681 L18: the successor's
     SessionStart hook may already have accepted; its note starts with ``AUTO_ACCEPT_HEAD``.
+    tp#2172 D1/D2: *model_full* / *facts_rest* name the sidecars of a cut model part and of
+    fact records moved out for size.
     """
     accepted_note = AUTO_ACCEPT_HEAD.format(transfer=transfer.transfer_id)
     return (
@@ -410,7 +437,8 @@ def preamble(transfer: Any, source_label: str, transcript: str) -> str:
         f"below is also stored at {transfer.handoff_path}"
         + (f"; the old session's transcript is {transcript} (evidence only)" if transcript else "")
         + ".\n"
-        f"FIRST, unless a SessionStart note reads `{accepted_note}` (the hook already "
+        + _sidecar_lines(model_full, facts_rest)
+        + f"FIRST, unless a SessionStart note reads `{accepted_note}` (the hook already "
         f"accepted it), run (pass the Bash tool timeout 600000: under load accept retries a "
         f"slow handoff hook itself for up to ~8 min): ccc continue-session accept "
         f"{transfer.transfer_id}\n"
@@ -595,9 +623,18 @@ def _reconcile_successor_aim(store: Store, transfer: Any) -> bool:
 
 
 def _create_successor(store: Store, transfer: Any, src: Source, text: str) -> None:
-    """The successor's draft job (idempotent): AIM, cwd, account, models, no_codex, prompt."""
+    """The successor's draft job (idempotent): AIM, cwd, account, models, no_codex, prompt.
+
+    The preamble names each sidecar of *transfer* that exists on disk (tp#2172 D1/D2)."""
     if store.get(transfer.target_session) is not None:
         return
+    named = {
+        key: str(path) if path.is_file() else ""
+        for key, path in (
+            ("model_full", sidecar_path(transfer, MODEL_FULL_SUFFIX)),
+            ("facts_rest", sidecar_path(transfer, FACTS_REST_SUFFIX)),
+        )
+    }
     unchecked = [g.text for g in store.list_subgoals(src.session_id) if not g.checked]
     aim, aim_set_by = _successor_aim(store, transfer)
     store.create_draft(
@@ -605,7 +642,7 @@ def _create_successor(store: Store, transfer: Any, src: Source, text: str) -> No
         transfer.cwd,
         aim,
         aim_set_by=aim_set_by,
-        prompt=preamble(transfer, src.label, str(src.transcript or "")) + text,
+        prompt=preamble(transfer, src.label, str(src.transcript or ""), **named) + text,
         no_codex=transfer.no_codex,
         llm_overseer=transfer.llm_overseer,
         llm_exec=transfer.llm_exec,
@@ -625,6 +662,49 @@ def _write_handoff(path: Path, text: str) -> None:
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
     os.replace(tmp, path)
+
+
+@dataclass(frozen=True)
+class Sidecars:
+    """The scrubbed texts ``start`` keeps beside a handoff (tp#2172 D1/D2): the uncut model
+    part (with its body size) and the fact records moved out for size; ``""`` = none."""
+
+    model_full: str = ""
+    model_chars: int = 0
+    facts_rest: str = ""
+
+
+NO_SIDECARS = Sidecars()
+
+
+def _model_full_note(chars: int, path: Path | str) -> str:
+    from . import handoff_doc
+
+    return (
+        f"note: model part {chars} chars, cut to {handoff_doc.MODEL_MAX_CHARS}; full text in {path}"
+    )
+
+
+def _write_sidecars(transfer: Any, sidecars: Sidecars) -> None:
+    """Write *transfer*'s sidecars next to its handoff (0600, already scrubbed); a failed
+    write only warns: the handoff itself is whole and every moved fact stays in the
+    snapshot (``facts -k``)."""
+    for text, suffix in (
+        (sidecars.model_full, MODEL_FULL_SUFFIX),
+        (sidecars.facts_rest, FACTS_REST_SUFFIX),
+    ):
+        if not text:
+            continue
+        path = sidecar_path(transfer, suffix)
+        try:
+            _write_handoff(path, text)
+        except OSError as exc:
+            print(f"warning: could not write {path}: {exc}", file=sys.stderr)
+            continue
+        if suffix == MODEL_FULL_SUFFIX:
+            print(_model_full_note(sidecars.model_chars, path), file=sys.stderr)
+        else:
+            print(f"note: fact records moved out for size: {path}", file=sys.stderr)
 
 
 def _mark_retired(transfer: Any) -> None:
@@ -782,24 +862,188 @@ def _say_source(record: dict[str, Any], transfer_id: str, as_json: bool) -> None
         print(line)
 
 
-def _wait_accepted(store: Store, transfer_id: str, timeout: float) -> Any:
-    from .transfer_store import ACCEPTED, FAILED, FINALIZED
+# ------------------------------------------------------- successor liveness (tp#2172 D4)
 
-    deadline = time.monotonic() + max(0.0, timeout)
+LAUNCH_GRACE_S = 120  # a successor still a draft this long after its (re)launch never started
+START_GRACE_ENV = "CCC_RELAY_START_GRACE_S"  # R1: 0 = an unregistered successor aborts at once
+START_GRACE_DEFAULT_S = 90  # registry entry missing this long after the draft cleared: dead
+NO_ACCEPT_ENV = "CCC_RELAY_NO_ACCEPT_S"
+NO_ACCEPT_DEFAULT_S = 240  # registered, transcript still, no accept: above tp#1805's 180 s hooks
+GONE_POLLS = 2  # a registered successor missing from the registry on this many polls in a row
+AUTO_RELAUNCHES = 1  # D5 (Q3): one automatic relaunch per `start` call
+STARTING = "starting"
+LIVE = "live"
+DEAD_PREFIX = "dead:"
+
+
+def _now_ms() -> int:
+    """Wall-clock epoch-ms of the liveness rules (a seam next to ``_monotonic``)."""
+    from .models import now_ms
+
+    return now_ms()
+
+
+def _knob(name: str, default: int, minimum: int) -> int:
+    """A whole-seconds environment knob; unset → *default*, invalid → *default* + a note."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = minimum - 1
+    if value < minimum:
+        print(
+            f"note: {name}={raw!r} is not a whole number of seconds >= {minimum}; using {default}",
+            file=sys.stderr,
+        )
+        return default
+    return value
+
+
+@dataclass
+class SuccessorWatch:  # pylint: disable=too-many-instance-attributes  # knobs + one wait's memory
+    """The liveness knobs of one ``start`` call and what ONE wait remembers (tp#2172 D4).
+
+    ``seen_registered`` / ``missing_polls`` turn a vanished registry entry into
+    ``dead:process-gone`` only after it was seen alive in THIS wait and then missed on
+    ``GONE_POLLS`` polls in a row; ``transcript_size`` / ``grown_at`` record the successor
+    transcript's growth for ``dead:no-accept``; ``launched_ms`` is when this call
+    (re)launched a still-draft successor (the never-started grace restarts there).
+    """
+
+    start_grace_s: int = START_GRACE_DEFAULT_S
+    no_accept_s: int = NO_ACCEPT_DEFAULT_S
+    launched_ms: int = 0
+    seen_registered: bool = False
+    missing_polls: int = 0
+    transcript_size: int = -1
+    grown_at: int = 0
+
+    @classmethod
+    def from_env(cls) -> SuccessorWatch:
+        """The knobs, read ONCE per call (an invalid value falls back with a stderr note)."""
+        return cls(
+            start_grace_s=_knob(START_GRACE_ENV, START_GRACE_DEFAULT_S, 0),
+            no_accept_s=_knob(NO_ACCEPT_ENV, NO_ACCEPT_DEFAULT_S, 1),
+        )
+
+    def fresh(self) -> SuccessorWatch:
+        """Same knobs, no memory: the watch of a relaunched successor."""
+        return SuccessorWatch(start_grace_s=self.start_grace_s, no_accept_s=self.no_accept_s)
+
+
+def _transcript_growth(
+    adapter: ClaudeAdapter, transfer: Any, now: int, watch: SuccessorWatch
+) -> int:
+    """Epoch-ms of the successor transcript's last growth (its mtime, or a size change this
+    wait observed); 0 while it has no transcript."""
+    try:
+        path = adapter.transcript_path(
+            transfer.cwd, transfer.target_session, transfer.target_config_dir or None
+        )
+        stat = path.stat() if path is not None else None
+    except OSError:
+        stat = None
+    if stat is None:
+        return watch.grown_at
+    if 0 <= watch.transcript_size != stat.st_size:
+        watch.grown_at = now
+    watch.transcript_size = stat.st_size
+    return max(watch.grown_at, int(stat.st_mtime * 1000))
+
+
+def successor_state(
+    store: Store,
+    adapter: ClaudeAdapter,
+    transfer: Any,
+    now: int,
+    watch: SuccessorWatch | None = None,
+) -> str:
+    """``starting`` | ``live`` | ``dead:<why>`` for *transfer*'s successor (tp#2172 D4).
+
+    * ``dead:never-started`` — still a draft ``LAUNCH_GRACE_S`` after ``opened_at`` (or this
+      call's relaunch of it);
+    * ``starting`` / ``dead:never-registered`` — no longer a draft but no live entry in
+      Claude's registry, less / at least ``start_grace_s`` after ``target_launched_at``
+      (claude registers some seconds after its draft clears);
+    * ``dead:process-gone`` — an entry seen alive in this wait is gone or its pid dead on
+      ``GONE_POLLS`` polls in a row (no grace: a closed tab ends the process);
+    * ``dead:no-accept`` — registered and alive, but no transcript growth and no accept for
+      ``no_accept_s`` since ``target_launched_at`` or the last growth (a folder-trust
+      prompt, a stalled hook);
+    * ``live`` — anything else. An unreadable registry gives no verdict on that poll.
+
+    Liveness is the adapter's registry read only, never a ``ps`` of some pid. *watch*
+    carries the per-wait memory (a fresh one per call when omitted).
+    """
+    watch = watch if watch is not None else SuccessorWatch.from_env()
+    target = transfer.target_session
+    row = store.get(target)
+    if row is None or row.draft:
+        since = max(transfer.opened_at or transfer.created_at, watch.launched_ms)
+        return DEAD_PREFIX + "never-started" if now - since >= LAUNCH_GRACE_S * 1000 else STARTING
+    launched = transfer.target_launched_at or transfer.opened_at or transfer.created_at
+    try:
+        alive = any(e.session_id == target and e.alive for e in adapter.discover())
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return LIVE if watch.seen_registered else STARTING
+    if not alive:
+        if watch.seen_registered:
+            watch.missing_polls += 1
+            return DEAD_PREFIX + "process-gone" if watch.missing_polls >= GONE_POLLS else LIVE
+        if now - launched >= watch.start_grace_s * 1000:
+            return DEAD_PREFIX + "never-registered"
+        return STARTING
+    watch.seen_registered, watch.missing_polls = True, 0
+    last = max(launched, _transcript_growth(adapter, transfer, now, watch))
+    return DEAD_PREFIX + "no-accept" if now - last >= watch.no_accept_s * 1000 else LIVE
+
+
+def _wait_accepted_or_dead(
+    store: Store, adapter: ClaudeAdapter, transfer_id: str, deadline: float, watch: SuccessorWatch
+) -> tuple[Any, str]:
+    """Poll *transfer_id* until it leaves ``prepared``/``opened``, its successor is dead,
+    or *deadline* (``_monotonic``) passes: ``(transfer, "")`` or ``(transfer, "dead:<why>")``.
+
+    Every poll first refreshes the transfer's ``start_pid``/``start_heartbeat_at`` (D5:
+    the daemon sweep leaves a transfer with a fresh heartbeat to this call)."""
+    from .transfer_store import OPENED, PREPARED
+
+    pid = os.getpid()
     while True:
+        store.heartbeat_transfer(transfer_id, pid, _now_ms())
         current = store.get_transfer(transfer_id)
-        if current is None or current.state in (ACCEPTED, FINALIZED, FAILED):
-            return current
-        if time.monotonic() >= deadline:
-            return current
+        if current is None or current.state not in (PREPARED, OPENED):
+            return current, ""
+        verdict = successor_state(store, adapter, current, _now_ms(), watch)
+        if verdict.startswith(DEAD_PREFIX):
+            return current, verdict
+        if _monotonic() >= deadline:
+            return current, ""
         _sleep(ACCEPT_POLL_SEC)
 
 
-def _dry_run(transfer: Any, src: Source, text: str, as_json: bool) -> int:
+class SuccessorDied(StartRefused):
+    """The successor died and the one automatic relaunch did not save it (exit 1)."""
+
+
+def _dry_run(
+    transfer: Any, src: Source, text: str, as_json: bool, sidecars: Sidecars = NO_SIDECARS
+) -> int:
     from . import launch_argv
     from .models import LLM_MODEL_IDS
 
-    prompt = preamble(transfer, src.label, str(src.transcript or "")) + text
+    named = {"model_full": "", "facts_rest": ""}
+    if sidecars.model_full:
+        named["model_full"] = str(sidecar_path(transfer, MODEL_FULL_SUFFIX))
+        print(
+            _model_full_note(sidecars.model_chars, named["model_full"]) + " (dry run: not written)",
+            file=sys.stderr,
+        )
+    if sidecars.facts_rest:
+        named["facts_rest"] = str(sidecar_path(transfer, FACTS_REST_SUFFIX))
+    prompt = preamble(transfer, src.label, str(src.transcript or ""), **named) + text
     # The successor launches through `ccc start-job`, which feeds this prompt on claude's
     # STDIN, never in argv (tp#1681 L23/L24): the dry run shows the same split.
     argv = launch_argv.claude_argv(
@@ -826,70 +1070,264 @@ def _account_change_note(src: Source, transfer: Any) -> str:
     return f"note: the account changes {src.label or '?'} → {transfer.target_label}"
 
 
-def _reuse_or_create(store: Store, candidate: Any, now: int) -> Any:
-    """The transfer to drive: an exact-match active one (retry), or a fresh one."""
+#: How the D6 note names a snapshot field this call could not apply (the flag that set it);
+#: the account (``target_config_dir`` / ``target_label``) is named on its own.
+_IGNORED_FIELD_NAMES = {
+    "prompt_sha256": "handoff text",
+    "llm_overseer": "overseer -O",
+    "llm_exec": "executor -E",
+}
+_ACCOUNT_FIELDS = ("target_config_dir", "target_label")
+
+
+@dataclass
+class _Chosen:
+    """The transfer ``start`` drives; ``ignored`` non-empty = an ACTIVE transfer with a
+    live or starting successor is driven as stored (its handoff file is never rewritten)
+    and these fields of this call are ignored (tp#2172 D6)."""
+
+    transfer: Any
+    ignored: list[str] = field(default_factory=list)
+
+
+def _ignored_fields(active: Any, candidate: Any) -> list[str]:
+    """The D6 note's names of the fields where *candidate* differs from *active*."""
+    names: list[str] = []
+    for name in active.differs(candidate):
+        if name in _ACCOUNT_FIELDS:
+            account = (
+                f"account -A {candidate.target_label} (the successor stays on account "
+                f"{active.target_label})"
+            )
+            if account not in names:
+                names.append(account)
+            continue
+        names.append(_IGNORED_FIELD_NAMES.get(name, name))
+    return names
+
+
+def _settle_active(
+    store: Store, adapter: ClaudeAdapter, active: Any, candidate: Any
+) -> _Chosen | None:
+    """D6 on an active transfer that this call meets: a :class:`_Chosen` to drive, or
+    ``None`` once a differing transfer with a dead successor is aborted (``superseded``)."""
+    from .transfer_store import OPENED, PREPARED
+
+    ignored = _ignored_fields(active, candidate)
+    if not ignored:
+        return _Chosen(active)  # the identical re-run: drive it as before
+    verdict = LIVE
+    if active.state in (PREPARED, OPENED):
+        verdict = successor_state(store, adapter, active, _now_ms())
+    tid = active.transfer_id
+    if verdict.startswith(DEAD_PREFIX):  # dead or never started: no successor will accept it
+        code, message = abort_transfer(store, tid, "superseded", _now_ms())
+        print(
+            f"note: transfer {tid}'s successor is {verdict}; superseded by this call: {message}"
+            if code == 0
+            else f"warning: {message}",  # accepted meanwhile: the re-read drives it
+            file=sys.stderr,
+        )
+        return None
+    print(
+        f"note: transfer {tid}'s successor {active.target_session} is {verdict} "
+        f"({active.state}); it keeps the handoff it was given; ignored from this call: "
+        + ", ".join(ignored),
+        file=sys.stderr,
+    )
+    return _Chosen(active, ignored)
+
+
+def _reuse_or_create(store: Store, adapter: ClaudeAdapter, candidate: Any, now: int) -> _Chosen:
+    """The transfer to drive (tp#2172 D6): an identical active one (a retry); a differing
+    active one whose successor is live or starting, as stored; else a fresh one (a
+    differing active transfer with a dead successor is aborted first). A concurrent
+    create (``TransferConflict``) is re-read once and judged by the same rules."""
     from .transfer_store import TransferConflict, new_transfer_id
 
-    active = store.active_transfer(candidate.source_session)
-    if active is not None:
-        differing = active.differs(candidate)
-        if differing:
-            raise StartRefused(
-                f"transfer {active.transfer_id} ({active.state}) is already active for this "
-                f"session with different {', '.join(differing)} — see "
-                f"`ccc continue-session status {active.transfer_id}`"
-            )
-        return active
-    candidate.transfer_id = new_transfer_id()
-    candidate.target_session = str(uuid.uuid4())
-    candidate.handoff_path = str(handoff_path(candidate.transfer_id))
+    for _attempt in range(2):
+        active = store.active_transfer(candidate.source_session)
+        if active is not None:
+            chosen = _settle_active(store, adapter, active, candidate)
+            if chosen is not None:
+                return chosen
+        candidate.transfer_id = new_transfer_id()
+        candidate.target_session = str(uuid.uuid4())
+        candidate.handoff_path = str(handoff_path(candidate.transfer_id))
+        try:
+            return _Chosen(store.create_transfer(candidate, now))
+        except TransferConflict:
+            continue  # another start created one meanwhile: judge that one
+    raise StartRefused("another transfer of this session started concurrently; re-run start")
+
+
+def _driven_text(chosen: _Chosen, text: str) -> str:
+    """The handoff text to drive *chosen* with: the STORED one when this call's fields are
+    ignored (D6; this call's *text* only when the stored file is unreadable)."""
+    if not chosen.ignored:
+        return text
     try:
-        return store.create_transfer(candidate, now)
-    except TransferConflict as exc:
-        raise StartRefused("another transfer of this session started concurrently") from exc
+        return Path(chosen.transfer.handoff_path).read_text(encoding="utf-8") or text
+    except OSError:
+        return text
 
 
-def _drive(store: Store, transfer: Any, src: Source, text: str, args: Any) -> int:
-    """Launch (or re-launch) the successor, wait for ``accepted``, finalize."""
-    from .models import now_ms
-    from .transfer_store import ACCEPTED, FAILED, FINALIZED, OPENED, PREPARED
+def _open_target(  # pylint: disable=too-many-arguments
+    store: Store,
+    transfer: Any,
+    src: Source,
+    text: str,
+    watch: SuccessorWatch,
+    *,
+    rewrite: bool = True,
+    sidecars: Sidecars = NO_SIDECARS,
+) -> int | None:
+    """Write the handoff, create and (re)launch a still-draft successor: ``None`` = go on
+    waiting, else the exit code of a refused or failed launch (already reported).
 
-    if transfer.state in (PREPARED, OPENED):
+    ``rewrite=False`` (D6: a differing re-run meets a live or starting successor) leaves
+    the stored handoff file untouched: the successor already read it. A rewrite also writes
+    this call's *sidecars* next to it (tp#2172 D1/D2), before the successor's preamble names
+    them."""
+    from .transfer_store import FAILED, OPENED, PREPARED
+
+    if transfer.state not in (PREPARED, OPENED):
+        return None
+    if rewrite:
         _write_handoff(Path(transfer.handoff_path), text)
-        try:  # re-resolved from its name before every (re)launch, never from a snapshot
-            _checked_profile(transfer.launch_profile)
-        except StartRefused as exc:
-            if transfer.state == PREPARED:
-                store.transition_transfer(
-                    transfer.transfer_id, FAILED, now_ms(), failure=f"launch: {exc}"[:200]
-                )
-                if store.get(transfer.target_session) is not None:
-                    store.update_fields(transfer.target_session, archived=True)
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
-        _create_successor(store, transfer, src, text)
-        target_row = store.get(transfer.target_session)
-        if target_row is not None and target_row.draft:  # never started: (re)launch it
-            launcher = _launch(transfer.target_session)
-            if not launcher:
-                if transfer.state == PREPARED:
-                    store.transition_transfer(
-                        transfer.transfer_id, FAILED, now_ms(), failure="launch: no terminal tab"
-                    )
-                    store.update_fields(transfer.target_session, archived=True)
-                print(
-                    "error: could not open a terminal tab for the successor — the source "
-                    "session is unchanged",
-                    file=sys.stderr,
-                )
-                return 1
-            store.note_transfer(transfer.transfer_id, now_ms(), launcher=launcher)
-            store.transition_transfer(transfer.transfer_id, OPENED, now_ms())
-            print(
-                f"opened: successor {transfer.target_session} on {transfer.target_label} "
-                f"({launcher}); waiting for it to accept transfer {transfer.transfer_id}"
+        _write_sidecars(transfer, sidecars)
+    try:  # re-resolved from its name before every (re)launch, never from a snapshot
+        _checked_profile(transfer.launch_profile)
+    except StartRefused as exc:
+        if transfer.state == PREPARED:
+            store.transition_transfer(
+                transfer.transfer_id, FAILED, _now_ms(), failure=f"launch: {exc}"[:200]
             )
-    current = _wait_accepted(store, transfer.transfer_id, float(args.wait))
+            if store.get(transfer.target_session) is not None:
+                store.update_fields(transfer.target_session, archived=True)
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    _create_successor(store, transfer, src, text)
+    target_row = store.get(transfer.target_session)
+    if target_row is None or not target_row.draft:
+        return None
+    launcher = _launch(transfer.target_session)  # never started: (re)launch it
+    if not launcher:
+        if transfer.state == PREPARED:
+            store.transition_transfer(
+                transfer.transfer_id, FAILED, _now_ms(), failure="launch: no terminal tab"
+            )
+            store.update_fields(transfer.target_session, archived=True)
+        print(
+            "error: could not open a terminal tab for the successor — the source "
+            "session is unchanged",
+            file=sys.stderr,
+        )
+        return 1
+    watch.launched_ms = _now_ms()
+    store.note_transfer(transfer.transfer_id, watch.launched_ms, launcher=launcher)
+    store.transition_transfer(transfer.transfer_id, OPENED, watch.launched_ms)
+    print(
+        f"opened: successor {transfer.target_session} on {transfer.target_label} "
+        f"({launcher}); waiting for it to accept transfer {transfer.transfer_id}"
+    )
+    return None
+
+
+def _abort_dead(store: Store, transfer: Any, verdict: str) -> Any | None:
+    """Abort *transfer* for its dead successor (D3's core); ``None`` once it is failed, or
+    the re-read transfer when it was accepted meanwhile (then it is finalized, not
+    relaunched)."""
+    from .transfer_store import ACCEPTED, FINALIZED
+
+    why = verdict.removeprefix(DEAD_PREFIX)
+    code, message = abort_transfer(store, transfer.transfer_id, f"successor dead: {why}", _now_ms())
+    print(f"note: {message}" if code == 0 else f"warning: {message}", file=sys.stderr)
+    current = store.get_transfer(transfer.transfer_id)
+    if current is not None and current.state in (ACCEPTED, FINALIZED):
+        return current
+    return None
+
+
+def _relaunch_candidate(dead: Any) -> Any:
+    """The relaunch's transfer: the dead one's snapshot (same text, digest, accounts,
+    models, facts snapshot), every per-transfer field reset (``_reuse_or_create`` gives
+    it a new id, target and handoff path)."""
+    from .transfer_store import PREPARED
+
+    return dataclasses.replace(
+        dead,
+        transfer_id="",
+        target_session="",
+        handoff_path="",
+        launcher="",
+        state=PREPARED,
+        failure="",
+        created_at=0,
+        opened_at=0,
+        accepted_at=0,
+        finalized_at=0,
+        updated_at=0,
+        target_launched_at=0,
+        start_pid=0,
+        start_heartbeat_at=0,
+    )
+
+
+def _drive(  # pylint: disable=too-many-locals,too-many-arguments
+    store: Store,
+    transfer: Any,
+    src: Source,
+    text: str,
+    args: Any,
+    *,
+    rewrite: bool = True,
+    sidecars: Sidecars = NO_SIDECARS,
+) -> int:
+    """Launch (or re-launch) the successor, wait for ``accepted``, finalize.
+
+    A dead successor (``successor_state``) aborts its transfer and gets ONE automatic
+    relaunch (tp#2172 D5): a fresh transfer with the same snapshot and text, launched and
+    waited for inside the SAME ``-w`` budget; a second death raises :class:`SuccessorDied`.
+    ``rewrite=False`` keeps *transfer*'s stored handoff file as it is (D6); a relaunch
+    writes its own new file. *sidecars* (tp#2172 D1/D2) are written next to every handoff
+    file this call writes: they exist only once the transfer id does.
+    """
+    from .transfer_store import ACCEPTED, FAILED, FINALIZED
+
+    watch = SuccessorWatch.from_env()
+    deadline = _monotonic() + max(0.0, float(args.wait))
+    adapter = _adapter()
+    code = _open_target(store, transfer, src, text, watch, rewrite=rewrite, sidecars=sidecars)
+    if code is not None:
+        return code
+    current, dead = _wait_accepted_or_dead(store, adapter, transfer.transfer_id, deadline, watch)
+    deaths: list[str] = []
+    while dead:
+        why = dead.removeprefix(DEAD_PREFIX)
+        healed = _abort_dead(store, current, dead)
+        if healed is not None:  # accepted between the verdict and the abort: finalize it
+            current = healed
+            break
+        deaths.append(why)
+        first = current.target_session
+        if len(deaths) > AUTO_RELAUNCHES:
+            raise SuccessorDied(f"successor died twice: {'; '.join(deaths)}; nothing moved")
+        try:
+            chosen = _reuse_or_create(store, adapter, _relaunch_candidate(current), _now_ms())
+        except StartRefused as exc:
+            raise SuccessorDied(f"successor {first} died ({why}); no relaunch: {exc}") from exc
+        transfer, text = chosen.transfer, _driven_text(chosen, text)
+        print(f"relaunched: successor {transfer.target_session} (first {first} died: {why})")
+        watch = watch.fresh()
+        code = _open_target(
+            store, transfer, src, text, watch, rewrite=not chosen.ignored, sidecars=sidecars
+        )
+        if code is not None:
+            return code
+        current, dead = _wait_accepted_or_dead(
+            store, adapter, transfer.transfer_id, deadline, watch
+        )
     if current is None or current.state == FAILED:
         print(f"error: transfer {transfer.transfer_id} failed: {current and current.failure}")
         return 1
@@ -932,6 +1370,7 @@ class _Composed:
     digest: str
     snapshot: str = ""
     failed_required: list[tuple[str, str]] = field(default_factory=list)  # (name, error)
+    sidecars: Sidecars = NO_SIDECARS  # tp#2172 D1/D2: written by _drive once the id exists
 
 
 def _failed_required(snap_doc: dict[str, Any] | None) -> list[tuple[str, str]]:
@@ -948,9 +1387,12 @@ def _failed_required(snap_doc: dict[str, Any] | None) -> list[tuple[str, str]]:
     return out
 
 
-def _reused(text: str, digest: str, sid: str, snapshot: str) -> _Composed:
+def _reused(
+    text: str, digest: str, sid: str, snapshot: str, sidecars: Sidecars = NO_SIDECARS
+) -> _Composed:
     """A reused composed text, with the failed required providers of its stored snapshot."""
-    return _Composed(text, digest, snapshot, _failed_required(_stored_snapshot(sid, snapshot)))
+    failed = _failed_required(_stored_snapshot(sid, snapshot))
+    return _Composed(text, digest, snapshot, failed, sidecars)
 
 
 def _say_failed_required(args: argparse.Namespace, sid: str, composed: _Composed) -> None:
@@ -1003,10 +1445,14 @@ def _finish(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     sid: str,
     args: Any,
     generated: bool = False,
+    uncut: tuple[Any, Sidecars] | None = None,
 ) -> _Composed:
     """Compose the model part with the snapshot (D1, D9) and keep a cut original.
 
     *generated* (facts-only / capped) lets compose cut the model bodies to fit (tp#1835).
+    *uncut* (tp#2172 D1): ``(digest model, sidecars)`` of a ``start -f`` part cut to
+    ``MODEL_MAX_CHARS``: the digest comes from the UNCUT part, so an identical re-run still
+    matches. Fact records moved out for size (D2) join the sidecars, scrubbed.
     """
     from . import handoff_doc, handoff_facts
 
@@ -1021,9 +1467,28 @@ def _finish(  # pylint: disable=too-many-arguments,too-many-positional-arguments
             handoff_facts.write_private(model_path, handoff_facts.Scrubber().text(model.raw))
         except handoff_facts.FactsError as exc:
             raise StartRefused(f"facts collection refused — {exc}") from exc
+    digest_model, sidecars = uncut if uncut is not None else (model, NO_SIDECARS)
+    if composed.rest:
+        rest = _scrubbed("the facts-rest sidecar", composed.rest)
+        sidecars = dataclasses.replace(sidecars, facts_rest=rest)
     return _Composed(
-        doc.text, handoff_doc.model_digest(model, snapshot), snapshot, _failed_required(snap_doc)
+        doc.text,
+        handoff_doc.model_digest(digest_model, snapshot),
+        snapshot,
+        _failed_required(snap_doc),
+        sidecars,
     )
+
+
+def _scrubbed(what: str, text: str) -> str:
+    """*text* through the handoff's fail-closed scrub (tp#2172 D1/D2); a refusal refuses
+    ``start`` before anything is written."""
+    from . import handoff_doc
+
+    scrubbed, refusal = handoff_doc.scrub_text(text)
+    if refusal:
+        raise StartRefused(f"handoff rejected — {what}: {refusal}")
+    return scrubbed
 
 
 def _compose_generated(
@@ -1066,7 +1531,9 @@ def _compose(  # pylint: disable=too-many-arguments,too-many-positional-argument
     snapshot and stored composed text, no recollection): its digest is recomputed from the
     given model file and the stored snapshot id, so a changed ledger cannot fork a retry.
     ``--facts-only`` / ``--capped`` generate the model part (:func:`_compose_generated`);
-    a transfer from before snapshots keeps the whole-document path.
+    a transfer from before snapshots keeps the whole-document path. A model part over
+    ``MODEL_MAX_CHARS`` is cut, never refused (tp#2172 D1): the digest is taken from the
+    UNCUT part and the scrubbed full text rides along for :func:`_drive` to write.
     """
     from . import handoff_doc
     from .transfer_store import OPENED, PREPARED
@@ -1078,20 +1545,19 @@ def _compose(  # pylint: disable=too-many-arguments,too-many-positional-argument
         if not doc.ok:
             raise StartRefused("handoff rejected — " + "; ".join(doc.errors))
         return _Composed(doc.text, doc.sha256)
-    model = handoff_doc.parse_model_file(raw)
+    kept, full = handoff_doc.fit_model_part(raw)
+    model = handoff_doc.parse_model_file(kept if full else raw)
+    digest_model, sidecars = _uncut(raw, full) if full and model.ok else (model, NO_SIDECARS)
     sid = src.session_id
     retry = active is not None and active.state in (PREPARED, OPENED)
-    if retry and model.ok:  # the identical re-run of a stored transfer is never re-capped
-        digest = handoff_doc.model_digest(model, active.facts_snapshot)
+    if retry and model.ok:  # the identical re-run of a stored transfer is never re-composed
+        digest = handoff_doc.model_digest(digest_model, active.facts_snapshot)
         try:
             stored = Path(active.handoff_path).read_text(encoding="utf-8")
         except OSError:
             stored = ""
         if stored and digest == active.prompt_sha256:
-            return _reused(stored, digest, sid, active.facts_snapshot)
-    too_long = handoff_doc.model_chars_error(raw)
-    if too_long:
-        raise ModelPartTooLong("handoff rejected — " + too_long)
+            return _reused(stored, digest, sid, active.facts_snapshot, sidecars)
     if not model.ok:
         raise StartRefused("handoff rejected — " + "; ".join(model.errors))
     if retry:
@@ -1101,7 +1567,21 @@ def _compose(  # pylint: disable=too-many-arguments,too-many-positional-argument
         snapshot = active.facts_snapshot
     else:
         snap_doc, snapshot, _scrubber = _snapshot(adapter, store, src, args)
-    return _finish(model, snap_doc, snapshot, sid, args)
+    return _finish(model, snap_doc, snapshot, sid, args, uncut=(digest_model, sidecars))
+
+
+def _uncut(raw: bytes, full: str) -> tuple[Any, Sidecars]:
+    """``(digest model, sidecars)`` of a ``start -f`` part cut to ``MODEL_MAX_CHARS``
+    (tp#2172 D1): the UNCUT part's digest model (its parse, or the sha256 of its *full*
+    text when only the whole file fails a check the cut one passes, e.g. the 10 KB cap)
+    and the scrubbed full text."""
+    from . import handoff_doc
+
+    whole = handoff_doc.parse_model_file(raw)
+    if not whole.ok:
+        whole = handoff_doc.ModelPart(sha256=hashlib.sha256(full.encode("utf-8")).hexdigest())
+    text = _scrubbed("the full model part", full)
+    return whole, Sidecars(model_full=text, model_chars=handoff_doc.model_chars(full))
 
 
 def _transcript_stamp(path: Path | None) -> tuple[int, int] | None:
@@ -1220,9 +1700,6 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
             )
         try:
             composed = _compose(adapter, store, src, raw, active, args)
-        except ModelPartTooLong as exc:
-            _fail(args, src.session_id, str(exc))
-            return EXIT_MODEL_TOO_LONG
         except StartRefused as exc:
             return _fail(args, src.session_id, str(exc))
         _say_failed_required(args, src.session_id, composed)
@@ -1237,11 +1714,23 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
             if args.dry_run:
                 candidate.transfer_id = "<transfer>"
                 candidate.handoff_path = str(handoff_path("<transfer>"))
-                return _dry_run(candidate, src, composed.text, args.json)
-            transfer = _reuse_or_create(store, candidate, now_ms())
+                return _dry_run(candidate, src, composed.text, args.json, composed.sidecars)
+            chosen = _reuse_or_create(store, adapter, candidate, now_ms())
         except StartRefused as exc:
             return _fail(args, src.session_id, str(exc))
-        code = _drive(store, transfer, src, composed.text, args)
+        transfer = chosen.transfer
+        try:
+            code = _drive(
+                store,
+                transfer,
+                src,
+                _driven_text(chosen, composed.text),
+                args,
+                rewrite=not chosen.ignored,
+                sidecars=composed.sidecars,
+            )
+        except SuccessorDied as exc:  # both successors died: two failed rows, nothing moved
+            return _fail(args, src.session_id, str(exc))
         if code not in (0, EXIT_WAITING):
             return _fail(args, src.session_id, f"transfer {transfer.transfer_id} did not open")
         return code
@@ -1587,9 +2076,11 @@ def accept_as(  # pylint: disable=too-many-return-statements
 ) -> int:
     """The ``accept`` core with the caller's session id passed in: the CLI passes its
     session env, the SessionStart hook (which may lack it) its payload id (tp#1681 L18)."""
+    import sqlite3
+
     from . import accounts
     from .models import now_ms
-    from .transfer_store import ACCEPTED, FINALIZED, OPENED, PREPARED
+    from .transfer_store import ACCEPTED, FAILED, FINALIZED, OPENED, PREPARED
 
     transfer = store.get_transfer(transfer_id)
     if transfer is None:
@@ -1612,6 +2103,12 @@ def accept_as(  # pylint: disable=too-many-return-statements
     if transfer.state in (ACCEPTED, FINALIZED):
         return _accept_again(store, transfer, as_json)
     if transfer.state not in (PREPARED, OPENED):
+        if transfer.state == FAILED:
+            # tp#2172 D13: the daemon sweep closes this orphan successor's tab.
+            try:
+                store.record_accept_refusal(transfer.transfer_id, caller, now_ms())
+            except sqlite3.Error as exc:
+                print(f"warning: the refusal was not recorded ({exc})", file=sys.stderr)
         print(
             f"error: transfer {transfer.transfer_id} is {transfer.state}: "
             f"{transfer.failure or 'no longer acceptable'}",
@@ -1663,7 +2160,6 @@ def auto_accept(store: Store, session_id: str, inbound: list[Any], corrupt: int,
     manual ``accept``. Hooks get ``min(accept_hook_timeout_sec, 45 s)`` in all, no retry.
     """
     import contextlib
-    import dataclasses
     import io
 
     if corrupt or len(inbound) != 1:
@@ -1726,14 +2222,15 @@ def _print_accepted(transfer: Any, steps: list[str], source: dict[str, Any], as_
 def recovery_step(transfer: Any, target_is_draft: bool) -> str:
     """The exact next step for *transfer* in its current state."""
     tid = transfer.transfer_id
+    abort = f"; to give it up: `ccc continue-session abort {tid}` (nothing has moved yet)"
     return {
-        "prepared": "re-run the same `ccc continue-session start` in the source session",
+        "prepared": "re-run the same `ccc continue-session start` in the source session" + abort,
         "opened": (
             "re-run the same `ccc continue-session start` in the source session (the "
-            "successor never started; it relaunches it)"
+            "successor never started; it relaunches it)" + abort
             if target_is_draft
             else f"in the successor run `ccc continue-session accept {tid}`; if its tab is "
-            f"gone: `ccc resume {transfer.target_session}` and accept there"
+            f"gone: `ccc resume {transfer.target_session}` and accept there" + abort
         ),
         "accepted": (
             "nothing in the source — accept finalizes it and closes its tab in the background "
@@ -1780,6 +2277,136 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+ABORT_DEFAULT_REASON = "by hand"
+ABORT_PREFIX = "aborted: "  # the ``failure`` text of an aborted transfer starts with this
+
+
+@dataclass
+class _Abort:  # pylint: disable=too-many-instance-attributes  # one report row
+    """What one ``abort`` did (or why it did nothing)."""
+
+    code: int
+    message: str
+    transfer: str
+    state: str = ""  # the state after the call ("" = no such transfer)
+    was: str = ""  # the state before it
+    changed: bool = False
+    released: list[int] = field(default_factory=list)  # await groups handed back to the source
+    archived: bool = False  # the draft successor row was archived
+    next_step: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.code == 0,
+            "transfer": self.transfer,
+            "state": self.state,
+            "was": self.was,
+            "changed": self.changed,
+            "released_awaits": self.released,
+            "archived_successor": self.archived,
+            "message": self.message,
+            "next": self.next_step,
+        }
+
+
+def _abort(store: Store, transfer_id: str, reason: str, now: int) -> _Abort:
+    """The ``abort`` core: CAS ``prepared|opened → failed`` with ``aborted: <reason>``.
+
+    ``accepted`` is refused (ownership moved; there is no ``accepted → failed`` edge and
+    the successor already holds the work): its accept finalizes it. ``finalized``/``failed``
+    are reported unchanged (idempotent). A lost CAS (the state moved under us) is re-read
+    once and judged again, so a concurrent accept is refused, never overwritten.
+    """
+    from .transfer_store import ACCEPTED, FAILED, OPENED, PREPARED
+
+    failure = (ABORT_PREFIX + (" ".join(reason.split()) or ABORT_DEFAULT_REASON))[:200]
+    for _attempt in range(2):
+        transfer = store.get_transfer(transfer_id)
+        if transfer is None:
+            return _Abort(1, f"no such transfer {transfer_id}", transfer_id)
+        tid, target = transfer.transfer_id, transfer.target_session
+        if transfer.state == ACCEPTED:
+            return _Abort(
+                1,
+                f"transfer {tid} is accepted: ownership already moved to {target}, so it "
+                f"cannot be aborted; run `ccc continue-session accept {tid}` in the successor "
+                "to finalize",
+                tid,
+                state=ACCEPTED,
+                was=ACCEPTED,
+                next_step=f"in the successor {target} run `ccc continue-session accept {tid}`",
+            )
+        if transfer.state not in (PREPARED, OPENED):
+            note = f" ({transfer.failure})" if transfer.state == FAILED and transfer.failure else ""
+            return _Abort(
+                0,
+                f"transfer {tid} already {transfer.state}{note}; nothing changed",
+                tid,
+                state=transfer.state,
+                was=transfer.state,
+            )
+        reserved = [group.id for group in store.reserved_awaits(tid)]
+        if not store.transition_transfer(tid, FAILED, now, failure=failure):
+            continue  # the state moved between the read and the CAS: judge it again
+        row = store.get(target)
+        archived = row is not None and bool(row.draft)
+        if archived:  # never launched, or launched and never started: as `_drive`'s launch failure
+            store.update_fields(target, archived=True)
+        what = [f"transfer {tid} {transfer.state} → failed ({failure})"]
+        if reserved:
+            what.append(f"released {len(reserved)} await group(s) to the source")
+        if archived:
+            what.append(f"archived the never-started successor {target}")
+        elif row is not None:
+            what.append(
+                f"the successor {target} was started and stays open: its accept now "
+                "refuses; close its tab"
+            )
+        step = (
+            "nothing moved; to hand off again re-run `ccc continue-session start` in the "
+            f"source session {transfer.source_session} (a new transfer)"
+        )
+        return _Abort(
+            0,
+            "aborted: " + "; ".join(what),
+            tid,
+            state=FAILED,
+            was=transfer.state,
+            changed=True,
+            released=reserved,
+            archived=archived,
+            next_step=step,
+        )
+    return _Abort(1, f"transfer {transfer_id} kept changing state; try again", transfer_id)
+
+
+def abort_transfer(store: Store, transfer_id: str, reason: str, now: int) -> tuple[int, str]:
+    """Fail an active (``prepared``/``opened``) transfer: ``(exit code, message)``.
+
+    The reusable core of ``continue-session abort`` (and of the dead-successor relaunch
+    and the daemon sweep): ``failure = "aborted: <reason>"``, the reserved await groups
+    released (the ``failed`` CAS's transaction), a draft successor archived."""
+    done = _abort(store, transfer_id, reason, now)
+    return done.code, done.message
+
+
+def cmd_abort(args: argparse.Namespace) -> int:
+    """``continue-session abort``: give up an active transfer whose successor is stuck."""
+    from .models import now_ms
+    from .store import Store
+
+    with Store() as store:
+        done = _abort(store, args.transfer, args.reason or "", now_ms())
+    if args.json:
+        print(json.dumps(done.to_dict()))
+        return done.code
+    stream = sys.stdout if done.code == 0 else sys.stderr
+    print(done.message if done.code == 0 else f"error: {done.message}", file=stream)
+    if done.next_step:
+        print(f"next: {done.next_step}", file=stream)
+    return done.code
+
+
 _VERBS = {
     "state": cmd_state,
     "template": cmd_template,
@@ -1787,6 +2414,7 @@ _VERBS = {
     "start": cmd_start,
     "accept": cmd_accept,
     "status": cmd_status,
+    "abort": cmd_abort,
 }
 
 
@@ -1925,6 +2553,28 @@ def add_parser(sub: Any) -> None:
     p_status.add_argument("transfer", nargs="?", help="transfer id (default: this session's)")
     p_status.add_argument("-s", "--session", help="list the transfers of this session id")
     p_status.add_argument("-j", "--json", action="store_true", help="JSON output")
+
+    p_abort = verbs.add_parser(
+        "abort",
+        help="give up a prepared/opened transfer (stuck or dead successor); nothing moves",
+        description=(
+            "Fail an active transfer: prepared|opened → failed with 'aborted: <reason>'. "
+            "The reserved await groups go back to the source and a never-started successor "
+            "is archived; a started successor tab stays open (its accept then refuses). An "
+            "accepted transfer is refused (ownership already moved: accept it in the "
+            "successor); a finalized or failed one is reported unchanged (exit 0)."
+        ),
+        epilog="example:\n  ccc continue-session abort t0123456789ab -r 'successor hung'",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_abort.add_argument("transfer", help="the transfer id (see `continue-session status`)")
+    p_abort.add_argument(
+        "-r",
+        "--reason",
+        default=ABORT_DEFAULT_REASON,
+        help=f"recorded as 'aborted: REASON' (default {ABORT_DEFAULT_REASON!r})",
+    )
+    p_abort.add_argument("-j", "--json", action="store_true", help="JSON output")
 
     from . import handoff_facts, lean_check
 

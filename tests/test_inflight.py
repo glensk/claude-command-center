@@ -389,3 +389,197 @@ def test_doorbell_counts_without_the_close_predicate(
     assert inflight.inventory(adapter, 4242, transcript, disposable_shell=exempt).clear
     other = inflight.staff_doorbell("dev-2")
     assert not inflight.inventory(adapter, 4242, transcript, disposable_shell=other).clear
+
+
+# ---------------------------------------- the 4 drain aborts of tp#2172 M7 (C6)
+#
+# Reproduced from the transcripts (2026-11-07 … 11-10). In none of them did the keep-warm
+# timer veto: its shell carries ``cc-keepwarm.sh`` in argv and is skipped, its only child
+# is the exec'd ``keep-warm-guard.py``. The vetoing shell was work outside the main
+# transcript (root cause 1) or the session's own timed-out foreground Bash (root cause 2).
+# Argv shape: ``ps`` of the 5ad15521 abort (Claude Code, 2026-11-10); paths anonymised.
+
+_C6_SID = "5ad15521-12e9-43d5-9d8d-06bee3a83c47"
+_C6_PREFIX = (
+    "/bin/zsh -c source /home/user/.claude/shell-snapshots/snapshot-zsh-1794324079121-dw3w3m.sh"
+    f" 2>/dev/null || true && export CODEX_COMPANION_SESSION_ID='{_C6_SID}'\\012"
+    "export CLAUDE_PLUGIN_DATA='/home/user/.claude/plugins/data/codex-openai-codex'\\012"
+    ": && { shopt -u extglob || setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL; } >/dev/null 2>&1"
+    " || true && "
+)
+_C6_KEEPWARM = f"~/.claude/hooks/cc-keepwarm.sh 3000 /home/user/.claude/projects/p/{_C6_SID}.jsonl"
+_C6_GUARD = (
+    "/opt/homebrew/Frameworks/Python.framework/Versions/3.15/Resources/Python.app/Contents"
+    f"/MacOS/Python /home/user/.claude/hooks/keep-warm-guard.py -T 3000 /p/{_C6_SID}.jsonl"
+)
+
+_C6_FOLLOWER = (
+    'tail -f /private/tmp/claude-501/p/s/tasks/b7ukcu3cm.output | grep -m1 -A40 "=== pytest"'
+)
+
+
+def _c6_shell(command: str) -> str:
+    """A Bash-tool shell's argv as ``ps -Ao command=`` printed it in the aborts."""
+    return f"{_C6_PREFIX}eval '{command}' < /dev/null && pwd -P >| /tmp/claude-4f1a-cwd"
+
+
+def _c6_bash(use_id: str, command: str, description: str, *, background: bool) -> list[str]:
+    """The Bash ``tool_use`` record and its launch result (``backgroundTaskId`` = *use_id*)."""
+    params: dict[str, object] = {"command": command, "description": description}
+    if background:
+        params["run_in_background"] = True
+    use = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": f"u-{use_id}", "name": "Bash", "input": params}],
+        },
+    }
+    launched: dict[str, object] = {"stdout": "", "stderr": "", "backgroundTaskId": use_id}
+    if not background:
+        launched["timedOutAfterMs"] = 120000  # moved to the background by the tool timeout
+    result = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": f"u-{use_id}", "content": "…"}],
+        },
+        "toolUseResult": launched,
+    }
+    return [json.dumps(use), json.dumps(result)]
+
+
+def _c6_transcript(tmp_path: Path, *records: list[str]) -> Path:
+    transcript = tmp_path / f"{_C6_SID}.jsonl"
+    lines = [line for pair in records for line in pair]
+    transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return transcript
+
+
+@pytest.mark.parametrize(
+    "orphans",
+    [
+        # 2200569a 11-09: a finished builder's `tail -f` follower of its pytest output,
+        # moved to the background at 180 s; it timed out at 01:50:14, the retry passed.
+        ["timeout 560 tail -f /private/tmp/claude-501/p/s/tasks/brqq0nsgb.output"],
+        # 5ad15521 11-10: a finished subagent's Touch ID helper rebuild (real work: the
+        # successor reran it after the source TaskStopped it).
+        ["/home/user/dotfiles/tools/vault-touchid/build.sh"],
+        # cacad9b3 11-10: a finished reviewer's two followers, which never exit on their own.
+        [
+            _C6_FOLLOWER,
+            _C6_FOLLOWER,
+        ],
+    ],
+    ids=["2200569a-tail-timeout", "5ad15521-build", "cacad9b3-tail-grep"],
+)
+def test_c6_drain_abort_vetoer_is_a_subagent_shell_never_the_keepwarm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, orphans: list[str]
+) -> None:
+    """Root cause 1: a subagent's foreground Bash, auto-backgrounded, outlives the subagent.
+
+    Its shell is a child of the session's claude process but has no launch record in the
+    MAIN transcript, so it shows as ``untracked shell`` and vetoes (unknown is refused).
+    The keep-warm timer beside it is matched to its own shell and never vetoes: with the
+    orphans gone the same tree is clear, which is why each retry passed.
+    """
+    transcript = _c6_transcript(
+        tmp_path, _c6_bash("bkdcstgmr", _C6_KEEPWARM, "Arm keep-warm timer", background=True)
+    )
+    timer_tree: dict[int, list[tuple[int, str]]] = {
+        4242: [(98000, _c6_shell(_C6_KEEPWARM))],
+        98000: [(98001, _C6_GUARD)],
+    }
+    orphan_pids = [98628 + index for index in range(len(orphans))]
+    full_tree = {
+        **timer_tree,
+        4242: timer_tree[4242]
+        + [(pid, _c6_shell(cmd)) for pid, cmd in zip(orphan_pids, orphans, strict=True)],
+    }
+    adapter = claude_adapter.ClaudeAdapter()
+
+    monkeypatch.setattr(claude_adapter, "_children_map", lambda: full_tree)
+    inv = inflight.inventory(adapter, 4242, transcript)
+    assert inv.reasons == ["a background Bash task shell is running"]
+    by_id = {item.id: item for item in inv.items}
+    assert by_id["bkdcstgmr"].kind == inflight.KIND_KEEPWARM
+    assert by_id["bkdcstgmr"].pid == 98000
+    untracked = [item for item in inv.items if item.kind == inflight.KIND_UNKNOWN]
+    assert [(item.id, item.description, item.command) for item in untracked] == [
+        (f"pid:{pid}", "untracked shell", cmd)
+        for pid, cmd in zip(orphan_pids, orphans, strict=True)
+    ]
+
+    monkeypatch.setattr(claude_adapter, "_children_map", lambda: timer_tree)
+    clear = inflight.inventory(adapter, 4242, transcript)
+    assert clear.clear and not clear.reasons
+    assert [item.kind for item in clear.items] == [inflight.KIND_KEEPWARM]
+
+
+def test_c6_drain_first_vetoer_is_the_sessions_own_timed_out_bash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Root cause 2 (61d91d4c 11-07): the session's own foreground Bash hit its 120 s timeout.
+
+    The tool moved it to the background (``backgroundTaskId`` + ``timedOutAfterMs``, no
+    ``run_in_background``): a runaway recursive glob. Both signals name it — the process
+    probe and the transcript (pending ``br5llz9dy``); the keep-warm timer beside it does not.
+    A successful ``TaskStop`` plus the shell's exit clears the session.
+    """
+    glob_cmd = "python3 /tmp/find-auto-arm.py"
+    launches = [
+        _c6_bash("bj62aasel", _C6_KEEPWARM, "Arm keep-warm timer", background=True),
+        _c6_bash("br5llz9dy", glob_cmd, "Locate the auto-arm memo", background=False),
+    ]
+    transcript = _c6_transcript(tmp_path, *launches)
+    tree = {
+        4242: [(5100, _c6_shell(_C6_KEEPWARM)), (5200, _c6_shell(glob_cmd))],
+        5100: [(5101, _C6_GUARD)],
+    }
+    monkeypatch.setattr(claude_adapter, "_children_map", lambda: tree)
+    adapter = claude_adapter.ClaudeAdapter()
+    inv = inflight.inventory(adapter, 4242, transcript)
+    assert inv.reasons == [
+        "a background Bash task shell is running",
+        "background task(s) not yet reported back: br5llz9dy",
+    ]
+    kinds = {item.id: (item.kind, item.pid) for item in inv.items}
+    assert kinds == {
+        "br5llz9dy": (inflight.KIND_SHELL, 5200),
+        "bj62aasel": (inflight.KIND_KEEPWARM, 5100),
+    }
+
+    stop = [
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "u-stop",
+                            "name": "TaskStop",
+                            "input": {"task_id": "br5llz9dy"},
+                        }
+                    ]
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "u-stop",
+                            "content": "Successfully stopped task: br5llz9dy",
+                        }
+                    ]
+                },
+            }
+        ),
+    ]
+    stopped = _c6_transcript(tmp_path, *launches, stop)
+    monkeypatch.setattr(claude_adapter, "_children_map", lambda: {**tree, 4242: tree[4242][:1]})
+    assert inflight.inventory(adapter, 4242, stopped).clear

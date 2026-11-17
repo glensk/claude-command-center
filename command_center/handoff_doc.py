@@ -168,21 +168,36 @@ def _validated(text: str, scrub_policy: str | None) -> tuple[HandoffDoc, int]:
     errors = check_structure(text)
     if errors:
         return HandoffDoc(errors=errors), -1
+    scrubbed, labels, refusal = _scrub(text, scrub_policy)
+    if refusal:
+        return HandoffDoc(errors=[refusal]), -1
+    size = len(scrubbed.encode("utf-8"))
+    errors = check_structure(scrubbed)
+    if errors:
+        return HandoffDoc(errors=["after scrubbing: " + e for e in errors]), size
+    digest = hashlib.sha256(scrubbed.encode("utf-8")).hexdigest()
+    return HandoffDoc(text=scrubbed, sha256=digest, labels=labels), size
+
+
+def _scrub(text: str, scrub_policy: str | None) -> tuple[str, tuple[str, ...], str]:
+    """``(scrubbed text, labels, refusal)`` through the fail-closed handoff scrub."""
     from . import config, scrub  # local: scrub resolution spawns a probe
 
     policy = config.load_config().mirror_scrub_cmd if scrub_policy is None else scrub_policy
     resolution = scrub.resolve_scrubber(policy)
     if resolution.scrubber is None:
-        return HandoffDoc(errors=[f"credential scrub withheld: {resolution.reason}"]), -1
+        return "", (), f"credential scrub withheld: {resolution.reason}"
     result = scrub.scrub(resolution.scrubber, text)
     if not result.ok:
-        return HandoffDoc(errors=[f"credential scrub withheld: {result.reason}"]), -1
-    size = len(result.text.encode("utf-8"))
-    errors = check_structure(result.text)
-    if errors:
-        return HandoffDoc(errors=["after scrubbing: " + e for e in errors]), size
-    digest = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
-    return HandoffDoc(text=result.text, sha256=digest, labels=result.labels), size
+        return "", (), f"credential scrub withheld: {result.reason}"
+    return result.text, result.labels, ""
+
+
+def scrub_text(text: str, scrub_policy: str | None = None) -> tuple[str, str]:
+    """``(scrubbed text, refusal)``: a handoff sidecar through the SAME fail-closed scrub as
+    the handoff itself (tp#2172 D1/D2); a refusal leaves the text empty."""
+    scrubbed, _labels, refusal = _scrub(text, scrub_policy)
+    return scrubbed, refusal
 
 
 # ------------------------------------------------------------------ model part + compose
@@ -292,6 +307,92 @@ def model_chars_error(raw: bytes | str) -> str:
     )
 
 
+#: The line that ends a model section cut by :func:`fit_model_part` (tp#2172 D1); the
+#: successor's preamble names the sidecar with the full text and refers to this word.
+CONTINUED = "… (continued in the full model part named in the preamble)"
+FIT_KEEP_CHARS = 200  # a section this short is kept whole while the others are cut
+
+
+def _model_sections(text: str) -> list[tuple[str, str]]:
+    """``[(heading as written, body)]`` of *text*, comments stripped, first occurrence of a
+    name only (as :func:`sections` keeps it)."""
+    stripped = _COMMENT_RE.sub("", text)
+    matches = list(_HEADING_RE.finditer(stripped))
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for index, match in enumerate(matches):
+        name = _norm(match.group(1))
+        if name in seen:
+            continue
+        seen.add(name)
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(stripped)
+        out.append((match.group(1).strip(), stripped[match.end() : end].strip()))
+    return out
+
+
+def model_chars(raw: bytes | str) -> int:
+    """The characters of every section body of *raw* (comments stripped); 0 if undecodable."""
+    text, errors = _decode(raw)
+    return 0 if errors else sum(len(body) for _title, body in _model_sections(text))
+
+
+def _cut_chars(body: str, limit: int) -> str:
+    """*body* cut at a line boundary to at most *limit* characters; when not even its
+    first line fits, that line is clipped."""
+    if len(body) <= limit:
+        return body
+    kept: list[str] = []
+    used = 0
+    for line in body.splitlines():
+        size = len(line) + (1 if kept else 0)
+        if used + size > limit:
+            break
+        kept.append(line)
+        used += size
+    if not "".join(kept).strip():
+        return body.lstrip().splitlines()[0][: max(0, limit)].rstrip()
+    return "\n".join(kept).rstrip()
+
+
+def _shares(sizes: list[int], budget: int) -> list[int]:
+    """Each body's character share of *budget*: short bodies whole (while they take at most
+    half of it), the others cut proportionally to their length."""
+    small = [s if s <= FIT_KEEP_CHARS else 0 for s in sizes]
+    if sum(small) > budget // 2:
+        small = [0] * len(sizes)
+    rest = budget - sum(small)
+    large = sum(s for s, kept in zip(sizes, small, strict=True) if not kept) or 1
+    return [kept or (s * rest) // large for s, kept in zip(sizes, small, strict=True)]
+
+
+def fit_model_part(raw: bytes | str) -> tuple[str, str]:
+    """``(kept, full)``: a model-WRITTEN part (``start -f``) inside :data:`MODEL_MAX_CHARS`
+    (tp#2172 D1); ``full`` is the whole input when it was cut, else ``""``.
+
+    Never refuses: each section body is cut proportionally to its length at a line boundary
+    (a body of at most :data:`FIT_KEEP_CHARS` stays whole) and ends with a
+    :data:`CONTINUED` line; the cut bodies plus their markers stay inside the cap. Comments
+    and text outside sections are dropped from the cut part (``full`` keeps them).
+    Undecodable input gives ``("", "")`` (:func:`parse_model_file` reports it).
+    """
+    text, errors = _decode(raw)
+    if errors:
+        return "", ""
+    found = _model_sections(text)
+    sizes = [len(body) for _title, body in found]
+    if sum(sizes) <= MODEL_MAX_CHARS:
+        return text, ""
+    marker = len(CONTINUED) + 1
+    budget = MODEL_MAX_CHARS - marker * sum(1 for s in sizes if s)
+    parts = ["# Handoff", ""]
+    for (title, body), share in zip(found, _shares(sizes, max(0, budget)), strict=True):
+        if len(body) > share:
+            kept = _cut_chars(body, share)
+            body = f"{kept}\n{CONTINUED}" if kept else CONTINUED
+        parts += [f"## {title}", "", body, ""]
+    return "\n".join(parts), text
+
+
 def parse_model_file(raw: bytes | str) -> ModelPart:
     """The ``start -f`` file: a 3-section model part, or a legacy full document (D2, D9).
 
@@ -380,6 +481,7 @@ class Composed:
     text: str
     level: int
     model_cut: bool = False
+    rest: str = ""  # tp#2172 D2: the fact records moved out for size (the facts-rest sidecar)
 
 
 def _one(value: Any) -> str:
@@ -1066,6 +1168,75 @@ def _cap_error(doc: HandoffDoc) -> bool:
     return any("the cap is" in e for e in doc.errors)
 
 
+def _spill_order(facts: list[dict[str, Any]]) -> list[int]:
+    """The order fact records leave the document for size (D2): every other kind before
+    the never-cut kinds, then the lowest priority (highest number) and the latest first."""
+
+    def key(index: int) -> tuple[int, int, int]:
+        fact = facts[index]
+        never_cut = fact.get("kind") in ("session", "tp_item", "shell", *_FLOOR_KINDS)
+        return (int(never_cut), -int(fact.get("priority", 4)), -index)
+
+    return sorted(range(len(facts)), key=key)
+
+
+def _rest_text(moved: list[dict[str, Any]], ref: str) -> str:
+    """The facts-rest sidecar: the moved records, uncut, per section."""
+    lines = _facts_lines({"facts": moved}, 0, ref)
+    parts = [f"# Fact records moved out of the handoff for size ({ref})", ""]
+    for title in REQUIRED_SECTIONS:
+        if lines[title]:
+            parts += [f"## {title}", "", *lines[title], ""]
+    return "\n".join(parts).rstrip("\n") + "\n"
+
+
+def _spill(  # pylint: disable=too-many-arguments
+    model: ModelPart,
+    doc: dict[str, Any],
+    budget: int,
+    *,
+    ref: str,
+    model_path: str,
+    generated: bool,
+) -> _Fit:
+    """:func:`_fit`, and when every cut tier still overflows *budget*, the fewest lowest
+    priority fact records (:func:`_spill_order`) move to ``Composed.rest`` (tp#2172 D2)
+    instead of a refusal; the document names them in one warning line."""
+    kw = {"ref": ref, "model_path": model_path, "generated": generated}
+    fit = _fit(model, doc, budget, **kw)  # type: ignore[arg-type]
+    facts = list(doc.get("facts", []))
+    if (fit.room > 0 and fit.size <= budget) or not facts:
+        return fit
+    order = _spill_order(facts)
+
+    def moved_fit(count: int) -> _Fit:
+        gone = set(order[:count])
+        note = (
+            f"{count} fact record(s) moved out for size to the facts-rest file named in the "
+            f"preamble (each also: ccc continue-session facts {ref} -k <key>)"
+        )
+        kept = {
+            **doc,
+            "facts": [f for i, f in enumerate(facts) if i not in gone],
+            "warnings": [*doc.get("warnings", []), note],
+        }
+        out = _fit(model, kept, budget, **kw)  # type: ignore[arg-type]
+        rest = _rest_text([f for i, f in enumerate(facts) if i in gone], ref)
+        out.composed = Composed(out.composed.text, out.composed.level, out.composed.model_cut, rest)
+        return out
+
+    low, high = 1, len(facts)  # binary search: the fewest moved records that fit
+    best = moved_fit(high)  # all of them moved: the floor (still too big = the old refusal)
+    while low < high:
+        mid = (low + high) // 2
+        trial = moved_fit(mid)
+        if trial.room > 0 and trial.size <= budget:
+            best, high = trial, mid
+        else:
+            low = mid + 1
+    return best
+
+
 def compose_checked(  # pylint: disable=too-many-arguments
     model: ModelPart,
     doc: dict[str, Any],
@@ -1078,21 +1249,23 @@ def compose_checked(  # pylint: disable=too-many-arguments
     """Compose at the smallest cut tier that fits, :func:`validate` it, and re-fit once.
 
     *generated* (facts-only / capped): the model bodies are cut to what the facts leave, so
-    the text always fits. A model-written part that does not fit is refused with the body
-    bytes it may have (``A``, at most :data:`MODEL_MAX_BYTES`). Facts that overflow alone
-    get their own message. When the scrubber lengthens the text past the cap, ONE more pass
+    the text always fits. When every cut tier still overflows, the fewest lowest-priority
+    fact records move to ``Composed.rest`` (the facts-rest sidecar, tp#2172 D2) instead of a
+    refusal; only a text that overflows with every record moved is still refused (a
+    model-written part with the body bytes it may have, ``A`` ≤ :data:`MODEL_MAX_BYTES`;
+    facts with their own message). When the scrubber lengthens the text past the cap, ONE more pass
     budgets for the measured growth (``budget - growth - 256``): two validate passes at most.
     """
     budget = MAX_BYTES - SCRUB_MARGIN
     kw = {"ref": ref, "model_path": model_path, "generated": generated}
-    fit = _fit(model, doc, budget, **kw)  # type: ignore[arg-type]
+    fit = _spill(model, doc, budget, **kw)  # type: ignore[arg-type]
     if fit.room <= 0 or (generated and fit.size > budget):
         return HandoffDoc(errors=[_defect(fit, generated)]), fit.composed
     result, scrubbed = _validated(fit.composed.text, scrub_policy)
     if result.ok or not _cap_error(result):
         return result, fit.composed
     growth = max(0, scrubbed - fit.size) if scrubbed >= 0 else 0
-    fit = _fit(model, doc, budget - growth - 256, **kw)  # type: ignore[arg-type]
+    fit = _spill(model, doc, budget - growth - 256, **kw)  # type: ignore[arg-type]
     if fit.room <= 0 or (generated and fit.size > fit.budget):
         return HandoffDoc(errors=[_defect(fit, generated)]), fit.composed
     if fit.size > fit.budget:

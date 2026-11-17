@@ -43,10 +43,13 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 # pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 
 import dataclasses
+import functools
 import sqlite3
+import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 from .await_store import (
     AwaitBusy,
@@ -61,6 +64,8 @@ from .await_store import (
     reserved_ids,
     target_conflict,
 )
+
+_T = TypeVar("_T")
 
 PREPARED = "prepared"
 OPENED = "opened"
@@ -125,7 +130,11 @@ CREATE TABLE IF NOT EXISTS transfers (
     accepted_at       INTEGER NOT NULL DEFAULT 0,
     finalized_at      INTEGER NOT NULL DEFAULT 0,
     updated_at        INTEGER NOT NULL DEFAULT 0,
-    facts_snapshot    TEXT
+    facts_snapshot    TEXT,
+    target_launched_at INTEGER NOT NULL DEFAULT 0,
+    start_pid         INTEGER NOT NULL DEFAULT 0,
+    start_heartbeat_at INTEGER NOT NULL DEFAULT 0,
+    accept_refused_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_transfers_active_source ON transfers(source_session)
     WHERE state IN ('prepared', 'opened', 'accepted');
@@ -170,6 +179,15 @@ class Transfer:  # pylint: disable=too-many-instance-attributes
     finalized_at: int = 0
     updated_at: int = 0
     facts_snapshot: str = ""  # id of the frozen facts snapshot the handoff was composed from
+    # tp#2172 D4/D5: when the CURRENT target's draft was claimed/cleared (the start of the
+    # successor's start-up grace, never ``opened_at``), and the driving ``start``'s pid and
+    # last poll (its heartbeat for the daemon sweep). 0 = not yet / written by an older build.
+    target_launched_at: int = 0
+    start_pid: int = 0
+    start_heartbeat_at: int = 0
+    # tp#2172 D13: when the successor last ran ``accept`` on this transfer after it had
+    # failed (the refusal the daemon sweep's orphan close keys on). 0 = never.
+    accept_refused_at: int = 0
 
     def snapshot(self) -> dict[str, Any]:
         """The fields a retry must match (:data:`SNAPSHOT_FIELDS`)."""
@@ -220,6 +238,62 @@ class HandoffCandidate:  # pylint: disable=too-many-instance-attributes  # one q
         return self.close_bound.startswith(HANDOFF_DEBT_PREFIX)
 
 
+#: tp#2172 D7: the waits between the tries of :func:`retry_locked` (first try + one per wait).
+RETRY_LOCKED_WAITS = (0.25, 0.5, 1.0)
+
+
+def _retry_sleep(seconds: float) -> None:
+    """The one sleep of :func:`retry_locked` (tests patch it)."""
+    time.sleep(seconds)
+
+
+def is_locked(exc: BaseException) -> bool:
+    """A transient SQLite lock: an ``OperationalError`` whose text says locked or busy."""
+    text = str(exc).lower()
+    return isinstance(exc, sqlite3.OperationalError) and ("locked" in text or "busy" in text)
+
+
+def retry_locked(fn: Callable[[], _T]) -> _T:
+    """Run *fn*, retrying a transient lock (tp#2172 D7): ``database is locked``/``busy``
+    after waits of :data:`RETRY_LOCKED_WAITS`; any other error, or the last lock, raises.
+
+    Only for ONE store method that is a single transaction, CAS-guarded and idempotent on
+    retry — never for an outer function with side effects (``accept_as``, ``_drive``,
+    ``cmd_start``, anything that runs ``handoff_hooks``)."""
+    for wait in RETRY_LOCKED_WAITS:
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            if not is_locked(exc):
+                raise
+        _retry_sleep(wait)
+    return fn()
+
+
+def _locked_retried(*, writes: bool) -> Callable[[Callable[..., _T]], Callable[..., _T]]:
+    """Decorate a :class:`TransferStoreMixin` method with :func:`retry_locked`.
+
+    A write's half-done transaction is rolled back before the next try, so the CAS is
+    judged afresh (a read never rolls back: it may run inside a caller's transaction)."""
+
+    def wrap(method: Callable[..., _T]) -> Callable[..., _T]:
+        @functools.wraps(method)
+        def retried(self: Any, *args: Any, **kwargs: Any) -> _T:
+            def once() -> _T:
+                try:
+                    return method(self, *args, **kwargs)
+                except sqlite3.OperationalError as exc:
+                    if writes and is_locked(exc) and self.conn.in_transaction:
+                        self.conn.rollback()
+                    raise
+
+            return retry_locked(once)
+
+        return retried
+
+    return wrap
+
+
 def new_transfer_id() -> str:
     """A fresh transfer id (``t`` + 12 hex: short enough to type, unique enough)."""
     return "t" + uuid.uuid4().hex[:12]
@@ -239,6 +313,7 @@ class TransferStoreMixin:
 
     conn: sqlite3.Connection
 
+    @_locked_retried(writes=True)
     def create_transfer(self, transfer: Transfer, now: int) -> Transfer:
         """Insert *transfer* as ``prepared``; :class:`TransferConflict` if one is active.
 
@@ -266,6 +341,7 @@ class TransferStoreMixin:
         assert got is not None
         return got
 
+    @_locked_retried(writes=False)
     def get_transfer(self, transfer_id: str) -> Transfer | None:
         """The transfer *transfer_id*, or ``None``."""
         row = self.conn.execute(
@@ -282,6 +358,7 @@ class TransferStoreMixin:
         ).fetchone()
         return _row_to_transfer(row) if row is not None else None
 
+    @_locked_retried(writes=False)
     def transfers_of(self, session_id: str) -> list[Transfer]:
         """Every transfer *session_id* is the source or the target of, newest first."""
         rows = self.conn.execute(
@@ -317,6 +394,7 @@ class TransferStoreMixin:
                 corrupt += 1
         return found, corrupt
 
+    @_locked_retried(writes=True)
     def transition_transfer(
         self, transfer_id: str, to_state: str, now: int, *, failure: str = ""
     ) -> bool:
@@ -377,6 +455,7 @@ class TransferStoreMixin:
             return None
         return swept
 
+    @_locked_retried(writes=True)
     def accept_transfer(self, transfer_id: str, now: int) -> list[AwaitGroup] | None:
         """``prepared|opened → accepted`` WITH the await rebind, in ONE transaction.
 
@@ -457,6 +536,61 @@ class TransferStoreMixin:
         )
         self.conn.commit()
         return cur.rowcount == 1
+
+    def heartbeat_transfer(self, transfer_id: str, pid: int, now: int) -> bool:
+        """The driving ``start``'s heartbeat on an ACTIVE transfer (tp#2172 D5).
+
+        Sets ``start_pid`` and ``start_heartbeat_at`` only; ``updated_at`` is left alone (a
+        heartbeat is not a state change). ``False`` when the transfer is not active any more.
+        """
+        cur = self.conn.execute(
+            "UPDATE transfers SET start_pid = ?, start_heartbeat_at = ? "
+            "WHERE transfer_id = ? AND state IN ('prepared', 'opened', 'accepted')",
+            (pid, now, transfer_id),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def record_accept_refusal(self, transfer_id: str, caller: str, now: int) -> bool:
+        """Stamp ``accept_refused_at`` (tp#2172 D13): *caller* ran ``accept`` on a FAILED
+        transfer whose successor it is. A CAS on both, so nothing else is ever stamped."""
+        cur = self.conn.execute(
+            "UPDATE transfers SET accept_refused_at = ? "
+            "WHERE transfer_id = ? AND state = 'failed' AND target_session = ? "
+            "AND target_session != ''",
+            (now, transfer_id, caller),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def dead_transfer_candidates(self, created_before: int) -> list[Transfer]:
+        """``prepared``/``opened`` transfers created at or before *created_before* (epoch
+        ms) — the daemon sweep judges their successor and their ``start`` (tp#2172 D5).
+        Through the partial active-source index."""
+        rows = self.conn.execute(
+            "SELECT * FROM transfers WHERE state IN ('prepared', 'opened', 'accepted') "
+            "AND state IN ('prepared', 'opened') AND created_at <= ?",
+            (created_before,),
+        ).fetchall()
+        return sorted((_row_to_transfer(row) for row in rows), key=lambda t: t.transfer_id)
+
+    def orphan_close_candidates(self) -> list[Transfer]:
+        """``failed`` transfers whose successor recorded an accept refusal (tp#2172 D13):
+        the daemon sweep closes that successor's tab while the refusing process lives.
+        Through the partial ``accept_refused_at`` index."""
+        rows = self.conn.execute(
+            "SELECT * FROM transfers WHERE accept_refused_at > 0 AND state = 'failed'"
+        ).fetchall()
+        return sorted((_row_to_transfer(row) for row in rows), key=lambda t: t.transfer_id)
+
+    def _stamp_target_launched(self, target_session: str, now: int) -> None:
+        """``target_launched_at`` of the active transfer whose successor is *target_session*,
+        without a commit: the draft clear/claim that launches it owns the transaction."""
+        self.conn.execute(
+            "UPDATE transfers SET target_launched_at = ? "
+            "WHERE target_session = ? AND state IN ('prepared', 'opened')",
+            (now, target_session),
+        )
 
     def handoff_done_sources(self) -> set[str]:
         """Not-done sessions whose handoff is done: the successor took over.

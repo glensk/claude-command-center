@@ -22,6 +22,7 @@ from command_center import (
 )
 from command_center.daemon import DaemonReport, _run_handoff_finalize
 from command_center.models import LiveSession, now_ms
+from command_center.snapshot import PsRow
 from command_center.store import Store
 from command_center.transfer_store import ACCEPTED, OPENED, Transfer
 
@@ -743,3 +744,178 @@ def test_a_failing_reclaim_is_isolated_per_candidate(
     assert report.handoff_reclaimed == [SRC2] and not spawns.calls
     assert _row().close_requested_at == 0 and _row(SRC2).close_requested_at > 0
     assert f"handoff {broken} failed" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------ dead transfers (tp#2172 C5)
+
+SRC_PID = 4242
+MINUTE = 60 * 1000
+
+
+def _ps_rows(*rows: tuple[int, int, str]) -> dict[int, PsRow]:
+    """A ``ps`` table of ``(pid, ppid, command)`` rows."""
+    return {pid: PsRow(ppid, "ttys001", "S", command) for pid, ppid, command in rows}
+
+
+def _use_ps(monkeypatch: pytest.MonkeyPatch, table: dict[int, PsRow]) -> None:
+    monkeypatch.setattr(terminal, "ps_table", lambda: table)
+
+
+def _opened(*, age_ms: int = 10 * MINUTE, heartbeat_ms: int | None = None, pid: int = 0) -> str:
+    """An ``opened`` transfer SRC → DST created *age_ms* ago; DST is a started (non-draft)
+    row; a heartbeat *heartbeat_ms* ago from *pid* when given."""
+    tid = "t" + SRC[:6] + DST[:6]
+    born = now_ms() - age_ms
+    with Store() as store:
+        store.ensure(SRC, "/repo")
+        store.ensure(DST, "/repo")
+        store.create_transfer(
+            Transfer(transfer_id=tid, source_session=SRC, target_session=DST), born
+        )
+        assert store.transition_transfer(tid, OPENED, born)
+        if heartbeat_ms is not None:
+            assert store.heartbeat_transfer(tid, pid, now_ms() - heartbeat_ms)
+    return tid
+
+
+def _failure(tid: str) -> str:
+    with Store() as store:
+        transfer = store.get_transfer(tid)
+    assert transfer is not None
+    return transfer.failure
+
+
+def test_sweep_aborts_dead_opened_transfer(
+    spawns: _Spawns, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Successor never registered, start heartbeat stale and its pid gone: dry-run lists
+    the transfer and changes nothing; the real pass aborts it and releases nothing else."""
+    assert handoff_sweep.HEARTBEAT_STALE_MS == (3 * continue_session.ACCEPT_POLL_SEC + 30) * 1000
+    tid = _opened(heartbeat_ms=5 * MINUTE, pid=777)
+    _use_ps(monkeypatch, _ps_rows((SRC_PID, 1, "claude")))
+    dry = _sweep(dry_run=True)
+    assert dry.handoff_aborted == [tid] and _state(tid) == OPENED
+    report = _sweep()
+    assert report.handoff_aborted == [tid] and not report.handoff_errors
+    assert _state(tid) == "failed"
+    assert _failure(tid) == "aborted: sweep: successor dead: never-registered"
+    assert not spawns.calls and not report.is_empty()
+    assert not _sweep().handoff_aborted  # failed: never a candidate again
+
+
+def test_sweep_leaves_live_successor(spawns: _Spawns, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The successor is registered and was launched 30 s ago: live, however stale the start."""
+    tid = _opened(age_ms=3 * MINUTE, heartbeat_ms=3 * MINUTE, pid=777)
+    with Store() as store:
+        store.conn.execute(
+            "UPDATE transfers SET target_launched_at = ? WHERE transfer_id = ?",
+            (now_ms() - 30_000, tid),
+        )
+        store.conn.commit()
+    _use_ps(monkeypatch, _ps_rows((SRC_PID, 1, "claude")))
+    snapshot = {**_live(), **_live(DST)}
+    report = _sweep(snapshot)
+    assert not report.handoff_aborted and _state(tid) == OPENED and not spawns.calls
+
+
+def test_sweep_skips_fresh_start_heartbeat(
+    spawns: _Spawns, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dead successor whose start still polls (fresh heartbeat, pid alive) is the start's
+    to relaunch; a fresh heartbeat whose pid is gone is not."""
+    tid = _opened(heartbeat_ms=4_000, pid=777)
+    _use_ps(
+        monkeypatch, _ps_rows((SRC_PID, 1, "claude"), (777, SRC_PID, "ccc continue-session start"))
+    )
+    assert not _sweep().handoff_aborted and _state(tid) == OPENED
+    _use_ps(monkeypatch, _ps_rows((SRC_PID, 1, "claude")))
+    assert _sweep().handoff_aborted == [tid] and _state(tid) == "failed"
+    assert not spawns.calls
+
+
+def test_sweep_grandchild_start_counts_live(
+    spawns: _Spawns, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No heartbeat (an older build): claude → zsh → ccc start is the source's own start;
+    the same command under another parent is not."""
+    tid = _opened()
+    chain = _ps_rows(
+        (SRC_PID, 1, "claude --resume x"),
+        (5000, SRC_PID, "/bin/zsh -c ccc continue-session start -f /tmp/m.md"),
+        (5001, 5000, "/usr/bin/python3 /bin/ccc continue-session start -f /tmp/m.md"),
+    )
+    _use_ps(monkeypatch, chain)
+    assert not _sweep().handoff_aborted and _state(tid) == OPENED
+    elsewhere = _ps_rows(
+        (SRC_PID, 1, "claude --resume x"),
+        (6000, 1, "/bin/zsh"),
+        (6001, 6000, "/usr/bin/python3 /bin/ccc continue-session start -f /tmp/m.md"),
+    )
+    _use_ps(monkeypatch, elsewhere)
+    assert _sweep().handoff_aborted == [tid] and _state(tid) == "failed"
+    assert not spawns.calls
+
+
+def test_sweep_ps_unreadable_counts_live(spawns: _Spawns, monkeypatch: pytest.MonkeyPatch) -> None:
+    tid = _opened()
+    _use_ps(monkeypatch, {})
+    report = _sweep()
+    assert not report.handoff_aborted and not report.handoff_errors
+    assert _state(tid) == OPENED and not spawns.calls
+
+
+def test_sweep_never_touches_accepted_or_finalized(
+    spawns: _Spawns, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    accepted = _transfer("accepted")
+    finalized = _transfer("finalized", src=SRC2, dst=DST2)
+    _use_ps(monkeypatch, _ps_rows((SRC_PID, 1, "claude")))  # no start live anywhere
+    with Store() as store:
+        assert store.dead_transfer_candidates(now_ms()) == []
+    report = _sweep({})
+    assert not report.handoff_aborted
+    assert _state(accepted) == "finalized" and _state(finalized) == "finalized"
+    assert not _failure(accepted) and not _failure(finalized)
+    assert not spawns.calls  # the sources are gone: finalized only
+
+
+def test_sweep_arms_close_for_refused_successor_of_failed_transfer(
+    spawns: _Spawns, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D13: the successor that refused its accept on a failed transfer is still open and
+    idle: its close is armed and the token-scoped closer spawned for IT, once per window.
+    A later process (the user reopened the tab) is never closed."""
+    tid = _opened(age_ms=MINUTE)
+    with Store() as store:
+        assert continue_session.abort_transfer(store, tid, "by hand", now_ms())[0] == 0
+        refused = now_ms()
+        assert store.record_accept_refusal(tid, DST, refused)
+    _use_ps(monkeypatch, _ps_rows((SRC_PID, 1, "claude")))
+    reopened = {DST: LiveSession(5151, DST, "/repo", alive=True, started_at=refused + 1)}
+    assert not _sweep(reopened).handoff_closers and not spawns.calls
+    busy = {
+        DST: LiveSession(
+            5151,
+            DST,
+            "/repo",
+            "interactive",
+            "cli",
+            "busy",
+            alive=True,
+            started_at=refused - MINUTE,
+        )
+    }
+    assert not _sweep(busy).handoff_closers and not spawns.calls
+    orphan = {DST: LiveSession(5151, DST, "/repo", alive=True, started_at=refused - MINUTE)}
+    assert _sweep(orphan, dry_run=True).handoff_closers == [DST]
+    assert not spawns.calls and not _row(DST).close_token  # dry-run: nothing armed
+    report = _sweep(orphan)
+    assert report.handoff_closers == [DST] and spawns.calls == [_closer(tid, DST)]
+    row = _row(DST)
+    assert row.close_token and row.close_requested_at > 0
+    assert not _row(SRC).close_token  # the source is never touched
+    with Store() as store:
+        assert handoff_close.lineage_refusal(store, tid, DST) == ""
+        assert handoff_close.lineage_refusal(store, tid, SRC) != ""
+    assert not _sweep(orphan).handoff_closers  # paced
+    assert _state(tid) == "failed"

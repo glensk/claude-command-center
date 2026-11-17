@@ -2270,3 +2270,72 @@ def test_release_tab_refuses_a_row_without_a_pid(
     _tabbed(store, "nopid", pid=None)
     assert store.release_tab("nopid", _TAB, _TAB_PID) is False
     assert _tab_cols(store, "nopid")[0] == _TAB
+
+
+# ------------------------------------------------------------------ retry_locked (tp#2172 D7)
+
+
+def test_retry_locked_retries_lock_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    from command_center import transfer_store  # pylint: disable=import-outside-toplevel
+
+    waits: list[float] = []
+    monkeypatch.setattr(transfer_store, "_retry_sleep", waits.append)
+    calls: list[int] = []
+
+    def flaky() -> str:
+        calls.append(1)
+        if len(calls) <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        return "ok"
+
+    assert transfer_store.retry_locked(flaky) == "ok"
+    assert len(calls) == 3 and waits == [0.25, 0.5]
+
+
+def test_retry_locked_raises_other_operational_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from command_center import transfer_store  # pylint: disable=import-outside-toplevel
+
+    waits: list[float] = []
+    monkeypatch.setattr(transfer_store, "_retry_sleep", waits.append)
+    calls: list[int] = []
+
+    def broken() -> None:
+        calls.append(1)
+        raise sqlite3.OperationalError("no such table: transfers")
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        transfer_store.retry_locked(broken)
+    assert len(calls) == 1 and not waits  # never retried
+
+    def always_busy() -> None:
+        calls.append(1)
+        raise sqlite3.OperationalError("database is busy")
+
+    calls.clear()
+    with pytest.raises(sqlite3.OperationalError, match="busy"):
+        transfer_store.retry_locked(always_busy)
+    assert len(calls) == 4 and waits == [0.25, 0.5, 1.0]  # bounded: first try + 3 retries
+
+
+def test_retry_locked_wraps_only_store_methods() -> None:
+    """D7/debate 10: the helper lives in the store modules and wraps only the
+    single-transaction CAS methods, never a function that runs hooks or side effects."""
+    root = Path(__file__).resolve().parent.parent / "command_center"
+    users = sorted(
+        path.name for path in root.rglob("*.py") if "retry_locked" in path.read_text("utf-8")
+    )
+    assert users == ["transfer_store.py"]
+    from command_center import transfer_store  # pylint: disable=import-outside-toplevel
+
+    wrapped = sorted(
+        name
+        for name, fn in vars(transfer_store.TransferStoreMixin).items()
+        if callable(fn) and hasattr(fn, "__wrapped__")
+    )
+    assert wrapped == [
+        "accept_transfer",
+        "create_transfer",
+        "get_transfer",
+        "transfers_of",
+        "transition_transfer",
+    ]

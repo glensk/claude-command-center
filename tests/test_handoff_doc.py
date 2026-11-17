@@ -473,3 +473,78 @@ def test_minimal_held_line_is_kept_and_tier_nine_is_unchanged() -> None:
     body = handoff_doc.sections(tier9)["tp ownership"]
     assert "- held:" not in body
     assert body.startswith("- tp#1681 [plan_wcdx] perf(relay): shrink successor start-up cost")
+
+
+# ------------------------------------------------ tp#2172 C4: no size refusals (D1, D2)
+
+
+def test_fit_model_part_proportional_cut() -> None:
+    """D1: each section is cut in proportion to its length, at a line boundary, with a
+    ``continued`` line; the cut part fits the cap and the full text is returned whole."""
+    lines = {
+        "Current state": [f"state line {i:03d} " + "s" * 40 for i in range(80)],
+        "Decisions and constraints": [f"decision {i:03d} " + "d" * 40 for i in range(40)],
+        "First steps": ["none"],
+    }
+    raw = "# Handoff\n\n" + "".join(
+        f"## {title}\n\n" + "\n".join(body) + "\n\n" for title, body in lines.items()
+    )
+    raw += "<!-- guidance never counts -->\n"
+    kept, full = handoff_doc.fit_model_part(raw)
+    assert full == raw
+    assert handoff_doc.model_chars(kept) <= handoff_doc.MODEL_MAX_CHARS
+    part = handoff_doc.parse_model_file(kept)
+    assert part.ok, part.errors
+    state = part.sections["Current state"].splitlines()
+    decisions = part.sections["Decisions and constraints"].splitlines()
+    assert state[-1] == decisions[-1] == handoff_doc.CONTINUED
+    assert part.sections["First steps"] == "none"  # a short section stays whole
+    for body, source in (
+        (state, lines["Current state"]),
+        (decisions, lines["Decisions and constraints"]),
+    ):
+        assert body[:-1] == source[: len(body) - 1]  # whole lines, from the top
+    assert 1.5 < (len(state) - 1) / (len(decisions) - 1) < 2.5  # the 2:1 ratio holds
+    one_line = _model("x").replace("Current state: x", "Current state: " + "q" * 5000)
+    kept, full = handoff_doc.fit_model_part(one_line)
+    assert full and handoff_doc.model_chars(kept) <= handoff_doc.MODEL_MAX_CHARS
+    assert (
+        handoff_doc.parse_model_file(kept).sections["Current state"].startswith("Current state: qq")
+    )
+    short = _model("x")
+    assert handoff_doc.fit_model_part(short) == (short, "")
+    assert handoff_doc.fit_model_part(b"\xff") == ("", "")
+
+
+def _questions(count: int) -> list[dict]:
+    from command_center.handoff_facts import rec
+
+    return [
+        rec(
+            "question",
+            f"question:{i}",
+            "Open items and questions",
+            3 if i % 2 else 1,
+            tp_id=i,
+            source="ask",
+            detail=f"question {i} " + "w" * 300,
+        )
+        for i in range(count)
+    ]
+
+
+def test_compose_facts_overflow_moves_lowest_priority_to_rest(tmp_path: Path) -> None:
+    """D2: never-cut facts that overflow every tier move, lowest priority first, to
+    ``Composed.rest`` instead of a refusal; the document names the move."""
+    facts = _questions(150)  # ~150 x 240 B floor lines: far over the 22 KB budget
+    result, composed = _compose(_model("mine"), _snap(_session_fact(), *facts), tmp_path)
+    assert result.ok, result.errors
+    assert len(result.text.encode("utf-8")) <= handoff_doc.MAX_BYTES
+    assert "moved out for size to the facts-rest file named in the preamble" in result.text
+    moved = [f for f in facts if f"question {f['fields']['tp_id']} " in composed.rest]
+    kept = [f for f in facts if f"- ? tp#{f['fields']['tp_id']} ask" in result.text]
+    assert moved and kept and len(moved) + len(kept) == len(facts)
+    assert max(int(f["priority"]) for f in kept) <= min(int(f["priority"]) for f in moved)
+    assert "AIM (done-condition): ship tp#9" in result.text  # the session fact never moves
+    small, composed = _compose(_model("mine"), _snap(_session_fact(), *_questions(3)), tmp_path)
+    assert small.ok and composed.rest == ""

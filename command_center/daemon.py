@@ -84,10 +84,12 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
     panel_restart: str = ""  # stale panel server asked to re-exec (tp#70 S5b); routine
     # continue-session handoff sweep (tp#1582): transfers finalized (accepted → finalized),
     # sources a token-scoped closer was spawned for, sources whose dead closer's in-flight
-    # token went back pending (tp#1595), and "<transfer>: <why>" failures.
+    # token went back pending (tp#1595), active transfers aborted because their successor
+    # is dead and no start drives them (tp#2172 D5), and "<transfer>: <why>" failures.
     handoff_finalized: list[str] = field(default_factory=list)
     handoff_closers: list[str] = field(default_factory=list)
     handoff_reclaimed: list[str] = field(default_factory=list)
+    handoff_aborted: list[str] = field(default_factory=list)
     handoff_errors: list[str] = field(default_factory=list)
     # tp#1990: "<short id> <short tab UUID>" per row whose gone tab's binding was released.
     tabs_released: list[str] = field(default_factory=list)
@@ -105,6 +107,7 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
             or self.handoff_finalized
             or self.handoff_closers
             or self.handoff_reclaimed
+            or self.handoff_aborted
             or self.handoff_errors
             or self.scored
             or self.short_aimed

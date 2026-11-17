@@ -23,6 +23,20 @@ indexed query (:meth:`TransferStoreMixin.handoff_finalize_candidates`):
   an unreadable ``ps`` is never stale; a legacy token without a claim time is first
   stamped "seen now" (:meth:`Store.mark_in_flight_seen`).
 
+Two more candidate sets (tp#2172), each from its own indexed query:
+
+* a ``prepared``/``opened`` transfer older than ``LAUNCH_GRACE_S`` whose successor is
+  ``dead:*`` (``continue_session.successor_state`` against the pass's snapshot) and whose
+  ``start`` is not live is aborted (``abort_transfer``, reason ``sweep: successor dead:
+  <why>``). A ``start`` is live while its heartbeat (``start_heartbeat_at``) is fresher than
+  :data:`HEARTBEAT_STALE_MS` and its ``start_pid`` is not provably gone; a transfer with no
+  heartbeat (an older build) is live while a ``continue-session start`` runs among the
+  source pid's descendants in the pass's ONE ``ps`` table (any such process when the source
+  is unknown). An unreadable ``ps`` counts as live: the transfer is left alone.
+* a ``failed`` transfer whose successor recorded an accept refusal (``accept_refused_at``)
+  and still runs, idle, as the SAME process that refused (started before the refusal), gets
+  that successor's close armed and the token-scoped closer spawned — the orphan close.
+
 One closer spawn per source per :data:`PACING_MS`. Nothing is ever selected by age: the
 age floor only gates reverting an existing in-flight token of a candidate the query already
 returns, never a close. A source whose close completed (token retired) is never a candidate
@@ -46,9 +60,11 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 # pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 # pylint: disable=import-outside-toplevel  # continue_session / spawn stay lazy (module convention)
 
+import functools
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -56,7 +72,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from . import config
 from .models import LiveSession, now_ms
 from .store import Store
-from .transfer_store import ACCEPTED, HandoffCandidate
+from .transfer_store import ACCEPTED, HandoffCandidate, Transfer
 
 if TYPE_CHECKING:  # pragma: no cover
     from .adapters.claude import ClaudeAdapter
@@ -71,6 +87,9 @@ PACING_MS = 10 * 60 * 1000
 #: legacy rows) and is a belt for a recorded dead holder.
 STALE_MS = 20 * 60 * 1000
 
+#: tp#2172 D5: a ``start`` heartbeat older than this is stale (3 polls + 30 s).
+HEARTBEAT_STALE_MS = int((3 * 2.0 + 30) * 1000)
+
 
 class Tally(Protocol):
     """The ``DaemonReport`` fields this sweep fills."""
@@ -78,6 +97,7 @@ class Tally(Protocol):
     handoff_finalized: list[str]  # transfers moved accepted → finalized
     handoff_closers: list[str]  # source sessions a closer was spawned for
     handoff_reclaimed: list[str]  # source sessions whose dead holder's token went pending
+    handoff_aborted: list[str]  # active transfers aborted: successor dead, no live start
     handoff_errors: list[str]  # "<transfer>: <why>"
 
 
@@ -116,6 +136,16 @@ class _SnapshotRegistry:  # pylint: disable=too-few-public-methods  # the one me
 
     def discover(self) -> list[LiveSession]:
         return list(self._entries)
+
+    def transcript_path(
+        self, cwd: str, session_id: str, config_dir: str | None = None
+    ) -> Path | None:
+        """The real adapter's path resolution (a file lookup, no registry read)."""
+        from . import continue_session
+
+        return continue_session._adapter().transcript_path(  # pylint: disable=protected-access
+            cwd, session_id, config_dir
+        )
 
 
 @dataclass
@@ -243,27 +273,147 @@ def _close_finalized(sweep: _Pass, cand: HandoffCandidate) -> None:
         sweep.report.handoff_errors.append(f"{tid}: closer spawn failed")
 
 
-def run(store: Store, snapshot: dict[str, LiveSession], report: Tally, dry_run: bool) -> None:
-    """One sweep over :meth:`~TransferStoreMixin.handoff_finalize_candidates`; never raises."""
+# ------------------------------------------------------------ dead transfers (tp#2172 D5)
+
+
+def _is_start_command(command: str) -> bool:
+    """A ``… continue-session start …`` command line (ccc itself or a shell running it)."""
+    parts = command.split()
     try:
-        candidates = store.handoff_finalize_candidates()
+        at = parts.index("continue-session")
+    except ValueError:
+        return False
+    return "start" in parts[at + 1 :]
+
+
+def _start_live(sweep: _Pass, transfer: Transfer) -> bool:
+    """Is the ``start`` driving *transfer* alive? Fails toward "live" on any doubt."""
+    rows = sweep.ps_rows()
+    if transfer.start_heartbeat_at:
+        if sweep.now - transfer.start_heartbeat_at > HEARTBEAT_STALE_MS:
+            return False
+        return not (rows and transfer.start_pid and transfer.start_pid not in rows)
+    if not rows:
+        return True  # ps unreadable: leave the transfer
+    starts = [pid for pid, row in rows.items() if _is_start_command(str(row.command))]
+    entry = sweep.snapshot.get(transfer.source_session)
+    if entry is None or entry.pid <= 0:
+        return bool(starts)  # the source is unknown: any start may be its own
+    from . import terminal
+
+    return any(terminal.pid_descends_from(pid, entry.pid, rows) for pid in starts)
+
+
+def _abort_dead(sweep: _Pass, transfer: Transfer, watch: Any) -> None:
+    """Abort *transfer* when its successor is dead and no ``start`` drives it any more."""
+    from . import continue_session
+
+    registry = cast("ClaudeAdapter", _SnapshotRegistry(sweep.snapshot))
+    verdict = continue_session.successor_state(
+        sweep.store, registry, transfer, sweep.now, watch.fresh()
+    )
+    if not verdict.startswith(continue_session.DEAD_PREFIX) or _start_live(sweep, transfer):
+        return
+    tid = transfer.transfer_id
+    if sweep.dry_run:
+        sweep.report.handoff_aborted.append(tid)
+        return
+    why = verdict.removeprefix(continue_session.DEAD_PREFIX)
+    code, message = continue_session.abort_transfer(
+        sweep.store, tid, f"sweep: successor dead: {why}", sweep.now
+    )
+    if code != 0:
+        sweep.report.handoff_errors.append(f"{tid}: {message}")
+    elif message.startswith(continue_session.ABORT_PREFIX):
+        print(f"ccc daemon: handoff {tid} {message}", file=sys.stderr)
+        sweep.report.handoff_aborted.append(tid)
+
+
+def _orphan_due(sweep: _Pass, transfer: Transfer) -> bool:
+    """Is *transfer*'s successor the idle, still-running process that refused its accept,
+    with no close in flight and no closer spawned for it in this pacing window?"""
+    from .adapters.claude_agents import contract_status
+
+    sid = transfer.target_session
+    entry = sweep.snapshot.get(sid)
+    if entry is None or not entry.alive or contract_status(entry.raw_status) != "idle":
+        return False
+    if not entry.started_at or entry.started_at > transfer.accept_refused_at:
+        return False  # a later process (the tab reopened) or an unknown start: never closed
+    row = sweep.store.get(sid)
+    if row is None or (row.close_token and not row.close_requested_at):
+        return False  # unknown row, or a close already in flight
+    return sweep.now - sweep.pacing.get(sid, 0) >= PACING_MS
+
+
+def _close_orphan(sweep: _Pass, transfer: Transfer) -> None:
+    """Close the live successor of a FAILED transfer that refused its accept (D13).
+
+    Only the process that refused (registry start at or before the refusal): a tab the
+    user reopened later is never closed. Idle only, paced, a held token left alone."""
+    from . import continue_session
+
+    sid, tid = transfer.target_session, transfer.transfer_id
+    if not _orphan_due(sweep, transfer):
+        return
+    if sweep.dry_run:
+        sweep.report.handoff_closers.append(sid)
+        return
+    sweep.store.ensure_close_armed(sid, sweep.now)
+    row = sweep.store.get(sid)
+    if row is None or not row.close_token or not row.close_requested_at:
+        return  # claimed meanwhile (its own Stop chain): that holder closes it
+    if continue_session._spawn_closer(tid, sid):  # pylint: disable=protected-access
+        sweep.pacing[sid] = sweep.now
+        sweep.report.handoff_closers.append(sid)
+    else:
+        sweep.report.handoff_errors.append(f"{tid}: orphan closer spawn failed")
+
+
+def _guarded(sweep: _Pass, tid: str, step: Callable[[], None]) -> None:
+    """Run one candidate's *step*; a failure is reported and the rest still run."""
+    try:
+        step()
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        why = f"{type(exc).__name__}: {exc}"
+        print(f"ccc daemon: handoff {tid} failed: {why}", file=sys.stderr)
+        sweep.report.handoff_errors.append(f"{tid}: {why}")
+
+
+def _query(report: Tally, name: str, read: Callable[[], list[Any]]) -> list[Any]:
+    """One candidate query; a failure is reported and yields nothing."""
+    try:
+        return read()
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         print(f"ccc daemon: handoff sweep failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-        report.handoff_errors.append(f"query: {type(exc).__name__}: {exc}")
+        report.handoff_errors.append(f"{name}: {type(exc).__name__}: {exc}")
+        return []
+
+
+def run(store: Store, snapshot: dict[str, LiveSession], report: Tally, dry_run: bool) -> None:
+    """One sweep over the three candidate queries; never raises."""
+    from . import continue_session
+
+    now = now_ms()
+    grace_ms = continue_session.LAUNCH_GRACE_S * 1000
+    candidates: list[HandoffCandidate] = _query(report, "query", store.handoff_finalize_candidates)
+    dead: list[Transfer] = _query(
+        report, "dead query", lambda: store.dead_transfer_candidates(now - grace_ms)
+    )
+    orphans: list[Transfer] = _query(report, "orphan query", store.orphan_close_candidates)
+    if not (candidates or dead or orphans):
         return
-    if not candidates:
-        return
-    sweep = _Pass(store, snapshot, report, dry_run, now_ms(), _load_pacing())
+    sweep = _Pass(store, snapshot, report, dry_run, now, _load_pacing())
     before = dict(sweep.pacing)
     for cand in candidates:
-        try:
-            if cand.state == ACCEPTED:
-                _finalize_stranded(sweep, cand)
-            else:
-                _close_finalized(sweep, cand)
-        except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-            why = f"{type(exc).__name__}: {exc}"
-            print(f"ccc daemon: handoff {cand.transfer_id} failed: {why}", file=sys.stderr)
-            report.handoff_errors.append(f"{cand.transfer_id}: {why}")
+        step = _finalize_stranded if cand.state == ACCEPTED else _close_finalized
+        _guarded(sweep, cand.transfer_id, functools.partial(step, sweep, cand))
+    watch = continue_session.SuccessorWatch.from_env() if dead else None
+    for transfer in dead:
+        _guarded(
+            sweep, transfer.transfer_id, functools.partial(_abort_dead, sweep, transfer, watch)
+        )
+    for transfer in orphans:
+        _guarded(sweep, transfer.transfer_id, functools.partial(_close_orphan, sweep, transfer))
     if not dry_run and sweep.pacing != before:
         _save_pacing(sweep.pacing, sweep.now)

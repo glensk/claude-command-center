@@ -1977,6 +1977,33 @@ effective value on stderr (`accept wait: 420s (effective -w)`). The caller passe
 tool `timeout: 600000` (the default 120 s would cut the call off); a run that still runs out
 of accept wait exits 3 and the identical command re-run keeps waiting.
 
+**Dead successor: one automatic relaunch (tp#2172).** While it waits, `start` also checks
+that the successor is alive (Claude's registry, never a `ps` of some pid) and writes its own
+pid and a heartbeat (`transfers.start_pid`, `start_heartbeat_at`) on every 2 s poll. The
+successor is dead when it is still a draft 120 s after its launch (`never-started`); when
+its draft cleared (`transfers.target_launched_at`, stamped by the claim) but no live registry
+entry appeared within `CCC_RELAY_START_GRACE_S` (default 90; `0` = at once;
+`never-registered`); when a registry entry seen alive in this wait is missing on two polls in
+a row (`process-gone`, no grace: a closed tab); or when it is registered but its transcript
+has not grown and it has not accepted for `CCC_RELAY_NO_ACCEPT_S` (default 240; `no-accept`,
+e.g. a folder-trust prompt). An invalid knob value falls back to its default with a stderr
+note. A dead successor aborts its transfer (`aborted: successor dead: <why>`) and `start`
+creates ONE fresh transfer with the same snapshot and text, launches it and waits for the rest
+of the same `-w` budget, printing `relaunched: successor <new> (first <old> died: <why>)` (a
+still-open first tab is then identifiable). A second death exits 1 with `successor died twice:
+<why1>; <why2>; nothing moved`: two `failed` rows, no active transfer, the source untouched.
+
+**A differing re-run never refuses (tp#2172).** A `start` that meets an active `prepared` /
+`opened` transfer of the same source with a different snapshot (handoff text, account `-A`,
+overseer `-O`, executor `-E`, AIM, …) judges that transfer's successor by the same rules. A
+dead or never-started successor: the old transfer is aborted (`aborted: superseded`) and a
+new one is created and launched. A live or starting successor: `start` drives the EXISTING
+transfer with its STORED text and never rewrites its handoff file (the successor already read
+it); stderr names what this call could not apply (`note: transfer <id>'s successor <sid> is
+starting (opened); it keeps the handoff it was given; ignored from this call: handoff text,
+account -A work (the successor stays on account private)`). Two concurrent starts: the loser
+re-reads once and follows the same rules (an identical snapshot drives the winner's transfer).
+
 **Code facts and the model part.** The handoff is split: six sections are filled by code
 (`Goal and done-condition`, `tp ownership`, `Repositories, files, worktrees`, `Subagent
 continuations`, `Background restarts`, `Open items and questions`; ccc fills them from its
@@ -2048,12 +2075,19 @@ whose facts leave room for the model part within 22 KB (24 KB minus a 2 KB scrub
 A code-generated part (`--facts-only`, `--capped`) never fails for its size: its bodies are
 cut to what the facts leave, keeping the banner and the predecessor-transcript line, with a
 `… cut — full original: <path>` pointer to `handoffs/facts/<sid>/<snapshot>.model.md`. A
-model-written part (`-f`) that does not fit is refused with the room it has: `… it may have
-at most A bytes — shorten it to ≤ A` (A ≤ 10 KB). A model-written part whose section
-bodies (comments not counted) are over 2,500 characters is refused first, with exit 2,
-naming its largest section (`model part is N chars; the cap is 2500 — shorten ## <section>`;
-tp#1681): ccc carries the facts, the model writes decisions, next actions and pointers. The
-identical re-run of a stored `prepared`/`opened` transfer is never re-capped. Facts that overflow alone after every cut
+model-written part (`-f`) whose section bodies (comments not counted) are over 2,500
+characters is cut, never refused (tp#2172): each section keeps a share proportional to its
+length, cut at a line boundary and ended by a `… (continued in the full model part named in
+the preamble)` line (a section of at most 200 characters stays whole), and the whole file,
+scrubbed the same way, is kept in `handoffs/<transfer>.model-full.md` (0600); stderr says
+`note: model part N chars, cut to 2500; full text in <path>` and the successor's preamble
+names the file. The transfer digest is taken from the UNCUT part, so the identical re-run of
+a stored `prepared`/`opened` transfer still reuses it. ccc carries the facts, the model
+writes decisions, next actions and pointers. When the facts still overflow beside the model
+part after every cut tier, the fewest lowest-priority fact records (never-cut kinds last)
+move to `handoffs/<transfer>.facts-rest.md` (0600, named by one line of the document and by
+the preamble) instead of a refusal. Only a text that overflows with every record moved is
+still refused (`… it may have at most A bytes`, A ≤ 10 KB). Facts that overflow alone after every cut
 get their own message (`… this is a ccc defect, not the model part — file it`, plus `relay
 with --facts-only` for a written part). When the scrubber lengthens the text past 24 KB,
 compose fits once more with the budget less the measured growth and 256 B (at most two
@@ -2186,7 +2220,12 @@ hands the source's close to a token-scoped closer. Once the transfer is
 source done (it sinks to FINISHED; `handed_off_to` and the `⇢` marker stay).
 `ccc continue-session status` names the recovery step for every state; for an `accepted`
 transfer it is to re-run `ccc continue-session accept` in the successor (never touch the
-source).
+source). `ccc continue-session abort <transfer> [-r REASON] [-j]` gives up a `prepared` or
+`opened` transfer whose successor is stuck or dead: it moves it to `failed` with
+`aborted: REASON` (default `by hand`), hands the reserved `ccc await` groups back to the
+source and archives a never-started (draft) successor; a started successor tab stays open
+and its `accept` then refuses. It refuses an `accepted` transfer (ownership already moved:
+run `accept` in the successor) and reports a `finalized` or `failed` one unchanged (exit 0).
 
 **Who finalizes and closes the source.** `ccc continue-session accept` is the primary
 finalizer: right after the `opened → accepted` CAS, when the source is idle (or alive), it

@@ -442,10 +442,13 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
 - **Facts are code, collected once per transfer** (`handoff_facts.py`, `handoff_doc.compose`,
   tp#1479): six sections are filled from recorded facts, the model writes only `Current
   state`, `Decisions and constraints`, `First steps` (`validate_model_part`: ≤ 10 KB, no
-  other `##`); a model-WRITTEN part (`start -f`) is also capped at `MODEL_MAX_CHARS` (2,500
-  characters of section bodies, `model_chars_error`, exit 2 naming the largest section,
-  tp#1681), checked AFTER the identical-retry reuse so a stored transfer keeps its exit-3
-  retry; generated parts are cut, never refused. `start` freezes ONE snapshot `handoffs/facts/<sid>/<snap12>.json` (id =
+  other `##`); a model-WRITTEN part (`start -f`) over `MODEL_MAX_CHARS` (2,500 characters
+  of section bodies) is CUT by `handoff_doc.fit_model_part` (tp#2172 D1), never refused:
+  `EXIT_MODEL_TOO_LONG` is no longer returned. Its digest stays the UNCUT part's (so the
+  identical re-run reuses its transfer), and the scrubbed full text is a sidecar
+  `<transfer>.model-full.md` written by `_drive` next to the handoff (the transfer id does
+  not exist in `_compose`); facts that overflow every tier move to `<transfer>.facts-rest.md`
+  the same way (D2); the preamble names both. Generated parts are cut, never refused. `start` freezes ONE snapshot `handoffs/facts/<sid>/<snap12>.json` (id =
   sha256 of its canonical JSON, the transfer's `facts_snapshot` column); `prompt_sha256` =
   sha256(model part) + snapshot id, and a re-run on an active `prepared`/`opened` transfer
   reuses the stored snapshot and composed text without recollecting — never let a

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """``ccc close-now --handoff-transfer <id> --session <src>`` — the handoff closer (tp#1582).
 
-Closes the SOURCE of a ``finalized`` continue-session transfer: SIGTERM its one live
+Closes the SOURCE of a ``finalized`` continue-session transfer (or, tp#2172 D13, the orphan
+successor of a ``failed`` one that refused its accept): SIGTERM its one live
 Claude process and close its tmux pane / iTerm tab, but only once that process is
 provably and stably idle. Token-scoped and process-bound:
 
@@ -145,13 +146,19 @@ class Debt:
             return None
 
 
-def lineage_refusal(store: Store, transfer_id: str, session_id: str) -> str:
-    """Why *transfer_id* does not license closing *session_id* (``""`` = it does)."""
-    from .transfer_store import FINALIZED
+def lineage_refusal(store: Store, transfer_id: str, session_id: str) -> str:  # pylint: disable=too-many-return-statements
+    """Why *transfer_id* does not license closing *session_id* (``""`` = it does).
+
+    The source of a finalized transfer, or (tp#2172 D13) the orphan SUCCESSOR of a
+    ``failed`` transfer that recorded an accept refusal: its work never moved."""
+    from .transfer_store import FAILED, FINALIZED
 
     transfer = store.get_transfer(transfer_id)
     if transfer is None:
         return f"transfer {transfer_id} not found"
+    if transfer.state == FAILED and transfer.target_session == session_id:
+        licensed = transfer.source_session != session_id and transfer.accept_refused_at
+        return "" if licensed else f"transfer {transfer_id} failed, no accept refusal recorded"
     if transfer.source_session != session_id:
         return f"transfer {transfer_id} is not this session's handoff"
     if transfer.state != FINALIZED:

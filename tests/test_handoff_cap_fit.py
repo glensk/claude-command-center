@@ -209,7 +209,9 @@ def test_a_cut_generated_part_keeps_banner_and_transcript(tmp_path: Path) -> Non
     _assert_never_cut(result.text)
 
 
-def test_written_model_part_refusal_names_the_room(tmp_path: Path) -> None:
+def test_written_model_part_overflow_moves_facts_not_refused(tmp_path: Path) -> None:
+    """tp#2172 D2: a written part beside facts that overflow every tier is never refused;
+    the lowest-priority records move to ``Composed.rest``."""
     doc = bigsnap.big_snapshot(held=200, title_bytes=200)
     doc["facts"] += [
         rec("note", f"note:{n}", "Repositories, files, worktrees", 4, text="n" * 400)
@@ -220,27 +222,17 @@ def test_written_model_part_refusal_names_the_room(tmp_path: Path) -> None:
         "".join(f"## {t}\n\n{body}\n" for t in handoff_doc.MODEL_SECTIONS)
     )
     assert big.ok
-    result, _ = _checked(big, doc, tmp_path)
-    assert not result.ok
-    (msg,) = [e for e in result.errors if "at most" in e]
-    room = int(msg.split("at most ")[1].split(" bytes")[0])
-    assert 0 < room < 10 * 1024
-    third, rest = divmod(room, 3)
-    sizes = [third + rest, third, third]
-    exact = handoff_doc.validate_model_part(
-        "".join(
-            f"## {t}\n\n{'y' * n}\n\n"
-            for t, n in zip(handoff_doc.MODEL_SECTIONS, sizes, strict=True)
-        )
-    )
-    assert sum(len(b.encode()) for b in exact.sections.values()) == room
-    result, _ = _checked(exact, doc, tmp_path)
+    result, composed = _checked(big, doc, tmp_path)
     assert result.ok, result.errors
+    assert len(result.text.encode()) <= handoff_doc.MAX_BYTES
+    assert composed.rest and "moved out for size" in result.text
+    assert "x" * 3300 in result.text  # the model part is whole
 
 
-def test_facts_alone_overflow_does_not_blame_the_model(
+def test_facts_alone_overflow_moves_facts_not_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """tp#2172 D2: facts that overflow alone (hard guard off) move out, for both paths."""
     monkeypatch.setattr(handoff_doc, "_guard_facts", lambda rendered, _cap, _ref: rendered)
     doc = bigsnap.big_snapshot()
     doc["facts"] += [
@@ -249,10 +241,9 @@ def test_facts_alone_overflow_does_not_blame_the_model(
     ]
     for generated in (False, True):
         model = _facts_only_part(doc, tmp_path)
-        result, _ = _checked(model, doc, tmp_path, generated=generated)
-        assert not result.ok
-        text = " ".join(result.errors)
-        assert "facts alone" in text and "shorten" not in text
+        result, composed = _checked(model, doc, tmp_path, generated=generated)
+        assert result.ok, result.errors
+        assert composed.rest and "moved out for size" in result.text
 
 
 def test_scrub_growth_is_budgeted(tmp_path: Path) -> None:

@@ -808,7 +808,16 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         "held_notice_at": "INTEGER NOT NULL DEFAULT 0",
     }
 
-    _ADDED_TRANSFER_COLUMNS = {"launch_profile": "TEXT", "facts_snapshot": "TEXT"}
+    _ADDED_TRANSFER_COLUMNS = {
+        "launch_profile": "TEXT",
+        "facts_snapshot": "TEXT",
+        # tp#2172 D4/D5: successor start-up grace + the driving start's heartbeat.
+        "target_launched_at": "INTEGER NOT NULL DEFAULT 0",
+        "start_pid": "INTEGER NOT NULL DEFAULT 0",
+        "start_heartbeat_at": "INTEGER NOT NULL DEFAULT 0",
+        # tp#2172 D13: the successor's accept refusal on a failed transfer (orphan close).
+        "accept_refused_at": "INTEGER NOT NULL DEFAULT 0",
+    }
 
     def _add_column(self, table: str, column: str, decl: str) -> None:
         """``ALTER TABLE`` *table* to add *column*, tolerating a peer that just did it.
@@ -895,6 +904,12 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_close_token "
             "ON sessions(close_token) WHERE close_token != ''"
+        )
+        # …and from the few failed transfers whose successor refused its accept (tp#2172
+        # D13, the orphan close). Created HERE: an old DB gains the column above.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_transfers_accept_refused "
+            "ON transfers(accept_refused_at) WHERE accept_refused_at > 0"
         )
         self.conn.commit()
 
@@ -1348,8 +1363,17 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         return got
 
     def clear_draft(self, session_id: str) -> None:
-        """Promote a draft to a real session: drop the draft flag as it launches."""
-        self.update_fields(session_id, draft=False, status=Status.IDLE.value)
+        """Promote a draft to a real session: drop the draft flag as it launches.
+
+        A handoff successor's transfer gets its ``target_launched_at`` in the same
+        transaction (tp#2172 D4: the start of its start-up grace)."""
+        ts = now_ms()
+        self.conn.execute(
+            "UPDATE sessions SET draft = 0, status = ?, updated_at = ? WHERE session_id = ?",
+            (Status.IDLE.value, ts, session_id),
+        )
+        self._stamp_target_launched(session_id, ts)
+        self.conn.commit()
 
     def claim_draft(self, session_id: str, pid: int = 0) -> bool:
         """One-shot atomic launch claim of a draft: ``True`` for exactly one claimant.
@@ -1366,14 +1390,18 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         pass can tell a launch still waiting at a pre-registry dialog from a dead one
         (``core.orphan_launched_ids``). ``0`` leaves the column alone.
         """
+        ts = now_ms()
         cur = self.conn.execute(
             "UPDATE sessions SET draft = 0, fire_at = 0, status = ?, updated_at = ?, "
             "last_seen_pid = CASE WHEN ? > 0 THEN ? ELSE last_seen_pid END "
             "WHERE session_id = ? AND draft = 1",
-            (Status.IDLE.value, now_ms(), pid, pid, session_id),
+            (Status.IDLE.value, ts, pid, pid, session_id),
         )
+        claimed = cur.rowcount == 1
+        if claimed:  # a handoff successor: its start-up grace starts now (tp#2172 D4)
+            self._stamp_target_launched(session_id, ts)
         self.conn.commit()
-        return cur.rowcount == 1
+        return claimed
 
     def armed_draft_summary(self, now: int | None = None) -> tuple[int, int] | None:
         """``(earliest fire_at, count)`` over ALL armed fire times, or ``None``.

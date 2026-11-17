@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -395,8 +396,8 @@ def test_retry_with_a_different_handoff_names_the_field(
     harness.accept_on_sleep = False
     assert harness.start("-w", "0") == continue_session.EXIT_WAITING
     harness.file.write_text(_handoff_text(**{"Current state": "changed"}), encoding="utf-8")
-    assert harness.start("-w", "0") == 1
-    assert "different prompt_sha256" in capsys.readouterr().err
+    assert harness.start("-w", "0") == continue_session.EXIT_WAITING  # tp#2172 D6: no refusal
+    assert "ignored from this call: handoff text" in capsys.readouterr().err
 
 
 def test_rerun_after_acceptance_finalizes(harness: _Harness) -> None:
@@ -444,29 +445,126 @@ def test_start_composes_a_three_section_model_part_with_the_facts(
     assert "Decide before restarting" in (job.prompt or "")
 
 
-def test_an_eleven_kb_model_part_is_refused_before_anything_is_written(
-    harness: _Harness, capsys: pytest.CaptureFixture[str]
-) -> None:
-    harness.file.write_text(_model_file(**{"Current state": "y" * 11000}), encoding="utf-8")
-    assert harness.start() == continue_session.EXIT_MODEL_TOO_LONG
-    assert "the cap is" in capsys.readouterr().err
-    with Store() as store:
-        assert store.transfers_of(SID) == []
+FIXTURE_4901 = Path(__file__).parent / "fixtures" / "model_part_4901.md"
 
 
-def test_handoff_cap_refuses_a_long_model_part_naming_its_largest_section(
+def _model_bodies_in(stored: str, kept: str) -> int:
+    """The chars of *kept*'s model bodies, each found as the END of its section in *stored*
+    (code facts come first in a section)."""
+    found, part = handoff_doc.sections(stored), handoff_doc.parse_model_file(kept)
+    assert part.ok, part.errors
+    for title, body in part.sections.items():
+        assert found[" ".join(title.lower().split())].endswith(body), title
+    return sum(len(body) for body in part.sections.values())
+
+
+def test_start_overlong_model_part_cut_with_sidecar(
     harness: _Harness, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """tp#1681 L3c: a model-written part over 2,500 chars exits 2 and names the section."""
-    big = "d" * (handoff_doc.MODEL_MAX_CHARS - 10)
-    harness.file.write_text(_model_file(**{"Decisions and constraints": big}), encoding="utf-8")
-    assert harness.start() == 2
+    """tp#2172 D1: a 4,901-char part is cut to the cap, never refused; the full text is a
+    0600 sidecar next to the handoff and the successor's preamble names it."""
+    raw = FIXTURE_4901.read_text(encoding="utf-8")
+    assert handoff_doc.model_chars(raw) == 4901
+    harness.file.write_text(raw, encoding="utf-8")
+    assert harness.start() == 0
     err = capsys.readouterr().err
-    assert f"the cap is {handoff_doc.MODEL_MAX_CHARS}" in err
-    assert "## Decisions and constraints" in err
     with Store() as store:
-        assert store.transfers_of(SID) == []
-    assert harness.launches == []
+        (transfer,) = store.transfers_of(SID)
+        job = store.get(transfer.target_session)
+    stored = Path(transfer.handoff_path).read_text(encoding="utf-8")
+    kept, full = handoff_doc.fit_model_part(raw)
+    assert full == raw and _model_bodies_in(stored, kept) <= handoff_doc.MODEL_MAX_CHARS
+    assert handoff_doc.CONTINUED in stored
+    sidecar = Path(transfer.handoff_path).with_name(f"{transfer.transfer_id}.model-full.md")
+    assert sidecar.read_text(encoding="utf-8") == raw
+    assert oct(sidecar.stat().st_mode & 0o777) == "0o600"
+    assert f"note: model part 4901 chars, cut to 2500; full text in {sidecar}" in err
+    prompt = " ".join(((job and job.prompt) or "").split())
+    assert f"its full text is at {sidecar}" in prompt and "ends with `continued`" in prompt
+    model = handoff_doc.parse_model_file(raw)
+    assert transfer.prompt_sha256 == handoff_doc.model_digest(model, transfer.facts_snapshot)
+
+
+def test_start_overlong_identical_rerun_reuses_transfer(
+    harness: _Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Objection 4: the digest is the UNCUT part's, so the same over-long file twice is ONE
+    transfer (the retry match), never a "differs" note or a second transfer."""
+    harness.file.write_text(FIXTURE_4901.read_text(encoding="utf-8"), encoding="utf-8")
+    harness.accept_on_sleep = False
+    assert harness.start("-w", "0") == continue_session.EXIT_WAITING
+    with Store() as store:
+        (first,) = store.transfers_of(SID)
+    stored = Path(first.handoff_path).read_bytes()
+    capsys.readouterr()
+    harness.accept_on_sleep = True
+    assert harness.start() == 0
+    err = capsys.readouterr().err
+    with Store() as store:
+        (again,) = store.transfers_of(SID)
+    assert again.transfer_id == first.transfer_id and again.state == "finalized"
+    assert again.prompt_sha256 == first.prompt_sha256
+    assert "ignored from this call" not in err and "with different" not in err
+    assert Path(first.handoff_path).read_bytes() == stored
+
+
+def test_start_short_model_part_byte_identical(
+    harness: _Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A part at most the cap is composed exactly as before tp#2172: no sidecar, no note, the
+    document is the plain compose of the uncut part."""
+    room = handoff_doc.MODEL_MAX_CHARS - len("mine: Current state") - len("mine: First steps")
+    harness.file.write_text(
+        _model_file(**{"Decisions and constraints": "d" * room}), encoding="utf-8"
+    )
+    kept, full = handoff_doc.fit_model_part(harness.file.read_bytes())
+    assert full == "" and kept == harness.file.read_text(encoding="utf-8")
+    assert harness.start() == 0
+    assert "cut to" not in capsys.readouterr().err
+    with Store() as store:
+        (transfer,) = store.transfers_of(SID)
+        job = store.get(transfer.target_session)
+    stored = Path(transfer.handoff_path).read_text(encoding="utf-8")
+    assert not list(Path(transfer.handoff_path).parent.glob("*.model-full.md"))
+    assert handoff_doc.CONTINUED not in stored
+    assert "model part below was cut" not in ((job and job.prompt) or "")
+    from command_center import handoff_facts  # pylint: disable=import-outside-toplevel
+
+    snap = json.loads(
+        (handoff_facts.facts_dir(SID) / f"{transfer.facts_snapshot[:12]}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    model = handoff_doc.parse_model_file(harness.file.read_bytes())
+    composed = handoff_doc.compose_checked(model, snap, ref=SID, model_path="<unused>")[1]
+    assert stored == composed.text
+
+
+def test_an_eleven_kb_model_part_is_cut_not_refused(harness: _Harness) -> None:
+    """Over the 10 KB byte cap too: the cut part passes, the digest is the full text's."""
+    harness.file.write_text(_model_file(**{"Current state": "y" * 11000}), encoding="utf-8")
+    assert harness.start() == 0
+    with Store() as store:
+        (transfer,) = store.transfers_of(SID)
+    sidecar = Path(transfer.handoff_path).with_name(f"{transfer.transfer_id}.model-full.md")
+    assert len(sidecar.read_text(encoding="utf-8")) > 11000
+
+
+def test_exit_model_too_long_never_returned() -> None:
+    """tp#2172 D1: no code path returns EXIT_MODEL_TOO_LONG (kept as a constant only)."""
+    import ast  # pylint: disable=import-outside-toplevel
+
+    tree = ast.parse(Path(continue_session.__file__).read_text(encoding="utf-8"))
+    returned = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "EXIT_MODEL_TOO_LONG"
+    ]
+    assert returned == []
+    assert continue_session.EXIT_MODEL_TOO_LONG == 2
+    assert not hasattr(continue_session, "ModelPartTooLong")
 
 
 def test_handoff_cap_allows_a_part_at_the_cap(harness: _Harness) -> None:
@@ -543,8 +641,8 @@ def test_a_retry_with_another_model_file_still_names_the_digest(
     harness.accept_on_sleep = False
     assert harness.start("-w", "0") == continue_session.EXIT_WAITING
     harness.file.write_text(_model_file(**{"First steps": "different"}), encoding="utf-8")
-    assert harness.start("-w", "0") == 1
-    assert "different prompt_sha256" in capsys.readouterr().err
+    assert harness.start("-w", "0") == continue_session.EXIT_WAITING  # tp#2172 D6: no refusal
+    assert "ignored from this call: handoff text" in capsys.readouterr().err
 
 
 def test_a_transfer_from_before_snapshots_keeps_the_whole_document_path(
@@ -1084,8 +1182,6 @@ def test_accept_refuses_the_wrong_session_and_the_wrong_account(
 
 
 def _relay_state_dir() -> Path:
-    import os  # pylint: disable=import-outside-toplevel
-
     path = Path(os.environ["CC_RELAY_STATE_DIR"])  # pinned under tmp_path by conftest
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -1452,6 +1548,652 @@ def test_status_names_the_recovery_step(
     out = capsys.readouterr().out
     assert tid in out and "next:" in out
     assert cli.main(["continue-session", "status", "t-missing"]) == 1
+
+
+# ------------------------------------------------------------- abort (tp#2172 D3)
+
+
+def _abort(*args: str) -> int:
+    return cli.main(["continue-session", "abort", *args])
+
+
+def _transfer(tid: str) -> Any:
+    with Store() as store:
+        transfer = store.get_transfer(tid)
+    assert transfer is not None
+    return transfer
+
+
+def _target_row(tid: str) -> Any:
+    with Store() as store:
+        row = store.get(_transfer(tid).target_session)
+    assert row is not None
+    return row
+
+
+def test_abort_prepared_to_failed(harness: _Harness, capsys: pytest.CaptureFixture[str]) -> None:
+    tid = _opened_transfer(harness)
+    with Store() as store:  # a start that died before its launch left it prepared
+        store.conn.execute("UPDATE transfers SET state = 'prepared' WHERE transfer_id = ?", (tid,))
+        store.conn.commit()
+    capsys.readouterr()
+    assert _abort(tid, "-r", "launch never ran", "-j") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["ok"] and data["changed"] and (data["was"], data["state"]) == ("prepared", "failed")
+    assert "continue-session start" in data["next"]
+    transfer = _transfer(tid)
+    assert transfer.state == "failed" and transfer.failure == "aborted: launch never ran"
+    assert _target_row(tid).archived
+    source = _source_row()
+    assert not source.handed_off_to and not source.close_requested_at
+    with Store() as store:
+        assert store.active_transfer(SID) is None  # the source may start a new transfer
+
+
+@pytest.mark.parametrize("draft", [True, False])
+def test_abort_opened_releases_await_groups(
+    harness: _Harness, capsys: pytest.CaptureFixture[str], draft: bool
+) -> None:
+    gid = _arm_await(SID)
+    tid = _opened_transfer(harness)
+    assert _group(gid).transfer_id == tid
+    target = _transfer(tid).target_session
+    if not draft:  # the successor's tab started (claude cleared the draft flag)
+        with Store() as store:
+            store.clear_draft(target)
+    capsys.readouterr()
+    assert _abort(tid) == 0
+    out = capsys.readouterr().out
+    assert f"transfer {tid} opened → failed (aborted: by hand)" in out
+    assert "released 1 await group(s)" in out and "next:" in out
+    transfer = _transfer(tid)
+    assert transfer.state == "failed" and transfer.failure == "aborted: by hand"
+    group = _group(gid)
+    assert not group.transfer_id and group.session_id == SID  # back with the source
+    row = _target_row(tid)
+    assert bool(row.archived) is draft  # a started successor is never archived (nor killed)
+    if not draft:
+        assert f"successor {target} was started and stays open" in out
+
+
+def test_abort_accepted_refused(harness: _Harness, capsys: pytest.CaptureFixture[str]) -> None:
+    from command_center.transfer_store import ACCEPTED  # pylint: disable=C0415
+
+    gid = _arm_await(SID)
+    tid = _opened_transfer(harness)
+    with Store() as store:
+        store.transition_transfer(tid, ACCEPTED, 1)
+    before = _transfer(tid)
+    capsys.readouterr()
+    assert _abort(tid, "-r", "too late") == 1
+    err = capsys.readouterr().err
+    assert "ownership already moved" in err
+    assert f"`ccc continue-session accept {tid}`" in err
+    after = _transfer(tid)
+    assert after.to_dict() == before.to_dict()  # unchanged, failure text included
+    assert _group(gid).transfer_id == tid  # the reservation is untouched
+    assert not _target_row(tid).archived
+    assert _abort(tid, "-j") == 1
+    data = json.loads(capsys.readouterr().out)
+    assert not data["ok"] and not data["changed"] and data["state"] == "accepted"
+
+
+@pytest.mark.parametrize("terminal", ["finalized", "failed"])
+def test_abort_terminal_idempotent(
+    harness: _Harness, capsys: pytest.CaptureFixture[str], terminal: str
+) -> None:
+    if terminal == "finalized":
+        assert harness.start() == 0
+        with Store() as store:
+            (transfer,) = store.transfers_of(SID)
+        tid = transfer.transfer_id
+    else:
+        tid = _opened_transfer(harness)
+        assert _abort(tid, "-r", "first") == 0
+    before = _transfer(tid)
+    capsys.readouterr()
+    assert _abort(tid, "-r", "second") == 0
+    out = capsys.readouterr().out
+    assert f"already {terminal}" in out and "nothing changed" in out
+    assert _transfer(tid).to_dict() == before.to_dict()
+    assert _abort(tid, "-j") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["ok"] and not data["changed"] and data["state"] == terminal
+
+
+def test_abort_unknown_id(harness: _Harness, capsys: pytest.CaptureFixture[str]) -> None:
+    del harness
+    assert _abort("t-missing") == 1
+    assert "no such transfer t-missing" in capsys.readouterr().err
+    assert _abort("t-missing", "-j") == 1
+    data = json.loads(capsys.readouterr().out)
+    assert not data["ok"] and data["state"] == ""
+
+
+def test_abort_transfer_core_returns_code_and_message(harness: _Harness) -> None:
+    tid = _opened_transfer(harness)
+    with Store() as store:
+        code, message = continue_session.abort_transfer(store, tid, "successor dead: x", 5)
+        assert (code, message.startswith("aborted: ")) == (0, True)
+        assert continue_session.abort_transfer(store, tid, "again", 6)[0] == 0
+    assert _transfer(tid).failure == "aborted: successor dead: x"
+
+
+def test_accept_after_abort_refuses(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    log = tmp_path / "hooks.log"
+    tid = _opened_transfer(harness)
+    assert _abort(tid, "-r", "successor hung") == 0
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch, [_ok_hook(tmp_path, log)])
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    assert f"transfer {tid} is failed: aborted: successor hung" in capsys.readouterr().err
+    assert not log.exists()  # no hook ran: ownership never moved
+    assert _state(tid) == "failed"
+    assert not _source_row().handed_off_to
+
+
+def test_accept_refused_records_accept_refused_at(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """tp#2172 D13: the successor's refused accept on a failed transfer is recorded (the
+    daemon sweep's orphan close keys on it); an outside caller's refusal is not."""
+    tid = _opened_transfer(harness)
+    assert _abort(tid, "-r", "successor hung") == 0
+    with Store() as store:
+        assert store.get_transfer(tid).accept_refused_at == 0  # type: ignore[union-attr]
+        assert not store.record_accept_refusal(tid, "someone-else", 5)  # not the target
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "someone-else")
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    with Store() as store:
+        assert store.get_transfer(tid).accept_refused_at == 0  # type: ignore[union-attr]
+    _as_successor(monkeypatch, harness, tid)
+    _hooks(monkeypatch, [_ok_hook(tmp_path, tmp_path / "hooks.log")])
+    capsys.readouterr()
+    assert cli.main(["continue-session", "accept", tid]) == 1
+    assert f"transfer {tid} is failed: aborted: successor hung" in capsys.readouterr().err
+    with Store() as store:
+        transfer = store.get_transfer(tid)
+    assert transfer is not None and transfer.state == "failed"
+    assert transfer.accept_refused_at > 0
+
+
+def test_status_shows_aborted_reason(harness: _Harness, capsys: pytest.CaptureFixture[str]) -> None:
+    tid = _opened_transfer(harness)
+    capsys.readouterr()
+    assert cli.main(["continue-session", "status", tid, "-j"]) == 0
+    before = json.loads(capsys.readouterr().out)
+    assert f"`ccc continue-session abort {tid}`" in before["recovery"]  # names the verb
+    assert _abort(tid, "-r", "stuck since monday") == 0
+    capsys.readouterr()
+    assert cli.main(["continue-session", "status", tid]) == 0
+    out = capsys.readouterr().out
+    assert "failed" in out and "last failure: aborted: stuck since monday" in out
+    assert cli.main(["continue-session", "status", tid, "-j"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["failure"] == "aborted: stuck since monday"
+    assert "aborted: stuck since monday" in data["recovery"]
+
+
+def test_abort_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["continue-session", "abort", "-h"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "--reason REASON" in out and "-j, --json" in out
+
+
+# ------------------------------------- successor liveness + one relaunch (tp#2172 D4/D5)
+
+
+class _World:  # pylint: disable=too-many-instance-attributes  # the successor side of a wait
+    """A fake wall clock tied to the harness clock, a fake registry for successors and a
+    per-poll script standing in for the successor tabs (claim, register, write, accept)."""
+
+    def __init__(
+        self, harness: _Harness, adapter: _Adapter, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from command_center import models  # pylint: disable=import-outside-toplevel
+        from command_center import store as store_module  # pylint: disable=C0415
+
+        self.harness = harness
+        self.base = models.now_ms()
+        self.registered: set[str] = set()
+        self.transcripts: dict[str, Path] = {}
+        self.polls: list[float] = []  # the harness clock at every sleep of the wait
+        self.heartbeats: list[tuple[int, int, int]] = []  # (now, start_pid, heartbeat)
+        self.script: Any = lambda world: None
+        monkeypatch.setattr(continue_session, "_now_ms", self.now)
+        monkeypatch.setattr(store_module, "now_ms", self.now)
+        monkeypatch.setattr(continue_session, "_sleep", self.sleep)
+        source = adapter.discover
+        monkeypatch.setattr(adapter, "discover", lambda: source() + self._entries())
+        self._source_transcript = adapter.transcript_path
+        monkeypatch.setattr(adapter, "transcript_path", self._transcript)
+        monkeypatch.delenv(continue_session.START_GRACE_ENV, raising=False)
+        monkeypatch.delenv(continue_session.NO_ACCEPT_ENV, raising=False)
+
+    def now(self) -> int:
+        return self.base + int(self.harness.clock * 1000)
+
+    def _entries(self) -> list[LiveSession]:
+        return [
+            LiveSession(pid=5000 + n, session_id=sid, cwd="/repo", alive=True)
+            for n, sid in enumerate(sorted(self.registered))
+        ]
+
+    def _transcript(self, cwd: str, session_id: str, config_dir: str | None = None) -> Path | None:
+        if session_id == SID:
+            return self._source_transcript(cwd, session_id, config_dir)
+        return self.transcripts.get(session_id)  # a successor: only once it has written one
+
+    def sleep(self, seconds: float) -> None:
+        active = self.active()
+        if active is not None:
+            self.heartbeats.append((self.now(), active.start_pid, active.start_heartbeat_at))
+        self.polls.append(self.harness.clock)
+        self.harness.clock += seconds
+        self.script(self)
+
+    @staticmethod
+    def active() -> Any:
+        with Store() as store:
+            return store.active_transfer(SID)
+
+    @property
+    def target(self) -> str:
+        """The successor launched last."""
+        return self.harness.launches[-1]
+
+    def claim(self) -> None:
+        """The successor's tab ran ``start-job``: its draft is claimed."""
+        with Store() as store:
+            store.claim_draft(self.target)
+
+    def write(self, sid: str) -> None:
+        """The successor's transcript grows (mtime on the fake clock)."""
+        path = self.transcripts.setdefault(sid, self.harness.tmp / f"{sid}.jsonl")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write("{}\n")
+        stamp = self.now() / 1000
+        os.utime(path, (stamp, stamp))
+
+    def start_up(self) -> None:
+        """Claim the newest successor, register it and give it a transcript."""
+        self.claim()
+        self.registered.add(self.target)
+        self.write(self.target)
+
+    def accept(self) -> None:
+        from command_center.transfer_store import ACCEPTED  # pylint: disable=C0415
+
+        active = self.active()
+        assert active is not None
+        with Store() as store:
+            store.transition_transfer(active.transfer_id, ACCEPTED, self.now())
+
+
+@pytest.fixture(name="world")
+def _world(harness: _Harness, fixture_session: _Adapter, monkeypatch: pytest.MonkeyPatch) -> _World:
+    return _World(harness, fixture_session, monkeypatch)
+
+
+def _transfers() -> list[Any]:
+    """The source's transfers in launch order (opened_at is on the fake clock)."""
+    with Store() as store:
+        return sorted(store.transfers_of(SID), key=lambda t: (t.opened_at, t.created_at))
+
+
+def _relaunched_once(world: _World, why: str) -> tuple[Any, Any]:
+    """Two transfers: the first failed for *why*, the second finalized; two launches."""
+    first, second = _transfers()
+    assert first.state == "failed" and first.failure == f"aborted: successor dead: {why}"
+    assert second.state == "finalized"
+    assert world.harness.launches == [first.target_session, second.target_session]
+    assert first.prompt_sha256 == second.prompt_sha256  # same snapshot, same text
+    assert first.facts_snapshot == second.facts_snapshot
+    return first, second
+
+
+def test_start_relaunch_after_draft_never_started(
+    world: _World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def script(w: _World) -> None:
+        if len(w.harness.launches) == 2:  # the relaunched tab starts and accepts
+            w.accept()
+
+    world.script = script
+    assert world.harness.start() == 0
+    first, _second = _relaunched_once(world, "never-started")
+    assert world.harness.clock >= continue_session.LAUNCH_GRACE_S
+    with Store() as store:
+        job = store.get(first.target_session)
+        assert job is not None and job.archived  # the never-started draft is archived
+    assert "finalized:" in capsys.readouterr().out
+
+
+def test_start_no_registry_entry_within_start_grace_no_abort(world: _World) -> None:
+    def script(w: _World) -> None:
+        if w.harness.clock == 2:
+            w.claim()  # the draft clears; claude has not registered yet
+        elif w.harness.clock >= 32:  # 30 s after the clear, still unregistered: then accept
+            w.accept()
+
+    world.script = script
+    assert world.harness.start() == 0
+    (transfer,) = _transfers()
+    assert transfer.state == "finalized" and len(world.harness.launches) == 1
+    assert transfer.target_launched_at == world.base + 2000  # stamped by the claim
+
+
+def test_start_never_registered_after_grace_relaunches(
+    world: _World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def script(w: _World) -> None:
+        if len(w.harness.launches) == 2:
+            w.accept()
+        elif w.harness.clock == 2:
+            w.claim()
+
+    world.script = script
+    assert world.harness.start() == 0
+    first, _second = _relaunched_once(world, "never-registered")
+    grace = continue_session.START_GRACE_DEFAULT_S
+    assert 2 + grace <= world.polls[-1] <= 2 + grace + continue_session.ACCEPT_POLL_SEC
+    assert first.target_launched_at == world.base + 2000
+    assert "died: never-registered" in capsys.readouterr().out
+
+
+def test_start_grace_zero_aborts_unregistered_at_once(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(continue_session.START_GRACE_ENV, "0")
+
+    def script(w: _World) -> None:
+        if len(w.harness.launches) == 2:
+            w.accept()
+        elif w.harness.clock == 2:
+            w.claim()
+
+    world.script = script
+    assert world.harness.start() == 0
+    _relaunched_once(world, "never-registered")
+    assert world.polls[:2] == [0.0, 2.0]  # the poll right after the clear aborted it
+
+
+def test_start_registered_pid_gone_aborts_at_once(
+    world: _World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def script(w: _World) -> None:
+        if len(w.harness.launches) == 2:
+            w.accept()
+        elif w.harness.clock == 2:
+            w.start_up()
+        elif w.harness.clock == 10:
+            w.registered.clear()  # the tab was closed: the process is gone
+
+    world.script = script
+    assert world.harness.start() == 0
+    _relaunched_once(world, "process-gone")
+    # missing at 10 and 12 → dead at 12, long inside the 90 s start grace
+    assert world.polls[:7] == [0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0]
+    assert "died: process-gone" in capsys.readouterr().out
+
+
+def test_start_pid_missing_one_poll_no_abort(world: _World) -> None:
+    def script(w: _World) -> None:
+        clock = w.harness.clock
+        if clock == 2:
+            w.start_up()
+        elif clock == 10:
+            w.registered.clear()  # one poll without its registry entry (a rewrite)
+        elif clock == 12:
+            w.registered.add(w.target)
+        elif clock >= 20:
+            w.accept()
+
+    world.script = script
+    assert world.harness.start() == 0
+    (transfer,) = _transfers()
+    assert transfer.state == "finalized" and len(world.harness.launches) == 1
+
+
+def test_start_stuck_successor_no_accept_relaunches(world: _World) -> None:
+    def script(w: _World) -> None:
+        if len(w.harness.launches) == 2:
+            w.accept()
+        elif w.harness.clock == 2:
+            w.start_up()  # registered, alive, and its transcript never grows again
+
+    world.script = script
+    assert world.harness.start() == 0
+    _relaunched_once(world, "no-accept")
+    stuck = continue_session.NO_ACCEPT_DEFAULT_S
+    assert 2 + stuck <= world.polls[-1] <= 2 + stuck + continue_session.ACCEPT_POLL_SEC
+
+
+def test_start_no_accept_counts_as_the_one_relaunch(
+    world: _World, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv(continue_session.NO_ACCEPT_ENV, "60")
+
+    def script(w: _World) -> None:
+        if w.target not in w.registered:
+            w.start_up()  # each successor registers and then hangs (a folder-trust prompt)
+
+    world.script = script
+    assert world.harness.start() == 1
+    assert [t.state for t in _transfers()] == ["failed", "failed"]
+    assert "successor died twice: no-accept; no-accept; nothing moved" in capsys.readouterr().err
+
+
+def test_start_second_death_exits_1(world: _World, capsys: pytest.CaptureFixture[str]) -> None:
+    def script(w: _World) -> None:
+        if len(w.harness.launches) == 1 and w.harness.clock == 2:
+            w.claim()  # the first clears and never registers; the second never starts
+
+    world.script = script
+    assert world.harness.start() == 1
+    first, second = _transfers()
+    assert first.failure == "aborted: successor dead: never-registered"
+    assert second.failure == "aborted: successor dead: never-started"
+    assert first.state == second.state == "failed"
+    with Store() as store:
+        assert store.active_transfer(SID) is None
+        source = store.get(SID)
+        assert source is not None and not source.handed_off_to and not source.close_requested_at
+    err = capsys.readouterr().err
+    assert "successor died twice: never-registered; never-started; nothing moved" in err
+    assert len(world.harness.launches) == 2
+
+
+def test_start_relaunch_names_first_target(
+    world: _World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def script(w: _World) -> None:
+        if len(w.harness.launches) == 2:
+            w.accept()
+
+    world.script = script
+    assert world.harness.start() == 0
+    first, second = _relaunched_once(world, "never-started")
+    out = capsys.readouterr().out
+    line = (
+        f"relaunched: successor {second.target_session} (first {first.target_session} "
+        "died: never-started)"
+    )
+    assert line in out
+    assert out.index(f"opened: successor {first.target_session}") < out.index(line)
+    assert out.index(line) < out.index(f"opened: successor {second.target_session}")
+    assert out.index(f"opened: successor {second.target_session}") < out.index("finalized:")
+
+
+def test_start_heartbeat_written_each_poll(world: _World) -> None:
+    def script(w: _World) -> None:
+        if len(w.polls) >= 5:
+            w.accept()
+
+    world.script = script
+    assert world.harness.start() == 0
+    assert len(world.heartbeats) == 5
+    for now, pid, beat in world.heartbeats:  # every poll wrote this call's pid and its time
+        assert pid == os.getpid() and beat == now
+    assert [beat for _now, _pid, beat in world.heartbeats] == sorted(
+        {beat for _now, _pid, beat in world.heartbeats}
+    )
+
+
+def test_start_effective_wait_fits_budget(
+    world: _World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def script(w: _World) -> None:
+        if len(w.harness.launches) == 2:  # the relaunch is alive and busy, never accepts
+            if w.target not in w.registered:
+                w.start_up()
+            w.write(w.target)
+
+    world.script = script
+    assert world.harness.start() == continue_session.EXIT_WAITING
+    wait = continue_session.effective_wait(continue_session.ACCEPT_WAIT_DEFAULT_SEC, 0, [])
+    assert "accept wait: 420s (effective -w)" in capsys.readouterr().err
+    # the relaunch waits only the REST of the one -w budget: the call stays under the cap
+    assert world.harness.clock < wait + continue_session.ACCEPT_POLL_SEC
+    assert wait + continue_session.START_CALL_MARGIN_SEC <= continue_session.START_CALL_BUDGET_SEC
+    first, second = _transfers()
+    assert first.state == "failed" and second.state == "opened"
+    assert second.start_pid == os.getpid() and second.start_heartbeat_at > 0
+
+
+def test_successor_state_knob_invalid_falls_back_with_a_note(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv(continue_session.START_GRACE_ENV, "soon")
+    monkeypatch.setenv(continue_session.NO_ACCEPT_ENV, "0")
+    watch = continue_session.SuccessorWatch.from_env()
+    assert watch.start_grace_s == continue_session.START_GRACE_DEFAULT_S
+    assert watch.no_accept_s == continue_session.NO_ACCEPT_DEFAULT_S
+    err = capsys.readouterr().err
+    assert continue_session.START_GRACE_ENV in err and continue_session.NO_ACCEPT_ENV in err
+
+
+# ------------------------------------- a differing re-run self-heals (tp#2172 D6, C3)
+
+
+def _first_opened(world: _World) -> Any:
+    """A first ``start -w 0``: one ``opened`` transfer, its successor still a draft."""
+    assert world.harness.start("-w", "0") == continue_session.EXIT_WAITING
+    (first,) = _transfers()
+    assert first.state == "opened"
+    return first
+
+
+def _accept_on_first_poll(w: _World) -> None:
+    if w.active() is not None:
+        w.accept()
+
+
+def test_reuse_differing_dead_supersedes(world: _World) -> None:
+    first = _first_opened(world)
+    world.harness.clock += continue_session.LAUNCH_GRACE_S + 1  # never started: dead
+    world.harness.file.write_text(_handoff_text(**{"Current state": "changed"}), encoding="utf-8")
+    world.script = _accept_on_first_poll
+    assert world.harness.start() == 0
+    old, new = _transfers()
+    assert old.transfer_id == first.transfer_id
+    assert old.state == "failed" and old.failure == "aborted: superseded"
+    assert new.state == "finalized" and new.prompt_sha256 != old.prompt_sha256
+    assert world.harness.launches == [old.target_session, new.target_session]
+    assert "changed" in Path(new.handoff_path).read_text(encoding="utf-8")
+
+
+def test_reuse_differing_live_drives_existing_file_unchanged(
+    world: _World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = _first_opened(world)
+    world.start_up()  # the successor claimed its draft, registered and read the handoff
+    before = Path(first.handoff_path).read_bytes()
+    world.harness.file.write_text(_handoff_text(**{"Current state": "changed"}), encoding="utf-8")
+    world.script = _accept_on_first_poll
+    capsys.readouterr()
+    assert world.harness.start() == 0
+    (transfer,) = _transfers()
+    assert transfer.transfer_id == first.transfer_id and transfer.state == "finalized"
+    assert transfer.prompt_sha256 == first.prompt_sha256  # driven as stored
+    assert Path(first.handoff_path).read_bytes() == before
+    assert world.harness.launches == [first.target_session]  # claimed: never relaunched
+    err = capsys.readouterr().err
+    assert f"transfer {first.transfer_id}'s successor" in err
+    assert "is live (opened)" in err and "ignored from this call: handoff text" in err
+
+
+def test_reuse_differing_live_note_names_ignored_account(
+    world: _World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = _first_opened(world)
+    world.claim()  # starting: the draft cleared, claude not registered yet
+    before = Path(first.handoff_path).read_bytes()
+    world.script = _accept_on_first_poll
+    capsys.readouterr()
+    assert world.harness.start("-A", "work") == 0  # the later -A wins
+    (transfer,) = _transfers()
+    assert transfer.transfer_id == first.transfer_id and transfer.state == "finalized"
+    assert transfer.target_config_dir == str(world.harness.private)
+    assert Path(first.handoff_path).read_bytes() == before
+    err = capsys.readouterr().err
+    assert "is starting (opened)" in err
+    assert "account -A work (the successor stays on account private)" in err
+    assert "handoff text" not in err  # the text did not change
+
+
+def test_reuse_identical_snapshot_reuses(world: _World, capsys: pytest.CaptureFixture[str]) -> None:
+    first = _first_opened(world)
+    before = Path(first.handoff_path).read_bytes()
+    world.script = _accept_on_first_poll
+    assert world.harness.start() == 0
+    (transfer,) = _transfers()
+    assert transfer.transfer_id == first.transfer_id and transfer.state == "finalized"
+    assert Path(first.handoff_path).read_bytes() == before
+    assert "ignored from this call" not in capsys.readouterr().err
+    assert world.harness.launches == [first.target_session] * 2  # still a draft: relaunched
+
+
+def test_reuse_concurrent_create_race(world: _World, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Another start inserts its transfer between this call's read and its create: the
+    loser re-reads once and drives the winner's transfer (one transfer, one launch)."""
+    real_create = Store.create_transfer
+    winners: list[str] = []
+
+    def racing_create(store: Store, transfer: Any, now: int) -> Any:
+        if not winners:  # the concurrent start wins the INSERT first
+            twin = dataclasses.replace(
+                transfer,
+                transfer_id="t-winner",
+                target_session="winner-target",
+                handoff_path=str(continue_session.handoff_path("t-winner")),
+            )
+            winners.append(real_create(store, twin, now).transfer_id)
+        return real_create(store, transfer, now)
+
+    monkeypatch.setattr(Store, "create_transfer", racing_create)
+    world.script = _accept_on_first_poll
+    assert world.harness.start() == 0
+    (transfer,) = _transfers()
+    assert winners == ["t-winner"] and transfer.transfer_id == "t-winner"
+    assert transfer.state == "finalized"
+    assert world.harness.launches == ["winner-target"]
+
+
+def test_no_with_different_refusal_left() -> None:
+    source = Path(continue_session.__file__).read_text(encoding="utf-8")
+    assert "with different" not in source
 
 
 # ------------------------------------------------- accept finalizes the source (tp#1582)
@@ -2455,3 +3197,73 @@ def test_accept_retry_integration_with_a_stub_executable(
     monkeypatch.setattr(continue_session, "_sleep", _sleep)
     assert continue_session.cmd_accept(type("A", (), {"transfer": tid, "json": False})()) == 0
     assert _state(tid) == "finalized"
+
+
+# ------------------------------------------------ tp#2172 C4: no size refusals (D1, D2)
+
+
+def test_compose_facts_overflow_rest_sidecar(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D2: facts that overflow every cut tier beside a model-written part are never refused:
+    the lowest-priority records go to a 0600 ``<transfer>.facts-rest.md`` written by
+    ``_drive`` next to the handoff, named by the document and the preamble."""
+    import bigsnap  # pylint: disable=import-outside-toplevel,import-error
+
+    from command_center import handoff_facts  # pylint: disable=import-outside-toplevel
+    from command_center.handoff_facts import rec  # pylint: disable=import-outside-toplevel
+
+    doc = bigsnap.big_snapshot()
+    doc["session_id"] = SID
+    doc["facts"] += [
+        rec(
+            "question",
+            f"question:{900 + n}:1",
+            "Open items and questions",
+            3,
+            tp_id=900 + n,
+            source="ask",
+            detail=f"OVERFLOW-{n} " + "o" * 300,
+        )
+        for n in range(150)
+    ]
+    monkeypatch.setattr(handoff_facts, "collect", lambda *_a, **_k: doc)
+    harness.file.write_text(_model_file(), encoding="utf-8")
+    assert harness.start() == 0
+    err = capsys.readouterr().err
+    stored, transfer = _stored_text()
+    assert len(stored.encode("utf-8")) <= handoff_doc.MAX_BYTES
+    assert "moved out for size to the facts-rest file named in the preamble" in stored
+    rest = Path(transfer.handoff_path).with_name(f"{transfer.transfer_id}.facts-rest.md")
+    assert oct(rest.stat().st_mode & 0o777) == "0o600"
+    moved = rest.read_text(encoding="utf-8")
+    assert "OVERFLOW-" in moved and "QUESTION-0" in stored  # priority 0 stays, 3 moves
+    assert f"note: fact records moved out for size: {rest}" in err
+    with Store() as store:
+        job = store.get(transfer.target_session)
+    assert job is not None and f"listed at {rest}" in " ".join((job.prompt or "").split())
+    assert not rest.with_name(f"{transfer.transfer_id}.model-full.md").exists()
+
+
+@pytest.mark.parametrize("flag", ["--facts-only", "--capped"])
+def test_facts_only_and_capped_unchanged(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, flag: str
+) -> None:
+    """D1 touches only ``start -f``: the generated paths never call ``fit_model_part``,
+    write no model sidecar and carry no ``continued`` marker."""
+    del harness
+
+    def boom(_raw: object) -> tuple[str, str]:
+        raise AssertionError("a generated model part is never fitted by fit_model_part")
+
+    monkeypatch.setattr(handoff_doc, "fit_model_part", boom)
+    if flag == "--capped":
+        answer = tmp_path / "answer.json"
+        answer.write_text(json.dumps(_SUPPLEMENT), encoding="utf-8")
+        _router(monkeypatch, f"cat {answer}")
+    assert cli.main(["continue-session", "start", flag, "-A", "private", "-s", SID]) == 0
+    stored, transfer = _stored_text()
+    assert handoff_doc.CONTINUED not in stored and transfer.state == "finalized"
+    assert transfer.capped == (flag == "--capped")
+    assert ("parser half done" in stored) == (flag == "--capped")
+    assert not list(Path(transfer.handoff_path).parent.glob("*.model-full.md"))
