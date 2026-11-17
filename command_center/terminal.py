@@ -568,6 +568,9 @@ def resume_in_new_tab(
     (0600) temp file that the typed line feeds to claude's stdin and unlinks before claude
     starts (:func:`command_center.launch_argv.claude_command` ``stdin_file``), so the text
     never rides in argv or the shell history. The file is removed here when no tab opened.
+    Its input-ledger row (tp#2170 kind ``resume_prompt``, origin ``caller``; the sha only,
+    never the text) is written right before the tab opens and marked ``failed`` when none
+    did; no prompt, no row.
     """
     from . import automated, launch_argv
     from .accounts import LaunchTarget, ensure_trusted
@@ -583,6 +586,7 @@ def resume_in_new_tab(
         return False
     ensure_trusted(config_dir, cwd)  # the tab's claude must not park on the trust dialog
     stdin_file = _write_prompt_file(prompt) if prompt is not None else ""
+    input_id = _ledger_resume_prompt(session_id, config_dir, cwd, prompt)
     if _launcher_mode() == "tmux":
         opened = _tmux_window(
             launch_argv.claude_command(target, argv, stdin_file=stdin_file), cwd=cwd
@@ -592,7 +596,34 @@ def resume_in_new_tab(
         opened = bool(_open_tab(command, tmux_fallback=False))
     if not opened and stdin_file:
         Path(stdin_file).unlink(missing_ok=True)
+    if not opened and input_id:
+        from . import input_ledger  # pylint: disable=import-outside-toplevel  # startup cost
+        from .store import Store  # pylint: disable=import-outside-toplevel
+
+        input_ledger.mark_failed(Store, input_id, input_ledger.REASON_NOT_TYPED)
     return bool(opened)
+
+
+def _ledger_resume_prompt(
+    session_id: str, config_dir: str, cwd: str, prompt: str | None
+) -> str | None:
+    """Write the ``pending`` input-ledger row of a ``resume-job -P`` first prompt (tp#2170).
+
+    Kind ``resume_prompt`` / origin ``caller`` (the text is handed in by another program),
+    the sha of *prompt* only, anchored on the session's existing transcript. ``None`` when
+    there is no prompt. Never raises: the launch must not die on bookkeeping.
+    """
+    if prompt is None:
+        return None
+    try:
+        from . import input_ledger  # pylint: disable=import-outside-toplevel  # startup cost
+        from .store import Store  # pylint: disable=import-outside-toplevel
+
+        spec = input_ledger.LedgerSpec("resume_prompt", "caller", session_id, config_dir, cwd)
+        return input_ledger.record_exec(Store, spec, prompt)
+    except Exception as exc:  # pylint: disable=broad-exception-caught  # never block a resume
+        print(f"input ledger: no row written ({type(exc).__name__})", file=sys.stderr)
+        return None
 
 
 def _write_prompt_file(prompt: str) -> str:

@@ -362,6 +362,67 @@ def test_prompt_file_refuses_a_live_session(
     assert not answer.exists() and not env["focused"]
 
 
+# --------------------------------------------------------------------------- #
+# -P: the input-ledger row of the first prompt (tp#2170 B3d)
+# --------------------------------------------------------------------------- #
+def _ledger_rows() -> list[dict[str, Any]]:
+    """Every ``inputs`` row of the test store (``CLAUDE_HOME`` is pinned under tmp)."""
+    with Store() as store:
+        cur = store.conn.execute("SELECT * FROM inputs ORDER BY rowid")
+        names = [d[0] for d in cur.description]
+        return [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
+
+
+def test_prompt_file_is_ledgered_before_the_tab_opens(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One ``resume_prompt`` / ``caller`` row of the prompt's sha, written before the tab
+    opens; no column, output or log line carries the text."""
+    from command_center.input_ledger import content_sha
+
+    text = "first prompt: feed the wombat"
+    seen_at_open: list[int] = []
+    recording = terminal._open_tab  # the env fixture's fake
+
+    def open_tab(command: str, *, tmux_fallback: bool) -> str:
+        seen_at_open.append(len(_ledger_rows()))
+        return str(recording(command, tmux_fallback=tmux_fallback))
+
+    monkeypatch.setattr(terminal, "_open_tab", open_tab)
+    answer = _prompt_file(env, text)
+    assert _run("-P", str(answer), "-j") == 0
+    assert seen_at_open == [1]
+    (row,) = _ledger_rows()
+    assert (row["kind"], row["origin"], row["state"]) == ("resume_prompt", "caller", "pending")
+    assert row["session_id"] == SID and row["content_sha"] == content_sha(text)
+    assert row["alt_sha"] == "" and row["cwd"] == str(env["repo"])
+    assert accounts.same_config_dir(row["config_dir"], str(env["private"]))
+    assert str(row["transcript_path"]).endswith(f"{SID}.jsonl")
+    out = capsys.readouterr()
+    for blob in [*map(str, row.values()), out.out, out.err, *env["typed"]]:
+        assert "wombat" not in blob
+    _stdin_file(env["typed"][0]).unlink()  # the tab's shell would have removed it
+
+
+def test_prompt_file_ledger_row_failed_when_no_tab(
+    env: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    env["landed"]["rung"] = ""  # every launcher rung failed
+    answer = _prompt_file(env, "never sent: the wombat")
+    assert _run("-P", str(answer), "-j") == 1
+    assert _error_code(capsys) == "no_tab"
+    (row,) = _ledger_rows()
+    assert (row["kind"], row["state"], row["reason"]) == ("resume_prompt", "failed", "not_typed")
+
+
+def test_resume_without_prompt_writes_no_ledger_row(
+    env: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _run("-j") == 0
+    assert _envelope(capsys)["ok"] is True
+    assert env["typed"] and not _ledger_rows()
+
+
 def test_namespace_without_new_flags_still_works(env: dict[str, Any]) -> None:
     """Callers that build the Namespace by hand (older tests, the TUI) keep working."""
     assert cli.cmd_resume_job(argparse.Namespace(session_id=SID)) == 0

@@ -60,7 +60,7 @@ PRIMITIVES = frozenset(
     }
 )
 
-#: Design D2's kinds (one per ledgered path P1-P10).
+#: Design D2's kinds (one per ledgered path P1-P10, plus ``resume_prompt``: B3d).
 KINDS = frozenset(
     {
         "send",
@@ -73,6 +73,7 @@ KINDS = frozenset(
         "start_job",
         "switch_resume",
         "limit_resume",
+        "resume_prompt",
     }
 )
 
@@ -176,11 +177,7 @@ SITES: dict[Key, tuple[int, str]] = {
     ),
     # terminal.py: the new-tab typers type SHELL lines; prompts travel through P5/P7/P8/P10.
     ("terminal", "resume_in_new_tab", "claude_argv"): (1, "exempt: " + _NO_PROMPT),
-    ("terminal", "resume_in_new_tab", "claude_command"): (
-        3,
-        "gap: `ccc resume-job -P` (tp#2165) feeds a first prompt through claude_command's "
-        "stdin_file; not ledgered yet (no D2 kind), the other callers pass no prompt",
-    ),
+    ("terminal", "resume_in_new_tab", "claude_command"): (3, "resume_prompt"),
     ("terminal", "resume_in_new_tab", "_tmux_window"): (
         1,
         "exempt: types the shell line built by claude_command (its row covers the prompt)",
