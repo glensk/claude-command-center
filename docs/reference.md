@@ -100,7 +100,8 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 - `ccc rm` · `ccc prune` — drop a tracked row / delete leftovers (contentless, headless `claude -p`, and dead-launched jobs that never had a turn).
 - `ccc peek` (`--print`) · `ccc jump` — the macOS peek panel / the ccc↔session toggle.
 - `ccc snapshot` (`-l/--list`, `-n/--dry-run`) · `ccc restore-snapshot [name]` (`-n/--dry-run`, `-y/--yes`) — save the whole iTerm layout before a reboot, rebuild it afterwards.
-- `ccc sessions` · `ccc inspect` · `ccc send` · `ccc answer` · `ccc close` · `ccc lineage` · `ccc user-aims` · `ccc delivery` · `ccc events` · `ccc name` (all `-j`) — the voice-bridge JSON CLI: list, read, message, answer and close live sessions, list a session's predecessors, every session's hand-set AIM and done flag; see "The voice-bridge JSON CLI" below.
+- `ccc sessions` · `ccc inspect` · `ccc send` · `ccc answer` · `ccc close` · `ccc lineage` · `ccc user-aims` · `ccc delivery` · `ccc events` · `ccc sent` · `ccc name` (all `-j`) — the voice-bridge JSON CLI: list, read, message, answer and close live sessions, list a session's predecessors, every session's hand-set AIM and done flag, what ccc itself typed into a session; see "The voice-bridge JSON CLI" below.
+- `ccc input-ledger [-S | -A [-F] | -D] [-j]` — show, arm or disarm the input ledger's coverage watermark (the read side of `ccc sent`); see "The input ledger" below.
 
 **Obsidian & mirrors**
 
@@ -1379,7 +1380,7 @@ cwd is trusted for that account; and the session has no pending attached prompt
   row by its token BEFORE `claude --resume` (at-most-once). A launcher that fails hands
   the row back, at most 3 times, then blocks it;
 - **fresh group (`-F`)** → always the new-tab path, live session or not: `fire-await`
-  execs `claude "<preamble + prompt>"` (a new session, no `--resume`).
+  execs `claude --session-id <new uuid> "<preamble + prompt>"` (a new session, no `--resume`; the id is pre-assigned so the input ledger's row is bound to it).
 
 **The prompt** is a fixed framing (the event is untrusted data from an outside party;
 re-check the source before acting) followed by your template with `{event}` =
@@ -3817,7 +3818,7 @@ human acts). Expiry is filtered on READ, so concurrent invocations racing an exp
 entry can each probe once before the first failure re-records — accepted; they
 converge via `observed_at` ordering.
 
-## The voice-bridge JSON CLI — `ccc sessions | inspect | send | answer | delivery | events`
+## The voice-bridge JSON CLI — `ccc sessions | inspect | send | answer | delivery | events | sent`
 
 Machine-facing commands (no TUI key) that the mac-voice Claude bridge (my-stt-tts
 `claude_sessions.py` / `attention.py`) and other agents drive to list, read, message and
@@ -3838,6 +3839,7 @@ ccc user-aims -j -d 400                            # every session's hand-set AI
 ccc user-aims -j -s <session-id> -s <session-id>   # … of just these sessions
 ccc delivery -i <delivery-id> -j                   # follow one send up
 ccc events -a 0 -l 200 -j                          # the problem stream after a cursor
+ccc sent -s <session-id> -a 2026-11-16T15:00:00Z -j   # what ccc typed into it
 ```
 
 ### The envelope
@@ -4195,6 +4197,132 @@ error kind; `detail.error`), `needs_input`, `delivery_failed` (a delivery `faile
 `timed_out`; `detail` carries `delivery_id`, `state`, `reason`). Successes emit no event;
 details never carry message text. Code: `invalid_cursor` (a negative cursor, exit 2).
 
+### `ccc sent` (`-s/--session ID`, `-a/--after SINCE`, `-u/--until UNTIL`, `-j/--json`)
+
+What did ccc itself type or launch into this session? Read-only: it opens the store with
+`mode=ro` (never migrates, never writes), reads the `inputs` rows, the gap file and the
+transcript, and matches a still-`pending` row IN MEMORY; the stored row stays `pending`.
+
+| Option             | Meaning                                                                                                                         |
+| :----------------- | :------------------------------------------------------------------------------------------------------------------------------ |
+| `-s/--session`     | the full session id (36-char UUID; no prefix matching)                                                                          |
+| `-a/--after SINCE` | window start, inclusive: ISO-8601 with `Z` or an offset, or epoch ms (default `0`)                                              |
+| `-u/--until UNTIL` | window end, exclusive: the same forms (default: now)                                                                            |
+| `-j/--json`        | the envelope; without it a header (window, watermark, verdict) and one line per row `HH:MM:SS  kind  state  sha[:12]  uuid[:8]` |
+
+An ISO time without a zone is refused (`invalid_time`); so are other unparsable times and
+times before 1970. `since=0` prints as `1970-01-01T00:00:00Z`. Rows written up to 6 h
+(`MATCH_WINDOW_MS`) before `SINCE` are looked at too: a prompt typed just before the window can
+match a line inside it. `data`:
+
+| Field                                               | Meaning                                                                                                        |
+| :-------------------------------------------------- | :------------------------------------------------------------------------------------------------------------- |
+| `session_id`                                        | the session asked about                                                                                        |
+| `since` / `since_ms`, `until` / `until_ms`, `as_of` | the window (ISO and epoch ms) and the time of the read                                                         |
+| `normalisation`                                     | `ccc-text-sha-v1` — see "The input ledger"                                                                     |
+| `coverage`                                          | the stored coverage integer, `null` when not armed                                                             |
+| `complete_since` / `complete_since_ms`              | the watermark, `null` when not armed                                                                           |
+| `complete`                                          | true iff `incomplete_reasons` is empty                                                                         |
+| `incomplete_reasons`                                | `not_armed` · `coverage_stale` · `before_watermark` · `pending_match` · `unbound_rows` · `ledger_write_failed` |
+| `inputs[]`                                          | one row per input, ordered by `created_at` (below)                                                             |
+
+`inputs[]`: `input_id`, `kind`, `origin`, `created_at` / `created_at_ms`, `norm`, `content_sha`,
+`alt_sha`, `state`, `stored_state`, `matched_in_memory`, `transcript_path`, `transcript_inode`,
+`anchor_offset`, `line_offset`, `line_uuid`, `line_kind`, `stray_len`, `delivery_id`, `reason`.
+Empty strings and a `line_offset` of `-1` render as `null`. `state` is what the listing
+concludes; `stored_state` is what the row holds, and `matched_in_memory` says the matcher moved
+the row for this answer only (a row past the 6 h window reads `unmatched` with `reason`
+`match_window`). `failed` rows are listed too (audit, with their reason code; nothing was
+typed).
+
+**The `complete` rule.** `complete` is true iff the ledger is armed, the stored `coverage` is
+this build's, `SINCE >= complete_since`, and the lookback holds no `pending` row of the
+session, no unbound row (`session_id` empty) and no gap-file entry. Each failing condition
+adds its reason: `not_armed` (no watermark; also an older store without the ledger tables),
+`coverage_stale`, `before_watermark`, `pending_match`, `unbound_rows`, `ledger_write_failed`.
+A consumer that needs certainty treats `complete: false` as "unknown", never as "nothing was
+injected". Usage errors (exit 2): `invalid_session`, `invalid_time`, `invalid_window`.
+
+### The input ledger
+
+Every path that types or launches text into a Claude session writes one `inputs` row FIRST
+(`input_ledger.record`): after the fact, a prompt ccc injected (a parked prompt, an `ccc await`
+delivery, a job's first prompt, an auto-resume "continue") is indistinguishable in the
+transcript from one a person typed. The row holds the sha256 of the normalised text and
+transcript facts — **never the text**, not a prefix, not a length. `cwd` and `transcript_path`
+are paths the store already holds.
+
+**Kinds and origins** (`origin` is a hint, not a verdict: `caller` = text handed in by another
+program or stored on a row ccc cannot attribute; the consumer decides which kinds count):
+
+| kind              | path                                 | origin                                                         | text hashed                                                                                                              |
+| :---------------- | :----------------------------------- | :------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------- |
+| `send`            | `ccc send`                           | `caller`                                                       | the stdin message                                                                                                        |
+| `answer`          | `ccc answer`                         | `caller`                                                       | canonical JSON of the expected answers (sorted keys); never matches a prompt line, it matches the answered `tool_result` |
+| `park_now`        | a parked prompt fired now            | `user` when it came from the park panel capture, else `caller` | the pasted prompt                                                                                                        |
+| `attached_paste`  | a prompt pasted into an attached tab | `caller`                                                       | the pasted prompt                                                                                                        |
+| `attached_resume` | a resume in an attached tab          | `caller`                                                       | the stdin prompt                                                                                                         |
+| `await_paste`     | `ccc await` delivery into a live tab | `automation`                                                   | the delivery prompt                                                                                                      |
+| `await_resume`    | `ccc await` delivery by resume       | `automation`                                                   | the stdin prompt                                                                                                         |
+| `start_job`       | `ccc start-job`                      | `caller` (a handoff successor: `automation`)                   | the final launch prompt, prefixes included                                                                               |
+| `resume_prompt`   | `ccc resume-job -P`                  | `caller`                                                       | the `-P` prompt file's text                                                                                              |
+| `switch_resume`   | an account-switch resume             | `automation`                                                   | the `--prompt` value                                                                                                     |
+| `limit_resume`    | the rate-limit auto-resume           | `automation`                                                   | the prompt                                                                                                               |
+
+`ccc await -F` (a fresh session) pre-assigns the new session's id with `claude --session-id`
+(the flag `start-job` uses), so its row is bound to the session it starts. A `last` resume that
+resolves no session writes the row with an empty `session_id` (unbound).
+
+**Normalisation `ccc-text-sha-v1`.** `content_sha = sha256_hex(utf8(N(text)))`, `N`: Unicode
+NFC; `\r\n` and `\r` become `\n`; every line `rstrip()`ed (all trailing Unicode whitespace);
+the whole `strip()`ped. `alt_sha` is the same over the one-line form the AppleScript paste rung
+types, when that differs from `N(text)`, else empty (exec and argv kinds never have one). The
+row's `norm` names the contract; a change of rules is `ccc-text-sha-v2` and a new `norm`.
+**Consumer recipe:** take a transcript line's text (a string content, or its `text` parts
+joined with `\n`), compute the sha of it AND of the same text with `<pasted_content>` wrappers
+unwrapped, and compare both with `content_sha` / `alt_sha`. A line behind a stray prefix cannot
+be reproduced from hashes; ccc's own match covers it through `line_uuid`.
+
+**States.** A row is written `pending` BEFORE the typing (anchored on the session's transcript,
+or the expected path of a fresh session), so a crash after the typing still leaves a row.
+`failed` (with a `reason` code, never text): nothing was typed. `matched`: the row claimed a
+transcript record (`line_offset`, `line_uuid`, `line_kind`; `stray_len` for a stray prefix; a
+queued prompt is followed to the record that consumes it). `unmatched` (final): no match within
+6 h of `created_at`. A paste whose Return did not go out stays `pending`. Rows of a session are
+matched FIFO, each claiming the first unclaimed prompt record at or after its anchor. `ccc
+send` and `ccc answer` record their own match; every other row is advanced by a daemon step
+after the await backstop, reported as `inputs_matched` / `inputs_unmatched` in the daemon's
+report. **The consumer's rule:** a candidate line is ccc's when its `uuid` equals a row's
+`line_uuid`; a `pending` row in the window makes the answer incomplete; `unmatched` rows are
+final and may be matched by sha at the consumer's discretion.
+
+**The coverage watermark.** `bridge_meta` keys `inputs.complete_since_ms` and
+`inputs.coverage` (an integer naming the set of ledgered paths; this build's is reported as
+`coverage_build`). Nothing sets them automatically: until armed, `ccc sent` says
+`complete_since: null` and every answer is incomplete. A build with a higher coverage reports
+`coverage_stale` until re-armed, so a later path cannot retro-claim old history. Re-arming
+moves the watermark to now.
+
+`ccc input-ledger [-S | -A [-F] | -D] [-j]` (no TUI key):
+
+| Option        | Meaning                                                                                                                                                                                                                 |
+| :------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-S/--status` | default: `armed`, watermark, `coverage`, `coverage_build`, `coverage_stale`, `counts` by state, `gaps` and `last_gap_at`; read-only                                                                                     |
+| `-A/--arm`    | `complete_since` = now, `coverage` = this build's; refuses with `stale_processes` (exit 1, pids only in `data.stale_pids`) while a ccc process started before the newest installed `command_center/*.py` mtime is alive |
+| `-F/--force`  | with `-A` only (without it: a usage error); arms anyway, `forced` and `stale_pids` say so                                                                                                                               |
+| `-D/--disarm` | deletes both keys; every listing then reads `not_armed`                                                                                                                                                                 |
+| `-j/--json`   | the envelope                                                                                                                                                                                                            |
+
+The stale-process check ignores two long-runners that never type: `ccc tab-symbol -w/--watch`
+and `ccc resume-halted --watch` (the `claude-session-continue` it starts runs fresh code).
+
+**The gap file.** A ledger write that fails (locked database, disk full) does not stop the
+injection: one JSON line `{"at_ms", "session_id", "kind", "error_class"}` is appended to
+`input-ledger-gaps.jsonl` in the ccc app home (0600). A gap entry in the lookback (for that
+session, or with an empty session id) makes the listing `ledger_write_failed`. If even the
+append fails the window stays silently uncovered (the stderr log says so); accepted as the
+residual risk.
+
 ### Error codes
 
 | Code                                                                                                                                                                    | Commands              | Meaning                                                                 |
@@ -4212,6 +4340,8 @@ details never carry message text. Code: `invalid_cursor` (a negative cursor, exi
 | `answer_failed` / `answer_unknown` / `answer_mismatch`                                                                                                                  | answer                | no key reached / no answer recorded in 10 s / a different answer        |
 | `unknown_session` / `transcript_missing` / `transcript_unknown`                                                                                                         | inspect, send, answer | ccc does not know it / no transcript / a transcript that does not parse |
 | `unknown_delivery` / `invalid_cursor`                                                                                                                                   | delivery, events      | no such delivery / negative cursor                                      |
+| `invalid_session` / `invalid_time` / `invalid_window`                                                                                                                   | sent                  | bad session id / time without zone / until <= since (exit 2)            |
+| `stale_processes`                                                                                                                                                       | input-ledger          | `-A` refused: stale ccc processes (`data.stale_pids`)                   |
 | `empty_message` / `message_too_long` / `control_characters` / `stdin_required` / `invalid_json` / `invalid_answers` / `invalid_decision_id` / `unknown_field` / `usage` | all                   | usage errors (exit 2)                                                   |
 | `internal`                                                                                                                                                              | all                   | unexpected exception (exit 3)                                           |
 

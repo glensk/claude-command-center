@@ -73,6 +73,7 @@ its code at launch, so restart it after a change (`ccc restart-tui`). Secrets li
 - touch `continue-session`: § "The session handoff". `no_codex`/`launch_profile`: §
   "The `no_codex` job flag", § "Launch profiles". `ccc await`: § "`ccc await`".
 - touch the staff close guard in `release-locks`: § "The staff close guard".
+- type or launch text into a session: § "The input ledger".
 - launch jobs/tabs, `start-job`, `open-job`: § "Launching jobs: always a tab".
 - add package data, slash commands or console entry points: § "Assets / package data",
   § "Where the plumbing lives".

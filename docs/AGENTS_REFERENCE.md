@@ -596,6 +596,14 @@ Invariants:
 - `await` is a hot subcommand (`cli._HOT_SUBCOMMANDS`): `await_cli` imports nothing
   heavy at load time, and `-r` returns after one indexed query when nothing is armed.
 
+## The input ledger (do not regress)
+
+Every path that types or launches text into a Claude session records an `inputs` row first
+(`input_ledger.record`); `tests/test_input_ledger_paths.py` enforces it. The row holds hashes
+and transcript facts, never the text. A new injection path takes a kind in the table of
+docs/reference.md § "The input ledger", raises `input_ledger.COVERAGE`, and is only claimed
+once the overseer re-arms (`ccc input-ledger -A`).
+
 ## The staff close guard in `release-locks` (do not regress)
 
 `command_center/staff_close_guard.py` refuses a Stop of a session that released an
