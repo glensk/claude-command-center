@@ -713,6 +713,77 @@ def test_continue_session_retry_re_resolves_the_profile(exe: Path, harness: tcs.
         assert transfer.state == "opened"
 
 
+# --------------------------------------------------------------------------- #
+# SessionStart adopts the shell's profile (tp#2303: a session started outside ccc)
+# --------------------------------------------------------------------------- #
+def _session_start(monkeypatch: pytest.MonkeyPatch, sid: str, label: str) -> None:
+    from command_center import hooks  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.delenv("ITERM_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_SESSION_AIM", raising=False)
+    monkeypatch.setenv(accounts.PROFILE_VAR, label)
+    assert hooks.handle_session_start({"session_id": sid, "cwd": "/repo"}) == 0
+    monkeypatch.delenv(accounts.PROFILE_VAR)
+
+
+@pytest.mark.usefixtures("exe")
+def test_session_start_records_a_configured_env_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _session_start(monkeypatch, "fresh", LABEL)
+    with Store() as store:
+        row = store.get("fresh")
+        assert row is not None and row.launch_profile == LABEL
+
+
+@pytest.mark.usefixtures("exe")
+def test_session_start_ignores_an_unconfigured_env_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _session_start(monkeypatch, "fresh", "apinope")
+    with Store() as store:
+        row = store.get("fresh")
+        assert row is not None and row.launch_profile is None
+
+
+def test_session_start_never_replaces_a_recorded_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))
+    _set_profiles(
+        [f"{LABEL}={_write_exe(tmp_path / 'a')}", f"apipriv={_write_exe(tmp_path / 'b')}"]
+    )
+    with Store() as store:
+        store.ensure("kept", cwd="/repo")
+        store.update_fields("kept", launch_profile="apipriv")
+    _session_start(monkeypatch, "kept", LABEL)
+    with Store() as store:
+        row = store.get("kept")
+        assert row is not None and row.launch_profile == "apipriv"
+
+
+def test_env_profile_session_relays_to_a_successor_on_the_same_profile(
+    exe: Path, harness: tcs._Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """capiw end to end: SessionStart records the label, continue-session carries it, and
+    the successor's ``start-job`` execs the profile's executable with the label exported."""
+    _session_start(monkeypatch, tcs.SID, LABEL)
+    assert harness.start() == 0
+    with Store() as store:
+        (transfer,) = store.transfers_of(tcs.SID)
+        assert transfer.launch_profile == LABEL
+        target = transfer.target_session
+    monkeypatch.setenv("CCC_START_JOB_HEADLESS", "1")
+    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
+    monkeypatch.setattr(accounts, "is_trusted", lambda *_a, **_k: True)  # tp#1512 gate
+    seen = _Exec()
+    monkeypatch.setattr(os, "execvp", seen)
+    with pytest.raises(SystemExit):
+        cli.cmd_start_job(argparse.Namespace(session_id=target, force=True, auto=False))
+    assert seen.argv[0] == str(exe) and target in seen.argv
+    assert seen.env[accounts.PROFILE_VAR] == LABEL
+
+
 def test_old_transfer_rows_read_as_no_profile() -> None:
     with Store() as store:
         store.conn.execute("INSERT INTO transfers (transfer_id, source_session) VALUES ('t', 'x')")

@@ -436,6 +436,31 @@ def _auto_accept(store: Store, sid: str, payload: dict[str, Any]) -> str | None:
         return None
 
 
+def _adopt_env_launch_profile(store: Store, sid: str, session: Session) -> Session:
+    """Record the shell's ``CCC_LAUNCH_PROFILE`` on a row that has no profile yet.
+
+    A session started outside ccc through a profile's executable (a shell function that
+    exports the label and runs the profile's wrapper) bills that route, not an account
+    seat. Recording the label makes every later launch surface (relay successor, resume,
+    jump) start through the same executable, and makes account failover refuse. Only a
+    label that is CONFIGURED (``claude_launch_profiles``) is recorded, and a row that
+    already carries a profile keeps it (immutable identity). Never raises.
+    """
+    from . import accounts
+
+    label = os.environ.get(accounts.PROFILE_VAR, "").strip()
+    if not label or accounts.session_launch_profile(session):
+        return session
+    try:
+        known = config.parse_launch_profiles(config.load_config().claude_launch_profiles)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return session
+    if label not in known:
+        return session
+    store.update_fields(sid, launch_profile=label)
+    return store.get(sid) or session
+
+
 def handle_session_start(payload: dict[str, Any]) -> int:
     sid = _session_id(payload)
     if not sid:
@@ -446,6 +471,7 @@ def handle_session_start(payload: dict[str, Any]) -> int:
         # incarnation was running died with it and never fired its SubagentStop, and a
         # stranded count would veto every `switch-account` for this id from here on.
         store.reset_subagents(sid)
+        session = _adopt_env_launch_profile(store, sid, session)
         # A close arm belongs to the process that armed it: only `compact` / `clear` keep
         # the SAME Claude process. startup/resume/fork, a missing or an unknown source all
         # mean a new one, which must never inherit (or have close-now restore) the arm.
