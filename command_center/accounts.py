@@ -370,6 +370,42 @@ def account_email(config_dir: str) -> str | None:
     return email if isinstance(email, str) and email else None
 
 
+# ``account_uuid`` memo: ``{claude.json path: ((st_mtime_ns, st_size), uuid_or_None)}``.
+# The ``.claude.json`` is large (hundreds of KB of per-project state) and the cache-TTL cell
+# asks for the seat on every warm row of every refresh, so an unchanged file is parsed once.
+_UUID_MEMO: dict[Path, tuple[tuple[int, int], str | None]] = {}
+
+
+def account_uuid(config_dir: str) -> str | None:
+    """The ``accountUuid`` logged into *config_dir*'s Claude account (its seat), or ``None``.
+
+    Reads ``oauthAccount.accountUuid`` from the same ``.claude.json`` as
+    :func:`account_email` (:func:`_claude_json_path`: ``$HOME/.claude.json`` for the
+    default account, ``<config_dir>/.claude.json`` for any other). The prompt cache is per
+    account, so this names whose cache a session's next request reads (``cachettl``).
+    Memoized on the file's ``(st_mtime_ns, st_size)``. Best-effort and read-only: a
+    missing/unreadable/malformed file, or no OAuth account, returns ``None``. Never raises.
+    """
+    path = _claude_json_path(config_dir)
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    key = (stat.st_mtime_ns, stat.st_size)
+    cached = _UUID_MEMO.get(path)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    oauth = data.get("oauthAccount") if isinstance(data, dict) else None
+    raw = oauth.get("accountUuid") if isinstance(oauth, dict) else None
+    uuid = raw if isinstance(raw, str) and raw else None
+    _UUID_MEMO[path] = (key, uuid)
+    return uuid
+
+
 def resolve_card_label(card_label: str) -> str | None:
     """Which configured account label's cache actually backs *card_label*'s card.
 

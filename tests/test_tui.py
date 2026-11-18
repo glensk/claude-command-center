@@ -3601,14 +3601,13 @@ def test_model_column_shows_play_icon_while_working_and_ttl_otherwise(
     from command_center.models import Session, Status
     from command_center.views.tui import _STATUS_STYLE, CommandCenterApp, SessionTable
 
-    # A transcript whose newest line is a fresh main-chain assistant turn → warm cache.
+    # A transcript whose newest line is a fresh main-chain cache request → warm cache.
     now = time.time()
     stamp = datetime.fromtimestamp(now - 60, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     transcript = tmp_path / "warm.jsonl"
-    transcript.write_text(
-        json.dumps({"type": "assistant", "timestamp": stamp}, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
+    message = {"model": "claude-opus-4-5", "usage": {"cache_read_input_tokens": 1000}}
+    row = {"type": "assistant", "timestamp": stamp, "message": message}
+    transcript.write_text(json.dumps(row, separators=(",", ":")) + "\n", encoding="utf-8")
 
     async def scenario() -> None:
         app = CommandCenterApp()

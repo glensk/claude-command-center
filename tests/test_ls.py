@@ -280,16 +280,24 @@ class _FakeAdapter:
 
 
 def _fresh_transcript(tmp_path: Path) -> Path:
-    """A transcript whose newest line is a fresh assistant turn → warm (green) countdown.
+    """A transcript whose newest line is a fresh cache request → warm (green) countdown.
 
-    The cache anchor is the newest main-chain ``"type":"assistant"`` entry, so a fresh
-    mtime alone is not enough — the file must carry a recent API turn (see cachettl).
+    The cache anchor is the newest real main-chain assistant entry that read or wrote the
+    prompt cache, so a fresh mtime alone is not enough — the file must carry a recent API
+    turn with positive cache usage (see cachettl).
     """
     transcript = tmp_path / "t.jsonl"
     now = time.time()
     ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + ".000000Z"
+    message = {"model": "claude-opus-4-5", "usage": {"cache_read_input_tokens": 1000}}
     line = json.dumps(
-        {"type": "assistant", "isSidechain": False, "timestamp": ts, "requestId": "r"},
+        {
+            "type": "assistant",
+            "isSidechain": False,
+            "timestamp": ts,
+            "requestId": "r",
+            "message": message,
+        },
         separators=(",", ":"),
     )
     transcript.write_text(line + "\n", encoding="utf-8")

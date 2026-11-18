@@ -18,7 +18,7 @@ from typing import cast
 
 import pytest
 
-from command_center import cachettl
+from command_center import accounts, cachettl
 from command_center.models import Session
 
 
@@ -99,16 +99,53 @@ def _iso(epoch: float) -> str:
     return f"{base}.{micros:06d}Z"
 
 
-def _assistant(epoch: float, *, sidechain: bool = False) -> str:
-    """A compact main-chain (or ``isSidechain``) assistant transcript line — one API turn."""
-    return json.dumps(
-        {
-            "type": "assistant",
-            "isSidechain": sidechain,
-            "timestamp": _iso(epoch),
-            "requestId": "req_abc",
-            "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+def _assistant(
+    epoch: float,
+    *,
+    sidechain: bool = False,
+    cache_read: int = 150_000,
+    model: str = "claude-opus-4-5",
+    error: bool = False,
+) -> str:
+    """A compact main-chain (or ``isSidechain``) assistant transcript line — one API turn.
+
+    By default a real cache request (it reads *cache_read* cached tokens); ``cache_read=0``
+    with ``model="<synthetic>"`` and ``error=True`` is the usage-limit refusal's shape.
+    """
+    row: dict[str, object] = {
+        "type": "assistant",
+        "isSidechain": sidechain,
+        "timestamp": _iso(epoch),
+        "requestId": "req_abc",
+        "message": {
+            "role": "assistant",
+            "model": model,
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 10,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": cache_read,
+            },
+            "content": [{"type": "text", "text": "ok"}],
         },
+    }
+    if error:
+        row["isApiErrorMessage"] = True
+    return json.dumps(row, separators=(",", ":"))
+
+
+def _bridge(seat: str) -> str:
+    """A ``bridge-session`` row (remote control on): the seat of the process writing it."""
+    return json.dumps(
+        {"type": "bridge-session", "sessionId": "s", "ownerAccountUuid": seat},
+        separators=(",", ":"),
+    )
+
+
+def _owner(seat: str) -> str:
+    """A ``session-owner`` row: the (sticky) seat the session started on."""
+    return json.dumps(
+        {"type": "session-owner", "accountUuid": seat, "sessionId": "s"},
         separators=(",", ":"),
     )
 
@@ -264,9 +301,9 @@ def test_anchor_cache_reuses_until_mtime_moves(
     calls = {"n": 0}
     real_scan = cachettl._scan_anchor
 
-    def _counting(scan_path: Path) -> float | None:
+    def _counting(scan_path: Path) -> tuple[float, str | None] | None:
         calls["n"] += 1
-        return cast("float | None", real_scan(scan_path))
+        return cast("tuple[float, str | None] | None", real_scan(scan_path))
 
     monkeypatch.setattr(cachettl, "_scan_anchor", _counting)
     adapter = _FakeAdapter(path)
@@ -360,3 +397,208 @@ def test_cell_width_measured_by_len_matches_terminal_cells() -> None:
 
     for text in ("♨ 59:26", "❄ cold", cachettl._RUNNING_GLYPH):
         assert cell_len(text) == len(text), text
+
+
+# --------------------------------------------------------------------------- tp#2243 predicates
+_FIXTURE = Path(__file__).parent / "fixtures" / "warm_anchor_cases.jsonl"
+
+
+def test_fixture_cases() -> None:
+    """Every shared case (byte copy of the hooks' ``testdata/warm_anchor_cases.jsonl``)
+    gets the same ``is_real_response`` / ``is_cache_anchor`` verdict as in the other three
+    implementations (hooks ``cc_warm.py``, the statusline, decide)."""
+    cases = [json.loads(line) for line in _FIXTURE.read_text(encoding="utf-8").splitlines()]
+    cases = [case for case in cases if case]
+    assert len(cases) >= 10
+    for case in cases:
+        row = case["row"]
+        assert cachettl.is_real_response(row) is case["real_response"], case["case"]
+        assert cachettl.is_cache_anchor(row) is case["cache_anchor"], case["case"]
+
+
+def test_refusal_never_anchors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The usage-limit refusal (``isApiErrorMessage``, ``<synthetic>``, zero usage) written
+    a minute ago after a 30-hour-old real request: the cache is cold, not ``♨ 59:00``."""
+    monkeypatch.delenv("CC_CACHE_TTL_S", raising=False)
+    now = 1_000_000.0
+    lines = [
+        _assistant(now - 30 * 3600),
+        _assistant(now - 60, cache_read=0, model="<synthetic>", error=True),
+    ]
+    path = _write(tmp_path / "t.jsonl", lines, mtime=now)
+    assert cachettl.countdown_for(_FakeAdapter(path), _session(), now=now) == ("❄ cold", "red")
+
+
+def test_refusal_is_skipped_back_to_the_real_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scan keeps reading back past a refusal to the newest real cache request."""
+    monkeypatch.delenv("CC_CACHE_TTL_S", raising=False)
+    now = 1_000_000.0
+    lines = [
+        _assistant(now - 600),
+        _assistant(now - 60, cache_read=0, model="<synthetic>", error=True),
+    ]
+    path = _write(tmp_path / "t.jsonl", lines, mtime=now)
+    assert cachettl.countdown_for(_FakeAdapter(path), _session(), now=now) == ("♨ 50:00", "green")
+
+
+def test_zero_usage_response_never_anchors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A valid model response that read and wrote no cache does not refresh the clock."""
+    monkeypatch.delenv("CC_CACHE_TTL_S", raising=False)
+    now = 1_000_000.0
+    path = _write(tmp_path / "t.jsonl", [_assistant(now - 60, cache_read=0)], mtime=now)
+    assert cachettl.countdown_for(_FakeAdapter(path), _session(), now=now) == ("❄ cold", "red")
+    assert cachettl.is_real_response(json.loads(_assistant(now, cache_read=0)))
+
+
+def test_unparsable_assistant_line_never_anchors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A truncated assistant line cannot show its usage, so it never anchors."""
+    monkeypatch.delenv("CC_CACHE_TTL_S", raising=False)
+    now = 1_000_000.0
+    path = _write(tmp_path / "t.jsonl", [_assistant(now - 60)[:-5]], mtime=now)
+    assert cachettl.countdown_for(_FakeAdapter(path), _session(), now=now) == ("❄ cold", "red")
+
+
+# --------------------------------------------------------------------------- tp#2243 seats
+_SEAT_A = "00000000-0000-4000-8000-00000000000a"
+_SEAT_B = "00000000-0000-4000-8000-00000000000b"
+
+
+def _seat_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """Two configured accounts whose ``.claude.json`` name seat A and seat B."""
+    monkeypatch.delenv("CC_CACHE_TTL_S", raising=False)
+    monkeypatch.setattr(accounts, "is_multi_account", lambda: True)
+    dirs: dict[str, str] = {}
+    for label, seat in (("a", _SEAT_A), ("b", _SEAT_B)):
+        folder = tmp_path / f"seat-{label}"
+        folder.mkdir()
+        (folder / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"accountUuid": seat}}), encoding="utf-8"
+        )
+        dirs[label] = str(folder)
+    return dirs
+
+
+def _seated(config_dir: str) -> Session:
+    return Session(session_id="s", cwd="/repo", aim="x", config_dir=config_dir)
+
+
+def test_same_seat_is_warm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Anchor written on seat A, the session runs on seat A → the countdown shows."""
+    dirs = _seat_dirs(tmp_path, monkeypatch)
+    now = 1_000_000.0
+    path = _write(tmp_path / "t.jsonl", [_bridge(_SEAT_A), _assistant(now - 300)], mtime=now)
+    cell = cachettl.countdown_for(_FakeAdapter(path), _seated(dirs["a"]), now=now)
+    assert cell == ("♨ 55:00", "green")
+
+
+def test_seat_change_reads_cold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Anchor on seat A, then the tab switched to seat B (a newer bridge row for B, no new
+    request): the cache belongs to A, so the B session reads cold."""
+    dirs = _seat_dirs(tmp_path, monkeypatch)
+    now = 1_000_000.0
+    lines = [_bridge(_SEAT_A), _assistant(now - 300), _bridge(_SEAT_B)]
+    path = _write(tmp_path / "t.jsonl", lines, mtime=now)
+    cell = cachettl.countdown_for(_FakeAdapter(path), _seated(dirs["b"]), now=now)
+    assert cell == ("❄ cold", "red")
+
+
+def test_reopen_on_other_seat_without_new_bridge_row_reads_cold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Old bridge A, anchor A, reopened on seat B with remote control off (no new bridge
+    row): the newest bridge row is NOT the running seat; ``config_dir`` B decides → cold."""
+    dirs = _seat_dirs(tmp_path, monkeypatch)
+    now = 1_000_000.0
+    lines = [_bridge(_SEAT_A), _assistant(now - 300), _local("mode", now - 5)]
+    path = _write(tmp_path / "t.jsonl", lines, mtime=now)
+    cell = cachettl.countdown_for(_FakeAdapter(path), _seated(dirs["b"]), now=now)
+    assert cell == ("❄ cold", "red")
+
+
+def test_unknown_seat_reads_cold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail closed: no seat row before the anchor, or an unknown running seat → cold."""
+    dirs = _seat_dirs(tmp_path, monkeypatch)
+    now = 1_000_000.0
+    adapter = _FakeAdapter(_write(tmp_path / "t.jsonl", [_assistant(now - 300)], mtime=now))
+    assert cachettl.countdown_for(adapter, _seated(dirs["a"]), now=now) == ("❄ cold", "red")
+    cachettl._ANCHOR_CACHE.clear()
+    seated = _FakeAdapter(
+        _write(tmp_path / "u.jsonl", [_bridge(_SEAT_A), _assistant(now - 300)], mtime=now)
+    )
+    assert cachettl.countdown_for(seated, _seated(""), now=now) == ("❄ cold", "red")
+    missing = str(tmp_path / "no-such-account")
+    assert cachettl.countdown_for(seated, _seated(missing), now=now) == ("❄ cold", "red")
+
+
+def test_seat_row_past_the_scan_bound_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bridge row further back than ``_SEAT_SCAN_BYTES`` before the anchor is not read."""
+    dirs = _seat_dirs(tmp_path, monkeypatch)
+    monkeypatch.setattr(cachettl, "_SEAT_SCAN_BYTES", 1024)
+    now = 1_000_000.0
+    pad = [_local("mode", now - 900, filler="x" * 600) for _ in range(3)]
+    lines = [_bridge(_SEAT_A), *pad, _assistant(now - 300)]
+    path = _write(tmp_path / "t.jsonl", lines, mtime=now)
+    cell = cachettl.countdown_for(_FakeAdapter(path), _seated(dirs["a"]), now=now)
+    assert cell == ("❄ cold", "red")
+
+
+def test_no_bridge_rows_falls_back_to_session_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Remote control never on: the ``session-owner`` row names the anchor's seat."""
+    dirs = _seat_dirs(tmp_path, monkeypatch)
+    now = 1_000_000.0
+    lines = [_owner(_SEAT_A), _assistant(now - 300), _owner(_SEAT_A)]
+    path = _write(tmp_path / "t.jsonl", lines, mtime=now)
+    assert cachettl.countdown_for(_FakeAdapter(path), _seated(dirs["a"]), now=now) == (
+        "♨ 55:00",
+        "green",
+    )
+    assert cachettl.countdown_for(_FakeAdapter(path), _seated(dirs["b"]), now=now) == (
+        "❄ cold",
+        "red",
+    )
+
+
+def test_bridge_row_beats_a_nearer_session_owner_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``session-owner`` is sticky (the start seat); a bridge row at or before the anchor
+    names the seat of the process that made the request, so it wins."""
+    dirs = _seat_dirs(tmp_path, monkeypatch)
+    now = 1_000_000.0
+    lines = [_bridge(_SEAT_B), _owner(_SEAT_A), _assistant(now - 300)]
+    path = _write(tmp_path / "t.jsonl", lines, mtime=now)
+    cell = cachettl.countdown_for(_FakeAdapter(path), _seated(dirs["b"]), now=now)
+    assert cell == ("♨ 55:00", "green")
+
+
+def test_single_account_skips_the_seat_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One configured account: no seat rows and no ``config_dir`` still read warm."""
+    monkeypatch.delenv("CC_CACHE_TTL_S", raising=False)
+    monkeypatch.setattr(accounts, "is_multi_account", lambda: False)
+    now = 1_000_000.0
+    path = _write(tmp_path / "t.jsonl", [_assistant(now - 300)], mtime=now)
+    assert cachettl.countdown_for(_FakeAdapter(path), _session(), now=now) == ("♨ 55:00", "green")
+
+
+def test_same_mtime_changed_size_rescans(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An append that keeps the mtime (same tick) but grows the file is re-scanned."""
+    monkeypatch.delenv("CC_CACHE_TTL_S", raising=False)
+    now = 1_000_000.0
+    path = _write(tmp_path / "t.jsonl", [_assistant(now - 3000)], mtime=now)
+    adapter = _FakeAdapter(path)
+    assert cachettl.countdown_for(adapter, _session(), now=now) == ("♨ 10:00", "orange")
+    stamp = path.stat().st_mtime_ns
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(_assistant(now - 300) + "\n")
+    os.utime(path, ns=(stamp, stamp))
+    assert cachettl.countdown_for(adapter, _session(), now=now) == ("♨ 55:00", "green")

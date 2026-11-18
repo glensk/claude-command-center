@@ -9,11 +9,26 @@ switching cpriv↔cwork then costs the same as continuing). Surfacing the remain
 time lets you decide whether a parked session is still cheap to resume.
 
 "Last request" has no first-class signal, so we anchor the clock on the session's last
-real API interaction: the **timestamp of the newest main-chain ``"type":"assistant"``
-transcript entry**. Each assistant entry is the product of one API response (it carries a
-``requestId``) and re-reads/refreshes the prompt-cache prefix, so its timestamp is exactly
-"when the cache was last warmed". Assistant entries with ``"isSidechain":true`` are
-EXCLUDED — subagent traffic refreshes a *different* cache prefix, not the main session's.
+real cache request: the **timestamp of the newest main-chain assistant transcript entry that
+read or wrote the prompt cache** (:func:`is_cache_anchor`: a real model response whose
+``message.usage`` carries a positive ``cache_read_input_tokens`` or
+``cache_creation_input_tokens``). Refused, synthetic or zero-cache replies never count — a
+usage-limit refusal is written as an ``isApiErrorMessage`` row with model ``<synthetic>``
+and zero usage, and anchoring on it once showed a 30-hour-cold cache as warm (tp#2243).
+Assistant entries with ``"isSidechain":true`` are EXCLUDED too — subagent traffic refreshes
+a *different* cache prefix, not the main session's. The predicates mirror the hooks'
+``cc_warm.py`` and decide's; ``tests/fixtures/warm_anchor_cases.jsonl`` is the shared case
+list every implementation asserts.
+
+**Another seat's cache is cold.** The prompt cache is per account, so an anchor written on
+one seat (say work) does not warm a tab now running on the other (private). The anchor's
+seat is the ``ownerAccountUuid`` of the newest ``bridge-session`` row at or before it, else
+the ``accountUuid`` of the newest ``session-owner`` row, read at most
+:data:`_SEAT_SCAN_BYTES` back from the anchor; the running seat is
+:func:`accounts.account_uuid` of the session's ``config_dir`` (the account it last ran
+under). With more than one account configured the cell is warm only when both seats are
+known and equal; a different or unknown seat reads ``❄ cold`` (fail closed). A
+single-account install skips the check.
 
 The transcript **mtime is only a fast path, never the anchor.** Claude Code appends LOCAL
 entries on session open — ``mode``, ``permission-mode``, ``bridge-session``,
@@ -59,13 +74,16 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
     _direct_run(__file__)
 
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import json
 import os
-import re
 import time
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, BinaryIO
+
+from . import accounts
 
 if TYPE_CHECKING:
     from .models import Session
@@ -106,23 +124,31 @@ CELL_WIDTH = 8
 _CHUNK_BYTES = 64 * 1024
 _MAX_CHUNK_BYTES = 1024 * 1024
 
-# Cheap substring prefilter (bytes) applied before any JSON parse — mirrors the
-# statusline's ``grep '"type":"assistant"' | grep -v '"isSidechain":true'``. Claude Code
-# writes compact JSON (no spaces after colons), so these literals match verbatim.
+# Cheap substring prefilters (bytes) applied before any JSON parse. Claude Code writes
+# compact JSON (no spaces after colons), so these literals match verbatim. A line without
+# the assistant mark can never anchor; one with it is parsed and judged by
+# :func:`is_cache_anchor` (an unparsable line never anchors: its usage cannot be checked).
 _ASSISTANT_MARK = b'"type":"assistant"'
-_SIDECHAIN_MARK = b'"isSidechain":true'
+_BRIDGE_MARK = b'"type":"bridge-session"'
+_OWNER_MARK = b'"type":"session-owner"'
 
-# Fallback timestamp extractor for a single (already-qualified) line when JSON parsing
-# fails. ``findall()[-1]`` takes the LAST match — the top-level ``timestamp`` is emitted
-# after ``message`` in Claude Code's field order, so the last match is the entry's own
-# timestamp (mirrors the statusline's greedy ``sed`` capture).
-_TS_RE = re.compile(r'"timestamp":"([^"]+)"')
+# The model name Claude Code stamps on rows it wrote itself (refusals, API errors).
+_SYNTHETIC_MODEL = "<synthetic>"
 
-# Module-level anchor read-cache: ``{path: (mtime, anchor_or_None)}``. The TUI renders per
-# row per refresh and the daemon is long-lived, so an unchanged transcript must be read at
-# most once (same rationale as ``mirrors._PROMPT_CACHE``). Re-read only when mtime moved.
+# The anchor-seat back-scan reads at most this many bytes before the anchor line; past it
+# (or at the file start) without a seat row the anchor's seat is unknown.
+_SEAT_SCAN_BYTES = 256 * 1024
+
+# A scanned anchor: its epoch seconds and the ``accountUuid`` of the seat that wrote it
+# (``None`` = unknown).
+_Anchor = tuple[float, str | None]
+
+# Module-level anchor read-cache: ``{path: ((st_mtime_ns, st_size), anchor_or_None)}``. The
+# TUI renders per row per refresh and the daemon is long-lived, so an unchanged transcript
+# must be read at most once (same rationale as ``mirrors._PROMPT_CACHE``). Re-read when the
+# mtime OR the size moved (a same-tick append, e.g. a seat switch, keeps the float mtime).
 # The fast path (mtime expired) neither consults nor populates this — it is pure stat math.
-_ANCHOR_CACHE: dict[Path, tuple[float, float | None]] = {}
+_ANCHOR_CACHE: dict[Path, tuple[tuple[int, int], _Anchor | None]] = {}
 
 
 def cache_ttl_seconds() -> int:
@@ -185,78 +211,189 @@ def _parse_iso(ts: str) -> float | None:
         return None
 
 
+def _positive_int(value: object) -> bool:
+    """True for a positive ``int`` token count (``bool``, strings, floats, null → False)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def is_real_response(row: object) -> bool:
+    """True when transcript *row* is a real main-chain model response.
+
+    ``type == "assistant"``, not ``isSidechain``, not ``isApiErrorMessage``, a
+    ``message.model`` that is a non-empty string other than ``<synthetic>``, and a parsable
+    ``timestamp``. A refusal Claude Code wrote itself (usage limit, API error) fails here.
+    """
+    if not isinstance(row, dict) or row.get("type") != "assistant":
+        return False
+    if row.get("isSidechain") or row.get("isApiErrorMessage"):
+        return False
+    message = row.get("message")
+    if not isinstance(message, dict):
+        return False
+    model = message.get("model")
+    if not isinstance(model, str) or not model or model == _SYNTHETIC_MODEL:
+        return False
+    stamp = row.get("timestamp")
+    return isinstance(stamp, str) and _parse_iso(stamp) is not None
+
+
+def is_cache_anchor(row: object) -> bool:
+    """True when *row* read or wrote the prompt cache, so it anchors the warm countdown.
+
+    :func:`is_real_response` AND, read ONLY from the ``message.usage`` dict, a positive
+    ``int`` ``cache_read_input_tokens`` or ``cache_creation_input_tokens``. A valid
+    zero-cache response, every local row and a cache-token key inside a tool payload never
+    count.
+    """
+    if not is_real_response(row):
+        return False
+    assert isinstance(row, dict)  # narrowed by is_real_response
+    usage = row["message"].get("usage")
+    if not isinstance(usage, dict):
+        return False
+    return _positive_int(usage.get("cache_read_input_tokens")) or _positive_int(
+        usage.get("cache_creation_input_tokens")
+    )
+
+
+def _parse_line(line: bytes) -> dict[str, object] | None:
+    """*line* parsed as a JSON object, or ``None`` (unparsable, or not an object)."""
+    try:
+        obj = json.loads(line.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
 def _anchor_from_line(line: bytes) -> float | None:
     """Anchor epoch-seconds for one transcript line, or ``None`` when it does not qualify.
 
-    Qualification is the cheap substring prefilter (a main-chain assistant entry); the
-    timestamp is then read from the parsed object's top-level ``timestamp`` key (a regex
-    grabs the last match when the line will not parse as JSON).
+    A cheap substring prefilter (an assistant entry) runs first; the parsed object must
+    then pass :func:`is_cache_anchor`. A line that will not parse returns ``None``: its
+    usage cannot be checked, so it never anchors.
     """
-    if _ASSISTANT_MARK not in line or _SIDECHAIN_MARK in line:
+    if _ASSISTANT_MARK not in line:
         return None
-    text = line.decode("utf-8", "replace")
-    try:
-        obj = json.loads(text)
-    except ValueError:
-        obj = None
-    if isinstance(obj, dict):
-        raw = obj.get("timestamp")
-        return _parse_iso(raw) if isinstance(raw, str) else None
-    matches = _TS_RE.findall(text)
-    return _parse_iso(matches[-1]) if matches else None
+    obj = _parse_line(line)
+    if obj is None or not is_cache_anchor(obj):
+        return None
+    stamp = obj.get("timestamp")
+    return _parse_iso(stamp) if isinstance(stamp, str) else None
 
 
-def _scan_anchor(path: Path) -> float | None:
-    """Newest main-chain assistant entry's anchor by reading *path* backwards, or ``None``.
+def _seat_from_line(line: bytes) -> tuple[str, str] | None:
+    """``(kind, accountUuid)`` for a ``bridge-session`` / ``session-owner`` row, else ``None``.
+
+    *kind* is ``"bridge"`` (``ownerAccountUuid``: the seat of the process that wrote it, so
+    of the requests after it) or ``"owner"`` (``accountUuid``: sticky, the seat the session
+    started on).
+    """
+    if _BRIDGE_MARK in line:
+        kind, type_name, key = "bridge", "bridge-session", "ownerAccountUuid"
+    elif _OWNER_MARK in line:
+        kind, type_name, key = "owner", "session-owner", "accountUuid"
+    else:
+        return None
+    obj = _parse_line(line)
+    if obj is None or obj.get("type") != type_name:
+        return None
+    uuid = obj.get(key)
+    return (kind, uuid) if isinstance(uuid, str) and uuid else None
+
+
+def _reversed_lines(handle: BinaryIO) -> Iterator[tuple[int, bytes]]:
+    """Yield ``(start offset, line)`` for every line of *handle*, newest (EOF) first.
 
     Reads bounded chunks from EOF toward the start, doubling the chunk each step (capped at
-    :data:`_MAX_CHUNK_BYTES`). Lines are appended chronologically, so the FIRST qualifying
-    line found while scanning backwards is the newest — returned immediately. The partial
-    first line of each chunk is carried into the next (earlier) chunk so a line that
-    straddles — or is longer than — a chunk boundary is reassembled before it is inspected.
-    ``None`` when the file holds no qualifying assistant entry (or cannot be read).
+    :data:`_MAX_CHUNK_BYTES`). The partial first line of each chunk is carried into the
+    next (earlier) chunk so a line that straddles — or is longer than — a chunk boundary is
+    reassembled before it is yielded.
     """
+    handle.seek(0, os.SEEK_END)
+    pos = handle.tell()
+    carry = b""
+    chunk = _CHUNK_BYTES
+    while pos > 0:
+        read = min(chunk, pos)
+        pos -= read
+        handle.seek(pos)
+        data = handle.read(read) + carry
+        lines = data.split(b"\n")
+        if pos > 0:
+            # ``lines[0]`` starts earlier in the file — carry it to the next chunk.
+            carry = lines[0]
+            lines = lines[1:]
+            offset = pos + len(carry) + 1
+        else:
+            carry = b""
+            offset = 0
+        starts = []
+        for line in lines:
+            starts.append(offset)
+            offset += len(line) + 1
+        yield from zip(reversed(starts), reversed(lines), strict=True)
+        chunk = min(chunk * 2, _MAX_CHUNK_BYTES)
+
+
+def _scan_anchor(path: Path) -> _Anchor | None:
+    """Newest cache anchor of *path* and its seat, read backwards, or ``None``.
+
+    Lines are appended chronologically, so the FIRST qualifying line found while scanning
+    backwards is the newest. From there the scan keeps going back for the anchor's seat:
+    the newest ``bridge-session`` row at or before it wins; failing that, the newest
+    ``session-owner`` row; neither within :data:`_SEAT_SCAN_BYTES` before the anchor (or
+    before the file start) → seat ``None`` (unknown). ``None`` when the file holds no
+    qualifying assistant entry (or cannot be read).
+    """
+    anchor: float | None = None
+    limit = 0
+    owner: str | None = None
     try:
         with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            pos = handle.tell()
-            carry = b""
-            chunk = _CHUNK_BYTES
-            while pos > 0:
-                read = min(chunk, pos)
-                pos -= read
-                handle.seek(pos)
-                data = handle.read(read) + carry
-                lines = data.split(b"\n")
-                if pos > 0:
-                    # ``lines[0]`` starts earlier in the file — carry it to the next chunk.
-                    carry = lines[0]
-                    lines = lines[1:]
-                else:
-                    carry = b""
-                for line in reversed(lines):
+            for start, line in _reversed_lines(handle):
+                if anchor is None:
                     anchor = _anchor_from_line(line)
-                    if anchor is not None:
-                        return anchor
-                chunk = min(chunk * 2, _MAX_CHUNK_BYTES)
+                    limit = start - _SEAT_SCAN_BYTES
+                    continue
+                if start < limit:
+                    break
+                seat = _seat_from_line(line)
+                if seat is None:
+                    continue
+                if seat[0] == "bridge":
+                    return (anchor, seat[1])
+                if owner is None:
+                    owner = seat[1]
     except OSError:
         return None
-    return None
+    return None if anchor is None else (anchor, owner)
 
 
-def _cached_anchor(path: Path, mtime: float) -> float | None:
-    """:func:`_scan_anchor` for *path*, memoized on *mtime* in :data:`_ANCHOR_CACHE`.
+def _cached_anchor(path: Path, key: tuple[int, int]) -> _Anchor | None:
+    """:func:`_scan_anchor` for *path*, memoized on *key* in :data:`_ANCHOR_CACHE`.
 
-    An unchanged transcript (same mtime) is read at most once per process; a moved mtime
-    forces a re-scan. Only reached off the fast path, so the cache is populated solely for
-    transcripts fresh enough to still be warm.
+    *key* is the transcript's ``(st_mtime_ns, st_size)``: an unchanged transcript is read
+    at most once per process; a moved mtime or size forces a re-scan. Only reached off the
+    fast path, so the cache is populated solely for transcripts fresh enough to still be
+    warm.
     """
     cached = _ANCHOR_CACHE.get(path)
-    if cached is not None and cached[0] == mtime:
+    if cached is not None and cached[0] == key:
         return cached[1]
     anchor = _scan_anchor(path)
-    _ANCHOR_CACHE[path] = (mtime, anchor)
+    _ANCHOR_CACHE[path] = (key, anchor)
     return anchor
+
+
+def _running_seat(session: Session) -> str | None:
+    """The ``accountUuid`` *session*'s next request bills, from its ``config_dir``.
+
+    ``config_dir`` is the account the session last ran under (the live registry's, stamped
+    by reconcile); ``""`` means unknown and fails closed (``None``), as on every
+    multi-account surface.
+    """
+    config_dir = getattr(session, "config_dir", "") or ""
+    return accounts.account_uuid(config_dir) if config_dir else None
 
 
 def _transcript_path(adapter: object, session: Session) -> Path | None:
@@ -290,21 +427,32 @@ def transcript_anchor(adapter: object, session: Session, now: float, ttl: int) -
       yet (a freshly resumed/opened session whose only new lines are local ``mode`` /
       ``bridge-session`` / … entries with no API call): a deliberately-expired sentinel so
       :func:`countdown` renders ``❄ cold`` — the warm cache the fresh mtime implied is a lie.
-    * the **real anchor** — the transcript is fresh AND holds a qualifying assistant entry;
-      its timestamp is the last-request clock :func:`countdown` counts down from.
+    * the same sentinel when more than one account is configured and the anchor's seat is
+      not the session's running seat (:func:`_running_seat`), or either is unknown: that
+      cache belongs to the other seat, so this session's next request is a full write.
+    * the **real anchor** — the transcript is fresh AND holds a qualifying assistant entry
+      of the running seat; its timestamp is the last-request clock :func:`countdown`
+      counts down from.
     """
     path = _transcript_path(adapter, session)
     if path is None:
         return None
     try:
-        mtime = path.stat().st_mtime
+        stat = path.stat()
     except OSError:
         return None
+    mtime = stat.st_mtime
     if now - mtime >= ttl:
         return mtime  # fast path: file already older than the TTL → cold, no read
-    anchor = _cached_anchor(path, mtime)
-    if anchor is None:
-        return now - ttl - 1  # fresh mtime but no API turn yet → cold sentinel
+    cold = now - ttl - 1
+    scanned = _cached_anchor(path, (stat.st_mtime_ns, stat.st_size))
+    if scanned is None:
+        return cold  # fresh mtime but no cache request yet → cold sentinel
+    anchor, anchor_seat = scanned
+    if accounts.is_multi_account():
+        seat_now = _running_seat(session)
+        if seat_now is None or anchor_seat is None or seat_now != anchor_seat:
+            return cold  # another (or an unknown) seat's cache → cold sentinel
     return anchor
 
 

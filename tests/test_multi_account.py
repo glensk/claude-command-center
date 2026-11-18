@@ -887,6 +887,54 @@ def test_account_email_missing_or_malformed_is_none(
     assert accounts.account_email(str(empty)) is None
 
 
+# ---------------------------------------------------------------------------
+# `accounts.account_uuid`: the seat a config dir bills (cachettl's seat check)
+# ---------------------------------------------------------------------------
+def test_account_uuid_default_dir_reads_home_claude_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The DEFAULT account's seat is ``$HOME/.claude.json``'s ``oauthAccount.accountUuid``
+    (also for an empty, unstamped config dir)."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_HOME", str(home / ".claude"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "uuid-a"}}))
+    assert accounts.account_uuid(str(home / ".claude")) == "uuid-a"
+    assert accounts.account_uuid("") == "uuid-a"
+
+
+def test_account_uuid_work_dir_reads_its_own_claude_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-default account's seat lives INSIDE its config dir; a rewrite is re-read."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "private"))
+    work = tmp_path / "work"
+    work.mkdir()
+    target = work / ".claude.json"
+    target.write_text(json.dumps({"oauthAccount": {"accountUuid": "uuid-b"}}))
+    assert accounts.account_uuid(str(work)) == "uuid-b"
+    target.write_text(json.dumps({"oauthAccount": {"accountUuid": "uuid-bb"}}))
+    assert accounts.account_uuid(str(work)) == "uuid-bb"  # size moved → memo re-reads
+
+
+def test_account_uuid_missing_or_malformed_is_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Never raises: a missing file, bad JSON, no OAuth account or a non-string → None."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "private"))
+    assert accounts.account_uuid(str(tmp_path / "missing")) is None
+    cases = {"bad": "not json", "empty": "{}", "nouuid": '{"oauthAccount": {}}'}
+    cases["number"] = '{"oauthAccount": {"accountUuid": 7}}'
+    cases["list"] = "[1, 2]"
+    for name, body in cases.items():
+        folder = tmp_path / name
+        folder.mkdir()
+        (folder / ".claude.json").write_text(body)
+        assert accounts.account_uuid(str(folder)) is None, name
+
+
 def test_resolve_card_label_passthrough_when_no_hard_link(
     two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
