@@ -40,6 +40,7 @@ _EXPECTED_INERT_KEYS = {  # alphabetical, unlike config's grouped tuple
     "grade_on_turn",
     "handoff_facts",
     "handoff_hooks",
+    "launch_secret_check",
     "mirror_done",
     "mirror_running",
     "mirror_sessions",

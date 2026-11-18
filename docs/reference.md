@@ -941,7 +941,7 @@ oversized output, output that is not valid UTF-8, a returned document that lost 
 identity — means that write is **WITHHELD**: the previous file is left exactly as it was, that
 pass's cleanup is skipped (a withheld card must never be reaped as stale), the daemon logs one
 stderr line per pass, `ccc sync-mirrors` exits 3, and `ccc doctor` shows ❌ under
-"mirrors → scrubber".
+"launch check → scrubber".
 
 Scrubbing every card on every pass would be far too slow, so vouches are **persisted** — a
 `mirror_vouch` table in the store keyed by mirror path (a session has up to three cards, each
@@ -967,16 +967,22 @@ scrubber's rule set or its inventory. `mirror_scrub_cmd = ""` means *no scrubber
 every mirror write is withheld; `mirror_allow_unscrubbed = true` is the **only** passthrough, and
 `ccc doctor` keeps a ❌ on it for as long as it is on.
 
-**The FUTURE-draft tripwire.** A credential pasted into a draft's prompt would be echoed into the
-mirrors the moment the job runs, so with any mirror switch on (and `mirror_allow_unscrubbed` off)
+**The FUTURE-draft tripwire (`launch_secret_check`).** A credential pasted into a draft's
+prompt would be spoken to the session (and so land in its transcript, and in the mirrors while
+they are on) the moment the job runs. The check is armed by its own key,
+`launch_secret_check = true` (inert default `false`; `ccc init` offers it only when a scrubber
+resolves), and — while the mirrors exist — by any mirror switch on with
+`mirror_allow_unscrubbed` off; `mirror_allow_unscrubbed` never disarms the key. Armed,
 flipping `launch: true` first runs the scrubber's `check` verb over the draft's AIM + prompt. A
 leak — or a checker that cannot vouch (degraded/unavailable/missing) — **refuses the launch**:
 nothing is spawned, and the file gets the managed `status: error` callout naming the credential's
 **label** (never its value), e.g. *"launch refused: live credential in prompt/AIM (aws.key) —
 remove it and re-tick launch"*. The toggle was already consumed by the canonical rewrite, so a
-refusal never loops: remove the value (or fix the scrubber) and tick `launch` again. With every
-mirror off the tripwire is disarmed — nothing leaves the machine then, and a fresh install with no
-scrubber can still launch jobs.
+refusal never loops: remove the value (or fix the scrubber) and tick `launch` again. Disarmed
+(the fresh-install default), a machine with no scrubber can still launch jobs. `ccc doctor`
+prints `launch secret check: armed` or `launch secret check: disarmed`, and the
+"launch check → scrubber" row stays ❌ for an unresolvable scrubber while the check (or a
+mirror) depends on it.
 
 **The toggle never trusts a folder.** Folder trust is granted when a job is registered with
 `ccc new-job` (a sync import from a job file or the pad grants nothing) and by a human launch (`ccc open-job`, the TUI's `r`, a plain `ccc start-job`); automatic launches

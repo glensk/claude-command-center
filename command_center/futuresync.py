@@ -288,21 +288,20 @@ def untrusted_launch_error(session: Session) -> str:
 def _credential_tripwire(cfg: config.Config, session: Session) -> scrub.CheckVerdict | None:
     """Check a draft's AIM + prompt for a live credential; ``None`` when not armed.
 
-    **Armed** iff a mirror switch (``mirror_running`` / ``mirror_done`` /
-    ``mirror_sessions``) is on and ``mirror_allow_unscrubbed`` is off. Rationale: without
-    the mirrors the transcript never leaves the machine, so a fresh install with no broker
-    must still be able to launch jobs; WITH them the launched prompt is echoed verbatim
-    into the vault (the running/session cards), and those roots already require a
-    scrubber — so demanding one here costs nothing extra and closes the hole at its
-    source, before the value is ever spoken to a session.
+    **Armed** iff :func:`config.launch_secret_check_armed`: the dedicated
+    ``launch_secret_check`` key, or a mirror switch (``mirror_running`` / ``mirror_done`` /
+    ``mirror_sessions``) on with ``mirror_allow_unscrubbed`` off. Rationale: a fresh
+    install with no broker must still be able to launch jobs (the key is inert); a
+    launched prompt still reaches transcripts and every reader of them (and, with the
+    mirrors on, is echoed verbatim into the vault), so an opted-in install refuses it at
+    its source, before the value is ever spoken to a session. The key keeps the check
+    armed once the mirrors are retired (tp#2266).
 
     Runs the scrubber's ``check`` verb (a verdict, never a rewrite). An unresolvable
     scrubber is reported as DEGRADED with the resolution reason — fail closed, exactly
     like the mirror writes.
     """
-    if not (cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions):
-        return None
-    if cfg.mirror_allow_unscrubbed:
+    if not config.launch_secret_check_armed(cfg):
         return None
     text = f"{session.aim or ''}\n{session.prompt or ''}"
     resolution = scrub.resolve_scrubber(cfg.mirror_scrub_cmd, verb="check")
@@ -347,9 +346,10 @@ def _consume_launch(store: Store, cfg: config.Config, session_id: str, report: S
     ("blocked: depends on <4-hex> — <state>"). No retrigger loop (launch was already
     reset to false); the user re-flips once the dependency completes.
 
-    Then the **credential tripwire** (:func:`_credential_tripwire`): with the vault
-    mirrors on, a prompt/AIM carrying a live credential value is never launched — the
-    session would echo it straight into the running/session mirrors. A leak or a degraded
+    Then the **credential tripwire** (:func:`_credential_tripwire`): when armed
+    (``launch_secret_check``, or a vault mirror on), a prompt/AIM carrying a live
+    credential value is never launched — the session would echo it into its transcript
+    (and the running/session mirrors). A leak or a degraded
     checker refuses the launch the same way a blocked dependency does (callout + report
     line, no spawn); the user scrubs the prompt (or fixes the scrubber) and re-ticks.
 

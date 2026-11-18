@@ -659,7 +659,7 @@ def test_mirror_scrubber_check_states(tmp_path: Path) -> None:
 
     from command_center.models import MirrorHealth
 
-    label = "mirrors → scrubber"
+    label = "launch check → scrubber"
     assert _feat(config.Config(), label) == doctor.NA  # mirrors off → never probed
     assert (
         _feat(config.Config(mirror_running=True, mirror_allow_unscrubbed=True), label)

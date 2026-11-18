@@ -665,18 +665,33 @@ def _last_mirror_health() -> MirrorHealth | None:
         return None
 
 
-def _mirror_scrubber_check(cfg: config.Config) -> Check:
-    """The mirror credential scrubber: resolvable, and what the last pass did with it.
+def _launch_secret_check_line(cfg: config.Config) -> Check:
+    """Whether the launch credential check is armed; the label carries the state.
 
-    The mirror roots embed transcripts verbatim, so a mirror switch without a working
-    scrubber is a live-credential export waiting to happen — hence ❌ for the explicit
-    ``mirror_allow_unscrubbed`` opt-out and ❌ for an unresolvable command, both of which
-    are silent at runtime otherwise (the pass just withholds every write).
+    One grep (``launch secret check: armed``) proves the running code knows the key (an
+    older install's ``load_config`` silently drops it). Disarmed is informational (−).
     """
-    label = "mirrors → scrubber"
-    if not (cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions):
+    if not config.launch_secret_check_armed(cfg):
+        return Check(NA, "launch secret check: disarmed", "launch_secret_check = false")
+    if cfg.launch_secret_check:
+        return Check(OK, "launch secret check: armed", "launch_secret_check = true")
+    return Check(OK, "launch secret check: armed", "by a mirror switch")
+
+
+def _mirror_scrubber_check(cfg: config.Config) -> Check:
+    """The credential scrubber: resolvable, and what the last mirror pass did with it.
+
+    Two features depend on it: the mirror roots (verbatim transcripts — a mirror switch
+    without a scrubber is a live-credential export) and the launch credential check
+    (:func:`config.launch_secret_check_armed`; unresolvable → every toggle launch refused).
+    Hence ❌ for ``mirror_allow_unscrubbed`` under a mirror switch and ❌ for an
+    unresolvable command, both silent at runtime otherwise.
+    """
+    label = "launch check → scrubber"
+    mirrors_on = cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions
+    if not (mirrors_on or config.launch_secret_check_armed(cfg)):
         return Check(NA, label, "disabled")
-    if cfg.mirror_allow_unscrubbed:
+    if mirrors_on and cfg.mirror_allow_unscrubbed:
         return Check(
             FAIL,
             label,
@@ -686,6 +701,8 @@ def _mirror_scrubber_check(cfg: config.Config) -> Check:
     if not resolution.ok or resolution.scrubber is None:
         return Check(FAIL, label, resolution.reason)
     exe = resolution.scrubber.executable
+    if not mirrors_on:  # only the launch check uses it: no mirror pass to report on
+        return Check(OK, label, exe)
     health = _last_mirror_health()
     if health is not None and health.withheld > 0:
         return Check(
@@ -766,6 +783,7 @@ def _section_features(  # pylint: disable=too-many-branches,too-many-statements
     else:
         section.checks.append(Check(NA, "vault features → vault_root", "disabled"))
 
+    section.checks.append(_launch_secret_check_line(cfg))
     section.checks.append(_mirror_scrubber_check(cfg))
 
     if cfg.launcher == "iterm":

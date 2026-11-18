@@ -463,6 +463,11 @@ DEFAULTS: dict[str, object] = {
     # this is on together with any mirror switch. Not an inert-defaults key: False is the safe
     # value, True is the deliberate opt-OUT of the protection.
     "mirror_allow_unscrubbed": False,
+    # Launch credential check: before a FUTURE draft is launched from its ``launch: true``
+    # toggle, run the scrubber's ``check`` verb (``mirror_scrub_cmd``) over its AIM + prompt
+    # and refuse the launch on a leak or a degraded checker (INERT: off). Any mirror switch
+    # on (without ``mirror_allow_unscrubbed``) also arms it; see launch_secret_check_armed.
+    "launch_secret_check": False,
     "vault_name": "",  # Obsidian vault name for obsidian:// URIs ("" = basename of vault_root)
     # Root of the category/repo tree (layout <repo_root>/<category>/<repo>). Resolution:
     # this value → $GIT_BASE env → "" (no tree: every session falls into the "others" bucket).
@@ -536,6 +541,7 @@ INERT_DEFAULT_KEYS: tuple[str, ...] = (
     "mirror_running",  # no vault writes (RUNNING session mirror)
     "mirror_done",  # no vault writes (DONE session mirror)
     "mirror_sessions",  # no vault writes (full-conversation mirror)
+    "launch_secret_check",  # no scrubber `check` spawn before a toggle launch
     "copilot_usage",  # no `gh` billing calls
     "claude_usage",  # no keychain read / Claude OAuth /usage fetch
     "codex_usage",  # no Codex auth.json read / chatgpt.com usage fetch
@@ -1334,6 +1340,7 @@ class Config:
     sessions_dir: str = "~/obsidian/01-llm/ccc-tasks/sessions"
     mirror_scrub_cmd: str = "secret-broker-client.py scrub --shapes"
     mirror_allow_unscrubbed: bool = False
+    launch_secret_check: bool = False
     vault_name: str = ""
     repo_root: str = ""
     category_colors: dict[str, str] = field(default_factory=dict)
@@ -1406,6 +1413,21 @@ def _clamped_int(value: int, low: int, high: int, fallback: int) -> int:
     except (TypeError, ValueError):
         return fallback
     return max(low, min(high, number))
+
+
+def launch_secret_check_armed(cfg: Config) -> bool:
+    """Whether the launch credential check runs (the ONE arming formula, tp#2266).
+
+    Armed by the dedicated ``launch_secret_check`` key, or — until the mirror switches are
+    removed — by any mirror switch on without the ``mirror_allow_unscrubbed`` opt-out
+    (the launched prompt is echoed verbatim into the mirrors). The launch tripwire
+    (``futuresync._credential_tripwire``), ``ccc doctor``'s "launch secret check" line and
+    its "launch check → scrubber" row all read this, so they can never disagree.
+    """
+    if cfg.launch_secret_check:
+        return True
+    mirrors_on = cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions
+    return bool(mirrors_on) and not cfg.mirror_allow_unscrubbed
 
 
 def load_config() -> Config:

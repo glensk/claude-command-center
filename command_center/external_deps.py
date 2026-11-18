@@ -36,7 +36,8 @@ from extdeps import Dep, MissingExternalDependency, require, resolve
 # The one external tool the vault mirrors depend on: the secret-broker client. Its
 # `scrub` verb vouches for a document (stdin → scrubbed stdout, exit 0) or withholds it
 # (exit 3, nothing emitted); its `check` verb is the FUTURE-draft tripwire (exit 0 clean,
-# 1 leak, 3 unavailable — each with a v1 verdict marker as the first stdout line).
+# 1 leak, 3 unavailable — each with a v1 verdict marker as the first stdout line), armed by
+# `launch_secret_check` or a mirror switch (config.launch_secret_check_armed).
 # `SECRET_BROKER_CLIENT` is the same override the secret-check-index commit gate honours.
 EXTERNAL_DEPS: dict[str, Dep] = {
     "secret-broker-client.py": Dep(
@@ -48,9 +49,11 @@ EXTERNAL_DEPS: dict[str, Dep] = {
             "Install the secret-broker client (the same `secret-broker-client.py` the "
             "secret-check-index pre-commit gate uses) and put it on $PATH, or set "
             "SECRET_BROKER_CLIENT to its absolute path in the daemon's environment. "
-            "Needed only while a mirror switch (mirror_running / mirror_done / "
-            "mirror_sessions) is on; `mirror_allow_unscrubbed = true` is the explicit "
-            "opt-out that writes mirrors without a scrubber."
+            "Needed only while the launch credential check is armed "
+            "(`launch_secret_check = true`) or a mirror switch (mirror_running / "
+            "mirror_done / mirror_sessions) is on; `mirror_allow_unscrubbed = true` is the "
+            "explicit opt-out that writes mirrors without a scrubber (it does not disarm "
+            "`launch_secret_check`)."
         ),
     ),
     # Google's Antigravity CLI. ccc calls it for ONE thing: `agy -p /usage

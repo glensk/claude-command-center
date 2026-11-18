@@ -97,7 +97,7 @@ async def wait_for(pilot, predicate, timeout: float = 5.0) -> bool:
             return True
         await asyncio.sleep(0.02)
     await pilot.pause()
-    return predicate()
+    return bool(predicate())
 
 
 @pytest.fixture(autouse=True)

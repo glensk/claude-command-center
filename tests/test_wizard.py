@@ -32,6 +32,15 @@ def _claude_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path / "claude"
 
 
+@pytest.fixture(autouse=True)
+def _no_scrubber(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never probe the developer's real PATH for a scrubber (the answer differs per machine).
+
+    Tests that need one resolvable re-patch ``scrubber_status`` themselves.
+    """
+    monkeypatch.setattr(wizard, "scrubber_status", lambda: (None, "no scrubber (test stub)"))
+
+
 @pytest.fixture
 def _stub_installers(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     """Neutralise every side-effecting installer the wizard may call."""
@@ -69,6 +78,7 @@ def test_consent_groups_cover_every_inert_key() -> None:
     mapped = (
         set(wizard.GROUP_A_CHECKERS)
         | set(wizard.GROUP_B_VAULT)
+        | set(wizard.GROUP_S_LAUNCH_CHECK)
         | set(wizard.GROUP_C)
         | set(wizard.UNMAPPED_INERT)
     )
@@ -79,6 +89,7 @@ def test_consent_groups_cover_every_inert_key() -> None:
     total = (
         len(wizard.GROUP_A_CHECKERS)
         + len(wizard.GROUP_B_VAULT)
+        + len(wizard.GROUP_S_LAUNCH_CHECK)
         + len(wizard.GROUP_C)
         + len(wizard.UNMAPPED_INERT)
     )
@@ -120,7 +131,7 @@ def test_yes_with_vault_enables_vault_features(
     vault.mkdir()
     assert wizard.run(_args(yes=True, vault_root=str(vault))) == 0
     data = _load(_claude_home)
-    for key in wizard.GROUP_B_VAULT:
+    for key in (*wizard.GROUP_B_VAULT, *wizard.GROUP_S_LAUNCH_CHECK):
         assert data[key] is True
     assert data["vault_root"] == str(vault)
     assert data["future_dir"] == f"{vault}/01-llm/ccc-tasks/future"
@@ -238,3 +249,27 @@ def test_config_values_splits_future_files_from_mirrors() -> None:
     )
     for key in wizard.GROUP_B_VAULT:
         assert with_mirrors[key] is True
+
+
+# ------------------------------ launch credential check (tp#2266) ------------------------------ #
+def test_yes_without_vault_arms_launch_check_only_with_a_scrubber(
+    monkeypatch: pytest.MonkeyPatch,
+    _claude_home: Path,
+    _stub_installers: dict[str, int],
+) -> None:
+    """The launch check needs no vault, only a resolvable scrubber (else it refuses launches)."""
+    assert wizard.run(_args(yes=True)) == 0
+    assert "launch_secret_check" not in _load(_claude_home)  # no scrubber → stays inert
+
+    monkeypatch.setattr(wizard, "scrubber_status", lambda: ("/opt/stub/scrubber", ""))
+    assert wizard.run(_args(yes=True, force=True)) == 0
+    data = _load(_claude_home)
+    assert data["launch_secret_check"] is True
+    for key in wizard.GROUP_B_VAULT:  # still no vault features
+        assert key not in data
+
+
+def test_config_values_launch_check_is_its_own_consent() -> None:
+    assert "launch_secret_check" not in wizard.config_values(wizard.Profile(checkers=True))
+    values = wizard.config_values(wizard.Profile(launch_check=True))
+    assert values == {"launch_secret_check": True}

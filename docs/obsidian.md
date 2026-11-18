@@ -125,6 +125,7 @@ external credential scrubber before it is written:
 | :------------------------ | :--------------------------------------- | :------------------------------------------------------ |
 | `mirror_scrub_cmd`        | `secret-broker-client.py scrub --shapes` | note on stdin, vouched note on stdout, exit 0 = vouched |
 | `mirror_allow_unscrubbed` | `false`                                  | the ONLY passthrough (`ccc doctor` ❌ while on)          |
+| `launch_secret_check`     | `false`                                  | arms the launch credential check without any mirror     |
 
 It **fails closed**: no scrubber, a non-zero exit, a timeout or unusable output means the
 note is simply not written — the previous file stays, that pass's cleanup is skipped,
