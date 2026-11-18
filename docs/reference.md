@@ -621,11 +621,19 @@ never leaks from a parent shell into another launch.
 executable that vanished, REFUSES the launch before any state changes (the draft stays a
 draft, a parked prompt stays parked, no trust is granted, no tab opens, nothing is reaped).
 Surfaces that propagate the profile: `start-job`, `resume`, `resume-job`, the TUI `r` and its
-undo-close, `ccc jump`, `fire-attached`, and snapshot restore (the typed tab command carries
-the export). Surfaces that **refuse** a profile session because their relaunch would be a bare
-`claude` on another route: account switching (`switch-account`, `switch-now`, the automatic
-rate-limit failover), the halted-session auto-resume, `ccc await` arming and delivery, and
-`continue-session start`.
+undo-close, `ccc jump`, `fire-attached`, snapshot restore (the typed tab command carries
+the export), `ccc await` arming and delivery, and `continue-session start` (the successor
+draft carries the label; an unresolvable one refuses the start). Surfaces that **refuse** a
+profile session because their relaunch would be a bare `claude` on another route: account
+switching (`switch-account`, `switch-now`, the automatic rate-limit failover) and the
+halted-session auto-resume.
+
+**A session started outside ccc.** A shell that exports `CCC_LAUNCH_PROFILE=<label>` and runs
+the profile's executable itself (a shell function, say) is adopted at SessionStart: when the
+label is configured in `claude_launch_profiles` and the session row has no profile yet, the
+hook records it, so that session's relay successor, resume and jump start through the same
+executable and account switching refuses it. An unconfigured label is ignored, and a row that
+already carries a profile keeps it.
 
 **Account vs billing profile.** The account (`-A`, `claude_accounts`) pins WHICH Claude config
 dir and subscription seat a session uses; the profile pins HOW the process is started and

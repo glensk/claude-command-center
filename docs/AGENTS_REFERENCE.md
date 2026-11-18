@@ -510,10 +510,15 @@ interactive launch of that session. It is billing-relevant identity, so a surfac
   `StoreRow` carry it like `no_codex`.
 - **Propagate:** `start-job` (resolves BEFORE `claim_draft`), `resume`, `resume-job`, TUI `r` +
   undo-close, `jump` (all via `terminal.resume_in_new_tab(launch_profile=)`, which resolves
-  before trust or a tab), `fire-attached` (before the claim), snapshot restore.
+  before trust or a tab), `fire-attached` (before the claim), snapshot restore,
+  `continue-session start` (transfer + successor draft carry the label), `ccc await` arm and
+  `fire-await` (re-resolved at delivery).
+- **Adopt:** `hooks._adopt_env_launch_profile` (SessionStart) records an ambient, CONFIGURED
+  `CCC_LAUNCH_PROFILE` on a row without a profile (a session its shell started through the
+  profile's executable); never overwrites a recorded one.
 - **Refuse:** `switch-account` / `switch-now` / `limitswitch` (an account switch does not
   change the billing route), the halted-session auto-resume (before the reap),
-  `resume_halted_in_new_tab`, `ccc await` arm and `fire-await`, `continue-session start`.
+  `resume_halted_in_new_tab`.
 - The store is the authority: the job file carries `launch_profile` but a file edit never
   re-routes an existing job. Machine contracts (`new-job -J`, `jobs -j`, `sessions -j`,
   `inspect -j`) and the `-K` conflict check include it. ccc stays public: labels are opaque,
