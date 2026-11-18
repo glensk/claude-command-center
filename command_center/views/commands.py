@@ -327,16 +327,15 @@ COMMANDS: list[Command] = [
     Command(
         key="os",
         word="open-session",
-        gloss="open the full-session file in Obsidian",
+        gloss="open the row's full session in the peek panel",
         section=PER_SESSION,
         explanation=(
-            "Open the selected session's FULL-CONVERSATION markdown mirror in Obsidian — "
-            "everything you typed, every Claude reply and the tool calls between, "
-            "terminal-like (the same content the peek panel's session tab shows). Type o "
-            "then s. Works for parked, running and done sessions once the mirror pass has "
-            "written the file (sessions_dir, synced by the daemon and every lifecycle "
-            "command); until then os just notifies. The running/done mirror files link to "
-            "the same file from their Transcript section."
+            "Open the selected session's FULL CONVERSATION — everything you typed, every "
+            "Claude reply and the tool calls between, terminal-like — in the peek panel: "
+            "the same call as sp (`ccc peek --session <id>`); the conversation is the "
+            "panel's session tab (→ from prompts). Type o then s. Works for parked, "
+            "running and done sessions, straight from the store and the transcript — no "
+            "Obsidian file needed. `ccc show -t` prints the same conversation to stdout."
         ),
         action="open_session_obsidian",
         chord=("o", "s"),

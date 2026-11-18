@@ -2702,47 +2702,54 @@ def test_draft_id_cell_scheduled_shows_bare_hash() -> None:
     assert len(longest[3:]) <= 5
 
 
-def test_action_open_session_obsidian_opens_exact_uri(
+def test_action_open_session_obsidian_opens_peek_not_mirror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The `os` chord opens the session mirror's obsidian:// URI (and notifies when absent)."""
+    """The `os` chord spawns the same peek call as `sp` and never touches the vault.
+
+    tp#2266 B2: no `mirrors` import, no `sessions_dir` read, no `open obsidian://…`.
+    """
+    import inspect
+
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     sid = _seed(tmp_path)
-    # A session-mirror file in the isolated vault (conftest points load_config there).
-    sdir = tmp_path / "vault" / "01-llm" / "ccc-tasks" / "sessions" / "other" / "repo"
-    sdir.mkdir(parents=True)
-    mirror = sdir / "ship-the-thing-abcd.md"
-    mirror.write_text(
-        f'---\nccc_mirror: "session"\nsession_id: "{sid}"\n---\n\nbody\n', encoding="utf-8"
-    )
 
+    from command_center import spawn
     from command_center.views import tui as tui_mod
     from command_center.views.tui import CommandCenterApp
 
+    action = CommandCenterApp.action_open_session_obsidian
+    assert "import mirrors" not in inspect.getsource(action)
+    names = set(action.__code__.co_names)
+    assert not names & {"mirrors", "session_file_path", "sessions_dir", "obsidian_uri"}
+
+    spawned: list[list[str]] = []
     opened: list[list[str]] = []
+
+    def _fake_spawn(args: list[str]) -> bool:
+        spawned.append(list(args))
+        return True
+
+    monkeypatch.setattr(spawn, "spawn_ccc", _fake_spawn)
 
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
             await pilot.pause()
-            app._current = sid
             monkeypatch.setattr(
                 tui_mod.subprocess, "Popen", lambda argv, **_kw: opened.append(list(argv))
             )
+            app._current = sid
             app.action_open_session_obsidian()
             await pilot.pause()
-            # Missing mirror → notify, no open.
-            mirror.unlink()
+            # No selected row → nothing spawns.
+            app._current = None
             app.action_open_session_obsidian()
             await pilot.pause()
 
     asyncio.run(scenario())
-    # conftest points vault_root at tmp_path/"vault", so the derived vault name is "vault".
-    expected = (
-        "obsidian://open?vault=vault"
-        "&file=01-llm/ccc-tasks/sessions/other/repo/ship-the-thing-abcd.md"
-    )
-    assert opened == [["open", expected]]
+    assert [a for a in spawned if a and a[0] == "peek"] == [["peek", "--session", sid]]
+    assert not [a for a in opened if a and a[0] == "open"]
 
 
 def test_action_peek_spawns_peek_for_selected_row(

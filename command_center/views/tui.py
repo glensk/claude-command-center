@@ -5459,27 +5459,13 @@ class CommandCenterApp(App[None]):
             self.notify("Could not open Obsidian.", severity="warning")
 
     def action_open_session_obsidian(self) -> None:
-        """Open the selected session's full-conversation mirror in Obsidian — `os` chord.
+        """Open the selected session's full conversation in the peek panel — `os` chord.
 
-        Works for parked, running and done sessions once the mirror pass has written
-        the file under ``sessions_dir`` (the daemon / any lifecycle command syncs it);
-        until then there is nothing to open and ``os`` just notifies.
+        The same call as `sp` (`ccc peek --session <id>`): the conversation is the
+        panel's session tab. Reads nothing from the vault (no ``sessions_dir`` mirror),
+        so it works for parked, running and done sessions straight from the store.
         """
-        from .. import mirrors  # lazy: keep TUI startup free of the mirror machinery
-
-        if not (sid := self._current):
-            return
-        hit = mirrors.session_file_path(self.cfg, sid)
-        if hit is None:
-            self.notify("No session file yet (mirror sync pending).", severity="warning")
-            return
-        uri = future_files.obsidian_uri(hit.vault_relpath)
-        try:
-            subprocess.Popen(  # noqa: S603  # pylint: disable=consider-using-with
-                ["open", uri], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except (OSError, ValueError):
-            self.notify("Could not open Obsidian.", severity="warning")
+        self.action_peek()
 
     def action_peek(self) -> None:
         """Open the peek panel for the selected session — the `sp` chord.

@@ -924,7 +924,8 @@ full session. Embedded verbatim text is **fence-safe**: line-leading ``` runs in
 backslash-escaped (a pasted terminal snippet can open a code fence it never closes, which would
 swallow the whole rest of the note), and a dangling fence in an assistant reply is self-closed —
 Claude's balanced code blocks keep rendering as code. In the TUI, the **`os`** chord (type `o`
-then `s` on the selected row) opens the selected session's full-session file in Obsidian directly.
+then `s` on the selected row) no longer opens this file: it opens the same peek panel as `sp`
+(the conversation is its **session** tab), straight from the store, with no vault file needed.
 
 **Credential scrubbing (fail closed).** The three mirror roots embed prompts, replies and tool
 output **verbatim** — including any credential value a session ever printed — so every mirror
