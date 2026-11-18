@@ -771,8 +771,7 @@ def _section_features(  # pylint: disable=too-many-branches,too-many-statements
     else:
         section.checks.append(Check(NA, "resume_halted → session-continue", "disabled"))
 
-    vault_on = cfg.future_files or cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions
-    if vault_on:
+    if config.vault_features_on(cfg):
         vault = Path(cfg.vault_root).expanduser()
         if vault.is_dir():
             section.checks.append(Check(OK, "vault features → vault_root", str(vault)))

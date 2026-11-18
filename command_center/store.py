@@ -207,6 +207,7 @@ _SESSION_COLUMNS = (
     "future_sync_hash",
     "future_synced_at",
     "future_missing_since",
+    "launched_from_draft",
     "archived",
     "created_at",
     "updated_at",
@@ -236,6 +237,7 @@ _BOOL_COLUMNS = frozenset(
         "aim_met",
         "no_codex",
         "lean_start",
+        "launched_from_draft",
     }
 )
 # Columns the automatic reconcile is allowed to touch (never user-authored fields).
@@ -345,6 +347,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     future_sync_hash     TEXT,
     future_synced_at     INTEGER NOT NULL DEFAULT 0,
     future_missing_since INTEGER NOT NULL DEFAULT 0,
+    launched_from_draft  INTEGER NOT NULL DEFAULT 0,
     archived          INTEGER NOT NULL DEFAULT 0,
     created_at        INTEGER NOT NULL DEFAULT 0,
     updated_at        INTEGER NOT NULL DEFAULT 0,
@@ -675,6 +678,9 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         "future_sync_hash": "TEXT",
         "future_synced_at": "INTEGER NOT NULL DEFAULT 0",
         "future_missing_since": "INTEGER NOT NULL DEFAULT 0",
+        # Provenance (tp#2266): 1 = this row was launched from a FUTURE draft (set by
+        # start-job's claim, backfilled by `sync-future --detach`). `unlaunch` keys on it.
+        "launched_from_draft": "INTEGER NOT NULL DEFAULT 0",
         "aim_score": "INTEGER NOT NULL DEFAULT -1",
         "aim_score_reason": "TEXT",
         "aim_prev": "TEXT",
@@ -1392,7 +1398,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         """
         ts = now_ms()
         cur = self.conn.execute(
-            "UPDATE sessions SET draft = 0, fire_at = 0, status = ?, updated_at = ?, "
+            "UPDATE sessions SET draft = 0, fire_at = 0, launched_from_draft = 1, status = ?, "
+            "updated_at = ?, "
             "last_seen_pid = CASE WHEN ? > 0 THEN ? ELSE last_seen_pid END "
             "WHERE session_id = ? AND draft = 1",
             (Status.IDLE.value, ts, pid, pid, session_id),

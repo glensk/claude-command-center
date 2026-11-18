@@ -1115,6 +1115,8 @@ def _seed_filed_draft(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sid: str)
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress detached ccc spawns
     cfg = _config.load_config()  # conftest points every vault dir at tmp_path
+    cfg.future_files = True  # these tests exercise the job-file lifecycle (tp#2266 gate)
+    monkeypatch.setattr("command_center.cli.config.load_config", lambda: cfg)
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir(exist_ok=True)
     with Store(tmp_path / "command-center" / "state.db") as store:

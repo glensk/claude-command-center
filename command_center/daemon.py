@@ -418,9 +418,10 @@ def _sync_future_files(store: Store, cfg: config.Config) -> None:
     converges the store and the vault. A sync failure (a bad file, a disk error) must never
     break the housekeeping pass, so it is caught and logged.
     """
-    if not cfg.future_files:
-        return
     from . import futuresync
+
+    if not futuresync.pad_on(cfg):  # future_files or future_pad_enabled (the pad alone too)
+        return
 
     try:
         futuresync.run_sync(store, cfg)

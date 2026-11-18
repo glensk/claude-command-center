@@ -3448,6 +3448,143 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
     return 0
 
 
+def _edit_job_fields(  # pylint: disable=too-many-branches,too-many-return-statements
+    args: argparse.Namespace, store: Store, session: Session, git_base: Any
+) -> Any:
+    """The draft's current fields with the ``edit-job`` flags applied (a ParsedJob), or
+    an error string (exit 1) for a flag that cannot be resolved."""
+    import dataclasses
+    from pathlib import Path
+
+    from . import deps, futuresync
+    from .future_files import ParsedJob, cwd_to_repo
+    from .models import DEFAULT_LLM
+
+    job = ParsedJob(
+        session_id=session.session_id,
+        status="registered",
+        repo=cwd_to_repo(session.cwd, git_base),
+        job_type=session.job_type or "claude",
+        llm_overseer=session.llm_overseer or DEFAULT_LLM,
+        llm_exec=session.llm_exec or DEFAULT_LLM,
+        start_when=session.start_when or "",
+        deadline=session.deadline or "",
+        created="",
+        aim=session.aim or "",
+        prompt=session.prompt,
+        start_date=session.start_date or "",
+        depends_on=session.depends_on or "",
+        no_codex=bool(session.no_codex),
+        account=futuresync._account_label(session.config_dir or ""),  # pylint: disable=protected-access
+    )
+    changes: dict[str, Any] = {}
+    if args.aim is not None:
+        changes["aim"] = args.aim.strip()
+    if args.prompt is not None:
+        changes["prompt"] = args.prompt
+    if args.clear_prompt:
+        changes["prompt"] = None
+    if args.cwd is not None:
+        changes["repo"] = cwd_to_repo(str(Path(args.cwd).expanduser().absolute()), git_base)
+    for flag, name in (("deadline", "deadline"), ("when", "start_when")):
+        value = getattr(args, flag)
+        if value is not None:
+            changes[name] = value.strip()
+    if args.clear_deadline:
+        changes["deadline"] = ""
+    if args.clear_when:
+        changes["start_when"] = ""
+    if args.start_date is not None:
+        start_date = args.start_date.strip()
+        if start_date and parse_iso_date(start_date) is None:
+            return f"error: --start-date {start_date!r} is not a valid ISO date (YYYY-MM-DD)"
+        changes["start_date"] = start_date
+    if args.clear_start_date:
+        changes["start_date"] = ""
+    if args.depends_on is not None:
+        try:
+            changes["depends_on"] = deps.resolve_dependency_ref(store, args.depends_on.strip())
+        except deps.DependencyError as exc:
+            return f"error: {exc}"
+    if args.clear_depends_on:
+        changes["depends_on"] = ""
+    for flag, name in (("job_type", "job_type"), ("overseer", "llm_overseer")):
+        if getattr(args, flag) is not None:
+            changes[name] = getattr(args, flag)
+    if args.executor is not None:
+        changes["llm_exec"] = args.executor
+    if args.account is not None:
+        changes["account"] = args.account.strip()
+    if args.no_codex:
+        changes["no_codex"] = True
+    if args.clear_no_codex:
+        changes["no_codex"] = False
+    return dataclasses.replace(job, **changes)
+
+
+def cmd_edit_job(  # pylint: disable=too-many-return-statements
+    args: argparse.Namespace,
+) -> int:
+    """Change a FUTURE job's fields in the store (tp#2266) — the CLI write path for drafts.
+
+    Takes ``new-job``'s field flags (only the given ones change; ``--clear-*`` empties an
+    optional field) and goes through :func:`futuresync.apply_job_fields`: validation, the
+    dependency-cycle guard, :meth:`Store.set_aim` for the AIM (history ``set_by`` user,
+    score spawn) and :meth:`Store.update_fields` for the rest. A non-draft or archived row
+    is refused with exit 2; a validation error / cycle exits 1. ``-J`` prints one JSON line.
+    """
+    from . import futuresync, repos
+
+    as_json = bool(getattr(args, "json", False))
+    if args.prompt_file:
+        if args.prompt is not None:
+            print("error: -p/--prompt and -P/--prompt-file are exclusive", file=sys.stderr)
+            return 2
+        try:
+            args.prompt = launch_argv.read_prompt_file(args.prompt_file)
+        except launch_argv.PromptFileError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    cfg = config.load_config()
+    with Store() as store:
+        session_id = _resolve_job_or_report(store, args.session_id)
+        if session_id is None:
+            return 1
+        session = store.get(session_id)
+        assert session is not None  # resolve_job_id only ever returns a real id
+        if not session.draft or session.archived or session.done:
+            print(
+                f"error: {session_id} is not a live future job (draft) — edit-job only "
+                "changes drafts",
+                file=sys.stderr,
+            )
+            return 2
+        git_base = repos.git_base()
+        job = _edit_job_fields(args, store, session, git_base)
+        if isinstance(job, str):
+            print(job, file=sys.stderr)
+            return 1
+        try:
+            changed = futuresync.apply_job_fields(store, cfg, session, job, git_base)
+        except futuresync.JobFieldsError as exc:
+            for error in exc.errors:
+                print(f"error: {error}", file=sys.stderr)
+            return 1
+    if changed and cfg.future_files and session.future_file:
+        from .spawn import spawn_ccc
+
+        spawn_ccc(["sync-future"])  # export the edit into the job file out-of-band
+    if as_json:
+        print(
+            json.dumps(
+                {"version": JSON_SCHEMA_VERSION, "session_id": session_id, "changed": changed}
+            )
+        )
+    else:
+        print(f"edited future job {session_id}: {', '.join(changed) or 'no change'}")
+    return 0
+
+
 def cmd_new_prompt(args: argparse.Namespace) -> int:
     """Create a fresh FUTURE-job capture file (a prefilled draft page), print its clickable path.
 
@@ -3472,6 +3609,13 @@ def cmd_new_prompt(args: argparse.Namespace) -> int:
     from .links import osc8_link
 
     cfg = config.load_config()
+    if not cfg.future_files:
+        print(
+            "error: new-prompt writes a FUTURE job file, and future_files is off — register "
+            "the job with `ccc new-job -a AIM …` (edit it with `ccc edit-job ID …`)",
+            file=sys.stderr,
+        )
+        return 2
     repo = (args.repo or "").strip()
     root = future_root(cfg)
 
@@ -5455,6 +5599,15 @@ def cmd_sync_future(args: argparse.Namespace) -> int:
     from . import futuresync
 
     cfg = config.load_config()
+    if getattr(args, "detach", False):
+        try:
+            with Store() as store:
+                cleared = futuresync.detach(store, cfg)
+        except futuresync.DetachError as exc:
+            print(f"error: sync-future --detach refused: {exc}", file=sys.stderr)
+            return 2
+        print(f"sync-future --detach: cleared the job-file link on {cleared} row(s)")
+        return 0
     only_file = None
     if getattr(args, "file", None):
         only_file = Path(os.path.abspath(os.path.expanduser(args.file)))
@@ -5743,10 +5896,11 @@ def unlaunch_job(
     The pure state-logic core shared by ``ccc unlaunch`` (CLI) and the TUI dead-row dialog:
     no printing, and it takes an already-open *store* plus the caller's live-id set.
     Guards: (a) NO live process (id in *live_ids*) — kill/exit the tab first;
-    (b) launched-draft provenance — a ``future_file`` on the row OR an archived job file for
-    the UUID (refuse otherwise, so a hand-typed or genuinely-live session id can't be
-    demoted); (c) ``done=0``. On success: restore ``draft=1`` + ``status=parked``, move the
-    job file back out of ``future/_archive/`` (fresh export if the archive copy is gone), and
+    (b) launched-draft provenance — the ``launched_from_draft`` column (with ``future_files``
+    on also a ``future_file`` on the row OR an archived job file for the UUID; refuse
+    otherwise, so a hand-typed or genuinely-live session id can't be demoted);
+    (c) ``done=0``. On success: restore ``draft=1`` + ``status=parked``, move the job
+    file back out of ``future/_archive/`` (fresh export if the archive copy is gone), and
     remove the running mirror. Any transcript is preserved untouched, so a later ``start-job``
     resumes it (decision 14). The caller runs ``_spawn_sync_mirrors`` afterwards.
     """
@@ -5759,8 +5913,16 @@ def unlaunch_job(
         return False, f"{session_id} is still live — kill or exit its tab first"
     if session.done:  # (c)
         return False, f"{session_id} is done — reopen it with `ccc mark-done --undo` first"
-    archived_file = None if session.future_file else _archived_job_file(cfg, session_id)
-    if not session.future_file and archived_file is None:  # (b)
+    # (b) provenance: the DB fact (tp#2266); the file fallbacks only while the job
+    # files are on (rows launched before the column existed, not yet detached).
+    files_on = bool(cfg.future_files)
+    archived_file = (
+        _archived_job_file(cfg, session_id)
+        if files_on and not session.future_file and not session.launched_from_draft
+        else None
+    )
+    has_file = files_on and bool(session.future_file)
+    if not session.launched_from_draft and not has_file and archived_file is None:  # (b)
         return False, (
             f"{session_id} has no launched-draft provenance (no future-job file) — "
             "refusing to unlaunch"
@@ -5809,18 +5971,8 @@ def _archived_job_file(cfg: config.Config, session_id: str):  # -> Path | None
     a real future job (not a hand-typed / live session id).
     """
     from . import futuresync
-    from .future_files import parse_job_file
 
-    archive_dir = futuresync.future_root(cfg) / "_archive"
-    if not archive_dir.is_dir():
-        return None
-    for path in sorted(archive_dir.glob("*.md")):
-        try:
-            if parse_job_file(path.read_text(encoding="utf-8")).session_id.strip() == session_id:
-                return path
-        except OSError:
-            continue
-    return None
+    return futuresync.archived_job_files(cfg).get(session_id)
 
 
 def cmd_hook(args: argparse.Namespace) -> int:
@@ -7521,6 +7673,61 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     )
     p_newjob.set_defaults(func=cmd_new_job)
 
+    p_editjob = sub.add_parser(
+        "edit-job",
+        help="change a future job's fields in the store (the new-job flags; only the given "
+        "ones change)",
+    )
+    p_editjob.add_argument("session_id", help="the job (full UUID or unique id/hash prefix)")
+    p_editjob.add_argument("-a", "--aim", default=None, help="new done-condition")
+    p_editjob.add_argument("-p", "--prompt", default=None, help="new prompt")
+    p_editjob.add_argument(
+        "-P",
+        "--prompt-file",
+        default=None,
+        metavar="FILE",
+        help="read the new prompt from FILE (mode 0600 or narrower); exclusive with -p",
+    )
+    p_editjob.add_argument("-c", "--cwd", default=None, help="new repo working directory")
+    p_editjob.add_argument("-D", "--deadline", default=None, help="finish-by date (YYYY-MM-DD)")
+    p_editjob.add_argument("-w", "--when", default=None, help="when you intend to start")
+    p_editjob.add_argument(
+        "-d", "--depends-on", default=None, help="job this one waits for (UUID or prefix)"
+    )
+    p_editjob.add_argument("-s", "--start-date", default=None, help="FIXED start date YYYY-MM-DD")
+    p_editjob.add_argument("-j", "--job-type", choices=JOB_TYPES, default=None, help="launch type")
+    p_editjob.add_argument(
+        "-O", "--overseer", choices=NEW_JOB_LLM_CHOICES, default=None, help="session model"
+    )
+    p_editjob.add_argument(
+        "-E", "--executor", choices=NEW_JOB_LLM_CHOICES, default=None, help="subagent model"
+    )
+    p_editjob.add_argument(
+        "-A", "--account", default=None, help='Claude account label ("" = the default)'
+    )
+    p_editjob.add_argument(
+        "-N", "--no-codex", action="store_true", help="ban every Codex integration"
+    )
+    p_editjob.add_argument("-C", "--clear-no-codex", action="store_true", help="allow Codex again")
+    p_editjob.add_argument(
+        "-R", "--clear-prompt", action="store_true", help="drop the prompt (runs the AIM)"
+    )
+    p_editjob.add_argument("-T", "--clear-deadline", action="store_true", help="drop the deadline")
+    p_editjob.add_argument("-W", "--clear-when", action="store_true", help="drop the when-note")
+    p_editjob.add_argument(
+        "-U", "--clear-depends-on", action="store_true", help="drop the dependency"
+    )
+    p_editjob.add_argument(
+        "-S", "--clear-start-date", action="store_true", help="drop the fixed start date"
+    )
+    p_editjob.add_argument(
+        "-J",
+        "--json",
+        action="store_true",
+        help="print one JSON line {version, session_id, changed} and nothing else",
+    )
+    p_editjob.set_defaults(func=cmd_edit_job)
+
     p_newprompt = sub.add_parser(
         "new-prompt",
         help="create a fresh FUTURE-job capture file (prefilled draft) and print its path",
@@ -7905,6 +8112,14 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     )
     p_syncf.add_argument(
         "-v", "--verbose", action="store_true", help="print the per-item detail log"
+    )
+    p_syncf.add_argument(
+        "-x",
+        "--detach",
+        action="store_true",
+        help="one final import, then detach EVERY row from its job file (clears future_file "
+        "and the sync columns, backfills launched_from_draft); refused while future_files "
+        "is on or on any import error; idempotent",
     )
     p_syncf.set_defaults(func=cmd_sync_future)
 

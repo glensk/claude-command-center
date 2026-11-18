@@ -774,6 +774,7 @@ def test_unlaunch_refuses_when_done(
 def test_unlaunch_returns_launched_job_to_future(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
     from command_center.cli import cmd_unlaunch
 
+    env.cfg.future_files = True  # the job-file lifecycle (tp#2266 gate)
     monkeypatch.setattr("command_center.cli.config.load_config", lambda: env.cfg)
     # A launched draft: created, file exported, then promoted + archived (what start-job does).
     sid = str(uuid.uuid4())

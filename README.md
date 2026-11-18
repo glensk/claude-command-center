@@ -45,6 +45,11 @@ visible, hoists directly under it in the TUI and `ccc ls`; every launch path (CL
 the Obsidian `launch: true` toggle) warns before starting a still-blocked job. See
 [Dependent jobs](docs/reference.md#dependent-jobs) for the full behaviour.
 
+`ccc edit-job <id> …` changes a parked job in the store with the `new-job` flags (only the
+given fields change). With `future_files = false` the jobs live in the store only;
+`ccc sync-future --detach` makes that switch once, and `future_pad_enabled = true` keeps
+the single Obsidian capture pad (`new-prompt.md`) working on its own.
+
 A job can also start its interactive `claude` through a configured **launch profile**
 (`ccc new-job -L <label>`, labels from the `claude_launch_profiles` config key, default
 `[]`): one executable per label replaces the bare `claude`, the env carries only

@@ -263,6 +263,8 @@ def write_launch_callout(
     ``future_file`` (or a file that cannot be read) is left alone.
     """
     if not session.future_file:
+        if _PAD_REFUSAL.get(session.session_id):  # a pad launch with no job file
+            _pad_refusal(cfg, session.session_id, error, report)
         return
     path = _abs_path(cfg, session.future_file)
     try:
@@ -271,6 +273,38 @@ def write_launch_callout(
         text = ""
     if text:
         _write_error(path, text, [error], report)
+
+
+# Session ids registered from the pad this pass with no job file (``future_files`` off):
+# a refused launch writes its callout onto the pad, which then is NOT reset.
+_PAD_REFUSAL: dict[str, bool] = {}
+_LAUNCH_LINE_RE = re.compile(r"(?m)^(launch:[ \t]*).*$")
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _pad_refusal(cfg: config.Config, session_id: str, error: str, report: SyncReport) -> None:
+    """Write a refused pad launch onto the pad (``future_files`` off: there is no job file).
+
+    The pad is NOT reset: it keeps the content plus the managed error callout, and its
+    ``launch`` toggle is cleared so the next pass does not register the same job again
+    (the draft row already exists; the callout names its id).
+    """
+    pad = pad_path(cfg)
+    original = _read(pad)
+    untoggled = _LAUNCH_LINE_RE.sub(r"\1false", original, count=1)
+    line = f"{error} (registered as job {session_id}: start it with ccc open-job {session_id})"
+    new_text = upsert_error_block(untoggled, [line])
+    if new_text != original:
+        _atomic_write(pad, new_text)
+    if pad.name not in report.errors:
+        report.errors.append(pad.name)
+    _PAD_REFUSAL[session_id] = False
 
 
 def untrusted_launch_error(session: Session) -> str:
@@ -621,7 +655,7 @@ def archive_file(store: Store, cfg: config.Config, session: object, final_status
     """
     session_id: str = session.session_id  # type: ignore[attr-defined]
     future_file: str | None = session.future_file  # type: ignore[attr-defined]
-    if not future_file:
+    if not future_file or not cfg.future_files:  # row-only with the job files off (tp#2266)
         store.update_fields(session_id, future_missing_since=0)
         return
     src = _abs_path(cfg, future_file)
@@ -684,7 +718,7 @@ def unarchive_file(store: Store, cfg: config.Config, session: object) -> None:
     session_id: str = session.session_id  # type: ignore[attr-defined]
     row = store.get(session_id) or session
     future_file: str | None = row.future_file  # type: ignore[attr-defined]
-    if not future_file:
+    if not future_file or not cfg.future_files:  # never re-create a vault file when off
         store.update_fields(session_id, future_missing_since=0)
         return
     git_base = repos.git_base()
@@ -717,7 +751,7 @@ def unarchive_file(store: Store, cfg: config.Config, session: object) -> None:
     )
 
 
-def delete_file(store: Store, cfg: config.Config, session: object) -> Path:
+def delete_file(store: Store, cfg: config.Config, session: object) -> Path | None:
     """Move a job's file to the ``delete_root`` trash with ``status: deleted``.
 
     The trashed copy keeps the ``<cat>/<repo>`` substructure and full frontmatter
@@ -726,8 +760,10 @@ def delete_file(store: Store, cfg: config.Config, session: object) -> Path:
     it and ``ccc restore-job --file`` can re-register it even if the DB row is
     later pruned. A fileless draft is serialized fresh from its row. Re-points
     ``future_file`` at the trashed copy (the caller flips ``archived``); returns
-    the destination path.
+    the destination path. With ``future_files`` off it writes nothing and returns ``None``.
     """
+    if not cfg.future_files:
+        return None
     session_id: str = session.session_id  # type: ignore[attr-defined]
     future_file: str | None = session.future_file  # type: ignore[attr-defined]
     git_base = repos.git_base()
@@ -855,8 +891,18 @@ def _handle_pad(  # pylint: disable=too-many-arguments,too-many-positional-argum
     if errors:
         _write_error(pad, text, errors, report)
         return
-    _register(store, cfg, padjob, git_base, repo_options, report, source=None)
-    reset_pad(cfg)
+    if cfg.future_files:
+        _register(store, cfg, padjob, git_base, repo_options, report, source=None)
+        reset_pad(cfg)
+        return
+    _PAD_REFUSAL[padjob.session_id] = True
+    try:
+        _register(store, cfg, padjob, git_base, repo_options, report, source=None)
+        refused = not _PAD_REFUSAL.get(padjob.session_id, True)
+    finally:
+        _PAD_REFUSAL.pop(padjob.session_id, None)
+    if not refused:
+        reset_pad(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -905,6 +951,11 @@ def _register(  # pylint: disable=too-many-arguments,too-many-positional-argumen
         config_dir=_account_config_dir(job.account) or routing.pick_job_account()[1],
     )
     _spawn_aim_jobs(cfg, session_id)
+    if not cfg.future_files:  # DB-only registration (the pad with the job files off)
+        report.registered.append(session_id)
+        if launch_requested(job):
+            _consume_launch(store, cfg, session_id, report)
+        return None
     directory = future_root(cfg) / rel_dir_for(job.repo, git_base)
     dest = directory / job_filename(session_id, job.aim)
     session = store.get(session_id)
@@ -1000,12 +1051,19 @@ def _handle_registered(  # pylint: disable=too-many-arguments,too-many-positiona
     git_base: Path,
     repo_options: list[str],
     report: SyncReport,
+    *,
+    export: bool = True,
 ) -> None:
-    """A file that belongs to a known draft row: export a DB change, or import a file edit."""
+    """A file that belongs to a known draft row: export a DB change, or import a file edit.
+
+    *export* False (the ``--detach`` import) leaves an untouched file alone.
+    """
     session = store.get(job.session_id)
     if session is None:  # row vanished mid-run — leave the file for a later pass
         return
     if hsh == (session.future_sync_hash or ""):
+        if not export:
+            return
         # Untouched: regenerate canonical from the DB. If a DB-side change makes it differ,
         # export it; else write nothing (echo suppression). Preserve any conflict note so a
         # DB-driven re-export stays a fixed point.
@@ -1038,37 +1096,44 @@ def _handle_registered(  # pylint: disable=too-many-arguments,too-many-positiona
     _import_file_wins(store, cfg, file, job, session, git_base, repo_options, report)
 
 
-def _import_file_wins(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches
+class JobFieldsError(ValueError):
+    """A draft edit refused before any write (validation errors or a dependency cycle)."""
+
+    def __init__(self, errors: list[str]) -> None:
+        super().__init__("; ".join(errors))
+        self.errors = errors
+
+
+def apply_job_fields(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
     store: Store,
     cfg: config.Config,
-    file: Path,
-    job: ParsedJob,
     session: object,
+    job: ParsedJob,
     git_base: Path,
-    repo_options: list[str],
-    report: SyncReport,
-) -> None:
-    """Apply the file's values to the DB (only where they differ), then rewrite canonical."""
-    session_id: str = session.session_id  # type: ignore[attr-defined]
-    updated_at: int = session.updated_at  # type: ignore[attr-defined]
-    synced_at: int = session.future_synced_at  # type: ignore[attr-defined]
-    conflict = (updated_at - synced_at) > _SYNC_SLOP_MS
-    changed: list[str] = []
+    *,
+    checked: bool = False,
+) -> list[str]:
+    """Write *job*'s file-owned fields onto the draft row *session*; return what changed.
 
-    # Cycle guard (file wins EXCEPT a cyclic dependency): a file edit making this job depend
-    # on itself (directly or transitively) is rejected wholesale — write the managed
-    # sync-error callout and import NOTHING (validate can't see cycles; it needs the DB).
+    The ONE write path for a draft's editable fields, shared by the file-wins import
+    (:func:`_import_file_wins`) and ``ccc edit-job``. Refuses BEFORE any write
+    (:class:`JobFieldsError`) when :func:`future_files.validate` fails or the dependency
+    would close a cycle (*checked* = the caller already ran both). The AIM goes through
+    :meth:`Store.set_aim` (history, ``set_by`` user, score/short-aim spawn), everything
+    else through :meth:`Store.update_fields`, each only where it differs. ``launch_profile``
+    is never written (the store owns the billing route). A repo change updates ``cwd`` and
+    reports ``"repo"``; moving a job file is the caller's business.
+    """
+    session_id: str = session.session_id  # type: ignore[attr-defined]
     new_depends = job.depends_on.strip()
-    cur_depends: str = session.depends_on or ""  # type: ignore[attr-defined]
-    if new_depends != cur_depends and deps.would_create_cycle(store.get, session_id, new_depends):
-        current = file.read_text(encoding="utf-8")
-        _write_error(
-            file,
-            current,
-            [f"depends_on {new_depends} would create a dependency cycle — not imported"],
-            report,
-        )
-        return
+    if not checked:
+        errors = validate(job, git_base)
+        cur_dep: str = session.depends_on or ""  # type: ignore[attr-defined]
+        if new_depends != cur_dep and deps.would_create_cycle(store.get, session_id, new_depends):
+            errors.append(f"depends_on {new_depends} would create a dependency cycle")
+        if errors:
+            raise JobFieldsError(errors)
+    changed: list[str] = []
 
     new_aim = job.aim.strip()
     if new_aim != (session.aim or ""):  # type: ignore[attr-defined]
@@ -1141,11 +1206,49 @@ def _import_file_wins(  # pylint: disable=too-many-arguments,too-many-positional
         store.update_fields(session_id, config_dir=new_account_dir)
         changed.append("account")
 
-    # Repo change is the only edit that moves the file (slug frozen; AIM edits never rename).
     new_cwd = repo_to_cwd(job.repo, git_base)
     cur_cwd: str = session.cwd  # type: ignore[attr-defined]
     if job.repo.strip() and os.path.normpath(str(new_cwd)) != os.path.normpath(cur_cwd):
         store.update_fields(session_id, cwd=str(new_cwd))
+        changed.append("repo")
+    return changed
+
+
+def _import_file_wins(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches
+    store: Store,
+    cfg: config.Config,
+    file: Path,
+    job: ParsedJob,
+    session: object,
+    git_base: Path,
+    repo_options: list[str],
+    report: SyncReport,
+) -> None:
+    """Apply the file's values to the DB (only where they differ), then rewrite canonical."""
+    session_id: str = session.session_id  # type: ignore[attr-defined]
+    updated_at: int = session.updated_at  # type: ignore[attr-defined]
+    synced_at: int = session.future_synced_at  # type: ignore[attr-defined]
+    conflict = (updated_at - synced_at) > _SYNC_SLOP_MS
+
+    # Cycle guard (file wins EXCEPT a cyclic dependency): a file edit making this job depend
+    # on itself (directly or transitively) is rejected wholesale — write the managed
+    # sync-error callout and import NOTHING (validate can't see cycles; it needs the DB).
+    new_depends = job.depends_on.strip()
+    cur_depends: str = session.depends_on or ""  # type: ignore[attr-defined]
+    if new_depends != cur_depends and deps.would_create_cycle(store.get, session_id, new_depends):
+        current = file.read_text(encoding="utf-8")
+        _write_error(
+            file,
+            current,
+            [f"depends_on {new_depends} would create a dependency cycle — not imported"],
+            report,
+        )
+        return
+
+    changed = apply_job_fields(store, cfg, session, job, git_base, checked=True)
+
+    # Repo change is the only edit that moves the file (slug frozen; AIM edits never rename).
+    if "repo" in changed:
         new_dir = future_root(cfg) / rel_dir_for(job.repo, git_base)
         new_dir.mkdir(parents=True, exist_ok=True)
         new_path = new_dir / file.name
@@ -1153,7 +1256,6 @@ def _import_file_wins(  # pylint: disable=too-many-arguments,too-many-positional
             os.replace(file, new_path)
             file = new_path
         store.update_fields(session_id, future_file=_vault_relpath(cfg, file))
-        changed.append("repo")
 
     fresh = store.get(session_id)
     assert fresh is not None
@@ -1204,6 +1306,10 @@ def _process_file(  # pylint: disable=too-many-arguments,too-many-positional-arg
     hsh = content_hash(text)
     sid = job.session_id.strip()
 
+    if ctx.import_only:
+        _process_file_import_only(store, cfg, file, text, hsh, job, ctx, report)
+        return
+
     if not _is_uuid(sid):
         if job.status == "ready":
             _register(store, cfg, job, ctx.git_base, ctx.repo_options, report, source=file)
@@ -1225,12 +1331,30 @@ def _process_file(  # pylint: disable=too-many-arguments,too-many-positional-arg
     if row is not None:
         if canon is None or _same(canon, file):
             _handle_registered(
-                store, cfg, file, text, hsh, job, ctx.git_base, ctx.repo_options, report
+                store,
+                cfg,
+                file,
+                text,
+                hsh,
+                job,
+                ctx.git_base,
+                ctx.repo_options,
+                report,
+                export=not ctx.import_only,
             )
         else:  # canonical path is missing → this file carries the UUID (rename detected here)
             store.update_fields(sid, future_file=_vault_relpath(cfg, file), future_missing_since=0)
             _handle_registered(
-                store, cfg, file, text, hsh, job, ctx.git_base, ctx.repo_options, report
+                store,
+                cfg,
+                file,
+                text,
+                hsh,
+                job,
+                ctx.git_base,
+                ctx.repo_options,
+                report,
+                export=not ctx.import_only,
             )
         return
 
@@ -1239,6 +1363,39 @@ def _process_file(  # pylint: disable=too-many-arguments,too-many-positional-arg
         _register(store, cfg, job, ctx.git_base, ctx.repo_options, report, source=file)
     else:
         ctx.sidecar[str(file)] = hsh
+
+
+def _process_file_import_only(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    store: Store,
+    cfg: config.Config,
+    file: Path,
+    text: str,
+    hsh: str,
+    job: ParsedJob,
+    ctx: _Context,
+    report: SyncReport,
+) -> None:
+    """The ``--detach`` import: only a draft's LINKED file is imported (file wins).
+
+    A file whose row is no longer linked (``future_file`` NULL — a re-run after a detach)
+    is never re-linked or imported: its content is stale against later ``ccc edit-job``
+    writes. A ready file that would register a NEW job is refused as an error (a DB-only
+    registration would leave the file behind and register it again on the next run);
+    duplicates and plain drafts are left alone.
+    """
+    sid = job.session_id.strip()
+    row = ctx.db_by_id.get(sid) if _is_uuid(sid) else None
+    canon = ctx.canonical_abs.get(sid) if row is not None else None
+    if row is not None and canon is not None and _same(canon, file):
+        _handle_registered(
+            store, cfg, file, text, hsh, job, ctx.git_base, ctx.repo_options, report, export=False
+        )
+        return
+    if job.status == "ready" and (not _is_uuid(sid) or store.get(sid) is None):
+        report.errors.append(
+            f"{file}: unregistered ready job — register it (future_files on, sync-future) "
+            "or clear its ready status before --detach"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1317,7 +1474,7 @@ def _db_side(store: Store, cfg: config.Config, ctx: _Context, report: SyncReport
 # entry point
 # ---------------------------------------------------------------------------
 @dataclass
-class _Context:
+class _Context:  # pylint: disable=too-many-instance-attributes  # one per-run bag
     """Shared per-run lookups threaded through the handlers."""
 
     git_base: Path
@@ -1327,78 +1484,170 @@ class _Context:
     scanned_uuids: dict[str, list[Path]]
     taken: set[str]
     sidecar: dict[str, str]
+    import_only: bool = False
 
 
-def run_sync(  # pylint: disable=too-many-locals
-    store: Store, cfg: config.Config, only_file: Path | None = None
-) -> SyncReport:
+def pad_on(cfg: config.Config) -> bool:
+    """Whether the capture pad is served: ``future_pad_enabled``, or the job files (which
+    always included the pad). The watcher/daemon/doctor gates read the same formula."""
+    return bool(cfg.future_files or cfg.future_pad_enabled)
+
+
+def run_sync(store: Store, cfg: config.Config, only_file: Path | None = None) -> SyncReport:
     """Reconcile the FUTURE-job draft rows with their Obsidian files (idempotent, flock-guarded).
 
     *only_file* runs a targeted single-file import (Phase 3a's ``start-job`` uses it to pick
     up last-minute edits) — the pad and the DB-side bootstrap/grace passes are skipped. The
     flock singleton makes a concurrent invocation return an empty report immediately.
+
+    Gated for EVERY entry point (tp#2266): the per-job half (scan, import, export, the
+    ``_bootstrap_export`` of fileless drafts, the delete-grace archive) runs only with
+    ``future_files`` on; the pad half only when :func:`pad_on`. Both off = an empty report.
     """
     report = SyncReport()
+    if not cfg.future_files and not pad_on(cfg):
+        return report
     lock = _acquire_lock()
     if lock is None:  # another sync run holds the singleton — leave it to that one
         return report
     try:
-        git_base = repos.git_base()
-        repo_options = _repo_options()
-        sidecar = _load_sidecar()
+        return _run_locked(store, cfg, only_file, report, import_only=False)
+    finally:
+        _release_lock(lock)
 
-        sessions = store.list_sessions()
-        db_by_id: dict[str, object] = {s.session_id: s for s in sessions if s.draft}
-        canonical_abs = {
-            sid: _abs_path(cfg, s.future_file)  # type: ignore[attr-defined]
-            for sid, s in db_by_id.items()
-            if s.future_file  # type: ignore[attr-defined]
-        }
-        taken = {display_hash(s.session_id) for s in sessions}
 
-        if only_file is not None:
-            files = [only_file] if only_file.exists() else []
-        else:
-            files = _scan_files(cfg)
+def _run_locked(  # pylint: disable=too-many-locals
+    store: Store,
+    cfg: config.Config,
+    only_file: Path | None,
+    report: SyncReport,
+    *,
+    import_only: bool,
+) -> SyncReport:
+    """One sync pass under the held flock (see :func:`run_sync` / :func:`detach`)."""
+    jobs_on = bool(cfg.future_files) or import_only
+    git_base = repos.git_base()
+    repo_options = _repo_options()
+    sidecar = _load_sidecar()
 
-        parsed: list[tuple[Path, str, ParsedJob]] = []
-        for path in files:
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            parsed.append((path, text, parse_job_file(text)))
+    sessions = store.list_sessions()
+    db_by_id: dict[str, object] = {s.session_id: s for s in sessions if s.draft}
+    canonical_abs = {
+        sid: _abs_path(cfg, s.future_file)  # type: ignore[attr-defined]
+        for sid, s in db_by_id.items()
+        if s.future_file  # type: ignore[attr-defined]
+    }
+    taken = {display_hash(s.session_id) for s in sessions}
 
-        # Migrate any legacy ``<hash>-<slug>.md`` files to ``<slug>-<hash>.md`` in place
-        # (mutates *parsed* + canonical_abs + DB future_file) before classification.
-        _migrate_legacy_names(store, cfg, parsed, db_by_id, canonical_abs, report)
+    if not jobs_on:
+        files = []
+    elif only_file is not None:
+        files = [only_file] if only_file.exists() else []
+    else:
+        files = _scan_files(cfg)
 
-        scanned_uuids: dict[str, list[Path]] = {}
-        for path, _text, job in parsed:
-            sid = job.session_id.strip()
-            if _is_uuid(sid):
-                scanned_uuids.setdefault(sid, []).append(path)
-                taken.add(display_hash(sid))
+    parsed: list[tuple[Path, str, ParsedJob]] = []
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        parsed.append((path, text, parse_job_file(text)))
 
-        ctx = _Context(
-            git_base=git_base,
-            repo_options=repo_options,
-            db_by_id=db_by_id,
-            canonical_abs=canonical_abs,
-            scanned_uuids=scanned_uuids,
-            taken=taken,
-            sidecar=sidecar,
-        )
+    # Migrate any legacy ``<hash>-<slug>.md`` files to ``<slug>-<hash>.md`` in place
+    # (mutates *parsed* + canonical_abs + DB future_file) before classification.
+    _migrate_legacy_names(store, cfg, parsed, db_by_id, canonical_abs, report)
 
-        for path, text, job in parsed:
-            _process_file(store, cfg, path, text, job, ctx, report)
+    scanned_uuids: dict[str, list[Path]] = {}
+    for path, _text, job in parsed:
+        sid = job.session_id.strip()
+        if _is_uuid(sid):
+            scanned_uuids.setdefault(sid, []).append(path)
+            taken.add(display_hash(sid))
 
-        if only_file is None:
+    ctx = _Context(
+        git_base=git_base,
+        repo_options=repo_options,
+        db_by_id=db_by_id,
+        canonical_abs=canonical_abs,
+        scanned_uuids=scanned_uuids,
+        taken=taken,
+        sidecar=sidecar,
+        import_only=import_only,
+    )
+
+    for path, text, job in parsed:
+        _process_file(store, cfg, path, text, job, ctx, report)
+
+    if only_file is None and not import_only:
+        if pad_on(cfg):
             _handle_pad(store, cfg, git_base, repo_options, taken, report)
+        if cfg.future_files:
             _db_side(store, cfg, ctx, report)
 
-        _prune_sidecar(sidecar)
-        _save_sidecar(sidecar)
-        return report
+    _prune_sidecar(sidecar)
+    _save_sidecar(sidecar)
+    return report
+
+
+class DetachError(RuntimeError):
+    """``sync-future --detach`` refused (switch still on, lock held, or a sync error)."""
+
+
+def archived_job_files(cfg: config.Config) -> dict[str, Path]:
+    """``{session_id: path}`` of every job file under ``future_root/_archive/`` (one scan)."""
+    archive_dir = future_root(cfg) / "_archive"
+    out: dict[str, Path] = {}
+    if not archive_dir.is_dir():
+        return out
+    for path in sorted(archive_dir.glob("*.md")):
+        sid = parse_job_file(_read(path)).session_id.strip()
+        if _is_uuid(sid):
+            out.setdefault(sid, path)
+    return out
+
+
+def detach(store: Store, cfg: config.Config) -> int:
+    """Detach every row from its job file (Design 8, tp#2266); return the cleared count.
+
+    Refuses (:class:`DetachError`) while ``future_files`` is on — any later ``run_sync``
+    would re-export the detached drafts. Under the sync flock: one final file-wins import
+    (import only, no export, no pad, no grace archive), refused on any reported error;
+    then, in ONE transaction, backfills ``launched_from_draft`` on every non-draft row
+    whose job file or ``_archive/`` copy exists, and clears ``future_file``,
+    ``future_sync_hash``, ``future_synced_at`` and ``future_missing_since`` on ALL rows
+    (drafts, launched and archived). Idempotent: a second run clears 0.
+    """
+    if cfg.future_files:
+        raise DetachError("future_files is on — set future_files = false first")
+    lock = _acquire_lock()
+    if lock is None:
+        raise DetachError("another sync-future run holds the lock — retry")
+    try:
+        report = _run_locked(store, cfg, None, SyncReport(), import_only=True)
+        if report.errors:
+            raise DetachError(
+                f"the final import reported {len(report.errors)} error(s): "
+                f"{', '.join(report.errors)} — fix them first"
+            )
+        archived = archived_job_files(cfg)
+        conn = store.conn
+        rows = conn.execute("SELECT session_id, draft, future_file FROM sessions").fetchall()
+        provenance = [
+            (str(sid),)
+            for sid, draft, fpath in rows
+            if not draft and ((fpath and _abs_path(cfg, fpath).exists()) or sid in archived)
+        ]
+        with conn:
+            conn.executemany(
+                "UPDATE sessions SET launched_from_draft = 1 WHERE session_id = ?", provenance
+            )
+            cur = conn.execute(
+                "UPDATE sessions SET future_file = NULL, future_sync_hash = NULL, "
+                "future_synced_at = 0, future_missing_since = 0 WHERE future_file IS NOT NULL "
+                "OR future_sync_hash IS NOT NULL OR future_synced_at != 0 "
+                "OR future_missing_since != 0"
+            )
+        return cur.rowcount
     finally:
         _release_lock(lock)

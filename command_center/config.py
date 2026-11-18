@@ -444,6 +444,9 @@ DEFAULTS: dict[str, object] = {
     "future_dir": "~/obsidian/01-llm/ccc-tasks/future",  # root of the future-job files
     "delete_dir": "~/obsidian/01-llm/ccc-tasks/delete",  # trash for deleted jobs (restorable)
     "future_pad": "~/obsidian/01-llm/ccc-tasks/new-prompt.md",  # persistent manual capture pad
+    # The capture pad alone (INERT: off): register + launch from ``future_pad`` without the
+    # per-job FUTURE files (``future_files``). Either switch keeps the sync watcher.
+    "future_pad_enabled": False,
     "future_delete_grace_sec": 600,  # missing job file grace before its draft is archived
     "mirror_running": False,  # export-only markdown mirror of RUNNING sessions (INERT: off)
     "mirror_done": False,  # export-only markdown mirror of DONE sessions (INERT: off)
@@ -538,6 +541,7 @@ DEPRECATED_LLM_CONFIG_KEYS = frozenset(
 # be False in DEFAULTS (a test enforces both the membership and the values).
 INERT_DEFAULT_KEYS: tuple[str, ...] = (
     "future_files",  # no vault writes (FUTURE-job markdown mirror)
+    "future_pad_enabled",  # no capture-pad reads/writes (the one inbound vault file)
     "mirror_running",  # no vault writes (RUNNING session mirror)
     "mirror_done",  # no vault writes (DONE session mirror)
     "mirror_sessions",  # no vault writes (full-conversation mirror)
@@ -1331,6 +1335,7 @@ class Config:
     future_dir: str = "~/obsidian/01-llm/ccc-tasks/future"
     delete_dir: str = "~/obsidian/01-llm/ccc-tasks/delete"
     future_pad: str = "~/obsidian/01-llm/ccc-tasks/new-prompt.md"
+    future_pad_enabled: bool = False
     future_delete_grace_sec: int = 600
     mirror_running: bool = False
     mirror_done: bool = False
@@ -1428,6 +1433,21 @@ def launch_secret_check_armed(cfg: Config) -> bool:
         return True
     mirrors_on = cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions
     return bool(mirrors_on) and not cfg.mirror_allow_unscrubbed
+
+
+def vault_features_on(cfg: Config) -> bool:
+    """Whether any vault surface is on: the job files, the capture pad alone or a mirror.
+
+    The systemd watcher units and the doctor's vault section read this one formula
+    (tp#2266: ``future_pad_enabled`` alone keeps the pad's trigger).
+    """
+    return bool(
+        cfg.future_files
+        or cfg.future_pad_enabled
+        or cfg.mirror_running
+        or cfg.mirror_done
+        or cfg.mirror_sessions
+    )
 
 
 def load_config() -> Config:

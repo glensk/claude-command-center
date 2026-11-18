@@ -250,7 +250,7 @@ StandardError=append:{_literal_path(log_path)}
 
 
 def _vault_features_on(cfg: config.Config) -> bool:
-    return cfg.future_files or cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions
+    return config.vault_features_on(cfg)
 
 
 def is_installed(cfg: config.Config | None = None) -> bool:

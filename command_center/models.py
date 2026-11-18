@@ -725,6 +725,8 @@ class Session:
     future_sync_hash: str | None = None
     future_synced_at: int = 0
     future_missing_since: int = 0
+    # Launched from a FUTURE draft (start-job claim / detach backfill); unlaunch keys on it.
+    launched_from_draft: bool = False
     archived: bool = False
     created_at: int = 0
     updated_at: int = 0

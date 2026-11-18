@@ -71,7 +71,7 @@ GROUP_A_CHECKERS: tuple[str, ...] = (
     "short_aim",
 )
 #: Group B1 — the editable FUTURE-job files (no verbatim transcript content leaves ccc).
-GROUP_B_FUTURE: tuple[str, ...] = ("future_files",)
+GROUP_B_FUTURE: tuple[str, ...] = ("future_files", "future_pad_enabled")
 #: Group B2 — the export-only mirrors. They embed transcripts VERBATIM, so the wizard only
 #: offers them when a credential scrubber resolves (see :func:`scrubber_status`).
 GROUP_B_MIRRORS: tuple[str, ...] = ("mirror_running", "mirror_done", "mirror_sessions")

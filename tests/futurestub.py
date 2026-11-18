@@ -51,7 +51,7 @@ def future_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **cfg_extra: Any
         future_delete_grace_sec=600,
         aim_score_on_set=False,
         short_aim=False,
-        **cfg_extra,
+        **{"future_files": True, "future_pad_enabled": True, **cfg_extra},
     )
     return FutureEnv(cfg, git_base, vault, future_dir, pad)
 

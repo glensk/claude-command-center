@@ -37,6 +37,7 @@ _EXPECTED_INERT_KEYS = {  # alphabetical, unlike config's grouped tuple
     "copilot_usage",
     "drift_check",
     "future_files",
+    "future_pad_enabled",
     "grade_on_turn",
     "handoff_facts",
     "handoff_hooks",
