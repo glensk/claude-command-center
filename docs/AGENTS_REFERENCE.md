@@ -744,7 +744,7 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
 - **Onboarding layer** — `wizard.py` (`ccc init`) is the first-run flow (env detection,
   consent checklist, minimal `config.toml`, then the installers, incl. `install-shell`).
   `install_commands.py` (`ccc install-commands`) copies the slash commands; `obsidian.py`
-  (`ccc obsidian-setup`) seeds the vault folders, dashboards and shellcommands entries;
+  (`ccc obsidian-setup`) seeds the capture pad, mirror folders and dashboards;
   `shell_install.py` (`ccc install-shell`) writes the opt-in shell rc block (AIM-at-startup
   wrapper + cross-terminal OSC tab badges).
 - **Platform seam** — `service.py` is the ONE place that decides launchd (macOS,

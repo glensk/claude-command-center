@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-"""``ccc obsidian-setup`` — seed the vault's task folders, dashboards & buttons.
+"""``ccc obsidian-setup`` — seed the vault's capture pad, mirror folders & dashboards.
 
-A default (no-flag) run is **content-only and offline**: it creates the task-folder
-structure derived from config (``future_dir`` / ``delete_dir`` / ``running_dir`` /
-``done_dir`` / ``sessions_dir`` + the capture pad), renders the four generified Obsidian
+A default (no-flag) run is **content-only and offline**: it creates the mirror folders
+derived from config (``running_dir`` / ``done_dir`` / ``sessions_dir``), seeds the capture
+pad when it is served (:func:`futuresync.pad_on`), and renders the generified Obsidian
 dashboards from the templates under ``assets/obsidian/`` (parameterising the queried
-folder paths + the absolute ``ccc`` binary from config, not hardcoded values), and merges
-the four obsidian-shellcommands entries the in-note job buttons fire. Every generated
-dashboard carries a ``ccc_generated: true`` frontmatter marker so reruns / ``--uninstall``
-only ever overwrite or remove files ccc itself wrote. All writes are atomic + backed up;
-``--dry-run`` writes nothing.
+folder paths + the absolute ``ccc`` binary from config, not hardcoded values). Future jobs
+live in ccc's store (tp#2266): setup seeds no ``future/`` / ``delete/`` folders, no
+``future.md`` / ``delete.md`` dashboards and no job-button shellcommands — a rerun strips
+the four retired ccc entries from an existing obsidian-shellcommands ``data.json``. Every
+generated dashboard carries a ``ccc_generated: true`` frontmatter marker so reruns /
+``--uninstall`` only ever overwrite or remove files ccc itself wrote. All writes are
+atomic + backed up; ``--dry-run`` writes nothing.
 
 ``--install-plugins`` is the ONLY networked path: a consent-gated bootstrap that downloads
 the three pinned community plugins (manifest ``assets/obsidian/plugins.json``), verifies
 each file's sha256 (a mismatch aborts + rolls back), writes ``plugins/<id>/`` and enables
 them in ``community-plugins.json``.
 
-Pure helpers (``render_dashboard`` / ``merge_shellcommands`` / ``build_shellcommand_entries``
-/ ``load_plugins_manifest``) carry the logic and are unit-tested; :func:`run_setup` wires
-them to the filesystem.
+Pure helpers (``render_dashboard`` / ``strip_shellcommands`` / ``load_plugins_manifest``)
+carry the logic and are unit-tested; :func:`run_setup` wires them to the filesystem.
 """
 
 from __future__ import annotations
@@ -58,18 +59,16 @@ MARKER_KEY = "ccc_generated"
 #: obsidian-shellcommands command-id prefix (``<plugin>:shell-command-<entry-id>``).
 _SHELLCMD_PREFIX = "obsidian-shellcommands:shell-command-"
 
-#: The four job-button shell commands, in the order the buttons appear. Each is
-#: ``(obsidian-command-id, alias, ccc-subcommand)``; the entry id in data.json is the
-#: command id with the plugin prefix stripped.
-_SHELLCMD_SPECS: tuple[tuple[str, str, str], ...] = (
-    (_START_JOB_COMMAND_ID, "ccc: start job from file", "open-job"),
-    (_DONE_JOB_COMMAND_ID, "ccc: mark job done from file", "done-job"),
-    (_DELETE_JOB_COMMAND_ID, "ccc: delete job from file", "delete-job"),
-    (_RESTORE_JOB_COMMAND_ID, "ccc: restore job from file", "restore-job"),
+#: The obsidian command ids of the four RETIRED job-button shell commands (open-job /
+#: done-job / delete-job / restore-job ``--file``; tp#2266). Setup no longer merges them;
+#: it strips them from an existing ``data.json`` (the entry id is the command id with the
+#: plugin prefix stripped).
+_RETIRED_SHELLCMD_IDS: tuple[str, ...] = (
+    _START_JOB_COMMAND_ID,
+    _DONE_JOB_COMMAND_ID,
+    _DELETE_JOB_COMMAND_ID,
+    _RESTORE_JOB_COMMAND_ID,
 )
-
-#: shellcommands settings_version we stamp on a data.json we create from scratch.
-_SHELLCMD_SETTINGS_VERSION = "0.23.0"
 
 #: The three community plugins obsidian-setup depends on (ids match community-plugins.json).
 REQUIRED_PLUGINS: tuple[str, ...] = (
@@ -135,28 +134,13 @@ def _vault_rel(path: Path, vault: Path) -> str:
         return path.expanduser().as_posix()
 
 
-def _repo_tree_rel(cfg: config.Config, vault: Path) -> str:
-    """Vault-relative repo tree (``{{REPO_TREE}}``) for the future dashboard's cascade.
-
-    The future dashboard scans ``<repo-tree>/<cat>`` vault folders to offer repo options.
-    Resolution mirrors ccc's repo_root: config ``repo_root`` → ``$GIT_BASE`` → a harmless
-    ``repos`` placeholder (the cascade then finds nothing and degrades to "(no repos)").
-    """
-    root = cfg.repo_root or os.environ.get("GIT_BASE") or ""
-    if not root:
-        return "repos"
-    path = Path(root).expanduser()
-    try:
-        return path.resolve().relative_to(vault.resolve()).as_posix()
-    except (ValueError, OSError):
-        return path.name or "repos"
-
-
 def task_dirs(cfg: config.Config) -> list[Path]:
-    """The task folders obsidian-setup creates (expanded)."""
+    """The mirror folders obsidian-setup creates (expanded).
+
+    No ``future_dir`` / ``delete_dir``: future jobs live in ccc's store (tp#2266); the
+    capture pad is seeded on its own (see :func:`_setup_folders`).
+    """
     return [
-        Path(cfg.future_dir).expanduser(),
-        Path(cfg.delete_dir).expanduser(),
         Path(cfg.running_dir).expanduser(),
         Path(cfg.done_dir).expanduser(),
         Path(cfg.sessions_dir).expanduser(),
@@ -178,10 +162,7 @@ def render_dashboard(template_name: str, cfg: config.Config, vault: Path, ccc: s
     text = _asset_text("obsidian", template_name)
     tokens = {
         "{{CCC_BIN}}": ccc,
-        "{{FUTURE_FOLDER}}": _vault_rel(Path(cfg.future_dir).expanduser(), vault),
         "{{RUNNING_FOLDER}}": _vault_rel(Path(cfg.running_dir).expanduser(), vault),
-        "{{DELETE_FOLDER}}": _vault_rel(Path(cfg.delete_dir).expanduser(), vault),
-        "{{REPO_TREE}}": _repo_tree_rel(cfg, vault),
     }
     for token, value in tokens.items():
         text = text.replace(token, value)
@@ -189,20 +170,15 @@ def render_dashboard(template_name: str, cfg: config.Config, vault: Path, ccc: s
 
 
 def dashboard_targets(cfg: config.Config) -> list[tuple[str, Path]]:
-    """``(template_name, destination_path)`` for each of the four dashboards.
+    """``(template_name, destination_path)`` for each dashboard (running + parked).
 
-    The three top dashboards live one level above their queried folder (so they never
-    mirror themselves); the delete dashboard sits inside the trash folder, matching the
-    reference vault layout.
+    Both live one level above their queried folder, so they never mirror themselves.
+    The ``future.md`` / ``delete.md`` job dashboards are retired (tp#2266).
     """
-    future_dir = Path(cfg.future_dir).expanduser()
     running_dir = Path(cfg.running_dir).expanduser()
-    delete_dir = Path(cfg.delete_dir).expanduser()
     return [
-        ("future.md.tmpl", future_dir.parent / "future.md"),
         ("running.md.tmpl", running_dir.parent / "running.md"),
         ("parked.md.tmpl", running_dir.parent / "parked.md"),
-        ("delete.md.tmpl", delete_dir / "delete.md"),
     ]
 
 
@@ -220,7 +196,7 @@ def has_marker(text: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# obsidian-shellcommands data.json merge
+# obsidian-shellcommands data.json: strip the retired job-button entries
 # --------------------------------------------------------------------------- #
 def _entry_id(command_id: str) -> str:
     """The data.json entry ``id`` for an obsidian command id (strip the plugin prefix)."""
@@ -231,68 +207,25 @@ def _entry_id(command_id: str) -> str:
     )
 
 
-def _shellcommand_entry(entry_id: str, alias: str, command: str) -> dict:
-    """One obsidian-shellcommands entry matching the plugin's real on-disk schema."""
-    return {
-        "id": entry_id,
-        "platform_specific_commands": {"default": command},
-        "alias": alias,
-        "confirm_execution": False,
-        "ignore_error_codes": [],
-        "input_contents": {"stdin": ""},
-        "events": {},
-        "output_handlers": {
-            "stdout": {
-                "handler": {"handler": "ignore", "convert_ansi_code": True},
-                "convert_ansi_code": True,
-            },
-            "stderr": {
-                "handler": {"handler": "notification", "convert_ansi_code": True},
-                "convert_ansi_code": True,
-            },
-        },
-        "shells": {},
-        "icon": None,
-        "output_wrappers": {"stdout": None, "stderr": None},
-        "output_channel_order": "stdout-first",
-        "output_handling_mode": "buffered",
-        "execution_notification_mode": None,
-        "debounce": None,
-        "command_palette_availability": "enabled",
-        "preactions": [],
-        "variable_default_values": {},
-    }
+def retired_entry_ids() -> set[str]:
+    """The data.json entry ids of the four retired ccc job-button shell commands."""
+    return {_entry_id(cmd_id) for cmd_id in _RETIRED_SHELLCMD_IDS}
 
 
-def build_shellcommand_entries(ccc: str) -> list[dict]:
-    """The four ccc job-button shellcommands entries (one per :data:`_SHELLCMD_SPECS`)."""
-    entries = []
-    for command_id, alias, sub in _SHELLCMD_SPECS:
-        command = f"{ccc} {sub} --file {{{{file_path:absolute}}}}"
-        entries.append(_shellcommand_entry(_entry_id(command_id), alias, command))
-    return entries
+def strip_shellcommands(data: dict) -> dict:
+    """*data* without ccc's retired job-button entries; foreign entries are preserved.
 
-
-def _our_entry_ids() -> set[str]:
-    return {_entry_id(cmd_id) for cmd_id, _, _ in _SHELLCMD_SPECS}
-
-
-def merge_shellcommands(data: dict, ccc: str, *, uninstall: bool = False) -> dict:
-    """Merge (or strip) ccc's four shellcommands entries; foreign entries are preserved.
-
-    Idempotent: ccc's entries are matched by their fixed ``id`` and replaced in place; a
-    rerun never duplicates them and never touches any other entry.
+    Idempotent and otherwise lossless: only entries whose fixed ``id`` is one of
+    :func:`retired_entry_ids` are dropped, every other key and entry is kept as is.
     """
     result = copy.deepcopy(data) if isinstance(data, dict) else {}
     existing = result.get("shell_commands")
     if not isinstance(existing, list):
-        existing = []
-    ours = _our_entry_ids()
-    kept = [e for e in existing if not (isinstance(e, dict) and e.get("id") in ours)]
-    if not uninstall:
-        kept.extend(build_shellcommand_entries(ccc))
-    result["shell_commands"] = kept
-    result.setdefault("settings_version", _SHELLCMD_SETTINGS_VERSION)
+        return result
+    ours = retired_entry_ids()
+    result["shell_commands"] = [
+        e for e in existing if not (isinstance(e, dict) and e.get("id") in ours)
+    ]
     return result
 
 
@@ -328,6 +261,10 @@ def _setup_folders(cfg: config.Config, *, dry_run: bool) -> None:
         print(f"  {'exists' if exists else 'create'}  {path}")
         if not dry_run and not exists:
             path.mkdir(parents=True, exist_ok=True)
+    # The capture pad is the one future-job surface left in the vault (tp#2266): seeded
+    # only when it is served (future_files OR future_pad_enabled — futuresync.pad_on).
+    if not futuresync.pad_on(cfg):
+        return
     pad = Path(cfg.future_pad).expanduser()
     print(f"  {'exists' if pad.exists() else 'create'}  {pad}  (capture pad)")
     if not dry_run and not pad.exists():
@@ -371,40 +308,29 @@ def _uninstall_dashboards(cfg: config.Config, *, dry_run: bool) -> None:
             print(f"  keep    {dest} (not ccc-generated)")
 
 
-def _setup_shellcommands(
-    vault: Path, ccc: str, *, dry_run: bool, uninstall: bool, allow_create: bool
-) -> bool:
-    """Merge/strip our shellcommands entries. Returns whether ``.obsidian`` was touched."""
-    plugin_dir = _shellcommands_dir(vault)
-    data_path = plugin_dir / "data.json"
-    if not plugin_dir.is_dir() and not allow_create:
-        if not uninstall:
-            print("shellcommands:")
-            print(
-                "  obsidian-shellcommands is not installed — the in-note job buttons need it.\n"
-                "  install it (Settings → Community plugins) then rerun, or run\n"
-                "  `ccc obsidian-setup --install-plugins` to bootstrap it automatically."
-            )
-        return False
+def _strip_retired_shellcommands(vault: Path, *, dry_run: bool) -> bool:
+    """Drop ccc's retired job-button entries from an existing obsidian-shellcommands
+    ``data.json`` (backed up). Creates nothing; a missing, unreadable or already-clean
+    file is left alone. Returns whether ``.obsidian`` was touched."""
+    data_path = _shellcommands_dir(vault) / "data.json"
     raw = _read(data_path)
-    try:
-        data = json.loads(raw) if raw else {}
-    except (json.JSONDecodeError, ValueError):
-        data = {}
-    merged = merge_shellcommands(data, ccc, uninstall=uninstall)
-    new_text = json.dumps(merged, indent=2, ensure_ascii=False) + "\n"
-    print("shellcommands:")
-    if raw is not None and json.dumps(json.loads(raw), sort_keys=True) == json.dumps(
-        merged, sort_keys=True
-    ):
-        print(f"  ok      {data_path} (up to date)")
+    if not raw:
         return False
-    verb = "strip" if uninstall else ("merge" if raw is not None else "create")
-    print(f"  {verb}  {data_path} ({len(_SHELLCMD_SPECS)} ccc entries)")
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    stripped = strip_shellcommands(data)
+    if stripped == data:
+        return False
+    dropped = len(data.get("shell_commands", [])) - len(stripped.get("shell_commands", []))
+    print("shellcommands:")
+    print(f"  strip   {data_path} ({dropped} retired ccc job-button entries; backed up)")
     if not dry_run:
-        if raw is not None:
-            _backup(data_path)
-        _atomic_write(data_path, new_text)
+        _backup(data_path)
+        _atomic_write(data_path, json.dumps(stripped, indent=2, ensure_ascii=False) + "\n")
     return True
 
 
@@ -416,7 +342,7 @@ def run_setup(
     install_plugins: bool = False,
     yes: bool = False,
 ) -> int:
-    """Seed (or tear down) the vault's ccc task folders, dashboards and job buttons."""
+    """Seed (or tear down) the vault's ccc mirror folders, capture pad and dashboards."""
     cfg = config.load_config()
     vault = resolve_vault(cfg, root)
     if not vault.is_dir():
@@ -433,15 +359,11 @@ def run_setup(
 
     if uninstall:
         _uninstall_dashboards(cfg, dry_run=dry_run)
-        if _setup_shellcommands(vault, ccc, dry_run=dry_run, uninstall=True, allow_create=False):
-            touched_obsidian = True
     else:
         _setup_folders(cfg, dry_run=dry_run)
         _setup_dashboards(cfg, vault, ccc, dry_run=dry_run)
-        if _setup_shellcommands(
-            vault, ccc, dry_run=dry_run, uninstall=False, allow_create=install_plugins
-        ):
-            touched_obsidian = True
+    if _strip_retired_shellcommands(vault, dry_run=dry_run):
+        touched_obsidian = True
 
     if touched_obsidian and not dry_run:
         print("\nNote: reload Obsidian (Cmd+R) so the plugins re-read their config.")

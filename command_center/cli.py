@@ -8290,13 +8290,14 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
 
     p_obs = sub.add_parser(
         "obsidian-setup",
-        help="seed the vault's task folders, dashboards & job-button shellcommands",
+        help="seed the vault's capture pad, mirror folders & dashboards",
         description=(
-            "Create the ccc task-folder structure (future/delete/running/done/sessions + the "
-            "capture pad) derived from config, render the four generified Obsidian dashboards "
-            "from templates (folder paths + the abs ccc binary come from config, not "
-            "hardcoded), and merge the obsidian-shellcommands entries the in-note job buttons "
-            "fire. Default run is content-only and offline; generated dashboards carry a "
+            "Seed the capture pad (when future_pad_enabled or future_files is on), create the "
+            "mirror folders (running/done/sessions) derived from config, render the generified "
+            "running/parked Obsidian dashboards from templates (folder paths + the abs ccc "
+            "binary come from config, not hardcoded), and strip the retired ccc job-button "
+            "entries from an existing obsidian-shellcommands data.json (future jobs live in "
+            "ccc's store). Default run is content-only and offline; generated dashboards carry a "
             "ccc_generated marker so reruns/-u only touch ccc's own files. "
             "--install-plugins is the only networked path (consent-gated, sha256-verified)."
         ),

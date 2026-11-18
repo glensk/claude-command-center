@@ -230,12 +230,11 @@ def test_account_switch_chords_are_tp_and_tw() -> None:
     assert binds.isdisjoint({"tp", "tw"}) and aliases.isdisjoint({"tp", "tw"})
 
 
-def test_oo_chord_is_open_obsidian() -> None:
-    cmd = commands.by_action("open_obsidian")
-    assert cmd.chord == ("o", "o")
-    assert cmd.key == "oo"
-    assert cmd.section == commands.PER_SESSION
-    assert cmd.footer_pos is not None  # visible in the footer hint line
+def test_oo_chord_is_retired() -> None:
+    """tp#2266 B12: no `oo` open-in-Obsidian chord; `o` leads only `os`."""
+    assert not any(c.action == "open_obsidian" for c in commands.COMMANDS)
+    assert not any(c.key == "oo" or c.chord == ("o", "o") for c in commands.COMMANDS)
+    assert [c.key for c in commands.chords_for_leader("o")] == ["os"]
 
 
 def test_undo_is_bound_and_in_footer() -> None:

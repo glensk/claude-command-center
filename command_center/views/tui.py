@@ -37,7 +37,6 @@ from typing import Any, Protocol
 
 from rich.cells import cell_len
 from rich.color import Color
-from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
@@ -618,20 +617,13 @@ def _draft_id_cell(session: Session) -> Text:
     free-text "when I intend to start" note now rides the next-step (tags/notes)
     column (see :func:`_draft_next_cell`). A SCHEDULED draft (fixed ``start_date``)
     still has its date span the importance + ver cells at the row's start, so this
-    column stays a narrow hash throughout. Once the draft has synced to a
-    future-job file (``session.future_file`` set), the hash span carries a Rich
-    ``Style(link=...)`` so Textual (8.2.7+) emits an OSC 8 hyperlink that opens the
-    file in Obsidian — the same guaranteed path as the `oo` chord.
+    column stays a narrow hash throughout. The hash is plain text: a job lives in the
+    store, not in a vault file (tp#2266), so there is no Obsidian link to carry.
 
     Carries no leading padding of its own: the caller composes the badge part of the id
     chip, so the hash starts at the same column as a session id (see _add_session_row).
     """
-    hash_ = future_files.display_hash(session.session_id)
-    text = Text(hash_, style=_DRAFT_BLUE)
-    if session.future_file:
-        uri = future_files.obsidian_uri(session.future_file)
-        text.stylize(Style(link=uri), 0, len(hash_))
-    return text
+    return Text(future_files.display_hash(session.session_id), style=_DRAFT_BLUE)
 
 
 def _read_awaits(store: Store) -> list[AwaitEntry]:
@@ -5435,28 +5427,6 @@ class CommandCenterApp(App[None]):
         self.push_screen(
             TopicScreen(f"Sub-goal history — {len(revisions)} version{plural}", "\n".join(lines))
         )
-
-    def action_open_obsidian(self) -> None:
-        """Open the selected session's future-job file in Obsidian — the `oo` chord.
-
-        Works on any row with a synced future-job file (drafts, primarily). A
-        draft that hasn't synced yet (``future_file`` still unset) has nothing to
-        open — this is the guaranteed fallback for the id-column link, which
-        depends on terminal OSC 8 support (see `_draft_id_cell`).
-        """
-        if not (sid := self._current) or (store := self.store) is None:
-            return
-        session = store.get(sid)
-        if session is None or not session.future_file:
-            self.notify("No Obsidian file for this session yet.", severity="warning")
-            return
-        uri = future_files.obsidian_uri(session.future_file)
-        try:
-            subprocess.Popen(  # noqa: S603  # pylint: disable=consider-using-with
-                ["open", uri], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except (OSError, ValueError):
-            self.notify("Could not open Obsidian.", severity="warning")
 
     def action_open_session_obsidian(self) -> None:
         """Open the selected session's full conversation in the peek panel — `os` chord.

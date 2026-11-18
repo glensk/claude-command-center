@@ -83,7 +83,9 @@ def test_wheel_ships_entrypoints_and_assets(installed_wheel: InstalledWheel) -> 
     assert skill in names
     # The core skill shipped by default (install-commands) must survive a non-editable install.
     assert "command_center/assets/skills/ccc-mark-done-and-close/SKILL.md" in names
-    assert "command_center/assets/obsidian/future.md.tmpl" in names
+    # The future/delete job dashboards are retired (tp#2266 B12).
+    assert "command_center/assets/obsidian/future.md.tmpl" not in names
+    assert "command_center/assets/obsidian/delete.md.tmpl" not in names
     assert "command_center/assets/obsidian/plugins.json" in names
     assert "command_center/assets/karabiner/peek-s-p.json" in names
     # The panel poker template (``ccc panel-server --install`` bakes + copies it).

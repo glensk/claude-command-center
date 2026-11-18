@@ -828,9 +828,10 @@ to the **`01-llm/ccc-tasks/delete/` trash** (keeping the `<cat>/<repo>` substruc
 `status: deleted`, a `deleted: <date>` stamp and a single **↩ Stage job back in** button;
 `ccc restore-job` (the button, the trash dashboard's ↩ column, or the CLI) un-archives the row and
 moves the file back to its live spot (`status: registered`) — and can re-register from the file
-alone (same UUID) even if the row was pruned. The trash has its own dashboard
-(`01-llm/ccc-tasks/delete/delete.md`) with an ↩ restore column; the future dashboard deliberately
-keeps only ▶ per row — ✓ done / 🗑 delete live inside each job note.
+alone (same UUID) even if the row was pruned. `ccc obsidian-setup` no longer registers those
+`obsidian-shellcommands` entries (it strips them from an existing `data.json`) and no longer seeds
+the `future.md` / `delete/delete.md` job dashboards (tp#2266): the buttons only fire where the
+entries were added by hand; the `--file` verbs stay available on the CLI.
 
 > **Troubleshooting — buttons show "Button ID not Found".** Meta Bind keys its button registry
 > by *file path* with refcounted register/unregister per render. When a job file is renamed or
@@ -864,11 +865,9 @@ draft shows a **`Scheduled for:`** line directly under `Status:` — the blue `D
 set, a grey `—` when not. While editing (`e`) those readouts drop out of the head (their
 editable rows — `/overseer` `/executor` `/account` `Scheduled for` — are the **top rows of the
 form**, so each option renders exactly once). All of it is editable inline in the job-details pane
-(`e`); once the job has synced to its file, the 4-hex hash becomes a clickable link
-(`obsidian://open`) that opens it directly — same in `ccc ls`. That's a Rich/OSC 8 hyperlink, so clickability depends on the terminal
-(⌘-click under iTerm2); the guaranteed path is the **`oo`** chord (type `o` then `o` on the
-selected job) — it shells out to `open` regardless of terminal support. A draft that hasn't
-synced yet (no file) has nothing to open — `oo` just notifies.
+(`e`). The 4-hex hash is plain text in the TUI and in `ccc ls`: a job lives in ccc's store, so
+there is no Obsidian file to link to (the `oo` open-in-Obsidian chord is retired, tp#2266);
+`ccc show -s <id>` prints the whole job.
 
 You can also **capture a new job as a file first**: `ccc new-prompt [-r cat/repo] [-o]` writes a
 fresh, hash-named draft page under the future root (prefilled frontmatter + Meta Bind repo
@@ -1004,14 +1003,14 @@ the normal budgeted passes are no-ops until content changes. `ccc init` enables
 it says so and leaves them off (the future-job files, which hold no verbatim transcript, still go
 on).
 
-**Vault dashboards.** Three dataviewjs dashboards sit one level above the mirror trees (outside the
-queried folders, so they never mirror themselves): **`01-llm/ccc-tasks/future.md`** (editable — native
-dropdowns write frontmatter, ▶ launches via `ccc open-job`), **`01-llm/ccc-tasks/running.md`**
+**Vault dashboards.** Two dataviewjs dashboards sit one level above the running tree (outside the
+queried folder, so they never mirror themselves; the future-job dashboard is retired, tp#2266):
+**`01-llm/ccc-tasks/running.md`**
 (read-only over the RUNNING tree, ⤢ focuses a live tab via `ccc focus-job`) and
 **`01-llm/ccc-tasks/parked.md`** (read-only view over the SAME running tree filtered on
 `status: "parked"` — every ☾ row, i.e. closed-but-unfinished sessions; ▶ resumes in a new iTerm tab
 via `ccc resume-job`). Running and parked stack the Models cell identically: `ran` — the observed
-`model:` key with its `effort:` next to it — above the `ovr`/`exe` config chips. Gotcha baked into all three: the Hash cell derives from `session_id`,
+`model:` key with its `effort:` next to it — above the `ovr`/`exe` config chips. Gotcha baked into both: the Hash cell derives from `session_id`,
 never from the frontmatter `id` — Dataview coerces duration-shaped id strings (`"035d"` = 35 days
 renders as `P35D`).
 

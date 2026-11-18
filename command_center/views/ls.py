@@ -18,7 +18,7 @@ from .. import accounts, await_view, cachettl, colors, config, repos, resume, ta
 from ..adapters.base import Adapter
 from ..adapters.claude import ClaudeAdapter
 from ..core import Row, build_rows
-from ..future_files import display_hash, obsidian_uri
+from ..future_files import display_hash
 from ..links import folder_link, osc8_link
 from ..models import (
     HALTED_RESUME_ICON,
@@ -202,14 +202,12 @@ def _render_row(
         aim = f"{chip_str} {label}"
 
     if session.draft:
-        # Future job: show the 4-hex display hash, clickable once it has synced to
-        # a future-job file (mirrors the TUI id column / `oo` chord).
+        # Future job: show the 4-hex display hash, plain (the job lives in the store, not
+        # in a vault file — tp#2266), same as the TUI id column.
         hash_text = display_hash(session.session_id)
         sid = _paint(_DIM, hash_text, enabled)
-        if session.future_file:
-            sid = osc8_link(obsidian_uri(session.future_file), sid)
-        # Pad OUTSIDE the link (trailing blanks must not be clickable) up to the live rows'
-        # id width, so a draft's line does not sit 4 columns left of every other row.
+        # Pad up to the live rows' id width, so a draft's line does not sit 4 columns
+        # left of every other row.
         sid += " " * max(0, _ID_WIDTH - len(hash_text))
     else:
         sid = _paint(_DIM, short_id(session.session_id), enabled)

@@ -310,21 +310,6 @@ COMMANDS: list[Command] = [
         footer_pos=13.5,  # right after aim-history (13)
     ),
     Command(
-        key="oo",
-        word="open-obsidian",
-        gloss="open the job's file in Obsidian",
-        section=PER_SESSION,
-        explanation=(
-            "Open the selected job's markdown file in Obsidian — the human editing surface "
-            "for a future job (see the Future jobs section). Type o then o. Only works once "
-            "the draft has synced to a file (its id-column hash is a clickable link the "
-            "instant that happens); until then there is nothing to open and oo just notifies."
-        ),
-        action="open_obsidian",
-        chord=("o", "o"),
-        footer_pos=13.75,  # right after subgoal-history (13.5), before quit (14)
-    ),
-    Command(
         key="os",
         word="open-session",
         gloss="open the row's full session in the peek panel",
@@ -339,7 +324,7 @@ COMMANDS: list[Command] = [
         ),
         action="open_session_obsidian",
         chord=("o", "s"),
-        footer_pos=13.8,  # right after open-obsidian (13.75), before quit (14)
+        footer_pos=13.8,  # right after subgoal-history (13.5), before quit (14)
     ),
     Command(
         key="sp",

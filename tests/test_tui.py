@@ -1528,9 +1528,8 @@ def test_draft_id_cell_bare_hash() -> None:
     assert _draft_id_cell(long_session).plain == "3a8b"
 
 
-def test_draft_id_cell_links_hash_when_future_file_set() -> None:
-    """Once synced to a future-job file, the 4-hex hash span carries a Rich link style."""
-    from command_center import future_files
+def test_draft_id_cell_never_links_to_obsidian() -> None:
+    """tp#2266 B12: the 4-hex hash is plain even with a ``future_file`` (no OSC 8 link)."""
     from command_center.models import Session
     from command_center.views.tui import _draft_id_cell
 
@@ -1546,10 +1545,8 @@ def test_draft_id_cell_links_hash_when_future_file_set() -> None:
 
     cell = _draft_id_cell(session)
     assert cell.plain == "3a8b"
-    assert len(cell.spans) == 1
-    span = cell.spans[0]
-    assert (span.start, span.end) == (0, 4)  # the whole (unpadded) hash is the link
-    assert getattr(span.style, "link", None) == future_files.obsidian_uri(relpath)
+    assert not [s for s in cell.spans if getattr(s.style, "link", None)]
+    assert "obsidian://" not in repr(cell)
 
 
 def test_draft_next_cell_tags_and_note(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1615,10 +1612,11 @@ def test_draft_next_cell_tags_and_note(tmp_path: Path, monkeypatch: pytest.Monke
     assert len(long_head.plain) - 2 <= 48
 
 
-def test_oo_chord_opens_future_file_in_obsidian(
+def test_oo_chord_is_retired_and_opens_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`oo` shells out to macOS `open` on the selected draft's future-job file."""
+    """tp#2266 B12: `oo` is gone — `o o` on a draft with a ``future_file`` opens no
+    ``obsidian://`` URI, and the app has no ``action_open_obsidian``."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     relpath = "01-llm/ccc-tasks/future/home/repo/j-migrate-tickets.md"
     store = Store(tmp_path / "command-center" / "state.db")
@@ -1626,7 +1624,6 @@ def test_oo_chord_opens_future_file_in_obsidian(
     store.update_fields("job-1", future_file=relpath)
     store.close()
 
-    from command_center import future_files
     from command_center.views import tui as tui_mod
     from command_center.views.tui import CommandCenterApp
 
@@ -1689,33 +1686,8 @@ def test_oo_chord_opens_future_file_in_obsidian(
 
     asyncio.run(scenario())
 
-    assert ["open", future_files.obsidian_uri(relpath)] in calls
-
-
-def test_oo_chord_notifies_when_draft_has_no_future_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A draft that hasn't synced to a file yet has nothing to open — `oo` just notifies."""
-    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    store = Store(tmp_path / "command-center" / "state.db")
-    store.create_draft("job-1", "/Users/x/repo", "Migrate tickets", start_when="during holidays")
-    store.close()
-
-    from command_center.views.tui import CommandCenterApp
-
-    async def scenario() -> None:
-        app = CommandCenterApp()
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            notes: list[str] = []
-            monkeypatch.setattr(app, "notify", lambda msg, **_kw: notes.append(msg))
-
-            await pilot.press("o")
-            await pilot.press("o")
-            await pilot.pause()
-            assert notes and "No Obsidian file" in notes[-1]
-
-    asyncio.run(scenario())
+    assert not hasattr(CommandCenterApp, "action_open_obsidian")
+    assert not [c for c in calls if any("obsidian://" in str(a) for a in c)]
 
 
 def test_t_alone_shows_toggle_menu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -210,25 +210,23 @@ def test_render_row_waiting_codex_shows_sleeping_face_and_reset_hint() -> None:
     assert "waiting for Codex 5h reset" in lines[1]
 
 
-def test_render_row_draft_shows_hash_linked_when_future_file_set() -> None:
-    from command_center.future_files import display_hash, obsidian_uri
-    from command_center.links import osc8_link
+def test_render_row_draft_hash_never_links_to_obsidian() -> None:
+    """tp#2266 B12: a draft's hash is plain, with or without a ``future_file``."""
+    from command_center.future_files import display_hash
 
     sid = "3a8b7c12-1111-2222-3333-444444444444"
     session = Session(session_id=sid, cwd="/repo", aim="x", draft=True)
     row = Row(session, None, Status.PARKED, 0, 0)
 
-    # No future_file yet: bare hash, no obsidian:// hyperlink (the folder cell may
-    # still carry its own unrelated openterm:// OSC 8 link, hence the narrow check).
+    # The folder cell may still carry its own unrelated openterm:// OSC 8 link, hence
+    # the narrow obsidian:// check.
     line = ls_view._render_row(row, enabled=False, warn_days=2, aim_threshold=50)[0]
     assert display_hash(sid) in line
     assert "obsidian://" not in line
 
-    # Synced to a future-job file: the hash is wrapped in an OSC 8 link to it.
     session.future_file = "01-llm/ccc-tasks/future/home/claude-command-center/3a8b-fix.md"
-    linked_line = ls_view._render_row(row, enabled=False, warn_days=2, aim_threshold=50)[0]
-    expected = osc8_link(obsidian_uri(session.future_file), display_hash(sid))
-    assert expected in linked_line
+    still_plain = ls_view._render_row(row, enabled=False, warn_days=2, aim_threshold=50)[0]
+    assert still_plain == line
 
 
 def test_render_row_draft_shows_start_when_note() -> None:

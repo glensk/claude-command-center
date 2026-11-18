@@ -1,93 +1,45 @@
-# ccc + Obsidian
+# ccc + Obsidian: the capture pad
 
-`ccc` can mirror your whole session lifecycle into an [Obsidian](https://obsidian.md)
-vault: future jobs you can launch from a note, read-only mirrors of every running and
-done session, and full-conversation notes you can search. Everything is driven by
-`ccc obsidian-setup` and the vault-mirror config flags.
+Future jobs live in ccc's store: you create and change them with `ccc new-job`,
+`ccc edit-job` and the TUI `e` editor, and read them back with `ccc show`, `ccc ls`,
+`ccc jobs` and the TUI. The one Obsidian surface left for them is the **capture pad**: a
+single note, `new-prompt.md`, that queues (and optionally launches) a job from any device
+that syncs your vault — your phone included. Separately, the read-only session mirrors
+and their two dashboards are described below.
 
 This integration is entirely opt-in. With no vault configured, `ccc` never touches disk
 outside `CLAUDE_HOME`.
 
-## One-time setup
+## The capture pad
 
-```commands
-ccc obsidian-setup [-r VAULT] [--install-plugins] [-n] [-u]
-```
+The pad's path is the `future_pad` config key (default
+`~/obsidian/01-llm/ccc-tasks/new-prompt.md`). It is served when `future_pad_enabled` is
+on (or the legacy `future_files` switch is); both default to `false`. While it is
+served, the future-job sync (`ccc sync-future`, run by the daemon and the vault watcher)
+reads the pad on every pass:
 
-`obsidian-setup` is **content-only and offline by default**. It:
+1. Write the AIM (and, optionally, a prompt, repo, job type, start date or deadline) into
+   the pad's frontmatter and body.
+2. Set `status: ready` — the job is registered in ccc's store under a fresh id and the
+   pad is reset to blank. Or tick the bare-boolean `launch` property instead: a `draft` pad
+   with `launch` on is treated as `ready` and registers **and** launches in one pass, no
+   status edit needed.
 
-- creates the ccc task folders under your vault (`01-llm/ccc-tasks/{future,delete,running,done,sessions}`
-  plus the capture pad `new-prompt.md`) — the exact paths come from your config, not
-  hard-coded;
-- renders the dashboards (below) from templates, substituting your folder paths and the
-  absolute `ccc` binary; generated files carry a `ccc_generated` marker so reruns and
-  `-u/--uninstall` only ever touch ccc's own files;
-- merges the four `obsidian-shellcommands` entries the in-note job buttons fire.
+An empty `repo` defaults to `$HOME`, so the minimal capture is literally an AIM plus the
+launch tick. On mobile, Obsidian renders `launch: false` as a one-tap checkbox in the
+properties UI (the mobile Properties `status` field is free text, and `ready` never
+persists anywhere, so its suggestions cannot offer the one value that matters). The pad
+is reset to `launch: false` *before* the launch spawns, so a failed spawn never
+re-triggers.
 
-`-n/--dry-run` shows what would change; `-u/--uninstall` removes the ccc-generated
-dashboards and entries.
-
-### Required community plugins
-
-The job buttons and dashboards need three community plugins:
-
-| Plugin                    | Used for                                                          |
-| :------------------------ | :--------------------------------------------------------------- |
-| **Meta Bind**             | the inline `▶ / ✓ / 🗑` buttons and the labelled `## Controls` dropdowns |
-| **Obsidian Shell Commands** | the commands those buttons run (`ccc open-job` / `done-job` / …)  |
-| **Dataview**              | the `future` / `running` / `parked` / `delete` dashboards (dataviewjs) |
-
-Install them yourself, or let ccc bootstrap them: `ccc obsidian-setup --install-plugins`
-is the **only networked path** — it is consent-gated and each download is sha256-verified
-against a pinned manifest. After it runs, reload Obsidian so the plugins load.
-
-> **Meta Bind is pinned to 1.4.1**, not the latest 1.5.1: 1.5.1's `manifest.json` declares
-> `minAppVersion 1.13.1`, but the current Obsidian release line is 1.12.x — installing 1.5.1
-> there never registers and the job buttons render as raw code. 1.4.1 (`minAppVersion 1.4.0`)
-> renders the real ▶/✓/🗑 row. Repin to 1.5.1 once Obsidian 1.13+ is widespread.
-
-## Future-job files
-
-Every future job (draft) is mirrored to one editable markdown file under
-`01-llm/ccc-tasks/future/<category>/<repo>/<slug>-<hash>.md`. The file is the source of
-truth you can edit by hand — the sync reconciles file edits back into ccc (file wins) and
-exports ccc-side changes to the file, atomically and idempotently.
-
-Each job file carries an in-note **button row** (rendered by Meta Bind), above the AIM,
-prompt and `## Controls` dropdowns:
-
-![a parked future job note in Obsidian: the ▶ Start this job / ✓ Mark job as done / 🗑 Delete job button row over the AIM, prompt, and the status / job-type / overseer / executor / repo Controls dropdowns](img/obsidian-future-job.png)
-
-| Button              | Runs                          | Effect                                                        |
-| :------------------ | :---------------------------- | :----------------------------------------------------------- |
-| **▶ Start this job** | `ccc open-job --file <path>`  | launches the job in a new terminal tab (AIM pre-set)         |
-| **✓ Mark job as done** | `ccc done-job --file <path>` | marks it done *without* running it; it joins the DONE list   |
-| **🗑 Delete job**    | `ccc delete-job --file <path>` | soft-deletes to the vault trash (restorable)                 |
-| **↩ Stage job back in** | `ccc restore-job --file <path>` | (in the trash) un-deletes it back into FUTURE            |
-
-Below the prompt, a `## Controls` section holds labelled Meta Bind dropdowns — **status**,
-**job type**, **overseer** / **executor** model, and **repo** — because Obsidian's native
-Properties panel can only *suggest* values, not offer a fixed option list.
-
-### Launch from your phone: the `launch:` checkbox
-
-Every job file has a bare-boolean frontmatter key `launch: false`. On mobile — where the
-Shell-Commands buttons are dead — Obsidian renders it as a one-tap **checkbox** in the
-properties UI. Flip it to `true`, and the next sync pass consumes the flag and launches
-the job (in an iTerm tab, or a tmux window when scripting isn't available, e.g. under the
-launchd watcher). The file is reset to `launch: false` *before* the launch spawns, so a
-failed spawn never re-triggers. This is the phone-flip → sync-daemon → launch chain.
-
-On the **capture pad**, ticking `launch` is enough by itself: a `draft` pad with the
-toggle on is treated as `ready` and registers **and** launches in one pass — no status
-edit needed. An empty `repo` on the pad defaults to `$HOME`, so the minimal capture is
-literally an AIM plus the launch tick (a blank repo in a copied job *file* still
-errors — there it is more likely a mistake) (the mobile Properties `status` field is free text, and `ready` never
-persists anywhere, so its suggestions can't offer the one value that matters). A pad
-flipped to `status: error` by a failed validation keeps retrying while `launch` stays
-ticked: fix the offending field and the next sync pass registers and launches it — no
+A pad flipped to `status: error` by a failed validation keeps retrying while `launch`
+stays ticked: fix the offending field and the next pass registers and launches it — no
 status reset, and never delete the error block by hand (ccc owns it; it disappears on
-successful registration).
+successful registration). A deleted pad is recreated blank on the next pass.
+
+Once registered, the job is an ordinary future job: there is no per-job file to open.
+Check it with `ccc show -s <id>` or `ccc jobs`, change it with `ccc edit-job <id> …` or
+the TUI.
 
 **Where the job opens.** The launchd watcher cannot AppleScript iTerm (TCC silently
 denies without prompting, and iTerm's Python-API cookies are single-use and mintable
@@ -100,6 +52,44 @@ iTerm's auth-disable file — `sudo chown root:wheel "~/Library/Application
 Support/iTerm2/disable-automation-auth"` (the file must exist first; iTerm honors it
 only when root-owned) — which lets any local process use the iTerm API without
 authentication; the spawn chain then upgrades automatically via its Python-API step.
+
+## One-time setup
+
+```commands
+ccc obsidian-setup [-r VAULT] [--install-plugins] [-n] [-u]
+```
+
+`obsidian-setup` is **content-only and offline by default**. It:
+
+- seeds the capture pad, when it is served (above) — no per-job `future/` or `delete/`
+  folders, no job dashboards;
+- creates the session-mirror folders (`01-llm/ccc-tasks/{running,done,sessions}`) — the
+  exact paths come from your config, not hard-coded;
+- renders the two mirror dashboards (below) from templates, substituting your folder
+  paths and the absolute `ccc` binary; generated files carry a `ccc_generated` marker so
+  reruns and `-u/--uninstall` only ever touch ccc's own files;
+- strips the four retired ccc job-button entries (`ccc-*-job-from-file`) from an existing
+  `obsidian-shellcommands` `data.json` (backed up first); it never adds an entry.
+
+`-n/--dry-run` shows what would change; `-u/--uninstall` removes the ccc-generated
+dashboards (and the retired entries).
+
+### Community plugins
+
+| Plugin       | Used for                                                       |
+| :----------- | :------------------------------------------------------------- |
+| **Dataview** | the `running` / `parked` mirror dashboards (dataviewjs)         |
+| **Meta Bind** | the pad's labelled `## Controls` dropdowns (optional: the pad works from plain frontmatter) |
+
+`ccc obsidian-setup --install-plugins` is the **only networked path** — it is
+consent-gated and each download is sha256-verified against a pinned manifest (which also
+still pins Obsidian Shell Commands; ccc registers no commands in it). After it runs,
+reload Obsidian so the plugins load.
+
+> **Meta Bind is pinned to 1.4.1**, not the latest 1.5.1: 1.5.1's `manifest.json` declares
+> `minAppVersion 1.13.1`, but the current Obsidian release line is 1.12.x — installing 1.5.1
+> there never registers and its widgets render as raw code. Repin to 1.5.1 once Obsidian
+> 1.13+ is widespread.
 
 ## Whole-lifecycle mirrors
 
@@ -132,33 +122,21 @@ note is simply not written — the previous file stays, that pass's cleanup is s
 `ccc sync-mirrors` exits 3 and `ccc doctor` flags it. Vouches are cached in the store, so
 the steady state costs no scrubber calls at all. Migrating an existing vault: install the
 scrubber client, then run `ccc sync-mirrors --full -v` once to scrub and vouch everything
-already there. The same check guards launches — ticking `launch` on a future job whose
+already there. The same check guards launches — ticking `launch` on the pad while its
 prompt carries a live credential is refused, with the label (never the value) written into
-the job file.
+the pad.
 
 ## Dashboards
 
-Three dataviewjs dashboards sit one level above the mirror trees (so they never mirror
+Two dataviewjs dashboards sit one level above the running tree (so they never mirror
 themselves):
 
-- **`01-llm/ccc-tasks/future.md`** — editable: native dropdowns write frontmatter, ▶ launches
-  a job via `ccc open-job`.
 - **`01-llm/ccc-tasks/running.md`** — read-only over the running tree; ⤢ focuses a live tab via
   `ccc focus-job`.
 - **`01-llm/ccc-tasks/parked.md`** — the running tree filtered to closed-but-unfinished (`☾`)
   sessions; ▶ resumes one in a new tab via `ccc resume-job`.
 
-The trash has its own `01-llm/ccc-tasks/delete/delete.md` with an ↩ restore column.
-
 ## Troubleshooting
-
-**A button reads "Button ID not Found."** Meta Bind keys its button registry by file
-path, with refcounted register/unregister per render. If a job file is renamed or moved
-**while its tab is open**, the inline `BUTTON[…]` row can look the buttons up under a
-different path than the hidden definitions registered under — all three chips then read
-"Button ID not Found" even though the file is correct. **Fix: close and reopen the note,
-or reload Obsidian (Cmd/Ctrl+R).** Nothing is wrong with the file or with ccc; verify with
-`ccc sync-future -v` (expect `errors=0`) if in doubt.
 
 **Verifying a dashboard renders (for agents/automation).** Obsidian normally runs without
 a debugging port. Relaunch it with the Chrome DevTools Protocol enabled and drive it with

@@ -109,7 +109,7 @@ and some are macOS-first (they drive iTerm2 / Karabiner). Honest table:
 | Sub-goal auto-derive + grade  | auto-builds + ticks the checklist so the bar moves on its own                                | a cheap LLM (Haiku)                                                | `autoprogress` / `grade_on_turn`     |
 | Drift + DONE checkers         | impartial second model grades goal-drift and "is the AIM met?"                               | a cheap LLM (Haiku)                                                | `drift_check` / `assess_aim_on_turn` |
 | Future jobs                   | park a described job, launch it later from terminal or Obsidian                              | Python only                                                        | always on                            |
-| Obsidian mirrors + dashboards | every session as a searchable markdown note; job-launch buttons                              | an Obsidian vault + a credential scrubber                          | `ccc obsidian-setup`, mirror flags   |
+| Obsidian mirrors + dashboards | every session as a searchable markdown note; a phone capture pad                            | an Obsidian vault + a credential scrubber                          | `ccc obsidian-setup`, mirror flags   |
 | Background daemon + alerts    | reaps idle sessions, regenerates summaries, desktop-notifies                                 | launchd (macOS) / systemd --user (Linux); `notify-send` on Linux   | `ccc daemon --install`               |
 | Auto-resume halted            | resumes rate-limit-halted sessions once the limit resets (machine must stay on)              | `claude-session-continue`                                          | `resume_halted`                      |
 | Rate-limit failover           | a halted session relaunches itself on an account that still has quota, same tab              | a second account in `claude_accounts`                              | `auto_switch_on_limit`               |
@@ -291,7 +291,7 @@ a second install. Three complementary channels — all verified on a de-Googled
    exactly where you left it. `ccc serve` offers the same TUI in the phone browser as an
    even lighter client.
 3. **Obsidian mobile (read + queue + launch, zero terminal).** With the vault mirrors on,
-   every session is a synced note; a future-job file's `launch:` checkbox is a one-tap
+   every session is a synced note; the capture pad's `launch:` checkbox is a one-tap
    "start this on the host" button — see [docs/obsidian.md](docs/obsidian.md).
 
 As a fallback for when the host is unreachable, Claude Code itself runs on the phone
@@ -316,8 +316,8 @@ full phone story: [docs/roadmap-mobile-grapheneos.md](docs/roadmap-mobile-graphe
   shell-command escape hatch. Anthropic is the default, not a hard dependency.
 - **Packaging is `uv` + `hatchling`** — the Obsidian templates, Linux hotkey samples and
   the pinned plugin manifest ship as package data inside the wheel.
-- **Optional Obsidian layer** (Dataview / Meta Bind / Shell commands) turns future jobs and
-  sessions into editable, searchable notes.
+- **Optional Obsidian layer** (Dataview / Meta Bind) turns sessions into searchable notes
+  and offers a phone capture pad for new jobs.
 - **Platform glue**: macOS uses AppleScript + PyObjC (iTerm tabs, the peek panel); Linux
   uses the equivalents — **systemd** user units, **`notify-send`**, and **OSC** terminal
   tab badges.
@@ -354,8 +354,8 @@ So, whenever you add or change anything that renders into a row:
 - [docs/hooks.md](docs/hooks.md) — what each installed hook does, the status line, the
   Stop-hook lock lease (same-event hooks run in parallel, so the lease — not a wiring
   order — is what keeps a peer off a file that is still being committed).
-- [docs/obsidian.md](docs/obsidian.md) — the Obsidian integration: dashboards, job-file
-  buttons, the phone-friendly `launch:` toggle, troubleshooting.
+- [docs/obsidian.md](docs/obsidian.md) — the Obsidian integration: the capture pad and its
+  phone-friendly `launch:` toggle, the session mirrors and dashboards, troubleshooting.
 - [docs/codex.md](docs/codex.md) — delegating implementation to OpenAI Codex.
 - [docs/linux.md](docs/linux.md) — the Ubuntu quickstart: what works out of the box, the
   systemd daemon, `notify-send`, tmux job launch, and the keyd/xremap hotkey samples.
