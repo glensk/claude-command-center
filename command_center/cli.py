@@ -865,6 +865,41 @@ def cmd_aim_history(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_show(args: argparse.Namespace) -> int:
+    """Print one session's card from the store (tp#2266): no file read or written.
+
+    Default session = the caller's (like ``ccc aim``); ``-s`` takes a full id or a unique
+    prefix. ``-t`` appends the full conversation (the ``ccc peek`` session-tab segments);
+    ``-j`` prints :func:`sessioncard.build_card` as one JSON object (schema 1). stdout
+    only, same trust level as ``ccc peek``: nothing is persisted, so nothing is scrubbed.
+    """
+    from . import repos, sessioncard
+
+    adapter = _adapter()
+    session_id = resolve_session_id(adapter, args.session, None)
+    if not session_id:
+        print("error: could not resolve a session (pass -s <id>)", file=sys.stderr)
+        return 1
+    with Store() as store:
+        if args.session:
+            resolved = _resolve_session_arg(store, session_id)
+            if resolved is None:
+                return 1
+            session_id = resolved
+        session = store.get(session_id)
+        if session is None:
+            print(f"error: no such session {session_id}", file=sys.stderr)
+            return 1
+        card = sessioncard.build_card(
+            store, session, adapter, repos.git_base(), conversation=bool(args.transcript)
+        )
+    if args.json:
+        print(json.dumps(card, ensure_ascii=False, indent=2))
+    else:
+        print(sessioncard.render_text(card), end="")
+    return 0
+
+
 def cmd_strip_aim_runs(args: argparse.Namespace) -> int:
     """One-time cleanup: drop the tracker-written ``: tp#N`` tail from session AIMs (tp#1566).
 
@@ -6882,6 +6917,34 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "user_aim, aims: [{at, aim, aim_full_len, by, session_id, hop}], truncated}",
     )
     p_aimhist.set_defaults(func=cmd_aim_history)
+
+    p_show = sub.add_parser(
+        "show",
+        help="print a session's card from the store (AIM, status, sub-goals, history, models)",
+        description=(
+            "Print one session's card from ccc's store: AIM, status, next step, blocked, "
+            "sub-goals, summary, AIM history, models, repo, deadline and transcript path; "
+            "for a future job also its prompt, start date, when-note and dependency. "
+            "Reads no vault file and writes nothing."
+        ),
+    )
+    p_show.add_argument(
+        "-s", "--session", help="session id or unique prefix (default: the current session)"
+    )
+    p_show.add_argument(
+        "-t",
+        "--transcript",
+        action="store_true",
+        help="append the full conversation (the segments the `ccc peek` session tab shows)",
+    )
+    p_show.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help="print the card as one JSON object (schema_version 1; `conversation` is set "
+        "only with -t)",
+    )
+    p_show.set_defaults(func=cmd_show)
 
     p_strip = sub.add_parser(
         "strip-aim-runs",

@@ -176,7 +176,9 @@ A few features that don't fit in a one-liner but are the reason people keep it r
 keys, the future-job files, the daemon — lives in
 [docs/reference.md](docs/reference.md). The two worth knowing on day one are `ccc demo`
 (the zero-setup, fake-data command center) and `ccc doctor` (a read-only health check of
-your install and environment). Inside a Claude Code session, the slash commands `/aim`
+your install and environment). `ccc show` prints one session's card straight from
+the store (AIM, status, next step, sub-goals, summary, AIM history, models; `-s ID`,
+`-t` adds the full conversation, `-j` JSON). Inside a Claude Code session, the slash commands `/aim`
 `/next-step` `/done` `/block` `/deadline` (installed by `ccc init`) drive the same
 actions from the prompt, and the `ccc-mark-done-and-close` skill (shipped by default)
 lets you say "mark this session as done" to finish AND close the session — its terminal

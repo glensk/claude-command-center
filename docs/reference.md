@@ -50,6 +50,15 @@ flags. Grouped by what they do:
   `ccc aim-history -s ID -t` shows the whole **thread** instead (every continue-session hop,
   root first; see "Thread AIM history" below), `-j` the same as JSON. `-s` takes a full id
   or a unique id prefix; an unknown or ambiguous prefix is an error (exit 1).
+- `ccc show` (`-s/--session ID`, `-t/--transcript`, `-j/--json`) — one session's card,
+  read from the store only (no vault file): AIM (current, first, short), status and phase
+  (`draft`/`running`/`parked`/`done`, plus `archived`), next step, blocked, sub-goals and
+  progress, summary, AIM history, models (configured and observed), repo, deadline,
+  dependency and transcript path; for a future job also its prompt, start date and
+  when-note. Default session = the caller's (like `ccc aim`); `-s` takes a full id or a
+  unique prefix. `-t` appends the full conversation (the segments the `ccc peek` session
+  tab shows); `-j` prints one JSON object (`schema_version: 1`, every key always present,
+  `conversation` set only with `-t`). stdout only, nothing persisted.
 - `ccc strip-aim-runs` (`-a/--all` | `-s/--session`, `-n/--dry-run`) — one-time cleanup from
   when a tracker still rewrote AIMs: a non-archived, not-done session whose one-line AIM ends
   in a `: tp#N, #M` run with words before it gets the words alone (`Store.rewrite_aim_text`,
