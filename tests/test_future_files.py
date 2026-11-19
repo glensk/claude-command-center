@@ -166,7 +166,7 @@ def test_controls_block_lists_model_selects() -> None:
     llm_opts = ", ".join(f"option({choice})" for choice in models.LLM_CHOICES)
     assert f"inlineSelect({llm_opts}):llm_overseer]" in text
     assert f"inlineSelect({llm_opts}):llm_exec]" in text
-    assert "fable-5" not in llm_opts
+    assert "option(fable-5)" not in llm_opts  # retired; fable-5.2 is offered (tp#2330)
 
 
 def test_controls_block_labels_every_select() -> None:

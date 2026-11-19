@@ -343,6 +343,7 @@ _LLM_STYLE: dict[str, str] = {
     "opus-5": "#2ecc71",  # green (retired, tp#2032: old rows still render)
     "opus-4.8": "#2ecc71",  # green
     "sonnet-5": "#5fafff",  # blue
+    "fable-5.2": "#ff8700",  # orange
 }
 _FUTURE_LABEL = "FUTURE"  # separator above the not-yet-started future-job block
 _SCHEDULED_LABEL = "SCHEDULED"  # separator above future jobs with a FIXED start date (very bottom)

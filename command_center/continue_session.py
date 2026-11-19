@@ -379,8 +379,12 @@ def _monotonic() -> float:
 
 
 def _job_model(observed: str, explicit: str | None) -> str:
-    """Q1: an explicit ``-O``/``-E`` wins; else the observed model when launchable; else default."""
-    from .models import NEW_JOB_DEFAULT_LLM, NEW_JOB_LLM_CHOICES
+    """Q1: an explicit ``-O``/``-E`` wins; else the observed model when launchable; else default.
+
+    *observed* may be a ccc label (``fable-5.2``) or a raw ``claude --model`` id
+    (``claude-fable-5-2``, the live-entry fallback): both resolve to the label (tp#2330).
+    """
+    from .models import NEW_JOB_DEFAULT_LLM, NEW_JOB_LLM_CHOICES, model_label
 
     if explicit:
         if explicit not in NEW_JOB_LLM_CHOICES:
@@ -388,7 +392,26 @@ def _job_model(observed: str, explicit: str | None) -> str:
                 f"unknown model {explicit!r} (choices: {', '.join(NEW_JOB_LLM_CHOICES)})"
             )
         return explicit
-    return observed if observed in NEW_JOB_LLM_CHOICES else NEW_JOB_DEFAULT_LLM
+    label = model_label(observed)
+    return label if label in NEW_JOB_LLM_CHOICES else NEW_JOB_DEFAULT_LLM
+
+
+def _notice_unknown_model(observed: str, overseer: str, executor: str) -> None:
+    """One stderr line when the source ran on a model ccc cannot launch (tp#2330).
+
+    A draft job only stores a known choice, so an unknown (newer) observed id falls back to
+    the default; the relay says so instead of switching models silently.
+    """
+    from .models import NEW_JOB_LLM_CHOICES, model_label
+
+    if not observed or model_label(observed) in NEW_JOB_LLM_CHOICES:
+        return
+    used = overseer if overseer == executor else f"{overseer} / {executor}"
+    print(
+        f"notice: source model {observed!r} is not a ccc model choice; "
+        f"the successor runs on {used} (pass -O/-E to choose)",
+        file=sys.stderr,
+    )
 
 
 def handoff_path(transfer_id: str) -> Path:
@@ -552,6 +575,12 @@ def _candidate(  # pylint: disable=too-many-arguments,too-many-positional-argume
 
     session = store.get(src.session_id)
     profile = _checked_profile((session.launch_profile if session else "") or "")
+    overseer = _job_model(src.model, getattr(args, "overseer", None))
+    executor = _job_model(
+        src.model, getattr(args, "executor", None) or getattr(args, "overseer", None)
+    )
+    if not getattr(args, "overseer", None):  # an explicit -O sets both: nothing inherited
+        _notice_unknown_model(src.model, overseer, executor)
     return Transfer(
         transfer_id="",
         source_session=src.session_id,
@@ -561,10 +590,8 @@ def _candidate(  # pylint: disable=too-many-arguments,too-many-positional-argume
         cwd=src.cwd,
         source_aim=(session.aim if session else "") or "",
         source_aim_rev=store.count_aim_history(src.session_id),
-        llm_overseer=_job_model(src.model, getattr(args, "overseer", None)),
-        llm_exec=_job_model(
-            src.model, getattr(args, "executor", None) or getattr(args, "overseer", None)
-        ),
+        llm_overseer=overseer,
+        llm_exec=executor,
         no_codex=bool(session and session.no_codex),
         launch_profile=profile,
         prompt_sha256=digest,

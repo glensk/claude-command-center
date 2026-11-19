@@ -45,12 +45,13 @@ tags: [ccc, parked-jobs, dashboard]
 	const DEFAULT_MODEL = "opus-5.5";
 
 	// Per-model accent — the future dashboard's MODEL_COLORS (text/border colour +
-	// low-alpha tint, legible in light and dark). Retired Fable observations stay orange,
+	// low-alpha tint, legible in light and dark). fable-5.2 and retired fable-5 orange,
 	// opus-5.5/opus-5/opus-4.8 green,
 	// opus-4.8-1m teal (the 1M-context claude-opus-4-8[1m]), sonnet-5 blue,
 	// haiku-4.5 purple. Mirror of ccc's models.LLM_CHOICES — keep in sync.
 	const MODEL_COLORS = {
 		"fable-5": { fg: "#d97706", bg: "rgba(217, 119, 6, 0.12)" },
+		"fable-5.2": { fg: "#d97706", bg: "rgba(217, 119, 6, 0.12)" },
 		"opus-5.5": { fg: "#16a34a", bg: "rgba(22, 163, 74, 0.12)" },
 		"opus-5": { fg: "#16a34a", bg: "rgba(22, 163, 74, 0.12)" },
 		"opus-4.8": { fg: "#16a34a", bg: "rgba(22, 163, 74, 0.12)" },
@@ -483,7 +484,7 @@ on the same session. A resumed row **leaves this dashboard** on the next sync,
 because its status flips from `parked` back to a live state (and it then reappears
 on the [running dashboard](running.md)).
 
-**Model colours** (ccc's `MODEL_COLORS`): 🟠 `fable-5` · 🟢 `opus-4.8` (200K) · 🩵
+**Model colours** (ccc's `MODEL_COLORS`): 🟠 `fable-5.2` / `fable-5` · 🟢 `opus-4.8` (200K) · 🩵
 `opus-4.8-1m` (teal — the 1M-context `claude-opus-4-8[1m]`) · 🔵 `sonnet-5` · 🟣
 `haiku-4.5`.
 

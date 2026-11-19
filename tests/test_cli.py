@@ -2616,6 +2616,7 @@ def test_new_job_offers_and_defaults_to_opus_never_fable() -> None:
     assert "fable-5" not in models.LLM_CHOICES
     assert "fable-5" not in models.LLM_MODEL_IDS
     assert "fable-5" not in models.LLM_AGENT_ALIAS
+    assert parser.parse_args(["new-job", "--aim", "x", "-O", "fable-5.2"]).overseer == "fable-5.2"
 
 
 def test_exec_in_restores_cwd_when_the_exec_does_not_happen(

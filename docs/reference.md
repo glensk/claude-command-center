@@ -744,8 +744,8 @@ future job), **cancelled** (the dependency was `mark-done`-on-draft or `delete-j
   byte-identical.
 
 Each future job also picks **which models it runs on**: `-O/--overseer` and `-E/--executor`
-(choices `opus-5.5` / `opus-4.8` / `opus-4.8-1m` / `sonnet-5` / `haiku-4.5`, both defaulting to
-`opus-5.5`; `opus-4.8-1m` is the 1M-context Opus, launched as `claude-opus-4-8[1m]` and delegating
+(choices `opus-5.5` / `opus-4.8` / `opus-4.8-1m` / `sonnet-5` / `haiku-4.5` / `fable-5.2`, both
+defaulting to `opus-5.5`; `fable-5.2` launches as `claude-fable-5-2` and delegates to `fable`; `opus-4.8-1m` is the 1M-context Opus, launched as `claude-opus-4-8[1m]` and delegating
 to plain `opus` — sonnet-5 is natively 1M). At launch the session
 runs on the **overseer's** model (`claude --model …`) with an **explicit reasoning effort**
 (`claude --effort <level>`, config key `launch_effort`, default `xhigh`; set it to `""` to omit the
@@ -2153,7 +2153,9 @@ the composed text, and a re-run on an active `prepared`/`opened` transfer reuses
 snapshot and composed handoff without recollecting — so `start` → exit 3 → a ledger change
 → the same `start` still reuses the transfer. The successor is a draft job (`create_draft`: the source's latest user AIM — see below —, cwd,
 `no_codex`, the observed model unless `-O`/`-E` say otherwise — a retired one such as `opus-5`
-is replaced through `models.RETIRED_LLM_REPLACEMENTS`, tp#2032 —, the unchecked sub-goals)
+is replaced through `models.RETIRED_LLM_REPLACEMENTS`, tp#2032; a raw observed id is mapped
+to its ccc choice, and one ccc does not know falls back to `opus-5.5` with a stderr notice
+naming both, tp#2330 —, the unchecked sub-goals)
 launched through `start-job` in a new tab; its prompt is a short preamble (take over from
 session X, transfer T, FIRST run `ccc continue-session accept T`, then relaunch the agents
 from their capsules, restart only the `restart:` shells, judge the `Decide before

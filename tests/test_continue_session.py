@@ -3267,3 +3267,115 @@ def test_facts_only_and_capped_unchanged(
     assert transfer.capped == (flag == "--capped")
     assert ("parser half done" in stored) == (flag == "--capped")
     assert not list(Path(transfer.handoff_path).parent.glob("*.model-full.md"))
+
+
+# ------------------------------------------------- tp#2330: the relay keeps the source model
+
+
+def _source_model(model: str) -> None:
+    with Store() as store:
+        store.update_fields(SID, model=model)
+
+
+def _successor_argv(monkeypatch: pytest.MonkeyPatch, target: str) -> list[str]:
+    """The argv the successor's tab would exec (``ccc start-job`` on the draft)."""
+    monkeypatch.setenv("CCC_INTERNAL", "1")  # no detached sync-mirrors spawn
+    monkeypatch.setattr(cli, "_start_job_trust_refusal", lambda *_a, **_k: "")
+    seen: dict[str, list[str]] = {}
+
+    def _capture(_file: str, argv: list[str]) -> None:
+        seen["argv"] = list(argv)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(cli.os, "execvp", _capture)
+    with pytest.raises(SystemExit):
+        cli.cmd_start_job(argparse.Namespace(session_id=target))
+    return seen["argv"]
+
+
+def _model_flag(argv: list[str]) -> str:
+    return argv[argv.index("--model") + 1]
+
+
+@pytest.mark.parametrize("observed", ["fable-5.2", "claude-fable-5-2"])
+def test_a_fable_source_hands_over_to_a_fable_successor(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, observed: str
+) -> None:
+    """The observed model (ccc label or a raw id stored before ccc knew it) is kept."""
+    _source_model(observed)
+    assert harness.start() == 0
+    [target] = harness.launches
+    with Store() as store:
+        job = store.get(target)
+    assert job is not None and job.llm_overseer == "fable-5.2" and job.llm_exec == "fable-5.2"
+    assert _model_flag(_successor_argv(monkeypatch, target)) == "claude-fable-5-2"
+
+
+def test_an_outside_relay_of_a_fable_source_stays_on_fable(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``start -X`` resolves the source from the store and keeps its model too."""
+    _source_model("fable-5.2")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "someone-else")
+    monkeypatch.setattr(continue_session, "_sleep", _Clock(harness, grow_until=0).sleep)
+    monkeypatch.setattr(continue_session, "_idle_now", lambda *_a: True)
+    assert cli.main(_outside("-s", SID)) == 0
+    [target] = harness.launches
+    with Store() as store:
+        job = store.get(target)
+    assert job is not None and job.llm_overseer == "fable-5.2" and job.llm_exec == "fable-5.2"
+    assert _model_flag(_successor_argv(monkeypatch, target)) == "claude-fable-5-2"
+
+
+def test_a_fable_dry_run_shows_the_fable_model(
+    harness: _Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _source_model("fable-5.2")
+    assert harness.start("-n", "-j") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert _model_flag(data["argv"]) == "claude-fable-5-2"
+    assert data["snapshot"]["llm_overseer"] == "fable-5.2"
+
+
+def test_an_unknown_source_model_is_never_switched_silently(
+    harness: _Harness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A model ccc cannot launch falls back to the default, with one notice naming both."""
+    _source_model("claude-brand-new-9")
+    assert harness.start() == 0
+    err = capsys.readouterr().err
+    assert err.count("claude-brand-new-9") == 1
+    assert "not a ccc model choice; the successor runs on opus-5.5" in err
+    [target] = harness.launches
+    with Store() as store:
+        job = store.get(target)
+    assert job is not None and job.llm_overseer == "opus-5.5" and job.llm_exec == "opus-5.5"
+
+
+def test_an_explicit_overseer_wins_over_the_source_model(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _source_model("claude-brand-new-9")
+    assert harness.start("-O", "sonnet-5") == 0
+    assert "not a ccc model choice" not in capsys.readouterr().err
+    [target] = harness.launches
+    with Store() as store:
+        job = store.get(target)
+    assert job is not None and job.llm_overseer == "sonnet-5" and job.llm_exec == "sonnet-5"
+    assert _model_flag(_successor_argv(monkeypatch, target)) == "claude-sonnet-5"
+
+
+@pytest.mark.parametrize(
+    ("observed", "explicit", "expected"),
+    [
+        ("fable-5.2", None, "fable-5.2"),
+        ("claude-fable-5-2", None, "fable-5.2"),
+        ("claude-haiku-4-5-20251001", None, "haiku-4.5"),  # a raw known id maps too
+        ("opus-5.5", None, "opus-5.5"),
+        ("", None, "opus-5.5"),  # nothing observed: the default
+        ("claude-brand-new-9", None, "opus-5.5"),
+        ("fable-5.2", "haiku-4.5", "haiku-4.5"),  # -O/-E wins
+    ],
+)
+def test_job_model_resolution(observed: str, explicit: str | None, expected: str) -> None:
+    assert continue_session._job_model(observed, explicit) == expected  # noqa: SLF001  # pylint: disable=protected-access

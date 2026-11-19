@@ -397,6 +397,7 @@ LLM_CHOICES: tuple[str, ...] = (
     "opus-4.8-1m",
     "sonnet-5",
     "haiku-4.5",
+    "fable-5.2",
 )
 DEFAULT_LLM = "opus-5.5"
 # Kept as named CLI constants because the new-job parser imports this public surface. All
@@ -411,6 +412,7 @@ LLM_MODEL_IDS: dict[str, str] = {
     "opus-4.8-1m": "claude-opus-4-8[1m]",
     "sonnet-5": "claude-sonnet-5",
     "haiku-4.5": "claude-haiku-4-5-20251001",
+    "fable-5.2": "claude-fable-5-2",
 }
 # The Agent-tool ``model`` enum used in the delegation instruction (executor subagents).
 # The enum has no 1M variant, so opus-4.8-1m delegates to plain "opus".
@@ -420,6 +422,7 @@ LLM_AGENT_ALIAS: dict[str, str] = {
     "opus-4.8-1m": "opus",
     "sonnet-5": "sonnet",
     "haiku-4.5": "haiku",
+    "fable-5.2": "fable",
 }
 # THE superseded-model table (tp#2032): a retired choice → the current one it launches as.
 # Rows written before a retirement remain readable, but a retired value is deliberately
