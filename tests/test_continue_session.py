@@ -3711,3 +3711,77 @@ def test_an_explicit_non_token_model_is_refused() -> None:
 )
 def test_job_model_resolution(observed: str, explicit: str | None, expected: str) -> None:
     assert continue_session._job_model(observed, explicit) == expected  # noqa: SLF001  # pylint: disable=protected-access
+
+
+# ------------------------------------------- tp#2172 C8: own chain, final veto re-drains
+
+_OWN_SHELL = 58721  # the Bash-tool shell `start` runs in (2026-11-18 23:24:27Z)
+_OWN_SHELL_ARGV = (
+    "/bin/zsh -c source /home/user/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null"
+    " || true && eval 'ccc continue-session start -A private -f h.md' < /dev/null"
+)
+
+
+def test_c8_start_excludes_its_own_shell_after_a_failed_ancestry_read(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``ps`` failed while ``resolve_source`` built the ancestry ({getpid} alone), and the
+    preflight listed the caller's own shell as an untracked shell. The final check now
+    rebuilds the chain when it lacks the session pid."""
+    from command_center import snapshot, terminal  # pylint: disable=import-outside-toplevel
+
+    me = os.getpid()
+    rows = {
+        me: snapshot.PsRow(_OWN_SHELL, "ttys001", "S", "ccc continue-session start"),
+        _OWN_SHELL: snapshot.PsRow(4242, "ttys001", "S", _OWN_SHELL_ARGV),
+        4242: snapshot.PsRow(1, "ttys001", "S", "claude"),
+    }
+    reads: list[dict[int, Any]] = [snapshot.PsTimedOut(), snapshot.PsTimedOut()]
+    monkeypatch.setattr(terminal, "ps_table", lambda: reads.pop(0) if reads else dict(rows))
+    tree = {4242: [(_OWN_SHELL, _OWN_SHELL_ARGV)], _OWN_SHELL: [(me, "ccc")]}
+    scans: list[dict[int, list[tuple[int, str]]]] = [snapshot.PsFailed()]
+    monkeypatch.setattr(claude_adapter, "_children_map", lambda: scans.pop(0) if scans else tree)
+    assert harness.start() == 0
+    assert "untracked shell" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("drain", "code"), [("30", 0), ("0", 1)])
+def test_c8_final_in_flight_veto_redrains_within_the_drain_budget(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    drain: str,
+    code: int,
+) -> None:
+    """A shell that starts after ``-D``'s drain cleared vetoes the final check; with budget
+    left the start drains again (the shell ends) and opens, with none it fails as before."""
+    tree: dict[int, list[tuple[int, str]]] = {}
+    monkeypatch.setattr(claude_adapter, "_children_map", lambda: tree)
+    real_inventory = continue_session.inventory
+    real_compose = continue_session._compose  # pylint: disable=protected-access
+    calls: list[bool] = []
+
+    def _compose(*args: Any) -> Any:
+        composed = real_compose(*args)
+        tree[4242] = [(_OWN_SHELL, _OWN_SHELL_ARGV)]  # a shell starts after the drain
+        return composed
+
+    def _inventory(*args: Any) -> inflight.Inventory:
+        inv = real_inventory(*args)
+        calls.append(inv.clear)
+        tree.clear()  # … and it is gone by the next poll
+        return inv
+
+    monkeypatch.setattr(continue_session, "_compose", _compose)
+    monkeypatch.setattr(continue_session, "inventory", _inventory)
+    assert harness.start("-D", drain) == code
+    err = capsys.readouterr().err
+    with Store() as store:
+        transfers = store.transfers_of(SID)
+    # the compose-time state read, then the final check that meets the shell
+    if code == 0:
+        assert "draining again" in err and calls == [True, False, True]
+        assert transfers and transfers[0].state == "finalized"
+    else:
+        assert "work is still in flight" in err and calls == [True, False]
+        assert transfers == [] and harness.launches == []

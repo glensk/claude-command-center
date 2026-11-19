@@ -88,7 +88,7 @@ def resolve_source(
     caller is treated as another shell — account, cwd, pid and transcript come from the
     registry/store and no process ancestry is ignored.
     """
-    from . import accounts, terminal
+    from . import accounts
     from .models import current_model
 
     if outside and not explicit:
@@ -112,7 +112,7 @@ def resolve_source(
     cwd = (live.cwd if live else "") or (stored.cwd if stored else "") or os.getcwd()
     # tp#2032: a superseded observed model (opus-5) is never carried into the successor.
     model = current_model((stored.model if stored else "") or (getattr(live, "model", "") or ""))
-    ignore = terminal.pid_ancestry(os.getpid(), terminal.ps_table()) if inside else frozenset()
+    ignore = _own_ancestry() if inside else frozenset()
     return Source(
         session_id=sid,
         cwd=cwd,
@@ -124,6 +124,36 @@ def resolve_source(
         ignore=ignore,
         model=model,
     )
+
+
+def _own_ancestry() -> frozenset[int]:
+    """This process and every parent above it — the chain an inside caller must ignore.
+
+    A failed or timed-out ``ps`` read (one without this very process in it) left the
+    ancestry at ``{getpid}`` alone, so the caller's own Bash-tool shell vetoed the start as
+    an "untracked shell" (tp#2172 C8): read the table twice, then fall back to inverting
+    the adapter's own process scan. Best effort — never raises.
+    """
+    # pylint: disable=protected-access  # the adapter's cached ``ps`` scan is the fallback
+    from . import terminal
+    from .adapters import claude as claude_adapter
+
+    me = os.getpid()
+    for _attempt in range(2):
+        table = terminal.ps_table()
+        if me in table:
+            return terminal.pid_ancestry(me, table)
+    parents = {
+        child: parent
+        for parent, kids in claude_adapter._children_map().items()
+        for child, _command in kids
+    }
+    chain: set[int] = set()
+    current = me
+    while current > 0 and current not in chain:
+        chain.add(current)
+        current = parents.get(current, 0)
+    return frozenset(chain)
 
 
 def _clear_stale_counter(store: Store, session_id: str, stale: int) -> None:
@@ -324,6 +354,14 @@ ACCEPT_WAIT_FLOOR_SEC = 120  # the clamp never cuts the accept wait below this
 
 class StartRefused(Exception):
     """A fail-closed preflight refusal; the message is printed, nothing was written."""
+
+
+class InFlightRefused(StartRefused):
+    """:func:`_preflight`'s final in-flight veto — ``start -D`` re-drains on it (tp#2172 C8)."""
+
+
+#: ``start -D``: how often the final in-flight veto may send the start back to the drain.
+START_REDRAIN_MAX = 3
 
 
 #: tp#1681 L3c: once the exit of a model-written part over MODEL_MAX_CHARS. Never returned
@@ -558,9 +596,11 @@ def _preflight(  # pylint: disable=too-many-arguments
         accounts.ensure_trusted(target, src.cwd)  # the successor must not park on the dialog
     if not dry_run and not accounts.is_trusted(target, src.cwd):
         raise StartRefused(f"could not confirm {src.cwd} is trusted for the {label!r} account")
+    if src.inside and src.pid not in src.ignore:  # tp#2172 C8: a failed ps hid the chain
+        src.ignore = _own_ancestry()
     inv = inventory(adapter, store, src)
     if not inv.clear:
-        raise StartRefused(
+        raise InFlightRefused(
             "work is still in flight — drain first (ccc continue-session drain): "
             + "; ".join(inv.reasons + inv.unknown_processes())
         )
@@ -1752,6 +1792,47 @@ def _start_drained(adapter: ClaudeAdapter, store: Store, src: Source, args: Any)
     return ok
 
 
+def _preflight_drained(  # pylint: disable=too-many-arguments
+    adapter: ClaudeAdapter,
+    store: Store,
+    src: Source,
+    args: Any,
+    *,
+    outside: bool,
+    drain_started: float,
+) -> str:
+    """:func:`_preflight`; under ``start -D`` its in-flight veto re-drains with what is left.
+
+    The budget is ``-D`` minus the seconds since the first drain began: work that started
+    after the drain cleared (a shell, a resumed agent) is waited out within the same
+    bounded call instead of failing the start (tp#2172 C8). Without ``-D``, with no budget
+    left, or after :data:`START_REDRAIN_MAX` re-drains, the veto is raised as before.
+    """
+    attempts = 0
+    while True:
+        try:
+            return _preflight(
+                adapter, store, src, args.account, dry_run=args.dry_run, outside=outside
+            )
+        except InFlightRefused:
+            left = (
+                float(args.drain) - (_monotonic() - drain_started)
+                if args.drain is not None
+                else 0.0
+            )
+            attempts += 1
+            if left <= 0 or attempts > START_REDRAIN_MAX:
+                raise
+            print(
+                f"work is in flight at the final check — draining again ({left:.0f}s of -D left)",
+                file=sys.stderr,
+            )
+            ok, inv = _drain_source(adapter, store, src, left)
+            if not ok:
+                print(_render_inflight(inv.to_dict()))
+                raise
+
+
 def _start_input(args: argparse.Namespace) -> tuple[bytes, str]:
     """``(model file bytes, refusal)``: the handoff file, or why the flags give none."""
     if args.facts_only and (args.file or args.capped):
@@ -1804,6 +1885,7 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
         raw, problem = _start_input(args)
         if problem:
             return _fail(args, src.session_id, problem)
+        drain_started = _monotonic()
         if args.drain is not None and not _start_drained(adapter, store, src, args):
             return _fail(
                 args,
@@ -1817,8 +1899,8 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
             return _fail(args, src.session_id, str(exc))
         _say_failed_required(args, src.session_id, composed)
         try:
-            target_dir = _preflight(
-                adapter, store, src, args.account, dry_run=args.dry_run, outside=outside
+            target_dir = _preflight_drained(
+                adapter, store, src, args, outside=outside, drain_started=drain_started
             )
             candidate = _candidate(
                 store, src, target_dir, args.account, args, composed.digest, composed.snapshot

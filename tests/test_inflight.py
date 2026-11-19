@@ -655,3 +655,156 @@ def test_current_quote_style_matches_its_transcript_item_and_the_doorbell_exempt
     )
     assert inflight.inventory(adapter, 4242, bell_only, disposable_shell=exempt).clear
     assert not inflight.inventory(adapter, 4242, bell_only).clear
+
+
+# --------------------------------------- tp#2172 C8: ps failure, keep-alive notifications
+
+
+@pytest.mark.parametrize("failure", ["timeout", "oserror", "nonzero"])
+def test_c8_a_failed_ps_is_unknown_never_idle(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-11-18 23:21Z: ``ps`` failed under load, the walk saw no children and the drain
+    passed with the session's own pylint shell alive. A failed read now vetoes."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    def _run(argv: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(argv, float(kw["timeout"]))  # type: ignore[arg-type]
+        if failure == "oserror":
+            raise OSError("no ps")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    monkeypatch.setattr(claude_adapter, "_PROC_CACHE", {"ts": 0.0, "map": {}, "failed_at": None})
+    monkeypatch.setattr(claude_adapter.subprocess, "run", _run)
+    adapter = claude_adapter.ClaudeAdapter()
+    assert claude_adapter._children_map() == {}  # pylint: disable=protected-access
+    assert adapter.process_scan_failed()
+    inv = inflight.inventory(adapter, 4242, _empty_transcript(tmp_path))
+    assert not inv.clear
+    assert any("process table could not be read" in reason for reason in inv.reasons)
+    # No live pid (nothing to walk): the process table is not consulted at all.
+    assert inflight.inventory(adapter, 0, _empty_transcript(tmp_path)).clear
+
+
+def test_c8_a_good_read_after_a_failed_one_in_the_window_still_vetoes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass whose first read failed is not cleared by a later good read."""
+    monkeypatch.setattr(
+        claude_adapter, "_PROC_CACHE", {"ts": 0.0, "map": {}, "failed_at": time.monotonic()}
+    )
+    monkeypatch.setattr(claude_adapter, "_children_map", dict)
+    inv = inflight.inventory(claude_adapter.ClaudeAdapter(), 4242, _empty_transcript(tmp_path))
+    assert not inv.clear
+    monkeypatch.setattr(
+        claude_adapter,
+        "_PROC_CACHE",
+        {"ts": 0.0, "map": {}, "failed_at": time.monotonic() - 60.0},
+    )
+    assert inflight.inventory(
+        claude_adapter.ClaudeAdapter(), 4242, _empty_transcript(tmp_path)
+    ).clear
+
+
+def _iso(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(epoch))
+
+
+def _agent_launch(agent: str, epoch: float) -> str:
+    return json.dumps(
+        {
+            "type": "user",
+            "timestamp": _iso(epoch),
+            "toolUseResult": {"isAsync": True, "status": "async_launched", "agentId": agent},
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_" + agent}]},
+        }
+    )
+
+
+def _agent_notification(agent: str, epoch: float, *, keepalive: bool) -> str:
+    if keepalive:
+        summary = f'Agent "{agent}" is waiting on its own background work'
+        note = (
+            "This agent stopped with background work of its own still running. It may "
+            "resume when that work finishes, and the same task-id notifies again."
+        )
+    else:
+        summary = f'Agent "{agent}" finished'
+        note = "fires each time this agent stops with no live background children"
+    content = (
+        f"<task-notification>\n<task-id>{agent}</task-id>\n<status>completed</status>\n"
+        f"<summary>{summary}</summary>\n<note>{note}</note>\n</task-notification>"
+    )
+    return json.dumps(
+        {
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "timestamp": _iso(epoch),
+            "content": content,
+        }
+    )
+
+
+def test_c8_keepalive_notification_keeps_the_agent_and_never_calls_the_counter_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-11-18 23:20:43Z: agent a8d6673e notified "waiting on its own background work";
+    at 23:27:39Z the drain called the store counter (1, SubagentStart 177 s old) stale and
+    cleared it while the agent ran. The keep-alive notification no longer ends the agent;
+    the later "finished" one does."""
+    monkeypatch.setattr(claude_adapter, "_children_map", dict)
+    adapter = claude_adapter.ClaudeAdapter()
+    now = time.time()
+    agent = "a8d6673efdbaa0117"
+    transcript = tmp_path / "s.jsonl"
+    lines = [
+        _agent_launch(agent, now - 1500),
+        _agent_notification(agent, now - 400, keepalive=True),
+    ]
+    transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    now_ms = int(now * 1000)
+    kept = inflight.inventory(
+        adapter,
+        0,
+        transcript,
+        active_subagents=1,
+        subagent_started_at=now_ms - 177_000,
+        now_ms=now_ms,
+    )
+    assert not kept.clear and kept.stale_counter == 0
+    assert any(agent in reason for reason in kept.reasons)
+
+    lines.append(_agent_notification(agent, now - 5, keepalive=False))
+    transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    done = inflight.inventory(
+        adapter,
+        0,
+        transcript,
+        active_subagents=1,
+        subagent_started_at=now_ms - 177_000,
+        now_ms=now_ms,
+    )
+    assert done.clear and done.stale_counter == 1
+
+
+def test_c8_keepalive_without_a_sign_of_life_ends_after_the_stale_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An old keep-alive notification counts as ended unless the subagent jsonl moved."""
+    monkeypatch.setattr(claude_adapter, "_children_map", dict)
+    now = time.time()
+    old = now - claude_adapter.KEEPALIVE_STALE_S - 600
+    transcript = tmp_path / "s.jsonl"
+    transcript.write_text(
+        _agent_launch("ag1", old - 60)
+        + "\n"
+        + _agent_notification("ag1", old, keepalive=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    assert background_work_split(transcript) == ([], [])
+    jsonl = tmp_path / "s" / "subagents" / "agent-ag1.jsonl"
+    jsonl.parent.mkdir(parents=True)
+    jsonl.write_text("{}\n", encoding="utf-8")  # written just now: alive
+    assert background_work_split(transcript) == (["ag1"], [])

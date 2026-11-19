@@ -219,6 +219,14 @@ def background_work(  # pylint: disable=too-many-arguments
         extra = {"disposable_shell": disposable_shell} if disposable_shell is not None else {}
         if adapter.has_background_task(live_pid, ignore, skip_keepwarm=True, **extra):
             reasons.append("a background Bash task shell is running")
+        # tp#2172 C8: an unreadable process table walked as empty is UNKNOWN, never idle
+        # (an adapter stub without the probe keeps today's behaviour).
+        scan_failed = getattr(adapter, "process_scan_failed", None)
+        if callable(scan_failed) and scan_failed() is True:
+            reasons.append(
+                "the process table could not be read (ps failed or timed out)"
+                " — background state unknown"
+            )
     if transcript is None:
         reasons.append("the session transcript could not be located — background state unknown")
     else:

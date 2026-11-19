@@ -43,6 +43,7 @@ from ..models import (
     now_ms,
 )
 from ..session_continue import parse_limit_message
+from ..snapshot import PsFailed, ps_failed
 
 # A genuine invocation of the Codex workflow records the slash command as a
 # ``<command-name>/codex-implement-task-and-claude-review`` tag in the transcript.
@@ -55,7 +56,11 @@ _CODEX_WORKFLOW_MARKER = f"<command-name>/{CODEX_WORKFLOW_NAME}"
 
 # Short-lived cache of the process tree (ppid -> [(pid, command)]) so all the
 # per-session has_subagent() calls in one TUI refresh share a single `ps` scan.
-_PROC_CACHE: dict[str, object] = {"ts": 0.0, "map": {}}
+_PROC_CACHE: dict[str, object] = {"ts": 0.0, "map": {}, "failed_at": None}
+#: How long a failed ``ps`` read keeps :meth:`ClaudeAdapter.process_scan_failed` true: one
+#: veto pass reads the table several times (cache 3 s, a read up to 5 s), and any read
+#: of the pass that failed makes the whole pass unknown (tp#2172 C8).
+_PS_FAILURE_WINDOW_S = 15.0
 
 # A Bash-tool shell signature: Claude Code runs every Bash tool call as a zsh that
 # first ``source``s a per-session shell snapshot under ``~/.claude/shell-snapshots/``.
@@ -657,6 +662,16 @@ def _is_claude_program(command: str) -> bool:
 
 _TRANSCRIPT_TAIL_BYTES = 32 * 1024 * 1024
 _TASK_ID_RE = re.compile(r"<task-id>([A-Za-z0-9_-]+)</task-id>")
+# tp#2172 C8: the notification Claude Code sends when an agent STOPS a turn while its own
+# background work still runs. The agent is not over: it resumes when that work reports
+# back, and the same task id notifies again (the real end is a later notification).
+_KEEPALIVE_RE = re.compile(
+    rb"stopped with background work of its own still running"
+    rb"|is waiting on its own background work"
+)
+#: How long a kept-alive agent counts as in flight after its last sign of life (the
+#: keep-alive notification, its subagent jsonl's mtime); older, it is taken as ended.
+KEEPALIVE_STALE_S = 1800
 
 
 def transcript_turn_in_flight(transcript: Path) -> bool | None:
@@ -766,7 +781,10 @@ def background_work_split(
     task) or ``status == "async_launched"`` with an ``agentId`` (a background agent);
     it ends with a ``TaskStop`` tool call that did not error, or with a
     ``<task-notification>`` naming the id in ``<task-id>…</task-id>`` — in ANY of the
-    shapes Claude Code has written one (``_notification_task_ids``). Launched minus
+    shapes Claude Code has written one (``_notification_task_ids``) — except a keep-alive
+    notification (``_KEEPALIVE_RE``: the agent stopped a turn with its own background work
+    still running), which keeps it in flight until a later notification / TaskStop, or
+    until it shows no sign of life for ``KEEPALIVE_STALE_S`` (tp#2172 C8). Launched minus
     ended = still in flight (order kept). An in-flight Bash task whose launching
     ``tool_use`` command is a keep-warm timer (``is_keepwarm_command``; the launch
     record's ``tool_result.tool_use_id`` names that ``tool_use``) goes to *keepwarm*
@@ -834,6 +852,7 @@ def background_launch_scan(
     keepwarm: set[str] = set()  # launched task ids that are keep-warm timers
     launches: dict[str, BackgroundLaunch] = {}
     agent_inputs: dict[str, dict[str, object]] = {}  # Agent/Task tool_use id -> input
+    kept_alive: dict[str, float] = {}  # task id -> epoch of its keep-alive notification
     for index, line in enumerate(lines):
         if not line.strip():
             continue
@@ -856,14 +875,53 @@ def background_launch_scan(
             keepwarm.add(task_id)
         keepwarm_uses.update(_keepwarm_tool_use_ids(record, disposable_shell))
         agent_inputs.update(_agent_tool_inputs(record))
-        ended.update(_notification_task_ids(record))
+        notified = _notification_task_ids(record)
+        if notified and _KEEPALIVE_RE.search(line):  # last event wins: not over yet
+            ended.difference_update(notified)
+            kept_alive.update(dict.fromkeys(notified, _record_epoch(record)))
+        else:
+            ended.update(notified)
         _track_task_stops(record, stops, ended)
+    ended.update(_stale_keepalives(transcript, kept_alive, ended))
     in_flight = [task_id for task_id in launched if task_id not in ended]
     return BackgroundScan(
         [task_id for task_id in in_flight if task_id not in keepwarm],
         [task_id for task_id in in_flight if task_id in keepwarm],
         launches,
     )
+
+
+def _record_epoch(record: dict[str, object]) -> float:
+    """*record*'s ISO ``timestamp`` as epoch seconds (``0.0`` when absent or unparseable)."""
+    stamp = record.get("timestamp")
+    if not isinstance(stamp, str) or not stamp:
+        return 0.0
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _stale_keepalives(transcript: Path, kept_alive: dict[str, float], ended: set[str]) -> set[str]:
+    """The kept-alive ids (still open in *ended*'s terms) with no sign of life for too long.
+
+    A sign of life is the keep-alive notification itself or a write to the agent's subagent
+    jsonl (``<stem>/subagents/agent-<id>.jsonl``); both older than
+    :data:`KEEPALIVE_STALE_S` = the agent is taken as ended (tp#2172 C8).
+    """
+    now = time.time()
+    base = transcript.parent / transcript.stem / "subagents"
+    stale: set[str] = set()
+    for task_id, notified_at in kept_alive.items():
+        if task_id in ended:
+            continue
+        try:
+            seen = max(notified_at, (base / f"agent-{task_id}.jsonl").stat().st_mtime)
+        except OSError:
+            seen = notified_at
+        if now - seen > KEEPALIVE_STALE_S:
+            stale.add(task_id)
+    return stale
 
 
 def _agent_tool_inputs(record: dict[str, object]) -> dict[str, dict[str, object]]:
@@ -993,21 +1051,34 @@ def _track_task_stops(record: dict[str, object], stops: dict[str, str], ended: s
 
 
 def _children_map() -> dict[int, list[tuple[int, str]]]:
+    """``{ppid: [(pid, command), …]}`` from one short-lived ``ps`` pass (cached 3 s).
+
+    A ``ps`` that raised, timed out or exited non-zero answers an empty
+    :class:`snapshot.PsFailed` (cached like a good read, and its time kept in
+    ``_PROC_CACHE["failed_at"]``), so display callers keep degrading on ``{}`` while a
+    veto (:meth:`ClaudeAdapter.process_scan_failed`) tells "unknown" from "idle"
+    (tp#2172 C8).
+    """
     now = time.monotonic()
     if isinstance(_PROC_CACHE["ts"], float) and now - _PROC_CACHE["ts"] < 3.0:
         return _PROC_CACHE["map"]  # type: ignore[return-value]
     children: dict[int, list[tuple[int, str]]] = {}
     try:
-        out = subprocess.run(
+        result = subprocess.run(
             ["ps", "-Ao", "pid=,ppid=,command="],
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
-        ).stdout
+        )
     except (subprocess.SubprocessError, OSError):
-        out = ""
-    for line in out.splitlines():
+        result = None
+    if result is None or result.returncode != 0:
+        failed: dict[int, list[tuple[int, str]]] = PsFailed()
+        _PROC_CACHE["ts"] = _PROC_CACHE["failed_at"] = time.monotonic()
+        _PROC_CACHE["map"] = failed
+        return failed
+    for line in result.stdout.splitlines():
         parts = line.split(None, 2)
         if len(parts) < 3:
             continue
@@ -1016,7 +1087,7 @@ def _children_map() -> dict[int, list[tuple[int, str]]]:
         except ValueError:
             continue
         children.setdefault(parent_pid, []).append((child_pid, parts[2]))
-    _PROC_CACHE["ts"] = now
+    _PROC_CACHE["ts"] = time.monotonic()
     _PROC_CACHE["map"] = children
     return children
 
@@ -1575,6 +1646,21 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
             except OSError:
                 pass
         return live.updated_at or live.status_updated_at or live.started_at
+
+    def process_scan_failed(self) -> bool:
+        """True when the process table could not be read (``ps`` failed or timed out).
+
+        Then :meth:`has_subagent` / :meth:`has_background_task` saw an empty tree and
+        answered ``False`` — unknown, not idle; the relaunch veto refuses on it (tp#2172 C8).
+        A failure within the last ``_PS_FAILURE_WINDOW_S`` counts too, so a pass whose
+        earlier read failed is not cleared by a later good one.
+        """
+        if ps_failed(_children_map()):
+            return True
+        failed_at = _PROC_CACHE.get("failed_at")
+        return isinstance(failed_at, float) and (
+            time.monotonic() - failed_at < _PS_FAILURE_WINDOW_S
+        )
 
     def has_subagent(self, pid: int, ignore: frozenset[int] = frozenset()) -> bool:
         """Best-effort: True if *pid* has a descendant ``claude`` process (a subagent).

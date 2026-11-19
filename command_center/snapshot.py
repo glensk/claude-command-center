@@ -382,7 +382,20 @@ def parse_ps(text: str) -> dict[int, PsRow]:
 PS_TIMEOUT_SEC = 15.0
 
 
-class PsTimedOut(dict[int, PsRow]):
+class PsFailed(dict[Any, Any]):
+    """The EMPTY table a ``ps`` read answers when it FAILED (tp#2172 C8).
+
+    Still an empty dict, so every display caller that degrades on ``{}`` keeps doing so;
+    a veto that must not read "no processes" as "idle" asks :func:`ps_failed` instead.
+    """
+
+
+def ps_failed(table: Mapping[Any, Any]) -> bool:
+    """True when *table* is a failed (or timed-out) ``ps`` read, never a real empty table."""
+    return isinstance(table, PsFailed)
+
+
+class PsTimedOut(PsFailed):
     """The EMPTY table :func:`read_ps` answers when ``ps`` timed out (tp#1868 B5).
 
     Still an empty dict, so every caller that degrades on ``{}`` keeps doing so; only the
@@ -399,8 +412,8 @@ def ps_timed_out(table: Mapping[int, Any]) -> bool:
 def read_ps(timeout: float = PS_TIMEOUT_SEC) -> dict[int, PsRow]:
     """One live ``ps`` pass (empty on any failure — every caller degrades).
 
-    A timeout answers an empty :class:`PsTimedOut`, an OSError or a non-zero exit a plain
-    ``{}`` (:func:`ps_timed_out` tells them apart).
+    A timeout answers an empty :class:`PsTimedOut`, an OSError or a non-zero exit an empty
+    :class:`PsFailed` (:func:`ps_timed_out` / :func:`ps_failed` tell them apart).
     """
     try:
         result = subprocess.run(
@@ -413,8 +426,8 @@ def read_ps(timeout: float = PS_TIMEOUT_SEC) -> dict[int, PsRow]:
     except subprocess.TimeoutExpired:
         return PsTimedOut()
     except (OSError, subprocess.SubprocessError):
-        return {}
-    return parse_ps(result.stdout) if result.returncode == 0 else {}
+        return PsFailed()
+    return parse_ps(result.stdout) if result.returncode == 0 else PsFailed()
 
 
 def parse_lsof_cwds(text: str) -> dict[int, str]:
