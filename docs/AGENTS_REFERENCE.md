@@ -398,7 +398,12 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
   There is NO relaunch (the cause is deterministic): `start` aborts the transfer and exits 1
   (`SuccessorDied`, nothing moved, the source stays authoritative); the sweep aborts it the
   same way. The abort stamps the transfer (`record_orphaned`, reusing `accept_refused_at`) so
-  the D13 orphan closer closes the idle successor tab. `status` shows `first_turn` and the
+  the D13 orphan closer closes the idle successor tab. Such a stub never got a prompt, so it
+  has no transcript: the sweep spawns that closer with `--orphan` (tp#2326 B7), which, with
+  NO transcript file at all, proves idle by the same PID + start time, registry `idle` and a
+  still `pending` `start_job` ledger row (no row `matched`), stable over the window; a
+  transcript that exists but is unreadable, and every source close, still refuses
+  `unobservable`. `status` shows `first_turn` and the
   next step. `no-accept` (a first turn but never accepted) still relaunches once.
 - **The handoff closer is the only thing that closes a handed-off source**
   (`handoff_close.py`): it claims the source's close token, binds ONE live process (PID +

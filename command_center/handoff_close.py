@@ -15,6 +15,9 @@ provably and stably idle. Token-scoped and process-bound:
 4. Require registry ``idle``, ``inspect_transcript(...).turn_active is False`` and an
    unchanged transcript identity (inode, mtime, size) over :data:`STABLE_WINDOW_SEC` —
    also with ``stop_barrier_enabled = false``, where only the Stop-chain drain is skipped.
+   The orphan close of a successor that has NO transcript at all (``--orphan``, tp#2326
+   B7: a ``no-first-turn`` stub never got a prompt) proves idle instead by the same PID +
+   start time, registry ``idle`` and a still ``pending`` handoff ledger row.
 5. Revalidate lineage, token, PID, PID start time, idle state and transcript immediately
    before the SIGTERM, then write the ``handoff:`` debt onto the still in-flight token
    (:meth:`Store.bind_close_debt`, a holder CAS) — a failed write refuses unsignalled, and

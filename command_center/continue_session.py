@@ -818,13 +818,14 @@ def _source_alive(adapter: ClaudeAdapter, session_id: str) -> bool:
         return True
 
 
-def _spawn_closer(transfer_id: str, session_id: str) -> bool:
-    """Start the detached token-scoped handoff closer (``close-now --handoff-transfer``)."""
+def _spawn_closer(transfer_id: str, session_id: str, *, orphan: bool = False) -> bool:
+    """Start the detached token-scoped handoff closer (``close-now --handoff-transfer``).
+
+    *orphan* (the daemon sweep's orphan close only, tp#2326 B7) adds ``--orphan``."""
     from . import spawn
 
-    return spawn.spawn_ccc(
-        ["close-now", "--handoff-transfer", transfer_id, "--session", session_id]
-    )
+    argv = ["close-now", "--handoff-transfer", transfer_id, "--session", session_id]
+    return spawn.spawn_ccc([*argv, "--orphan"] if orphan else argv)
 
 
 def finalize_handoff_source(store: Store, adapter: ClaudeAdapter, transfer: Any) -> dict[str, Any]:
@@ -2492,6 +2493,11 @@ def _abort(store: Store, transfer_id: str, reason: str, now: int) -> _Abort:
             what.append(f"released {len(reserved)} await group(s) to the source")
         if archived:
             what.append(f"archived the never-started successor {target}")
+        elif row is not None and failure.endswith(NO_FIRST_TURN):  # tp#2326 B7: the orphan close
+            what.append(
+                f"the successor {target} was started and stays open: it never got its "
+                "first prompt; ccc closes its tab once it is idle"
+            )
         elif row is not None:
             what.append(
                 f"the successor {target} was started and stays open: its accept now "

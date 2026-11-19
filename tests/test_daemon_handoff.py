@@ -4,6 +4,8 @@ Every closer spawn is stubbed (``spawn.spawn_ccc``) and ``os.kill`` refuses: the
 itself never signals anything; state lives in the temp ``CCC_HOME`` of ``conftest``.
 """
 
+# pylint: disable=too-many-lines  # one module covers every handoff sweep step
+
 from __future__ import annotations
 
 import argparse
@@ -56,6 +58,11 @@ def _spawns(monkeypatch: pytest.MonkeyPatch) -> _Spawns:
 
     monkeypatch.setattr(daemon.os, "kill", no_kill)
     return stub
+
+
+def _orphan_closer(tid: str) -> list[str]:
+    """The orphan close's spawn: ``--orphan`` (tp#2326 B7) on the successor's closer."""
+    return [*_closer(tid, DST), "--orphan"]
 
 
 def _closer(tid: str, sid: str = SRC) -> list[str]:
@@ -861,7 +868,7 @@ def test_sweep_closes_the_orphan_of_a_no_first_turn_abort(
     assert _sweep(snapshot, dry_run=True).handoff_closers == [DST]
     assert not spawns.calls and not _row(DST).close_token  # dry run: nothing armed
     closing = _sweep(snapshot)
-    assert closing.handoff_closers == [DST] and spawns.calls == [_closer(tid, DST)]
+    assert closing.handoff_closers == [DST] and spawns.calls == [_orphan_closer(tid)]
     assert _row(DST).close_token and not _row(SRC).close_token  # the source is never touched
     assert not _sweep(snapshot).handoff_closers  # paced
     assert _state(tid) == "failed" and _stamp(tid) == stamp
@@ -988,7 +995,7 @@ def test_sweep_arms_close_for_refused_successor_of_failed_transfer(
     assert _sweep(orphan, dry_run=True).handoff_closers == [DST]
     assert not spawns.calls and not _row(DST).close_token  # dry-run: nothing armed
     report = _sweep(orphan)
-    assert report.handoff_closers == [DST] and spawns.calls == [_closer(tid, DST)]
+    assert report.handoff_closers == [DST] and spawns.calls == [_orphan_closer(tid)]
     row = _row(DST)
     assert row.close_token and row.close_requested_at > 0
     assert not _row(SRC).close_token  # the source is never touched
@@ -997,3 +1004,22 @@ def test_sweep_arms_close_for_refused_successor_of_failed_transfer(
         assert handoff_close.lineage_refusal(store, tid, SRC) != ""
     assert not _sweep(orphan).handoff_closers  # paced
     assert _state(tid) == "failed"
+
+
+def test_only_the_orphan_close_spawns_its_closer_with_the_orphan_flag(
+    spawns: _Spawns, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#2326 B7: the orphan spawn's argv parses to ``orphan=True`` on the successor; a
+    finalized source's closer never carries the flag (it keeps the transcript rule)."""
+    tid = _opened(heartbeat_ms=5 * MINUTE, pid=777)
+    _use_ps(monkeypatch, _ps_rows((SRC_PID, 1, "claude")))
+    snapshot = {**_live(), DST: _successor(now_ms() - 9 * MINUTE)}
+    assert _sweep(snapshot).handoff_aborted == [tid]
+    assert _sweep(snapshot).handoff_closers == [DST]
+    (argv,) = spawns.calls
+    args = cli.build_parser().parse_args(argv)
+    assert args.orphan is True and args.session == DST and args.handoff_transfer == tid
+    finalized = _transfer("finalized", src=SRC2, dst=DST2)
+    _sweep({SRC2: LiveSession(4243, SRC2, "/repo", raw_status="idle", alive=True)})
+    assert spawns.calls[1:] == [_closer(finalized, SRC2)]
+    assert cli.build_parser().parse_args(spawns.calls[1]).orphan is False

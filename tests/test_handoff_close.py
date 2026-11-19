@@ -776,3 +776,173 @@ def test_an_error_after_the_signal_keeps_the_debt(
     assert row.close_token == token and row.close_requested_at > 0
     assert handoff_close.Debt.decode(row.close_bound) == _EXPECTED_DEBT
     assert "internal error" in _events(tmp_path)
+
+
+# ------------------------------------------- tp#2326 B7: a transcript-less orphan successor
+
+
+def _seed_orphan(*, ledger: str | None = "pending") -> str:
+    """A FAILED transfer SRC → TGT whose ``no-first-turn`` abort orphaned TGT: the orphan
+    stamp, TGT's close armed and (unless *ledger* is ``None``) its ``start_job`` row."""
+    from command_center.bridge_store import Input
+
+    now = now_ms()
+    with Store() as store:
+        store.ensure(SRC, cwd="/repo")
+        store.ensure(TGT, cwd="/repo")
+        store.update_fields(TGT, iterm_session_id=ITERM)
+        store.create_transfer(
+            Transfer(transfer_id=TID, source_session=SRC, target_session=TGT), now
+        )
+        store.conn.execute("UPDATE transfers SET state = 'failed' WHERE transfer_id = ?", (TID,))
+        store.conn.commit()
+        assert store.record_orphaned(TID, now)
+        if ledger is not None:
+            store.insert_input(
+                Input(
+                    input_id="launch-1",
+                    session_id=TGT,
+                    kind="start_job",
+                    origin="automation",
+                    created_at=now,
+                    state=ledger,
+                )
+            )
+        return store.ensure_close_armed(TGT, now)
+
+
+def _no_transcript(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.ClaudeAdapter, "transcript_path", lambda *_a, **_k: None)
+
+
+def _target_row() -> Any:
+    with Store() as store:
+        return store.get(TGT)
+
+
+def _assert_orphan_refused(world: World, token: str, tmp_path: Path, text: str) -> None:
+    assert not world.killed and not world.closed
+    row = _target_row()
+    assert row.close_token == token and row.close_requested_at > 0  # pending again
+    assert text in _events(tmp_path)
+
+
+def test_a_transcriptless_orphan_with_a_pending_launch_row_is_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--orphan``, no transcript file at all, the same pid + start, registry ``idle``,
+    the handoff ledger row still ``pending``: idle is proved, the stub tab closes."""
+    world = _install(tmp_path, monkeypatch)
+    _no_transcript(monkeypatch)
+    _seed_orphan()
+    assert cli.main(["close-now", "-H", TID, "-s", TGT, "-O"]) == 0
+    assert world.killed == [(PID, signal.SIGTERM)]
+    assert world.closed == [ITERM]
+    row = _target_row()
+    assert row.close_token == "" and row.close_requested_at == 0
+    assert "reaped, closed" in _events(tmp_path)
+
+
+def test_a_transcriptless_orphan_whose_launch_row_matched_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = _install(tmp_path, monkeypatch)
+    _no_transcript(monkeypatch)
+    token = _seed_orphan(ledger="matched")
+    assert handoff_close.run(_args(session=TGT, orphan=True)) == 1
+    _assert_orphan_refused(world, token, tmp_path, "got a prompt")
+
+
+@pytest.mark.parametrize("ledger", ["unmatched", None])
+def test_a_transcriptless_orphan_without_a_pending_launch_row_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ledger: str | None
+) -> None:
+    world = _install(tmp_path, monkeypatch)
+    _no_transcript(monkeypatch)
+    token = _seed_orphan(ledger=ledger)
+    assert handoff_close.run(_args(session=TGT, orphan=True)) == 1
+    _assert_orphan_refused(world, token, tmp_path, "idle unprovable")
+
+
+def test_a_transcriptless_orphan_whose_pid_start_changed_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = _install(tmp_path, monkeypatch)
+    _no_transcript(monkeypatch)
+    world.starts = [START, START, "Tue Nov  3 07:00:00 2026"]
+    token = _seed_orphan()
+    assert handoff_close.run(_args(session=TGT, orphan=True)) == 1
+    _assert_orphan_refused(world, token, tmp_path, "replaced")
+
+
+def test_a_transcriptless_orphan_whose_ledger_moves_in_the_window_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row written during the stability window changes the evidence: never signalled."""
+    from command_center.bridge_store import Input
+
+    world = _install(tmp_path, monkeypatch)
+    _no_transcript(monkeypatch)
+
+    def _send() -> None:
+        with Store() as store:
+            store.insert_input(Input(input_id="send-1", session_id=TGT, kind="send"))
+
+    world.on_sleep.append(_send)
+    token = _seed_orphan()
+    assert handoff_close.run(_args(session=TGT, orphan=True)) == 1
+    _assert_orphan_refused(world, token, tmp_path, "changed during the stability window")
+
+
+def test_a_transcriptless_orphan_in_shell_status_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``shell`` is idle only with a transcript showing no open turn."""
+    world = _install(tmp_path, monkeypatch)
+    _no_transcript(monkeypatch)
+    world.statuses = ["shell"]
+    token = _seed_orphan()
+    assert handoff_close.run(_args(session=TGT, orphan=True)) == 1
+    _assert_orphan_refused(world, token, tmp_path, "source busy")
+
+
+def test_an_orphan_with_an_unreadable_transcript_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The opt-in covers only NO transcript file: one that exists but cannot be read
+    refuses ``unobservable`` exactly as before."""
+    world = _install(tmp_path, monkeypatch)
+    world.transcript.chmod(0)
+    token = _seed_orphan()
+    try:
+        assert handoff_close.run(_args(session=TGT, orphan=True)) == 1
+    finally:
+        world.transcript.chmod(0o600)
+    _assert_orphan_refused(world, token, tmp_path, "transcript unreadable")
+
+
+def test_a_transcriptless_orphan_without_the_flag_stays_unobservable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = _install(tmp_path, monkeypatch)
+    _no_transcript(monkeypatch)
+    token = _seed_orphan()
+    assert handoff_close.run(_args(session=TGT)) == 1
+    _assert_orphan_refused(world, token, tmp_path, "transcript unreadable")
+
+
+@pytest.mark.parametrize("orphan", [False, True])
+def test_a_source_close_without_a_transcript_stays_unobservable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, orphan: bool
+) -> None:
+    """A finalized source's close keeps today's rule, ``--orphan`` or not: no transcript
+    refuses ``unobservable`` (the ledger fallback is the orphan successor's only)."""
+    from command_center.bridge_store import Input
+
+    world = _install(tmp_path, monkeypatch)
+    _no_transcript(monkeypatch)
+    token = _seed()
+    with Store() as store:
+        store.insert_input(Input(input_id="launch-1", session_id=SRC, kind="start_job"))
+    assert handoff_close.run(_args(orphan=orphan)) == 1
+    _assert_refused_and_restored(world, token, tmp_path, "transcript unreadable")

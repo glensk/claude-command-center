@@ -7303,6 +7303,9 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         default="",
         help="close a finalized continue-session transfer's idle source (token-scoped)",
     )
+    # Internal (daemon sweep, tp#2326 B7): the orphan close of a failed transfer's
+    # successor may prove idle without a transcript (pid + start + pending ledger row).
+    p_closenow.add_argument("-O", "--orphan", action="store_true", help=argparse.SUPPRESS)
     p_closenow.set_defaults(func=cmd_close_now)
 
     from . import continue_session  # stdlib-only at import: cheap to register

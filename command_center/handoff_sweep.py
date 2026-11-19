@@ -370,7 +370,9 @@ def _close_orphan(sweep: _Pass, transfer: Transfer) -> None:
     row = sweep.store.get(sid)
     if row is None or not row.close_token or not row.close_requested_at:
         return  # claimed meanwhile (its own Stop chain): that holder closes it
-    if continue_session._spawn_closer(tid, sid):  # pylint: disable=protected-access
+    # --orphan (tp#2326 B7): a no-first-turn stub has no transcript; its closer may prove
+    # idle by pid + start + a pending ledger row instead.
+    if continue_session._spawn_closer(tid, sid, orphan=True):  # pylint: disable=protected-access
         sweep.pacing[sid] = sweep.now
         sweep.report.handoff_closers.append(sid)
     else:

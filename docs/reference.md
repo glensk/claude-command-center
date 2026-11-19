@@ -2047,7 +2047,9 @@ launch through the same route would spend the rest of `-w` and leave a second de
 (no-first-turn: …); nothing moved and THIS session stays authoritative`, and the daemon
 sweep aborts such a transfer the same way (`sweep: successor dead: no-first-turn`). The abort
 stamps the transfer (`accept_refused_at`, "accept refused or orphaned") so the orphan closer
-closes the idle successor tab; fix the cause and run `start` again.
+closes the idle successor tab (with no transcript, as such a stub has none, it proves idle by
+the same process, registry `idle` and the successor's still-pending launch row in the input
+ledger); fix the cause and run `start` again.
 
 **A differing re-run never refuses (tp#2172).** A `start` that meets an active `prepared` /
 `opened` transfer of the same source with a different snapshot (handoff text, account `-A`,
