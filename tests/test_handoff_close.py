@@ -827,14 +827,38 @@ def _assert_orphan_refused(world: World, token: str, tmp_path: Path, text: str) 
     assert text in _events(tmp_path)
 
 
-def test_a_transcriptless_orphan_with_a_pending_launch_row_is_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _add_launch_row(state: str) -> None:
+    """A second ``start_job`` row of TGT in *state*."""
+    from command_center.bridge_store import Input
+
+    with Store() as store:
+        store.insert_input(
+            Input(
+                input_id="launch-2",
+                session_id=TGT,
+                kind="start_job",
+                origin="automation",
+                created_at=now_ms(),
+                state=state,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("ledger", "extra"),
+    [("pending", None), ("unmatched", None), ("pending", "unmatched")],
+)
+def test_a_transcriptless_orphan_with_an_unsubmitted_launch_row_is_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ledger: str, extra: str | None
 ) -> None:
     """``--orphan``, no transcript file at all, the same pid + start, registry ``idle``,
-    the handoff ledger row still ``pending``: idle is proved, the stub tab closes."""
+    every handoff ledger row still ``pending`` or ``unmatched`` (the ledger's 6 h expiry
+    of ``pending``, tp#2326 B8): idle is proved, the stub tab closes."""
     world = _install(tmp_path, monkeypatch)
     _no_transcript(monkeypatch)
-    _seed_orphan()
+    _seed_orphan(ledger=ledger)
+    if extra is not None:
+        _add_launch_row(extra)
     assert cli.main(["close-now", "-H", TID, "-s", TGT, "-O"]) == 0
     assert world.killed == [(PID, signal.SIGTERM)]
     assert world.closed == [ITERM]
@@ -853,7 +877,20 @@ def test_a_transcriptless_orphan_whose_launch_row_matched_is_refused(
     _assert_orphan_refused(world, token, tmp_path, "got a prompt")
 
 
-@pytest.mark.parametrize("ledger", ["unmatched", None])
+@pytest.mark.parametrize("first", ["pending", "unmatched"])
+def test_a_transcriptless_orphan_with_one_matched_launch_row_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: str
+) -> None:
+    """One ``matched`` row beside ``pending`` / ``unmatched`` ones still refuses."""
+    world = _install(tmp_path, monkeypatch)
+    _no_transcript(monkeypatch)
+    token = _seed_orphan(ledger=first)
+    _add_launch_row("matched")
+    assert handoff_close.run(_args(session=TGT, orphan=True)) == 1
+    _assert_orphan_refused(world, token, tmp_path, "got a prompt")
+
+
+@pytest.mark.parametrize("ledger", ["failed", None])
 def test_a_transcriptless_orphan_without_a_pending_launch_row_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ledger: str | None
 ) -> None:

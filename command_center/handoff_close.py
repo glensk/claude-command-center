@@ -292,12 +292,18 @@ def _stamp(path: Path | None) -> tuple[int, int, int] | None:
     return (stat.st_ino, stat.st_mtime_ns, stat.st_size) if stat is not None else None
 
 
+#: The input-ledger states of a launch row no prompt matched: ``pending``, and
+#: ``unmatched`` (``pending`` expired after ``MATCH_WINDOW_MS``, tp#2326 B8).
+_UNSUBMITTED = ("pending", "unmatched")
+
+
 def _no_transcript_proof(adapter: ClaudeAdapter, session_id: str, bound: Bound) -> Evidence:
     """The orphan's idle proof without a transcript (tp#2326 B7), or :class:`Refused`.
 
     Still no transcript file at all, and the successor's input ledger shows no prompt
-    ever reached it: at least one ``start_job`` row, every one still ``pending``, no row
-    of any kind ``matched``. The evidence is pid + start + every row's ``(id, state)``,
+    ever reached it: at least one ``start_job`` row, every one still ``pending`` or
+    ``unmatched`` (the ledger's expiry of ``pending`` after ``MATCH_WINDOW_MS``, tp#2326
+    B8), no row of any kind ``matched``. The evidence is pid + start + every row's ``(id, state)``,
     so a row written or moved during the stability window changes it.
     """
     try:
@@ -314,7 +320,7 @@ def _no_transcript_proof(adapter: ClaudeAdapter, session_id: str, bound: Bound) 
     launches = [row for row in rows if row.kind == "start_job"]
     if any(row.state == "matched" for row in rows):
         raise Refused("the successor got a prompt (input ledger matched)", "busy")
-    if not launches or any(row.state != "pending" for row in launches):
+    if not launches or any(row.state not in _UNSUBMITTED for row in launches):
         raise Refused(
             "no transcript and no pending handoff ledger row — idle unprovable", "unobservable"
         )
