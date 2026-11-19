@@ -3577,12 +3577,32 @@ facts as a top-level `api_credits` list (`id`, `account`, `usd_per_cycle`, `cycl
 `spend_at`, `spend_pending`, `spend_error`; `name`, `label`; with a `balance_json` source
 `balance_usd`, `balance_grant_usd`, `balance_used_pct`, `balance_source: "measured"`,
 `balance_at`, `balance_age_sec`, `balance_rows`, `purchased_usd`, `balance_error`,
-`balance_note`, `cap_spent_usd`, `cap_limit_usd`, `cap_used_pct`, `cap_resets_on`,
+`balance_note`, `balance_state`, `balance_status`, `balance_hint`, `cap_spent_usd`, `cap_limit_usd`, `cap_used_pct`, `cap_resets_on`,
 `cap_room_usd`, `cap_binds`, and with a fresh `cloud_credit` `cloud_left_usd`,
 `cloud_granted_usd`, `cloud_used_pct`, `cloud_expires_on`, `cloud_at`, `cloud_age_sec`;
 additive, schema still v2, absent when nothing is configured). `balance_usd` is `null`
 unless a fresh measured reading exists: an estimate is not a balance. They are not
 provider rows: no verdict, ranking or ladder reads them.
+
+**Unusable balance reading.** With a `balance_json` source configured, `balance_state`
+classifies the file: `missing` (no or unreadable file, or no good reading and no failure),
+`logged_out` (no usable reading, writer status `logged_out` or `wrong_account`),
+`read_failed` (no usable reading, any other failure), `stale` (older than 9 h, status `ok`),
+`no_promo` (fresh, no active promo row), `measured_failing` (fresh measured figure, but the
+latest attempt failed) and `measured`. "No usable reading" means no `measured_at` or one older
+than 9 h. `balance_status` and `balance_hint` carry the writer's `status` and `error` strings
+whenever a file was read. For `missing`, `logged_out`, `read_failed` and `stale` the estimate
+is never shown as if it were the balance:
+
+- **API PROMO card**: one warning line `<label>: <word> · <age> old` replaces the bar, with
+  the words `logged out`, `wrong account`, `read failed`, `stale` or `no Console reading`
+  (no age part for the last); a reading that never succeeded ends `· no data`. No `$`, no `%`,
+  no bar. The writer's hint follows as a grey line. A `measured_failing` or `no_promo` row
+  keeps its figure and adds a grey `Console <status>` line.
+- **`ccc quota`**: the state column reads `logged out`, `wrong acct`, `read fail`, `stale` or
+  `no reading`, no bar is drawn, the renew column is `—` (the configured expiry is as untrusted
+  as the estimate), the age column is the reading's age, and the detail leads with the state
+  and ends in `estimate only: …` followed by the spend estimate.
 
 ### The Muse Code row — `muse`
 
