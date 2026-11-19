@@ -2969,6 +2969,11 @@ def _account_config_dir(label: str | None) -> tuple[str, str | None]:
     if path is None:
         known = ", ".join(sorted(dirs)) or "(none)"
         return "", f"error: unknown account {label!r} — configured accounts: {known}"
+    from . import accounts
+
+    disabled = accounts.disabled_account_error(label)
+    if disabled:
+        return "", f"error: {disabled}"
     return str(path), None
 
 
@@ -5859,6 +5864,9 @@ def _resume_job(  # pylint: disable=too-many-locals,too-many-branches
                 "unknown_account",
                 f"unknown account {label!r} — configured accounts: {known}",
             )
+        disabled = accounts.disabled_account_error(label)
+        if disabled:
+            raise BridgeError("disabled_account", disabled)
     adapter = _adapter()
     live_ids = {ls.session_id for ls in adapter.discover() if ls.alive}
     with Store() as store:

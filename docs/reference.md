@@ -108,7 +108,7 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 **Sessions & tabs**
 
 - `ccc resume <id>` — resume a session in this terminal (`execvp`).
-- `ccc resume-job <id> [-A LABEL] [-P FILE] [-j]` — resume a parked session in a new tab (focuses it if already live). `-A/--account` resumes it on another configured account: only when its transcript is one shared file under both accounts (else `not_shared`) and after trusting the cwd for the target (else `untrusted`); the target's env pin comes from `accounts.py`, `no_codex` and the launch profile travel, a live session is refused (`live`, never focused) and the row then records the new account. `-P/--prompt-file` gives claude a first prompt from a private (0600) file, fed on stdin through a temp copy the tab's shell unlinks before claude starts (never argv or shell history); the file is removed whether or not the resume succeeds. `-j/--json` prints the bridge envelope: data `{session_id, result: "resumed", account}`, or `error.code` `unknown_account` · `not_shared` · `untrusted` · `live` · `no_transcript` · `no_tab` · `no_session` · `draft` · `no_account` · `prompt_file` (exit 2) · `automated` (exit 75 under `AI_AUTOMATED`).
+- `ccc resume-job <id> [-A LABEL] [-P FILE] [-j]` — resume a parked session in a new tab (focuses it if already live). `-A/--account` resumes it on another configured account: only when its transcript is one shared file under both accounts (else `not_shared`) and after trusting the cwd for the target (else `untrusted`); the target's env pin comes from `accounts.py`, `no_codex` and the launch profile travel, a live session is refused (`live`, never focused) and the row then records the new account. `-P/--prompt-file` gives claude a first prompt from a private (0600) file, fed on stdin through a temp copy the tab's shell unlinks before claude starts (never argv or shell history); the file is removed whether or not the resume succeeds. `-j/--json` prints the bridge envelope: data `{session_id, result: "resumed", account}`, or `error.code` `unknown_account` · `disabled_account` (listed in `claude_accounts_disabled`) · `not_shared` · `untrusted` · `live` · `no_transcript` · `no_tab` · `no_session` · `draft` · `no_account` · `prompt_file` (exit 2) · `automated` (exit 75 under `AI_AUTOMATED`).
 - `ccc focus-job <id>` — bring a live session's tab forward (verifies it is live first).
 - `ccc archive <id>` (`-u/--undo`) — soft-hide a PARKED session (`archived=1`) so it is listed once, on tp's board (`tp import-ccc -a -z` calls this); the row keeps its cwd/account, so `ccc resume <id>` / `ccc resume-job <id>` still work, and the moment the session is seen live again it is un-archived (it parks back into ccc's list until tp re-archives it). Refuses live sessions and FUTURE drafts (`delete-job` is the draft trash).
 - `ccc rm` · `ccc prune` — drop a tracked row / delete leftovers (contentless, headless `claude -p`, and dead-launched jobs that never had a turn).
@@ -3241,7 +3241,10 @@ filenames); malformed entries are skipped.
   ```
   The account stays configured (its old sessions keep resolving and can be resumed on
   another account with `-A` of the resume-job command), but `ccc job-account -j` reports
-  it `usable: false`, `reason: "disabled"`. Empty (the default) ⇒ no account is disabled.
+  it `usable: false`, `reason: "disabled"`, and every command that takes an account label
+  from you refuses it with exit 1 (`new-job --account`, `resume-job -A` with error code
+  `disabled_account`, `continue-session start -A`, `switch-account`). Empty (the default)
+  ⇒ no account is disabled.
 - **Subscription end dates (`subscription_ends`) — the `-> D.M` a card can carry.** A
   paid plan you mean to cancel is only cancellable if you remember it renews. Pin the
   date to the card that bills it and its border title says so:

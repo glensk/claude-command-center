@@ -235,6 +235,52 @@ def test_unknown_account(env: dict[str, Any], capsys: pytest.CaptureFixture[str]
     assert not env["typed"]
 
 
+def test_disabled_account_refused(
+    env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#2197: ``-A`` naming a seat in ``claude_accounts_disabled`` is refused, exit 1."""
+    monkeypatch.setattr(config, "claude_disabled_accounts", lambda: {"work"})
+    assert _run("-A", "work", "-j") == 1
+    assert _error_code(capsys) == "disabled_account"
+    assert _run("-A", "work") == 1
+    err = capsys.readouterr().err
+    assert "account 'work' is disabled (claude_accounts_disabled)" in err
+    assert "enabled accounts: private" in err
+    assert not env["typed"]
+    with Store() as store:
+        row = store.get(SID)
+    assert row is not None and row.config_dir == str(env["private"])
+
+
+@pytest.mark.usefixtures("env")
+def test_new_job_disabled_account_refused(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#2197: ``new-job --account`` refuses a disabled seat the same way (no row made)."""
+    monkeypatch.setattr(config, "claude_disabled_accounts", lambda: {"work"})
+    assert cli._account_config_dir("work") == (
+        "",
+        "error: account 'work' is disabled (claude_accounts_disabled) — enabled accounts: private",
+    )
+    assert cli._account_config_dir("private")[1] is None
+    with Store() as store:
+        before = len(store.list_sessions(include_archived=True))
+    assert cli.main(["new-job", "--aim", "x", "--account", "work"]) == 1
+    assert "is disabled" in capsys.readouterr().err
+    with Store() as store:
+        assert len(store.list_sessions(include_archived=True)) == before
+
+
+@pytest.mark.usefixtures("env")
+def test_continue_session_target_refuses_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """tp#2197: ``continue-session start -A`` (cc-relay ``-t`` on a live tab) refuses too."""
+    from command_center import continue_session
+
+    monkeypatch.setattr(config, "claude_disabled_accounts", lambda: {"work"})
+    with pytest.raises(continue_session.StartRefused, match="'work' is disabled"):
+        continue_session._target_dir("work")
+
+
 def test_not_shared_when_each_account_has_its_own_copy(
     env: dict[str, Any], capsys: pytest.CaptureFixture[str]
 ) -> None:

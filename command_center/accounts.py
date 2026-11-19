@@ -478,6 +478,24 @@ def account_unusable_reason(label: str) -> str:
     return ""
 
 
+def disabled_account_error(label: str) -> str:
+    """The refusal for an explicitly chosen account *label* listed in
+    ``claude_accounts_disabled``, or ``""`` when it is not disabled (tp#2197).
+
+    Every surface that takes an account label from the caller (``new-job --account``,
+    ``resume-job -A``, ``continue-session start -A``, ``switch-account``) refuses a
+    disabled seat with this one message, naming the configured accounts still enabled.
+    """
+    disabled = config.claude_disabled_accounts()
+    if label not in disabled:
+        return ""
+    enabled = sorted(set(config.claude_config_dirs()) - disabled)
+    return (
+        f"account {label!r} is disabled (claude_accounts_disabled) — "
+        f"enabled accounts: {', '.join(enabled) or '(none)'}"
+    )
+
+
 def transcripts_are_one_file(transcript: Path, session_id: str, *config_dirs: str) -> bool:
     """True when *transcript* is the very file each account in *config_dirs* resumes from.
 

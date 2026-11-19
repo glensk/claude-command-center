@@ -552,6 +552,9 @@ def _target_dir(label: str) -> str:
     if label not in dirs:
         known = ", ".join(sorted(dirs)) or "none"
         raise StartRefused(f"unknown account {label!r} (configured: {known})")
+    disabled = accounts.disabled_account_error(label)
+    if disabled:
+        raise StartRefused(disabled)
     target = str(dirs[label])
     email = accounts.account_email(target)
     expected = config.claude_account_email_map().get(label)
