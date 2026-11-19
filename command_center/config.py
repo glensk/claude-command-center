@@ -1309,7 +1309,7 @@ class Config:
     handoff_hooks: list[list[str]] = field(default_factory=list)  # continue-session accept
     accept_hook_timeout_sec: int = 180  # one accept hook run's budget (10..480)
     accept_hook_retry_sec: int = 420  # accept's hook retry window (0 = off, ≤ 480)
-    handoff_auto_accept: bool = True  # SessionStart runs accept on the inbound transfer
+    handoff_auto_accept: bool = True  # the first handoff prompt runs accept (UserPromptSubmit)
     handoff_facts: list[dict[str, object]] = field(default_factory=list)  # fact providers
     resume_stagger_sec: int = 120
     resume_poll_sec: int = 30

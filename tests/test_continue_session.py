@@ -606,6 +606,42 @@ def test_preamble_keys_point_to_keyed_facts_only() -> None:
     assert "ccc continue-session accept t9" in flat
 
 
+def test_preamble_carries_the_auto_accept_gate() -> None:
+    """tp#2326 D1/D2: the hook accepts only a prompt with the head and ``transfer <id>``."""
+    from command_center import hooks  # pylint: disable=import-outside-toplevel
+
+    assert continue_session.HANDOFF_PROMPT_HEAD == hooks.HANDOFF_PROMPT_HEAD
+    transfer = type(
+        "T", (), {"source_session": "src-1", "transfer_id": "t9", "handoff_path": "/h.md"}
+    )()
+    text = continue_session.preamble(transfer, "work", "")
+    assert text.startswith(hooks.HANDOFF_PROMPT_HEAD + "src-1 ")
+    assert "transfer t9" in text
+    assert "launch profile" not in text and "(account work), transfer t9." in text
+    flat = " ".join(text.split())
+    head = continue_session.AUTO_ACCEPT_HEAD.format(transfer="t9")
+    assert f"FIRST, unless a ccc hook note on this prompt reads `{head}`" in flat
+
+
+def test_preamble_names_the_launch_profile_only_when_set() -> None:
+    def _transfer(profile: str) -> Any:
+        return type(
+            "T",
+            (),
+            {
+                "source_session": "src-1",
+                "transfer_id": "t9",
+                "handoff_path": "/h.md",
+                "launch_profile": profile,
+            },
+        )()
+
+    named = continue_session.preamble(_transfer("route"), "work", "")
+    assert "(account work, launch profile route), transfer t9." in named
+    bare = continue_session.preamble(_transfer(""), "work", "")
+    assert "launch profile" not in bare and "(account work), transfer t9." in bare
+
+
 def test_waiting_then_a_ledger_change_then_the_same_start_reuses_the_transfer(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:

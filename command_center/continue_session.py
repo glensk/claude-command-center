@@ -443,6 +443,11 @@ def _sidecar_lines(model_full: str, facts_rest: str) -> str:
     return out
 
 
+# The preamble's first words: the successor's UserPromptSubmit hook accepts only a prompt
+# that holds them (``hooks.HANDOFF_PROMPT_HEAD``, pinned equal by a test; tp#2326 D1).
+HANDOFF_PROMPT_HEAD = "[handoff] You take over the work of session "
+
+
 def preamble(
     transfer: Any, source_label: str, transcript: str, *, model_full: str = "", facts_rest: str = ""
 ) -> str:
@@ -451,21 +456,25 @@ def preamble(
     tp#1681 L3c: cut facts are fetched by KEY only (``facts <src> -k <key>``, the key each
     ``… cut`` line names), never as the whole snapshot; nothing here asks to re-claim work
     (ownership moves on ``accept`` through ``handoff_hooks``). tp#1681 L18: the successor's
-    SessionStart hook may already have accepted; its note starts with ``AUTO_ACCEPT_HEAD``.
+    UserPromptSubmit hook accepts on this very prompt (tp#2326 D1: the text must hold
+    :data:`HANDOFF_PROMPT_HEAD` and name ``transfer <id>``); its note starts with
+    ``AUTO_ACCEPT_HEAD``. tp#2326 D2: the source's launch profile is named when set.
     tp#2172 D1/D2: *model_full* / *facts_rest* name the sidecars of a cut model part and of
     fact records moved out for size.
     """
     accepted_note = AUTO_ACCEPT_HEAD.format(transfer=transfer.transfer_id)
+    profile = str(getattr(transfer, "launch_profile", "") or "")
+    route = f", launch profile {profile}" if profile else ""
     return (
-        f"[handoff] You take over the work of session {transfer.source_session} "
-        f"(account {source_label or '?'}), transfer {transfer.transfer_id}. The handoff "
-        f"below is also stored at {transfer.handoff_path}"
+        f"{HANDOFF_PROMPT_HEAD}{transfer.source_session} "
+        f"(account {source_label or '?'}{route}), transfer {transfer.transfer_id}. "
+        f"The handoff below is also stored at {transfer.handoff_path}"
         + (f"; the old session's transcript is {transcript} (evidence only)" if transcript else "")
         + ".\n"
         + _sidecar_lines(model_full, facts_rest)
-        + f"FIRST, unless a SessionStart note reads `{accepted_note}` (the hook already "
-        f"accepted it), run (pass the Bash tool timeout 600000: under load accept retries a "
-        f"slow handoff hook itself for up to ~8 min): ccc continue-session accept "
+        + f"FIRST, unless a ccc hook note on this prompt reads `{accepted_note}` (the hook "
+        "already accepted it), run (pass the Bash tool timeout 600000: under load accept "
+        "retries a slow handoff hook itself for up to ~8 min): ccc continue-session accept "
         f"{transfer.transfer_id}\n"
         "Only after it succeeds: relaunch every agent under 'Subagent continuations' as a NEW "
         "Agent from its capsule (old agent ids cannot be resumed across sessions), restart "
@@ -2168,7 +2177,7 @@ def accept_as(  # pylint: disable=too-many-return-statements
 
 AUTO_ACCEPT_HEAD = "handoff {transfer} accepted"  # what the preamble tells the model to look for
 AUTO_ACCEPT_NOTE = AUTO_ACCEPT_HEAD + " (auto)"
-AUTO_ACCEPT_BUDGET_SEC = 45  # under Claude Code's 60 s default SessionStart hook timeout
+AUTO_ACCEPT_BUDGET_SEC = 45  # under Claude Code's 60 s default UserPromptSubmit hook timeout
 AUTO_NOTE_MAX_BYTES = 200
 
 
@@ -2181,8 +2190,10 @@ def _fit(head: str, middle: str, tail: str) -> str:
 
 
 def auto_accept(store: Store, session_id: str, inbound: list[Any], corrupt: int, cfg: Any) -> str:
-    """The SessionStart auto-accept (tp#1681 L18): ONE attempt of :func:`accept_as` on the
-    single inbound transfer, its output captured; the ≤ 200-byte note for the context.
+    """The first-prompt auto-accept (tp#1681 L18, tp#2326 D1: run by the successor's
+    ``UserPromptSubmit`` hook on its first submitted handoff prompt): ONE attempt of
+    :func:`accept_as` on the single inbound transfer, its output captured; the ≤ 200-byte
+    note for the context.
 
     Several inbound transfers or an unreadable row accept none and name the status
     command. A refusal or a failing hook leaves the transfer as it was and names the

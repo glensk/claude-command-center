@@ -412,23 +412,49 @@ def _switch_landed_as_expected(store: Store, sid: str) -> bool:
 _CLOSE_KEEPING_SOURCES = frozenset({"compact", "clear"})
 
 
-def _auto_accept(store: Store, sid: str, payload: dict[str, Any]) -> str | None:
-    """The handoff auto-accept note for this start, or ``None`` (tp#1681 L18).
+# The first words of ``continue_session.preamble`` (a test pins the two equal), duplicated
+# here so an ordinary prompt never imports ``continue_session`` (tp#2326 D1).
+HANDOFF_PROMPT_HEAD = "[handoff] You take over the work of session "
+# How far into a prompt the head may sit: ``start-job`` prepends an ``[orchestration] …``
+# sentence when executor != overseer, and a ``job_launch_prefix`` may lead the prompt.
+HANDOFF_HEAD_WINDOW = 4096
 
-    Only on a new process (never ``compact`` / ``clear``), never inside ccc's own
-    ``claude -p``, and only with ``handoff_auto_accept`` on. One indexed query when there
-    is nothing inbound; ``continue_session`` is imported only when there is. Fail-open:
-    an error → ``None`` (the preamble's manual ``accept`` still applies).
+
+def _names_transfer(prompt: str, transfer_id: str) -> bool:
+    """True when *prompt* reads ``transfer <transfer_id>`` (the whole id, not a prefix)."""
+    import re  # local: only a handoff prompt pays for it
+
+    return re.search(rf"\btransfer {re.escape(transfer_id)}(?![\w-])", prompt) is not None
+
+
+def _prompt_auto_accept(store: Store, sid: str, prompt: str, cfg: config.Config) -> str | None:
+    """The handoff auto-accept note for this submitted prompt, or ``None`` (tp#2326 D1).
+
+    The automatic accept runs on the successor's FIRST SUBMITTED HANDOFF PROMPT, so on the
+    auto path ``accepted`` means the first turn exists. Only a prompt that holds
+    :data:`HANDOFF_PROMPT_HEAD` within its first :data:`HANDOFF_HEAD_WINDOW` characters
+    qualifies (one bounded ``str.find``: an ordinary prompt pays no import and no query).
+    Never inside ccc's own ``claude -p``, only with ``handoff_auto_accept`` on, and the
+    single inbound transfer must be the one the prompt names (``transfer <id>``): a
+    successor that never read its handoff must not accept it. Fail-open: an error →
+    ``None`` (the preamble's manual ``accept`` still applies).
     """
-    if payload.get("source") in _CLOSE_KEEPING_SOURCES or os.environ.get("CCC_INTERNAL"):
+    if prompt.find(HANDOFF_PROMPT_HEAD, 0, HANDOFF_HEAD_WINDOW) < 0 or os.environ.get(
+        "CCC_INTERNAL"
+    ):
         return None
     try:
-        cfg = config.load_config()
         if not cfg.handoff_auto_accept:
             return None
         inbound, corrupt = store.inbound_transfers(sid)
         if not inbound and not corrupt:
             return None
+        if not corrupt and len(inbound) == 1:
+            if not _names_transfer(prompt, inbound[0].transfer_id):
+                return (
+                    "handoff: this prompt names no inbound transfer; "
+                    f"run: ccc continue-session status -s {sid}"
+                )
         from . import continue_session  # lazy: only a successor pays for it
 
         return continue_session.auto_accept(store, sid, inbound, corrupt, cfg)
@@ -479,10 +505,6 @@ def handle_session_start(payload: dict[str, Any]) -> int:
             store.disarm_close(sid)
         if switch_warning and _switch_landed_as_expected(store, sid):
             switch_warning = None
-        # tp#1681 L18: accept the inbound handoff FIRST, so the reconciled AIM shows below.
-        handoff_note = _auto_accept(store, sid, payload)
-        if handoff_note:
-            session = store.get(sid) or session
         env_aim = os.environ.get("CLAUDE_SESSION_AIM")
         seeded = False
         if env_aim and env_aim.strip() and not session.aim:
@@ -525,7 +547,8 @@ def handle_session_start(payload: dict[str, Any]) -> int:
             context = _GROUND.format(aim=session.aim, progress=progress, nxt=nxt)
         # An armed parked prompt must be visible from the first turn — a resumed
         # session otherwise guesses from the AIM while the real prompt sits armed.
-        context = "\n\n".join(filter(None, [handoff_note, context, _parked_prompt_notice(session)]))
+        # A handoff is accepted on the first submitted prompt, never here (tp#2326 D1).
+        context = "\n\n".join(filter(None, [context, _parked_prompt_notice(session)]))
         # D11: prepend the account-switch warning (the only guard the native --resume
         # picker reaches) so a session resumed under the wrong account says so up front.
         if switch_warning:
@@ -627,6 +650,11 @@ def _handle_user_prompt_turn(payload: dict[str, Any], sid: str, cfg: config.Conf
     aim_text = _aim_command_text(str(payload.get("prompt") or ""))
     with Store() as store:
         session, _ = ensure_current_session(store, sid, payload.get("cwd", ""))
+        # tp#2326 D1: a successor accepts its handoff on its first submitted handoff
+        # prompt, before the nudges below, so they see the reconciled AIM.
+        handoff_note = _prompt_auto_accept(store, sid, str(payload.get("prompt") or ""), cfg)
+        if handoff_note:
+            session = store.get(sid) or session
         if cfg.aim_intercept and aim_text is not None:
             # `/aim <text>` is set here, programmatically. Blocking costs no model turn (the
             # agent is not told); non-blocking costs one tiny reply.
@@ -646,7 +674,7 @@ def _handle_user_prompt_turn(payload: dict[str, Any], sid: str, cfg: config.Conf
         store.update_fields(sid, last_response_at=now_ms(), prompt_count=count, aim_prev=None)
         # AIM-related nudges are mutually exclusive (no-aim > vague > stale checklist);
         # an unresolved drift nudge is additive — it can fire alongside any of them.
-        parts: list[str] = []
+        parts: list[str] = [handoff_note] if handoff_note else []
         if not session.aim:
             every = cfg.nag_every_n_turns
             if every > 0 and (count - 1) % every == 0:
