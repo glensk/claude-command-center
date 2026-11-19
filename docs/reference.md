@@ -649,6 +649,60 @@ The label also appears as `launch_profile` in `new-job -J`, `jobs -j`, `sessions
 the `/profile` readout in the TUI detail pane. A `-K` key reused with a different
 `--launch-profile` is a caller bug (exit 2), like a different `--no-codex`.
 
+#### Watchable profile workers — the overseer recipe and result protocol
+
+A launch profile lets an orchestrating session (the **overseer**) run a builder as an ordinary,
+visible ccc tab billed through the profile, instead of an invisible headless `claude -p`. ccc
+tracks it like any other session (TUI row, `ccc peek`, `ccc sessions -j`, `ccc inspect`), and
+the worker hands its result back through one file. The steps below use the example label
+`billing`; ccc itself knows nothing of the protocol — it is a convention between the overseer
+and the worker's prompt.
+
+1. **Preflight the profile.** Before registering anything, run the profile executable's own
+   key-free check, if it offers one (with `CCC_LAUNCH_PROFILE=billing` exported, as ccc would),
+   and stop on a non-zero exit. ccc only checks that the label is configured and its executable
+   resolves — at `new-job` and again at launch — not that the route behind it can serve.
+2. **Preallocate the result dir.** Pick a random nonce and create `<scratch>/worker-<nonce>/`.
+   The prompt names that dir and the nonce and tells the worker, as its LAST act, to write
+   `result.tmp` there and then rename it to `result.json` (the rename is atomic on one
+   filesystem, so a reader never sees a half-written file):
+
+   ```json
+   {"nonce": "<the nonce from the prompt>", "session_id": "<its own Claude session id>",
+    "status": "<the worker's own verdict, e.g. done | failed>", "report": "<final report>"}
+   ```
+
+3. **Register, then open.**
+
+   ```commands
+   ccc new-job -L billing -O sonnet-5 -E sonnet-5 -N -K <key> -c <worktree> -a "<aim>" -P <prompt-file> -J
+   ccc open-job <session_id> -j
+   ```
+
+   `-K` makes a retry of the overseer return the same job (a reused key with a different
+   `--launch-profile` exits 2); `-J` prints `{version, session_id, created, account, no_codex,
+   launch_profile}`. `-P <file>` gives the worker its prompt from a private (0600 or narrower) file you own, so
+   it never shows in argv or `ps`; `-p "<prompt>"` works
+   too. `-N` is optional (bans Codex in the worker). `open-job -j` prints `{version,
+   session_id, launcher[, tmux]}`. Under `AI_AUTOMATED=1` `open-job` exits 75 and leaves a
+   draft — the overseer must be an interactive session.
+4. **Wait with a deadline.** Poll (a Monitor until-loop, say) for `result.json` AND the
+   session's state via `ccc sessions -j` (`status`) and `ccc inspect -s <session_id> -N -j`
+   (`live`, `state`, `turn_active`). Exactly one outcome ends the wait:
+
+   | Outcome          | Condition                                                                                  | Overseer action                                         |
+   | :--------------- | :----------------------------------------------------------------------------------------- | :------------------------------------------------------ |
+   | `completed`      | `result.json` parses, its `nonce` is the one issued and its `session_id` is the job's       | read `status` / `report`                                |
+   | `needs_input`    | no result, session live and idle (`turn_active: false`) — it asked something or stopped    | read `inspect` (`last_reply`, `actions`), answer it     |
+   | `process_exited` | no result, the session is no longer listed / `inspect` says `live: false`                  | treat the job as failed; the result dir stays as is     |
+   | `timed_out`      | the deadline passed with none of the above                                                 | inspect the tab; stop or extend                         |
+
+   A `result.json` with a wrong nonce or session id is not a completion (a stale or foreign
+   file); `result.tmp` alone is ignored. Check for the file before the session state, so a
+   worker that wrote its result and then exited counts as `completed`.
+5. **The tab stays open.** Nothing closes it automatically; the overseer (or the user) closes
+   it once the result has been read — for an idle session `ccc close -s <session_id> -j`.
+
 #### Idempotent registration + JSON output (for automations)
 
 `ccc new-job -K/--idempotency-key KEY` makes registration **create-or-retrieve**: the first call
