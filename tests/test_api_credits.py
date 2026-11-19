@@ -819,8 +819,130 @@ def test_card_row_says_why_the_reading_is_not_used(tmp_path: Path) -> None:
         TODAY,
         now=NOW,
     )[0]
-    promo, note = usage.render_api_credit_row(row).plain.splitlines()
-    assert promo.startswith("API PROMO: ≈$150 left →26.10.") and note == "Console reading 10h old"
+    (state,) = usage.render_api_credit_row(row).plain.splitlines()
+    assert state == "API PROMO: stale · 10h old"
+    assert "$" not in state and "%" not in state
+
+
+def _promo_lines(tmp_path: Path, name: str = "b.json", **over: object) -> list[str]:
+    """The card lines of the private row with a balance file shaped by *over*."""
+    from command_center import usage
+
+    row = _state_row(tmp_path, name, **over)
+    return usage.render_api_credit_row(row).plain.splitlines()
+
+
+def _assert_fits(lines: list[str]) -> None:
+    from command_center import usage
+
+    assert all(len(line) <= usage._CARD_INNER_WIDTH for line in lines), lines  # noqa: SLF001
+
+
+def test_promo_row_unusable_states_show_no_figure(tmp_path: Path) -> None:
+    hint = "log in once: ./agent-login.py -g console"
+    cases: list[tuple[dict[str, object], str]] = [
+        (
+            {"measured_at": NOW - 14 * 86400, "status": "logged_out", "error": hint},
+            "API PROMO: logged out · 14d old",
+        ),
+        (
+            {"measured_at": NOW - 10 * 3600, "status": "browser_down"},
+            "API PROMO: read failed · 10h old",
+        ),
+        ({"measured_at": NOW - 10 * 3600}, "API PROMO: stale · 10h old"),
+        ({"measured_at": None, "status": "logged_out"}, "API PROMO: logged out · no reading"),
+        ({"measured_at": None, "status": "timeout"}, "API PROMO: read failed · no readi…"),
+    ]
+    for index, (over, first) in enumerate(cases):
+        lines = _promo_lines(tmp_path, f"u{index}.json", **over)
+        assert lines[0] == first, lines
+        joined = "\n".join(lines)
+        assert "$" not in joined and "%" not in joined and "≈" not in joined, lines
+        _assert_fits(lines)
+    # The writer's own hint is the grey line, clipped to the card width.
+    lines = _promo_lines(
+        tmp_path, "h.json", measured_at=NOW - 14 * 86400, status="logged_out", error=hint
+    )
+    assert len(lines) == 2 and lines[1] == "log in once: ./agent-login.py -g…"
+    # No hint: no second line.
+    assert len(_promo_lines(tmp_path, "n.json", measured_at=NOW - 10 * 3600)) == 1
+
+
+def test_promo_row_missing_file_says_no_console_reading(tmp_path: Path) -> None:
+    from command_center import usage
+
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=balance_json:{tmp_path / 'nope.json'}"], TODAY, now=NOW
+    )[0]
+    lines = usage.render_api_credit_row(row).plain.splitlines()
+    assert lines == ["API PROMO: no Console reading"]
+    _assert_fits(lines)
+
+
+def test_promo_row_wrong_account_keeps_the_agent_hint_unclipped(tmp_path: Path) -> None:
+    lines = _promo_lines(
+        tmp_path,
+        measured_at=NOW - 10 * 3600,
+        status="wrong_account",
+        error="agent: -L console-private",
+    )
+    assert lines == ["API PROMO: wrong account · 10h old", "agent: -L console-private"]
+    _assert_fits(lines)
+
+
+def test_promo_row_long_label_is_clipped_with_an_ellipsis(tmp_path: Path) -> None:
+    from command_center import usage
+
+    row = dict(
+        _state_row(tmp_path, measured_at=NOW - 14 * 86400, status="logged_out"),
+        label="API PROMO MAX LONG",
+    )
+    (line,) = usage.render_api_credit_row(row).plain.splitlines()
+    assert len(line) <= usage._CARD_INNER_WIDTH and line.endswith("…")  # noqa: SLF001
+
+
+def test_promo_row_unusable_state_without_expires_on_is_not_first_grant(tmp_path: Path) -> None:
+    from command_center import usage
+
+    row = dict(
+        _state_row(tmp_path, measured_at=NOW - 14 * 86400, status="logged_out"),
+        next_grant_on="2026-12-01",
+    )
+    row.pop("expires_on", None)
+    lines = usage.render_api_credit_row(row).plain.splitlines()
+    assert lines == ["API PROMO: logged out · 14d old"]
+    assert "first grant" not in usage.render_api_credit_row(row).plain
+
+
+def test_promo_row_measured_failing_keeps_the_bar_and_adds_a_failure_line(
+    tmp_path: Path,
+) -> None:
+    lines = _promo_lines(tmp_path, status="logged_out", measured_at=NOW - 3600)
+    assert lines[0].startswith("API PROMO: $186 left →26.11.") and lines[0].endswith("7%")
+    assert lines[1] == "Console logged_out · figure 1h old" and len(lines) == 2
+    _assert_fits(lines)
+
+
+def test_promo_row_no_promo_with_failing_status_shows_the_failure_line(tmp_path: Path) -> None:
+    expired = [{"remaining_usd": 5, "granted_usd": 10, "expires_at": "2026-10-01T00:00:00Z"}]
+    lines = _promo_lines(tmp_path, promo=expired, status="logged_out")
+    assert lines[-1] == "Console logged_out" and lines.count("Console logged_out") == 1
+    _assert_fits(lines[-1:])
+    # With an ok status the rendering is today's: no failure line.
+    ok = _promo_lines(tmp_path, "ok.json", promo=expired)
+    assert not any(line.startswith("Console logged_out") for line in ok)
+
+
+def test_promo_row_without_balance_json_keeps_the_estimate_bar(tmp_path: Path) -> None:
+    from command_center import usage
+
+    ledger = _ledger(tmp_path / "runs.jsonl", [{"ts": "2026-10-10T10:00:00+02:00", "cost_usd": 50}])
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=runs_jsonl:{ledger}"], TODAY, now=NOW
+    )[0]
+    assert "balance_state" not in row
+    (line,) = usage.render_api_credit_row(row).plain.splitlines()
+    assert line.startswith("API PROMO: ≈$150 left →26.10.") and line.endswith("%")
 
 
 def test_report_draws_measured_and_cap_rows(

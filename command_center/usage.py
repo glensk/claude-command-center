@@ -2200,6 +2200,10 @@ def _api_promo_row(status: dict[str, Any], accent: str) -> Text:
     import datetime as _dt  # pylint: disable=import-outside-toplevel
 
     prefix = str(status.get("label") or API_PROMO_LABEL)
+    unusable = _api_unusable_row(status, prefix)
+    if unusable is not None:
+        return unusable
+    failure = _api_failure_line(status)
     note = (
         Text(f"{status['balance_note']}\n", style="grey50")
         if status.get("balance_note")
@@ -2208,14 +2212,15 @@ def _api_promo_row(status: dict[str, Any], accent: str) -> Text:
     expires = status.get("expires_on")
     if not expires:
         first = _dt.date.fromisoformat(str(status["next_grant_on"]))
-        return Text(f"{prefix}: first grant {first.day}.{first.month}.\n", style="grey50") + note
+        first_line = Text(f"{prefix}: first grant {first.day}.{first.month}.\n", style="grey50")
+        return first_line + note + failure
     end = _dt.date.fromisoformat(str(expires))
     measured_pct = status.get("balance_used_pct")
     if status.get("balance_source") == "measured" and measured_pct is not None:
         left = float(status.get("balance_usd") or 0.0)
         label = f"{prefix}: {_api_money(left)} left →{end.day}.{end.month}."
         pct = float(measured_pct)
-        return _bar_row(pct, _fill_for_pct(pct), label=label, label_color=accent)
+        return _bar_row(pct, _fill_for_pct(pct), label=label, label_color=accent) + failure
     est_pct = status.get("est_used_pct")
     if est_pct is None:
         why = "spend fetch failed" if status.get("spend_error") else "balance n/a"
@@ -2223,12 +2228,74 @@ def _api_promo_row(status: dict[str, Any], accent: str) -> Text:
         line = Text(
             f"{prefix}: {_api_money(usd)} →{end.day}.{end.month}. · {why}\n", style="grey50"
         )
-        return line + note
+        return line + note + failure
     left = float(status.get("est_left_usd") or 0.0)
     label = f"{prefix}: ≈{_api_money(left)} left →{end.day}.{end.month}."
     pct = float(est_pct)
     # _bar_row ends its row with a newline, so the note lands on the line below.
-    return _bar_row(pct, _fill_for_pct(pct), label=label, label_color=accent) + note
+    return _bar_row(pct, _fill_for_pct(pct), label=label, label_color=accent) + note + failure
+
+
+def _card_clip(text: str) -> str:
+    """*text* cut to :data:`_CARD_INNER_WIDTH` cells, ending in ``…`` when it was cut."""
+    if cell_len(text) <= _CARD_INNER_WIDTH:
+        return text
+    while text and cell_len(text) > _CARD_INNER_WIDTH - 1:
+        text = text[:-1]
+    return text.rstrip() + "…"
+
+
+def _reading_age(seconds: int) -> str:
+    """``45s`` / ``12m`` / ``3h`` / ``2d`` — the age of a Console reading."""
+    seconds = max(0, seconds)
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
+
+
+_API_UNUSABLE_WORDS = {
+    "logged_out": "logged out",
+    "read_failed": "read failed",
+    "stale": "stale",
+    "missing": "no Console reading",
+}
+
+
+def _api_unusable_row(status: dict[str, Any], prefix: str) -> Text | None:
+    """The promo row of a balance file whose reading cannot be trusted, else ``None``.
+
+    No bar, no figure, no percentage (the estimate would pass for the real balance): one
+    warning line ``<label>: <state> · <age> old`` plus the writer's own hint in grey.
+    """
+    state = str(status.get("balance_state") or "")
+    word = _API_UNUSABLE_WORDS.get(state)
+    if word is None:
+        return None
+    if state == "logged_out" and status.get("balance_status") == "wrong_account":
+        word = "wrong account"
+    line = f"{prefix}: {word}"
+    if state != "missing":
+        age = status.get("balance_age_sec")
+        line += f" · {_reading_age(int(age))} old" if age is not None else " · no reading"
+    out = Text(_card_clip(line) + "\n", style="bold yellow")
+    hint = str(status.get("balance_hint") or "").strip()
+    if hint:
+        out += Text(_card_clip(hint) + "\n", style="grey50")
+    return out
+
+
+def _api_failure_line(status: dict[str, Any]) -> Text:
+    """Grey line under a measured / no-promo row whose latest Console read failed."""
+    state = status.get("balance_state")
+    failed = str(status.get("balance_status") or "ok")
+    if failed == "ok" or state not in ("measured_failing", "no_promo"):
+        return Text()
+    line = f"Console {failed}"
+    age = status.get("balance_age_sec")
+    if state == "measured_failing" and age is not None:
+        line += f" · figure {_reading_age(int(age))} old"
+    return Text(_card_clip(line) + "\n", style="grey50")
 
 
 def _api_cap_row(status: dict[str, Any], accent: str) -> Text:
