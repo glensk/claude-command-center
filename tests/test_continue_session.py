@@ -2041,6 +2041,7 @@ def test_start_no_accept_counts_as_the_one_relaunch(
     world.script = script
     assert world.harness.start() == 1
     assert [t.state for t in _transfers()] == ["failed", "failed"]
+    assert [t.accept_refused_at for t in _transfers()] == [0, 0]  # had turns: never orphaned
     assert "successor died twice: no-accept; no-accept; nothing moved" in capsys.readouterr().err
 
 
@@ -2253,6 +2254,7 @@ def test_start_no_first_turn_aborts_without_relaunch(
     (transfer,) = _transfers()
     assert transfer.state == "failed"
     assert transfer.failure == "aborted: successor dead: no-first-turn"
+    assert transfer.accept_refused_at > 0  # tp#2326 D6: the orphan close is stamped
     assert len(world.harness.launches) == 1  # no relaunch
     with Store() as store:
         source = store.get(SID)
@@ -2282,6 +2284,8 @@ def test_start_no_accept_then_no_first_turn_died_twice(
     first, second = _transfers()
     assert first.failure == "aborted: successor dead: no-accept"
     assert second.failure == "aborted: successor dead: no-first-turn"
+    # tp#2326 D6: only the no-first-turn successor is orphaned; the no-accept one had a turn
+    assert first.accept_refused_at == 0 and second.accept_refused_at > 0
     err = capsys.readouterr().err
     assert "successor died twice: no-accept; no-first-turn; nothing moved" in err
 
@@ -2306,6 +2310,7 @@ def test_start_no_first_turn_accepted_before_the_abort_finalizes(
     assert world.harness.start() == 0
     (transfer,) = _transfers()
     assert transfer.state == "finalized" and len(world.harness.launches) == 1
+    assert transfer.accept_refused_at == 0  # nothing aborted: never orphaned
 
 
 def _status_json(tid: str, capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:

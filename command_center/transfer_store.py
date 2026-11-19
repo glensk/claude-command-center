@@ -186,7 +186,8 @@ class Transfer:  # pylint: disable=too-many-instance-attributes
     start_pid: int = 0
     start_heartbeat_at: int = 0
     # tp#2172 D13: when the successor last ran ``accept`` on this transfer after it had
-    # failed (the refusal the daemon sweep's orphan close keys on). 0 = never.
+    # failed, or (tp#2326 D6) when a ``no-first-turn`` abort orphaned it: accept refused or
+    # orphaned, the stamp the daemon sweep's orphan close keys on. 0 = never.
     accept_refused_at: int = 0
 
     def snapshot(self) -> dict[str, Any]:
@@ -552,13 +553,28 @@ class TransferStoreMixin:
         return cur.rowcount == 1
 
     def record_accept_refusal(self, transfer_id: str, caller: str, now: int) -> bool:
-        """Stamp ``accept_refused_at`` (tp#2172 D13): *caller* ran ``accept`` on a FAILED
-        transfer whose successor it is. A CAS on both, so nothing else is ever stamped."""
+        """Stamp ``accept_refused_at`` (accept refused or orphaned; tp#2172 D13): *caller*
+        ran ``accept`` on a FAILED transfer whose successor it is. A CAS on both, so nothing
+        else is ever stamped (an orphan stamp is :meth:`record_orphaned`)."""
         cur = self.conn.execute(
             "UPDATE transfers SET accept_refused_at = ? "
             "WHERE transfer_id = ? AND state = 'failed' AND target_session = ? "
             "AND target_session != ''",
             (now, transfer_id, caller),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def record_orphaned(self, transfer_id: str, now: int) -> bool:
+        """Stamp ``accept_refused_at`` (tp#2326 D6): a ``no-first-turn`` abort orphaned the
+        FAILED transfer's started successor, which never got its first prompt; the daemon
+        sweep's orphan close (D13) then closes its tab once it is idle. A CAS: only a
+        ``failed`` row with a target and no stamp yet, so a second call is ``False``."""
+        cur = self.conn.execute(
+            "UPDATE transfers SET accept_refused_at = ? "
+            "WHERE transfer_id = ? AND state = 'failed' AND target_session != '' "
+            "AND accept_refused_at = 0",
+            (now, transfer_id),
         )
         self.conn.commit()
         return cur.rowcount == 1
@@ -575,9 +591,10 @@ class TransferStoreMixin:
         return sorted((_row_to_transfer(row) for row in rows), key=lambda t: t.transfer_id)
 
     def orphan_close_candidates(self) -> list[Transfer]:
-        """``failed`` transfers whose successor recorded an accept refusal (tp#2172 D13):
-        the daemon sweep closes that successor's tab while the refusing process lives.
-        Through the partial ``accept_refused_at`` index."""
+        """``failed`` transfers whose successor recorded an accept refusal (tp#2172 D13) or
+        was orphaned by a ``no-first-turn`` abort (tp#2326 D6): the daemon sweep closes that
+        successor's tab while the process stamped then lives. Through the partial
+        ``accept_refused_at`` index."""
         rows = self.conn.execute(
             "SELECT * FROM transfers WHERE accept_refused_at > 0 AND state = 'failed'"
         ).fetchall()

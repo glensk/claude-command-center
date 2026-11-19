@@ -825,6 +825,62 @@ def test_sweep_aborts_a_successor_without_its_first_turn(
     assert not spawns.calls
 
 
+def _stamp(tid: str) -> int:
+    with Store() as store:
+        transfer = store.get_transfer(tid)
+    assert transfer is not None
+    return transfer.accept_refused_at
+
+
+def _successor(started_at: int, status: str = "idle") -> LiveSession:
+    return LiveSession(
+        5151, DST, "/repo", "interactive", "cli", status, alive=True, started_at=started_at
+    )
+
+
+def test_sweep_closes_the_orphan_of_a_no_first_turn_abort(
+    spawns: _Spawns, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#2326 D6: the sweep's ``no-first-turn`` abort stamps the orphan close; the NEXT
+    pass closes the idle successor that existed at the stamp (closer spawned, paced). A busy
+    one waits, a process started after the stamp is never closed, dry runs write nothing."""
+    tid = _opened(heartbeat_ms=5 * MINUTE, pid=777)
+    _use_ps(monkeypatch, _ps_rows((SRC_PID, 1, "claude")))
+    started = now_ms() - 9 * MINUTE
+    snapshot = {**_live(), DST: _successor(started)}
+    dry = _sweep(snapshot, dry_run=True)
+    assert dry.handoff_aborted == [tid] and not dry.handoff_closers
+    assert _state(tid) == OPENED and _stamp(tid) == 0
+    report = _sweep(snapshot)
+    assert report.handoff_aborted == [tid] and not report.handoff_closers
+    assert _failure(tid) == "aborted: sweep: successor dead: no-first-turn"
+    assert (stamp := _stamp(tid)) > 0 and not spawns.calls
+    assert not _sweep({**_live(), DST: _successor(started, "busy")}).handoff_closers
+    assert not _sweep({**_live(), DST: _successor(stamp + 1)}).handoff_closers  # reopened
+    assert not spawns.calls and not _row(DST).close_token
+    assert _sweep(snapshot, dry_run=True).handoff_closers == [DST]
+    assert not spawns.calls and not _row(DST).close_token  # dry run: nothing armed
+    closing = _sweep(snapshot)
+    assert closing.handoff_closers == [DST] and spawns.calls == [_closer(tid, DST)]
+    assert _row(DST).close_token and not _row(SRC).close_token  # the source is never touched
+    assert not _sweep(snapshot).handoff_closers  # paced
+    assert _state(tid) == "failed" and _stamp(tid) == stamp
+
+
+def test_sweep_no_accept_abort_never_orphans(
+    spawns: _Spawns, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``no-accept`` successor had its first turn (it may hold work the user wants): the
+    abort stamps nothing and no later pass closes its tab."""
+    tid = _opened(heartbeat_ms=5 * MINUTE, pid=777)
+    _set_row(DST, prompt_count=1)
+    _use_ps(monkeypatch, _ps_rows((SRC_PID, 1, "claude")))
+    snapshot = {**_live(), DST: _successor(now_ms() - 9 * MINUTE)}
+    assert _sweep(snapshot).handoff_aborted == [tid]
+    assert _failure(tid) == "aborted: sweep: successor dead: no-accept" and _stamp(tid) == 0
+    assert not _sweep(snapshot).handoff_closers and not spawns.calls
+
+
 def test_sweep_leaves_live_successor(spawns: _Spawns, monkeypatch: pytest.MonkeyPatch) -> None:
     """The successor is registered and was launched 30 s ago: live, however stale the start."""
     tid = _opened(age_ms=3 * MINUTE, heartbeat_ms=3 * MINUTE, pid=777)

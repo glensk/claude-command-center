@@ -1332,12 +1332,16 @@ def _open_target(  # pylint: disable=too-many-arguments
 def _abort_dead(store: Store, transfer: Any, verdict: str) -> Any | None:
     """Abort *transfer* for its dead successor (D3's core); ``None`` once it is failed, or
     the re-read transfer when it was accepted meanwhile (then it is finalized, not
-    relaunched)."""
+    relaunched). A ``no-first-turn`` abort that changed the row also stamps the orphan
+    close (tp#2326 D6): the daemon closes that successor's tab once it is idle."""
     from .transfer_store import ACCEPTED, FINALIZED
 
     why = verdict.removeprefix(DEAD_PREFIX)
-    code, message = abort_transfer(store, transfer.transfer_id, f"successor dead: {why}", _now_ms())
+    now = _now_ms()
+    code, message = abort_transfer(store, transfer.transfer_id, f"successor dead: {why}", now)
     print(f"note: {message}" if code == 0 else f"warning: {message}", file=sys.stderr)
+    if code == 0 and why == NO_FIRST_TURN and message.startswith(ABORT_PREFIX):
+        store.record_orphaned(transfer.transfer_id, now)
     current = store.get_transfer(transfer.transfer_id)
     if current is not None and current.state in (ACCEPTED, FINALIZED):
         return current

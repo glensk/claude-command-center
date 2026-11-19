@@ -241,3 +241,31 @@ def test_migration_adds_the_nullable_facts_snapshot_column_to_an_existing_db(
         got = store.get_transfer("tnew")
         assert got is not None and got.facts_snapshot == "ab" * 32
         assert "facts_snapshot" not in got.snapshot()  # not part of the retry-match fields
+
+
+def test_record_orphaned_stamps_only_a_failed_row_with_a_target_once(tmp_path: Path) -> None:
+    """tp#2326 D6: a CAS on ``failed``, a target and an unset stamp; a second call is
+    ``False`` and keeps the first stamp; ``opened``/``finalized`` rows are never stamped."""
+    with Store(tmp_path / "db") as store:
+        failed = store.create_transfer(_transfer("s-failed"), NOW).transfer_id
+        assert store.transition_transfer(failed, FAILED, NOW, failure="aborted: x")
+        assert store.record_orphaned(failed, NOW + 1) is True
+        assert store.record_orphaned(failed, NOW + 2) is False
+        got = store.get_transfer(failed)
+        assert got is not None and got.accept_refused_at == NOW + 1
+        assert [t.transfer_id for t in store.orphan_close_candidates()] == [failed]
+
+        no_target = store.create_transfer(_transfer("s-none", target_session=""), NOW)
+        assert store.transition_transfer(no_target.transfer_id, FAILED, NOW, failure="x: y")
+        assert store.record_orphaned(no_target.transfer_id, NOW + 1) is False
+
+        opened = store.create_transfer(_transfer("s-opened"), NOW).transfer_id
+        assert store.transition_transfer(opened, OPENED, NOW)
+        finalized = store.create_transfer(_transfer("s-final"), NOW).transfer_id
+        _force_state(store, finalized, FINALIZED)
+        for tid in (opened, finalized, no_target.transfer_id):
+            assert store.record_orphaned(tid, NOW + 3) is False
+            row = store.get_transfer(tid)
+            assert row is not None and row.accept_refused_at == 0
+        assert store.record_orphaned("no-such-transfer", NOW) is False
+        assert [t.transfer_id for t in store.orphan_close_candidates()] == [failed]

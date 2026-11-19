@@ -33,9 +33,12 @@ Two more candidate sets (tp#2172), each from its own indexed query:
   heartbeat (an older build) is live while a ``continue-session start`` runs among the
   source pid's descendants in the pass's ONE ``ps`` table (any such process when the source
   is unknown). An unreadable ``ps`` counts as live: the transfer is left alone.
-* a ``failed`` transfer whose successor recorded an accept refusal (``accept_refused_at``)
-  and still runs, idle, as the SAME process that refused (started before the refusal), gets
-  that successor's close armed and the token-scoped closer spawned — the orphan close.
+* a ``failed`` transfer whose successor recorded an accept refusal (``accept_refused_at``),
+  or was orphaned by a ``no-first-turn`` abort (tp#2326 D6: the same stamp, written by the
+  abort in ``start`` or in this sweep; a ``no-accept`` abort stamps nothing, that successor
+  had a turn), and still runs, idle, as the SAME process that existed at the stamp (started
+  before it), gets that successor's close armed and the token-scoped closer spawned — the
+  orphan close.
 
 One closer spawn per source per :data:`PACING_MS`. Nothing is ever selected by age: the
 age floor only gates reverting an existing in-flight token of a candidate the query already
@@ -327,11 +330,14 @@ def _abort_dead(sweep: _Pass, transfer: Transfer, watch: Any) -> None:
     elif message.startswith(continue_session.ABORT_PREFIX):
         print(f"ccc daemon: handoff {tid} {message}", file=sys.stderr)
         sweep.report.handoff_aborted.append(tid)
+        if why == continue_session.NO_FIRST_TURN:  # tp#2326 D6: a later pass closes its tab
+            sweep.store.record_orphaned(tid, sweep.now)
 
 
 def _orphan_due(sweep: _Pass, transfer: Transfer) -> bool:
-    """Is *transfer*'s successor the idle, still-running process that refused its accept,
-    with no close in flight and no closer spawned for it in this pacing window?"""
+    """Is *transfer*'s successor the idle, still-running process that refused its accept
+    (or was orphaned by a ``no-first-turn`` abort), with no close in flight and no closer
+    spawned for it in this pacing window?"""
     from .adapters.claude_agents import contract_status
 
     sid = transfer.target_session
@@ -347,9 +353,10 @@ def _orphan_due(sweep: _Pass, transfer: Transfer) -> bool:
 
 
 def _close_orphan(sweep: _Pass, transfer: Transfer) -> None:
-    """Close the live successor of a FAILED transfer that refused its accept (D13).
+    """Close the live successor of a FAILED transfer that refused its accept (D13) or that a
+    ``no-first-turn`` abort orphaned (tp#2326 D6).
 
-    Only the process that refused (registry start at or before the refusal): a tab the
+    Only the process that existed at the stamp (registry start at or before it): a tab the
     user reopened later is never closed. Idle only, paced, a held token left alone."""
     from . import continue_session
 
