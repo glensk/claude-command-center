@@ -3610,32 +3610,80 @@ def test_a_fable_dry_run_shows_the_fable_model(
     assert data["snapshot"]["llm_overseer"] == "fable-5.2"
 
 
-def test_an_unknown_source_model_is_never_switched_silently(
+@pytest.mark.parametrize("observed", ["claude-brand-new-9", "nova-12.5-preview"])
+def test_an_unknown_source_model_passes_through_unchanged(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    observed: str,
+) -> None:
+    """tp#2335: a model ccc has no row for is kept as its raw id, with no fallback notice."""
+    _source_model(observed)
+    assert harness.start() == 0
+    assert "notice: source model" not in capsys.readouterr().err
+    [target] = harness.launches
+    with Store() as store:
+        job = store.get(target)
+    assert job is not None and job.llm_overseer == observed and job.llm_exec == observed
+    assert _model_flag(_successor_argv(monkeypatch, target)) == observed
+
+
+def test_an_outside_relay_of_an_unknown_source_model_keeps_it(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``start -X`` carries a raw id through to the successor's argv as well (tp#2335)."""
+    _source_model("claude-brand-new-9")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "someone-else")
+    monkeypatch.setattr(continue_session, "_sleep", _Clock(harness, grow_until=0).sleep)
+    monkeypatch.setattr(continue_session, "_idle_now", lambda *_a: True)
+    assert cli.main(_outside("-s", SID)) == 0
+    assert "notice: source model" not in capsys.readouterr().err
+    [target] = harness.launches
+    with Store() as store:
+        job = store.get(target)
+    assert job is not None and job.llm_overseer == "claude-brand-new-9"
+    assert job.llm_exec == "claude-brand-new-9"
+    assert _model_flag(_successor_argv(monkeypatch, target)) == "claude-brand-new-9"
+
+
+def test_a_synthetic_source_model_falls_back_with_a_notice(
     harness: _Harness, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A model ccc cannot launch falls back to the default, with one notice naming both."""
-    _source_model("claude-brand-new-9")
+    """A non-token observation (``<synthetic>``) is no model id: the default, said once."""
+    _source_model("<synthetic>")
     assert harness.start() == 0
     err = capsys.readouterr().err
-    assert err.count("claude-brand-new-9") == 1
-    assert "not a ccc model choice; the successor runs on opus-5.5" in err
+    assert "source model '<synthetic>' is not a model id; the successor runs on opus-5.5" in err
     [target] = harness.launches
     with Store() as store:
         job = store.get(target)
     assert job is not None and job.llm_overseer == "opus-5.5" and job.llm_exec == "opus-5.5"
 
 
+@pytest.mark.parametrize(
+    ("explicit", "model_id"),
+    [("sonnet-5", "claude-sonnet-5"), ("claude-brand-new-9", "claude-brand-new-9")],
+)
 def test_an_explicit_overseer_wins_over_the_source_model(
-    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    explicit: str,
+    model_id: str,
 ) -> None:
-    _source_model("claude-brand-new-9")
-    assert harness.start("-O", "sonnet-5") == 0
-    assert "not a ccc model choice" not in capsys.readouterr().err
+    _source_model("fable-5.2")
+    assert harness.start("-O", explicit) == 0
+    assert "notice: source model" not in capsys.readouterr().err
     [target] = harness.launches
     with Store() as store:
         job = store.get(target)
-    assert job is not None and job.llm_overseer == "sonnet-5" and job.llm_exec == "sonnet-5"
-    assert _model_flag(_successor_argv(monkeypatch, target)) == "claude-sonnet-5"
+    assert job is not None and job.llm_overseer == explicit and job.llm_exec == explicit
+    assert _model_flag(_successor_argv(monkeypatch, target)) == model_id
+
+
+def test_an_explicit_non_token_model_is_refused() -> None:
+    with pytest.raises(continue_session.StartRefused, match="unknown model"):
+        continue_session._job_model("fable-5.2", "<synthetic>")  # noqa: SLF001  # pylint: disable=protected-access
 
 
 @pytest.mark.parametrize(
@@ -3646,8 +3694,14 @@ def test_an_explicit_overseer_wins_over_the_source_model(
         ("claude-haiku-4-5-20251001", None, "haiku-4.5"),  # a raw known id maps too
         ("opus-5.5", None, "opus-5.5"),
         ("", None, "opus-5.5"),  # nothing observed: the default
-        ("claude-brand-new-9", None, "opus-5.5"),
+        ("claude-brand-new-9", None, "claude-brand-new-9"),  # tp#2335: raw id kept
+        ("nova-12.5-preview", None, "nova-12.5-preview"),
+        ("<synthetic>", None, "opus-5.5"),  # no model id: the default
+        ("opus-5", None, "opus-5.5"),  # retired: its replacement
+        ("claude-opus-5", None, "opus-5.5"),
         ("fable-5.2", "haiku-4.5", "haiku-4.5"),  # -O/-E wins
+        ("fable-5.2", "claude-brand-new-9", "claude-brand-new-9"),
+        ("fable-5.2", "claude-sonnet-5", "sonnet-5"),  # a known raw id maps to its label
     ],
 )
 def test_job_model_resolution(observed: str, explicit: str | None, expected: str) -> None:

@@ -169,6 +169,24 @@ def test_controls_block_lists_model_selects() -> None:
     assert "option(fable-5)" not in llm_opts  # retired; fable-5.2 is offered (tp#2330)
 
 
+def test_a_raw_model_id_round_trips_and_joins_the_select_options() -> None:
+    """tp#2335: a held raw id survives serialize → parse and is offered by its select."""
+    text = future_files.serialize(
+        session_id=_UUID,
+        aim="x",
+        repo="home/ccc",
+        llm_overseer="claude-brand-new-9",
+        llm_exec="claude-opus-4-8[1m]",  # not Meta-Bind-safe: kept, not offered
+    )
+    job = future_files.parse_job_file(text)
+    assert job.llm_overseer == "claude-brand-new-9" and job.llm_exec == "claude-opus-4-8[1m]"
+    base = ", ".join(f"option({choice})" for choice in models.LLM_CHOICES)
+    llm_opts = f"{base}, option(claude-brand-new-9)"
+    assert f"inlineSelect({llm_opts}):llm_overseer]" in text
+    assert f"inlineSelect({llm_opts}):llm_exec]" in text
+    assert "option(claude-opus-4-8[1m])" not in text
+
+
 def test_controls_block_labels_every_select() -> None:
     # Each Controls widget carries a bold label so the boxes are identifiable.
     text = future_files.serialize(session_id=_UUID, aim="x", repo="home/ccc")
@@ -315,10 +333,14 @@ def test_validate_ok_and_failures(tmp_path: Path) -> None:
     )
     assert any(
         "llm_overseer" in e
-        for e in future_files.validate(replace(good, llm_overseer="gpt-9"), git_base)
+        for e in future_files.validate(replace(good, llm_overseer="<synthetic>"), git_base)
     )
     assert any(
-        "llm_exec" in e for e in future_files.validate(replace(good, llm_exec="bogus"), git_base)
+        "llm_exec" in e for e in future_files.validate(replace(good, llm_exec="bo gus"), git_base)
+    )
+    # tp#2335: a raw model id (a model newer than the choice table) is valid.
+    assert not future_files.validate(
+        replace(good, llm_overseer="claude-brand-new-9", llm_exec="nova-12.5-preview"), git_base
     )
     assert any(
         "repo" in e for e in future_files.validate(replace(good, repo="home/missing"), git_base)

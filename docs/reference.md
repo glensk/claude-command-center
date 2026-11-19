@@ -756,6 +756,15 @@ notice on stderr; the retired model is never passed to Claude or offered by a mo
 The same table covers raw ids: `claude_argv` never emits `--model claude-opus-5`, and a
 `continue-session` successor never inherits its predecessor's retired observed model — a
 chain started on Opus 5 moves to `claude-opus-5-5` at its next relay (tp#2032).
+The choices are the offered menu (labels, colours, CLI choices), not a gate (tp#2335): a job may
+also hold a **raw model id** ccc has no row for — any plain token (`models.is_raw_model_id`:
+letters, digits, `._:/[]-`, no leading `-`, never `<synthetic>`), e.g. a model released after
+this table. It is stored, synced and validated as-is, launched as `claude --model <id>` (one
+argv element), shown without a colour, and offered as an extra option by the TUI dropdowns and
+the Meta Bind selects of the job that holds it (Meta Bind only for ids of letters, digits,
+`._-`); its Agent-tool alias is the family word in the id (`opus`, `sonnet`, `haiku`,
+`fable`), and without one the delegation line names the id itself. Only an empty or non-token
+value falls back to `opus-5.5`. `ccc new-job`/`edit-job -O/-E` still accept the choices only.
 If the **executor** differs, the launch
 prompt tells the overseer to delegate implementation to Agent-tool subagents on the executor's model
 (e.g. Opus oversees, Sonnet executes) while keeping planning, review and integration itself. Both fields
@@ -2154,8 +2163,10 @@ snapshot and composed handoff without recollecting — so `start` → exit 3 →
 → the same `start` still reuses the transfer. The successor is a draft job (`create_draft`: the source's latest user AIM — see below —, cwd,
 `no_codex`, the observed model unless `-O`/`-E` say otherwise — a retired one such as `opus-5`
 is replaced through `models.RETIRED_LLM_REPLACEMENTS`, tp#2032; a raw observed id is mapped
-to its ccc choice, and one ccc does not know falls back to `opus-5.5` with a stderr notice
-naming both, tp#2330 —, the unchecked sub-goals)
+to its ccc choice, tp#2330, and one ccc has no row for passes through unchanged, so the
+successor runs on the same model whatever its name or version, tp#2335; only an empty or
+non-token observation such as `<synthetic>` falls back to `opus-5.5`, the latter with a stderr
+notice; an explicit `-O`/`-E` takes a choice or a raw id —, the unchecked sub-goals)
 launched through `start-job` in a new tab; its prompt is a short preamble (take over from
 session X, transfer T, FIRST run `ccc continue-session accept T`, then relaunch the agents
 from their capsules, restart only the `restart:` shells, judge the `Decide before

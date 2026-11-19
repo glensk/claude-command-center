@@ -67,6 +67,8 @@ _AIM_HEADING = "## AIM"
 _PROMPT_HEADING = "## Prompt"
 _CONTROLS_HEADING = "## Controls"
 _SECTION_RE = re.compile(r"^#{1,2} +(AIM|Prompt|Controls)\s*$")
+# A value Meta Bind can carry inside ``option(...)`` unquoted (raw model ids, tp#2335).
+_SAFE_OPTION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _section_name(line: str) -> str | None:
@@ -316,12 +318,16 @@ def validate(job: ParsedJob, git_base: Path) -> list[str]:
         errors.append("AIM is empty")
     if job.job_type not in models.JOB_TYPES:
         errors.append(f"job_type {job.job_type!r} is not one of {', '.join(models.JOB_TYPES)}")
-    if job.llm_overseer not in models.LLM_CHOICES:
+    # A raw model id (a model newer than the choice table, tp#2335) is valid too.
+    if not models.is_launchable_llm(job.llm_overseer):
         errors.append(
             f"llm_overseer {job.llm_overseer!r} is not one of {', '.join(models.LLM_CHOICES)}"
+            " or a model id"
         )
-    if job.llm_exec not in models.LLM_CHOICES:
-        errors.append(f"llm_exec {job.llm_exec!r} is not one of {', '.join(models.LLM_CHOICES)}")
+    if not models.is_launchable_llm(job.llm_exec):
+        errors.append(
+            f"llm_exec {job.llm_exec!r} is not one of {', '.join(models.LLM_CHOICES)} or a model id"
+        )
     if not _repo_dir(job.repo, git_base):
         errors.append(f"repo {job.repo!r} is not an existing <cat>/<repo> or absolute directory")
     if job.start_date.strip() and models.parse_iso_date(job.start_date) is None:
@@ -469,17 +475,32 @@ def _restore_button() -> str:
     return _button_block("↩ Stage job back in", _RESTORE_JOB_COMMAND_ID, style="primary")
 
 
-def _controls_block(repo: str, repo_options: list[str]) -> str:
+def _llm_options(llm_values: tuple[str, ...]) -> str:
+    """The model ``inlineSelect`` options: :data:`models.LLM_CHOICES`, then held raw ids.
+
+    A job holding a raw model id (tp#2335) gets it appended so the select shows the
+    stored value instead of a blank one. Only a Meta-Bind-safe token (letters, digits,
+    ``.``, ``_``, ``-``) is appended; any other raw id stays in the frontmatter untouched.
+    """
+    options = list(models.LLM_CHOICES)
+    for value in llm_values:
+        if value not in options and _SAFE_OPTION_RE.match(value or ""):
+            options.append(value)
+    return ", ".join(f"option({m})" for m in options)
+
+
+def _controls_block(repo: str, repo_options: list[str], llm_values: tuple[str, ...] = ()) -> str:
     """The Meta Bind ``## Controls`` section — labelled inline selects over the frontmatter.
 
     ``status`` and ``job_type`` options are the static enums; the ``repo`` options
     are injected by the caller (current repos from ``repos.py``) with the file's
-    own repo listed first. The widgets are sugar over plain-text frontmatter, so a
+    own repo listed first; the model options are :func:`_llm_options` over the job's
+    own *llm_values*. The widgets are sugar over plain-text frontmatter, so a
     stale option list is harmless — validation is the source of truth.
     """
     status_opts = ", ".join(f"option({s})" for s in STATUSES)
     jobtype_opts = ", ".join(f"option({j})" for j in models.JOB_TYPES)
-    llm_opts = ", ".join(f"option({m})" for m in models.LLM_CHOICES)
+    llm_opts = _llm_options(llm_values)
     seen: list[str] = []
     for opt in [repo, *repo_options]:
         opt = (opt or "").strip()
@@ -577,7 +598,7 @@ def serialize(  # pylint: disable=too-many-arguments
     frontmatter = "\n".join(keys)
     aim_body = aim.strip()
     prompt_body = prompt.strip() if (prompt and prompt.strip()) else ""
-    controls = _controls_block(repo, repo_options or [])
+    controls = _controls_block(repo, repo_options or [], (llm_overseer, llm_exec))
     # The buttons need a real session_id to target; the button-less pad template
     # (empty session_id) stays button-less. A trashed file swaps the action row
     # for the restore button.

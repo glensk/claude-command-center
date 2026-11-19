@@ -76,13 +76,18 @@ def test_create_draft_stores_llm_models_and_defaults(tmp_path: Path) -> None:
     # Default when omitted is opus-5.5 on both.
     d = store.create_draft("jobdef", "/repo", "Do it")
     assert d.llm_overseer == "opus-5.5" and d.llm_exec == "opus-5.5"
-    # A retired or bogus value falls back to the active default.
-    b = store.create_draft("jobbad", "/repo", "Do it", llm_overseer="gpt-9", llm_exec="")
+    # A retired value maps to its replacement; a non-token one falls back to the default.
+    b = store.create_draft("jobbad", "/repo", "Do it", llm_overseer="<synthetic>", llm_exec="")
     assert b.llm_overseer == "opus-5.5" and b.llm_exec == "opus-5.5"
     retired = store.create_draft(
-        "jobretired", "/repo", "Do it", llm_overseer="fable-5", llm_exec="fable-5"
+        "jobretired", "/repo", "Do it", llm_overseer="fable-5", llm_exec="opus-5"
     )
     assert retired.llm_overseer == "opus-5.5" and retired.llm_exec == "opus-5.5"
+    # tp#2335: a raw model id ccc has no choice for is kept verbatim.
+    raw = store.create_draft(
+        "jobraw", "/repo", "Do it", llm_overseer="claude-brand-new-9", llm_exec="nova-12.5-preview"
+    )
+    assert raw.llm_overseer == "claude-brand-new-9" and raw.llm_exec == "nova-12.5-preview"
 
 
 def test_clear_draft_promotes_to_real_session(tmp_path: Path) -> None:

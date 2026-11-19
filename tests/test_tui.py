@@ -2187,6 +2187,55 @@ def test_inline_edit_models_selects_save_through_commit(
     assert saved.llm_exec == "sonnet-5"
 
 
+def test_inline_edit_keeps_a_held_raw_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#2335: a draft on a raw model id shows it in the Select and keeps it on save."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    draft_sid = "draft-raw-model"
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft(
+        draft_sid,
+        "/Users/x/repo",
+        "Prepare draft",
+        llm_overseer="claude-brand-new-9",
+        llm_exec="sonnet-5",
+    )
+    store.close()
+
+    from textual.widgets import Select
+
+    from command_center.views.tui import CommandCenterApp, SessionTable
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app.cfg.aim_score_on_set = False
+            table = app.query_one("#sessions", SessionTable)
+            table.move_cursor(row=table.get_row_index(draft_sid))
+            table.focus()
+            await pilot.pause()
+            await pilot.press("e")
+            await pilot.pause()
+            overseer = app.query_one("#edit-overseer", Select)
+            assert overseer.value == "claude-brand-new-9"
+            assert "claude-brand-new-9" in {str(value) for _prompt, value in overseer._options}
+            app.query_one("#edit-executor", Select).value = "haiku-4.5"
+            await pilot.pause()
+            app.action_exit_edit()
+            await pilot.pause()
+
+    asyncio.run(scenario())
+
+    store = Store(tmp_path / "command-center" / "state.db")
+    saved = store.get(draft_sid)
+    store.close()
+    assert saved is not None
+    assert saved.llm_overseer == "claude-brand-new-9"
+    assert saved.llm_exec == "haiku-4.5"
+
+
 def test_inline_edit_account_select_saves_config_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

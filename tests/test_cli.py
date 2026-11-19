@@ -316,6 +316,30 @@ def test_start_job_argv_delegates_when_exec_differs(
     assert prompt.endswith("run it")
 
 
+@pytest.mark.parametrize(
+    ("executor", "named"),
+    [("claude-sonnet-9-preview", "model 'sonnet'"), ("nova-12.5-preview", "nova-12.5-preview")],
+)
+def test_start_job_raw_executor_delegates_without_a_table_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, executor: str, named: str
+) -> None:
+    """tp#2335: a raw executor id builds the delegation line (family alias, else the id)."""
+    _argv, prompt = _start_job_launch(tmp_path, monkeypatch, overseer="opus-5.5", executor=executor)
+    assert prompt.startswith("[orchestration] You are the overseer running as opus-5.5.")
+    assert named in prompt and prompt.endswith("run it")
+
+
+def test_start_job_raw_overseer_launches_on_its_own_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#2335: a raw overseer id is the ``--model`` argument as one argv element."""
+    argv, prompt = _start_job_launch(
+        tmp_path, monkeypatch, overseer="claude-brand-new-9", executor="claude-brand-new-9"
+    )
+    assert argv[:3] == ["claude", "--model", "claude-brand-new-9"]
+    assert "[orchestration]" not in prompt
+
+
 def test_start_job_argv_codex_keeps_model_but_no_delegation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

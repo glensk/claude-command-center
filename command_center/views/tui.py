@@ -120,11 +120,14 @@ from ..models import (
     handoff_marker,
     humanize_age,
     importance_marks,
+    is_raw_model_id,
     iso_date,
     iso_datetime,
+    launchable_llm_or,
     loads_todos,
     low_aim_score,
     model_effort_cell,
+    model_select_options,
     now_ms,
     parse_iso_date,
     parse_manual_progress,
@@ -1129,8 +1132,9 @@ class EditForm(Vertical):
         # and Scheduled-for right under it, so their edit rows are reachable at the
         # very top of the form rather than buried below the AIM.
         # Clickable dropdowns: pick from LLM_CHOICES with the mouse or arrow keys — invalid
-        # input is impossible, and the Selects stay in the Tab/↑↓ focus chain.
-        model_opts = [(choice, choice) for choice in LLM_CHOICES]
+        # input is impossible, and the Selects stay in the Tab/↑↓ focus chain. A job's
+        # held raw model id is added per edit (action_edit_session, tp#2335).
+        model_opts = model_select_options()
         with Horizontal(id="edit-overseer-row", classes="fieldrow"):
             yield Label("/overseer: ", classes="fieldlabel")
             yield Select(model_opts, value=DEFAULT_LLM, allow_blank=False, id="edit-overseer")
@@ -5632,10 +5636,11 @@ class CommandCenterApp(App[None]):
         if (session := store.get(sid)) is None:
             return
         self._edit_sid = sid
-        # Model choices must be valid LLM_CHOICES for the Selects to accept them (a legacy
-        # or non-draft row may carry None) — coerce to the default so the Select never errors.
-        overseer = session.llm_overseer if session.llm_overseer in LLM_CHOICES else DEFAULT_LLM
-        executor = session.llm_exec if session.llm_exec in LLM_CHOICES else DEFAULT_LLM
+        # A model must be launchable (a choice or a raw id, tp#2335) for the Selects to hold
+        # it (a legacy or non-draft row may carry None) — else coerce to the default so
+        # the Select never errors; a raw id is added to the options below.
+        overseer = launchable_llm_or(session.llm_overseer, DEFAULT_LLM)
+        executor = launchable_llm_or(session.llm_exec, DEFAULT_LLM)
         # The account Select only accepts a configured label; coerce an unknown/legacy
         # config_dir to the first configured label so it never raises InvalidSelectValue.
         account_dirs = config.claude_config_dirs()
@@ -5685,6 +5690,11 @@ class CommandCenterApp(App[None]):
         self.query_one("#edit-progress", Input).value = self._edit_original["progress"]
         self.query_one("#edit-block", Input).value = self._edit_original["block"]
         self.query_one("#edit-prompt", TextArea).text = self._edit_original["prompt"]
+        # A held raw model id (tp#2335) joins the options, so the Select shows it and an
+        # unchanged save keeps it.
+        model_opts = model_select_options(overseer, executor)
+        for select_id in ("#edit-overseer", "#edit-executor"):
+            self.query_one(select_id, Select).set_options(model_opts)
         self.query_one("#edit-overseer", Select).value = self._edit_original["overseer"]
         self.query_one("#edit-executor", Select).value = self._edit_original["executor"]
         self.query_one("#edit-account", Select).value = self._edit_original["account"]
@@ -5896,9 +5906,10 @@ class CommandCenterApp(App[None]):
             self._commit_subgoals(sid, subgoals)
         if session.draft and prompt != original.get("prompt", ""):
             store.update_fields(sid, prompt=prompt or None)
-        # Model pair (drafts only): the Selects only ever hold a valid LLM_CHOICES value,
-        # so _commit_model (which still validates via expand_llm_choice, kept for the CLI)
-        # simply saves it. The isinstance guard also narrows Select.value off Select.BLANK.
+        # Model pair (drafts only): the Selects only ever hold a valid LLM_CHOICES value or
+        # the job's own held raw id (tp#2335), so _commit_model (which still validates via
+        # expand_llm_choice, kept for the CLI) simply saves it. The isinstance guard also
+        # narrows Select.value off Select.BLANK.
         if session.draft:
             overseer = self.query_one("#edit-overseer", Select).value
             executor = self.query_one("#edit-executor", Select).value
@@ -5959,7 +5970,8 @@ class CommandCenterApp(App[None]):
         """Validate an edited model field and save it (invalid → notify, value unchanged)."""
         if (store := self.store) is None:
             return
-        canonical = expand_llm_choice(raw)
+        # A held raw model id offered by the dropdown (tp#2335) is saved as-is.
+        canonical = expand_llm_choice(raw) or (raw if is_raw_model_id(raw) else None)
         if canonical is None:
             self.notify(
                 f"Invalid {label} model {raw!r} — expected one of "

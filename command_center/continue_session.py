@@ -381,34 +381,48 @@ def _monotonic() -> float:
 def _job_model(observed: str, explicit: str | None) -> str:
     """Q1: an explicit ``-O``/``-E`` wins; else the observed model when launchable; else default.
 
-    *observed* may be a ccc label (``fable-5.2``) or a raw ``claude --model`` id
-    (``claude-fable-5-2``, the live-entry fallback): both resolve to the label (tp#2330).
+    *observed* (and *explicit*) may be a ccc label (``fable-5.2``) or a raw ``claude
+    --model`` id (``claude-fable-5-2``, the live-entry fallback): a known id resolves to
+    its label (tp#2330), a retired one to its replacement, and an id ccc has no row for
+    (a newer model) passes through unchanged (tp#2335). Only an empty or non-token value
+    (``<synthetic>``) takes the default; an explicit one of those is refused.
     """
-    from .models import NEW_JOB_DEFAULT_LLM, NEW_JOB_LLM_CHOICES, model_label
+    from .models import (
+        NEW_JOB_DEFAULT_LLM,
+        NEW_JOB_LLM_CHOICES,
+        RETIRED_LLM_REPLACEMENTS,
+        is_launchable_llm,
+        model_label,
+    )
 
     if explicit:
-        if explicit not in NEW_JOB_LLM_CHOICES:
+        label = model_label(explicit)
+        if not is_launchable_llm(label):
             raise StartRefused(
-                f"unknown model {explicit!r} (choices: {', '.join(NEW_JOB_LLM_CHOICES)})"
+                f"unknown model {explicit!r} (choices: {', '.join(NEW_JOB_LLM_CHOICES)}, "
+                "or a model id)"
             )
-        return explicit
+        return label
     label = model_label(observed)
-    return label if label in NEW_JOB_LLM_CHOICES else NEW_JOB_DEFAULT_LLM
+    label = RETIRED_LLM_REPLACEMENTS.get(label, label)
+    return label if is_launchable_llm(label) else NEW_JOB_DEFAULT_LLM
 
 
 def _notice_unknown_model(observed: str, overseer: str, executor: str) -> None:
-    """One stderr line when the source ran on a model ccc cannot launch (tp#2330).
+    """One stderr line when the source's model is no launchable id (tp#2330, tp#2335).
 
-    A draft job only stores a known choice, so an unknown (newer) observed id falls back to
-    the default; the relay says so instead of switching models silently.
+    Any plain model id is carried over as-is; only a non-token observation (a transcript
+    placeholder such as ``<synthetic>``) falls back to the default, and the relay says so
+    instead of switching models silently.
     """
-    from .models import NEW_JOB_LLM_CHOICES, model_label
+    from .models import RETIRED_LLM_REPLACEMENTS, is_launchable_llm, model_label
 
-    if not observed or model_label(observed) in NEW_JOB_LLM_CHOICES:
+    label = model_label(observed)
+    if not observed or is_launchable_llm(RETIRED_LLM_REPLACEMENTS.get(label, label)):
         return
     used = overseer if overseer == executor else f"{overseer} / {executor}"
     print(
-        f"notice: source model {observed!r} is not a ccc model choice; "
+        f"notice: source model {observed!r} is not a model id; "
         f"the successor runs on {used} (pass -O/-E to choose)",
         file=sys.stderr,
     )
@@ -1113,7 +1127,7 @@ def _dry_run(
     transfer: Any, src: Source, text: str, as_json: bool, sidecars: Sidecars = NO_SIDECARS
 ) -> int:
     from . import launch_argv
-    from .models import LLM_MODEL_IDS
+    from .models import llm_model_id
 
     named = {"model_full": "", "facts_rest": ""}
     if sidecars.model_full:
@@ -1129,7 +1143,7 @@ def _dry_run(
     # STDIN, never in argv (tp#1681 L23/L24): the dry run shows the same split.
     argv = launch_argv.claude_argv(
         session_id="<new session id>",
-        model=LLM_MODEL_IDS.get(transfer.llm_overseer, transfer.llm_overseer),
+        model=llm_model_id(transfer.llm_overseer),
         name="",
     )
     if as_json:

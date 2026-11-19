@@ -70,8 +70,6 @@ from .models import (
     BUSY_RAW_STATUSES,
     EFFORT_LEVELS,
     JOB_TYPES,
-    LLM_AGENT_ALIAS,
-    LLM_MODEL_IDS,
     NEW_JOB_DEFAULT_LLM,
     NEW_JOB_LLM_CHOICES,
     Session,
@@ -80,6 +78,8 @@ from .models import (
     aim_column_first,
     days_until_start,
     effective_status,
+    llm_agent_alias,
+    llm_model_id,
     no_codex_conflict,
     now_ms,
     parse_iso_date,
@@ -4064,11 +4064,14 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
         from .models import job_launch_prefix
 
         if job_type == "claude" and executor != overseer:
+            # A raw executor id naming no known family (tp#2335) has no Agent-tool alias:
+            # the sentence names the id itself.
+            alias = llm_agent_alias(executor)
+            target = f"model '{alias}'" if alias else f"the model {executor}"
             prompt = (
                 f"[orchestration] You are the overseer running as {overseer}. Delegate "
-                f"implementation work to subagents via the Agent tool with model "
-                f"'{LLM_AGENT_ALIAS[executor]}'; keep planning, review, verification and "
-                f"integration yourself. " + prompt
+                f"implementation work to subagents via the Agent tool with {target}; "
+                f"keep planning, review, verification and integration yourself. " + prompt
             )
         launch_prompt = job_launch_prefix(job_type) + prompt
     # The original prompt of a resumed job was already submitted; a bare resume continues
@@ -4080,7 +4083,7 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
     argv = launch_argv.claude_argv(
         resume=args.session_id if resume else "",
         session_id="" if resume else args.session_id,
-        model=LLM_MODEL_IDS[overseer],
+        model=llm_model_id(overseer),  # a raw id passed is_raw_model_id (tp#2335)
         effort=effort,
         launch_profile=profile,
         startup_sysprompt=True,  # tp#2168 B10: this execvp bypasses the shell wrapper

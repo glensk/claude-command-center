@@ -49,7 +49,6 @@ from .models import (
     AIM_SET_BY_USER,
     DEFAULT_LLM,
     JOB_TYPES,
-    LLM_CHOICES,
     AimRevision,
     CloseClaim,
     FileLock,
@@ -64,6 +63,7 @@ from .models import (
     SwitchClaim,
     TabbedRow,
     TranscriptScan,
+    launchable_llm_or,
     no_codex_conflict,
     now_ms,
     short_id,
@@ -72,7 +72,6 @@ from .slrender import FIRST_AIM_SELECT
 from .transfer_store import TRANSFER_SCHEMA, TransferStoreMixin
 
 _JOB_TYPES = frozenset(JOB_TYPES)
-_LLM_CHOICES = frozenset(LLM_CHOICES)
 
 
 def pid_alive(pid: int | None) -> bool:
@@ -91,8 +90,12 @@ def pid_alive(pid: int | None) -> bool:
 
 
 def _llm_or_default(value: str | None) -> str:
-    """A valid future-job model choice, falling back to :data:`DEFAULT_LLM`."""
-    return value if value in _LLM_CHOICES else DEFAULT_LLM
+    """A launchable future-job model (a choice or a raw model id, tp#2335).
+
+    A retired value maps to its replacement; an empty or non-token one to
+    :data:`DEFAULT_LLM`.
+    """
+    return launchable_llm_or(value, DEFAULT_LLM)
 
 
 # Normalize a sub-goal's text for tick-carryover matching (case/space/punctuation-insensitive).

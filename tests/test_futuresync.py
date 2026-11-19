@@ -225,6 +225,30 @@ def test_db_model_edit_exports_to_file_frontmatter(env: Env) -> None:
     assert futuresync.run_sync(env.store, env.cfg).total() == 0
 
 
+def test_a_raw_model_id_survives_export_and_import(
+    env: Env,  # pylint: disable=redefined-outer-name  # the pytest fixture
+) -> None:
+    """tp#2335: a job holding a raw model id keeps it across vault syncs, error-free."""
+    sid = _new_draft(env, "Ship the thing")
+    futuresync.run_sync(env.store, env.cfg)  # bootstrap export
+    env.store.update_fields(sid, llm_overseer="claude-brand-new-9", llm_exec="claude-brand-new-9")
+    assert futuresync.run_sync(env.store, env.cfg).exported == [sid]
+    path = _abs(env, sid)
+    text = path.read_text(encoding="utf-8")
+    assert 'llm_overseer: "claude-brand-new-9"' in text and "<!-- ccc-sync-error -->" not in text
+    # A file-side edit to another raw id imports as-is (no fallback to the default).
+    path.write_text(
+        text.replace('llm_exec: "claude-brand-new-9"', 'llm_exec: "nova-12.5-preview"'),
+        encoding="utf-8",
+    )
+    report = futuresync.run_sync(env.store, env.cfg)
+    assert report.imported == [sid]
+    assert _session(env, sid).llm_overseer == "claude-brand-new-9"
+    assert _session(env, sid).llm_exec == "nova-12.5-preview"
+    assert "<!-- ccc-sync-error -->" not in path.read_text(encoding="utf-8")
+    assert futuresync.run_sync(env.store, env.cfg).total() == 0
+
+
 def test_repo_change_moves_file_and_updates_cwd(env: Env) -> None:
     sid = _new_draft(env, "Ship the thing")
     futuresync.run_sync(env.store, env.cfg)

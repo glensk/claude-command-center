@@ -424,6 +424,9 @@ LLM_AGENT_ALIAS: dict[str, str] = {
     "haiku-4.5": "haiku",
     "fable-5.2": "fable",
 }
+# These three tables give a KNOWN model its label, launch id and colour; they are the
+# offered menu, not a gate: a newer model with no row here still launches under its raw
+# id (:func:`is_launchable_llm`, :func:`llm_model_id`, :func:`llm_agent_alias`, tp#2335).
 # THE superseded-model table (tp#2032): a retired choice → the current one it launches as.
 # Rows written before a retirement remain readable, but a retired value is deliberately
 # absent from every executable choice/id/alias map above. Launch resolution maps it to its
@@ -460,6 +463,95 @@ def model_label(model_id: str | None) -> str:
         if raw == model_id:
             return choice
     return model_id
+
+
+# A raw ``claude --model`` id ccc has no table row for (tp#2335): one plain token, so it is
+# always a single argv element and never an option (no leading ``-``) or a transcript
+# placeholder such as ``<synthetic>``.
+_RAW_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]*$")
+# The family words a raw id may carry, for the Agent-tool ``model`` enum (delegation line).
+_AGENT_FAMILIES: tuple[str, ...] = ("opus", "sonnet", "haiku", "fable")
+
+
+def is_raw_model_id(value: str | None) -> bool:
+    """True when *value* is a model id ccc has no choice for but can still launch (tp#2335).
+
+    A non-empty plain token (:data:`_RAW_MODEL_ID_RE`: no whitespace, no leading ``-``, no
+    ``<synthetic>``) that is neither an :data:`LLM_CHOICES` name nor a retired value (a
+    :data:`RETIRED_LLM_REPLACEMENTS` choice or its raw transcript id), compared
+    case-insensitively. A model released after this table was written passes, whatever its
+    name or version, so a relay or a stored job keeps it instead of falling back.
+    """
+    if not value or not _RAW_MODEL_ID_RE.match(value):
+        return False
+    lowered = value.lower()
+    return (
+        lowered not in LLM_CHOICES
+        and lowered not in RETIRED_LLM_REPLACEMENTS
+        and lowered not in _RETIRED_MODEL_LABELS
+    )
+
+
+def is_launchable_llm(value: str | None) -> bool:
+    """True for a current :data:`LLM_CHOICES` member or a raw model id (tp#2335).
+
+    The ONE gate for a stored or observed job model: :data:`LLM_CHOICES` is the offered
+    menu, never a filter — a raw id is kept, a retired value maps through
+    :data:`RETIRED_LLM_REPLACEMENTS`, and only garbage falls back to :data:`DEFAULT_LLM`.
+    """
+    return bool(value) and (value in LLM_CHOICES or is_raw_model_id(value))
+
+
+def launchable_llm_or(value: str | None, fallback: str) -> str:
+    """*value* when launchable, its replacement when retired, else *fallback* (tp#2335).
+
+    The shared repair of a stored job model (store, vault sync, TUI dialog): a raw id is
+    kept as-is, a retired choice maps through :data:`RETIRED_LLM_REPLACEMENTS`, and only
+    an empty or non-token value takes *fallback*.
+    """
+    if value and is_launchable_llm(value):
+        return value
+    return RETIRED_LLM_REPLACEMENTS.get((value or "").strip().lower(), fallback)
+
+
+def model_select_options(*held: str) -> list[tuple[str, str]]:
+    """``(label, value)`` options for a model dropdown: the choices, then held raw ids.
+
+    *held* are the job's current models; a raw id among them (tp#2335) is appended once,
+    so the dropdown can show it and saving it unchanged keeps it.
+    """
+    values = list(LLM_CHOICES)
+    values += [v for v in dict.fromkeys(held) if v not in values and is_raw_model_id(v)]
+    return [(value, value) for value in values]
+
+
+def llm_model_id(value: str) -> str:
+    """The ``claude --model`` argument for a launchable job model (tp#2335).
+
+    A ccc choice → its :data:`LLM_MODEL_IDS` id; a raw id → itself, after it passed
+    :func:`is_raw_model_id` (one argv element, never an option). Anything else raises
+    :class:`ValueError`, so no argv is built from an unchecked value.
+    """
+    if value in LLM_MODEL_IDS:
+        return LLM_MODEL_IDS[value]
+    if is_raw_model_id(value):
+        return value
+    raise ValueError(f"not a launchable model: {value!r}")
+
+
+def llm_agent_alias(value: str) -> str | None:
+    """The Agent-tool ``model`` alias for a job model, or ``None`` (tp#2335).
+
+    A ccc choice → its :data:`LLM_AGENT_ALIAS` entry; a raw id → the first family word it
+    contains (``opus``, ``sonnet``, ``haiku``, ``fable``); a raw id naming no known family
+    → ``None`` (the caller names the raw id instead of an alias).
+    """
+    if value in LLM_AGENT_ALIAS:
+        return LLM_AGENT_ALIAS[value]
+    if not is_raw_model_id(value):
+        return None
+    lowered = value.lower()
+    return next((family for family in _AGENT_FAMILIES if family in lowered), None)
 
 
 def model_effort_cell(model: str, effort: str) -> str:
@@ -509,17 +601,21 @@ def expand_llm_choice(value: str) -> str | None:
 def resolve_job_llm(value: str | None) -> tuple[str, bool]:
     """Return a launchable job model and whether a retired value was replaced.
 
-    Unknown/corrupt values use :data:`DEFAULT_LLM`, as before. A persisted pre-retirement
-    value (``fable-5``, ``opus-5``) resolves to its :data:`RETIRED_LLM_REPLACEMENTS`
-    entry, but reports ``True`` so the launch
-    boundary can emit exactly one notice even when both job fields contain it.
+    A raw model id (:func:`is_raw_model_id`, tp#2335) is returned unchanged; corrupt values
+    use :data:`DEFAULT_LLM`, as before. A persisted pre-retirement value (``fable-5``,
+    ``opus-5``) resolves to its :data:`RETIRED_LLM_REPLACEMENTS` entry, but reports
+    ``True`` so the launch boundary can emit exactly one notice even when both job fields
+    contain it.
     """
-    candidate = (value or "").strip().lower()
+    stripped = (value or "").strip()
+    candidate = stripped.lower()
     replacement = RETIRED_LLM_REPLACEMENTS.get(candidate)
     if replacement is not None:
         return replacement, True
     if candidate in LLM_MODEL_IDS:
         return candidate, False
+    if is_raw_model_id(stripped):
+        return stripped, False
     return DEFAULT_LLM, False
 
 

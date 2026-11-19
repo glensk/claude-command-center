@@ -30,13 +30,20 @@ from command_center.models import (
     expand_llm_choice,
     humanize_age,
     importance_marks,
+    is_launchable_llm,
+    is_raw_model_id,
+    launchable_llm_or,
+    llm_agent_alias,
+    llm_model_id,
     loads_todos,
     model_effort_cell,
     model_label,
+    model_select_options,
     models_readout,
     parse_manual_progress,
     progress_bar,
     progress_fraction,
+    resolve_job_llm,
     short_id,
     short_version,
     subgoal_provenance,
@@ -475,3 +482,87 @@ def test_current_model_replaces_superseded_ids() -> None:
     assert current_model(None) == ""
     # Every replacement is itself launchable (no chain ends on a retired value).
     assert set(RETIRED_LLM_REPLACEMENTS.values()) <= set(LLM_CHOICES)
+
+
+# ------------------------------------------- tp#2335: raw model ids pass through generically
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["claude-brand-new-9", "nova-12.5-preview", "claude-opus-4-8[1m]", "vendor/model:v2"],
+)
+def test_is_raw_model_id_accepts_plain_tokens(value: str) -> None:
+    assert is_raw_model_id(value)
+    assert is_launchable_llm(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        None,
+        "<synthetic>",
+        "claude brand",
+        " claude-x",
+        "-claude-x",
+        "--model",
+        "a;b",
+        "opus-5.5",  # a ccc choice is no RAW id (but launchable)
+        "OPUS-5.5",
+        "opus-5",  # retired choice
+        "claude-opus-5",  # retired raw id
+        "fable-5",
+    ],
+)
+def test_is_raw_model_id_rejects_non_tokens_choices_and_retired(value: str | None) -> None:
+    assert not is_raw_model_id(value)
+
+
+def test_is_launchable_llm() -> None:
+    assert all(is_launchable_llm(choice) for choice in LLM_CHOICES)
+    assert is_launchable_llm("claude-brand-new-9")
+    for value in ("", None, "<synthetic>", "opus-5", "fable-5", "has space"):
+        assert not is_launchable_llm(value)
+
+
+def test_llm_model_id() -> None:
+    assert llm_model_id("fable-5.2") == "claude-fable-5-2"
+    assert llm_model_id("opus-4.8-1m") == "claude-opus-4-8[1m]"
+    assert llm_model_id("claude-brand-new-9") == "claude-brand-new-9"
+    assert llm_model_id("nova-12.5-preview") == "nova-12.5-preview"
+    for bad in ("", "<synthetic>", "-x", "opus-5", "a b"):
+        with pytest.raises(ValueError):
+            llm_model_id(bad)
+
+
+def test_llm_agent_alias() -> None:
+    assert llm_agent_alias("opus-4.8-1m") == "opus"
+    assert llm_agent_alias("fable-5.2") == "fable"
+    assert llm_agent_alias("claude-sonnet-9-preview") == "sonnet"
+    assert llm_agent_alias("Claude-Haiku-7") == "haiku"
+    assert llm_agent_alias("claude-fable-6") == "fable"
+    assert llm_agent_alias("nova-12.5-preview") is None
+    assert llm_agent_alias("<synthetic>") is None
+    assert llm_agent_alias("opus-5") is None  # retired: resolved before any alias lookup
+
+
+def test_resolve_job_llm_keeps_a_raw_id() -> None:
+    assert resolve_job_llm("claude-brand-new-9") == ("claude-brand-new-9", False)
+    assert resolve_job_llm(" nova-12.5-preview ") == ("nova-12.5-preview", False)
+    assert resolve_job_llm("sonnet-5") == ("sonnet-5", False)
+    assert resolve_job_llm("opus-5") == ("opus-5.5", True)
+    assert resolve_job_llm("<synthetic>") == ("opus-5.5", False)
+    assert resolve_job_llm(None) == ("opus-5.5", False)
+
+
+def test_launchable_llm_or_and_select_options() -> None:
+    assert launchable_llm_or("claude-brand-new-9", "x") == "claude-brand-new-9"
+    assert launchable_llm_or("sonnet-5", "x") == "sonnet-5"
+    assert launchable_llm_or("opus-5", "x") == "opus-5.5"  # retired: its replacement
+    assert launchable_llm_or("<synthetic>", "x") == "x"
+    assert launchable_llm_or(None, "x") == "x"
+    plain = model_select_options()
+    assert [value for _label, value in plain] == list(LLM_CHOICES)
+    held = model_select_options("claude-brand-new-9", "claude-brand-new-9", "sonnet-5")
+    assert [value for _label, value in held] == [*LLM_CHOICES, "claude-brand-new-9"]
+    assert model_select_options("<synthetic>") == plain
