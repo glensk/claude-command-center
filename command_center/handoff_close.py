@@ -115,6 +115,17 @@ class Bound:
     start: str
     cwd: str
     transcript: Path | None
+    #: tp#2326 B7: the orphan close of a FAILED transfer's successor (``close-now
+    #: --orphan``, set only by the daemon sweep's orphan path, never by a source close).
+    #: With NO transcript at all its idle proof is the pid, its start time and a still
+    #: ``pending`` handoff ledger row (:func:`_no_transcript_proof`).
+    orphan: bool = False
+    config_dir: str = ""
+
+
+#: One idle proof: the transcript identity ``(inode, mtime_ns, size)``, or (orphan, no
+#: transcript) ``("no-transcript", pid, start, ((input_id, state), ...))``.
+Evidence = tuple[Any, ...]
 
 
 @dataclass(frozen=True)
@@ -281,14 +292,47 @@ def _stamp(path: Path | None) -> tuple[int, int, int] | None:
     return (stat.st_ino, stat.st_mtime_ns, stat.st_size) if stat is not None else None
 
 
+def _no_transcript_proof(adapter: ClaudeAdapter, session_id: str, bound: Bound) -> Evidence:
+    """The orphan's idle proof without a transcript (tp#2326 B7), or :class:`Refused`.
+
+    Still no transcript file at all, and the successor's input ledger shows no prompt
+    ever reached it: at least one ``start_job`` row, every one still ``pending``, no row
+    of any kind ``matched``. The evidence is pid + start + every row's ``(id, state)``,
+    so a row written or moved during the stability window changes it.
+    """
+    try:
+        path = adapter.transcript_path(bound.cwd, session_id, bound.config_dir or None)
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        raise Refused(f"source transcript unresolvable ({exc})", "unobservable") from exc
+    if path is not None:
+        raise Refused("the successor's transcript appeared", "stale_evidence")
+    try:
+        with Store() as store:
+            rows = store.inputs_for(session_id, 0, 2**62)
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        raise Refused(f"input ledger unreadable ({exc})", "unobservable") from exc
+    launches = [row for row in rows if row.kind == "start_job"]
+    if any(row.state == "matched" for row in rows):
+        raise Refused("the successor got a prompt (input ledger matched)", "busy")
+    if not launches or any(row.state != "pending" for row in launches):
+        raise Refused(
+            "no transcript and no pending handoff ledger row — idle unprovable", "unobservable"
+        )
+    ledger = tuple((row.input_id, row.state) for row in rows)
+    return ("no-transcript", bound.pid, bound.start, ledger)
+
+
 def observe(
     adapter: ClaudeAdapter, session_id: str, bound: Bound, *, patient: bool = True
-) -> tuple[int, int, int]:
+) -> Evidence:
     """One idle proof of the bound process — its transcript identity, or :class:`Refused`.
 
     The same single live entry with the bound pid, registry ``idle``, the same PID start
     time, a readable transcript whose inspection shows no open turn, and an identity that
-    did not move while it was being read. *patient*: :func:`_start_of`'s.
+    did not move while it was being read. *patient*: :func:`_start_of`'s. An orphan
+    successor with no transcript file at all (:attr:`Bound.orphan`) proves idle by
+    :func:`_no_transcript_proof` instead, under a plain registry ``idle`` (a ``shell``
+    status needs a transcript); a transcript that exists but is unreadable still refuses.
     """
     from .adapters.claude_agents import contract_status
     from .bridge_send import BridgeError, inspect_transcript
@@ -304,6 +348,10 @@ def observe(
         raise Refused(f"source busy (registry {entry.raw_status or 'unknown'})", "busy")
     if _start_of(bound.pid, patient=patient) != bound.start:
         raise Refused(f"pid {bound.pid} was replaced (start time differs)", "identity_changed")
+    if bound.orphan and bound.transcript is None:
+        if contract_status(entry.raw_status) != "idle":
+            raise Refused(f"source busy (registry {entry.raw_status or 'unknown'})", "busy")
+        return _no_transcript_proof(adapter, session_id, bound)
     before = _stamp(bound.transcript)
     if before is None or bound.transcript is None:
         raise Refused("source transcript unreadable", "unobservable")
@@ -318,8 +366,9 @@ def observe(
     return before
 
 
-def await_stable(adapter: ClaudeAdapter, session_id: str, bound: Bound) -> tuple[int, int, int]:
-    """Idle proofs across :data:`STABLE_WINDOW_SEC` with ONE transcript identity throughout.
+def await_stable(adapter: ClaudeAdapter, session_id: str, bound: Bound) -> Evidence:
+    """Idle proofs across :data:`STABLE_WINDOW_SEC` with ONE piece of evidence throughout
+    (the transcript identity, or an orphan's pid + start + ledger state).
 
     The close's deadline is checked before EACH observation (:func:`check_deadline`).
     """
@@ -358,7 +407,7 @@ def _revalidate(
     adapter: ClaudeAdapter,
     claim: Claim,
     bound: Bound,
-    stamp: tuple[int, int, int],
+    stamp: Evidence,
     *,
     patient: bool = True,
 ) -> None:
@@ -496,6 +545,21 @@ def _finish(claim: Claim, debt: Debt, signalled: bool, closed: bool) -> int:
     )
 
 
+def _orphan_lineage(claim: Claim) -> bool:
+    """Is *claim* the orphan close of a FAILED transfer's successor? (``--orphan`` only
+    counts there: a source close keeps the transcript rule.)"""
+    from .transfer_store import FAILED
+
+    with Store() as store:
+        transfer = store.get_transfer(claim.transfer_id)
+    return (
+        transfer is not None
+        and transfer.state == FAILED
+        and transfer.target_session == claim.session_id
+        and transfer.source_session != claim.session_id
+    )
+
+
 def close_source(args: argparse.Namespace, claim: Claim, cfg: config.Config) -> int:
     """First run: bind, prove stable idle, drain, revalidate, SIGTERM, close the terminal."""
     from . import cli, terminal
@@ -509,7 +573,14 @@ def close_source(args: argparse.Namespace, claim: Claim, cfg: config.Config) -> 
             row = store.get(sid)
         cwd = entry.cwd or (row.cwd if row else "") or ""
         transcript = adapter.transcript_path(cwd, sid, entry.config_dir or None)
-        bound = Bound(entry.pid, start, cwd, transcript)
+        bound = Bound(
+            entry.pid,
+            start,
+            cwd,
+            transcript,
+            orphan=bool(getattr(args, "orphan", False)) and _orphan_lineage(claim),
+            config_dir=entry.config_dir or "",
+        )
         stamp = await_stable(adapter, sid, bound)
         if cfg.stop_barrier_enabled:
             _drain(bound, cfg)
