@@ -313,14 +313,42 @@ def describe(status: dict[str, Any], today: _dt.date) -> str:
     spend estimate (:func:`with_spend`): ``≈$X of $Y left (est.) · $S spent since D.M.
     (<source>)``. Without one the balance stays ``n/a`` — a configured source that has not
     been read yet says so instead of passing for an empty pot. A configured balance file
-    that could not be used adds why (``Console reading 7h old``).
+    that could not be used adds why (``Console reading 7h old``); an unusable reading
+    (``balance_state`` ``logged_out`` / ``read_failed`` / ``stale`` / ``missing``) LEADS with
+    the state instead (:func:`_unusable_sentence`) and labels the rest ``estimate only``.
     """
     if status.get("balance_source") == "measured":
         return _describe_measured(status, today)
+    state = _unusable_sentence(status)
+    if state:
+        return f"{state} · estimate only: {_describe_estimate(status, today)}"
     line = _describe_estimate(status, today)
     if status.get("balance_note"):
         line += f" · {status['balance_note']}"
     return line
+
+
+def _unusable_sentence(status: dict[str, Any]) -> str:
+    """Why the configured balance file gives no figure, or ``""`` when it is usable.
+
+    ``Console logged out, last reading 14d ago`` (``wrong_account``: ``Console wrong
+    account, …``) / ``Console read failed (<status>), last reading 3h ago`` / ``Console
+    reading 10h old, balance job not running`` / ``no Console reading``. Without a good
+    reading ever (no ``balance_age_sec``) the age part reads ``no good reading yet``.
+    """
+    state = status.get("balance_state")
+    if state == "missing":
+        return "no Console reading"
+    if state not in ("logged_out", "read_failed", "stale"):
+        return ""
+    age_sec = status.get("balance_age_sec")
+    if state == "stale":
+        return f"Console reading {_age(int(age_sec or 0))} old, balance job not running"
+    when = "no good reading yet" if age_sec is None else f"last reading {_age(int(age_sec))} ago"
+    if state == "logged_out":
+        who = "wrong account" if status.get("balance_status") == "wrong_account" else "logged out"
+        return f"Console {who}, {when}"
+    return f"Console read failed ({status.get('balance_status') or 'unknown'}), {when}"
 
 
 def _describe_estimate(status: dict[str, Any], today: _dt.date) -> str:
@@ -653,6 +681,8 @@ def with_spend(
 # reading's age is said). The writer runs every 4 h, so nine hours
 # tolerate two missed runs.
 BALANCE_FRESH_SEC = 9 * 3600
+# Writer statuses meaning the agent browser does not hold the expected Console login.
+_LOGGED_OUT_STATUSES = frozenset({"logged_out", "wrong_account"})
 _BALANCE_KIND = "balance_json"
 
 
@@ -821,26 +851,40 @@ def with_balance(status: dict[str, Any], source: BalanceSource | None, now: int)
     (:func:`_with_cloud`). Otherwise nothing is
     replaced and ``balance_note`` says why (missing file, failed read, stale reading with
     its age). Never touches the network.
+
+    With a *source* configured, ``balance_state`` classifies the reading: ``missing`` (no
+    or unreadable file, or no good reading and no failure), ``logged_out`` (not usable,
+    writer status ``logged_out`` / ``wrong_account``), ``read_failed`` (not usable, other
+    failure), ``stale`` (older than :data:`BALANCE_FRESH_SEC`, status ``ok``),
+    ``no_promo`` (fresh, no active promo row), ``measured_failing`` (fresh, measured,
+    latest attempt failed) or ``measured``. "Not usable" = no ``measured_at`` or older than
+    the freshness window. Whenever a file was read, ``balance_status`` / ``balance_hint``
+    carry the writer's ``status`` / ``error`` strings.
     """
     out = dict(status)
     if source is None:
         return out
     reading = read_balance(Path(os.path.expanduser(source.path)))
     if reading is None:
+        out["balance_state"] = "missing"
         out["balance_note"] = "no Console reading"
         return out
+    out["balance_status"] = reading["status"]
+    out["balance_hint"] = reading["error"]
     measured = reading["measured_at"]
     active = [
         row for row in reading["promo"] if row["expires_at"] > now and reading["currency"] == "USD"
     ]
     failed = reading["status"] != "ok"
     if measured is None:
+        out["balance_state"] = _unusable_state(reading["status"]) if failed else "missing"
         out["balance_note"] = f"Console read failed: {reading['status']}"
         return out
     age = max(0, now - measured)
     out["balance_at"] = measured
     out["balance_age_sec"] = age
     if age > BALANCE_FRESH_SEC:
+        out["balance_state"] = _unusable_state(reading["status"]) if failed else "stale"
         why = f", last read failed: {reading['status']}" if failed else ""
         out["balance_note"] = f"Console reading {_age(age)} old{why}"
         return out
@@ -854,7 +898,10 @@ def with_balance(status: dict[str, Any], source: BalanceSource | None, now: int)
         if cap["resets_at"] is not None:
             out["cap_resets_on"] = _utc_date(cap["resets_at"])
     if not active:
+        out["balance_state"] = "no_promo"
         out["balance_note"] = "Console shows no current promotional credit"
+        if failed:
+            out["balance_error"] = reading["status"]
         _cap_binds(out, 0.0)
         return out
     first = min(active, key=lambda row: row["expires_at"])
@@ -874,10 +921,16 @@ def with_balance(status: dict[str, Any], source: BalanceSource | None, now: int)
     )
     if first["granted_at"] is not None:
         out["granted_on"] = _utc_date(first["granted_at"])
+    out["balance_state"] = "measured_failing" if failed else "measured"
     if failed:
         out["balance_error"] = reading["status"]
     _cap_binds(out, left)
     return out
+
+
+def _unusable_state(reading_status: str) -> str:
+    """``balance_state`` of a reading that is not usable and whose latest attempt failed."""
+    return "logged_out" if reading_status in _LOGGED_OUT_STATUSES else "read_failed"
 
 
 def _with_cloud(out: dict[str, Any], reading: dict[str, Any], now: int) -> None:

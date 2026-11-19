@@ -578,7 +578,9 @@ def test_stale_or_failed_reading_falls_back_to_the_estimate(tmp_path: Path) -> N
     assert row.get("balance_source") == "n/a" and row["balance_usd"] is None
     assert row["est_left_usd"] == 150 and "cap_used_pct" not in row
     assert row["balance_note"] == "Console reading 10h old"
-    assert api_credits.describe(row, TODAY).endswith("· Console reading 10h old")
+    assert api_credits.describe(row, TODAY).startswith(
+        "Console reading 10h old, balance job not running · estimate only: ≈$150 of $200 left"
+    )
     # Never read: the status says so, nothing is invented.
     never = _balance_file(tmp_path / "never.json", measured_at=None, status="logged_out")
     row = api_credits.statuses_with_spend(
@@ -631,6 +633,140 @@ def test_expired_or_malformed_rows_are_dropped(tmp_path: Path) -> None:
     )[0]
     assert row["balance_usd"] is None and "cap_used_pct" not in row
     assert row["balance_note"] == "Console shows no current promotional credit"
+
+
+# ── balance_state: classifying the reading ────────────────────────────────────
+
+
+def _state_row(tmp_path: Path, name: str = "b.json", **over: object) -> dict[str, Any]:
+    """The private row with an estimate and a balance file shaped by *over*."""
+    ledger = _ledger(tmp_path / "runs.jsonl", [{"ts": "2026-10-10T10:00:00+02:00", "cost_usd": 50}])
+    path = _balance_file(tmp_path / name, **over)
+    return api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=runs_jsonl:{ledger}", f"private=balance_json:{path}"], TODAY, now=NOW
+    )[0]
+
+
+def test_balance_state_measured_and_measured_failing(tmp_path: Path) -> None:
+    row = _state_row(tmp_path)
+    assert row["balance_state"] == "measured"
+    assert row["balance_status"] == "ok" and row["balance_hint"] == ""
+    failing = _state_row(tmp_path, "f.json", status="logged_out", error="log in once")
+    assert failing["balance_state"] == "measured_failing"
+    assert failing["balance_status"] == "logged_out" and failing["balance_hint"] == "log in once"
+    assert failing["balance_source"] == "measured" and failing["balance_error"] == "logged_out"
+
+
+def test_balance_state_missing_file(tmp_path: Path) -> None:
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=balance_json:{tmp_path / 'nope.json'}"], TODAY, now=NOW
+    )[0]
+    assert row["balance_state"] == "missing" and "balance_status" not in row
+    assert api_credits.describe(row, TODAY).startswith("no Console reading · estimate only: ")
+
+
+def test_balance_state_absent_without_a_source(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path / "runs.jsonl", [{"ts": "2026-10-10T10:00:00+02:00", "cost_usd": 50}])
+    row = api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=runs_jsonl:{ledger}"], TODAY, now=NOW
+    )[0]
+    assert "balance_state" not in row
+    assert "estimate only" not in api_credits.describe(row, TODAY)
+
+
+def test_balance_state_stale_when_the_writer_stopped(tmp_path: Path) -> None:
+    row = _state_row(tmp_path, measured_at=NOW - 10 * 3600)
+    assert row["balance_state"] == "stale" and row["balance_usd"] is None
+    assert api_credits.describe(row, TODAY).startswith(
+        "Console reading 10h old, balance job not running · estimate only: ≈$150"
+    )
+
+
+def test_balance_state_logged_out_and_wrong_account(tmp_path: Path) -> None:
+    hint = "log in once: ./agent-login.py -g console"
+    row = _state_row(tmp_path, measured_at=NOW - 14 * 86400, status="logged_out", error=hint)
+    assert row["balance_state"] == "logged_out" and row["balance_usd"] is None
+    assert row["balance_status"] == "logged_out" and row["balance_hint"] == hint
+    assert row["balance_note"] == "Console reading 14d old, last read failed: logged_out"
+    assert api_credits.describe(row, TODAY).startswith(
+        "Console logged out, last reading 14d ago · estimate only: ≈$150"
+    )
+    wrong = _state_row(tmp_path, "w.json", measured_at=NOW - 10 * 3600, status="wrong_account")
+    assert wrong["balance_state"] == "logged_out" and wrong["balance_status"] == "wrong_account"
+    assert api_credits.describe(wrong, TODAY).startswith(
+        "Console wrong account, last reading 10h ago · estimate only: "
+    )
+
+
+def test_balance_state_read_failed(tmp_path: Path) -> None:
+    row = _state_row(tmp_path, measured_at=NOW - 10 * 3600, status="browser_down")
+    assert row["balance_state"] == "read_failed" and row["balance_status"] == "browser_down"
+    assert api_credits.describe(row, TODAY).startswith(
+        "Console read failed (browser_down), last reading 10h ago · estimate only: "
+    )
+
+
+def test_balance_state_nine_hour_boundary(tmp_path: Path) -> None:
+    edge = _state_row(tmp_path, measured_at=NOW - api_credits.BALANCE_FRESH_SEC)
+    assert edge["balance_state"] == "measured"
+    past = _state_row(tmp_path, "p.json", measured_at=NOW - api_credits.BALANCE_FRESH_SEC - 1)
+    assert past["balance_state"] == "stale"
+    out = _state_row(
+        tmp_path, "o.json", measured_at=NOW - api_credits.BALANCE_FRESH_SEC - 1, status="logged_out"
+    )
+    assert out["balance_state"] == "logged_out"
+
+
+@pytest.mark.parametrize(
+    ("status", "state", "sentence"),
+    [
+        ("logged_out", "logged_out", "Console logged out, no good reading yet"),
+        ("wrong_account", "logged_out", "Console wrong account, no good reading yet"),
+        ("timeout", "read_failed", "Console read failed (timeout), no good reading yet"),
+    ],
+)
+def test_balance_state_never_good_reading(
+    tmp_path: Path, status: str, state: str, sentence: str
+) -> None:
+    """No ``measured_at`` ever: classified without arithmetic on ``None``, no age shown."""
+    row = _state_row(tmp_path, measured_at=None, status=status, error="hint")
+    assert row["balance_state"] == state and "balance_age_sec" not in row
+    assert row["balance_status"] == status and row["balance_hint"] == "hint"
+    assert row["balance_note"] == f"Console read failed: {status}"
+    assert api_credits.describe(row, TODAY).startswith(f"{sentence} · estimate only: ")
+
+
+def test_balance_state_no_promo_carries_a_failing_status(tmp_path: Path) -> None:
+    expired = [{"remaining_usd": 5, "granted_usd": 10, "expires_at": "2026-10-01T00:00:00Z"}]
+    row = _state_row(tmp_path, promo=expired, status="logged_out", error="log in")
+    assert row["balance_state"] == "no_promo"
+    assert row["balance_status"] == "logged_out" and row["balance_hint"] == "log in"
+    assert row["balance_error"] == "logged_out"
+    assert row["balance_note"] == "Console shows no current promotional credit"
+    ok = _state_row(tmp_path, "ok.json", promo=expired)
+    assert ok["balance_state"] == "no_promo" and "balance_error" not in ok
+
+
+def test_balance_state_describe_states_its_reason_once(tmp_path: Path) -> None:
+    cases: list[tuple[dict[str, object], str]] = [
+        ({"measured_at": NOW - 14 * 86400, "status": "logged_out"}, "logged out"),
+        ({"measured_at": NOW - 10 * 3600, "status": "wrong_account"}, "wrong account"),
+        ({"measured_at": NOW - 10 * 3600, "status": "page_error"}, "page_error"),
+        ({"measured_at": None, "status": "busy"}, "busy"),
+        ({"measured_at": NOW - 10 * 3600}, "10h old"),
+    ]
+    for index, (over, reason) in enumerate(cases):
+        row = _state_row(tmp_path, f"c{index}.json", **over)
+        text = api_credits.describe(row, TODAY)
+        assert text.count(reason) == 1, text
+        assert text.count("estimate only") == 1, text
+        # The balance_note suffix is not appended: the state sentence already says it.
+        assert not text.endswith(row["balance_note"]), text
+        assert "last read failed" not in text, text
+    missing = api_credits.statuses_with_spend(
+        [PRIVATE], [f"private=balance_json:{tmp_path / 'nope.json'}"], TODAY, now=NOW
+    )[0]
+    assert api_credits.describe(missing, TODAY).count("no Console reading") == 1
 
 
 # Spent $153.89 of a $300 limit: $146.11 of room < $185.88 + $10 of money — the cap binds.
