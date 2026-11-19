@@ -3666,6 +3666,43 @@ def test_a_synthetic_source_model_falls_back_with_a_notice(
 
 
 @pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        (("haiku-4.5", "haiku-4.5"), ("haiku-4.5", "haiku-4.5")),  # tp#2339: not the default
+        (("haiku-4.5", "sonnet-5"), ("haiku-4.5", "sonnet-5")),  # each role keeps its own
+        (("opus-5", "opus-5"), ("opus-5.5", "opus-5.5")),  # a retired row model: its replacement
+        (("opus-5.5", "opus-5.5"), ("opus-5.5", "opus-5.5")),  # a default row stays the default
+    ],
+)
+def test_an_unobserved_source_model_falls_back_to_the_source_row(
+    harness: _Harness,
+    capsys: pytest.CaptureFixture[str],
+    row: tuple[str, str],
+    expected: tuple[str, str],
+) -> None:
+    """tp#2339: no observed model → the source row's llm_overseer/llm_exec, before the default."""
+    with Store() as store:
+        store.update_fields(SID, model="", llm_overseer=row[0], llm_exec=row[1])
+    assert harness.start() == 0
+    assert "notice: source model" not in capsys.readouterr().err
+    [target] = harness.launches
+    with Store() as store:
+        job = store.get(target)
+    assert job is not None and (job.llm_overseer, job.llm_exec) == expected
+
+
+def test_an_observed_source_model_wins_over_the_source_row(harness: _Harness) -> None:
+    """tp#2339: the row's job config is only the fallback; an observed model still wins."""
+    with Store() as store:
+        store.update_fields(SID, model="fable-5.2", llm_overseer="haiku-4.5", llm_exec="haiku-4.5")
+    assert harness.start() == 0
+    [target] = harness.launches
+    with Store() as store:
+        job = store.get(target)
+    assert job is not None and job.llm_overseer == "fable-5.2" and job.llm_exec == "fable-5.2"
+
+
+@pytest.mark.parametrize(
     ("explicit", "model_id"),
     [("sonnet-5", "claude-sonnet-5"), ("claude-brand-new-9", "claude-brand-new-9")],
 )
@@ -3711,6 +3748,25 @@ def test_an_explicit_non_token_model_is_refused() -> None:
 )
 def test_job_model_resolution(observed: str, explicit: str | None, expected: str) -> None:
     assert continue_session._job_model(observed, explicit) == expected  # noqa: SLF001  # pylint: disable=protected-access
+
+
+@pytest.mark.parametrize(
+    ("observed", "explicit", "configured", "expected"),
+    [
+        ("", None, "haiku-4.5", "haiku-4.5"),  # tp#2339: nothing observed → the row's model
+        ("", None, "claude-haiku-4-5-20251001", "haiku-4.5"),
+        ("", None, "opus-5", "opus-5.5"),  # a retired row model: its replacement
+        ("", None, "", "opus-5.5"),  # no row model either: the default
+        ("fable-5.2", None, "haiku-4.5", "fable-5.2"),  # an observed model wins
+        ("<synthetic>", None, "haiku-4.5", "opus-5.5"),  # non-token observed: the default
+        ("", "sonnet-5", "haiku-4.5", "sonnet-5"),  # -O/-E wins over the row
+    ],
+)
+def test_job_model_falls_back_to_the_configured_model(
+    observed: str, explicit: str | None, configured: str, expected: str
+) -> None:
+    got = continue_session._job_model(observed, explicit, configured)  # noqa: SLF001  # pylint: disable=protected-access
+    assert got == expected
 
 
 # ------------------------------------------- tp#2172 C8: own chain, final veto re-drains

@@ -416,14 +416,16 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
-def _job_model(observed: str, explicit: str | None) -> str:
+def _job_model(observed: str, explicit: str | None, configured: str = "") -> str:
     """Q1: an explicit ``-O``/``-E`` wins; else the observed model when launchable; else default.
 
     *observed* (and *explicit*) may be a ccc label (``fable-5.2``) or a raw ``claude
     --model`` id (``claude-fable-5-2``, the live-entry fallback): a known id resolves to
     its label (tp#2330), a retired one to its replacement, and an id ccc has no row for
-    (a newer model) passes through unchanged (tp#2335). Only an empty or non-token value
-    (``<synthetic>``) takes the default; an explicit one of those is refused.
+    (a newer model) passes through unchanged (tp#2335). Nothing observed takes
+    *configured*, the source row's ``llm_overseer``/``llm_exec`` (tp#2339), before the
+    default. Only a non-token value (``<synthetic>``) or nothing at all takes the default;
+    an explicit non-token one is refused.
     """
     from .models import (
         NEW_JOB_DEFAULT_LLM,
@@ -441,7 +443,7 @@ def _job_model(observed: str, explicit: str | None) -> str:
                 "or a model id)"
             )
         return label
-    label = model_label(observed)
+    label = model_label(observed or configured)
     label = RETIRED_LLM_REPLACEMENTS.get(label, label)
     return label if is_launchable_llm(label) else NEW_JOB_DEFAULT_LLM
 
@@ -638,9 +640,16 @@ def _candidate(  # pylint: disable=too-many-arguments,too-many-positional-argume
 
     session = store.get(src.session_id)
     profile = _checked_profile((session.launch_profile if session else "") or "")
-    overseer = _job_model(src.model, getattr(args, "overseer", None))
+    # tp#2339: nothing observed → the source row's own job models, not the default
+    overseer = _job_model(
+        src.model,
+        getattr(args, "overseer", None),
+        (session.llm_overseer if session else "") or "",
+    )
     executor = _job_model(
-        src.model, getattr(args, "executor", None) or getattr(args, "overseer", None)
+        src.model,
+        getattr(args, "executor", None) or getattr(args, "overseer", None),
+        (session.llm_exec if session else "") or "",
     )
     if not getattr(args, "overseer", None):  # an explicit -O sets both: nothing inherited
         _notice_unknown_model(src.model, overseer, executor)
