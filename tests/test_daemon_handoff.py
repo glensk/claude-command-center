@@ -803,6 +803,28 @@ def test_sweep_aborts_dead_opened_transfer(
     assert not _sweep().handoff_aborted  # failed: never a candidate again
 
 
+@pytest.mark.parametrize("prompted", [False, True])
+def test_sweep_aborts_a_successor_without_its_first_turn(
+    spawns: _Spawns, monkeypatch: pytest.MonkeyPatch, prompted: bool
+) -> None:
+    """tp#2326 D3/D4: registered and alive for 10 min, no transcript, no prompt and no start
+    left: ``no-first-turn`` (a counted prompt makes it ``no-accept``); dry run writes nothing."""
+    tid = _opened(heartbeat_ms=5 * MINUTE, pid=777)
+    if prompted:
+        with Store() as store:
+            store.conn.execute("UPDATE sessions SET prompt_count = 1 WHERE session_id = ?", (DST,))
+            store.conn.commit()
+    _use_ps(monkeypatch, _ps_rows((SRC_PID, 1, "claude")))
+    snapshot = {**_live(), **_live(DST)}
+    dry = _sweep(snapshot, dry_run=True)
+    assert dry.handoff_aborted == [tid] and _state(tid) == OPENED
+    report = _sweep(snapshot)
+    assert report.handoff_aborted == [tid] and not report.handoff_errors
+    why = "no-accept" if prompted else "no-first-turn"
+    assert _failure(tid) == f"aborted: sweep: successor dead: {why}"
+    assert not spawns.calls
+
+
 def test_sweep_leaves_live_successor(spawns: _Spawns, monkeypatch: pytest.MonkeyPatch) -> None:
     """The successor is registered and was launched 30 s ago: live, however stale the start."""
     tid = _opened(age_ms=3 * MINUTE, heartbeat_ms=3 * MINUTE, pid=777)

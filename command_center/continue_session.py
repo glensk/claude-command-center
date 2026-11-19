@@ -912,6 +912,10 @@ AUTO_RELAUNCHES = 1  # D5 (Q3): one automatic relaunch per `start` call
 STARTING = "starting"
 LIVE = "live"
 DEAD_PREFIX = "dead:"
+NO_FIRST_TURN = "no-first-turn"  # tp#2326 D3: registered, alive, its first prompt never sent
+NO_FIRST_TURN_CAUSES = (
+    "a trust dialog, a stalled start hook, or a launch route that did not submit the prompt"
+)
 
 
 def _now_ms() -> int:
@@ -991,6 +995,33 @@ def _transcript_growth(
     return max(watch.grown_at, int(stat.st_mtime * 1000))
 
 
+def first_turn_seen(store: Store, adapter: ClaudeAdapter, transfer: Any) -> bool:
+    """Did *transfer*'s successor ever get its first prompt? (tp#2326 D3)
+
+    Any one signal, cheapest first: the successor row's ``prompt_count > 0`` (the
+    ``UserPromptSubmit`` hook counts it); a ``matched`` ``start_job`` row in the target's
+    input ledger; or a human prompt in its transcript (:func:`has_human_prompt`). Reads
+    only, never ``advance_session``. A signal that raises counts as seen: a false
+    ``False`` costs the relaunch and closes a tab that may hold a turn.
+    """
+    from .adapters.claude import has_human_prompt
+
+    target = transfer.target_session
+    try:
+        row = store.get(target)
+        if row is not None and row.prompt_count > 0:
+            return True
+        if any(
+            r.kind == "start_job" and r.state == "matched"
+            for r in store.inputs_for(target, 0, 2**62)
+        ):
+            return True
+        path = adapter.transcript_path(transfer.cwd, target, transfer.target_config_dir or None)
+        return path is not None and has_human_prompt(path)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return True
+
+
 def successor_state(
     store: Store,
     adapter: ClaudeAdapter,
@@ -1008,8 +1039,11 @@ def successor_state(
     * ``dead:process-gone`` — an entry seen alive in this wait is gone or its pid dead on
       ``GONE_POLLS`` polls in a row (no grace: a closed tab ends the process);
     * ``dead:no-accept`` — registered and alive, but no transcript growth and no accept for
-      ``no_accept_s`` since ``target_launched_at`` or the last growth (a folder-trust
-      prompt, a stalled hook);
+      ``no_accept_s`` since ``target_launched_at`` or the last growth, after its first
+      prompt (:func:`first_turn_seen`);
+    * ``dead:no-first-turn`` — the same, but the first prompt never arrived (tp#2326 D3:
+      a trust dialog, a stalled start hook, or a launch route that did not submit the
+      prompt; the successor's tab shows which);
     * ``live`` — anything else. An unreadable registry gives no verdict on that poll.
 
     Liveness is the adapter's registry read only, never a ``ps`` of some pid. *watch*
@@ -1035,7 +1069,16 @@ def successor_state(
         return STARTING
     watch.seen_registered, watch.missing_polls = True, 0
     last = max(launched, _transcript_growth(adapter, transfer, now, watch))
-    return DEAD_PREFIX + "no-accept" if now - last >= watch.no_accept_s * 1000 else LIVE
+    stuck = now - last >= watch.no_accept_s * 1000
+    return _stuck_verdict(store, adapter, transfer) if stuck else LIVE
+
+
+def _stuck_verdict(store: Store, adapter: ClaudeAdapter, transfer: Any) -> str:
+    """A registered, alive successor stuck past the window: ``dead:no-accept`` after its
+    first prompt, else ``dead:no-first-turn`` (tp#2326 D3; checked on this branch only,
+    never per live poll)."""
+    seen = first_turn_seen(store, adapter, transfer)
+    return DEAD_PREFIX + ("no-accept" if seen else NO_FIRST_TURN)
 
 
 def _wait_accepted_or_dead(
@@ -1312,6 +1355,16 @@ def _relaunch_candidate(dead: Any) -> Any:
     )
 
 
+def _no_first_turn_message(target: str) -> str:
+    """The ``start`` error of a ``dead:no-first-turn`` successor (tp#2326 D4)."""
+    return (
+        f"successor {target} never received its first prompt ({NO_FIRST_TURN}: a trust "
+        "dialog, a stalled start hook, or a launch route that did not submit the handoff; "
+        "its tab shows which); nothing moved and THIS session stays authoritative — keep "
+        "working here. ccc closes that tab once it is idle; fix the cause and run start again"
+    )
+
+
 def _drive(  # pylint: disable=too-many-locals,too-many-arguments
     store: Store,
     transfer: Any,
@@ -1327,6 +1380,7 @@ def _drive(  # pylint: disable=too-many-locals,too-many-arguments
     A dead successor (``successor_state``) aborts its transfer and gets ONE automatic
     relaunch (tp#2172 D5): a fresh transfer with the same snapshot and text, launched and
     waited for inside the SAME ``-w`` budget; a second death raises :class:`SuccessorDied`.
+    A ``no-first-turn`` death never relaunches (tp#2326 D4): it raises at once.
     ``rewrite=False`` keeps *transfer*'s stored handoff file as it is (D6); a relaunch
     writes its own new file. *sidecars* (tp#2172 D1/D2) are written next to every handoff
     file this call writes: they exist only once the transfer id does.
@@ -1351,6 +1405,8 @@ def _drive(  # pylint: disable=too-many-locals,too-many-arguments
         first = current.target_session
         if len(deaths) > AUTO_RELAUNCHES:
             raise SuccessorDied(f"successor died twice: {'; '.join(deaths)}; nothing moved")
+        if why == NO_FIRST_TURN:  # tp#2326 D4: deterministic so far, a relaunch would not help
+            raise SuccessorDied(_no_first_turn_message(first))
         try:
             chosen = _reuse_or_create(store, adapter, _relaunch_candidate(current), _now_ms())
         except StartRefused as exc:
@@ -2259,10 +2315,25 @@ def _print_accepted(transfer: Any, steps: list[str], source: dict[str, Any], as_
             print(f"next: {step}")
 
 
-def recovery_step(transfer: Any, target_is_draft: bool) -> str:
-    """The exact next step for *transfer* in its current state."""
+def recovery_step(transfer: Any, target_is_draft: bool, first_turn: bool | None = None) -> str:
+    """The exact next step for *transfer* in its current state.
+
+    *first_turn* (tp#2326 D7) is :func:`first_turn_seen` for an ``opened`` transfer with
+    a started successor (``None`` otherwise): ``False`` names the unsent first prompt."""
     tid = transfer.transfer_id
     abort = f"; to give it up: `ccc continue-session abort {tid}` (nothing has moved yet)"
+    if transfer.state == "opened" and not target_is_draft and first_turn is False:
+        return (
+            "the successor's first prompt is not submitted yet: if its tab shows the handoff "
+            "text unsent, press Enter there; if the tab does not react, "
+            f"`ccc continue-session abort {tid}` (nothing has moved) and fix the launch route"
+        )
+    if transfer.state == "failed" and (transfer.failure or "").endswith(NO_FIRST_TURN):
+        return (
+            "nothing moved; the source stays authoritative; its successor tab is closed by "
+            f"the daemon when idle; fix the cause ({NO_FIRST_TURN_CAUSES}) and start a new "
+            "transfer"
+        )
     return {
         "prepared": "re-run the same `ccc continue-session start` in the source session" + abort,
         "opened": (
@@ -2298,10 +2369,16 @@ def cmd_status(args: argparse.Namespace) -> int:
             print("no transfer found", file=sys.stderr)
             return 1
         rows = []
+        adapter = None
         for transfer in transfers:
             target = store.get(transfer.target_session)
-            step = recovery_step(transfer, bool(target is not None and target.draft))
-            rows.append({**transfer.to_dict(), "recovery": step})
+            draft = bool(target is not None and target.draft)
+            first_turn: bool | None = None
+            if transfer.state == "opened" and target is not None and not draft:
+                adapter = adapter or _adapter()
+                first_turn = first_turn_seen(store, adapter, transfer)
+            step = recovery_step(transfer, draft, first_turn)
+            rows.append({**transfer.to_dict(), "first_turn": first_turn, "recovery": step})
     if args.json:
         print(json.dumps(rows if not args.transfer else rows[0], indent=2))
         return 0

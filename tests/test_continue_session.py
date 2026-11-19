@@ -1801,6 +1801,7 @@ class _World:  # pylint: disable=too-many-instance-attributes  # the successor s
         from command_center import store as store_module  # pylint: disable=C0415
 
         self.harness = harness
+        self.adapter = adapter
         self.base = models.now_ms()
         self.registered: set[str] = set()
         self.transcripts: dict[str, Path] = {}
@@ -1862,11 +1863,23 @@ class _World:  # pylint: disable=too-many-instance-attributes  # the successor s
         stamp = self.now() / 1000
         os.utime(path, (stamp, stamp))
 
-    def start_up(self) -> None:
-        """Claim the newest successor, register it and give it a transcript."""
+    def write_prompt(self, sid: str, record: dict[str, Any] | None = None) -> None:
+        """The successor's transcript gains a user record (a human prompt by default)."""
+        path = self.transcripts.setdefault(sid, self.harness.tmp / f"{sid}.jsonl")
+        record = record or {"type": "user", "message": {"role": "user", "content": "go"}}
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+        stamp = self.now() / 1000
+        os.utime(path, (stamp, stamp))
+
+    def start_up(self, *, prompted: bool = False) -> None:
+        """Claim the newest successor, register it and give it a transcript (*prompted*:
+        one holding its first, human prompt)."""
         self.claim()
         self.registered.add(self.target)
         self.write(self.target)
+        if prompted:
+            self.write_prompt(self.target)
 
     def accept(self) -> None:
         from command_center.transfer_store import ACCEPTED  # pylint: disable=C0415
@@ -2007,7 +2020,7 @@ def test_start_stuck_successor_no_accept_relaunches(world: _World) -> None:
         if len(w.harness.launches) == 2:
             w.accept()
         elif w.harness.clock == 2:
-            w.start_up()  # registered, alive, and its transcript never grows again
+            w.start_up(prompted=True)  # registered, prompted, its transcript never grows again
 
     world.script = script
     assert world.harness.start() == 0
@@ -2023,7 +2036,7 @@ def test_start_no_accept_counts_as_the_one_relaunch(
 
     def script(w: _World) -> None:
         if w.target not in w.registered:
-            w.start_up()  # each successor registers and then hangs (a folder-trust prompt)
+            w.start_up(prompted=True)  # each successor gets its first prompt and then hangs
 
     world.script = script
     assert world.harness.start() == 1
@@ -2118,6 +2131,230 @@ def test_successor_state_knob_invalid_falls_back_with_a_note(
     assert watch.no_accept_s == continue_session.NO_ACCEPT_DEFAULT_S
     err = capsys.readouterr().err
     assert continue_session.START_GRACE_ENV in err and continue_session.NO_ACCEPT_ENV in err
+
+
+# ------------------------------------------------- dead:no-first-turn (tp#2326 D3/D4/D7)
+
+
+def _ledger_row(target: str, state: str) -> None:
+    """A ``start_job`` input-ledger row of *target* in *state*."""
+    from command_center.bridge_store import Input  # pylint: disable=import-outside-toplevel
+
+    with Store() as store:
+        store.insert_input(
+            Input(input_id=f"in-{target}", session_id=target, kind="start_job", state=state)
+        )
+
+
+def _ledger_states(target: str) -> list[str]:
+    with Store() as store:
+        return [r.state for r in store.inputs_for(target, 0, 2**62)]
+
+
+def _claimed(world: _World) -> Any:
+    """One ``opened`` transfer whose successor is claimed and registered, no transcript."""
+    assert world.harness.start("-w", "0") == continue_session.EXIT_WAITING
+    world.claim()
+    world.registered.add(world.target)
+    (transfer,) = _transfers()
+    return transfer
+
+
+def _verdict(world: _World, transfer: Any, after_s: float) -> str:
+    """``successor_state`` *after_s* seconds after the successor's launch."""
+    world.harness.clock = (transfer.target_launched_at - world.base) / 1000 + after_s
+    with Store() as store:
+        return continue_session.successor_state(
+            store, world.adapter, transfer, world.now(), continue_session.SuccessorWatch()
+        )
+
+
+def test_successor_without_first_prompt_is_no_first_turn_after_the_window(
+    world: _World,
+) -> None:
+    transfer = _claimed(world)
+    _ledger_row(transfer.target_session, "pending")
+    window = continue_session.NO_ACCEPT_DEFAULT_S
+    assert _verdict(world, transfer, window - 1) == continue_session.LIVE
+    assert _verdict(world, transfer, window) == "dead:no-first-turn"
+    assert _ledger_states(transfer.target_session) == ["pending"]  # read only, never advanced
+
+
+@pytest.mark.parametrize("signal", ["transcript", "matched", "prompt_count", "no_origin"])
+def test_any_first_turn_signal_makes_it_no_accept(world: _World, signal: str) -> None:
+    transfer = _claimed(world)
+    target = transfer.target_session
+    if signal == "transcript":
+        world.write_prompt(
+            target,
+            {
+                "type": "user",
+                "origin": {"kind": "human"},
+                "message": {"role": "user", "content": "go"},
+            },
+        )
+    elif signal == "no_origin":
+        world.write_prompt(target)  # no ``origin`` key at all: older Claude Code, human
+    elif signal == "matched":
+        _ledger_row(target, "matched")
+    else:
+        _ledger_row(target, "pending")
+        with Store() as store:
+            store.conn.execute(
+                "UPDATE sessions SET prompt_count = 1 WHERE session_id = ?", (target,)
+            )
+            store.conn.commit()
+    assert _verdict(world, transfer, continue_session.NO_ACCEPT_DEFAULT_S) == "dead:no-accept"
+    if signal == "prompt_count":
+        assert _ledger_states(target) == ["pending"]
+
+
+def test_tool_result_and_meta_records_are_no_first_turn(world: _World) -> None:
+    transfer = _claimed(world)
+    target = transfer.target_session
+    world.write_prompt(
+        target,
+        {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result"}]}},
+    )
+    world.write_prompt(
+        target, {"type": "user", "isMeta": True, "message": {"role": "user", "content": "ctx"}}
+    )
+    with Store() as store:
+        assert continue_session.first_turn_seen(store, world.adapter, transfer) is False
+    assert _verdict(world, transfer, continue_session.NO_ACCEPT_DEFAULT_S) == "dead:no-first-turn"
+
+
+def test_first_turn_seen_counts_an_unreadable_signal_as_seen(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transfer = _claimed(world)
+
+    def boom(*_args: Any, **_kwargs: Any) -> Path:
+        raise PermissionError("denied")
+
+    with Store() as store:
+        assert continue_session.first_turn_seen(store, world.adapter, transfer) is False
+        monkeypatch.setattr(world.adapter, "transcript_path", boom)
+        assert continue_session.first_turn_seen(store, world.adapter, transfer) is True
+
+
+def test_start_no_first_turn_aborts_without_relaunch(
+    world: _World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gid = _arm_await(SID)
+
+    def script(w: _World) -> None:
+        if w.target not in w.registered:
+            w.claim()  # registered and alive, its first prompt never submitted
+            w.registered.add(w.target)
+
+    world.script = script
+    assert world.harness.start() == 1
+    (transfer,) = _transfers()
+    assert transfer.state == "failed"
+    assert transfer.failure == "aborted: successor dead: no-first-turn"
+    assert len(world.harness.launches) == 1  # no relaunch
+    with Store() as store:
+        source = store.get(SID)
+        assert source is not None and not source.handed_off_to and not source.close_requested_at
+    group = _group(gid)
+    assert (group.session_id, group.transfer_id) == (SID, "")  # the reservation is released
+    captured = capsys.readouterr()
+    assert "relaunched:" not in captured.out
+    err = captured.err
+    assert f"successor {transfer.target_session} never received its first prompt" in err
+    for cause in ("a trust dialog", "a stalled start hook", "did not submit the handoff"):
+        assert cause in err
+    assert "THIS session stays authoritative" in err and "run start again" in err
+
+
+def test_start_no_accept_then_no_first_turn_died_twice(
+    world: _World, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv(continue_session.NO_ACCEPT_ENV, "60")
+
+    def script(w: _World) -> None:
+        if w.target not in w.registered:
+            w.start_up(prompted=len(w.harness.launches) == 1)  # only the first gets a turn
+
+    world.script = script
+    assert world.harness.start() == 1
+    first, second = _transfers()
+    assert first.failure == "aborted: successor dead: no-accept"
+    assert second.failure == "aborted: successor dead: no-first-turn"
+    err = capsys.readouterr().err
+    assert "successor died twice: no-accept; no-first-turn; nothing moved" in err
+
+
+def test_start_no_first_turn_accepted_before_the_abort_finalizes(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_abort = continue_session.abort_transfer
+
+    def accept_then_abort(store: Store, tid: str, reason: str, now: int) -> tuple[int, str]:
+        world.accept()  # the successor accepted between the verdict and the abort
+        return real_abort(store, tid, reason, now)
+
+    monkeypatch.setattr(continue_session, "abort_transfer", accept_then_abort)
+
+    def script(w: _World) -> None:
+        if w.target not in w.registered:
+            w.claim()
+            w.registered.add(w.target)
+
+    world.script = script
+    assert world.harness.start() == 0
+    (transfer,) = _transfers()
+    assert transfer.state == "finalized" and len(world.harness.launches) == 1
+
+
+def _status_json(tid: str, capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
+    capsys.readouterr()
+    assert cli.main(["continue-session", "status", tid, "-j"]) == 0
+    data: dict[str, Any] = json.loads(capsys.readouterr().out)
+    return data
+
+
+def test_status_names_an_unsent_first_prompt(
+    world: _World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert world.harness.start("-w", "0") == continue_session.EXIT_WAITING
+    (transfer,) = _transfers()
+    tid = transfer.transfer_id
+    draft = _status_json(tid, capsys)
+    assert draft["first_turn"] is None and "relaunches it" in draft["recovery"]
+    world.claim()
+    unsent = _status_json(tid, capsys)
+    assert unsent["first_turn"] is False
+    assert "first prompt is not submitted yet" in unsent["recovery"]
+    assert "press Enter there" in unsent["recovery"]
+    assert f"`ccc continue-session abort {tid}`" in unsent["recovery"]
+    assert cli.main(["continue-session", "status", tid]) == 0
+    assert "press Enter there" in capsys.readouterr().out
+    world.write_prompt(transfer.target_session)
+    sent = _status_json(tid, capsys)
+    assert sent["first_turn"] is True
+    assert f"`ccc continue-session accept {tid}`" in sent["recovery"]
+
+
+def test_status_after_a_no_first_turn_failure(
+    world: _World, capsys: pytest.CaptureFixture[str]
+) -> None:
+    transfer = _claimed(world)
+    tid = transfer.transfer_id
+    with Store() as store:
+        code, _message = continue_session.abort_transfer(
+            store, tid, "sweep: successor dead: no-first-turn", world.now()
+        )
+    assert code == 0
+    data = _status_json(tid, capsys)
+    assert data["first_turn"] is None
+    assert data["recovery"].startswith("nothing moved; the source stays authoritative")
+    for cause in ("a trust dialog", "a stalled start hook", "did not submit the prompt"):
+        assert cause in data["recovery"]
+    assert cli.main(["continue-session", "status", tid]) == 0
+    out = capsys.readouterr().out
+    assert "closed by the daemon when idle" in out
 
 
 # ------------------------------------- a differing re-run self-heals (tp#2172 D6, C3)
