@@ -1355,3 +1355,47 @@ def test_has_background_task_skip_keepwarm(monkeypatch: pytest.MonkeyPatch) -> N
     mixed_tree = {100: [(101, shell), (201, other)], 201: [(202, "sleep 90")]}
     monkeypatch.setattr(claude_mod, "_children_map", lambda: mixed_tree)
     assert adapter.has_background_task(100, skip_keepwarm=True) is True
+
+
+def _jsonl(path: Path, *records: object) -> Path:
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    return path
+
+
+def test_has_human_prompt_counts_a_user_record_without_origin(tmp_path: Path) -> None:
+    """tp#2326 D3: older Claude Code wrote no origin, and such a prompt is human."""
+    from command_center.adapters.claude import has_human_prompt
+
+    plain = {"type": "user", "message": {"role": "user", "content": "[handoff] go"}}
+    assert has_human_prompt(_jsonl(tmp_path / "a.jsonl", plain)) is True
+    queued = {
+        "type": "attachment",
+        "attachment": {"type": "queued_command", "commandMode": "prompt", "prompt": "go"},
+    }
+    assert has_human_prompt(_jsonl(tmp_path / "b.jsonl", queued)) is True
+
+
+def test_has_human_prompt_ignores_tool_results_meta_and_junk(tmp_path: Path) -> None:
+    from command_center.adapters.claude import has_human_prompt
+
+    tool = {
+        "type": "user",
+        "message": {"role": "user", "content": [{"type": "tool_result", "content": "x"}]},
+    }
+    meta = {"type": "user", "isMeta": True, "message": {"role": "user", "content": "ctx"}}
+    path = _jsonl(tmp_path / "t.jsonl", tool, meta, {"type": "assistant"})
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("not json\n")
+    assert has_human_prompt(path) is False
+    assert has_human_prompt(tmp_path / "missing.jsonl") is False
+
+
+def test_has_human_prompt_reads_only_the_first_bytes(tmp_path: Path) -> None:
+    from command_center.adapters.claude import has_human_prompt
+
+    meta = {"type": "user", "isMeta": True, "message": {"role": "user", "content": "c"}}
+    plain = {"type": "user", "message": {"role": "user", "content": "late prompt"}}
+    path = _jsonl(tmp_path / "t.jsonl", meta, plain)
+    first = len(json.dumps(meta)) + 1
+    assert has_human_prompt(path, max_bytes=first) is False
+    assert has_human_prompt(path) is True

@@ -231,6 +231,37 @@ def _queued_prompt_text(record: dict) -> str | None:
     return cleaned or None
 
 
+HUMAN_PROMPT_SCAN_BYTES = 4 * 1024 * 1024  # how far has_human_prompt reads into a transcript
+
+
+def has_human_prompt(path: Path, max_bytes: int = HUMAN_PROMPT_SCAN_BYTES) -> bool:
+    """True when the transcript at *path* holds a human prompt (tp#2326 D3).
+
+    A prompt is what :func:`_user_prompt_text` or :func:`_queued_prompt_text` classifies
+    as one: a missing ``origin`` is human, tool-result-only and ``isMeta`` / sidechain
+    records are not prompts. Reads at most the first *max_bytes*, line by line, and
+    skips a line that is not JSON. A missing file → ``False``; any other ``OSError``
+    propagates (the caller decides what an unreadable transcript means).
+    """
+    try:
+        handle = path.open("rb")
+    except FileNotFoundError:
+        return False
+    with handle:
+        seen = 0
+        for raw in handle:
+            seen += len(raw)
+            if seen > max_bytes:
+                break
+            try:
+                record = json.loads(raw)
+            except ValueError:
+                continue
+            if _user_prompt_text(record) is not None or _queued_prompt_text(record) is not None:
+                return True
+    return False
+
+
 _ANSWER_PICKED = "✅"
 _ANSWER_UNPICKED = "⬜"
 
