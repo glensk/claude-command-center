@@ -2266,7 +2266,9 @@ def _api_unusable_row(status: dict[str, Any], prefix: str) -> Text | None:
     """The promo row of a balance file whose reading cannot be trusted, else ``None``.
 
     No bar, no figure, no percentage (the estimate would pass for the real balance): one
-    warning line ``<label>: <state> · <age> old`` plus the writer's own hint in grey.
+    warning line ``<label>: <state> · <age> old`` (no good reading ever: ``· no data``,
+    short enough that ``API PROMO: wrong account · no data`` fits the card unclipped)
+    plus the writer's own hint in grey.
     """
     state = str(status.get("balance_state") or "")
     word = _API_UNUSABLE_WORDS.get(state)
@@ -2277,7 +2279,7 @@ def _api_unusable_row(status: dict[str, Any], prefix: str) -> Text | None:
     line = f"{prefix}: {word}"
     if state != "missing":
         age = status.get("balance_age_sec")
-        line += f" · {_reading_age(int(age))} old" if age is not None else " · no reading"
+        line += f" · {_reading_age(int(age))} old" if age is not None else " · no data"
     out = Text(_card_clip(line) + "\n", style="bold yellow")
     hint = str(status.get("balance_hint") or "").strip()
     if hint:

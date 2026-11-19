@@ -5363,6 +5363,24 @@ def _api_cap_name(row: dict[str, Any]) -> str:
 # every other row whose evidence has aged past its refresh cadence.
 _API_SPEND_STALE_SEC = 2 * 3600
 
+# State-column words (≤ 10 cells) for a balance file whose reading cannot be trusted
+# (``api_credits.with_balance``'s ``balance_state``): the row shows no bar and no renew
+# date, only the state, the reading's age and the labelled estimate in the detail.
+_API_UNUSABLE_STATE = {
+    "logged_out": "logged out",
+    "read_failed": "read fail",
+    "stale": "stale",
+    "missing": "no reading",
+}
+
+
+def _api_unusable_word(row: dict[str, Any]) -> str:
+    """The state-column word of an unusable balance reading, else ``""``."""
+    word = _API_UNUSABLE_STATE.get(str(row.get("balance_state") or ""), "")
+    if word == "logged out" and row.get("balance_status") == "wrong_account":
+        return "wrong acct"
+    return word
+
 
 def _api_credit_lines(  # pylint: disable=too-many-arguments,too-many-locals
     snap: dict[str, Any],
@@ -5387,6 +5405,12 @@ def _api_credit_lines(  # pylint: disable=too-many-arguments,too-many-locals
     that would claim an untouched grant. A second row, ``<name> cap``, shows the org's
     monthly spend limit (spent ÷ limit) — only when it binds first (``cap_binds``: its
     room is smaller than the money left).
+    A configured balance file whose reading cannot be trusted (``balance_state``
+    ``logged_out`` / ``read_failed`` / ``stale`` / ``missing``) draws NO bar and no renew
+    date (the config's expiry is as untrusted as the estimate): the state column says
+    ``logged out`` / ``wrong acct`` / ``read fail`` / ``stale`` / ``no reading``, the age
+    column the reading's age, and the detail leads with the state and labels the rest
+    ``estimate only`` (:func:`api_credits.describe`).
     A dim header line first says what the credits pay for, because they are a separate
     pot from every window above them.
     """
@@ -5401,23 +5425,55 @@ def _api_credit_lines(  # pylint: disable=too-many-arguments,too-many-locals
     intro = "API credits (Claude API, Console, Agent SDK — not interactive Claude Code):"
     lines = [f"  \033[2m{intro}\033[0m" if colorable else f"  {intro}"]
 
-    def line(
-        name: str, state: str, *, windows: dict[str, Any], day: Any, at: int, text: str
+    def line(  # pylint: disable=too-many-arguments
+        name: str,
+        state: str,
+        *,
+        windows: dict[str, Any],
+        day: Any,
+        at: int,
+        text: str,
+        unusable: bool = False,
     ) -> str:
         resets_at = int(datetime.fromisoformat(str(day)).timestamp()) if day else 0
         pseudo = {"kind": "api_credit", "windows": windows, "state": "", "resets_at": resets_at}
-        cells = _quota_bar_cells(pseudo, color=color)[0] if bars else ""
+        cells = ""
+        if bars:
+            # An unusable reading keeps the column's width but draws no bar at all: even
+            # an empty `API n/a` track would pass for a figure.
+            cells = (
+                " " * (_BAR_SPAN_WIDTH + 1)
+                if unusable
+                else _quota_bar_cells(pseudo, color=color)[0]
+            )
         renew, _at, renew_color = _quota_renew(pseudo, now)
         shown_renew = f"{renew:<{_RENEW_WIDTH}}"
         if colorable and renew_color:
             shown_renew = f"{renew_color}{shown_renew}\033[0m"
+        shown_state = f"{state:<10}"
+        if colorable and unusable:
+            shown_state = f"\033[33m{shown_state}\033[0m"
         age = _quota_age({"captured_at": at}, now)
         return (
-            f"  {_pad_cells('', _MARK_WIDTH)} {name:<{width}} {state:<10} "
+            f"  {_pad_cells('', _MARK_WIDTH)} {name:<{width}} {shown_state} "
             f"{age:<{age_w}} {cells}{shown_renew} {text}".rstrip()
         )
 
     for row in rows:
+        unusable_word = _api_unusable_word(row)
+        if unusable_word:
+            lines.append(
+                line(
+                    _api_credit_name(row),
+                    unusable_word,
+                    windows={},
+                    day=None,
+                    at=int(row.get("balance_at") or 0),
+                    text=api_credits.describe(row, today),
+                    unusable=True,
+                )
+            )
+            continue
         measured = row.get("balance_source") == "measured"
         pct = row.get("balance_used_pct") if measured else row.get("est_used_pct")
         spend_at = int(row.get("balance_at" if measured else "spend_at") or 0)

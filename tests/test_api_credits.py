@@ -850,8 +850,12 @@ def test_promo_row_unusable_states_show_no_figure(tmp_path: Path) -> None:
             "API PROMO: read failed · 10h old",
         ),
         ({"measured_at": NOW - 10 * 3600}, "API PROMO: stale · 10h old"),
-        ({"measured_at": None, "status": "logged_out"}, "API PROMO: logged out · no reading"),
-        ({"measured_at": None, "status": "timeout"}, "API PROMO: read failed · no readi…"),
+        ({"measured_at": None, "status": "logged_out"}, "API PROMO: logged out · no data"),
+        ({"measured_at": None, "status": "timeout"}, "API PROMO: read failed · no data"),
+        (
+            {"measured_at": None, "status": "wrong_account"},
+            "API PROMO: wrong account · no data",
+        ),
     ]
     for index, (over, first) in enumerate(cases):
         lines = _promo_lines(tmp_path, f"u{index}.json", **over)
@@ -979,6 +983,99 @@ def test_report_draws_measured_and_cap_rows(
     _balance_file(path)
     assert cli.cmd_quota(_quota_args(no_bars=False)) == 0
     assert "apipriv cap" not in capsys.readouterr().out
+
+
+def _credit_line(row: dict[str, Any], *, bars: bool = True) -> str:
+    """The ``ccc quota`` table row of one API-credit *row* (the dim intro line dropped)."""
+    from command_center import cli
+
+    lines = cli._api_credit_lines(  # noqa: SLF001
+        {"api_credits": [row]},
+        NOW,
+        width=20,
+        age_w=8,
+        bars=bars,
+        color=False,
+        colorable=False,
+    )
+    assert len(lines) == 2, lines
+    return lines[1]
+
+
+def _after_name(line: str) -> str:
+    """The row from its state column on (the private account's name and padding cut)."""
+    return line.split("claude:private", 1)[1].lstrip()
+
+
+def _assert_no_bar(line: str) -> None:
+    from command_center import usage
+
+    glyphs = (usage._BAR_FILL_GLYPH, usage._BAR_TRACK_GLYPH, usage.BAR_PAD)  # noqa: SLF001
+    assert not any(glyph in line for glyph in glyphs), line
+    assert "%" not in line and "API n/a" not in line and "API PROMO" not in line, line
+    # The renew column is blank: the config's expiry is as untrusted as the estimate.
+    assert "renew" not in line and "26.10." not in line.split("estimate only")[0], line
+    assert line.count("estimate only") == 1, line
+
+
+@pytest.mark.parametrize(
+    ("over", "word", "age"),
+    [
+        (
+            {"measured_at": NOW - 14 * 86400, "status": "logged_out", "error": "hint"},
+            "logged out",
+            "14d",
+        ),
+        ({"measured_at": NOW - 10 * 3600, "status": "wrong_account"}, "wrong acct", "10h"),
+        ({"measured_at": NOW - 10 * 3600, "status": "browser_down"}, "read fail", "10h"),
+        ({"measured_at": NOW - 10 * 3600}, "stale", "10h"),
+        ({"measured_at": None, "status": "logged_out"}, "logged out", "—"),
+        ({"measured_at": None, "status": "timeout"}, "read fail", "—"),
+    ],
+)
+def test_credit_lines_unusable_state_shows_no_bar_and_no_renew(
+    tmp_path: Path, over: dict[str, object], word: str, age: str
+) -> None:
+    from command_center import cli
+
+    row = _state_row(tmp_path, "b.json", **over)
+    line = _credit_line(row)
+    _assert_no_bar(line)
+    assert _after_name(line).startswith(f"{word:<10} {age}"), line
+    assert line.endswith(api_credits.describe(row, TODAY)), line
+    # The blank bar keeps the bar columns' width, so the renew and detail columns line up.
+    plain = _credit_line(row, bars=False)
+    _assert_no_bar(plain)
+    assert len(line) - len(plain) == cli._BAR_SPAN_WIDTH + 1  # noqa: SLF001
+
+
+def test_credit_lines_missing_file_says_no_reading(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path / "runs.jsonl", [{"ts": "2026-10-10T10:00:00+02:00", "cost_usd": 50}])
+    row = api_credits.statuses_with_spend(
+        [PRIVATE],
+        [f"private=runs_jsonl:{ledger}", f"private=balance_json:{tmp_path / 'nope.json'}"],
+        TODAY,
+        now=NOW,
+    )[0]
+    line = _credit_line(row)
+    _assert_no_bar(line)
+    assert _after_name(line).startswith("no reading —"), line
+    estimate = api_credits._describe_estimate(row, TODAY)  # noqa: SLF001
+    assert line.endswith(f"no Console reading · estimate only: {estimate}"), line
+
+
+def test_credit_lines_measured_row_is_unchanged(tmp_path: Path) -> None:
+    from command_center import usage
+
+    row = _state_row(tmp_path)
+    assert row["balance_state"] == "measured"
+    line = _credit_line(row)
+    assert _after_name(line).startswith("api        12m"), line
+    assert "API PROMO" in line and "7%" in line and usage._BAR_TRACK_GLYPH in line  # noqa: SLF001
+    assert "renew " in line and "estimate only" not in line
+    # A failing latest attempt on a fresh reading still draws the measured bar.
+    failing = _credit_line(_state_row(tmp_path, "f.json", status="logged_out"))
+    assert _after_name(failing).startswith("api ") and "7%" in failing and "renew " in failing
 
 
 CLOUD = {
