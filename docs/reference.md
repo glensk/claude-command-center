@@ -2032,12 +2032,22 @@ entry appeared within `CCC_RELAY_START_GRACE_S` (default 90; `0` = at once;
 `never-registered`); when a registry entry seen alive in this wait is missing on two polls in
 a row (`process-gone`, no grace: a closed tab); or when it is registered but its transcript
 has not grown and it has not accepted for `CCC_RELAY_NO_ACCEPT_S` (default 240; `no-accept`,
-e.g. a folder-trust prompt). An invalid knob value falls back to its default with a stderr
+e.g. a model turn that never ran accept). When the successor never got a first turn at all
+(`prompt_count` 0, no matched `start_job` ledger row, no human prompt in its transcript) the
+verdict is `no-first-turn` instead: a trust dialog, a stalled start hook, or a launch route
+that did not submit the prompt (the successor's tab shows which). An invalid knob value falls back to its default with a stderr
 note. A dead successor aborts its transfer (`aborted: successor dead: <why>`) and `start`
 creates ONE fresh transfer with the same snapshot and text, launches it and waits for the rest
 of the same `-w` budget, printing `relaunched: successor <new> (first <old> died: <why>)` (a
 still-open first tab is then identifiable). A second death exits 1 with `successor died twice:
 <why1>; <why2>; nothing moved`: two `failed` rows, no active transfer, the source untouched.
+A `no-first-turn` death is never relaunched (every case seen was deterministic: a second
+launch through the same route would spend the rest of `-w` and leave a second dead tab):
+`start` aborts the transfer and exits 1 with `successor <id> never received its first prompt
+(no-first-turn: …); nothing moved and THIS session stays authoritative`, and the daemon
+sweep aborts such a transfer the same way (`sweep: successor dead: no-first-turn`). The abort
+stamps the transfer (`accept_refused_at`, "accept refused or orphaned") so the orphan closer
+closes the idle successor tab; fix the cause and run `start` again.
 
 **A differing re-run never refuses (tp#2172).** A `start` that meets an active `prepared` /
 `opened` transfer of the same source with a different snapshot (handoff text, account `-A`,
@@ -2148,7 +2158,7 @@ every transition a compare-and-set):
 | :---------- | :------------------------------------------------- | :----------------------------------------------- |
 | `prepared`  | `start`: validated, snapshot written               | untouched                                        |
 | `opened`    | `start`: a launcher accepted `start-job`           | untouched                                        |
-| `accepted`  | `accept` in the successor, every hook succeeded    | untouched until finalized (same `accept` call)   |
+| `accepted`  | first handoff prompt submitted, or manual `accept`; every hook succeeded | untouched until finalized (same `accept` call)   |
 | `finalized` | `accept` (primary), `start` or the daemon sweep    | status `handed_off`, closer spawned              |
 | `failed`    | a typed refusal / launcher failure                 | untouched                                        |
 
@@ -2193,21 +2203,28 @@ count and elapsed seconds and says the transfer is still `opened`; the successor
 preamble says accept already retries by itself and lets it run accept once more on
 exactly that error, stopping on any other.
 
-**The successor's SessionStart hook accepts by itself** (tp#1681 L18, config
-`handoff_auto_accept`, default `true`; `false` restores the manual-only flow). On a new
-process (never `compact`/`clear`, never inside ccc's own `claude -p`) the hook looks up the
-`prepared`/`opened` transfers whose target is this session. None: silent. Exactly one: it
-runs the same `accept` (same session and account checks, same accept-prepare, same
+**The successor accepts by itself on its first handoff prompt** (tp#1681 L18, tp#2326, config
+`handoff_auto_accept`, default `true`; `false` restores the manual-only flow). SessionStart
+moves nothing for a handoff. The `UserPromptSubmit` hook (never inside ccc's own `claude -p`)
+acts only on a prompt that carries the handoff head (`[handoff] You take over the work of
+session` within its first 4096 characters, so a prepended orchestration line does not hide
+it) and names `transfer <id>`; any other prompt accepts nothing, so a successor that never
+read the handoff cannot accept it. It then looks up the `prepared`/`opened` transfers whose
+target is this session. None: silent. Exactly one whose id the prompt names: it runs the
+same `accept` (same session and account checks, same accept-prepare, same
 `handoff_hooks`) once, with no retry window and the hooks bounded by
 `min(accept_hook_timeout_sec, 45)` seconds in all (Claude Code's default hook timeout is
 60 s), before the AIM context is built so the reconciled AIM shows. Its output is captured;
-the context gets one note of at most 200 bytes: `handoff T accepted (auto)` (plus the
+the context gets one note of at most 200 bytes, first: `handoff T accepted (auto)` (plus the
 hooks' next steps when they fit), or `handoff T NOT accepted (auto): <reason>; run: ccc
-continue-session accept T` with the transfer left as it was. Several inbound transfers or an
-unreadable row accept none and name `ccc continue-session status -s <session>`. A resume
-after the accept finds no `prepared`/`opened` row and stays silent. The preamble tells the
-successor to skip its `accept` when a SessionStart note reads `handoff T accepted`;
-`accept` by hand keeps working and stays idempotent.
+continue-session accept T` with the transfer left as it was. A prompt naming no inbound
+transfer, several inbound transfers or an unreadable row accept none and name `ccc
+continue-session status -s <session>`. A resume after the accept finds no `prepared`/`opened`
+row and stays silent. The preamble tells the successor to skip its `accept` when a ccc hook
+note on its prompt reads `handoff T accepted`; `accept` by hand keeps working and stays
+idempotent. A successor that never gets its first prompt moves nothing (no ownership, AIM,
+await groups or source state change) and is judged `no-first-turn` (see the dead-successor
+paragraph above).
 
 Right before the first hook, `accept` moves its OWN process out of darwin background
 (`setpriority(PRIO_DARWIN_PROCESS, 0, 0)` plus `taskpolicy -B -p <pid>`, bounded by 10 s,
@@ -2270,7 +2287,12 @@ hands the source's close to a token-scoped closer. Once the transfer is
 source done (it sinks to FINISHED; `handed_off_to` and the `⇢` marker stay).
 `ccc continue-session status` names the recovery step for every state; for an `accepted`
 transfer it is to re-run `ccc continue-session accept` in the successor (never touch the
-source). `ccc continue-session abort <transfer> [-r REASON] [-j]` gives up a `prepared` or
+source). For an `opened` transfer whose
+successor has no first turn yet (`status -j` row `first_turn: false`; `null` for a draft or
+a non-`opened` transfer) it says to press Enter in the successor's tab when the handoff text
+sits there unsent, else `abort` and fix the launch route. A `failed` transfer ending in
+`no-first-turn` reads: nothing moved, the source stays authoritative, the idle successor tab
+is closed by the daemon; fix the cause and start a new transfer. `ccc continue-session abort <transfer> [-r REASON] [-j]` gives up a `prepared` or
 `opened` transfer whose successor is stuck or dead: it moves it to `failed` with
 `aborted: REASON` (default `by hand`), hands the reserved `ccc await` groups back to the
 source and archives a never-started (draft) successor; a started successor tab stays open

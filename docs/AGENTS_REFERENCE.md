@@ -362,7 +362,8 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
   account, after EVERY `handoff_hooks` entry succeeded (argv-only, bounded, JSON `"ok":
   true`); the source is retired only after `accepted` (`finalize`: idempotent session
   writes first, the `accepted → finalized` CAS last). **`accept` is the primary finalizer**:
-  once it has CASed `accepted` and the source is idle (or alive) it finalizes at once (marks
+  once it has CASed `accepted` and the source is idle (or alive) it finalizes at once (on the
+  auto path `accept` runs when the successor's first handoff prompt is submitted; marks
   the transfer finalized, writes the source's handed-off state) and spawns the token-scoped
   closer `ccc close-now --handoff-transfer <id> -s <src>`; `start` in the source is an
   idempotent race participant (first finalizer wins, the other is a no-op). A capped
@@ -373,16 +374,32 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
   `handed_off_to`, never on `done`): `core.reconcile_pass` closes it as done (one
   `handoff_done_sources` query per pass) once its transfer is `accepted`/`finalized` AND its
   process is gone, and `set_handoff_lineage` never lifts a done source back out.
-- **SessionStart auto-accept** (tp#1681 L18, `handoff_auto_accept`, default on; `false` is
-  the rollback): `hooks._auto_accept` runs `continue_session.accept_as` (the ONE accept
-  core; the CLI passes its env session, the hook its payload id) on the single inbound
-  `prepared`/`opened` transfer (`inbound_transfers`) before the AIM context is built — never
-  on `compact`/`clear` or under `CCC_INTERNAL`. One attempt, hooks bounded by
-  `min(accept_hook_timeout_sec, 45 s)` in all, accept's output captured (the hook prints ONE
-  JSON document), a ≤ 200-byte note (`AUTO_ACCEPT_NOTE`; the preamble names
-  `AUTO_ACCEPT_HEAD`). Several inbound or an unreadable row accept none; a refusal leaves
-  the transfer as it was; both name the recovery command. Already accepted on resume: no
-  row matches, silent. Manual `accept` is unchanged.
+- **First-prompt auto-accept** (tp#1681 L18, tp#2326, `handoff_auto_accept`, default on;
+  `false` is the rollback): the `UserPromptSubmit` hook (`hooks._prompt_auto_accept`, after
+  the handed-off refusal, before the `/aim` intercept) runs `continue_session.accept_as`
+  (the ONE accept core; the CLI passes its env session, the hook its payload id) on the
+  single inbound `prepared`/`opened` transfer (`inbound_transfers`), only when the prompt
+  is the handoff: `HANDOFF_PROMPT_HEAD` occurs within its first `HANDOFF_HEAD_WINDOW` (4096)
+  characters (one bounded `str.find`, not a prefix test: `start-job` may prepend an
+  orchestration line) AND names `transfer <id>` of that inbound transfer; any other prompt
+  accepts nothing (a successor that never read the handoff must not accept it). Never under
+  `CCC_INTERNAL`. SessionStart is silent about handoffs and moves nothing. One attempt,
+  hooks bounded by `min(accept_hook_timeout_sec, 45 s)` in all, accept's output captured
+  (the hook prints ONE JSON document), a ≤ 200-byte note first in the prompt context
+  (`AUTO_ACCEPT_NOTE`; the preamble names `AUTO_ACCEPT_HEAD`). Several inbound or an
+  unreadable row accept none; a refusal leaves the transfer as it was; both name the
+  recovery command. Already accepted on resume: no row matches, silent. Manual `accept` is
+  unchanged.
+- **`dead:no-first-turn`** (tp#2326, a refinement of `no-accept`, same knob
+  `CCC_RELAY_NO_ACCEPT_S`): the successor is registered and alive but no first turn is seen
+  (`prompt_count` 0, no matched `start_job` ledger row, no human prompt in its transcript;
+  `continue_session.first_turn_seen`, read only on the dead branch, writes nothing). Causes:
+  a trust dialog, a stalled start hook, or a launch route that did not submit the prompt.
+  There is NO relaunch (the cause is deterministic): `start` aborts the transfer and exits 1
+  (`SuccessorDied`, nothing moved, the source stays authoritative); the sweep aborts it the
+  same way. The abort stamps the transfer (`record_orphaned`, reusing `accept_refused_at`) so
+  the D13 orphan closer closes the idle successor tab. `status` shows `first_turn` and the
+  next step. `no-accept` (a first turn but never accepted) still relaunches once.
 - **The handoff closer is the only thing that closes a handed-off source**
   (`handoff_close.py`): it claims the source's close token, binds ONE live process (PID +
   start time), requires 10 s of stable idle (one transcript identity throughout), drains the
