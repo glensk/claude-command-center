@@ -954,3 +954,82 @@ def test_revalidation_under_the_tab_lock_is_impatient(
     monkeypatch.setattr(terminal, "probe_identity", _spy)
     assert bridge_close.run_close(deps, SID)["result"] == "closed"
     assert patience[-1] is False and all(patience[:-1]) and world.killed
+
+
+# --------------------------------------------------------------------------- #
+# tp#2375: ``ccc close --done`` marks the session done (decide's ``d``)
+# --------------------------------------------------------------------------- #
+def test_done_close_marks_done_and_closes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    synced: list[object] = []
+    monkeypatch.setattr(cli, "_spawn_sync_mirrors", synced.append)
+    marked: list[str] = []
+    real = cli.mark_session_done
+
+    def _mark(store: Store, sid: str) -> int:
+        assert not world.killed  # marked before the signal, never after
+        marked.append(sid)
+        return real(store, sid)
+
+    monkeypatch.setattr(cli, "mark_session_done", _mark)
+    data = bridge_close.run_close(deps, SID, done=True)
+    assert data == {
+        "session_id": SID,
+        "result": "closed",
+        "terminal": "tab",
+        "status": Status.DONE.value,
+        "close_debt": False,
+        "done": True,
+    }
+    assert marked == [SID] and world.killed == [(PID, signal.SIGTERM)]
+    row = _row()
+    assert row.done and row.done_at > 0 and row.status == Status.DONE.value
+    assert not row.close_token and len(synced) == 1
+
+
+def test_done_close_refused_busy_marks_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    world.statuses = ["busy"]
+    with pytest.raises(BridgeError) as err:
+        bridge_close.run_close(deps, SID, done=True)
+    assert err.value.code == "busy"
+    _nothing_signalled(world)
+    assert not _row().done
+
+
+def test_done_close_identity_changed_marks_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world, deps = _install(tmp_path, monkeypatch)
+    world.starts = [START, START, START, "Tue Nov  3 11:11:11 2026"]
+    with pytest.raises(BridgeError) as err:
+        bridge_close.run_close(deps, SID, done=True)
+    assert err.value.code == "identity_changed"
+    _nothing_signalled(world)
+    assert not _row().done
+
+
+def test_done_close_cli_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _world, deps = _install(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
+    monkeypatch.setattr(bridge_cli.bridge_target, "default_deps", lambda: deps)
+    assert cli.main(["close", "-s", SID, "-d", "-j"]) == 0
+    env = json.loads(capsys.readouterr().out)
+    assert env["ok"] is True and env["data"]["done"] is True
+    assert env["data"]["status"] == Status.DONE.value and _row().done
+
+
+def test_mark_session_done_is_mark_done_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ccc mark-done`` and ``ccc close --done`` share one done write."""
+    _install(tmp_path, monkeypatch)
+    with Store() as store:
+        store.update_fields(SID, status=Status.IDLE.value)
+        cli.mark_session_done(store, SID)
+    row = _row()
+    assert row.done and row.status == Status.DONE.value and row.done_at > 0

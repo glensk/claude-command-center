@@ -624,7 +624,12 @@ def cmd_answer(args: argparse.Namespace) -> int:
 def cmd_close(args: argparse.Namespace) -> int:
     from .bridge_close import run_close
 
-    return _run(args, lambda deps: run_close(deps, args.session, args.staff_agent or ""))
+    return _run(
+        args,
+        lambda deps: run_close(
+            deps, args.session, args.staff_agent or "", done=bool(getattr(args, "done", False))
+        ),
+    )
 
 
 def cmd_lineage(args: argparse.Namespace) -> int:
@@ -800,9 +805,11 @@ def _add_transcript_parsers(sub: Any) -> None:
             "close in flight, a drained Stop chain and an unchanged transcript over the "
             "stability window. Then SIGTERM (pid identity re-checked on a fresh "
             "snapshot) and the tmux pane, else the validated iTerm pane or tab, is "
-            "closed without focusing anything. DONE stays DONE, else PARKED; it never "
-            "marks a session done. data: {session_id, result: closed, terminal: "
-            "tab|pane|tmux|none, status, close_debt}; a refusal's error.code (and "
+            "closed without focusing anything. DONE stays DONE, else PARKED; without "
+            "-d it never marks a session done, with -d/--done it marks it done (as "
+            "ccc mark-done) once every check passed, right before the signal. data: "
+            "{session_id, result: closed, terminal: tab|pane|tmux|none, status, "
+            "close_debt[, done: true]}; a refusal's error.code (and "
             "data.reason) is busy|subagents|background_shell|picker_pending|"
             "not_running|background|conflict|stop_chain|identity_changed|staff_bound|"
             "close_in_flight|stale_evidence|unobservable. With -A A a session bound to "
@@ -817,6 +824,12 @@ def _add_transcript_parsers(sub: Any) -> None:
         "--staff-agent",
         metavar="AGENT",
         help="close a staff-bound session: the agent it must be bound to (tp#1790)",
+    )
+    p.add_argument(
+        "-d",
+        "--done",
+        action="store_true",
+        help="mark the session done (as ccc mark-done) once every check passed (tp#2375)",
     )
     _json_flag(p)
     p.set_defaults(func=cmd_close)

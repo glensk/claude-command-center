@@ -28,9 +28,12 @@ tab through :func:`terminal.close_iterm_session` (AppleScript ``close`` only —
 ``activate``, no selection) — but only a tab VALIDATED against the live pid's tty
 (``cli.cmd_close_now``'s stale-evidence guard: never close on a store-only id; else
 ``terminal: none``). The store status becomes DONE when ccc's DONE flag is set, else PARKED
-(HANDED_OFF for a handed-off row, :func:`models.closed_status`); a close never marks a
-session done. A pane that did not close keeps the debt: a repeated call closes that pane
-only, never signalling again. A session already gone answers ``not_running``.
+(HANDED_OFF for a handed-off row, :func:`models.closed_status`); a plain close never marks a
+session done. ``ccc close -s ID --done -j`` (``-d``, tp#2375: decide's ``d``) does, through
+``mark-done``'s own write (:func:`cli.mark_session_done`), once every check above passed and
+right before the signal (inside the tab lock); ``data`` then adds ``done: true``. A pane
+that did not close keeps the debt: a repeated call closes that pane only, never signalling
+again. A session already gone answers ``not_running``.
 
 ``ccc close -s ID -A A`` (``--staff-agent``, tp#1790) closes a staff-bound session: only
 when ``staffrole.adopted_role(ID) == A`` (else ``staff_bound``; decide's applier asked
@@ -240,6 +243,17 @@ def _terminal(pane: str, iterm: str) -> str:
     return {"tab": "tab", "session": "pane"}.get(result, "none")
 
 
+def _mark_done(deps: BridgeDeps, sid: str, cfg: Config) -> None:
+    """``--done``: mark the session done through ``mark-done``'s own write, log it and move
+    its mirror (done⇄running), as ``mark-done`` does."""
+    from . import cli, hooks
+
+    with deps.store() as store:
+        cli.mark_session_done(store, sid)
+    hooks._log_event(sid, _LOG_KIND, "ccc close --done: marked done before the signal")
+    cli._spawn_sync_mirrors(cfg)
+
+
 def _set_closed_status(sid: str) -> str:
     """DONE stays DONE, else PARKED (HANDED_OFF when handed off) — never marked done."""
     from .models import closed_status
@@ -275,10 +289,20 @@ def _check_binding(sid: str, staff_agent: str) -> None:
         raise hc.Refused(f"the session was adopted by staff agent {role}", "staff_bound")
 
 
-def _close_live(  # pylint: disable=too-many-locals
-    deps: BridgeDeps, claim: hc.Claim, own: bool, cfg: Config, staff_agent: str = ""
+def _close_live(  # pylint: disable=too-many-locals,too-many-arguments
+    deps: BridgeDeps,
+    claim: hc.Claim,
+    own: bool,
+    cfg: Config,
+    staff_agent: str = "",
+    *,
+    done: bool = False,
 ) -> dict[str, Any]:
-    """Bind, prove stable idle, drain, revalidate under the tab lock, SIGTERM, close."""
+    """Bind, prove stable idle, drain, revalidate under the tab lock, SIGTERM, close.
+
+    *done* (``--done``): every check has passed, so the session is marked done (ccc's own
+    ``mark-done`` write, :func:`cli.mark_session_done`) right before the signal.
+    """
     from . import cli, hooks, terminal
 
     adapter = cli._adapter()
@@ -314,6 +338,8 @@ def _close_live(  # pylint: disable=too-many-locals
         with lock:
             hc._revalidate(adapter, claim, bound, stamp, patient=False)  # no retry under the lock
             _check_binding(sid, staff_agent)
+            if done:
+                _mark_done(deps, sid, cfg)
             hc._bind_debt(claim, debt)
             signalled = cli._sigterm(bound.pid)
     except hc.Refused as exc:
@@ -334,11 +360,15 @@ def _close_live(  # pylint: disable=too-many-locals
         kind = _terminal(debt.pane, "" if debt.pane else debt.iterm)
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         kind = "none"
-    return _settle(claim, debt, kind, status, hooks)
+    return _settle(claim, debt, kind, status, hooks, done=done)
 
 
-def _settle(claim: hc.Claim, debt: hc.Debt, kind: str, status: str, hooks: Any) -> dict[str, Any]:
-    """Retire on a proven close; else keep the debt (a retry closes the pane only)."""
+def _settle(  # pylint: disable=too-many-arguments
+    claim: hc.Claim, debt: hc.Debt, kind: str, status: str, hooks: Any, *, done: bool = False
+) -> dict[str, Any]:
+    """Retire on a proven close; else keep the debt (a retry closes the pane only).
+
+    *done*: the close marked the session done (``--done``): ``data`` says ``done: true``."""
     sid = claim.session_id
     target = debt.pane or debt.iterm
     debt_kept = bool(target) and kind == "none" and not hc.pane_gone(debt)
@@ -358,6 +388,7 @@ def _settle(claim: hc.Claim, debt: hc.Debt, kind: str, status: str, hooks: Any) 
         "terminal": kind,
         "status": status,
         "close_debt": debt_kept,
+        **({"done": True} if done else {}),
     }
 
 
@@ -396,10 +427,13 @@ def _retry_debt(sid: str, holder: str) -> dict[str, Any] | None:
     return _settle(claim, debt, kind, _set_closed_status(sid), hooks)
 
 
-def run_close(deps: BridgeDeps, session_id: str, staff_agent: str = "") -> dict[str, Any]:
+def run_close(
+    deps: BridgeDeps, session_id: str, staff_agent: str = "", *, done: bool = False
+) -> dict[str, Any]:
     """Close *session_id* when it is provably idle; the ``data`` object or a refusal.
 
-    *staff_agent* (``-A``) opts in to closing a session bound to exactly that agent. The
+    *staff_agent* (``-A``) opts in to closing a session bound to exactly that agent. *done*
+    (``--done``, tp#2375) marks it done once every check passed, right before the signal. The
     whole close runs under ONE ``ps`` deadline (:data:`handoff_close.CLOSE_DEADLINE_SEC`,
     tp#1868 B5): past it the close refuses ``unobservable`` before its next probe.
     """
@@ -410,10 +444,10 @@ def run_close(deps: BridgeDeps, session_id: str, staff_agent: str = "") -> dict[
     if not sid:
         raise BridgeError("usage", "pass -s/--session <id>", 2)
     with terminal.ps_deadline(hc.CLOSE_DEADLINE_SEC):
-        return _run_close(deps, sid, agent)
+        return _run_close(deps, sid, agent, done)
 
 
-def _run_close(deps: BridgeDeps, sid: str, agent: str) -> dict[str, Any]:
+def _run_close(deps: BridgeDeps, sid: str, agent: str, done: bool = False) -> dict[str, Any]:
     """:func:`run_close` inside its ``ps`` deadline."""
     from . import config, staffrole
 
@@ -448,7 +482,7 @@ def _run_close(deps: BridgeDeps, sid: str, agent: str) -> dict[str, Any]:
     _idle_gate(adapter, sid, live, agent)
     claim, own = _claim(sid, live.cwd, holder)
     try:
-        return _close_live(deps, claim, own, config.load_config(), agent)
+        return _close_live(deps, claim, own, config.load_config(), agent, done=done)
     except BridgeError:
         raise
     except Exception:  # pylint: disable=broad-exception-caught

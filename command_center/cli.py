@@ -1310,6 +1310,30 @@ def cmd_subgoal_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def mark_session_done(store: Store, session_id: str) -> int:
+    """Mark *session_id* done in *store*: the one done write of ``ccc mark-done``.
+
+    Sets done, status DONE and ``done_at``, ticks every remaining sub-goal and archives a
+    future-job draft's mirror file. Returns how many sub-goals it ticked. ``ccc close
+    --done`` (decide's ``d``) calls it too, so both mark a session done the same way.
+    """
+    session = store.get(session_id)
+    store.update_fields(session_id, done=True, status=Status.DONE.value, done_at=now_ms())
+    # Done is the human's authoritative verdict — reconcile the progress bar to
+    # 100% so it never reads "done but 2/5".
+    ticked = store.check_all_subgoals(session_id)
+    # A future-job draft can't be "done"-graded: archive its mirror file and
+    # drop it out of the FUTURE list (archived) instead of leaving a done draft.
+    if session is not None and session.draft:
+        from . import futuresync
+
+        cfg = config.load_config()
+        if session.future_file:
+            futuresync.archive_file(store, cfg, session, "archived")
+        store.update_fields(session_id, archived=True)
+    return ticked
+
+
 def cmd_mark_done(args: argparse.Namespace) -> int:
     adapter = _adapter()
     session_id = resolve_session_id(adapter, args.session, None)
@@ -1322,25 +1346,8 @@ def cmd_mark_done(args: argparse.Namespace) -> int:
     with Store() as store:
         store.ensure(session_id, cwd=os.getcwd())
         session = store.get(session_id)
-        store.update_fields(
-            session_id,
-            done=not args.undo,
-            status=Status.DONE.value if not args.undo else Status.IDLE.value,
-            done_at=now_ms() if not args.undo else 0,
-        )
-        # Done is the human's authoritative verdict — reconcile the progress bar to
-        # 100% so it never reads "done but 2/5". Reopening (--undo) leaves ticks as-is.
         if not args.undo:
-            ticked = store.check_all_subgoals(session_id)
-            # A future-job draft can't be "done"-graded: archive its mirror file and
-            # drop it out of the FUTURE list (archived) instead of leaving a done draft.
-            if session is not None and session.draft:
-                from . import futuresync
-
-                cfg = config.load_config()
-                if session.future_file:
-                    futuresync.archive_file(store, cfg, session, "archived")
-                store.update_fields(session_id, archived=True)
+            ticked = mark_session_done(store, session_id)
             # --close: arm a close-after-turn request the release-locks Stop hook claims +
             # fires (SIGTERM + pane/tab close); a transient refusal may re-arm it once more
             # for the next turn, within the original TTL (Store.restore_close). A
@@ -1356,6 +1363,7 @@ def cmd_mark_done(args: argparse.Namespace) -> int:
                 else:
                     store.arm_close(session_id, now_ms())
         else:
+            store.update_fields(session_id, done=False, status=Status.IDLE.value, done_at=0)
             # Reopening disarms any pending close request so a resumed session never
             # self-closes on a stale arm (nor can an in-flight close-now restore one).
             store.disarm_close(session_id)

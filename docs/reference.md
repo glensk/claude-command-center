@@ -3984,6 +3984,7 @@ echo '{"decision_id": "…", "answers": [{"question_index": 0, "option_indices":
   | ccc answer -s <session-id> -j                  # answer its AskUserQuestion picker
 ccc close -s <session-id> -j                       # close an IDLE session (decide's close)
 ccc close -s <session-id> -A <agent> -j            # … a session bound to staff agent <agent>
+ccc close -s <session-id> -d -j                    # … and mark it done (decide's d)
 ccc lineage -s <session-id> -j                     # its continue-session predecessors
 ccc user-aims -j -d 400                            # every session's hand-set AIM + done flag
 ccc user-aims -j -s <session-id> -s <session-id>   # … of just these sessions
@@ -4221,7 +4222,7 @@ supported. The answer is verified within 10 s through the call's `tool_use_id` a
 `data = {decision_id, tool_use_id, outcome, channel, keys}` (`mismatched_questions` on a
 mismatch); `outcome` `accepted` / `unknown` / `failed`.
 
-### `ccc close` (`-s/--session ID`, `-A/--staff-agent AGENT`, `-j/--json`)
+### `ccc close` (`-s/--session ID`, `-A/--staff-agent AGENT`, `-d/--done`, `-j/--json`)
 
 Closes an IDLE live session from outside it (tp#1481; decide's Mac applier). Code:
 `bridge_close.py`, built on the handoff closer (`handoff_close.py`). Any failed check refuses
@@ -4245,8 +4246,12 @@ timed-out start stamp only while time is left, never under the tab lock).
 The terminal: the hosting tmux pane (`tmux`), else the iTerm pane (`pane`) or tab (`tab`)
 through AppleScript `close` (no `activate`, no selection) — only a tab validated against the
 live pid's tty, never a store-only id (`none`). The store status becomes DONE when ccc's
-DONE flag is set, else PARKED (HANDED_OFF for a handed-off row); the verb never marks a
-session done. `data = {session_id, result: "closed", terminal, status, close_debt}`;
+DONE flag is set, else PARKED (HANDED_OFF for a handed-off row); without `-d` the verb never
+marks a session done. `-d/--done` (tp#2375, decide's `d` key) marks it done with
+`mark-done`'s own write (`cli.mark_session_done`: done, status DONE, `done_at`, every sub-goal
+ticked, a draft archived) once every check passed, inside the tab lock right before the
+SIGTERM, so a refused close marks nothing; `data` then adds `done: true` and `status` is
+`done`. `data = {session_id, result: "closed", terminal, status, close_debt}`;
 `close_debt: true` = the pane did not close: a repeated call closes it without signalling
 again. A session already gone answers `not_running`. `ccc mark-done --close` stays the
 in-session path (it arms a close for after the next turn).
