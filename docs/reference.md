@@ -117,10 +117,10 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 - `ccc sessions` · `ccc inspect` · `ccc send` · `ccc answer` · `ccc close` · `ccc lineage` · `ccc user-aims` · `ccc delivery` · `ccc events` · `ccc sent` · `ccc name` (all `-j`) — the voice-bridge JSON CLI: list, read, message, answer and close live sessions, list a session's predecessors, every session's hand-set AIM and done flag, what ccc itself typed into a session; see "The voice-bridge JSON CLI" below.
 - `ccc input-ledger [-S | -A [-F] | -D] [-j]` — show, arm or disarm the input ledger's coverage watermark (the read side of `ccc sent`); see "The input ledger" below.
 
-**Obsidian & mirrors**
+**Obsidian**
 
-- `ccc obsidian-setup [-r VAULT] [--install-plugins]` — seed the vault folders, dashboards & job buttons.
-- `ccc sync-future` · `ccc sync-mirrors` (`-F/--full`, `-R/--rescrub`, `-v/--verbose`) — reconcile the future-job files / export the running+done+session mirrors (usually automatic). `ccc sync-future` only touches job files while `future_files` is on. The capture pad (`future_pad`, `new-prompt.md`) is served while `future_files` **or** `future_pad_enabled` (default `false`) is on. With `future_files` off, a pad job is registered in the store only (no job file), and a refused pad launch writes its error onto the pad and unticks `launch`. `ccc sync-future -x/--detach` is the one-off switch to store-only future jobs. It refuses while `future_files` is on. Under the sync lock it runs a final import of each draft's linked file and refuses on any error, including an unregistered ready file. It then records `launched_from_draft` on launched rows that still have a job file and clears the file link on ALL rows. A re-run clears 0 and never re-imports a file. `ccc unlaunch` keys on `launched_from_draft`, not on the file. Every mirror write is vouched for by the credential scrubber first: `-F/--full` lifts the per-pass scrub budgets (the one-off migration), `-R/--rescrub` drops every stored vouch before the pass, and the command exits **3** when any document was withheld because the scrubber could not vouch for it.
+- `ccc obsidian-setup [-r VAULT] [--install-plugins]` — seed the capture pad and strip the retired job-button entries.
+- `ccc sync-future` — reconcile the future-job files and the capture pad (usually automatic). `ccc sync-future` only touches job files while `future_files` is on. The capture pad (`future_pad`, `new-prompt.md`) is served while `future_files` **or** `future_pad_enabled` (default `false`) is on. With `future_files` off, a pad job is registered in the store only (no job file), and a refused pad launch writes its error onto the pad and unticks `launch`. `ccc sync-future -x/--detach` is the one-off switch to store-only future jobs. It refuses while `future_files` is on. Under the sync lock it runs a final import of each draft's linked file and refuses on any error, including an unregistered ready file. It then records `launched_from_draft` on launched rows that still have a job file and clears the file link on ALL rows. A re-run clears 0 and never re-imports a file. `ccc unlaunch` keys on `launched_from_draft`, not on the file.
 
 **Cross-session file locks**
 
@@ -196,9 +196,8 @@ fallback), and the **working directory**. Below it are **three tabs**:
 - **session** — the **full conversation**, terminal-like: each `## (N) you` prompt
   (numbering matches the prompts tab), Claude's replies, and dim `⏺ Tool(input…)` /
   `⎿ result…` one-liners for every tool call (results truncated to a few lines; no
-  thinking blocks, no full tool outputs). It is the SAME canonical render the vault
-  **session mirror** file embeds (`command_center/sessionmd.py` is the single
-  source), capped at 512 KiB keeping the newest whole turns (`showing last N of M
+  thinking blocks, no full tool outputs). It is the SAME canonical render `ccc show -t` prints (`command_center/sessionmd.py` is
+  the single source), capped at 512 KiB keeping the newest whole turns (`showing last N of M
   turns` note when trimmed).
 - **aim** — the session's AIM (done-condition) history, oldest first with the current
   AIM marked `← current`, including each revision's score and short label.
@@ -793,8 +792,7 @@ future job), **cancelled** (the dependency was `mark-done`-on-draft or `delete-j
   *Start anyway / Cancel* dialog; the Obsidian `launch: true` toggle refuses to spawn and writes a
   managed `blocked: depends on <hash> — <state>` sync-error callout instead. A *satisfied*
   dependency never blocks.
-- **Round-trip.** `depends_on:` is emitted in a future-job file's frontmatter (and in all three
-  running/done/session mirrors) **only when non-empty**, so dependency-less files stay
+- **Round-trip.** `depends_on:` is emitted in a future-job file's frontmatter **only when non-empty**, so dependency-less files stay
   byte-identical.
 
 Each future job also picks **which models it runs on**: `-O/--overseer` and `-E/--executor`
@@ -892,9 +890,8 @@ matching vault `obsidian-shellcommands` entry → `ccc open-job|done-job|delete-
 {{file_path:absolute}}` against the active (job) file. The buttons are emitted only when the draft
 has a real `session_id` — the button-less capture pad stays inert. **✓ done-job** means "this got
 done without running": the draft is promoted out of draft-hood (`draft=0, done=1`, sub-goals
-reconciled to 100%), its file is archived with a terminal `done` status, and the next mirror pass
-writes its snapshot under `done/` — distinct from `ccc mark-done` on a draft, which *cancels* it
-(archived, never mirrored). **🗑 delete-job** soft-deletes the row (`archived=1`) and moves the file
+reconciled to 100%), its file is archived with a terminal `done` status — distinct from `ccc mark-done` on a draft,
+which *cancels* it (archived). **🗑 delete-job** soft-deletes the row (`archived=1`) and moves the file
 to the **`01-llm/ccc-tasks/delete/` trash** (keeping the `<cat>/<repo>` substructure) with
 `status: deleted`, a `deleted: <date>` stamp and a single **↩ Stage job back in** button;
 `ccc restore-job` (the button, the trash dashboard's ↩ column, or the CLI) un-archives the row and
@@ -947,103 +944,21 @@ AIM/prompt and flip `status: ready` to register it. The persistent capture pad
 `01-llm/ccc-tasks/new-prompt.md` is the manual variant — write into it, flip it to `ready`, and the
 sync registers its content into a hash-named file and resets the pad (a deleted pad self-heals).
 
-**Whole-lifecycle vault mirrors.** The FUTURE file is the *editable* draft; the other two lifecycle
-phases get **export-only** read mirrors so every tracked session is one markdown file in the vault:
-**RUNNING** (`01-llm/ccc-tasks/running/<cat>/<repo>/<slug>-<hash>.md`, for every active session) and
-**DONE** (`.../done/…`, the final snapshot of every finished session). They are generated from the
-store (a banner + `ccc_mirror: running|done` frontmatter mark them; user edits are overwritten),
-byte-stable (rewritten only on a real change — the only timestamps are `created`/`last_response`/
-`done_at` as ISO dates, so routine passes are no-ops), and cleaned up only via the `ccc_mirror`
-marker — a file without it is never touched. Every mirror also carries **`model:`** and
-**`effort:`** frontmatter keys — the model that **actually answered** (the last real
-`message.model` in the transcript, mapped to a ccc short name like `opus-5.5`; `""` until a turn
-exists — read from the transcript's tail and persisted per session in the `transcript_scan`
-table keyed by the file's mtime/size, so a frozen transcript is never re-read) and the observed reasoning effort (captured while the session is live: an explicit
-`--effort` launch flag is authoritative, else the global `effortLevel` from
-`~/.claude/settings.json` fills it once; `""` for a session never observed live — a historical
-parked session is never backfilled with today's default). Trust them over
-`llm_overseer`/`llm_exec`, which are job *config* with an `opus-5.5` database default — for a session
-never launched as a ccc future job those are defaults, not observations. The same observed pair
-renders in ccc itself as the **`model` column** (right before `/aim`, in both the TUI and
-`ccc ls`, e.g. `opus-5.5·xhigh`; a draft never ran, so its cell shows the CONFIGURED
-`overseer ▸ executor` pair instead — compacted to the single name when both are equal). The top **`## AIM (1)`** section always shows the
-session's *first* recorded AIM (the original done-condition — never the latest sharpened revision),
-with the current revision's short label appended (`↳ short (current): …`) once available. Each body
-also carries an **`## AIM history`** section
-(every revision, `1.`→`N.` oldest→current) and a **`## Prompts`** section — every prompt the `sp`
-peek box shows, as a numbered list from the same source `ccc peek` reads (so they never diverge;
-capped at the last 200 prompts / 256 KiB for a pathological session). Filenames are slugged from the
-session's **first** AIM, so they never rename when the AIM is sharpened mid-session (a stale
-current-aim-named mirror is renamed on the next pass). The daemon refreshes them each pass and every
-lifecycle command (`start-job`, `mark-done`, `rm`, `unlaunch`) fires a detached `ccc sync-mirrors`.
-Both are **off by default** (fresh-install inert); enable with `mirror_running = true` /
-`mirror_done = true` — and only together with a working credential scrubber, which is what
-actually lets ccc write them (next-but-one paragraph).
-
-**Full-session mirrors (`01-llm/ccc-tasks/sessions/`).** A third export-only tree holds ONE file per
-tracked session (parked, running or done — membership is independent of the running/done
-switches; its own kill-switch is `mirror_sessions = false`, root `sessions_dir`) with the **whole
-conversation** rendered terminal-like: `## (N) you` / `## claude` sections, every prompt and reply,
-and dim `⏺ Tool(input…)` / `⎿ result…` one-liners per tool call — the exact content the peek
-panel's **session** tab shows (`command_center/sessionmd.py` is the single renderer; capped at
-512 KiB keeping the newest whole turns). The file keeps ONE stable path across the session's whole
-life (running → done), and every running/done mirror links to it TWICE: a **`session` frontmatter
-property** (a clickable chip at the very top of the note, next to the `transcript` property
-holding the raw `.jsonl` path) and a `[[…|full session]]` wikilink at the top of its
-`## Transcript` section — so from any running-job note in Obsidian one click opens the up-to-date
-full session. Embedded verbatim text is **fence-safe**: line-leading ``` runs in user prompts are
-backslash-escaped (a pasted terminal snippet can open a code fence it never closes, which would
-swallow the whole rest of the note), and a dangling fence in an assistant reply is self-closed —
-Claude's balanced code blocks keep rendering as code. In the TUI, the **`os`** chord (type `o`
-then `s` on the selected row) no longer opens this file: it opens the same peek panel as `sp`
-(the conversation is its **session** tab), straight from the store, with no vault file needed.
-
-**Credential scrubbing (fail closed).** The three mirror roots embed prompts, replies and tool
-output **verbatim** — including any credential value a session ever printed — so every mirror
-document (running, done and full-session alike) is passed through an external credential scrubber
-before it is written. The scrubber is a subprocess named by `mirror_scrub_cmd` (default
-`secret-broker-client.py scrub --shapes`): its **first token is the executable**, resolved through
-the external-deps registry (`$SECRET_BROKER_CLIENT` → `$PATH`; a token containing `/` is used
-verbatim and must exist and be executable), the remaining tokens are its arguments. The contract
-is deliberately dumb: the document goes in on **stdin**, the vouched document comes back on
-**stdout**, `SCRUBBED: <labels>` lines go to stderr (label names only, never values), and **exit 0
-means vouched**. Anything else — a non-zero exit, a timeout (60 s per document), empty or
-oversized output, output that is not valid UTF-8, a returned document that lost its frontmatter
-identity — means that write is **WITHHELD**: the previous file is left exactly as it was, that
-pass's cleanup is skipped (a withheld card must never be reaped as stale), the daemon logs one
-stderr line per pass, `ccc sync-mirrors` exits 3, and `ccc doctor` shows ❌ under
-"launch check → scrubber".
-
-Scrubbing every card on every pass would be far too slow, so vouches are **persisted** — a
-`mirror_vouch` table in the store keyed by mirror path (a session has up to three cards, each
-vouched on its own), holding the raw content hash, the written hash, the policy string (the exact
-`mirror_scrub_cmd`) and a timestamp. The steady state
-therefore costs **no scrubber calls at all**: a card is re-scrubbed only when its content changes,
-when its file changes, or when `mirror_scrub_cmd` changes, and is re-vouched after 24 h. One
-daemon pass spends at most 120 s on required scrubs and 20 s on re-vouching; whatever does not fit
-is reported as `deferred` and simply keeps its previous, stale-but-safe file.
-
-**An unchanged card is not even rendered.** Each vouch row also records `src_fp`, a hash of the
-card's *inputs* (the source of the modules that shape a card, the session row minus `updated_at`,
-AIM history, sub-goals, the transcript's path + mtime + size, the observed model). A pass computes
-that fingerprint for every card without opening a transcript; when it equals the row's `src_fp`,
-the policy matches and the file still hashes to the vouched bytes, the card is skipped (fresh) or —
-past the 24 h TTL — rendered once and re-vouched only if its content moved. Anything else (a legacy
-row without `src_fp`, an edited or deleted file, a code change) renders and scrubs exactly as
-before. A frozen DONE transcript therefore costs one `stat()` per pass, not two JSON walks, and a
-card that is rendered reads its transcript once for both the prompts and the session body.
-`ccc sync-mirrors -F/--full` lifts both budgets (the one-off migration pass), and
-`ccc sync-mirrors -R/--rescrub` drops every stored vouch first — what you run after changing the
-scrubber's rule set or its inventory. `mirror_scrub_cmd = ""` means *no scrubber*, and therefore
-every mirror write is withheld; `mirror_allow_unscrubbed = true` is the **only** passthrough, and
-`ccc doctor` keeps a ❌ on it for as long as it is on.
+**No vault mirrors.** The running/done/session mirror export (and its `ccc sync-mirrors` verb,
+dashboards and `mirror_*` / `*_dir` keys) is gone (tp#2266): read a session with `ccc show -s <id>`
+(`-t` adds the whole conversation, `-j` prints JSON). An old `config.toml` still carrying
+`mirror_running`, `mirror_done`, `mirror_sessions`, `running_dir`, `done_dir`, `sessions_dir` or
+`mirror_allow_unscrubbed` loads unchanged; the next save drops them. Archive an old mirror tree with
+`tools/retire_vault_files.py -k mirrors` (dry run by default; `-x` removes after a verified archive).
+The model column — the observed model (the last real `message.model` in the transcript, persisted
+in the `transcript_scan` table) and the observed effort — renders in the TUI and `ccc ls`
+(e.g. `opus-5.5·xhigh`; a draft shows its CONFIGURED `overseer ▸ executor` pair instead). In the
+TUI, the **`os`** chord opens the peek panel (the conversation is its **session** tab).
 
 **The FUTURE-draft tripwire (`launch_secret_check`).** A credential pasted into a draft's
-prompt would be spoken to the session (and so land in its transcript, and in the mirrors while
-they are on) the moment the job runs. The check is armed by its own key,
+prompt would be spoken to the session (and so land in its transcript) the moment the job runs. The check is armed by its own key,
 `launch_secret_check = true` (inert default `false`; `ccc init` offers it only when a scrubber
-resolves), and — while the mirrors exist — by any mirror switch on with
-`mirror_allow_unscrubbed` off; `mirror_allow_unscrubbed` never disarms the key. Armed,
+resolves). Armed,
 flipping `launch: true` first runs the scrubber's `check` verb over the draft's AIM + prompt. A
 leak — or a checker that cannot vouch (degraded/unavailable/missing) — **refuses the launch**:
 nothing is spawned, and the file gets the managed `status: error` callout naming the credential's
@@ -1052,8 +967,7 @@ remove it and re-tick launch"*. The toggle was already consumed by the canonical
 refusal never loops: remove the value (or fix the scrubber) and tick `launch` again. Disarmed
 (the fresh-install default), a machine with no scrubber can still launch jobs. `ccc doctor`
 prints `launch secret check: armed` or `launch secret check: disarmed`, and the
-"launch check → scrubber" row stays ❌ for an unresolvable scrubber while the check (or a
-mirror) depends on it.
+"launch check → scrubber" row stays ❌ for an unresolvable scrubber while the check depends on it.
 
 **The toggle never trusts a folder.** Folder trust is granted when a job is registered with
 `ccc new-job` (a sync import from a job file or the pad grants nothing) and by a human launch (`ccc open-job`, the TUI's `r`, a plain `ccc start-job`); automatic launches
@@ -1066,48 +980,12 @@ whose folder is not trusted for its account: nothing is spawned and the file get
 on that account therefore needs one human launch. A `--no-grant` refusal inside `start-job` (the
 file re-read moved the cwd) writes the same callout to the job file.
 
-**Migration (existing installs).** The mirrors now require a resolvable scrubber (or the explicit
-`mirror_allow_unscrubbed = true`). If you already run them: install the scrubber client, then run
-`ccc sync-mirrors --full -v` **once** so every existing card is scrubbed and vouched — after that
-the normal budgeted passes are no-ops until content changes. `ccc init` enables
-`mirror_running` / `mirror_done` / `mirror_sessions` only when a scrubber resolves; when none does
-it says so and leaves them off (the future-job files, which hold no verbatim transcript, still go
-on).
-
-**Vault dashboards.** Two dataviewjs dashboards sit one level above the running tree (outside the
-queried folder, so they never mirror themselves; the future-job dashboard is retired, tp#2266):
-**`01-llm/ccc-tasks/running.md`**
-(read-only over the RUNNING tree, ⤢ focuses a live tab via `ccc focus-job`) and
-**`01-llm/ccc-tasks/parked.md`** (read-only view over the SAME running tree filtered on
-`status: "parked"` — every ☾ row, i.e. closed-but-unfinished sessions; ▶ resumes in a new iTerm tab
-via `ccc resume-job`). Running and parked stack the Models cell identically: `ran` — the observed
-`model:` key with its `effort:` next to it — above the `ovr`/`exe` config chips. Gotcha baked into both: the Hash cell derives from `session_id`,
-never from the frontmatter `id` — Dataview coerces duration-shaped id strings (`"035d"` = 35 days
-renders as `P35D`).
-
-**Verifying dashboards render (for agents/LLMs).** Obsidian normally runs without a debugging port,
-so a dashboard change can't be checked headlessly. Relaunch it with the Chrome DevTools Protocol
-(CDP) enabled, then drive it with Playwright:
-
-```commands
-osascript -e 'quit app "Obsidian"'   # wait for exit, then:
-open -a Obsidian --args --remote-debugging-port=9223   # 9222 is the shared login Chromium
-curl -s http://localhost:9223/json/version             # sanity: Obsidian answers over CDP
-```
-
-Then from Python (`uv run --with playwright python …`): `connect_over_cdp("http://localhost:9223")`,
-find the page where `typeof app !== 'undefined' && !!app.workspace`, run
-`app.workspace.openLinkText('<vault-relative-note>', '', false)`, wait ~8 s for dataviewjs to
-render, and `page.screenshot(...)`. The flag does **not** persist — a normal manual relaunch drops
-the port, so re-run the two commands above when needed. (Dataviewjs blocks eval as a *Program*:
-no top-level `return`; the dashboards wrap their body in an async IIFE for that reason.)
-
 `ccc unlaunch <id>` reverses a launch
 (back to a FUTURE draft — requires the tab be closed first), and `ccc start-job` is **resume-aware**:
 if the job already has a transcript in its current repo it relaunches as a bare `claude --resume`
 (continuing the original prompt) instead of re-submitting it. `ccc resume-job <id>` is the
 shell-invokable equivalent of pressing **`r`** on a parked (`☾`) row — it opens the session in a
-**new** iTerm tab (never execs in place, so the Obsidian parked dashboard's ▶ button can spawn it),
+**new** iTerm tab (never execs in place),
 focuses the existing tab instead when the session is still live, and refuses a transcript-less or
 draft session.
 

@@ -631,14 +631,14 @@ def _pin_single_claude_account(monkeypatch: pytest.MonkeyPatch) -> None:
 def _isolate_vault_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep every test off the real Obsidian vault.
 
-    The future-job files and the running/done mirrors default to real paths under
+    The future-job files and the capture pad default to real paths under
     ``~/obsidian/01-llm/ccc-tasks/``. A test that reaches ``config.load_config()``
     indirectly (e.g. ``daemon.run_once``, CLI handlers) would otherwise export
     its fixture sessions into the developer's actual vault — which happened once:
     daemon tests isolated the store via ``CLAUDE_HOME`` but ``run_once``'s
-    internal ``load_config()`` still pointed the new mirror pass at the real
-    dirs, replacing the real mirrors with fixture jobs until the daemon healed
-    them. This wrapper rewrites the five vault-path keys on every loaded config;
+    internal ``load_config()`` still pointed the (since retired, tp#2266) mirror
+    pass at the real dirs, replacing the real mirrors with fixture jobs until the
+    daemon healed them. This wrapper rewrites the vault-path keys on every loaded config;
     tests that build ``Config(...)`` explicitly keep their own values (and the
     resolver-side guard in :mod:`command_center.config` fails loudly for any
     future leak vector this wrapper cannot see).
@@ -660,9 +660,6 @@ def _isolate_vault_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
         cfg.future_dir = str(vault / "01-llm" / "ccc-tasks" / "future")
         cfg.delete_dir = str(vault / "01-llm" / "ccc-tasks" / "delete")
         cfg.future_pad = str(vault / "01-llm" / "ccc-tasks" / "new-prompt.md")
-        cfg.running_dir = str(vault / "01-llm" / "ccc-tasks" / "running")
-        cfg.done_dir = str(vault / "01-llm" / "ccc-tasks" / "done")
-        cfg.sessions_dir = str(vault / "01-llm" / "ccc-tasks" / "sessions")
         cfg.repo_root = ""  # let each test's $GIT_BASE monkeypatch govern the repo tree
         return cfg
 

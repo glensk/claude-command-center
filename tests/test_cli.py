@@ -248,7 +248,7 @@ def _start_job_launch(
         cfg_dir = tmp_path / "command-center"
         cfg_dir.mkdir(parents=True, exist_ok=True)
         (cfg_dir / "config.toml").write_text(config_toml, encoding="utf-8")
-    monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress the detached ccc sync-mirrors spawn
+    monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress any detached ccc spawn
     store = Store(tmp_path / "command-center" / "state.db")
     store.create_draft(
         "job-x",
@@ -1000,7 +1000,7 @@ def test_start_job_resolves_a_unique_id_prefix(
     from command_center.cli import cmd_start_job
 
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress the detached ccc sync-mirrors spawn
+    monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress any detached ccc spawn
     store = Store(tmp_path / "command-center" / "state.db")
     store.create_draft(_UUID_C, "/no/such/dir", "Do the thing", prompt="run it")
     store.close()
@@ -1022,7 +1022,7 @@ def test_start_job_resolves_a_unique_id_prefix(
 
 def _make_scheduled_draft(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, start_date: str) -> None:
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress the detached ccc sync-mirrors spawn
+    monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress any detached ccc spawn
     store = Store(tmp_path / "command-center" / "state.db")
     store.create_draft(
         "job-sched", "/no/such/dir", "Re-enable FileVault", prompt="run it", start_date=start_date
@@ -1474,7 +1474,6 @@ def test_mark_done_close_arms_close_request(
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     monkeypatch.delenv("CCC_INTERNAL", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
-    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)  # never fork a real ccc
     assert cli.main(["mark-done", "--session", "s1", "--close"]) == 0
     with Store() as store:
         got = store.get("s1")
@@ -1487,7 +1486,6 @@ def test_mark_done_close_is_noop_under_ccc_internal(
     """Under a headless/SDK entrypoint (CCC_INTERNAL) arming is skipped but mark-done still wins."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     monkeypatch.setenv("CCC_INTERNAL", "1")
-    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
     assert cli.main(["mark-done", "--session", "s1", "--close"]) == 0
     with Store() as store:
         got = store.get("s1")
@@ -1499,7 +1497,6 @@ def test_mark_done_close_is_noop_under_ccc_internal(
 def test_mark_done_undo_clears_armed_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """`mark-done --undo` disarms any pending close so a resumed session won't self-close."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
     with Store() as store:
         store.ensure("s1", cwd="/repo")
         store.update_fields("s1", close_requested_at=1_234_567)  # previously armed
@@ -1523,7 +1520,6 @@ def test_mark_done_quiet_produces_no_stdout(
 ) -> None:
     """`-q` suppresses the human summary — stdout stays empty on success."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
     assert cli.main(["mark-done", "--session", "s1", "-q"]) == 0
     assert capsys.readouterr().out == ""
 

@@ -28,7 +28,7 @@ def _start(
     from command_center.cli import cmd_start_job
 
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    monkeypatch.setenv("CCC_INTERNAL", "1")  # no detached sync-mirrors spawn
+    monkeypatch.setenv("CCC_INTERNAL", "1")  # no detached ccc spawn
     cwd = tmp_path / "repo"
     cwd.mkdir()
     store = Store(tmp_path / "command-center" / "state.db")

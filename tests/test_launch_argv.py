@@ -260,7 +260,6 @@ def test_l5_cmd_start_job(
     spy: list[dict[str, Any]], job: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CCC_START_JOB_HEADLESS", "1")
-    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
     seen = _capture_exec(monkeypatch)
     with pytest.raises(SystemExit):
         cli.cmd_start_job(argparse.Namespace(session_id=job, force=True, auto=False))
@@ -348,7 +347,6 @@ def test_start_job_with_a_frontmatter_prompt_execs_it_after_the_marker(
     with Store() as store:
         store.update_fields(job, prompt=FRONTMATTER_PROMPT)
     monkeypatch.setenv("CCC_START_JOB_HEADLESS", "1")
-    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
     seen = _capture_exec(monkeypatch)
     with pytest.raises(SystemExit):
         cli.cmd_start_job(argparse.Namespace(session_id=job, force=True, auto=False))

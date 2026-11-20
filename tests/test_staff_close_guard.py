@@ -190,7 +190,6 @@ def test_close_then_undo_blocks_again(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.delenv("CCC_INTERNAL", raising=False)
-    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
     _session()
     _write_marker()
     assert cli.main(["mark-done", "--session", SID, "--close", "-q"]) == 0

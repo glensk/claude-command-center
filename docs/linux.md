@@ -29,8 +29,7 @@ to the Linux **hotkey samples** (see the bottom of this page).
 - **Deterministic tab symbols** — every session row shows a stable per-repo emoji, and
   **`ccc install-shell`** adds **cross-terminal OSC tab badges** that title your terminal
   tab `⟨symbol⟩ ⟨repo⟩` on `cd` (gnome-terminal, konsole, any emulator — see below).
-- **Obsidian setup** and the vault mirrors (`ccc obsidian-setup`, future/running/done/session
-  mirrors) — identical to macOS.
+- **Obsidian setup** and the capture pad (`ccc obsidian-setup`) — identical to macOS.
 - **Desktop notifications** via **`notify-send`** (libnotify). The default `notify = ["auto"]`
   resolves to `notify-send` on Linux; install it with `sudo apt install libnotify-bin`. A
   missing `notify-send` is a silent no-op.

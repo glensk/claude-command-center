@@ -320,7 +320,6 @@ def test_cmd_start_job_opts_in_for_the_jobs_seat(
         helper.switch()
     monkeypatch.setattr(accounts, "is_trusted", lambda *_a, **_k: True)
     monkeypatch.setenv("CCC_START_JOB_HEADLESS", "1")
-    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
     seen = _capture_exec(monkeypatch)
     with pytest.raises(SystemExit):
         cli.cmd_start_job(argparse.Namespace(session_id=job, force=True, auto=False))

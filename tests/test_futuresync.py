@@ -797,7 +797,7 @@ def test_start_job_no_grant_refusal_writes_the_callout_to_the_job_file(
 
 
 # ---------------------------------------------------------------------------
-# FUTURE-draft credential tripwire (a launched prompt is echoed into the mirrors)
+# FUTURE-draft credential tripwire (the launch_secret_check key)
 # ---------------------------------------------------------------------------
 #: A value the fake checker treats as a live credential (never a real secret shape).
 DUMMY_VALUE = "DUMMY-LIVE-VALUE-0123456789"
@@ -851,8 +851,8 @@ def _checker(tmp_path: Path, *, degraded: bool = False) -> Checker:
 
 
 def _arm_tripwire(env: Env, checker: Checker) -> None:
-    """Turn a mirror switch on (what arms the tripwire) and point it at *checker*."""
-    env.cfg.mirror_running = True
+    """Arm the launch check and point it at *checker*."""
+    env.cfg.launch_secret_check = True
     env.cfg.mirror_scrub_cmd = f"{checker.path} scrub"
 
 
@@ -950,14 +950,14 @@ def test_launch_with_clean_prompt_still_spawns(
     assert "<!-- ccc-sync-error -->" not in path.read_text(encoding="utf-8")
 
 
-def test_launch_tripwire_disarmed_without_mirrors(
+def test_launch_tripwire_disarmed_while_the_key_is_off(
     env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No mirror is on → the transcript never leaves the machine → no broker needed."""
+    """``launch_secret_check`` off (the inert default) → no broker needed."""
     _trust_repo(env)  # tp#1528: the toggle only checks trust
     spawned = _no_spawn(monkeypatch)
     checker = _checker(tmp_path)
-    env.cfg.mirror_scrub_cmd = f"{checker.path} scrub"  # mirrors stay off
+    env.cfg.mirror_scrub_cmd = f"{checker.path} scrub"  # the key stays off
     sid = _new_draft(env, "Rotate the deploy key", prompt=f"use token {DUMMY_VALUE} to deploy")
     futuresync.run_sync(env.store, env.cfg)
     _tick_launch(env, sid)
@@ -967,26 +967,6 @@ def test_launch_tripwire_disarmed_without_mirrors(
     assert spawned == [sid]
     assert report.launched == [sid]
     assert checker.calls == []  # never even resolved
-
-
-def test_launch_tripwire_disarmed_by_allow_unscrubbed(
-    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``mirror_allow_unscrubbed`` is the one deliberate passthrough — here too."""
-    _trust_repo(env)  # tp#1528: the toggle only checks trust
-    spawned = _no_spawn(monkeypatch)
-    checker = _checker(tmp_path)
-    _arm_tripwire(env, checker)
-    env.cfg.mirror_allow_unscrubbed = True
-    sid = _new_draft(env, "Rotate the deploy key", prompt=f"use token {DUMMY_VALUE} to deploy")
-    futuresync.run_sync(env.store, env.cfg)
-    _tick_launch(env, sid)
-
-    report = futuresync.run_sync(env.store, env.cfg)
-
-    assert spawned == [sid]
-    assert report.launched == [sid]
-    assert checker.calls == []
 
 
 def test_refused_launch_does_not_retrigger_next_pass(

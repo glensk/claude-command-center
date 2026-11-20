@@ -79,9 +79,8 @@ The invariants that keep it under a few seconds:
   (done/parked) transcript costs one `stat()`. New per-transcript facts go into
   `models.TranscriptScan` + that table (a nullable column added through
   `Store._add_column`, which tolerates the duplicate-column race between two fresh
-  builds), not into a fresh full-file read. `core.headless_leak_ids` (prune / daemon) and
-  `mirrors._scan_for` (every `ccc sync-mirrors`) go through the same
-  `scan_transcript(prior)` call — the per-file `is_oneshot_headless` / `observed_model`
+  builds), not into a fresh full-file read. `core.headless_leak_ids` (prune / daemon) goes
+  through `scan_transcript(prior)` — the per-file `is_oneshot_headless` / `observed_model`
   probes are the fallback for stub adapters only.
 - **A persisted fact is a *decided* fact.** `first_record_is_queue_op` is tri-state
   (`None` = empty / unreadable / malformed first record — never persisted as `False`, and
@@ -225,7 +224,7 @@ cells), and pin it with a test that asserts one identical offset across statuses
 ## Internal-style vs TUI commands
 
 Not every CLI subcommand is a TUI key. **Internal-style** commands (e.g. `score-aim`,
-`short-aim`, `check-drift`, `assess-aim`, `sync-future`, `sync-mirrors`, `copilot-usage`,
+`short-aim`, `check-drift`, `assess-aim`, `sync-future`, `copilot-usage`,
 `quota`, `claude-usage`, `codex-usage`, `tab-symbol`, `install-shell`, `demo`, `close-now`,
 `switch-now`; `switch-account` is CLI-only too — a slash command arms it) are spawned
 by hooks/the daemon/other
@@ -693,7 +692,7 @@ visible. Tests: `tests/test_start_job_tty.py`.
 
 ## Assets / package data
 
-Installable assets (slash commands, Obsidian dashboards/templates, plugin manifests) live
+Installable assets (slash commands, the Obsidian plugin manifest) live
 under `command_center/assets/` and ship as wheel package data. Installers read them via
 `importlib.resources`, **never** by resolving a path relative to `__file__` — so a
 non-editable install keeps working. Stdlib-only helper scripts that must survive a
@@ -771,7 +770,7 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
 - **Onboarding layer** — `wizard.py` (`ccc init`) is the first-run flow (env detection,
   consent checklist, minimal `config.toml`, then the installers, incl. `install-shell`).
   `install_commands.py` (`ccc install-commands`) copies the slash commands; `obsidian.py`
-  (`ccc obsidian-setup`) seeds the capture pad, mirror folders and dashboards;
+  (`ccc obsidian-setup`) seeds the capture pad;
   `shell_install.py` (`ccc install-shell`) writes the opt-in shell rc block (AIM-at-startup
   wrapper + cross-terminal OSC tab badges).
 - **Platform seam** — `service.py` is the ONE place that decides launchd (macOS,

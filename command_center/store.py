@@ -2255,8 +2255,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
     def drop_mirror_vouches(self, paths: Iterable[str] | None = None) -> None:
         """Forget the vouches of *paths* (``None`` = all of them → the next pass re-scrubs).
 
-        ``ccc sync-mirrors --rescrub`` drops everything; the cleanup pass drops the rows
-        of the files it removed, so the table does not accumulate orphans.
+        The table outlived the vault mirror export (tp#2266) and is no longer written; this
+        stays for an explicit cleanup of its old rows.
         """
         if paths is None:
             self.conn.execute("DELETE FROM mirror_vouch")

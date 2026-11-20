@@ -4052,7 +4052,7 @@ class CommandCenterApp(App[None]):
         """
         if (store := self.store) is None or (session := store.get(sid)) is None:
             return
-        from .. import cli, mirrors  # pylint: disable=import-outside-toplevel,cyclic-import
+        from .. import cli  # pylint: disable=import-outside-toplevel,cyclic-import
 
         label = colors.short_folder(session.cwd)
         allow_restore = bool(session.future_file) or (
@@ -4064,14 +4064,10 @@ class CommandCenterApp(App[None]):
                 return
             if choice == "delete":
                 st.delete(sid)
-                mirrors.remove_mirror(self.cfg, sid)  # drop any mirror the launch left behind
-                cli._spawn_sync_mirrors(self.cfg)  # pylint: disable=protected-access
                 self.notify(f"Deleted dead row (no conversation): {label}")
                 self.refresh_data()
             elif choice == "restore":
                 ok, msg = cli.unlaunch_job(st, self.cfg, sid, set())
-                if ok:
-                    cli._spawn_sync_mirrors(self.cfg)  # pylint: disable=protected-access
                 self.notify(
                     f"Restored to FUTURE: {label}" if ok else msg,
                     severity="information" if ok else "warning",
@@ -5437,7 +5433,7 @@ class CommandCenterApp(App[None]):
         """Open the selected session's full conversation in the peek panel — `os` chord.
 
         The same call as `sp` (`ccc peek --session <id>`): the conversation is the
-        panel's session tab. Reads nothing from the vault (no ``sessions_dir`` mirror),
+        panel's session tab. Reads nothing from the vault,
         so it works for parked, running and done sessions straight from the store.
         """
         self.action_peek()

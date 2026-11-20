@@ -4,8 +4,10 @@ Future jobs live in ccc's store: you create and change them with `ccc new-job`,
 `ccc edit-job` and the TUI `e` editor, and read them back with `ccc show`, `ccc ls`,
 `ccc jobs` and the TUI. The one Obsidian surface left for them is the **capture pad**: a
 single note, `new-prompt.md`, that queues (and optionally launches) a job from any device
-that syncs your vault — your phone included. Separately, the read-only session mirrors
-and their two dashboards are described below.
+that syncs your vault — your phone included. ccc writes no other note: the session
+mirrors (`running/`, `done/`, `sessions/`) and their dashboards are gone; read a session
+with `ccc show -s <id> [-t]` instead. Archive an old mirror tree with
+`tools/retire_vault_files.py -k mirrors` (dry run by default, `-x` to remove).
 
 This integration is entirely opt-in. With no vault configured, `ccc` never touches disk
 outside `CLAUDE_HOME`.
@@ -62,23 +64,17 @@ ccc obsidian-setup [-r VAULT] [--install-plugins] [-n] [-u]
 `obsidian-setup` is **content-only and offline by default**. It:
 
 - seeds the capture pad, when it is served (above) — no per-job `future/` or `delete/`
-  folders, no job dashboards;
-- creates the session-mirror folders (`01-llm/ccc-tasks/{running,done,sessions}`) — the
-  exact paths come from your config, not hard-coded;
-- renders the two mirror dashboards (below) from templates, substituting your folder
-  paths and the absolute `ccc` binary; generated files carry a `ccc_generated` marker so
-  reruns and `-u/--uninstall` only ever touch ccc's own files;
+  folders, no mirror folders, no dashboards;
 - strips the four retired ccc job-button entries (`ccc-*-job-from-file`) from an existing
   `obsidian-shellcommands` `data.json` (backed up first); it never adds an entry.
 
-`-n/--dry-run` shows what would change; `-u/--uninstall` removes the ccc-generated
-dashboards (and the retired entries).
+`-n/--dry-run` shows what would change; `-u/--uninstall` seeds nothing and only strips
+the retired entries.
 
 ### Community plugins
 
 | Plugin       | Used for                                                       |
 | :----------- | :------------------------------------------------------------- |
-| **Dataview** | the `running` / `parked` mirror dashboards (dataviewjs)         |
 | **Meta Bind** | the pad's labelled `## Controls` dropdowns (optional: the pad works from plain frontmatter) |
 
 `ccc obsidian-setup --install-plugins` is the **only networked path** — it is
@@ -91,54 +87,22 @@ reload Obsidian so the plugins load.
 > there never registers and its widgets render as raw code. Repin to 1.5.1 once Obsidian
 > 1.13+ is widespread.
 
-## Whole-lifecycle mirrors
+## Launch credential check
 
-With the mirror flags on, every tracked session becomes a markdown note (export-only —
-ccc owns them, your edits are overwritten):
+Ticking `launch` on the pad while its prompt carries a live credential is refused (the
+label, never the value, is written into the pad) when the check is armed:
 
-| Tree                         | Flag              | Contents                                                         |
-| :--------------------------- | :---------------- | :--------------------------------------------------------------- |
-| `01-llm/ccc-tasks/running/`  | `mirror_running`  | one note per active session (AIM, sub-goals, next step, prompts) |
-| `01-llm/ccc-tasks/done/`     | `mirror_done`     | the final snapshot of every finished session                     |
-| `01-llm/ccc-tasks/sessions/` | `mirror_sessions` | the **whole conversation** rendered terminal-like, per session   |
+| Key                   | Default                                  | What it does                                          |
+| :-------------------- | :--------------------------------------- | :---------------------------------------------------- |
+| `launch_secret_check` | `false`                                  | arms the check                                        |
+| `mirror_scrub_cmd`    | `secret-broker-client.py scrub --shapes` | the credential scrubber whose `check` verb it runs    |
 
-The mirrors are byte-stable (rewritten only on a real change) and slugged from the
-session's *first* AIM so filenames never churn when the AIM is sharpened. Each
-running/done note links to its stable full-session note (a `session` frontmatter chip and
-a `[[…|full session]]` wikilink), so your entire Claude Code history is searchable and
-cross-linked in Obsidian — and readable on your phone.
-
-Those notes embed the transcript **verbatim**, so every one of them is passed through an
-external credential scrubber before it is written:
-
-| Key                       | Default                                  | What it does                                            |
-| :------------------------ | :--------------------------------------- | :------------------------------------------------------ |
-| `mirror_scrub_cmd`        | `secret-broker-client.py scrub --shapes` | note on stdin, vouched note on stdout, exit 0 = vouched |
-| `mirror_allow_unscrubbed` | `false`                                  | the ONLY passthrough (`ccc doctor` ❌ while on)          |
-| `launch_secret_check`     | `false`                                  | arms the launch credential check without any mirror     |
-
-It **fails closed**: no scrubber, a non-zero exit, a timeout or unusable output means the
-note is simply not written — the previous file stays, that pass's cleanup is skipped,
-`ccc sync-mirrors` exits 3 and `ccc doctor` flags it. Vouches are cached in the store, so
-the steady state costs no scrubber calls at all. Migrating an existing vault: install the
-scrubber client, then run `ccc sync-mirrors --full -v` once to scrub and vouch everything
-already there. The same check guards launches — ticking `launch` on the pad while its
-prompt carries a live credential is refused, with the label (never the value) written into
-the pad.
-
-## Dashboards
-
-Two dataviewjs dashboards sit one level above the running tree (so they never mirror
-themselves):
-
-- **`01-llm/ccc-tasks/running.md`** — read-only over the running tree; ⤢ focuses a live tab via
-  `ccc focus-job`.
-- **`01-llm/ccc-tasks/parked.md`** — the running tree filtered to closed-but-unfinished (`☾`)
-  sessions; ▶ resumes one in a new tab via `ccc resume-job`.
+It fails closed: an armed check with no resolvable scrubber refuses every toggle launch,
+and `ccc doctor` flags it.
 
 ## Troubleshooting
 
-**Verifying a dashboard renders (for agents/automation).** Obsidian normally runs without
+**Verifying a note renders (for agents/automation).** Obsidian normally runs without
 a debugging port. Relaunch it with the Chrome DevTools Protocol enabled and drive it with
 Playwright:
 
@@ -150,6 +114,5 @@ curl -s http://localhost:9223/json/version    # sanity: Obsidian answers over CD
 
 Then `connect_over_cdp("http://localhost:9223")`, find the page where
 `typeof app !== 'undefined' && !!app.workspace`, run
-`app.workspace.openLinkText('<vault-relative-note>', '', false)`, wait for dataviewjs to
-render, and screenshot. The flag does not persist across a normal relaunch. (Dataviewjs
-blocks eval as a *Program*, so the dashboards wrap their body in an async IIFE.)
+`app.workspace.openLinkText('<vault-relative-note>', '', false)`, wait for it to render,
+and screenshot. The flag does not persist across a normal relaunch.

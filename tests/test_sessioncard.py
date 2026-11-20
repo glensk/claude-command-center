@@ -1,8 +1,8 @@
 """Tests for the store-only session card (:mod:`command_center.sessioncard`, ``ccc show``).
 
 Hermetic: a tmp ``CLAUDE_HOME`` (store + transcripts) and a tmp ``$GIT_BASE``. No vault,
-no scrubber — the card is printed, never written. The mirror documents the module also
-renders stay pinned by ``tests/test_mirrors.py`` (unchanged by the lift).
+no scrubber — the card is printed, never written. The section renderers and the transcript
+view were pinned by the retired ``tests/test_mirrors.py``; those cases live here (tp#2266 B10).
 """
 
 # pylint: disable=redefined-outer-name  # pytest fixtures are injected by parameter name
@@ -18,9 +18,9 @@ from typing import Any
 import pytest
 from futurestub import hermetic_ccc
 
-from command_center import cli, mirrors, sessioncard
+from command_center import cli, peek, sessioncard, sessionmd
 from command_center.adapters import ClaudeAdapter
-from command_center.models import Status, now_ms
+from command_center.models import AimRevision, Session, Status, TranscriptScan, now_ms
 from command_center.store import Store
 
 # The pinned ``ccc show -j`` key set (schema_version 1): a change here is a schema change.
@@ -111,21 +111,132 @@ def _card(store: Store, git_base: Path, sid: str, **kw: bool) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# the lift is pure: mirrors uses the very same objects
+# section renderers + the transcript view
 # ---------------------------------------------------------------------------
-def test_mirrors_reuses_the_sessioncard_objects() -> None:
-    assert mirrors._VIEW_CACHE is sessioncard.VIEW_CACHE  # pylint: disable=protected-access
-    assert mirrors._serialize_session is sessioncard.serialize_session  # pylint: disable=protected-access
-    assert mirrors.RUNNING == sessioncard.RUNNING and mirrors.DONE == sessioncard.DONE
-    # The renderer's source is part of the card fingerprint: an edit re-renders every card.
-    assert "sessioncard.py" in mirrors._CODE_MODULES  # pylint: disable=protected-access
-
-
 def test_render_prompts_caps_are_parameters() -> None:
     prompts = [f"p{i}" for i in range(5)]
     assert sessioncard.render_prompts(prompts).startswith("1. p0")
     trimmed = sessioncard.render_prompts(prompts, max_items=2)
     assert trimmed.startswith("_showing last 2 of 5 prompts_") and "2. p4" in trimmed
+
+
+def test_render_prompts_count_cap_keeps_the_newest() -> None:
+    text = sessioncard.render_prompts([f"prompt number {i}" for i in range(1, 251)])
+    assert "_showing last 200 of 250 prompts_" in text
+    assert "1. prompt number 51" in text  # oldest kept (renumbered 1) = original #51
+    assert "200. prompt number 250" in text  # newest kept (renumbered 200)
+    assert "prompt number 50\n" not in text  # #1..#50 dropped from the front
+
+
+def test_render_prompts_byte_cap_keeps_the_newest() -> None:
+    text = sessioncard.render_prompts(["x" * 100 for _ in range(10)], max_bytes=200)
+    assert "_showing last 1 of 10 prompts_" in text  # only the most recent survives 200 bytes
+
+
+def test_render_prompts_empty_and_multiline() -> None:
+    assert sessioncard.render_prompts([]) == "(no prompts in this session yet)"
+    text = sessioncard.render_prompts(["first ask", "second ask\nwith a second line"])
+    assert text == "1. first ask\n2. second ask\n   with a second line"
+
+
+def test_render_aim_history_numbers_oldest_to_current(env: tuple[Store, Path]) -> None:
+    store, git_base = env
+    sid = _running(store, git_base, "First aim")
+    store.set_aim(sid, "Second aim")
+    store.set_aim(sid, "Third aim")
+    store.set_short_aim(sid, "third short")  # onto the latest revision
+    revisions: list[AimRevision] = store.list_aim_history(sid)
+    text = sessioncard.render_aim_history(revisions)
+    assert text.startswith("1. ")
+    assert "First aim" in text and "Second aim" in text and "Third aim" in text
+    assert "3. " in text and "· current" in text
+    assert "↳ short: third short" in text
+    assert sessioncard.render_aim_history([]) == "(no AIM set for this session yet)"
+
+
+def test_observed_model_label_probes_an_adapter_without_a_scan(env: tuple[Store, Path]) -> None:
+    """No scan row: the label falls back to the adapter's ``observed_model`` probe."""
+
+    class _ProbeOnly:
+        def __init__(self) -> None:
+            self.asked: list[str] = []
+
+        def observed_model(self, cwd: str, session_id: str) -> str | None:
+            del cwd
+            self.asked.append(session_id)
+            return "claude-opus-4-8"
+
+    store, git_base = env
+    sid = _running(store, git_base, "Probe me")
+    session = store.get(sid)
+    assert session is not None
+    adapter: Any = _ProbeOnly()  # duck-typed adapter stand-in
+    assert sessioncard.observed_model_label(adapter, session) == "opus-4.8"
+    assert adapter.asked == [sid]
+
+    # A probe that raises (the OSError the readers propagate) degrades to "".
+    class _Raising:
+        def observed_model(self, cwd: str, session_id: str) -> str | None:
+            raise OSError("simulated EIO")
+
+    raising: Any = _Raising()
+    assert sessioncard.observed_model_label(raising, session) == ""
+    # A scan row wins over the probe.
+    scan = TranscriptScan(session_id=sid, path="/x", mtime_ns=0, size=0, model="claude-opus-4-8")
+    assert sessioncard.observed_model_label(raising, session, scan) == "opus-4.8"
+
+
+def _session(store: Store, sid: str) -> Session:
+    session = store.get(sid)
+    assert session is not None
+    return session
+
+
+def test_view_for_matches_the_two_walk_renderers(env: tuple[Store, Path]) -> None:
+    """One transcript pass equals ``peek.session_prompts`` + ``sessionmd.render_for``."""
+    store, git_base = env
+    sid = _running(store, git_base, "Parity")
+    cwd = str(git_base / "home" / "ccc")
+    tpath = _write_transcript(store, cwd, sid, ["first prompt", "second\nmultiline prompt"])
+    records = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "looking"},
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "file.txt"}],
+            },
+        },
+        {"type": "user", "message": {"role": "user", "content": "third prompt"}},
+    ]
+    with tpath.open("a", encoding="utf-8") as handle:
+        for rec in records:
+            handle.write(json.dumps(rec) + "\n")
+    session = _session(store, sid)
+    adapter = ClaudeAdapter()
+    view = sessioncard.view_for(adapter, session)
+    assert view.prompts == peek.session_prompts(adapter, session)
+    assert view.prompts == ["first prompt", "second\nmultiline prompt", "third prompt"]
+    body = "".join(text for text, _tag in view.segments)
+    assert body == sessionmd.render_for(adapter, session)
+    assert "ls" in body
+
+
+def test_view_for_missing_transcript_is_the_empty_view(env: tuple[Store, Path]) -> None:
+    store, git_base = env
+    sid = _running(store, git_base, "No transcript")
+    view = sessioncard.view_for(ClaudeAdapter(), _session(store, sid))
+    assert view.prompts == []
+    assert "".join(t for t, _ in view.segments) == sessionmd.render_session([])
 
 
 # ---------------------------------------------------------------------------

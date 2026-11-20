@@ -448,28 +448,17 @@ DEFAULTS: dict[str, object] = {
     # per-job FUTURE files (``future_files``). Either switch keeps the sync watcher.
     "future_pad_enabled": False,
     "future_delete_grace_sec": 600,  # missing job file grace before its draft is archived
-    "mirror_running": False,  # export-only markdown mirror of RUNNING sessions (INERT: off)
-    "mirror_done": False,  # export-only markdown mirror of DONE sessions (INERT: off)
-    "running_dir": "~/obsidian/01-llm/ccc-tasks/running",  # root of the RUNNING session mirrors
-    "done_dir": "~/obsidian/01-llm/ccc-tasks/done",  # root of the DONE session mirrors
-    "mirror_sessions": False,  # export-only full-conversation mirror per session (INERT: off)
-    "sessions_dir": "~/obsidian/01-llm/ccc-tasks/sessions",  # root of the full-session mirrors
-    # Mirror scrubber — every byte the three export-only mirror roots receive passes through
-    # it first (docs/reference.md § mirrors). First token = the scrubber executable, resolved
-    # through the external-deps registry ($SECRET_BROKER_CLIENT → $PATH; a token containing
-    # "/" is used verbatim and must exist + be executable); the rest are its arguments. The
-    # document goes in on stdin, the VOUCHED document comes back on stdout; exit 0 = vouched,
-    # anything else = that write is WITHHELD (previous file kept). "" = no scrubber = every
-    # mirror write withheld — fail closed.
+    # The credential scrubber (the session handoff, ``ccc await`` and the launch check use
+    # it). First token = the scrubber executable, resolved through the external-deps
+    # registry ($SECRET_BROKER_CLIENT → $PATH; a token containing "/" is used verbatim and
+    # must exist + be executable); the rest are its arguments. The document goes in on
+    # stdin, the VOUCHED document comes back on stdout; exit 0 = vouched, anything else =
+    # refused. "" = no scrubber — fail closed. (The key keeps its historical ``mirror_``
+    # name: the vault mirrors it was first written for are gone, tp#2266.)
     "mirror_scrub_cmd": "secret-broker-client.py scrub --shapes",
-    # The ONLY passthrough: write mirrors without a scrubber verdict. `ccc doctor` FAILs while
-    # this is on together with any mirror switch. Not an inert-defaults key: False is the safe
-    # value, True is the deliberate opt-OUT of the protection.
-    "mirror_allow_unscrubbed": False,
     # Launch credential check: before a FUTURE draft is launched from its ``launch: true``
     # toggle, run the scrubber's ``check`` verb (``mirror_scrub_cmd``) over its AIM + prompt
-    # and refuse the launch on a leak or a degraded checker (INERT: off). Any mirror switch
-    # on (without ``mirror_allow_unscrubbed``) also arms it; see launch_secret_check_armed.
+    # and refuse the launch on a leak or a degraded checker (INERT: off).
     "launch_secret_check": False,
     "vault_name": "",  # Obsidian vault name for obsidian:// URIs ("" = basename of vault_root)
     # Root of the category/repo tree (layout <repo_root>/<category>/<repo>). Resolution:
@@ -511,7 +500,7 @@ DEFAULTS: dict[str, object] = {
     ],
 }
 
-# Removed routing knobs are accepted in existing files but have no effect. Keeping this
+# Removed knobs are accepted in existing files but have no effect. Keeping this
 # explicit allow-list prevents config writers from treating a safe old key as an unknown
 # key that blocks an otherwise unrelated update; the next save simply omits it.
 DEPRECATED_LLM_CONFIG_KEYS = frozenset(
@@ -528,6 +517,15 @@ DEPRECATED_LLM_CONFIG_KEYS = frozenset(
         "llm_account",
         "sharpen_every_n_turns",  # the agent-side sharpen nudge is gone (tp#1566)
         "session_names",  # ccc generates no session names any more (tp#1808)
+        # The vault session mirrors are gone (tp#2266): their switches, roots and the
+        # unscrubbed opt-out still load from an old config.toml and are omitted on save.
+        "mirror_running",
+        "mirror_done",
+        "mirror_sessions",
+        "running_dir",
+        "done_dir",
+        "sessions_dir",
+        "mirror_allow_unscrubbed",
     }
 )
 
@@ -542,9 +540,6 @@ DEPRECATED_LLM_CONFIG_KEYS = frozenset(
 INERT_DEFAULT_KEYS: tuple[str, ...] = (
     "future_files",  # no vault writes (FUTURE-job markdown mirror)
     "future_pad_enabled",  # no capture-pad reads/writes (the one inbound vault file)
-    "mirror_running",  # no vault writes (RUNNING session mirror)
-    "mirror_done",  # no vault writes (DONE session mirror)
-    "mirror_sessions",  # no vault writes (full-conversation mirror)
     "launch_secret_check",  # no scrubber `check` spawn before a toggle launch
     "copilot_usage",  # no `gh` billing calls
     "claude_usage",  # no keychain read / Claude OAuth /usage fetch
@@ -1337,14 +1332,7 @@ class Config:
     future_pad: str = "~/obsidian/01-llm/ccc-tasks/new-prompt.md"
     future_pad_enabled: bool = False
     future_delete_grace_sec: int = 600
-    mirror_running: bool = False
-    mirror_done: bool = False
-    running_dir: str = "~/obsidian/01-llm/ccc-tasks/running"
-    done_dir: str = "~/obsidian/01-llm/ccc-tasks/done"
-    mirror_sessions: bool = False
-    sessions_dir: str = "~/obsidian/01-llm/ccc-tasks/sessions"
     mirror_scrub_cmd: str = "secret-broker-client.py scrub --shapes"
-    mirror_allow_unscrubbed: bool = False
     launch_secret_check: bool = False
     vault_name: str = ""
     repo_root: str = ""
@@ -1423,31 +1411,21 @@ def _clamped_int(value: int, low: int, high: int, fallback: int) -> int:
 def launch_secret_check_armed(cfg: Config) -> bool:
     """Whether the launch credential check runs (the ONE arming formula, tp#2266).
 
-    Armed by the dedicated ``launch_secret_check`` key, or — until the mirror switches are
-    removed — by any mirror switch on without the ``mirror_allow_unscrubbed`` opt-out
-    (the launched prompt is echoed verbatim into the mirrors). The launch tripwire
-    (``futuresync._credential_tripwire``), ``ccc doctor``'s "launch secret check" line and
-    its "launch check → scrubber" row all read this, so they can never disagree.
+    Armed by the dedicated ``launch_secret_check`` key alone (the vault-mirror arming
+    term left with the mirrors). The launch tripwire (``futuresync._credential_tripwire``),
+    ``ccc doctor``'s "launch secret check" line and its "launch check → scrubber" row all
+    read this, so they can never disagree.
     """
-    if cfg.launch_secret_check:
-        return True
-    mirrors_on = cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions
-    return bool(mirrors_on) and not cfg.mirror_allow_unscrubbed
+    return bool(cfg.launch_secret_check)
 
 
 def vault_features_on(cfg: Config) -> bool:
-    """Whether any vault surface is on: the job files, the capture pad alone or a mirror.
+    """Whether any vault surface is on: the job files or the capture pad alone.
 
     The systemd watcher units and the doctor's vault section read this one formula
     (tp#2266: ``future_pad_enabled`` alone keeps the pad's trigger).
     """
-    return bool(
-        cfg.future_files
-        or cfg.future_pad_enabled
-        or cfg.mirror_running
-        or cfg.mirror_done
-        or cfg.mirror_sessions
-    )
+    return bool(cfg.future_files or cfg.future_pad_enabled)
 
 
 def load_config() -> Config:

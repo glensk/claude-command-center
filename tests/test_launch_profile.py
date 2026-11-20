@@ -465,7 +465,6 @@ def test_cmd_start_job_execs_through_the_profile(
             "sj", str(repo), "aim", no_codex=no_codex, launch_profile=LABEL, config_dir=""
         )
     monkeypatch.setenv("CCC_START_JOB_HEADLESS", "1")
-    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
     monkeypatch.setattr(accounts, "ensure_trusted", lambda *_a, **_k: True)
     monkeypatch.setattr(accounts, "is_trusted", lambda *_a, **_k: True)  # tp#1512 gate
     seen = _Exec()
@@ -774,7 +773,6 @@ def test_env_profile_session_relays_to_a_successor_on_the_same_profile(
         assert transfer.launch_profile == LABEL
         target = transfer.target_session
     monkeypatch.setenv("CCC_START_JOB_HEADLESS", "1")
-    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
     monkeypatch.setattr(accounts, "is_trusted", lambda *_a, **_k: True)  # tp#1512 gate
     seen = _Exec()
     monkeypatch.setattr(os, "execvp", seen)

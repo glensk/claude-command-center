@@ -43,7 +43,6 @@ from . import config, install, scrub
 # "does this foreign hook also spawn `ccc hook`?" from the same helpers, and neither of
 # them may import the other. ``doctor._foreign_ccc_calls`` stays the address it was.
 from .hookroutes import _foreign_ccc_calls, foreign_hook_routes
-from .models import MirrorHealth
 
 OK, FAIL, NA, WARN = "ok", "fail", "na", "warn"
 _SYMBOL = {OK: "✅", FAIL: "❌", NA: "−", WARN: "⚠️"}
@@ -648,23 +647,6 @@ def _readable(path: Path) -> bool:
         return False
 
 
-def _last_mirror_health() -> MirrorHealth | None:
-    """Counters of the last mirror pass, or ``None`` (no pass yet / unreadable store).
-
-    Read-only and best-effort: ``ccc doctor`` must work on a machine with no store at
-    all, so ANY failure to open or query it degrades to "no row" rather than raising.
-    Only called when the mirror feature is on — a doctor run with mirrors off never
-    touches the database.
-    """
-    try:
-        from .store import Store  # pylint: disable=import-outside-toplevel
-
-        with Store() as store:
-            return store.mirror_health()
-    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-        return None
-
-
 def _launch_secret_check_line(cfg: config.Config) -> Check:
     """Whether the launch credential check is armed; the label carries the state.
 
@@ -673,48 +655,22 @@ def _launch_secret_check_line(cfg: config.Config) -> Check:
     """
     if not config.launch_secret_check_armed(cfg):
         return Check(NA, "launch secret check: disarmed", "launch_secret_check = false")
-    if cfg.launch_secret_check:
-        return Check(OK, "launch secret check: armed", "launch_secret_check = true")
-    return Check(OK, "launch secret check: armed", "by a mirror switch")
+    return Check(OK, "launch secret check: armed", "launch_secret_check = true")
 
 
-def _mirror_scrubber_check(cfg: config.Config) -> Check:
-    """The credential scrubber: resolvable, and what the last mirror pass did with it.
+def _scrubber_check(cfg: config.Config) -> Check:
+    """The credential scrubber the launch credential check runs: resolvable or not.
 
-    Two features depend on it: the mirror roots (verbatim transcripts — a mirror switch
-    without a scrubber is a live-credential export) and the launch credential check
-    (:func:`config.launch_secret_check_armed`; unresolvable → every toggle launch refused).
-    Hence ❌ for ``mirror_allow_unscrubbed`` under a mirror switch and ❌ for an
-    unresolvable command, both silent at runtime otherwise.
+    Probed only while :func:`config.launch_secret_check_armed`; an unresolvable command
+    is ❌ (every toggle launch would be refused, silent at runtime otherwise).
     """
     label = "launch check → scrubber"
-    mirrors_on = cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions
-    if not (mirrors_on or config.launch_secret_check_armed(cfg)):
+    if not config.launch_secret_check_armed(cfg):
         return Check(NA, label, "disabled")
-    if mirrors_on and cfg.mirror_allow_unscrubbed:
-        return Check(
-            FAIL,
-            label,
-            "mirror_allow_unscrubbed = true — mirrors are written WITHOUT a credential scrub",
-        )
     resolution = scrub.resolve_scrubber(cfg.mirror_scrub_cmd)
     if not resolution.ok or resolution.scrubber is None:
         return Check(FAIL, label, resolution.reason)
-    exe = resolution.scrubber.executable
-    if not mirrors_on:  # only the launch check uses it: no mirror pass to report on
-        return Check(OK, label, exe)
-    health = _last_mirror_health()
-    if health is not None and health.withheld > 0:
-        return Check(
-            FAIL, label, f"{exe} — last pass withheld {health.withheld} write(s): {health.reason}"
-        )
-    detail = exe
-    if health is not None:
-        detail += (
-            f" — last pass: vouched={health.vouched} scrubbed={health.scrubbed} "
-            f"deferred={health.deferred}"
-        )
-    return Check(OK, label, detail)
+    return Check(OK, label, resolution.scrubber.executable)
 
 
 def _section_features(  # pylint: disable=too-many-branches,too-many-statements
@@ -783,7 +739,7 @@ def _section_features(  # pylint: disable=too-many-branches,too-many-statements
         section.checks.append(Check(NA, "vault features → vault_root", "disabled"))
 
     section.checks.append(_launch_secret_check_line(cfg))
-    section.checks.append(_mirror_scrubber_check(cfg))
+    section.checks.append(_scrubber_check(cfg))
 
     if cfg.launcher == "iterm":
         if shutil.which("osascript"):

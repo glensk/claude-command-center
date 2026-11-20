@@ -13,13 +13,9 @@ features ON only when a vault is supplied, copilot/resume/reap OFF) and runs the
 installers; ``-m/--minimal`` writes nothing on and runs no installers. With neither ``-y``
 nor ``-m`` and no TTY the wizard exits 3 (the repo's interactive-only convention).
 
-The export-only **mirrors** are a separate consent step from the FUTURE-job files: they
-embed transcripts verbatim, so ccc never writes them without a vouch from the external
-credential scrubber. The wizard therefore offers/enables ``mirror_running`` /
-``mirror_done`` / ``mirror_sessions`` only when :func:`scrubber_status` resolves one, and
-otherwise says so instead of silently switching them on. The launch credential check
-(``launch_secret_check``) needs no vault but the same scrubber, so it is offered (and on
-under ``-y``) only when one resolves.
+The launch credential check (``launch_secret_check``) needs no vault but the external
+credential scrubber, so it is offered (and on under ``-y``) only when
+:func:`scrubber_status` resolves one.
 
 The consent groups are the SINGLE source mapping every inert key to a wizard question;
 :data:`UNMAPPED_INERT` names inert keys deliberately not surfaced. A drift test asserts the
@@ -72,13 +68,10 @@ GROUP_A_CHECKERS: tuple[str, ...] = (
 )
 #: Group B1 — the editable FUTURE-job files (no verbatim transcript content leaves ccc).
 GROUP_B_FUTURE: tuple[str, ...] = ("future_files", "future_pad_enabled")
-#: Group B2 — the export-only mirrors. They embed transcripts VERBATIM, so the wizard only
-#: offers them when a credential scrubber resolves (see :func:`scrubber_status`).
-GROUP_B_MIRRORS: tuple[str, ...] = ("mirror_running", "mirror_done", "mirror_sessions")
 #: Group B — vault export features, offered only when a vault path is supplied.
-GROUP_B_VAULT: tuple[str, ...] = GROUP_B_FUTURE + GROUP_B_MIRRORS
+GROUP_B_VAULT: tuple[str, ...] = GROUP_B_FUTURE
 #: Group S — the launch credential check (scrubber ``check`` verb over a toggle-launched
-#: draft's AIM + prompt). Needs no vault, but like the mirrors it is offered/enabled only
+#: draft's AIM + prompt). Needs no vault; it is offered/enabled only
 #: when a credential scrubber resolves: armed without one, it refuses every toggle launch.
 GROUP_S_LAUNCH_CHECK: tuple[str, ...] = ("launch_secret_check",)
 #: Group C — offered individually, each behind its own dependency / caveat.
@@ -107,24 +100,15 @@ ANCHOR_KEYS: tuple[str, ...] = ("vault_root",)
 def scrubber_status() -> tuple[str | None, str]:
     """Whether a credential scrubber resolves: ``(executable, "")`` or ``(None, reason)``.
 
-    The mirror roots embed transcripts verbatim, so ccc refuses to write them without a
-    vouch from the external scrubber (``mirror_scrub_cmd``). The wizard therefore only
-    offers/enables the mirror switches when the default command resolves here — one
-    ``<exe> -h`` probe through the external-deps registry, never an LLM/network call.
+    An armed launch check without one refuses every toggle launch, so the wizard only
+    offers/enables ``launch_secret_check`` when the default command (``mirror_scrub_cmd``)
+    resolves here — one ``<exe> -h`` probe through the external-deps registry, never an
+    LLM/network call.
     """
     resolution = scrub.resolve_scrubber(str(config.DEFAULTS["mirror_scrub_cmd"]))
     if resolution.scrubber is None:
         return None, resolution.reason
     return resolution.scrubber.executable, ""
-
-
-def _print_no_scrubber_note(reason: str) -> None:
-    """Explain why the wizard left the mirror switches off (printed on stdout)."""
-    print(
-        f"mirrors: off — no credential scrubber resolves ({reason}).\n"
-        "  Install secret-broker-client.py (or set SECRET_BROKER_CLIENT), then enable\n"
-        "  mirror_running / mirror_done / mirror_sessions in config.toml."
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -192,7 +176,6 @@ class Profile:  # pylint: disable=too-many-instance-attributes
     vault_root: str | None = None  # None → no vault features
     checkers: bool = False
     vault_features: bool = False  # the editable FUTURE-job files
-    mirrors: bool = False  # the export-only mirrors (needs a resolvable scrubber)
     launch_check: bool = False  # the launch credential check (needs a resolvable scrubber)
     copilot: bool = False
     resume: bool = False
@@ -206,9 +189,6 @@ def vault_dir_overrides(vault_root: str) -> dict[str, str]:
         "future_dir": f"{base}/future",
         "delete_dir": f"{base}/delete",
         "future_pad": f"{base}/new-prompt.md",
-        "running_dir": f"{base}/running",
-        "done_dir": f"{base}/done",
-        "sessions_dir": f"{base}/sessions",
     }
 
 
@@ -223,10 +203,6 @@ def config_values(profile: Profile) -> dict[str, object]:
         values.update(vault_dir_overrides(profile.vault_root))
         if profile.vault_features:
             for key in GROUP_B_FUTURE:
-                values[key] = True
-        if profile.mirrors:
-            # Only reachable with a scrubber (the mirrors are fail-closed on credentials).
-            for key in GROUP_B_MIRRORS:
                 values[key] = True
     if profile.launch_check:
         # Only reachable with a scrubber (an armed check without one refuses every launch).
@@ -321,21 +297,12 @@ def _interactive_profile(env: Env) -> tuple[Profile, bool]:
         default=True,
     )
     vault_features = False
-    mirrors = False
-    exe, reason = scrubber_status()
+    exe, _reason = scrubber_status()
     if vault_root:
         vault_features = _ask_yes_no(
             "Enable the vault export features (future-job files)?",
             default=True,
         )
-        if exe:
-            mirrors = _ask_yes_no(
-                "Enable the running/done/session mirrors? Every card passes through the "
-                f"credential scrubber at {exe}",
-                default=True,
-            )
-        else:
-            _print_no_scrubber_note(reason)
     launch_check = False
     if exe:
         launch_check = _ask_yes_no(
@@ -365,7 +332,6 @@ def _interactive_profile(env: Env) -> tuple[Profile, bool]:
             vault_root=vault_root,
             checkers=checkers,
             vault_features=vault_features,
-            mirrors=mirrors,
             launch_check=launch_check,
             copilot=copilot,
             resume=resume_opt,
@@ -437,14 +403,11 @@ def run(args) -> int:  # pylint: disable=too-many-branches
         profile = Profile(vault_root=vault_arg or None)
     elif yes:
         vault = vault_arg or env.vault_guess
-        exe, reason = scrubber_status()
-        if vault and exe is None:
-            _print_no_scrubber_note(reason)
+        exe, _reason = scrubber_status()
         profile = Profile(
             vault_root=vault,
             checkers=True,
             vault_features=bool(vault),
-            mirrors=bool(vault) and exe is not None,
             launch_check=exe is not None,
             copilot=False,
             resume=False,

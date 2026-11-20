@@ -50,10 +50,7 @@ EXTERNAL_DEPS: dict[str, Dep] = {
             "secret-check-index pre-commit gate uses) and put it on $PATH, or set "
             "SECRET_BROKER_CLIENT to its absolute path in the daemon's environment. "
             "Needed only while the launch credential check is armed "
-            "(`launch_secret_check = true`) or a mirror switch (mirror_running / "
-            "mirror_done / mirror_sessions) is on; `mirror_allow_unscrubbed = true` is the "
-            "explicit opt-out that writes mirrors without a scrubber (it does not disarm "
-            "`launch_secret_check`)."
+            "(`launch_secret_check = true`), and by the session handoff and `ccc await`."
         ),
     ),
     # Google's Antigravity CLI. ccc calls it for ONE thing: `agy -p /usage

@@ -3,8 +3,8 @@
 The check (``futuresync._credential_tripwire``) used to be armed only by a mirror switch.
 Retiring the mirrors must not silently disarm it, so ONE formula
 (:func:`config.launch_secret_check_armed`) arms the tripwire, ``ccc doctor``'s
-"launch secret check" line and its "launch check → scrubber" row: the dedicated key, or a
-mirror switch without ``mirror_allow_unscrubbed`` (until the mirror terms are removed).
+"launch secret check" line and its "launch check → scrubber" row: the dedicated key alone
+(the mirror arming terms left with the mirrors, B10).
 """
 
 from __future__ import annotations
@@ -33,11 +33,6 @@ def _features(cfg: config.Config) -> dict[str, doctor.Check]:
     [
         ({}, False),
         ({"launch_secret_check": True}, True),
-        ({"launch_secret_check": True, "mirror_allow_unscrubbed": True}, True),
-        ({"mirror_running": True}, True),
-        ({"mirror_done": True}, True),
-        ({"mirror_sessions": True}, True),
-        ({"mirror_sessions": True, "mirror_allow_unscrubbed": True}, False),
     ],
 )
 def test_arming_formula(overrides: dict[str, bool], armed: bool) -> None:
@@ -64,7 +59,7 @@ def test_tripwire_armed_by_key_with_all_mirrors_off(tmp_path: Path) -> None:
     """The key alone arms it: a leak in the prompt is reported, the checker was asked."""
     stub = stub_scrubber(tmp_path, "check")
     cfg = config.Config(launch_secret_check=True, mirror_scrub_cmd=stub.scrub_cmd)
-    assert not (cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions)
+    assert not hasattr(cfg, "mirror_running")  # the mirror switches are gone (B10)
 
     verdict = futuresync._credential_tripwire(cfg, _draft(f"use {DUMMY_VALUE}"))  # pylint: disable=protected-access
 
@@ -72,16 +67,6 @@ def test_tripwire_armed_by_key_with_all_mirrors_off(tmp_path: Path) -> None:
     assert stub.calls == ["check"]
     clean = futuresync._credential_tripwire(cfg, _draft("nothing secret"))  # pylint: disable=protected-access
     assert clean is not None and clean.state == scrub.CLEAN
-
-
-def test_tripwire_key_not_disarmed_by_allow_unscrubbed(tmp_path: Path) -> None:
-    """``mirror_allow_unscrubbed`` opts the MIRRORS out; it never disarms the key."""
-    stub = stub_scrubber(tmp_path, "check")
-    cfg = config.Config(
-        launch_secret_check=True, mirror_allow_unscrubbed=True, mirror_scrub_cmd=stub.scrub_cmd
-    )
-    verdict = futuresync._credential_tripwire(cfg, _draft(f"use {DUMMY_VALUE}"))  # pylint: disable=protected-access
-    assert verdict is not None and verdict.state == scrub.LEAK
 
 
 def test_tripwire_disarmed_with_key_off(tmp_path: Path) -> None:
@@ -107,9 +92,6 @@ def test_doctor_line_armed_and_disarmed() -> None:
     assert on["launch secret check: armed"].status == doctor.OK
     assert "launch_secret_check = true" in on["launch secret check: armed"].detail
 
-    by_mirror = _features(config.Config(mirror_done=True, mirror_scrub_cmd=""))
-    assert by_mirror["launch secret check: armed"].detail == "by a mirror switch"
-
 
 def test_doctor_rendered_text_carries_the_grep_string() -> None:
     """B5's precondition greps ``ccc doctor`` for exactly this substring."""
@@ -121,7 +103,7 @@ def test_doctor_rendered_text_carries_the_grep_string() -> None:
 
 
 def test_doctor_scrubber_fail_with_key_on_and_mirrors_off() -> None:
-    """An unresolvable scrubber is ❌ while the key arms the check, mirrors or not."""
+    """An unresolvable scrubber is ❌ while the key arms the check."""
     cfg = config.Config(launch_secret_check=True, mirror_scrub_cmd="/nonexistent/x scrub")
     assert _features(cfg)[LAUNCH_LABEL].status == doctor.FAIL
     assert doctor.build_report(cfg).exit_code == 1
@@ -131,7 +113,7 @@ def test_doctor_scrubber_ok_with_key_on_and_mirrors_off(tmp_path: Path) -> None:
     stub = stub_scrubber(tmp_path)
     cfg = config.Config(launch_secret_check=True, mirror_scrub_cmd=stub.scrub_cmd)
     check = _features(cfg)[LAUNCH_LABEL]
-    assert check.status == doctor.OK and check.detail == str(stub.path)  # no mirror-pass stats
+    assert check.status == doctor.OK and check.detail == str(stub.path)
 
 
 def test_doctor_scrubber_disabled_with_everything_off() -> None:

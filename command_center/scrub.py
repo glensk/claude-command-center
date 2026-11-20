@@ -16,8 +16,7 @@ FUTURE draft's prompt before launching it. Contract (settled in the tp#117 debat
   values). Exit 0 = vouched. Anything else — non-zero exit, timeout, empty output, output
   that grew past :data:`MAX_GROWTH_BYTES`, invalid UTF-8 — means the write is **withheld**.
 * **Fail closed.** No scrubber configured (``mirror_scrub_cmd = ""``), unresolvable,
-  outdated (lacks the verb), or degraded → withheld. The only passthrough is the explicit
-  ``mirror_allow_unscrubbed = true`` knob, which the callers honour (not this module).
+  outdated (lacks the verb), or degraded → withheld.
 * **Reasons never carry content.** Every ``reason`` string is built from exit codes,
   sizes and the scrubber's own label lines — a withheld card's bytes stay in memory.
 * ``check`` (the tripwire) speaks the client's v1 verdict contract: exit 0 with a

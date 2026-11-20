@@ -126,7 +126,7 @@ def _start_job_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str,
     from command_center import cli
 
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress the detached sync-mirrors spawn
+    monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress any detached ccc spawn
     with Store(tmp_path / "command-center" / "state.db") as store:
         store.create_draft("job-mem", "/no/such/dir", "Do the thing", prompt="run it")
     seen: dict[str, dict[str, str]] = {}

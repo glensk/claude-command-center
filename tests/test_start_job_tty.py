@@ -42,7 +42,7 @@ def _make_draft(
     from command_center import accounts
 
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress the detached sync-mirrors spawn
+    monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress any detached ccc spawn
     store = Store(tmp_path / "command-center" / "state.db")
     store.create_draft(sid, cwd, "Do the thing", prompt="run it")
     store.close()

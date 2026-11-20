@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
-"""``ccc obsidian-setup`` — seed the vault's capture pad, mirror folders & dashboards.
+"""``ccc obsidian-setup`` — seed the vault's capture pad, strip retired ccc entries.
 
-A default (no-flag) run is **content-only and offline**: it creates the mirror folders
-derived from config (``running_dir`` / ``done_dir`` / ``sessions_dir``), seeds the capture
-pad when it is served (:func:`futuresync.pad_on`), and renders the generified Obsidian
-dashboards from the templates under ``assets/obsidian/`` (parameterising the queried
-folder paths + the absolute ``ccc`` binary from config, not hardcoded values). Future jobs
-live in ccc's store (tp#2266): setup seeds no ``future/`` / ``delete/`` folders, no
-``future.md`` / ``delete.md`` dashboards and no job-button shellcommands — a rerun strips
-the four retired ccc entries from an existing obsidian-shellcommands ``data.json``. Every
-generated dashboard carries a ``ccc_generated: true`` frontmatter marker so reruns /
-``--uninstall`` only ever overwrite or remove files ccc itself wrote. All writes are
+A default (no-flag) run is **content-only and offline**: it seeds the capture pad when it
+is served (:func:`futuresync.pad_on`). Future jobs live in ccc's store and the vault
+mirror export is gone (tp#2266): setup seeds no ``future/`` / ``delete/`` / mirror folders,
+no dashboards and no job-button shellcommands — a rerun strips the four retired ccc
+entries from an existing obsidian-shellcommands ``data.json``. Legacy ``ccc_generated``
+dashboards are archived and removed by ``tools/retire_vault_files.py``. All writes are
 atomic + backed up; ``--dry-run`` writes nothing.
 
 ``--install-plugins`` is the ONLY networked path: a consent-gated bootstrap that downloads
-the three pinned community plugins (manifest ``assets/obsidian/plugins.json``), verifies
+the two pinned community plugins (manifest ``assets/obsidian/plugins.json``), verifies
 each file's sha256 (a mismatch aborts + rolls back), writes ``plugins/<id>/`` and enables
 them in ``community-plugins.json``.
 
-Pure helpers (``render_dashboard`` / ``strip_shellcommands`` / ``load_plugins_manifest``)
+Pure helpers (``strip_shellcommands`` / ``load_plugins_manifest``)
 carry the logic and are unit-tested; :func:`run_setup` wires them to the filesystem.
 """
 
@@ -33,7 +29,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
     _direct_run(__file__)
 
-
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import copy
 import json
 import os
@@ -42,7 +38,7 @@ import time
 from importlib.resources import files
 from pathlib import Path
 
-from . import config, futuresync, install
+from . import config, futuresync
 from .future_files import (
     _DELETE_JOB_COMMAND_ID,
     _DONE_JOB_COMMAND_ID,
@@ -53,9 +49,6 @@ from .future_files import (
 # --------------------------------------------------------------------------- #
 # constants
 # --------------------------------------------------------------------------- #
-#: Frontmatter marker line every generated dashboard carries (rerun/uninstall guard).
-MARKER_KEY = "ccc_generated"
-
 #: obsidian-shellcommands command-id prefix (``<plugin>:shell-command-<entry-id>``).
 _SHELLCMD_PREFIX = "obsidian-shellcommands:shell-command-"
 
@@ -70,11 +63,10 @@ _RETIRED_SHELLCMD_IDS: tuple[str, ...] = (
     _RESTORE_JOB_COMMAND_ID,
 )
 
-#: The three community plugins obsidian-setup depends on (ids match community-plugins.json).
+#: The two community plugins obsidian-setup depends on (ids match community-plugins.json).
 REQUIRED_PLUGINS: tuple[str, ...] = (
     "obsidian-meta-bind-plugin",
     "obsidian-shellcommands",
-    "dataview",
 )
 
 
@@ -126,73 +118,14 @@ def resolve_vault(cfg: config.Config, root: str | None) -> Path:
     return Path(root or cfg.vault_root).expanduser()
 
 
-def _vault_rel(path: Path, vault: Path) -> str:
-    """*path* relative to *vault* as a posix string (absolute path if not under it)."""
-    try:
-        return path.expanduser().resolve().relative_to(vault.resolve()).as_posix()
-    except (ValueError, OSError):
-        return path.expanduser().as_posix()
-
-
-def task_dirs(cfg: config.Config) -> list[Path]:
-    """The mirror folders obsidian-setup creates (expanded).
-
-    No ``future_dir`` / ``delete_dir``: future jobs live in ccc's store (tp#2266); the
-    capture pad is seeded on its own (see :func:`_setup_folders`).
-    """
-    return [
-        Path(cfg.running_dir).expanduser(),
-        Path(cfg.done_dir).expanduser(),
-        Path(cfg.sessions_dir).expanduser(),
-    ]
-
-
 # --------------------------------------------------------------------------- #
-# dashboards
+# assets
 # --------------------------------------------------------------------------- #
 def _asset_text(*parts: str) -> str:
     node = files("command_center") / "assets"
     for part in parts:
         node = node / part
     return node.read_text(encoding="utf-8")
-
-
-def render_dashboard(template_name: str, cfg: config.Config, vault: Path, ccc: str) -> str:
-    """Render one ``assets/obsidian/<template_name>`` with the config-derived tokens."""
-    text = _asset_text("obsidian", template_name)
-    tokens = {
-        "{{CCC_BIN}}": ccc,
-        "{{RUNNING_FOLDER}}": _vault_rel(Path(cfg.running_dir).expanduser(), vault),
-    }
-    for token, value in tokens.items():
-        text = text.replace(token, value)
-    return text
-
-
-def dashboard_targets(cfg: config.Config) -> list[tuple[str, Path]]:
-    """``(template_name, destination_path)`` for each dashboard (running + parked).
-
-    Both live one level above their queried folder, so they never mirror themselves.
-    The ``future.md`` / ``delete.md`` job dashboards are retired (tp#2266).
-    """
-    running_dir = Path(cfg.running_dir).expanduser()
-    return [
-        ("running.md.tmpl", running_dir.parent / "running.md"),
-        ("parked.md.tmpl", running_dir.parent / "parked.md"),
-    ]
-
-
-def has_marker(text: str) -> bool:
-    """Whether *text*'s leading YAML frontmatter carries the ``ccc_generated`` marker."""
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return False
-    for line in lines[1:]:
-        if line.strip() == "---":
-            return False
-        if line.split(":", 1)[0].strip() == MARKER_KEY:
-            return True
-    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -254,58 +187,16 @@ def _refuse_no_vault(vault: Path) -> int:
     return 1
 
 
-def _setup_folders(cfg: config.Config, *, dry_run: bool) -> None:
-    print("folders:")
-    for path in task_dirs(cfg):
-        exists = path.is_dir()
-        print(f"  {'exists' if exists else 'create'}  {path}")
-        if not dry_run and not exists:
-            path.mkdir(parents=True, exist_ok=True)
+def _setup_pad(cfg: config.Config, *, dry_run: bool) -> None:
     # The capture pad is the one future-job surface left in the vault (tp#2266): seeded
     # only when it is served (future_files OR future_pad_enabled — futuresync.pad_on).
     if not futuresync.pad_on(cfg):
         return
     pad = Path(cfg.future_pad).expanduser()
+    print("folders:")
     print(f"  {'exists' if pad.exists() else 'create'}  {pad}  (capture pad)")
     if not dry_run and not pad.exists():
         futuresync.reset_pad(cfg)
-
-
-def _setup_dashboards(cfg: config.Config, vault: Path, ccc: str, *, dry_run: bool) -> None:
-    print("dashboards:")
-    for template_name, dest in dashboard_targets(cfg):
-        rendered = render_dashboard(template_name, cfg, vault, ccc)
-        existing = _read(dest)
-        if existing is None:
-            print(f"  create  {dest}")
-            if not dry_run:
-                _atomic_write(dest, rendered)
-        elif existing == rendered:
-            print(f"  ok      {dest} (up to date)")
-        elif has_marker(existing):
-            print(f"  update  {dest} (ccc-generated; backed up)")
-            if not dry_run:
-                _backup(dest)
-                _atomic_write(dest, rendered)
-        else:
-            print(f"  keep    {dest} (not ccc-generated — refusing to overwrite)")
-
-
-def _uninstall_dashboards(cfg: config.Config, *, dry_run: bool) -> None:
-    print("dashboards:")
-    for _template_name, dest in dashboard_targets(cfg):
-        existing = _read(dest)
-        if existing is None:
-            continue
-        if has_marker(existing):
-            print(f"  remove  {dest}")
-            if not dry_run:
-                try:
-                    dest.unlink()
-                except OSError:
-                    pass
-        else:
-            print(f"  keep    {dest} (not ccc-generated)")
 
 
 def _strip_retired_shellcommands(vault: Path, *, dry_run: bool) -> bool:
@@ -342,12 +233,13 @@ def run_setup(
     install_plugins: bool = False,
     yes: bool = False,
 ) -> int:
-    """Seed (or tear down) the vault's ccc mirror folders, capture pad and dashboards."""
+    """Seed the vault's capture pad and strip ccc's retired shellcommands entries.
+
+    ``uninstall`` seeds nothing (only the strip runs)."""
     cfg = config.load_config()
     vault = resolve_vault(cfg, root)
     if not vault.is_dir():
         return _refuse_no_vault(vault)
-    ccc = install.ccc_binary()
 
     touched_obsidian = False
 
@@ -357,11 +249,8 @@ def run_setup(
             return rc
         touched_obsidian = True
 
-    if uninstall:
-        _uninstall_dashboards(cfg, dry_run=dry_run)
-    else:
-        _setup_folders(cfg, dry_run=dry_run)
-        _setup_dashboards(cfg, vault, ccc, dry_run=dry_run)
+    if not uninstall:
+        _setup_pad(cfg, dry_run=dry_run)
     if _strip_retired_shellcommands(vault, dry_run=dry_run):
         touched_obsidian = True
 
@@ -428,7 +317,7 @@ def run_install_plugins(  # pylint: disable=too-many-locals,too-many-branches,to
     dry_run: bool = False,
     downloader=None,
 ) -> int:
-    """Consent-gated download+verify+write of the three pinned community plugins."""
+    """Consent-gated download+verify+write of the two pinned community plugins."""
     downloader = downloader or _default_downloader
     manifest = load_plugins_manifest()
     plugins = manifest.get("plugins", [])

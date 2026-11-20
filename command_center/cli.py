@@ -181,22 +181,6 @@ def resolve_session_id(adapter: ClaudeAdapter, explicit: str | None, cwd: str | 
     return candidates[0].session_id
 
 
-def _spawn_sync_mirrors(cfg: config.Config) -> None:
-    """Fire a detached ``ccc sync-mirrors`` after a lifecycle mutation (best-effort).
-
-    Gated on the mirror kill-switches, and skipped inside a headless ``claude -p``
-    (``CCC_INTERNAL``) — like ``futuresync._spawn_aim_jobs`` — so a detached ccc never
-    re-spawns and unit tests never fork a real ccc. The daemon still re-syncs each pass.
-    """
-    if not (cfg.mirror_running or cfg.mirror_done or cfg.mirror_sessions) or os.environ.get(
-        "CCC_INTERNAL"
-    ):
-        return
-    from .spawn import spawn_ccc
-
-    spawn_ccc(["sync-mirrors"])
-
-
 # --------------------------------------------------------------------------- #
 # command handlers
 # --------------------------------------------------------------------------- #
@@ -1383,7 +1367,6 @@ def cmd_mark_done(args: argparse.Namespace) -> int:
             f" (ticked {ticked} remaining sub-goal{'s' if ticked != 1 else ''})" if ticked else ""
         )
         print(f"{session_id} marked {'not done' if args.undo else 'done'}{suffix}")
-    _spawn_sync_mirrors(config.load_config())  # done⇄running mirror move
     return 0
 
 
@@ -2765,7 +2748,6 @@ def cmd_rm(args: argparse.Namespace) -> int:
             futuresync.archive_file(store, config.load_config(), session, "archived")
         store.delete(args.session_id)
     print(f"removed {args.session_id}")
-    _spawn_sync_mirrors(config.load_config())  # drop any running/done mirror it left behind
     return 0
 
 
@@ -4102,7 +4084,6 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
         startup_sysprompt=True,  # tp#2168 B10: this execvp bypasses the shell wrapper
         config_dir=accounts.exec_config_dir(config_dir),
     )
-    _spawn_sync_mirrors(cfg)  # (BEFORE execvp: the success path replaces this process)
     # Pin the job's OWN Claude account (D8) into os.environ before exec — the default
     # account unsets CLAUDE_CONFIG_DIR, any other sets it — so an ambient value in this
     # tab can never bill the wrong seat — plus its own flags (CCC_NO_CODEX for a
@@ -4209,13 +4190,12 @@ def _job_target_id(args: argparse.Namespace) -> str:
 
 
 def cmd_done_job(args: argparse.Namespace) -> int:
-    """Mark a FUTURE job (draft) done WITHOUT running it — it joins the DONE list/mirror.
+    """Mark a FUTURE job (draft) done WITHOUT running it — it joins the DONE list.
 
-    Distinct from ``mark-done`` on a draft (the *cancel* path: the draft stays a draft,
-    is archived, and is never mirrored): done-job means "this got done", so the draft is
-    promoted out of draft-hood (``draft=0, done=1``), its future file is archived with a
-    terminal ``done`` status, sub-goals are reconciled to 100%, and the next mirror pass
-    writes its final snapshot under ``done_dir`` (the Done Jobs dashboard).
+    Distinct from ``mark-done`` on a draft (the *cancel* path: the draft stays a draft
+    and is archived): done-job means "this got done", so the draft is promoted out of
+    draft-hood (``draft=0, done=1``), its future file is archived with a terminal ``done``
+    status and sub-goals are reconciled to 100%.
     """
     from . import futuresync
 
@@ -4249,7 +4229,6 @@ def cmd_done_job(args: argparse.Namespace) -> int:
         ticked = store.check_all_subgoals(session_id)
     suffix = f" (ticked {ticked} sub-goal{'s' if ticked != 1 else ''})" if ticked else ""
     print(f"future job {session_id} marked done{suffix} — moving to the DONE list")
-    _spawn_sync_mirrors(cfg)  # writes the done/ mirror
     return 0
 
 
@@ -4294,9 +4273,9 @@ def cmd_archive(args: argparse.Namespace) -> int:  # pylint: disable=too-many-re
     tp imports ccc's parked jobs onto its own board and then retires them here so a job is
     listed once. The alternatives are wrong for that: ``rm`` hard-deletes the row and with
     it the cwd/account ``ccc resume`` needs (a multi-account setup then refuses to resume),
-    ``mark-done`` puts a job nobody did on the Done dashboard, and ``delete-job`` accepts
+    ``mark-done`` puts a job nobody did on the Done list, and ``delete-job`` accepts
     FUTURE drafts only. Archiving keeps the row — ``Store.get`` ignores ``archived`` — so
-    ``ccc resume <id>`` / ``ccc resume-job <id>`` still work; the running mirror is dropped.
+    ``ccc resume <id>`` / ``ccc resume-job <id>`` still work.
     A resumed session is un-archived the moment it is seen live
     (:meth:`Store.upsert_from_live`) so the TUI tracks it again; when it parks once more
     it is listed in ccc again until tp re-archives it (``tp import-ccc -a -z``).
@@ -4304,9 +4283,6 @@ def cmd_archive(args: argparse.Namespace) -> int:  # pylint: disable=too-many-re
     Refuses a LIVE session and a FUTURE draft (use ``delete-job``). ``-u/--undo`` clears
     the flag.
     """
-    from . import mirrors
-
-    cfg = config.load_config()
     with Store() as store:
         resolved = _resolve_job_or_report(store, args.session_id)
         if resolved is None:
@@ -4319,7 +4295,6 @@ def cmd_archive(args: argparse.Namespace) -> int:  # pylint: disable=too-many-re
                 return 1
             store.update_fields(resolved, archived=False)
             print(f"unarchived {resolved}")
-            _spawn_sync_mirrors(cfg)
             return 0
         if session.draft:
             print(
@@ -4335,7 +4310,6 @@ def cmd_archive(args: argparse.Namespace) -> int:  # pylint: disable=too-many-re
             print(f"{resolved} is already archived")
             return 0
         store.update_fields(resolved, archived=True)
-        mirrors.remove_mirror(cfg, resolved)
     print(
         f"archived {resolved} (still resumable: ccc resume {resolved}; "
         f"undo: ccc archive -u {resolved})"
@@ -5700,58 +5674,6 @@ def cmd_sync_future(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_sync_mirrors(args: argparse.Namespace) -> int:
-    """Reconcile the RUNNING + DONE session mirrors with the store (internal, export-only).
-
-    Writes ``running_dir``/``done_dir`` markdown mirrors for every active / finished
-    session, byte-stable (writes only on a real change) and ``ccc_mirror``-guarded (only
-    ever touches its own generated files). Idempotent + flock-guarded — safe to fire from
-    the daemon and every lifecycle command. ``-v`` prints the per-item detail log.
-
-    Every card passes the credential scrubber first (``mirror_scrub_cmd``); a card it
-    does not vouch for is NOT written and the file on disk is left alone. Exit 3 says
-    exactly that happened — the vault is intact but incomplete, so it is distinct from
-    the exit 2 of a failed pass. ``-F/--full`` lifts the per-pass scrub budgets (the
-    one-off migration of an existing vault), ``-R/--rescrub`` forgets every vouch first
-    (a new rule set); a deferred card alone is not a failure (exit 0).
-    """
-    from . import mirrors
-
-    cfg = config.load_config()
-    try:
-        with Store() as store:
-            report = mirrors.run_mirrors(
-                store,
-                cfg,
-                full=getattr(args, "full", False),
-                rescrub=getattr(args, "rescrub", False),
-            )
-    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-        print(f"error: sync-mirrors failed: {exc}", file=sys.stderr)
-        return 2
-    print(
-        f"sync-mirrors: running={len(report.running)} done={len(report.done)} "
-        f"sessions={len(report.sessions)} "
-        f"written={len(report.written)} removed={len(report.removed)} "
-        f"vouched={len(report.vouched)} scrubbed={len(report.scrubbed)} "
-        f"withheld={len(report.withheld)} deferred={len(report.deferred)}"
-    )
-    if getattr(args, "verbose", False):
-        for sid in report.written:
-            print(f"  wrote  {sid}")
-        for path in report.removed:
-            print(f"  removed {path}")
-        for path, labels in report.scrubbed:
-            print(f"  scrubbed {path} [{', '.join(labels)}]")
-        for path, reason in report.withheld:
-            print(f"  withheld {path}: {reason}")
-        for path in report.deferred:
-            print(f"  deferred {path}")
-        for detail in report.details:
-            print(f"  {detail}")
-    return 3 if report.withheld else 0
-
-
 def cmd_focus_job(args: argparse.Namespace) -> int:
     """Bring a LIVE session's iTerm tab to the front (decision 11).
 
@@ -5975,11 +5897,10 @@ def unlaunch_job(
     on also a ``future_file`` on the row OR an archived job file for the UUID; refuse
     otherwise, so a hand-typed or genuinely-live session id can't be demoted);
     (c) ``done=0``. On success: restore ``draft=1`` + ``status=parked``, move the job
-    file back out of ``future/_archive/`` (fresh export if the archive copy is gone), and
-    remove the running mirror. Any transcript is preserved untouched, so a later ``start-job``
-    resumes it (decision 14). The caller runs ``_spawn_sync_mirrors`` afterwards.
+    file back out of ``future/_archive/`` (fresh export if the archive copy is gone). Any
+    transcript is preserved untouched, so a later ``start-job`` resumes it (decision 14).
     """
-    from . import futuresync, mirrors
+    from . import futuresync
 
     session = store.get(session_id)
     if session is None:
@@ -6002,7 +5923,7 @@ def unlaunch_job(
             f"{session_id} has no launched-draft provenance (no future-job file) — "
             "refusing to unlaunch"
         )
-    # Restore the future-job state, then the file, then drop the running mirror.
+    # Restore the future-job state, then the file.
     if archived_file is not None:  # future_file was cleared — point it back at the archive
         store.update_fields(
             session_id,
@@ -6014,7 +5935,6 @@ def unlaunch_job(
     refreshed = store.get(session_id)
     if refreshed is not None:
         futuresync.unarchive_file(store, cfg, refreshed)  # archive → live (fresh export if gone)
-    mirrors.remove_mirror(cfg, session_id)  # drop its running mirror now
     return True, f"unlaunched {session_id} → future job (draft)"
 
 
@@ -6033,7 +5953,6 @@ def cmd_unlaunch(args: argparse.Namespace) -> int:
     if not ok:
         print(f"error: {msg}", file=sys.stderr)
         return 1
-    _spawn_sync_mirrors(cfg)
     print(msg)
     return 0
 
@@ -7903,7 +7822,7 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
 
     p_donejob = sub.add_parser(
         "done-job",
-        help="mark a future job done without running it (moves to the DONE list/mirror)",
+        help="mark a future job done without running it (moves to the DONE list)",
     )
     p_donejob.add_argument("session_id", nargs="?", help="future-job UUID")
     p_donejob.add_argument(
@@ -8201,27 +8120,6 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     )
     p_syncf.set_defaults(func=cmd_sync_future)
 
-    p_syncm = sub.add_parser(
-        "sync-mirrors",
-        help="internal: export RUNNING/DONE session mirrors to the vault (flock singleton)",
-    )
-    p_syncm.add_argument(
-        "-v", "--verbose", action="store_true", help="print the per-item detail log"
-    )
-    p_syncm.add_argument(
-        "-F",
-        "--full",
-        action="store_true",
-        help="no per-pass scrub budgets: scrub every card now (one-off vault migration)",
-    )
-    p_syncm.add_argument(
-        "-R",
-        "--rescrub",
-        action="store_true",
-        help="forget every scrubber vouch first, then reconcile (re-scrub the whole tree)",
-    )
-    p_syncm.set_defaults(func=cmd_sync_mirrors)
-
     _add_hook(sub)
     _add_await(sub)
 
@@ -8368,15 +8266,12 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
 
     p_obs = sub.add_parser(
         "obsidian-setup",
-        help="seed the vault's capture pad, mirror folders & dashboards",
+        help="seed the vault's capture pad, strip retired ccc entries",
         description=(
-            "Seed the capture pad (when future_pad_enabled or future_files is on), create the "
-            "mirror folders (running/done/sessions) derived from config, render the generified "
-            "running/parked Obsidian dashboards from templates (folder paths + the abs ccc "
-            "binary come from config, not hardcoded), and strip the retired ccc job-button "
-            "entries from an existing obsidian-shellcommands data.json (future jobs live in "
-            "ccc's store). Default run is content-only and offline; generated dashboards carry a "
-            "ccc_generated marker so reruns/-u only touch ccc's own files. "
+            "Seed the capture pad (when future_pad_enabled or future_files is on) and strip "
+            "the retired ccc job-button entries from an existing obsidian-shellcommands "
+            "data.json (future jobs live in ccc's store; the vault mirror export and its "
+            "dashboards are gone). Default run is content-only and offline. "
             "--install-plugins is the only networked path (consent-gated, sha256-verified)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -8388,13 +8283,16 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "-n", "--dry-run", action="store_true", help="show what would change; write nothing"
     )
     p_obs.add_argument(
-        "-u", "--uninstall", action="store_true", help="remove ccc-generated dashboards + entries"
+        "-u",
+        "--uninstall",
+        action="store_true",
+        help="seed nothing; only strip retired ccc entries",
     )
     p_obs.add_argument(
         "-p",
         "--install-plugins",
         action="store_true",
-        help="also download+enable the three pinned community plugins (network; consent-gated)",
+        help="also download+enable the two pinned community plugins (network; consent-gated)",
     )
     p_obs.add_argument(
         "-y",

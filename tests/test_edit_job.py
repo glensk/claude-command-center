@@ -26,15 +26,11 @@ class Env(FutureEnv):
 
 @pytest.fixture(name="env")
 def _env_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Env]:
-    mirrors = tmp_path / "mirrors"
     fe = future_env(
         tmp_path,
         monkeypatch,
         future_files=False,
         future_pad_enabled=False,
-        running_dir=str(mirrors / "running"),
-        done_dir=str(mirrors / "done"),
-        sessions_dir=str(mirrors / "sessions"),
     )
     store = Store(tmp_path / "claude" / "command-center" / "state.db")
     monkeypatch.setattr("command_center.cli.config.load_config", lambda: fe.cfg)

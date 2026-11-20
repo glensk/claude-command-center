@@ -1,12 +1,11 @@
-"""``ccc obsidian-setup`` — mirror folders, the capture pad and the generified dashboards.
+"""``ccc obsidian-setup`` — the capture pad and the retired-entry strip.
 
 The autouse ``_isolate_vault_dirs`` conftest fixture already points every loaded config's
 vault dirs at ``tmp_path/vault``; these tests create that vault and drive :func:`run_setup`
-against it, asserting the dashboards render from the config paths (not hardcoded) and carry
-the ``ccc_generated`` marker. Future jobs live in ccc's store (tp#2266 B12): setup seeds no
-``future/`` / ``delete/`` folders, no ``future.md`` / ``delete.md`` and no job-button
-shellcommands; it seeds the capture pad only when the pad is served, and strips the
-retired job-button entries from an existing shellcommands ``data.json``.
+against it. Future jobs live in ccc's store (tp#2266 B12) and the mirror export is gone
+(B10): setup seeds no ``future/`` / ``delete/`` / mirror folders, no dashboards and no
+job-button shellcommands; it seeds the capture pad only when the pad is served, and strips
+the retired job-button entries from an existing shellcommands ``data.json``.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import config, install, obsidian
+from command_center import config, obsidian
 
 _RETIRED_IDS = {
     "ccc-start-job-from-file",
@@ -24,11 +23,6 @@ _RETIRED_IDS = {
     "ccc-delete-job-from-file",
     "ccc-restore-job-from-file",
 }
-
-
-@pytest.fixture(autouse=True)
-def _pin_ccc(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(install, "ccc_binary", lambda: "/opt/ccc")
 
 
 @pytest.fixture(name="vault")
@@ -63,20 +57,21 @@ def test_refuses_when_vault_missing(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 # ------------------------------ folders + pad ------------------------------ #
-@pytest.mark.usefixtures("vault")
-def test_default_run_creates_mirror_folders_and_no_job_tree(
-    monkeypatch: pytest.MonkeyPatch,
+def test_default_run_seeds_no_folder_and_no_dashboard(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _with(monkeypatch, future_files=False, future_pad_enabled=False)
     assert obsidian.run_setup() == 0
     cfg = config.load_config()
-    for path in obsidian.task_dirs(cfg):
-        assert path.is_dir()
-    assert Path(cfg.future_dir).expanduser() not in obsidian.task_dirs(cfg)
     assert not Path(cfg.future_dir).expanduser().exists()
     assert not Path(cfg.delete_dir).expanduser().exists()
-    # The pad is not served → not seeded.
+    # The pad is not served → not seeded; no mirror folder or dashboard either.
     assert not Path(cfg.future_pad).expanduser().exists()
+    assert not (_tasks(vault) / "running").exists()
+    assert not (_tasks(vault) / "running.md").exists()
+    assert not (_tasks(vault) / "parked.md").exists()
+    assert not hasattr(obsidian, "task_dirs")
+    assert not hasattr(obsidian, "render_dashboard")
 
 
 @pytest.mark.parametrize(
@@ -94,74 +89,6 @@ def test_pad_seeded_when_served(
     # Still no job folders: only the pad.
     assert not Path(cfg.future_dir).expanduser().exists()
     assert not Path(cfg.delete_dir).expanduser().exists()
-
-
-# ------------------------------ dashboards ------------------------------ #
-def test_dashboards_render_from_config_paths(vault: Path) -> None:
-    obsidian.run_setup()
-    running_md = _tasks(vault) / "running.md"
-    assert running_md.is_file()
-    text = running_md.read_text(encoding="utf-8")
-    # Folder query + binary come from config, not hardcoded/personal values.
-    assert 'const FOLDER = "01-llm/ccc-tasks/running"' in text
-    assert '"/opt/ccc"' in text
-    assert "{{CCC_BIN}}" not in text and "{{RUNNING_FOLDER}}" not in text
-    assert obsidian.has_marker(text)
-    for _tmpl, dest in obsidian.dashboard_targets(config.load_config()):
-        assert dest.is_file()
-
-
-def test_job_dashboards_are_retired(vault: Path) -> None:
-    """tp#2266 B12: no ``future.md`` / ``delete.md`` target, asset or seeded file."""
-    templates = {tmpl for tmpl, _ in obsidian.dashboard_targets(config.load_config())}
-    assert templates == {"running.md.tmpl", "parked.md.tmpl"}
-    obsidian.run_setup()
-    assert not (_tasks(vault) / "future.md").exists()
-    assert not (_tasks(vault) / "delete" / "delete.md").exists()
-    with pytest.raises(FileNotFoundError):
-        obsidian.render_dashboard("future.md.tmpl", config.load_config(), vault, "/opt/ccc")
-
-
-def test_dashboard_folder_token_follows_custom_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    v = tmp_path / "myvault"
-    (v).mkdir()
-
-    def _custom() -> config.Config:
-        cfg = config.Config()
-        cfg.vault_root = str(v)
-        cfg.future_dir = str(v / "tasks" / "fut")
-        cfg.delete_dir = str(v / "tasks" / "del")
-        cfg.future_pad = str(v / "tasks" / "pad.md")
-        cfg.running_dir = str(v / "tasks" / "run")
-        cfg.done_dir = str(v / "tasks" / "done")
-        cfg.sessions_dir = str(v / "tasks" / "sess")
-        return cfg
-
-    monkeypatch.setattr(config, "load_config", _custom)
-    assert obsidian.run_setup() == 0
-    running = v / "tasks" / "running.md"
-    assert running.is_file()
-    assert 'const FOLDER = "tasks/run"' in running.read_text(encoding="utf-8")
-
-
-def test_marker_guarded_overwrite(vault: Path) -> None:
-    dest = _tasks(vault) / "running.md"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text("# my own note, no marker\n", encoding="utf-8")
-    obsidian.run_setup()
-    # A file without the marker is left untouched.
-    assert dest.read_text(encoding="utf-8") == "# my own note, no marker\n"
-
-
-def test_rerun_dashboard_is_idempotent(vault: Path) -> None:
-    obsidian.run_setup()
-    dest = _tasks(vault) / "running.md"
-    before = dest.stat().st_mtime_ns
-    obsidian.run_setup()
-    assert dest.stat().st_mtime_ns == before
-    assert not list(_tasks(vault).glob("running.md.ccc-backup-*"))
 
 
 # ------------------------------ shellcommands ------------------------------ #
@@ -221,14 +148,17 @@ def test_dry_run_writes_nothing(vault: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert data_path.read_text(encoding="utf-8") == before
 
 
-def test_uninstall_removes_only_marked(vault: Path) -> None:
-    obsidian.run_setup()
-    # An unmarked user file at a dashboard path is not removed.
-    parked = _tasks(vault) / "parked.md"
-    parked.write_text("mine, no marker\n", encoding="utf-8")
+def test_uninstall_seeds_nothing_and_keeps_legacy_dashboards(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """-u seeds no pad; a legacy dashboard is left for tools/retire_vault_files.py."""
+    _with(monkeypatch, future_pad_enabled=True)
+    legacy = _tasks(vault) / "running.md"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text("---\nccc_generated: true\n---\n", encoding="utf-8")
     assert obsidian.run_setup(uninstall=True) == 0
-    assert not (_tasks(vault) / "running.md").exists()
-    assert parked.exists()
+    assert legacy.exists()
+    assert not Path(config.load_config().future_pad).expanduser().exists()
 
 
 # ------------------------------ pure helpers ------------------------------ #

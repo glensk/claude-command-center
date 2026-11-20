@@ -57,7 +57,7 @@ A job can also start its interactive `claude` through a configured **launch prof
 never a bare `claude` on another billing route. See
 [Launch profiles](docs/reference.md#launch-profiles).
 
-Everything else — the progress bars, the drift checker, the vault mirrors, auto-resume
+Everything else — the progress bars, the drift checker, the peek panel, auto-resume
 — falls out of taking those two ideas seriously.
 
 ## Quickstart (5 minutes)
@@ -109,7 +109,7 @@ and some are macOS-first (they drive iTerm2 / Karabiner). Honest table:
 | Sub-goal auto-derive + grade  | auto-builds + ticks the checklist so the bar moves on its own                                | a cheap LLM (Haiku)                                                | `autoprogress` / `grade_on_turn`     |
 | Drift + DONE checkers         | impartial second model grades goal-drift and "is the AIM met?"                               | a cheap LLM (Haiku)                                                | `drift_check` / `assess_aim_on_turn` |
 | Future jobs                   | park a described job, launch it later from terminal or Obsidian                              | Python only                                                        | always on                            |
-| Obsidian mirrors + dashboards | every session as a searchable markdown note; a phone capture pad                            | an Obsidian vault + a credential scrubber                          | `ccc obsidian-setup`, mirror flags   |
+| Obsidian capture pad          | queue (and launch) a future job from any device, your phone included                        | an Obsidian vault                                                  | `future_pad_enabled`                 |
 | Background daemon + alerts    | reaps idle sessions, regenerates summaries, desktop-notifies                                 | launchd (macOS) / systemd --user (Linux); `notify-send` on Linux   | `ccc daemon --install`               |
 | Auto-resume halted            | resumes rate-limit-halted sessions once the limit resets (machine must stay on)              | `claude-session-continue`                                          | `resume_halted`                      |
 | Rate-limit failover           | a halted session relaunches itself on an account that still has quota, same tab              | a second account in `claude_accounts`                              | `auto_switch_on_limit`               |
@@ -152,12 +152,9 @@ A few features that don't fit in a one-liner but are the reason people keep it r
 - **Cross-session file locks.** Several sessions in one working tree editing the same
   file interleave their changes into one ambiguous blob. An advisory per-file lock (via
   hooks) serializes writes, with an agent-judged hand-off that commits before releasing.
-- **Full-session markdown mirrors.** Every session — running, parked, or done — is
-  mirrored to a markdown note in your Obsidian vault: the whole conversation, prompts,
-  AIM history, sub-goals, rendered terminal-like. Your entire Claude Code history
-  becomes searchable, linkable, and phone-readable. Because those notes embed the
-  transcript verbatim, every mirrored byte passes through a credential scrubber first —
-  fail closed: no scrubber, no write.
+- **Session cards.** `ccc show -s <id> [-t] [-j]` prints any session — running, parked,
+  done or future — from the store: AIM history, sub-goals, next step, prompts and, with
+  `-t`, the whole conversation rendered terminal-like (`-j` for JSON).
 - **The peek panel.** Hold a key, and a floating panel shows every prompt you've typed
   in the focused tab (plus its AIM history) — so *"what have I been asking here?"* is
   one keystroke, not a scroll through the transcript. The opt-in resident panel server
@@ -290,9 +287,8 @@ a second install. Three complementary channels — all verified on a de-Googled
    (`launcher = "tmux"`), and a dropped connection loses nothing — reconnect and tmux is
    exactly where you left it. `ccc serve` offers the same TUI in the phone browser as an
    even lighter client.
-3. **Obsidian mobile (read + queue + launch, zero terminal).** With the vault mirrors on,
-   every session is a synced note; the capture pad's `launch:` checkbox is a one-tap
-   "start this on the host" button — see [docs/obsidian.md](docs/obsidian.md).
+3. **Obsidian mobile (queue + launch, zero terminal).** The synced capture pad queues a
+   future job, and its `launch:` checkbox is a one-tap "start this on the host" button — see [docs/obsidian.md](docs/obsidian.md).
 
 As a fallback for when the host is unreachable, Claude Code itself runs on the phone
 inside a Termux **proot** Linux userland (unofficial but workable: official installer,
@@ -314,10 +310,9 @@ full phone story: [docs/roadmap-mobile-grapheneos.md](docs/roadmap-mobile-graphe
 - **Pluggable, multi-provider LLM ladder** for the cheap checkers (AIM score, drift, DONE,
   short-AIM): Copilot / gemini / codex / claude, first working rung wins, with a `custom`
   shell-command escape hatch. Anthropic is the default, not a hard dependency.
-- **Packaging is `uv` + `hatchling`** — the Obsidian templates, Linux hotkey samples and
-  the pinned plugin manifest ship as package data inside the wheel.
-- **Optional Obsidian layer** (Dataview / Meta Bind) turns sessions into searchable notes
-  and offers a phone capture pad for new jobs.
+- **Packaging is `uv` + `hatchling`** — the Linux hotkey samples and
+  the pinned Obsidian plugin manifest ship as package data inside the wheel.
+- **Optional Obsidian layer** (Meta Bind): a phone capture pad for new jobs.
 - **Platform glue**: macOS uses AppleScript + PyObjC (iTerm tabs, the peek panel); Linux
   uses the equivalents — **systemd** user units, **`notify-send`**, and **OSC** terminal
   tab badges.
@@ -350,12 +345,12 @@ So, whenever you add or change anything that renders into a row:
 ## Docs
 
 - [docs/reference.md](docs/reference.md) — the full feature reference (TUI keys, peek/jump,
-  future-job files, mirrors, locks, daemon, resume-halted, AIM scoring/drift/DONE internals).
+  future-job files, locks, daemon, resume-halted, AIM scoring/drift/DONE internals).
 - [docs/hooks.md](docs/hooks.md) — what each installed hook does, the status line, the
   Stop-hook lock lease (same-event hooks run in parallel, so the lease — not a wiring
   order — is what keeps a peer off a file that is still being committed).
 - [docs/obsidian.md](docs/obsidian.md) — the Obsidian integration: the capture pad and its
-  phone-friendly `launch:` toggle, the session mirrors and dashboards, troubleshooting.
+  phone-friendly `launch:` toggle, the launch credential check, troubleshooting.
 - [docs/codex.md](docs/codex.md) — delegating implementation to OpenAI Codex.
 - [docs/linux.md](docs/linux.md) — the Ubuntu quickstart: what works out of the box, the
   systemd daemon, `notify-send`, tmux job launch, and the keyd/xremap hotkey samples.

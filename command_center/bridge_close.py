@@ -243,15 +243,13 @@ def _terminal(pane: str, iterm: str) -> str:
     return {"tab": "tab", "session": "pane"}.get(result, "none")
 
 
-def _mark_done(deps: BridgeDeps, sid: str, cfg: Config) -> None:
-    """``--done``: mark the session done through ``mark-done``'s own write, log it and move
-    its mirror (done⇄running), as ``mark-done`` does."""
+def _mark_done(deps: BridgeDeps, sid: str) -> None:
+    """``--done``: mark the session done through ``mark-done``'s own write and log it."""
     from . import cli, hooks
 
     with deps.store() as store:
         cli.mark_session_done(store, sid)
     hooks._log_event(sid, _LOG_KIND, "ccc close --done: marked done before the signal")
-    cli._spawn_sync_mirrors(cfg)
 
 
 def _set_closed_status(sid: str) -> str:
@@ -339,7 +337,7 @@ def _close_live(  # pylint: disable=too-many-locals,too-many-arguments
             hc._revalidate(adapter, claim, bound, stamp, patient=False)  # no retry under the lock
             _check_binding(sid, staff_agent)
             if done:
-                _mark_done(deps, sid, cfg)
+                _mark_done(deps, sid)
             hc._bind_debt(claim, debt)
             signalled = cli._sigterm(bound.pid)
     except hc.Refused as exc:

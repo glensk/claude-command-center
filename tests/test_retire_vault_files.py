@@ -14,7 +14,7 @@ import sys
 import tarfile
 import uuid
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -38,6 +38,27 @@ rvf = _load()
 
 def _tasks(tmp_path: Path) -> Path:
     return tmp_path / "vault" / "01-llm" / "ccc-tasks"
+
+
+@pytest.fixture(autouse=True)
+def _mirror_roots_in_raw_toml(tmp_path: Path) -> None:
+    """The mirror root keys left ``Config`` (tp#2266 B10): the tool reads them from the raw
+    config.toml (as on a live install whose file still carries them), so pin them under
+    the tmp vault there — never the historic ``~/obsidian`` defaults."""
+    tasks = _tasks(tmp_path)
+    cfg_file = config.config_path()
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text(
+        "".join(
+            f'{key} = "{tasks / name}"\n'
+            for key, name in (
+                ("running_dir", "running"),
+                ("done_dir", "done"),
+                ("sessions_dir", "sessions"),
+            )
+        ),
+        encoding="utf-8",
+    )
 
 
 def _write(path: Path, text: str) -> Path:
@@ -248,8 +269,10 @@ def test_mirrors_refused_while_a_switch_is_on(
 ) -> None:
     _mirror_tree(tmp_path)
     loaded = config.load_config
+    # The switch is gone from ``Config`` (tp#2266 B10); an older ccc's config object that
+    # still carries it must still be refused.
     monkeypatch.setattr(
-        config, "load_config", lambda: dataclasses.replace(loaded(), mirror_sessions=True)
+        config, "load_config", lambda: SimpleNamespace(**vars(loaded()), mirror_sessions=True)
     )
     before = _snapshot(tmp_path)
     assert _main(tmp_path, "-k", "mirrors", "-x") == 2

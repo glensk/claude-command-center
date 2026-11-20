@@ -145,7 +145,7 @@ _Anchor = tuple[float, str | None]
 
 # Module-level anchor read-cache: ``{path: ((st_mtime_ns, st_size), anchor_or_None)}``. The
 # TUI renders per row per refresh and the daemon is long-lived, so an unchanged transcript
-# must be read at most once (same rationale as ``mirrors._PROMPT_CACHE``). Re-read when the
+# must be read at most once (same rationale as ``sessioncard.VIEW_CACHE``). Re-read when the
 # mtime OR the size moved (a same-tick append, e.g. a seat switch, keeps the float mtime).
 # The fast path (mtime expired) neither consults nor populates this — it is pure stat math.
 _ANCHOR_CACHE: dict[Path, tuple[tuple[int, int], _Anchor | None]] = {}

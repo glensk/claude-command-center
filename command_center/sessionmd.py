@@ -3,11 +3,10 @@
 
 The ONE canonical renderer behind both surfaces that show a session's full
 conversation (what the human typed, what Claude replied, the tool calls
-between): the vault **session mirror** files (:mod:`command_center.mirrors`,
-``sessions_dir``) and the ``ccc peek`` panel's **session** tab. Both consume
-:func:`session_segments`; the plain markdown (:func:`render_session`) is its
-tag-free concatenation — the same pattern as ``peek.prompt_segments`` /
-``format_prompts`` — so the file and the panel can never diverge.
+between): ``ccc show -t`` (:mod:`command_center.sessioncard`) and the ``ccc peek``
+panel's **session** tab. Both consume :func:`session_segments`; the plain markdown
+(:func:`render_session`) is its tag-free concatenation — the same pattern as
+``peek.prompt_segments`` / ``format_prompts`` — so the two can never diverge.
 
 Input is the normalized event stream from
 :meth:`ClaudeAdapter.session_events` (``prompt`` / ``text`` / ``tool`` — the
@@ -81,7 +80,7 @@ _INPUT_SUMMARY_KEYS = (
 _EMPTY_BODY = "(no conversation in this session yet)"
 
 # Render cache: cache key → (transcript mtime, segments). Same contract as
-# ``mirrors._PROMPT_CACHE`` — a frozen DONE transcript is rendered once per
+# ``sessioncard.VIEW_CACHE`` — a frozen DONE transcript is rendered once per
 # process, a growing RUNNING one re-renders when its mtime moves. Byte-stable:
 # the same mtime yields the same segments, hence the same bytes.
 _RENDER_CACHE: dict[str, tuple[float, list[tuple[str, str]]]] = {}

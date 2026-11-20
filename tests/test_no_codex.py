@@ -275,7 +275,6 @@ def test_cmd_start_job_execs_with_the_flag(
     from command_center import cli
 
     monkeypatch.setenv("CCC_START_JOB_HEADLESS", "1")
-    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
     seen: dict[str, str] = {}
 
     def fake_exec(_file: str, _argv: list[str]) -> None:

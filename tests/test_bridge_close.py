@@ -961,8 +961,6 @@ def test_revalidation_under_the_tab_lock_is_impatient(
 # --------------------------------------------------------------------------- #
 def test_done_close_marks_done_and_closes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     world, deps = _install(tmp_path, monkeypatch)
-    synced: list[object] = []
-    monkeypatch.setattr(cli, "_spawn_sync_mirrors", synced.append)
     marked: list[str] = []
     real = cli.mark_session_done
 
@@ -984,7 +982,7 @@ def test_done_close_marks_done_and_closes(tmp_path: Path, monkeypatch: pytest.Mo
     assert marked == [SID] and world.killed == [(PID, signal.SIGTERM)]
     row = _row()
     assert row.done and row.done_at > 0 and row.status == Status.DONE.value
-    assert not row.close_token and len(synced) == 1
+    assert not row.close_token
 
 
 def test_done_close_refused_busy_marks_nothing(
@@ -1015,7 +1013,6 @@ def test_done_close_cli_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _world, deps = _install(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
     monkeypatch.setattr(bridge_cli.bridge_target, "default_deps", lambda: deps)
     assert cli.main(["close", "-s", SID, "-d", "-j"]) == 0
     env = json.loads(capsys.readouterr().out)

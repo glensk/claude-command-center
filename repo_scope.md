@@ -11,7 +11,7 @@ A command center that organizes Claude Code sessions across projects by user-def
 - **Future jobs**: Park ideas as AIM + repo + optional prompt; launch later from CLI, TUI, or Obsidian buttons; support job dependencies
 - **Optional LLM features**: Auto-derive sub-goals and grade progress; drift detection; independent AIM-met checker
 - **Shell integration**: `c` wrapper asks for AIM before launching Claude, seeding the session automatically
-- **Obsidian mirrors**: Every session as a searchable markdown note with job-launch buttons
+- **Obsidian capture pad**: Queue (and launch) a future job from any device via one synced note
 - **Background daemon**: Auto-reaps idle sessions, regenerates summaries, desktop notifications (launchd/systemd)
 - **Auto-resume halted**: Resume rate-limit-blocked sessions once limits reset
 - **macOS extras**: Karabiner hotkeys, iTerm2 integration, AppKit-based peek panel

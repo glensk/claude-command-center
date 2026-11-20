@@ -145,7 +145,7 @@ def test_vault_features_check_vault_root(tmp_path: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(doctor.shutil, "which", _which_factory({"osascript"}))
     missing = config.Config(future_files=True, vault_root=str(tmp_path / "nope"))
     assert _feat(missing, "vault features → vault_root") == doctor.FAIL
-    present = config.Config(mirror_running=True, vault_root=str(tmp_path))
+    present = config.Config(future_pad_enabled=True, vault_root=str(tmp_path))
     assert _feat(present, "vault features → vault_root") == doctor.OK
 
 
@@ -653,34 +653,23 @@ def test_foreign_hook_routes_classifies_offender_unknown_and_clean(
     assert hookroutes.foreign_hook_routes(["/my/commit.sh"], lambda _c: False) == ([], [])
 
 
-# ------------------------------ mirror scrubber ------------------------------ #
-def test_mirror_scrubber_check_states(tmp_path: Path) -> None:
+# ------------------------------ launch-check scrubber ------------------------------ #
+def test_scrubber_check_states(tmp_path: Path) -> None:
     from scrubstub import stub_scrubber
 
-    from command_center.models import MirrorHealth
-
     label = "launch check → scrubber"
-    assert _feat(config.Config(), label) == doctor.NA  # mirrors off → never probed
+    assert _feat(config.Config(), label) == doctor.NA  # check disarmed → never probed
     assert (
-        _feat(config.Config(mirror_running=True, mirror_allow_unscrubbed=True), label)
-        == doctor.FAIL
-    )
-    assert (
-        _feat(config.Config(mirror_sessions=True, mirror_scrub_cmd="/nonexistent/x scrub"), label)
+        _feat(
+            config.Config(launch_secret_check=True, mirror_scrub_cmd="/nonexistent/x scrub"),
+            label,
+        )
         == doctor.FAIL
     )
     stub = stub_scrubber(tmp_path)
-    cfg = config.Config(mirror_done=True, mirror_scrub_cmd=stub.scrub_cmd)
+    cfg = config.Config(launch_secret_check=True, mirror_scrub_cmd=stub.scrub_cmd)
     check = {c.label: c for c in doctor._section_features(cfg).checks}[label]
-    assert check.status == doctor.OK and str(stub.path) in check.detail
-    with Store() as store:  # CLAUDE_HOME is pinned to tmp_path by the autouse fixture
-        store.put_mirror_health(
-            MirrorHealth(
-                at=1, vouched=0, scrubbed=0, withheld=2, deferred=0, reason="scrubber exit 3"
-            )
-        )
-    check = {c.label: c for c in doctor._section_features(cfg).checks}[label]
-    assert check.status == doctor.FAIL and "withheld 2" in check.detail
+    assert check.status == doctor.OK and check.detail == str(stub.path)
 
 
 # ------------------------------ panel server row (tp#70 S5a) ------------------------------ #

@@ -124,7 +124,7 @@ def test_yes_with_vault_enables_vault_features(
     _claude_home: Path,
     _stub_installers: dict[str, int],
 ) -> None:
-    # A resolvable credential scrubber is what unlocks the mirror switches (never probe
+    # A resolvable credential scrubber is what unlocks the launch check (never probe
     # the developer's real PATH here — the answer would differ per machine).
     monkeypatch.setattr(wizard, "scrubber_status", lambda: ("/opt/stub/scrubber", ""))
     vault = tmp_path / "v"
@@ -138,14 +138,14 @@ def test_yes_with_vault_enables_vault_features(
     assert _stub_installers.get("obsidian")
 
 
-def test_yes_with_vault_but_no_scrubber_leaves_mirrors_off(
+def test_yes_with_vault_but_no_scrubber_writes_no_mirror_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
     _claude_home: Path,
     _stub_installers: dict[str, int],
 ) -> None:
-    """No scrubber → the FUTURE files go on, the verbatim mirrors stay off (and it says so)."""
+    """No scrubber → the FUTURE files go on, the launch check stays off; the retired
+    mirror keys (tp#2266 B10) are never written."""
     monkeypatch.setattr(
         wizard,
         "scrubber_status",
@@ -156,11 +156,10 @@ def test_yes_with_vault_but_no_scrubber_leaves_mirrors_off(
     assert wizard.run(_args(yes=True, vault_root=str(vault))) == 0
     data = _load(_claude_home)
     assert data["future_files"] is True
-    for key in wizard.GROUP_B_MIRRORS:
+    assert "launch_secret_check" not in data
+    for key in ("mirror_running", "mirror_done", "mirror_sessions", "running_dir", "done_dir"):
         assert key not in data
-    out = capsys.readouterr().out
-    assert "mirrors: off" in out
-    assert "no scrubber configured" in out
+    assert "sessions_dir" not in data
 
 
 def test_a_refused_install_hooks_exits_1_and_the_rest_still_runs(
@@ -235,20 +234,12 @@ def test_minimal_config_text_only_diffs_from_defaults() -> None:
     assert "verify_subgoals_llm" not in text  # never turned on by init
 
 
-def test_config_values_splits_future_files_from_mirrors() -> None:
-    """``vault_features`` writes only the FUTURE keys; the mirrors need their own consent."""
-    base = wizard.Profile(vault_root="/tmp/v", vault_features=True)
-    values = wizard.config_values(base)
+def test_config_values_vault_features_write_only_the_future_keys() -> None:
+    values = wizard.config_values(wizard.Profile(vault_root="/tmp/v", vault_features=True))
     for key in wizard.GROUP_B_FUTURE:
         assert values[key] is True
-    for key in wizard.GROUP_B_MIRRORS:
-        assert key not in values
-
-    with_mirrors = wizard.config_values(
-        wizard.Profile(vault_root="/tmp/v", vault_features=True, mirrors=True)
-    )
-    for key in wizard.GROUP_B_VAULT:
-        assert with_mirrors[key] is True
+    assert not any(key.startswith("mirror_") for key in values)
+    assert not {"running_dir", "done_dir", "sessions_dir"} & set(values)
 
 
 # ------------------------------ launch credential check (tp#2266) ------------------------------ #

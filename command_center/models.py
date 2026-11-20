@@ -367,7 +367,7 @@ class MirrorVouch:
     policy: str  # the mirror_scrub_cmd string that produced it
     vouched_at: int  # epoch ms (see :func:`now_ms`)
     # sha256 of the card's INPUTS when it was vouched ("" = a legacy row): lets the next
-    # pass recognise an unchanged card without rendering it (see ``mirrors._card_fp``).
+    # pass recognise an unchanged card without rendering it (the retired mirror export).
     src_fp: str = ""
 
 
@@ -453,7 +453,7 @@ def model_label(model_id: str | None) -> str:
     Active ids reverse-map via :data:`LLM_MODEL_IDS`; retired transcript ids reverse-map
     through a display-only compatibility table. An id not in either map is returned unchanged — an
     unknown/newer model still surfaces its raw id rather than vanishing. ``None`` or an
-    empty id → ``""``. Used to label a session's OBSERVED model in the vault mirrors.
+    empty id → ``""``. Used to label a session's OBSERVED model (``ccc show``).
     """
     if not model_id:
         return ""
@@ -776,7 +776,7 @@ class Session:
     prompt_held_notice_at: int = 0
     # The full session UUID of another job this one depends on finishing first (NULL/'' =
     # none; a single dependency). Drives the red |--> marker + hoisting (see deps.py) and
-    # the launch guard; round-trips through the future-job file + all three mirrors.
+    # the launch guard; round-trips through the future-job file.
     depends_on: str | None = None
     # How a future job launches: 'claude' (normal session), 'codex'
     # (/codex-implement-task-and-claude-review, Codex implements via patch, Claude verifies),
@@ -1167,7 +1167,7 @@ def synthesize_aim_revision(session: Session) -> AimRevision:
     """One :class:`AimRevision` from a session's live AIM — the pre-history fallback.
 
     A session whose AIM predates ``aim_history`` tracking has no recorded revisions; the
-    peek panel, ``ccc aim-history`` and the running/done mirrors all fall back to this one
+    peek panel, ``ccc aim-history`` and ``ccc show`` all fall back to this one
     synthetic revision so the progression is never shown empty. Callers guard on a truthy
     ``session.aim`` before calling (the ``or ""`` only satisfies the type checker).
     """

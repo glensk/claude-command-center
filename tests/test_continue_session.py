@@ -333,7 +333,7 @@ def test_prompt_argv_successor_launch_feeds_the_handover_on_stdin(
     with Store() as store:
         job = store.get(target)
     assert job is not None and job.draft and (job.prompt or "").startswith("[handoff]")
-    monkeypatch.setenv("CCC_INTERNAL", "1")  # no detached sync-mirrors spawn
+    monkeypatch.setenv("CCC_INTERNAL", "1")  # no detached ccc spawn
     monkeypatch.setattr(cli, "_start_job_trust_refusal", lambda *_a, **_k: "")
     seen: dict[str, Any] = {}
 
@@ -3557,7 +3557,7 @@ def _source_model(model: str) -> None:
 
 def _successor_argv(monkeypatch: pytest.MonkeyPatch, target: str) -> list[str]:
     """The argv the successor's tab would exec (``ccc start-job`` on the draft)."""
-    monkeypatch.setenv("CCC_INTERNAL", "1")  # no detached sync-mirrors spawn
+    monkeypatch.setenv("CCC_INTERNAL", "1")  # no detached ccc spawn
     monkeypatch.setattr(cli, "_start_job_trust_refusal", lambda *_a, **_k: "")
     seen: dict[str, list[str]] = {}
 

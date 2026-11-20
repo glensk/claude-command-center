@@ -323,17 +323,13 @@ def _credential_tripwire(cfg: config.Config, session: Session) -> scrub.CheckVer
     """Check a draft's AIM + prompt for a live credential; ``None`` when not armed.
 
     **Armed** iff :func:`config.launch_secret_check_armed`: the dedicated
-    ``launch_secret_check`` key, or a mirror switch (``mirror_running`` / ``mirror_done`` /
-    ``mirror_sessions``) on with ``mirror_allow_unscrubbed`` off. Rationale: a fresh
-    install with no broker must still be able to launch jobs (the key is inert); a
-    launched prompt still reaches transcripts and every reader of them (and, with the
-    mirrors on, is echoed verbatim into the vault), so an opted-in install refuses it at
-    its source, before the value is ever spoken to a session. The key keeps the check
-    armed once the mirrors are retired (tp#2266).
+    ``launch_secret_check`` key. Rationale: a fresh install with no broker must still be
+    able to launch jobs (the key is inert); a launched prompt still reaches transcripts
+    and every reader of them, so an opted-in install refuses it at its source, before the
+    value is ever spoken to a session (tp#2266).
 
     Runs the scrubber's ``check`` verb (a verdict, never a rewrite). An unresolvable
-    scrubber is reported as DEGRADED with the resolution reason — fail closed, exactly
-    like the mirror writes.
+    scrubber is reported as DEGRADED with the resolution reason — fail closed.
     """
     if not config.launch_secret_check_armed(cfg):
         return None
@@ -381,9 +377,9 @@ def _consume_launch(store: Store, cfg: config.Config, session_id: str, report: S
     reset to false); the user re-flips once the dependency completes.
 
     Then the **credential tripwire** (:func:`_credential_tripwire`): when armed
-    (``launch_secret_check``, or a vault mirror on), a prompt/AIM carrying a live
-    credential value is never launched — the session would echo it into its transcript
-    (and the running/session mirrors). A leak or a degraded
+    (``launch_secret_check``), a prompt/AIM carrying a live
+    credential value is never launched — the session would echo it into its transcript.
+    A leak or a degraded
     checker refuses the launch the same way a blocked dependency does (callout + report
     line, no spawn); the user scrubs the prompt (or fixes the scrubber) and re-ticks.
 
