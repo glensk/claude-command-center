@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Fail-closed credential scrubbing through an external scrubber (the mirror invariant).
 
-The three export-only mirror roots (``running/``, ``done/``, ``sessions/``) embed prompts,
-replies and tool output **verbatim** — including any credential value a session ever
-printed. This module is the ONE gate those bytes pass before :mod:`command_center.mirrors`
-writes them into the vault, and the tripwire :mod:`command_center.futuresync` runs on a
+Stored session prompts, replies and tool output are **verbatim** — including any credential
+value a session ever printed. This module is the ONE gate those bytes pass before they are
+written to ccc's SQL store, and the tripwire :mod:`command_center.futuresync` runs on a
 FUTURE draft's prompt before launching it. Contract (settled in the tp#117 debate):
 
 * **Scrubber = a subprocess**, configured by ``mirror_scrub_cmd`` (default

@@ -269,10 +269,10 @@ def _ccc_selected_session(store: Store, frontmost: Frontmost) -> Session | None:
 def session_prompts(adapter: ClaudeAdapter, session: Session) -> list[str]:
     """Every human-typed prompt of a tracked *session*, oldest first (cleaned).
 
-    What the RUNNING/DONE vault mirrors (:mod:`command_center.mirrors`) read; the
+    What ccc's SQL store reads for its per-session prompt record; the
     ``ccc peek`` panel gets the identical list from its one-pass transcript read
     (:mod:`command_center.transcript_cache`, parity-tested against this walk), so the
-    panel's prompt list and the mirror's ``## Prompts`` section never diverge. A thin wrapper over
+    panel's prompt list and the stored prompt record never diverge. A thin wrapper over
     :meth:`ClaudeAdapter.all_user_prompts` — the filtering/order/truncation live there
     (``<task-notification>`` and other non-human records are dropped; oldest first; no
     truncation).
