@@ -19,8 +19,10 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -43,7 +45,7 @@ from ..models import (
     now_ms,
 )
 from ..session_continue import parse_limit_message
-from ..snapshot import PsFailed, ps_failed
+from ..snapshot import PS_TIMEOUT_SEC, PsFailed, ps_failed
 
 # A genuine invocation of the Codex workflow records the slash command as a
 # ``<command-name>/codex-implement-task-and-claude-review`` tag in the transcript.
@@ -56,11 +58,65 @@ _CODEX_WORKFLOW_MARKER = f"<command-name>/{CODEX_WORKFLOW_NAME}"
 
 # Short-lived cache of the process tree (ppid -> [(pid, command)]) so all the
 # per-session has_subagent() calls in one TUI refresh share a single `ps` scan.
-_PROC_CACHE: dict[str, object] = {"ts": 0.0, "map": {}, "failed_at": None}
+_PROC_CACHE: dict[str, object] = {"ts": 0.0, "map": {}, "failed_at": None, "veto": False}
 #: How long a failed ``ps`` read keeps :meth:`ClaudeAdapter.process_scan_failed` true: one
 #: veto pass reads the table several times (cache 3 s, a read up to 5 s), and any read
 #: of the pass that failed makes the whole pass unknown (tp#2172 C8).
 _PS_FAILURE_WINDOW_S = 15.0
+#: A display read (a TUI refresh, the reconcile pass) gives ``ps`` this long, no retry.
+_DISPLAY_PS_TIMEOUT_S = 5.0
+#: A veto read (:func:`veto_ps_reads`): ``snapshot.read_ps``'s timeout and one retry — at
+#: load ~80 one ``ps -Ao pid=,ppid=,command=`` took 15.4 s, so 5 s never cleared a
+#: ``-D`` drain (tp#2172 C9).
+_VETO_PS_TIMEOUT_S = PS_TIMEOUT_SEC
+_VETO_PS_RETRIES = 1
+# Per-thread veto pass state: nesting depth and whether any read of the pass failed.
+_VETO_PASS = threading.local()
+
+
+@contextmanager
+def veto_ps_reads() -> Iterator[None]:
+    """Within the block, :func:`_children_map` reads ``ps`` as a veto does (tp#2172 C9).
+
+    Each fresh read gets :data:`_VETO_PS_TIMEOUT_S` and :data:`_VETO_PS_RETRIES` retry, and
+    a failed read anywhere in the (outermost) block keeps
+    :meth:`ClaudeAdapter.process_scan_failed` true for the rest of it — however long the
+    pass runs, a later good read never hides the earlier unknown. Display callers outside
+    a block keep the short read. Nests; per thread.
+    """
+    depth = getattr(_VETO_PASS, "depth", 0)
+    if depth == 0:
+        _VETO_PASS.failed = False
+    _VETO_PASS.depth = depth + 1
+    try:
+        yield
+    finally:
+        _VETO_PASS.depth = depth
+
+
+def _in_veto_pass() -> bool:
+    return bool(getattr(_VETO_PASS, "depth", 0))
+
+
+def _read_ps_children() -> subprocess.CompletedProcess[str] | None:
+    """One ``ps`` run (retried once in a veto pass); ``None`` when every attempt failed."""
+    veto = _in_veto_pass()
+    timeout = _VETO_PS_TIMEOUT_S if veto else _DISPLAY_PS_TIMEOUT_S
+    for _attempt in range(1 + (_VETO_PS_RETRIES if veto else 0)):
+        try:
+            result = subprocess.run(
+                ["ps", "-Ao", "pid=,ppid=,command="],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError):
+            continue
+        if result.returncode == 0:
+            return result
+    return None
+
 
 # A Bash-tool shell signature: Claude Code runs every Bash tool call as a zsh that
 # first ``source``s a per-session shell snapshot under ``~/.claude/shell-snapshots/``.
@@ -1057,26 +1113,29 @@ def _children_map() -> dict[int, list[tuple[int, str]]]:
     :class:`snapshot.PsFailed` (cached like a good read, and its time kept in
     ``_PROC_CACHE["failed_at"]``), so display callers keep degrading on ``{}`` while a
     veto (:meth:`ClaudeAdapter.process_scan_failed`) tells "unknown" from "idle"
-    (tp#2172 C8).
+    (tp#2172 C8). Inside :func:`veto_ps_reads` the read is the veto's (longer timeout,
+    one retry), a failed map — fresh or cached — marks the pass unknown, and a cached
+    failure of a short display read is not reused: the veto reads for itself. Only a failed
+    veto read sets ``failed_at`` (tp#2172 C9).
     """
     now = time.monotonic()
+    veto = _in_veto_pass()
     if isinstance(_PROC_CACHE["ts"], float) and now - _PROC_CACHE["ts"] < 3.0:
-        return _PROC_CACHE["map"]  # type: ignore[return-value]
+        cached: dict[int, list[tuple[int, str]]] = _PROC_CACHE["map"]  # type: ignore[assignment]
+        if not (veto and ps_failed(cached) and not _PROC_CACHE.get("veto")):
+            if veto and ps_failed(cached):
+                _VETO_PASS.failed = True
+            return cached
     children: dict[int, list[tuple[int, str]]] = {}
-    try:
-        result = subprocess.run(
-            ["ps", "-Ao", "pid=,ppid=,command="],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (subprocess.SubprocessError, OSError):
-        result = None
-    if result is None or result.returncode != 0:
+    result = _read_ps_children()
+    _PROC_CACHE["veto"] = veto
+    if result is None:
         failed: dict[int, list[tuple[int, str]]] = PsFailed()
-        _PROC_CACHE["ts"] = _PROC_CACHE["failed_at"] = time.monotonic()
+        _PROC_CACHE["ts"] = time.monotonic()
         _PROC_CACHE["map"] = failed
+        if veto:
+            _PROC_CACHE["failed_at"] = _PROC_CACHE["ts"]
+            _VETO_PASS.failed = True
         return failed
     for line in result.stdout.splitlines():
         parts = line.split(None, 2)
@@ -1653,9 +1712,12 @@ class ClaudeAdapter:  # pylint: disable=too-many-public-methods
         Then :meth:`has_subagent` / :meth:`has_background_task` saw an empty tree and
         answered ``False`` — unknown, not idle; the relaunch veto refuses on it (tp#2172 C8).
         A failure within the last ``_PS_FAILURE_WINDOW_S`` counts too, so a pass whose
-        earlier read failed is not cleared by a later good one.
+        earlier read failed is not cleared by a later good one; inside
+        :func:`veto_ps_reads`, any failed read of the pass counts (tp#2172 C9).
         """
         if ps_failed(_children_map()):
+            return True
+        if _in_veto_pass() and getattr(_VETO_PASS, "failed", False):
             return True
         failed_at = _PROC_CACHE.get("failed_at")
         return isinstance(failed_at, float) and (

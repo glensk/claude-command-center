@@ -499,6 +499,14 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
   transfer row. `effective_wait` lowers `-w` to `min(-w, max(120, 540 − D − Σ
   handoff_facts timeout_s − 30))` and `start` prints it on stderr; callers pass the Bash
   tool `timeout: 600000`. Never let the clamp raise `-w`.
+- **An unreadable `ps` is unknown, not idle — and under `-D` not a hard veto** (tp#2172
+  C8/C9): every `inflight.inventory` / `background_work` pass runs inside
+  `adapters.claude.veto_ps_reads` (`snapshot.PS_TIMEOUT_SEC` per read, one retry; any
+  failed read keeps the whole pass unknown; a display read's cached failure is not reused).
+  Display reads stay 5 s, no retry. Without `-D` a failed read vetoes. With `-D`, once
+  the budget is spent and the ONLY reason left is the unreadable table (`Inventory.ps_unknown_only`: nothing pending in the transcript,
+  no store-counter excess, no process seen by the drain's last readable walk), the start
+  proceeds and prints `PS_UNKNOWN_NOTE`.
 - **`--facts-only` / `--capped` share one path** (`_compose_generated`): a capped router that
   is unset, fails or returns anything but the strict JSON supplement falls back to
   facts-only, never to a refusal. `start -j` prints JSON on a dry run only.

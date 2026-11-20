@@ -63,6 +63,15 @@ KIND_UNKNOWN = "unknown"
 # trusted only while the latest SubagentStart is younger than this.
 SUBAGENT_COUNTER_GRACE_S = 120
 
+# The veto reasons a process-table walk gives (only a readable ``ps`` produces the first
+# two) and the one a failed read gives (tp#2172 C8/C9).
+REASON_CHILD_CLAUDE = "a child claude process (subagent) is running"
+REASON_BG_SHELL = "a background Bash task shell is running"
+PROCESS_REASONS = (REASON_CHILD_CLAUDE, REASON_BG_SHELL)
+REASON_PS_UNREADABLE = (
+    "the process table could not be read (ps failed or timed out) — background state unknown"
+)
+
 # The Bash tool's shell embeds the command as ``eval '<command>' < /dev/null && pwd -P …``
 # with every single quote inside written as ``'\''`` (older Claude Code) or ``'"'"'``
 # (current Claude Code, tp#2187).
@@ -119,11 +128,28 @@ class Inventory:
     # Counter excess older than the grace window: ignored for the verdict, and the caller
     # resets the store counter (not part of ``to_dict``).
     stale_counter: int = 0
+    # :func:`drain`: the processes its last readable process-table walk saw running (process
+    # reasons + unknown processes); kept across polls whose ``ps`` failed (not in ``to_dict``).
+    seen_running: list[str] = field(default_factory=list)
 
     @property
     def clear(self) -> bool:
         """True when nothing blocks a relaunch or a handoff."""
         return not self.reasons
+
+    @property
+    def ps_unknown_only(self) -> bool:
+        """True when the one veto is an unreadable process table (tp#2172 C9).
+
+        The transcript (pending shells / agents), the store counter and every process seen
+        running found nothing: only "could not read ``ps``" is left. ``start -D`` proceeds
+        on it once its budget is spent; any other reason still vetoes.
+        """
+        return (
+            self.reasons == [REASON_PS_UNREADABLE]
+            and not self.seen_running
+            and not self.unknown_processes()
+        )
 
     def unknown_processes(self) -> list[str]:
         """``pid:N untracked shell: <command>`` for each unknown process (tp#2187)."""
@@ -203,6 +229,35 @@ def background_work(  # pylint: disable=too-many-arguments
     *disposable_shell* (close-only, default ``None``) names more disposable Bash commands,
     on both signals, handled like keep-warm timers (:func:`staff_doorbell`, tp#1790).
     """
+    from .adapters.claude import veto_ps_reads
+
+    with veto_ps_reads():
+        return _background_work(
+            adapter,
+            live_pid,
+            transcript,
+            ignore,
+            active_subagents=active_subagents,
+            keepwarm=keepwarm,
+            subagent_started_at=subagent_started_at,
+            now_ms=now_ms,
+            disposable_shell=disposable_shell,
+        )
+
+
+def _background_work(  # pylint: disable=too-many-arguments
+    adapter: ClaudeAdapter,
+    live_pid: int,
+    transcript: Any,
+    ignore: frozenset[int],
+    *,
+    active_subagents: int,
+    keepwarm: list[str] | None,
+    subagent_started_at: int | None,
+    now_ms: int | None,
+    disposable_shell: Callable[[str], bool] | None,
+) -> list[str]:
+    """:func:`background_work`'s body, run inside one veto ``ps`` pass."""
     from .adapters.claude import background_work_split
 
     reasons: list[str] = []
@@ -213,20 +268,17 @@ def background_work(  # pylint: disable=too-many-arguments
         )
     if live_pid > 0:
         if adapter.has_subagent(live_pid, ignore):
-            reasons.append("a child claude process (subagent) is running")
+            reasons.append(REASON_CHILD_CLAUDE)
         # The close-only exemption is passed only when set: every other caller's probe is
         # exactly today's call (an adapter stub without the parameter keeps working).
         extra = {"disposable_shell": disposable_shell} if disposable_shell is not None else {}
         if adapter.has_background_task(live_pid, ignore, skip_keepwarm=True, **extra):
-            reasons.append("a background Bash task shell is running")
+            reasons.append(REASON_BG_SHELL)
         # tp#2172 C8: an unreadable process table walked as empty is UNKNOWN, never idle
         # (an adapter stub without the probe keeps today's behaviour).
         scan_failed = getattr(adapter, "process_scan_failed", None)
         if callable(scan_failed) and scan_failed() is True:
-            reasons.append(
-                "the process table could not be read (ps failed or timed out)"
-                " — background state unknown"
-            )
+            reasons.append(REASON_PS_UNREADABLE)
     if transcript is None:
         reasons.append("the session transcript could not be located — background state unknown")
     else:
@@ -504,8 +556,36 @@ def inventory(  # pylint: disable=too-many-arguments
 ) -> Inventory:
     """Classify every in-flight item of a session; reasons are :func:`background_work`'s.
 
-    *disposable_shell* is the close-only exemption (:func:`background_work`).
+    *disposable_shell* is the close-only exemption (:func:`background_work`). The whole
+    classification is one veto ``ps`` pass (``adapters.claude.veto_ps_reads``, tp#2172 C9).
     """
+    from .adapters.claude import veto_ps_reads
+
+    with veto_ps_reads():
+        return _inventory(
+            adapter,
+            live_pid,
+            transcript,
+            ignore,
+            active_subagents=active_subagents,
+            subagent_started_at=subagent_started_at,
+            now_ms=now_ms,
+            disposable_shell=disposable_shell,
+        )
+
+
+def _inventory(  # pylint: disable=too-many-arguments
+    adapter: ClaudeAdapter,
+    live_pid: int,
+    transcript: Path | None,
+    ignore: frozenset[int],
+    *,
+    active_subagents: int,
+    subagent_started_at: int | None,
+    now_ms: int | None,
+    disposable_shell: Callable[[str], bool] | None,
+) -> Inventory:
+    """:func:`inventory`'s body, run inside one veto ``ps`` pass."""
     items = _transcript_items(transcript, disposable_shell) if transcript is not None else []
     items += _process_items(live_pid, ignore, items)
     fresh, stale = counter_split(transcript, active_subagents, subagent_started_at, now_ms)
@@ -547,8 +627,11 @@ def drain(  # pylint: disable=too-many-arguments
     *poll* below 3 s gains nothing: the adapter caches the process table for 3 s.
     *active_subagents* and *subagent_started_at* are re-read on every poll (the store
     counter moves); *on_stale_counter* is called with the stale excess when one is found.
+    The returned inventory's ``seen_running`` holds what the last poll with a readable
+    process table saw running (a poll whose ``ps`` failed and saw nothing keeps it).
     """
     deadline = time.monotonic() + max(0.0, timeout)
+    seen: list[str] = []
     while True:
         count = active_subagents() if active_subagents is not None else 0
         started = subagent_started_at() if subagent_started_at is not None else None
@@ -562,6 +645,10 @@ def drain(  # pylint: disable=too-many-arguments
         )
         if inv.stale_counter and on_stale_counter is not None:
             on_stale_counter(inv.stale_counter)
+        observed = [r for r in inv.reasons if r in PROCESS_REASONS] + inv.unknown_processes()
+        if observed or REASON_PS_UNREADABLE not in inv.reasons:
+            seen = observed
+        inv.seen_running = list(seen)
         if inv.clear:
             return True, inv
         if time.monotonic() >= deadline:

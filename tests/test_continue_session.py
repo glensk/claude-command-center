@@ -3841,3 +3841,104 @@ def test_c8_final_in_flight_veto_redrains_within_the_drain_budget(
     else:
         assert "work is still in flight" in err and calls == [True, False]
         assert transfers == [] and harness.launches == []
+
+
+# ------------------------------- tp#2172 C9: an unreadable ps under load, the transcript decides
+
+_REAL_CHILDREN_MAP = claude_adapter._children_map  # noqa: SLF001  # pylint: disable=protected-access
+
+
+def _ps_times_out(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Every ``ps`` read times out (V1 day 1: d475f00c, 22229e0c, 6c908c18, 5983da03)."""
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    real_run = subprocess.run
+    timeouts: list[float] = []
+
+    def _run(argv: Any, *args: Any, **kw: Any) -> Any:
+        if isinstance(argv, list) and argv and argv[0] == "ps":
+            timeouts.append(float(kw["timeout"]))
+            raise subprocess.TimeoutExpired(argv, timeouts[-1])
+        return real_run(argv, *args, **kw)  # pylint: disable=subprocess-run-check  # caller's
+
+    monkeypatch.setattr(claude_adapter, "_children_map", _REAL_CHILDREN_MAP)
+    monkeypatch.setattr(claude_adapter, "_PROC_CACHE", {"ts": 0.0, "map": {}, "failed_at": None})
+    monkeypatch.setattr(claude_adapter.subprocess, "run", _run)
+    return timeouts
+
+
+def _pending_shell_transcript(tmp_path: Path) -> Path:
+    """A transcript with a background Bash task that never reported back."""
+    use = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "u-bsh1",
+                    "name": "Bash",
+                    "input": {"command": "pylint big", "run_in_background": True},
+                }
+            ],
+        },
+    }
+    result = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "u-bsh1", "content": "…"}],
+        },
+        "toolUseResult": {"stdout": "", "stderr": "", "backgroundTaskId": "bsh1"},
+    }
+    path = tmp_path / "pending.jsonl"
+    path.write_text(json.dumps(use) + "\n" + json.dumps(result) + "\n", encoding="utf-8")
+    return path
+
+
+def test_c9_unreadable_ps_through_the_drain_budget_with_a_clean_transcript_starts(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``ps`` timed out on every read for the whole ``-D`` budget; the transcript shows no
+    pending shell or agent and no process was seen: the start proceeds, with a note."""
+    timeouts = _ps_times_out(monkeypatch)
+    assert harness.start("-D", "0") == 0
+    err = capsys.readouterr().err
+    assert continue_session.PS_UNKNOWN_NOTE in err
+    assert timeouts and set(timeouts) == {15.0}  # the veto's read: read_ps's timeout
+    with Store() as store:
+        (transfer,) = store.transfers_of(SID)
+    assert transfer.state == "finalized" and len(harness.launches) == 1
+
+
+def test_c9_unreadable_ps_with_a_pending_shell_in_the_transcript_vetoes(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Same unreadable ``ps``, but the transcript has a background shell still pending."""
+    _ps_times_out(monkeypatch)
+    adapter = continue_session._adapter()  # noqa: SLF001  # pylint: disable=protected-access
+    assert isinstance(adapter, _Adapter)
+    adapter.transcript = _pending_shell_transcript(tmp_path)
+    assert harness.start("-D", "0") == 1
+    out = capsys.readouterr()
+    assert "background task(s) not yet reported back: bsh1" in out.out
+    assert continue_session.PS_UNKNOWN_NOTE not in out.err
+    with Store() as store:
+        assert store.transfers_of(SID) == []
+    assert harness.launches == []
+
+
+def test_c9_unreadable_ps_without_a_drain_still_refuses(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No ``-D``: C8's guarantee stands — an unreadable table is never read as idle."""
+    _ps_times_out(monkeypatch)
+    assert harness.start() == 1
+    err = capsys.readouterr().err
+    assert "process table could not be read" in err
+    assert continue_session.PS_UNKNOWN_NOTE not in err
+    with Store() as store:
+        assert store.transfers_of(SID) == []

@@ -42,6 +42,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .adapters.claude import ClaudeAdapter
     from .inflight import Inventory
     from .store import Store
@@ -143,11 +145,9 @@ def _own_ancestry() -> frozenset[int]:
         table = terminal.ps_table()
         if me in table:
             return terminal.pid_ancestry(me, table)
-    parents = {
-        child: parent
-        for parent, kids in claude_adapter._children_map().items()
-        for child, _command in kids
-    }
+    with claude_adapter.veto_ps_reads():  # tp#2172 C9: the veto's read, not a display one
+        scan = claude_adapter._children_map()
+    parents = {child: parent for parent, kids in scan.items() for child, _command in kids}
     chain: set[int] = set()
     current = me
     while current > 0 and current not in chain:
@@ -359,9 +359,21 @@ class StartRefused(Exception):
 class InFlightRefused(StartRefused):
     """:func:`_preflight`'s final in-flight veto — ``start -D`` re-drains on it (tp#2172 C8)."""
 
+    def __init__(self, message: str, inv: Inventory | None = None) -> None:
+        super().__init__(message)
+        self.inventory = inv
+
 
 #: ``start -D``: how often the final in-flight veto may send the start back to the drain.
 START_REDRAIN_MAX = 3
+
+#: ``start -D``: printed when the process table stayed unreadable through the budget and the
+#: transcript decided instead (tp#2172 C9).
+PS_UNKNOWN_NOTE = (
+    "note: the process table could not be read through the -D budget (ps failed or timed "
+    "out under load); the transcript shows no pending shells or subagents and no process "
+    "was seen running — starting anyway"
+)
 
 
 #: tp#1681 L3c: once the exit of a model-written part over MODEL_MAX_CHARS. Never returned
@@ -576,11 +588,16 @@ def _preflight(  # pylint: disable=too-many-arguments
     *,
     dry_run: bool = False,
     outside: bool = False,
+    ps_unknown_ok: Callable[[], bool] | None = None,
 ) -> str:
     """Fail-closed checks before anything is written; returns the target config dir.
 
     *outside* (``start -X``) skips only the inside-the-source check: the provable-idle
     wait (``_await_idle``) stands in for it, every other check still applies.
+    *ps_unknown_ok* (``start -D``, tp#2172 C9): when the in-flight veto is only an
+    unreadable process table (:attr:`Inventory.ps_unknown_only`) and it answers ``True``
+    (the ``-D`` budget is spent), the transcript's verdict stands and the start proceeds
+    with :data:`PS_UNKNOWN_NOTE`; any other reason still refuses.
     """
     from . import accounts
 
@@ -604,12 +621,16 @@ def _preflight(  # pylint: disable=too-many-arguments
     if src.inside and src.pid not in src.ignore:  # tp#2172 C8: a failed ps hid the chain
         src.ignore = _own_ancestry()
     inv = inventory(adapter, store, src)
-    if not inv.clear:
-        raise InFlightRefused(
-            "work is still in flight — drain first (ccc continue-session drain): "
-            + "; ".join(inv.reasons + inv.unknown_processes())
-        )
-    return target
+    if inv.clear:
+        return target
+    if inv.ps_unknown_only and ps_unknown_ok is not None and ps_unknown_ok():
+        print(PS_UNKNOWN_NOTE, file=sys.stderr)
+        return target
+    raise InFlightRefused(
+        "work is still in flight — drain first (ccc continue-session drain): "
+        + "; ".join(inv.reasons + inv.unknown_processes()),
+        inv,
+    )
 
 
 def _checked_profile(profile: str) -> str:
@@ -1796,12 +1817,26 @@ def _clamp_wait(args: argparse.Namespace) -> None:
         print(f"accept wait: {wait}s (effective -w)", file=sys.stderr)
 
 
-def _start_drained(adapter: ClaudeAdapter, store: Store, src: Source, args: Any) -> bool:
-    """``start -D N``: one bounded in-flight wait; prints the inventory when still busy."""
+def _start_drained(
+    adapter: ClaudeAdapter, store: Store, src: Source, args: Any
+) -> tuple[bool, bool]:
+    """``start -D N``: one bounded in-flight wait; ``(go on, ps stayed unknown)``.
+
+    Prints the inventory when still busy. A drain whose only veto left is an unreadable
+    process table (:attr:`Inventory.ps_unknown_only`: the transcript shows nothing pending,
+    no process was seen running) goes on — the final check decides (tp#2172 C9).
+    """
     ok, inv = _drain_source(adapter, store, src, float(args.drain))
-    if not ok:
-        print(_render_inflight(inv.to_dict()))
-    return ok
+    if ok:
+        return True, False
+    if inv.ps_unknown_only:
+        print(
+            f"the process table stayed unreadable for {args.drain}s — the transcript decides",
+            file=sys.stderr,
+        )
+        return True, True
+    print(_render_inflight(inv.to_dict()))
+    return False, False
 
 
 def _preflight_drained(  # pylint: disable=too-many-arguments
@@ -1812,6 +1847,7 @@ def _preflight_drained(  # pylint: disable=too-many-arguments
     *,
     outside: bool,
     drain_started: float,
+    ps_unknown: bool = False,
 ) -> str:
     """:func:`_preflight`; under ``start -D`` its in-flight veto re-drains with what is left.
 
@@ -1819,19 +1855,35 @@ def _preflight_drained(  # pylint: disable=too-many-arguments
     after the drain cleared (a shell, a resumed agent) is waited out within the same
     bounded call instead of failing the start (tp#2172 C8). Without ``-D``, with no budget
     left, or after :data:`START_REDRAIN_MAX` re-drains, the veto is raised as before.
+
+    A process table that stays unreadable through the budget (*ps_unknown*: the first drain
+    ended on it; or a re-drain did; or no budget is left) is no hard veto: the transcript
+    decides and only a process seen running refuses (tp#2172 C9, ``_preflight``).
     """
+    unknown = [ps_unknown]
+
+    def _left() -> float:
+        if args.drain is None:
+            return 0.0
+        return float(args.drain) - (_monotonic() - drain_started)
+
+    def _ps_unknown_ok() -> bool:
+        return args.drain is not None and (unknown[0] or _left() <= 0)
+
     attempts = 0
     while True:
         try:
             return _preflight(
-                adapter, store, src, args.account, dry_run=args.dry_run, outside=outside
+                adapter,
+                store,
+                src,
+                args.account,
+                dry_run=args.dry_run,
+                outside=outside,
+                ps_unknown_ok=_ps_unknown_ok,
             )
         except InFlightRefused:
-            left = (
-                float(args.drain) - (_monotonic() - drain_started)
-                if args.drain is not None
-                else 0.0
-            )
+            left = _left()
             attempts += 1
             if left <= 0 or attempts > START_REDRAIN_MAX:
                 raise
@@ -1840,7 +1892,9 @@ def _preflight_drained(  # pylint: disable=too-many-arguments
                 file=sys.stderr,
             )
             ok, inv = _drain_source(adapter, store, src, left)
-            if not ok:
+            if not ok and inv.ps_unknown_only:
+                unknown[0] = True  # the next final check lets the transcript decide
+            elif not ok:
                 print(_render_inflight(inv.to_dict()))
                 raise
 
@@ -1898,7 +1952,10 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
         if problem:
             return _fail(args, src.session_id, problem)
         drain_started = _monotonic()
-        if args.drain is not None and not _start_drained(adapter, store, src, args):
+        drained, ps_unknown = (
+            _start_drained(adapter, store, src, args) if args.drain is not None else (True, False)
+        )
+        if not drained:
             return _fail(
                 args,
                 src.session_id,
@@ -1912,7 +1969,13 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
         _say_failed_required(args, src.session_id, composed)
         try:
             target_dir = _preflight_drained(
-                adapter, store, src, args, outside=outside, drain_started=drain_started
+                adapter,
+                store,
+                src,
+                args,
+                outside=outside,
+                drain_started=drain_started,
+                ps_unknown=ps_unknown,
             )
             candidate = _candidate(
                 store, src, target_dir, args.account, args, composed.digest, composed.snapshot

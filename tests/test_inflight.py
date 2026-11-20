@@ -26,12 +26,16 @@ The fixtures under ``tests/fixtures/inflight/`` pin the shapes Claude Code write
 from __future__ import annotations
 
 import json
+import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
-from command_center import inflight, limitswitch, quota
+from command_center import inflight, limitswitch, quota, snapshot
 from command_center.adapters import claude as claude_adapter
 from command_center.adapters.claude import background_work_split, is_keepwarm_command
 
@@ -666,7 +670,6 @@ def test_c8_a_failed_ps_is_unknown_never_idle(
 ) -> None:
     """2026-11-18 23:21Z: ``ps`` failed under load, the walk saw no children and the drain
     passed with the session's own pylint shell alive. A failed read now vetoes."""
-    import subprocess  # pylint: disable=import-outside-toplevel
 
     def _run(argv: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
         if failure == "timeout":
@@ -808,3 +811,91 @@ def test_c8_keepalive_without_a_sign_of_life_ends_after_the_stale_window(
     jsonl.parent.mkdir(parents=True)
     jsonl.write_text("{}\n", encoding="utf-8")  # written just now: alive
     assert background_work_split(transcript) == (["ag1"], [])
+
+
+# ------------------------------------- tp#2172 C9: a slow ps under load, the veto's read
+
+
+def _ps_run_stub(
+    outcomes: list[str], timeouts: list[float]
+) -> Callable[..., subprocess.CompletedProcess[str]]:
+    """A ``subprocess.run`` for ``ps``: pops "timeout" / "ok" per call, logs each timeout."""
+
+    def _run(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+        timeouts.append(float(kw["timeout"]))
+        if (outcomes.pop(0) if outcomes else "ok") == "timeout":
+            raise subprocess.TimeoutExpired(argv, timeouts[-1])
+        return subprocess.CompletedProcess(argv, 0, "4242 1 claude\n", "")
+
+    return _run
+
+
+def test_c9_a_veto_read_gets_read_ps_timeout_and_one_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-11-20, load ~80: one ``ps -Ao pid=,ppid=,command=`` took 15.4 s; the 5 s read
+    never cleared a ``-D`` drain. A veto pass reads with ``snapshot.read_ps``'s timeout and
+    retries once; a display read keeps the short single read."""
+    timeouts: list[float] = []
+    monkeypatch.setattr(claude_adapter, "_PROC_CACHE", {"ts": 0.0, "map": {}, "failed_at": None})
+    monkeypatch.setattr(claude_adapter.subprocess, "run", _ps_run_stub(["timeout"], timeouts))
+    adapter = claude_adapter.ClaudeAdapter()
+    assert inflight.inventory(adapter, 4242, _empty_transcript(tmp_path)).clear
+    assert timeouts == [snapshot.PS_TIMEOUT_SEC, snapshot.PS_TIMEOUT_SEC]
+
+    timeouts.clear()
+    monkeypatch.setattr(claude_adapter, "_PROC_CACHE", {"ts": 0.0, "map": {}, "failed_at": None})
+    monkeypatch.setattr(claude_adapter.subprocess, "run", _ps_run_stub(["timeout"], timeouts))
+    assert claude_adapter._children_map() == {}  # pylint: disable=protected-access
+    assert timeouts == [5.0]
+
+
+def test_c9_a_failed_read_anywhere_in_the_pass_keeps_it_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass longer than the C8 window (every read here is 100 s apart): its first read
+    failed (both attempts), a later one was good — the pass stays unknown; the next is not."""
+    timeouts: list[float] = []
+    clock = iter(range(0, 100_000, 100))
+    monkeypatch.setattr(
+        claude_adapter,
+        "time",
+        SimpleNamespace(monotonic=lambda: float(next(clock)), time=time.time, sleep=time.sleep),
+    )
+    monkeypatch.setattr(claude_adapter, "_PROC_CACHE", {"ts": 0.0, "map": {}, "failed_at": None})
+    monkeypatch.setattr(
+        claude_adapter.subprocess, "run", _ps_run_stub(["timeout", "timeout"], timeouts)
+    )
+    adapter = claude_adapter.ClaudeAdapter()
+    inv = inflight.inventory(adapter, 4242, _empty_transcript(tmp_path))
+    assert inv.reasons == [inflight.REASON_PS_UNREADABLE] and inv.ps_unknown_only
+    assert len(timeouts) > 2  # later reads of the same pass were good
+    assert inflight.inventory(adapter, 4242, _empty_transcript(tmp_path)).clear
+
+
+def test_c9_drain_keeps_a_process_seen_running_before_ps_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first poll saw a child claude; every later read failed. Only the ps reason is
+    left, yet a process was seen running: no ps-unknown verdict for the drain."""
+    reads: list[dict[int, list[tuple[int, str]]]] = [{4242: [(5000, "claude -p work")]}] * 4
+    monkeypatch.setattr(
+        claude_adapter,
+        "_children_map",
+        lambda: reads.pop(0) if reads else snapshot.PsFailed(),
+    )
+    ticks = iter([0.0, 0.0, 100.0])
+    monkeypatch.setattr(
+        inflight,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda _s: None, time=time.time),
+    )
+    ok, inv = inflight.drain(
+        claude_adapter.ClaudeAdapter(), 4242, _empty_transcript(tmp_path), timeout=10.0, poll=0
+    )
+    assert not ok and inv.reasons == [inflight.REASON_PS_UNREADABLE]
+    assert inv.seen_running == [
+        inflight.REASON_CHILD_CLAUDE,
+        "pid:5000 child claude process: claude -p work",
+    ]
+    assert not inv.ps_unknown_only
