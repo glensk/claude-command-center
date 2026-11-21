@@ -82,6 +82,23 @@ flags. Grouped by what they do:
   it back) and writes a 0600 JSON log `(id, old, new)` next to the backup. `-r LOG -a` undoes
   an apply, only on rows still holding the logged stamp (`-r LOG` alone: dry run).
   Idempotent: a second `-a` changes 0 rows.
+- `ccc thread-backfill` (`-n/--dry-run` default, `-w/--write`, `-j/--json`, `-o/--out PATH`,
+  `-T/--tp-db PATH`, `-d/--db PATH`, `-F/--fingerprint HEX`) — one-off fill of empty
+  `sessions.thread_id` columns with the thread root (internal-style, no TUI key; code:
+  `thread_backfill.py`). It audits the RAW lineage first (every `handed_off_from` and every
+  non-failed transfer, `prepared`/`opened` included; an edge counts as a succession only with
+  an accepted transfer of the same pair) and groups the sessions into components (connected
+  by any edge). A component with a cycle, a chain past 50 hops, a missing ancestor row, a
+  target with two candidate parents, a source with two successors, a recorded `thread_id`
+  that is not the structural root, or an unaccepted edge is **quarantined**: listed with its
+  reasons and sessions, never written. A clean component gets its root on every empty column
+  (`WHERE COALESCE(thread_id, '') = ''`; a root gets its own id, a recorded id is never
+  overwritten, a re-run writes nothing). `-j` prints `{written, already, quarantined: [{root,
+  reason, reasons, sessions, tp_claims, obligations}], summary, fingerprint}`; `-T` reads a
+  tp DB (`mode=ro`) for the open holdings (claims, drives, plan rows) of quarantined
+  sessions. `-o` writes the full report plus every `(session_id, thread_id)` written (the
+  undo list) as 0600 JSON. `-w` needs the dry run's `-F` fingerprint, re-audits inside one
+  `BEGIN IMMEDIATE` transaction and refuses (exit 2, nothing written) when anything changed.
 - `ccc set-next` · `ccc set-blocked` · `ccc set-deadline` · `ccc set-donecheck` — the other job fields.
 - `ccc subgoals "step" …` (`--list`, `--adaptive`, `--merge`) — the progress checklist.
 - `ccc check <N>` (`--uncheck`) · `ccc subgoal-check <N> "<cmd>"` — tick an item / attach a shell predicate.
