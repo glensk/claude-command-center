@@ -11,7 +11,11 @@ from __future__ import annotations
 # pylint: disable=redefined-outer-name  # pytest fixtures
 import argparse
 import json
+import os
+import shlex
 import sqlite3
+import subprocess
+import sys
 import threading
 import uuid
 from pathlib import Path
@@ -19,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from command_center import cli, config, hooks, shared_lifecycle, shared_store
+from command_center import cli, config, hooks, install, shared_lifecycle, shared_store
 from command_center.models import Status
 from command_center.store import Store
 from command_center.thread_join_store import ACCEPTED, CANCELLED, RESERVED
@@ -208,6 +212,31 @@ def test_resume_bumps_the_incarnation_and_an_older_end_is_ignored(
     _end(sid)  # once per incarnation
     member = _member(shared, sid)
     assert member is not None and member[2] is not None and member[3] == "closed"
+
+
+def test_process_key_is_the_parent_pid_that_claude_spawns_the_hook_from() -> None:
+    """FB12: the incarnation key stays the hook's parent pid, never the registry ``pid``.
+
+    The 2026-11-21 probe (Claude Code 2.1.330) found the hook's parent equal to the Claude
+    session registry pid on a tab, ``claude -p``, an Agent subagent and claude-wrapper.sh:
+    Claude spawns ``/bin/sh -c '<command>'`` and the shell execs a simple command in place.
+    This pins both halves: the key is the parent pid, and a simple command run that way
+    still sees its spawner (here the test process) as its parent.
+    """
+    assert shared_store.process_key() == f"ppid:{os.getppid()}"
+    code = "from command_center import shared_store; print(shared_store.process_key())"
+    out = subprocess.run(
+        ["/bin/sh", "-c", f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert out == f"ppid:{os.getpid()}"
+    built = install.build_hooks_settings({}, "/bin/ccc", uninstall=False)
+    for event, _matcher, arg in install.HOOK_SPEC:  # ccc's hooks stay simple commands
+        command = f"/bin/ccc hook {arg}"
+        assert command in install.hook_commands(built, event)
+        assert not any(op in command for op in ("&&", "||", ";", "|", "$(", "`"))
 
 
 def test_fork_and_unknown_resume_start_their_own_thread(shared: Path) -> None:

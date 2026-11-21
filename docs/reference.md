@@ -1982,6 +1982,17 @@ operation-bound succession: `reserved` → `committing` → `accepted` | `cancel
 columns: `state.db`'s `closed_at` is ccc's tab state; the shared `ended_at` is the
 session's lifecycle end (once per process incarnation).
 
+**Process incarnation key** (tp#2372 FB12): a hook names its Claude process by its parent
+pid (`ppid:<pid>` in `state.db`'s `shared_incarnations` and `shared_clear_marks`), not by
+the Claude session registry's `pid`. Probed 2026-11-21 on Claude Code 2.1.330: Claude runs a
+hook as `/bin/sh -c '<command>'` and the shell execs a simple command in place, so the
+hook's parent is the registry pid on every launch route: an interactive tab, `claude -p`,
+an Agent subagent (its SubagentStart/Stop fire from the same process) and a
+`claude-wrapper.sh` launch (the wrapper `exec`s `claude`). Only a compound hook command
+(`a && ccc hook …`) keeps `sh` in between; `ccc install` writes each hook as a simple
+`<ccc> hook <event>`, so keep it that way. The registry `.json` of an interactive session
+was not yet written during its first hooks, another reason not to read it here.
+
 Every shared write is one `BEGIN IMMEDIATE` transaction that first checks
 `meta.ccc_shared_schema = 1`, that the store is not under maintenance (`meta.backend`)
 and that `meta.holder_authority_epoch` equals the epoch ccc pinned at its first write; any

@@ -151,7 +151,18 @@ def configured_path(cfg: config.Config | None = None) -> Path | None:
 
 
 def process_key() -> str:
-    """This hook's Claude process: the parent pid (hooks are exec'd by the Claude process)."""
+    """This hook's Claude process: the parent pid (hooks are exec'd by the Claude process).
+
+    Kept over the Claude session registry's ``pid`` (tp#2372 FB12, probed 2026-11-21 on
+    Claude Code 2.1.330): Claude runs a hook command as ``/bin/sh -c '<command>'`` and the
+    shell execs a simple command in place, so the hook's parent IS the registry pid on an
+    interactive tab, ``claude -p`` (``entrypoint`` ``sdk-cli``), an Agent subagent's
+    SubagentStart/Stop (same process) and a ``claude-wrapper.sh`` launch (the wrapper
+    execs ``claude``). Only a compound hook command (``a && ccc hook …``) leaves ``sh``
+    in between; ``install.py`` writes every hook as a simple ``<ccc> hook <event>``. The
+    parent pid also needs no registry read (the probe found an interactive session's
+    registry ``.json`` not yet written during its first hooks).
+    """
     return f"ppid:{os.getppid()}"
 
 
