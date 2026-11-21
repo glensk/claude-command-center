@@ -3209,6 +3209,60 @@ def recover_shared_ops(
     return lines
 
 
+def preview_op(  # pylint: disable=too-many-return-statements  # one exit per branch
+    store: Store, op: Any, now: int, grace_ms: int = RECOVER_GRACE_MS
+) -> str | None:
+    """What :func:`_recover_op` would do to ONE pending *op*, writing nothing (``None`` =
+    leave it): ``ccc thread-reconcile --report``. Mirrors its decision tree branch by branch."""
+    from .thread_join_store import ACCEPTED as JOIN_ACCEPTED
+    from .thread_join_store import CANCELLED
+    from .transfer_store import ACCEPTED, FAILED, FINALIZED
+
+    if not op.pending:
+        return None
+    committing = op.state == "committing" and _old(op.created_at, now, grace_ms)
+    if op.join_kind == CONTINUE_JOIN:
+        transfer = store.get_transfer(op.op_id)
+        if transfer is None:
+            return None
+        if transfer.state == FAILED:
+            return f"op {op.op_id}: transfer failed, would cancel the reservation"
+        if transfer.state in (ACCEPTED, FINALIZED):
+            return f"op {op.op_id}: transfer {transfer.state}, would publish the succession"
+        if committing:
+            return f"op {op.op_id}: committing, would publish and finish the accept"
+        return None
+    if op.join_kind in ("park_start", "staff_accept"):
+        join = store.thread_join_op(op.op_id)
+        if join is None:
+            return None
+        if join.state == CANCELLED:
+            return f"op {op.op_id}: relay cancelled, would cancel the reservation"
+        if join.state == JOIN_ACCEPTED or committing:
+            return f"op {op.op_id}: relay {join.state}, would publish the succession"
+        return None
+    if op.join_kind == "clear" and _old(op.created_at, now, grace_ms):
+        return f"op {op.op_id}: would finish the /clear join"
+    return None
+
+
+def preview_published(
+    store: Store, shared: Any, now: int, grace_ms: int = RECOVER_GRACE_MS
+) -> list[str]:
+    """What :func:`_recover_published` would finish (state.db steps after an accepted op)."""
+    lines: list[str] = []
+    for transfer in store.dead_transfer_candidates(now):
+        op = shared.op(transfer.transfer_id)
+        if op is not None and op.state == "accepted" and _old(op.settled_at, now, grace_ms):
+            lines.append(f"op {op.op_id}: published, would finish the state.db accept")
+    rows = store.conn.execute("SELECT op_id FROM thread_joins WHERE state = 'reserved'")
+    for (op_id,) in rows.fetchall():
+        op = shared.op(str(op_id))
+        if op is not None and op.state == "accepted" and _old(op.settled_at, now, grace_ms):
+            lines.append(f"op {op.op_id}: published, would mark the relay accepted in state.db")
+    return lines
+
+
 def dispatch(args: argparse.Namespace) -> int:
     """Dispatch ``ccc continue-session <verb>``."""
     from . import handoff_facts, lean_check

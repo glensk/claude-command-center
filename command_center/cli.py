@@ -7468,6 +7468,10 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
 
     thread_backfill.add_parser(sub)
 
+    from . import thread_reconcile  # no store/TUI import: cheap to register
+
+    thread_reconcile.add_parser(sub)
+
     p_handoff = sub.add_parser(
         "handoff", help="commit+push a locked file, then release it for a waiting session"
     )

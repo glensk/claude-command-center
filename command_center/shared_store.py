@@ -252,16 +252,35 @@ class SharedStore:  # pylint: disable=too-many-public-methods  # one table famil
         )
         self.private.commit()
 
-    def _guard(self) -> str:
-        """Refuse unless component, maintenance flag and epoch allow a write; the epoch."""
+    def store_epoch(self) -> str | None:
+        """The store's current authority epoch (``meta.holder_authority_epoch``)."""
+        return self._meta(EPOCH_KEY)
+
+    def refusal(self) -> str | None:
+        """Why the component or the maintenance flag refuses every write (``None`` = open)."""
         component = self._meta(COMPONENT_KEY)
         if component != COMPONENT_VERSION:
-            raise Refused(f"unknown {COMPONENT_KEY} {component!r} (ccc writes {COMPONENT_VERSION})")
+            return f"unknown {COMPONENT_KEY} {component!r} (ccc writes {COMPONENT_VERSION})"
         if self._meta(BACKEND_KEY) == MAINTENANCE:
-            raise Refused("the shared store is under maintenance")
-        epoch = self._meta(EPOCH_KEY)
-        if epoch is None:
-            raise Refused(f"no {EPOCH_KEY}")
+            return "the shared store is under maintenance"
+        if self._meta(EPOCH_KEY) is None:
+            return f"no {EPOCH_KEY}"
+        return None
+
+    def _guard(self, expect: str | None = None) -> str:
+        """Refuse unless component, maintenance flag and epoch allow a write; the epoch.
+
+        *expect* (``thread-reconcile``'s acknowledged restore) replaces the pinned epoch:
+        the store must still be at the epoch the caller reported.
+        """
+        why = self.refusal()
+        if why is not None:
+            raise Refused(why)
+        epoch = str(self._meta(EPOCH_KEY))
+        if expect is not None:
+            if epoch != expect:
+                raise Refused(f"the store moved to epoch {epoch} since the report ({expect})")
+            return epoch
         pinned = self.pinned_epoch()
         if pinned is not None and pinned != epoch:
             raise Refused(
@@ -271,20 +290,52 @@ class SharedStore:  # pylint: disable=too-many-public-methods  # one table famil
         return epoch
 
     @contextmanager
-    def _tx(self, op: str) -> Iterator[sqlite3.Connection]:
-        """``BEGIN IMMEDIATE`` + guards; commit and a timing row, or roll back."""
+    def _tx(self, op: str, *, expect: str | None = None) -> Iterator[sqlite3.Connection]:
+        """``BEGIN IMMEDIATE`` + guards; commit and a timing row, or roll back.
+
+        With *expect* the commit (re-)pins that epoch (see :meth:`_guard`).
+        """
         self.conn.execute("BEGIN IMMEDIATE")
         started = time.perf_counter()
         try:
-            epoch = self._guard()
+            epoch = self._guard(expect)
             yield self.conn
         except BaseException:
             self.conn.execute("ROLLBACK")
             raise
         self.conn.execute("COMMIT")
         _timing_row(op, (time.perf_counter() - started) * 1000, str(self.path))
-        if self.pinned_epoch() is None:
+        if expect is not None or self.pinned_epoch() is None:
             self.pin_epoch(epoch)
+
+    def acknowledge_epoch(self, epoch: str, fail_ops: Iterable[str], now: int) -> int:
+        """``thread-reconcile``: settle *fail_ops* ``failed`` and re-pin *epoch*, atomically.
+
+        One transaction that refuses (:class:`Refused`) unless the store is still at
+        *epoch*; the quarantined operations it fails can then never be applied by a later
+        recovery. Returns how many pending operations it settled.
+        """
+        settled = 0
+        with self._tx("acknowledge_epoch", expect=epoch) as conn:
+            for op_id in fail_ops:
+                settled += conn.execute(
+                    "UPDATE ccc_thread_successions SET state = 'failed', settled_at = ? "
+                    "WHERE op_id = ? AND state IN ('reserved', 'committing')",
+                    (now, op_id),
+                ).rowcount
+        return settled
+
+    def high_water(self) -> int:
+        """The newest timestamp of any ccc fact in the store (its recovery point after a
+        restore): thread creations, session starts, ends and beats, succession steps."""
+        row = self.conn.execute(
+            "SELECT MAX(v) FROM ("
+            "SELECT MAX(created_at) AS v FROM ccc_threads UNION ALL "
+            "SELECT MAX(MAX(started_at, COALESCE(ended_at, 0), COALESCE(last_beat, 0))) "
+            "FROM ccc_sessions UNION ALL "
+            "SELECT MAX(MAX(created_at, COALESCE(settled_at, 0))) FROM ccc_thread_successions)"
+        ).fetchone()
+        return int(row[0] or 0) if row is not None else 0
 
     def write(self, op: str, fn: Callable[[sqlite3.Connection], T]) -> T | None:
         """Run *fn* in one guarded write transaction; ``None`` (logged) when refused/failed."""

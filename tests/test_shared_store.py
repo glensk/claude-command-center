@@ -501,3 +501,126 @@ def test_two_writers_never_publish_two_successors(shared: Path) -> None:
         t.join()
     assert sorted(r or "" for r in results) == ["accepted", "lost"]
     assert _current(shared, src) == 1
+
+
+# --------------------------------------------------------------------------- #
+# ccc thread-reconcile (FB4)
+# --------------------------------------------------------------------------- #
+def _dump(path: Path) -> list[Any]:
+    return [
+        _q(path, f"SELECT * FROM {table} ORDER BY 1")
+        for table in ("ccc_threads", "ccc_sessions", "ccc_thread_successions", "meta")
+    ]
+
+
+def _reconcile(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, dict[str, Any]]:
+    capsys.readouterr()
+    rc = _verb("thread-reconcile", "-J", *argv)
+    doc: dict[str, Any] = json.loads(capsys.readouterr().out)
+    return rc, doc
+
+
+def _set_meta(path: Path, key: str, value: str) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE meta SET value = ? WHERE key = ?", (value, key))
+    conn.commit()
+    conn.close()
+
+
+def test_thread_reconcile_report_writes_nothing_and_apply_settles_stuck_ops(
+    shared: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    orphan_src, clear_src, clear_new = _sid(), _sid(), _sid()
+    _start(orphan_src)
+    _start(clear_src)
+    old = shared_store.now_ms() - 2 * 3_600_000
+    with _open(shared) as s:
+        assert s.reserve(orphan_src, _sid(), "continue", old, op_id="orphan") is not None
+        res = s.reserve(clear_src, clear_new, "clear", old, op_id="clr")
+        assert res is not None and res.status == "reserved"
+    before = _dump(shared)
+    with Store() as store:
+        pins_before = list(store.conn.execute("SELECT * FROM shared_store_pins").fetchall())
+    rc, doc = _reconcile(capsys, "-r")
+    assert rc == 0 and doc["applied"] is False and doc["epoch_status"] == "ok"
+    assert doc["orphans"] == ["orphan"]
+    assert doc["recover"] == ["op clr: would finish the /clear join"]
+    assert doc["quarantined"] == []
+    assert _dump(shared) == before  # the report writes nothing
+    with Store() as store:
+        assert list(store.conn.execute("SELECT * FROM shared_store_pins")) == pins_before
+    rc, doc = _reconcile(capsys)
+    assert rc == 0 and doc["applied"] is True and doc["orphans"] == ["orphan"]
+    states = dict(_q(shared, "SELECT op_id, state FROM ccc_thread_successions"))
+    assert states == {"orphan": "failed", "clr": "accepted"}
+    assert _member(shared, clear_new)[:2] == (clear_src, 1)
+    assert _current(shared, orphan_src) == 0  # a failed op never moves the generation
+    rc, doc = _reconcile(capsys)  # a re-run finds nothing left
+    assert rc == 0 and doc["orphans"] == [] and doc["recover"] == []
+
+
+def test_thread_reconcile_after_a_restore_quarantines_newer_private_ops(
+    shared: Path, home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = _source(home)  # pins epoch 1
+    doc = _register(home, capsys, "-F", src, "-G", "accept", "-r", "staff/a/x", "-g", "4")
+    new, op = str(doc["session_id"]), str(doc["thread_op"])
+    _start(new)
+    snapshot = tmp_path / "snapshot.sqlite3"
+    snapshot.write_bytes(shared.read_bytes())  # the backup: the reservation, not the accept
+    accept = ("thread-accept", "-S", new, "-f", src, "-r", "staff/a/x", "-g", "4")
+    assert _verb(*accept) == 0
+    late = _sid()
+    _start(late)  # a session start after the backup
+    with Store() as store:  # the private facts land after the recovery point
+        store.conn.execute("UPDATE thread_joins SET settled_at = settled_at + 10000")
+        store.conn.execute(
+            "UPDATE shared_incarnations SET at = at + 10000 WHERE session_id = ?", (late,)
+        )
+        store.conn.commit()
+    shared.write_bytes(snapshot.read_bytes())  # the restore …
+    _set_meta(shared, "holder_authority_epoch", "2")  # … mints a new epoch
+    fenced = _sid()
+    _start(fenced)
+    assert _member(shared, fenced) is None  # stale pin: ccc writes nothing
+    before = _dump(shared)
+    rc, rep = _reconcile(capsys, "-r")
+    assert rc == 0 and rep["epoch_status"] == "stale" and rep["pinned_epoch"] == "1"
+    kinds = {(q["kind"], q["op_id"] or q["session"], q["shared_state"]) for q in rep["quarantined"]}
+    assert ("relay-accept", op, "reserved") in kinds
+    assert ("session-start", late, "missing") in kinds
+    assert rep["recover"] == []  # the quarantined accept is never previewed as a publication
+    assert _dump(shared) == before
+    rc, rep = _reconcile(capsys)
+    assert rc == 0 and rep["settled_quarantined"] == 1
+    assert _q(shared, "SELECT state FROM ccc_thread_successions WHERE op_id = ?", op) == [
+        ("failed",)
+    ]
+    assert _current(shared, src) == 0  # the restored source stays current
+    with Store() as store:
+        assert shared_store.SharedStore(shared, private=store.conn).pinned_epoch() == "2"
+    after = _sid()
+    _start(after)
+    assert _member(shared, after) is not None  # re-pinned: writes flow again
+
+
+@pytest.mark.parametrize(("key", "value"), [("backend", "maintenance"), ("ccc_shared_schema", "9")])
+def test_thread_reconcile_refuses_a_fenced_store(
+    shared: Path, capsys: pytest.CaptureFixture[str], key: str, value: str
+) -> None:
+    src = _sid()
+    _start(src)
+    with _open(shared) as s:
+        s.reserve(src, _sid(), "continue", 1, op_id="orphan")
+    _set_meta(shared, key, value)
+    before = _dump(shared)
+    rc, doc = _reconcile(capsys)
+    assert rc == 1 and doc["refused"] and doc["applied"] is False
+    assert _dump(shared) == before
+
+
+@pytest.mark.usefixtures("home")
+def test_thread_reconcile_is_a_noop_when_off(capsys: pytest.CaptureFixture[str]) -> None:
+    capsys.readouterr()
+    assert _verb("thread-reconcile", "-r") == 0
+    assert "unset" in capsys.readouterr().out
