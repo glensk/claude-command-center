@@ -4297,21 +4297,47 @@ def _debate_refresh(candidates: list[SeatCandidate], stale_after: int, budget: f
     a per-seat ``unknown``, which is tryable in routing order (tp#2494) — a failed fetch
     never raises a capped or blocked seat, and never lets a seat jump the order. A
     module-level function so tests can replace the network step.
+
+    The fetches run in PARALLEL daemon threads (started in candidate order) joined
+    against the one *budget* deadline (tp#2513 B3), so the worst-case network cost is
+    the slowest fetch, not the sum, and a DNS stall urllib's socket timeout does not
+    cover cannot stretch the verdict past the deadline. A fetch still running then is
+    abandoned: its seat stays a per-seat ``unknown``, and a late success writes genuine
+    data through the atomic, flock'ed live-cache writer. Short-lived CLI processes only
+    (``codex-in-claude debate-seat``): an abandoned daemon thread ends with the process.
     """
     from . import usage  # pylint: disable=import-outside-toplevel
 
     deadline = time.monotonic() + budget
     now = int(time.time())
+
+    def _fetch(home: Path, timeout: float) -> None:
+        with contextlib.suppress(Exception):
+            usage.fetch_codex_usage(home, now, timeout=timeout)
+
+    workers: list[threading.Thread] = []
     for cand in candidates:
         left = deadline - time.monotonic()
         if left <= 0:
-            return
+            break
         try:
             if _debate_fresh_five(_candidate_row(cand, now), now, stale_after) is not None:
                 continue
-            usage.fetch_codex_usage(cand.home, now, timeout=min(_REFRESH_FETCH_TIMEOUT_SEC, left))
         except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             continue
+        worker = threading.Thread(
+            target=_fetch,
+            args=(cand.home, min(_REFRESH_FETCH_TIMEOUT_SEC, left)),
+            name=f"debate-refresh-{cand.label}",
+            daemon=True,
+        )
+        worker.start()
+        workers.append(worker)
+    for worker in workers:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        worker.join(left)
 
 
 def _debate_known_week(row: quota.ProviderQuota, now: int) -> quota.WindowState | None:

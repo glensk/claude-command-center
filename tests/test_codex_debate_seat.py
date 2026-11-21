@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -1360,3 +1361,150 @@ def test_continue_verdict_is_first_tryable_candidate(
     else:
         assert verdict["state"] == "paused"
         assert cic._DEBATE_CONTINUE_EXIT["paused"] == 1  # noqa: SLF001
+
+
+# --------------------------------------------------------------------------- #
+# tp#2513 B3: ``_debate_refresh`` fetches in parallel daemon threads under ONE deadline.
+# --------------------------------------------------------------------------- #
+_SHRUNK_BUDGET = 0.2
+
+
+def _opt_in(fixture: SeatFixture) -> None:
+    """Turn the live-usage opt-in (``codex_usage``) on in the fixture's config."""
+    path = fixture.ccc_home / "command-center" / "config.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("codex_usage = false", "codex_usage = true"),
+        encoding="utf-8",
+    )
+    config.invalidate_config_cache()
+
+
+def _thread_spy(monkeypatch: pytest.MonkeyPatch) -> list[threading.Thread]:
+    """Record every thread ``_debate_refresh`` creates (in creation order)."""
+    created: list[threading.Thread] = []
+    real = threading.Thread
+
+    class _Spy(real):  # type: ignore[misc,valid-type]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(cic.threading, "Thread", _Spy)
+    return created
+
+
+def test_refresh_returns_at_the_deadline_and_the_seat_stays_unknown(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = int(time.time())
+    for label in three_seats.seats:
+        _live(three_seats.seats[label], 5.0, now=now, age=_HOUR)
+    _opt_in(three_seats)
+    release = threading.Event()
+    daemons: list[bool] = []
+
+    def _blocked(_home: Path, _now: int | None = None, *, timeout: float | None = None) -> None:
+        daemons.append(threading.current_thread().daemon)
+        assert timeout is not None
+        release.wait(30)
+
+    monkeypatch.setattr(usage, "fetch_codex_usage", _blocked)
+    monkeypatch.setattr(cic, "_DEBATE_REFRESH_BUDGET_SEC", _SHRUNK_BUDGET)
+    created = _thread_spy(monkeypatch)
+    cands = cic.codex_homes_in_order(now)
+    try:
+        start = time.monotonic()
+        cic._debate_refresh(cands, 600, _SHRUNK_BUDGET)  # noqa: SLF001
+        assert time.monotonic() - start < _SHRUNK_BUDGET + 0.5
+        assert [worker.name for worker in created] == [
+            f"debate-refresh-{cand.label}" for cand in cands
+        ]
+        assert all(worker.daemon for worker in created)
+        assert daemons and all(daemons)
+        start = time.monotonic()
+        verdict = cic.debate_seat_verdict(tier="strict", now=now)
+        assert time.monotonic() - start < _SHRUNK_BUDGET + 2.0
+    finally:
+        release.set()
+        for worker in created:
+            worker.join(5)
+    assert not any(worker.is_alive() for worker in created)
+    _assert_unmeasured_first(verdict)
+    assert verdict["seats"][0]["state"] == "unknown"
+    assert [seat["seat"] for seat in verdict["seats"]] == [cand.label for cand in cands]
+
+
+def test_refresh_fetches_run_in_parallel(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = int(time.time())
+    budget = 0.5
+    done: list[str] = []
+    never = threading.Event()
+
+    def _slow(home: Path, _now: int | None = None, *, timeout: float | None = None) -> None:
+        never.wait(0.6 * budget)  # 60 % of the budget: three in a row would overrun it
+        done.append(str(home))
+        assert timeout is not None
+
+    monkeypatch.setattr(usage, "fetch_codex_usage", _slow)
+    created = _thread_spy(monkeypatch)
+    cands = cic.codex_homes_in_order(now)
+    assert len(cands) == 3
+    cic._debate_refresh(cands, 600, budget)  # noqa: SLF001
+    for worker in created:
+        worker.join(5)
+    assert sorted(done) == sorted(str(cand.home) for cand in cands)
+    _ = three_seats
+
+
+def test_fresh_seat_starts_no_thread(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = int(time.time())
+    _live(three_seats.seats["private"], 10.0, now=now)
+    _live(three_seats.seats["de"], 10.0, now=now, age=_HOUR)
+    _live(three_seats.seats["default"], 10.0, now=now, age=_HOUR)
+    fetched: list[str] = []
+
+    def _fetch(home: Path, _now: int | None = None, *, timeout: float | None = None) -> None:
+        fetched.append(str(home))
+        assert timeout is not None
+
+    monkeypatch.setattr(usage, "fetch_codex_usage", _fetch)
+    created = _thread_spy(monkeypatch)
+    cic._debate_refresh(cic.codex_homes_in_order(now), 600, 5.0)  # noqa: SLF001
+    for worker in created:
+        worker.join(5)
+    assert sorted(worker.name for worker in created) == [
+        "debate-refresh-de",
+        "debate-refresh-default",
+    ]
+    assert str(three_seats.seats["private"]) not in fetched
+    for label in three_seats.seats:
+        _live(three_seats.seats[label], 10.0, now=now)
+    created.clear()
+    cic._debate_refresh(cic.codex_homes_in_order(now), 600, 5.0)  # noqa: SLF001
+    assert not created
+
+
+def test_no_opt_in_or_kill_switch_starts_no_thread(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = int(time.time())
+    for label in three_seats.seats:
+        _live(three_seats.seats[label], 10.0, now=now, age=_HOUR)
+    _configure(three_seats, 'codex_debate_seats = ["private", "de"]')
+    monkeypatch.setattr(cic, "_debate_cost_deltas", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        usage, "fetch_codex_usage", lambda *_a, **_k: pytest.fail("fetch without opt-in")
+    )
+    created = _thread_spy(monkeypatch)
+    cic.debate_seat_verdict(tier="default", now=now)
+    _cont()
+    assert not created
+    _opt_in(three_seats)
+    monkeypatch.setenv("CCC_NO_CODEX", "1")
+    assert cic.debate_seat_verdict(tier="default", now=now)["state"] == "disabled"
+    assert _cont()["state"] == "disabled"
+    assert not created
