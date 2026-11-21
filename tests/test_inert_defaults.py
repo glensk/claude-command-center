@@ -45,6 +45,7 @@ _EXPECTED_INERT_KEYS = {  # alphabetical, unlike config's grouped tuple
     "peer_name_from_aim",
     "reap",
     "resume_halted",
+    "shared_store_path",
     "short_aim",
     "summarize",
     "verify_subgoals_llm",
@@ -55,7 +56,8 @@ def test_inert_default_keys_match_and_are_all_false() -> None:
     """INERT_DEFAULT_KEYS is exactly the expected set and every member defaults OFF.
 
     OFF is falsy: ``False`` for a switch, ``[]`` for a list of commands (``handoff_hooks``,
-    tp#1300) — either way the fresh install runs nothing.
+    tp#1300), ``""`` for a path (``shared_store_path``, tp#2372) — either way the fresh
+    install runs nothing.
     """
     assert set(config.INERT_DEFAULT_KEYS) == _EXPECTED_INERT_KEYS
     assert len(config.INERT_DEFAULT_KEYS) == len(_EXPECTED_INERT_KEYS)  # no dupes
@@ -63,7 +65,7 @@ def test_inert_default_keys_match_and_are_all_false() -> None:
     for key in config.INERT_DEFAULT_KEYS:
         assert not config.DEFAULTS[key], f"{key} must be falsy in DEFAULTS (inert contract)"
         assert not getattr(default_cfg, key), f"Config().{key} must default falsy"
-        assert config.DEFAULTS[key] in (False, []), f"{key}: False or [] only"
+        assert config.DEFAULTS[key] in (False, [], ""), f'{key}: False, [] or "" only'
 
 
 def _files_outside(root: Path, exclude: Path) -> dict[str, bytes]:

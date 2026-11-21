@@ -506,11 +506,40 @@ def _join_thread_relay(store: Store, sid: str, source: object) -> None:
     try:
         join = store.thread_join_for(sid)
         if join is not None:
-            from .thread_join_store import join_thread  # lazy: only a relay successor
+            from .thread_join_store import JOIN_START, join_thread  # lazy: relay successor
 
             join_thread(store, join, now_ms())
+            # tp#2372 F3b: a `start` join publishes the successor in the shared store
+            # (idempotent: an accepted op is a no-op, a crash before it is healed here).
+            if join.join_kind == JOIN_START and join.state != "cancelled" and _shared_on():
+                from . import shared_lifecycle  # lazy: only with the shared store on
+
+                shared_lifecycle.relay_commit(
+                    store, join.source_session, sid, join.op_id, staff=False
+                )
     except sqlite3.Error:
         pass
+
+
+def _shared_on() -> bool:
+    """True when ``shared_store_path`` is set (tp#2372 F3b); off = no shared file touched."""
+    try:
+        return bool(config.load_config().shared_store_path)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return False
+
+
+def _shared_beat(sid: str) -> None:
+    """The throttled ``last_beat`` (Design 7); nothing at all with the store off."""
+    if not _shared_on():
+        return
+    try:
+        from . import shared_lifecycle  # lazy: only with the shared store on
+
+        with Store() as store:
+            shared_lifecycle.beat(store, sid)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        pass  # advisory: a beat never fails a hook
 
 
 def handle_session_start(payload: dict[str, Any]) -> int:
@@ -530,6 +559,12 @@ def handle_session_start(payload: dict[str, Any]) -> int:
         if payload.get("source") not in _CLOSE_KEEPING_SOURCES:
             store.disarm_close(sid)
         _join_thread_relay(store, sid, payload.get("source"))
+        if _shared_on():
+            from . import shared_lifecycle  # lazy: only with the shared store on
+
+            shared_lifecycle.session_start(
+                store, sid, payload.get("source"), str(payload.get("cwd") or "")
+            )
         if switch_warning and _switch_landed_as_expected(store, sid):
             switch_warning = None
         env_aim = os.environ.get("CLAUDE_SESSION_AIM")
@@ -671,6 +706,7 @@ def handle_user_prompt(payload: dict[str, Any]) -> int:
     if target := _handed_off_target(sid):
         _block_prompt(_HANDED_OFF_REASON.format(target8=target[:8]))
         return 0
+    _shared_beat(sid)
     cfg = config.load_config()
     if cfg.switch_intercept and switch_intercept.intercept(sid, str(payload.get("prompt") or "")):
         return 0
@@ -761,6 +797,7 @@ def handle_stop(payload: dict[str, Any]) -> int:
         session, _ = ensure_current_session(store, sid, payload.get("cwd", ""))
         # Keep this fast: just record activity and flag a summary refresh for the daemon.
         store.update_fields(sid, last_response_at=now_ms(), needs_summary=True)
+    _shared_beat(sid)
     # Grade this turn's progress out-of-band (detached, debounced) — never blocks here.
     _maybe_grade_after_turn(sid, session.last_progress_at)
     # Self-assess whether the AIM is now fulfilled (detached; the red DONE in the bar).
@@ -817,6 +854,8 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> int:
 def handle_post_tool_use(payload: dict[str, Any]) -> int:
     """After a file edit: nudge a hand-off if a peer is queued. After a todo/task tool:
     snapshot the live todo list. (One handler, wired for both tool groups.)"""
+    if sid := _session_id(payload):
+        _shared_beat(sid)
     if (payload.get("tool_name") or "") in _LOCK_TOOLS:
         return _post_tool_edit(payload)
     return _post_tool_todos(payload)
@@ -1129,6 +1168,12 @@ def handle_session_end(payload: dict[str, Any]) -> int:
             fields["done"] = True
         fields["status"] = closed_status(session, bool(fields.get("done"))).value
         store.update_fields(sid, **fields)
+        if _shared_on():
+            from . import shared_lifecycle  # lazy: only with the shared store on
+
+            shared_lifecycle.session_end(
+                store, sid, payload.get("reason"), done=bool(fields.get("done") or session.done)
+            )
     return 0
 
 

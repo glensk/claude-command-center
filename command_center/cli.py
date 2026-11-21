@@ -3287,7 +3287,7 @@ def _thread_relay_conflict(store: Store, session_id: str, relay: _ThreadRelay | 
 def _reserve_thread_relay(store: Store, session_id: str, relay: _ThreadRelay) -> ThreadJoin:
     """Stamp the draft's thread source and write its reservation (both idempotent)."""
     store.set_thread_source(session_id, relay.source, relay.join)
-    return store.reserve_thread_join(
+    join = store.reserve_thread_join(
         session_id,
         relay.source,
         relay.join,
@@ -3295,6 +3295,19 @@ def _reserve_thread_relay(store: Store, session_id: str, relay: _ThreadRelay) ->
         lease_generation=relay.lease_generation,
         now=now_ms(),
     )
+    if _shared_store_on():
+        # tp#2372 F3b: the shared reservation (Design 3 step 1) before the job can start.
+        from . import shared_lifecycle  # pylint: disable=import-outside-toplevel
+
+        shared_lifecycle.relay_reserve(
+            store, relay.source, session_id, join.op_id, staff=relay.join == "accept"
+        )
+    return join
+
+
+def _shared_store_on() -> bool:
+    """True when ``shared_store_path`` is set (tp#2372 F3b)."""
+    return bool(config.load_config().shared_store_path)
 
 
 def _idempotency_conflict(
@@ -3649,6 +3662,20 @@ def cmd_thread_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-m
             return 1
         now = now_ms()
         join_thread(store, join, now)
+        if _shared_store_on():
+            # tp#2372 F3b: publish the generation (step 3) before state.db's CAS (step 4).
+            from . import shared_lifecycle  # pylint: disable=import-outside-toplevel
+
+            outcome = shared_lifecycle.relay_commit(
+                store, join.source_session, sid, join.op_id, staff=True
+            )
+            if outcome not in ("accepted", "already"):
+                print(
+                    f"error: op {join.op_id}: shared publication {outcome or 'unavailable'}; "
+                    "the source stays current",
+                    file=sys.stderr,
+                )
+                return 1
         moved = store.settle_thread_join(join.op_id, ACCEPTED, now)
         current = store.thread_join_op(join.op_id) or join
     if current.state != ACCEPTED:
@@ -3679,7 +3706,17 @@ def cmd_thread_handback(args: argparse.Namespace) -> int:
             return 2
         moved = False
         if join.state not in (ACCEPTED, CANCELLED) and not args.dry_run:
-            moved = store.cancel_thread_join(join, now_ms())
+            shared_state = None
+            if _shared_store_on():
+                # tp#2372 F3b: cancel the shared reservation by its op token first; an
+                # accepted shared op means the successor already won (never undone).
+                from . import shared_lifecycle  # pylint: disable=import-outside-toplevel
+
+                shared_state = shared_lifecycle.relay_cancel(store, join.op_id)
+            if shared_state == ACCEPTED:
+                store.settle_thread_join(join.op_id, ACCEPTED, now_ms())
+            else:
+                moved = store.cancel_thread_join(join, now_ms())
         current = store.thread_join_op(join.op_id) or join
     if current.state == ACCEPTED:
         line = f"not cancelled: op {current.op_id} is accepted ({sid} is current)"

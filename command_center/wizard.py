@@ -80,8 +80,10 @@ GROUP_C: tuple[str, ...] = ("copilot_usage", "resume_halted", "reap")
 #: ``auto_switch_on_limit`` is here rather than in a group on purpose: the rate-limit
 #: failover is meaningless until ``claude_accounts`` lists a SECOND account, which this
 #: wizard does not configure — offering it on a first run would ask for consent to bill a
-#: seat that does not exist yet. ``peer_name_from_aim`` renames running Claude sessions
-#: (their peer name): a habit choice for a user who already sets AIMs, not a first-run one.
+#: seat that does not exist yet. ``shared_store_path`` names another tool's database file:
+#: it is set once that file exists, never on a first run. ``peer_name_from_aim`` renames
+#: running Claude sessions (their peer name): a habit choice for a user who already sets
+#: AIMs, not a first-run one.
 UNMAPPED_INERT: tuple[str, ...] = (
     "verify_subgoals_llm",
     "claude_usage",
@@ -91,6 +93,7 @@ UNMAPPED_INERT: tuple[str, ...] = (
     "handoff_hooks",
     "handoff_facts",
     "peer_name_from_aim",
+    "shared_store_path",
 )
 
 #: Anchor keys always written when the user supplies a vault (even if == default).

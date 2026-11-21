@@ -410,6 +410,11 @@ DEFAULTS: dict[str, object] = {
     # {cwd} {transcript} {config_dir} {phase} {tp_ids}. Each prints a typed-record JSON
     # document (see handoff_facts.py). [] = ccc's own facts only (inert).
     "handoff_facts": [],
+    # tp#2372 F3b: the shared SQLite file (tp's store) that holds ccc's thread lifecycle
+    # rows (``ccc_threads`` / ``ccc_sessions`` / ``ccc_thread_successions``). "" = off: no
+    # shared file is opened or written, ccc's own ``state.db`` thread column stays the
+    # source. ccc never creates the file (its owner migrates it).
+    "shared_store_path": "",
     "resume_stagger_sec": 120,  # min seconds between resumes across different repos (anti-herd)
     "resume_poll_sec": 30,  # resume-halted watcher poll interval
     "resume_max_attempts": 3,  # give up auto-resuming a session after this many failed tries
@@ -559,6 +564,7 @@ INERT_DEFAULT_KEYS: tuple[str, ...] = (
     "handoff_hooks",  # no command runs on a continue-session accept ([] = falsy)
     "handoff_facts",  # no fact provider runs on a continue-session collect/start ([] = falsy)
     "peer_name_from_aim",  # no running Claude session is renamed (hook sessionTitle)
+    "shared_store_path",  # no shared thread store is opened or written ("" = falsy)
 )
 
 
@@ -1306,6 +1312,7 @@ class Config:
     accept_hook_retry_sec: int = 420  # accept's hook retry window (0 = off, ≤ 480)
     handoff_auto_accept: bool = True  # the first handoff prompt runs accept (UserPromptSubmit)
     handoff_facts: list[dict[str, object]] = field(default_factory=list)  # fact providers
+    shared_store_path: str = ""  # tp#2372 F3b: the shared thread store ("" = off)
     resume_stagger_sec: int = 120
     resume_poll_sec: int = 30
     resume_max_attempts: int = 3
