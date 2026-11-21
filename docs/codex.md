@@ -415,6 +415,14 @@ Candidates are `codex_homes_in_order(probe=False)` — the pin, rota, cooldowns 
 fill/order ranking — FILTERED by `codex_debate_seats`; the first allowed one in routing
 order wins. An inherited `$CODEX_HOME` narrows them to that home but is still checked
 against the allowlist and the cap (`not_allowed` for a forbidden or unregistered home).
+The WEEK counts too (tp#2495): when a seat's seven-day reading is KNOWN (present, not
+stale, before its reset), its remaining weekly allowance must be at least the learned
+reserve `_headroom_reserve(10080)` (the cost of one full debate; 35 % bootstrap before 10
+samples). Only the value is used, not the offload gate, so there is no ten-minute
+near-reset exception: a seat inside its reserve is `capped` until the weekly reset. Missing
+or stale weekly data never denies. When both limits apply the reason names both and
+`resets_at` is the later reset.
+
 Seats without a fresh five-hour reading (younger than `codex_usage_refresh_sec`, before its
 own reset) get one live fetch; still none → `unknown`. A reading from a window that has
 reset is never read as 0 %.
@@ -433,7 +441,10 @@ The keys are validated together and fail **closed**: a malformed entry, a cap ou
 parse → `unknown`. States: `allowed | capped | not_allowed | unknown | blocked |
 disabled`; exit 0 allowed, 1 a known denial, 3 unknown. The JSON (`schema_version: 1`)
 carries `state, seat, home, email, tier, cap_percent, used_percent, resets_at, reason,
-seats[]`.
+seats[]`, plus the additive weekly fields `weekly_used_percent`, `weekly_reserve_percent`,
+`weekly_reserve_source`, `weekly_resets_at` (`null`/empty when the weekly reading is not
+known) and `window` (`five_hour | seven_day | both` for a `capped` seat, else empty). They
+appear at top level and on every `seats[]` entry; an older reader ignores them.
 
 #### Mid-debate: `debate-seat -c <seat>` (tp#620)
 
@@ -447,11 +458,14 @@ a debate can move seats between rounds. Before each round after the first,
   label (`-x` may name the current seat, e.g. after a mid-round refusal); `-p human` =
   exactly the inherited `$CODEX_HOME`, which must be the `-c` seat (else `unknown`).
 - **continue**: the current seat, refreshed first, has a FRESH five-hour reading below
-  the **pause point**, is not blocked and not excluded.
+  the **pause point**, is not blocked and not excluded, and (known weekly reading only)
+  keeps a weekly remainder of at least reserve / 3.3 (one learned round).
 - **failover** (`-p tool` only): otherwise the first OTHER candidate in routing order
-  that passes the START rule above (fresh reading, below its tier cap).
+  that passes the START rule above (fresh reading, below its tier cap, outside the weekly
+  reserve); a candidate inside its reserve is skipped.
 - **paused**: otherwise. `retry_at` is the earliest time a specific seat clears its
-  actual cause — the five-hour reset (over the pause point / its cap), the blocked row's
+  actual cause — the five-hour reset (over the pause point / its cap), the weekly reset
+  (inside the weekly reserve; the later one when both apply), the blocked row's
   reset (weekly exhaustion, a hold's or cooldown's expiry, the rota's next own week) —
   and `null` when no time is knowable (auth, entitlement, an open-ended block).
   `retry_seat` names that seat. When no seat has any KNOWN cause (none is measurable),
