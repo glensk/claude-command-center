@@ -40,6 +40,13 @@ may file its rows here too, and two optional keys say WHO and WHICH:
   Lines written before the key existed have none and are never hidden.
 * ``caller`` — who asked (``run -X``: ``ai.py:<attempt>``), sanitized like ``note``.
 
+Since 2026-11-21 (tp#2500) a row the RUNNER wrote says so: ``source = "runner"``, and a
+physical attempt that produced a reply carries ``reply_sha256``, the sha256 of the bytes its
+run log stores as ``reply.txt`` (:func:`command_center.codex_runlog.reply_digest`).
+``ccc record-run`` refuses both keys, so a hand-appended row never carries provenance;
+:func:`verify_provenance` (``codex-in-claude provenance -a ID``) re-hashes the stored reply
+against the runner row.
+
 Append-only, best-effort, never raises into the runner: a ledger that cannot be written
 is a missing measurement, not a failed Codex call. Timestamps are local ISO seconds with
 the UTC offset — the same spelling ai.py's own ``calls-*.jsonl`` uses, so the two sort
@@ -57,7 +64,10 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 
     _direct_run(__file__)
 
+# pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import contextlib
+import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -69,7 +79,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import config
+from . import codex_runlog, config
 
 if TYPE_CHECKING:
     from .codex_in_claude import RunResult
@@ -129,6 +139,15 @@ _OPTIONAL: dict[str, type | tuple[type, ...]] = {
     "automated": bool,
     "seat_violation": bool,
 }
+
+#: Keys only the runner writes (tp#2500 provenance): ``ccc record-run`` refuses them.
+SOURCE_RUNNER = "runner"
+RUNNER_ONLY_KEYS = ("reply_sha256", "source")
+
+#: ``codex-in-claude provenance`` exit codes.
+PROVENANCE_VERIFIED = 0
+PROVENANCE_REFUSED = 1  # not found, hand-written row, digest mismatch
+PROVENANCE_UNKNOWN = 3  # the ledger or the stored reply cannot be read
 
 #: The ``outcome`` of a run an automated caller was refused before any seat (tp#1697 B14).
 OUTCOME_SKIPPED = "skipped"
@@ -230,7 +249,11 @@ def attempt_records(
             "write": write,
             "cwd": workdir,
             "session": os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
+            "source": SOURCE_RUNNER,
         }
+        if getattr(attempt, "reply_sha256", ""):
+            # The digest of the reply the attempt's run log stores (tp#2500 provenance).
+            row["reply_sha256"] = attempt.reply_sha256
         if clean_note:
             row["note"] = clean_note
         if clean_caller:
@@ -302,6 +325,7 @@ def record_skip(  # pylint: disable=too-many-arguments
         "session": os.environ.get("CLAUDE_CODE_SESSION_ID", ""),
         "automated": True,
         "error": OUTCOME_SKIPPED,
+        "source": SOURCE_RUNNER,
     }
     for key, value in (("note", note), ("caller", caller), ("job", launchd_job())):
         clean = sanitize_note(value)
@@ -391,6 +415,12 @@ def _check_keys(raw: Any, where: str) -> None:
     version = raw.get("schema_version", SCHEMA_VERSION)
     if version != SCHEMA_VERSION:
         raise ValueError(f"{where}: schema_version {version!r} (this ccc writes {SCHEMA_VERSION})")
+    runner_only = [key for key in RUNNER_ONLY_KEYS if key in raw]
+    if runner_only:
+        raise ValueError(
+            f"{where}: {', '.join(repr(k) for k in runner_only)} only the Codex runner "
+            "writes (provenance), never `ccc record-run`"
+        )
     unknown = sorted(set(raw) - {"schema_version", *_REQUIRED, *_OPTIONAL})
     if unknown:
         raise ValueError(f"{where}: unknown key(s) {', '.join(unknown)}")
@@ -434,6 +464,110 @@ def read_runs(path: Path | None = None) -> list[dict[str, Any]]:
         if isinstance(row, dict) and row.get("ts"):
             rows.append(row)
     return rows
+
+
+def verify_provenance(attempt_id: str, path: Path | None = None) -> tuple[int, dict[str, Any]]:
+    """``(exit code, report)`` for ``codex-in-claude provenance -a ATTEMPT_ID`` (read-only).
+
+    Finds the attempt's RUNNER-written row (``source = "runner"``), re-hashes the
+    ``reply.txt`` its run log stores and compares the digest with the row's
+    ``reply_sha256``. The report is ``{attempt_id, model, seat, purpose, session, ts,
+    reply_sha256, digest_ok, reply_path, verified, why}`` (``why`` empty when verified).
+
+    Exit :data:`PROVENANCE_VERIFIED` (0) only for a runner row whose stored reply hashes
+    to its digest. :data:`PROVENANCE_REFUSED` (1): no row with that id, only hand-written
+    rows (no ``source = "runner"``), a runner row without ``reply_sha256``, a run log that
+    names another attempt or a digest mismatch. :data:`PROVENANCE_UNKNOWN` (3): the ledger
+    or the stored reply cannot be read (a pruned run log, run logs off), or the id is
+    ambiguous (two runner rows). A row ``ccc record-run`` appended under the same id
+    never shadows the runner row.
+    """
+    report: dict[str, Any] = {
+        "attempt_id": attempt_id,
+        "model": None,
+        "seat": None,
+        "purpose": None,
+        "session": None,
+        "ts": None,
+        "reply_sha256": None,
+        "digest_ok": False,
+        "reply_path": None,
+        "verified": False,
+        "why": "",
+    }
+
+    def _done(code: int, why: str) -> tuple[int, dict[str, Any]]:
+        report["why"] = why
+        report["verified"] = code == PROVENANCE_VERIFIED
+        return code, report
+
+    if not attempt_id.strip():
+        return _done(PROVENANCE_REFUSED, "empty attempt id")
+    rows, failure = _rows_of_attempt(attempt_id, ledger_path() if path is None else path)
+    if failure is not None:
+        return _done(*failure)
+    if not rows:
+        return _done(PROVENANCE_REFUSED, "attempt not in the run ledger")
+    runner = [row for row in rows if row.get("source") == SOURCE_RUNNER]
+    row = runner[0] if runner else rows[-1]
+    for key in ("model", "seat", "purpose", "session", "ts"):
+        value = row.get(key)
+        report[key] = value if isinstance(value, str) else None
+    if not runner:
+        return _done(PROVENANCE_REFUSED, "hand-written row (no source = runner)")
+    if len(runner) > 1:
+        return _done(PROVENANCE_UNKNOWN, f"ambiguous: {len(runner)} runner rows")
+    return _done(*_check_stored_reply(row, attempt_id, report))
+
+
+def _rows_of_attempt(
+    attempt_id: str, path: Path
+) -> tuple[list[dict[str, Any]], tuple[int, str] | None]:
+    """Every ledger row naming *attempt_id*, or a ``(code, why)`` when the ledger cannot
+    be read (absent: :data:`PROVENANCE_REFUSED`, unreadable: :data:`PROVENANCE_UNKNOWN`)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return [], (PROVENANCE_REFUSED, "no run ledger")
+    except (OSError, UnicodeDecodeError) as exc:
+        return [], (PROVENANCE_UNKNOWN, f"run ledger unreadable: {type(exc).__name__}")
+    rows: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("attempt_id") == attempt_id:
+            rows.append(row)
+    return rows, None
+
+
+def _check_stored_reply(
+    row: dict[str, Any], attempt_id: str, report: dict[str, Any]
+) -> tuple[int, str]:
+    """``(code, why)`` for the runner *row*: its ``reply_sha256`` against the sha256 of the
+    ``reply.txt`` its run log stores; fills *report*'s digest fields on the way."""
+    digest = row.get("reply_sha256")
+    if not isinstance(digest, str) or not digest:
+        return PROVENANCE_REFUSED, "runner row carries no reply_sha256"
+    report["reply_sha256"] = digest
+    run_dir = row.get("run_dir")
+    if not isinstance(run_dir, str) or not run_dir:
+        return PROVENANCE_UNKNOWN, "runner row names no run log"
+    reply_path = Path(run_dir) / codex_runlog.REPLY_NAME
+    report["reply_path"] = str(reply_path)
+    try:
+        data = reply_path.read_bytes()
+    except OSError as exc:
+        return PROVENANCE_UNKNOWN, f"stored reply unreadable: {type(exc).__name__}"
+    report["digest_ok"] = hmac.compare_digest(hashlib.sha256(data).hexdigest(), digest)
+    if not report["digest_ok"]:
+        return PROVENANCE_REFUSED, "digest mismatch: the stored reply was changed"
+    record = codex_runlog.read_record(Path(run_dir)) or {}
+    if record.get("attempt_id") not in (None, attempt_id):
+        report["digest_ok"] = False
+        return PROVENANCE_REFUSED, "the run log belongs to another attempt"
+    return PROVENANCE_VERIFIED, ""
 
 
 def _reply_relabel_candidate(row: Any) -> bool:

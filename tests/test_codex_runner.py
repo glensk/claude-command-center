@@ -636,6 +636,7 @@ def test_run_cli_envelope_schema(
         "attempts",
         "attempt_ids",  # additive (tp#392): the ledger lines this call wrote
         "run_dir",  # additive: the last physical attempt's run-log directory
+        "reply_sha256",  # additive (tp#2500): the serving attempt's stored-reply digest
         "reply",
         "error",
         "session_id",
@@ -658,6 +659,7 @@ def test_run_cli_envelope_schema(
         "outcome",
         "attempt_id",
         "run_dir",
+        "reply_sha256",
     }
 
 

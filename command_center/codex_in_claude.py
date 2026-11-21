@@ -4869,6 +4869,10 @@ class RunAttempt:  # pylint: disable=too-many-instance-attributes  # flat attemp
     # The attempt's run-log directory (:mod:`codex_runlog`); "" for a skip or when the
     # run log is off / could not be written.
     run_dir: str = ""
+    # sha256 of the attempt's final reply as ``reply.txt`` stores it
+    # (:func:`codex_runlog.reply_digest`); "" when the attempt produced no reply. The
+    # ledger row carries it next to ``source = "runner"`` (tp#2500 provenance).
+    reply_sha256: str = ""
 
 
 @dataclass
@@ -5602,6 +5606,7 @@ class _AttemptDone:  # pylint: disable=too-many-instance-attributes  # one finis
             self.tokens[1],
             attempt_id=self.attempt_id,
             run_dir=self.runlog.dir,
+            reply_sha256=codex_runlog.reply_digest(self.reply),
         )
 
 
@@ -5868,6 +5873,8 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
             record_seat_success(cand)
             result.ok = True
             result.reply = reply or _agent_message_of(events)
+            # The run log stores (and the ledger digests) the reply the caller GETS.
+            done.reply = result.reply
             result.seat = cand
             result.attempts.append(done.finish("ok"))
             if persistent and result.session_id:
@@ -6506,6 +6513,8 @@ def _run_cli_report(result: RunResult, args: argparse.Namespace, model: str, eff
                     "attempt_id": None if a.outcome.startswith("skipped:") else a.attempt_id,
                     # The attempt's run-log directory (`codex-in-claude runlog -s …`).
                     "run_dir": a.run_dir or None,
+                    # The ledger row's digest of this attempt's stored reply (tp#2500).
+                    "reply_sha256": a.reply_sha256 or None,
                 }
                 for a in result.attempts
             ],
@@ -6516,6 +6525,9 @@ def _run_cli_report(result: RunResult, args: argparse.Namespace, model: str, eff
             "attempt_ids": [
                 a.attempt_id for a in result.attempts if not a.outcome.startswith("skipped:")
             ],
+            # sha256 of `reply` as the serving attempt's run log stores it — the digest
+            # `codex-in-claude provenance -a <last attempt_id>` verifies; null unless ok.
+            "reply_sha256": _served_reply_sha256(result),
             "reply": result.reply,
             "error": (
                 None
@@ -6539,6 +6551,35 @@ def _run_cli_report(result: RunResult, args: argparse.Namespace, model: str, eff
             print(f"\n### SESSION\n{result.session_id}")
         return EX_OK
     return _run_error_exit(result)
+
+
+def _served_reply_sha256(result: RunResult) -> str | None:
+    """The serving (last physical) attempt's ``reply_sha256`` for an ok run, else ``None``."""
+    if not result.ok:
+        return None
+    for attempt in reversed(result.attempts):
+        if not attempt.outcome.startswith("skipped:"):
+            return attempt.reply_sha256 or None
+    return None
+
+
+def cmd_provenance(args: argparse.Namespace) -> int:
+    """``provenance -a ID`` — verify one attempt's runner-written reply digest (read-only).
+
+    Exit 0 verified; 1 not found, hand-written (no ``source = "runner"``) or digest
+    mismatch; 3 unknown (the ledger or the stored reply cannot be read). See
+    :func:`codex_ledger.verify_provenance`.
+    """
+    code, info = codex_ledger.verify_provenance(str(args.attempt or ""))
+    if getattr(args, "json", False):
+        print(json.dumps(info))
+        return code
+    for key in ("attempt_id", "verified", "why", "seat", "model", "purpose", "session", "ts"):
+        print(f"{key}: {info.get(key)}")
+    print(f"reply_sha256: {info.get('reply_sha256')}")
+    print(f"digest_ok: {info.get('digest_ok')}")
+    print(f"reply_path: {info.get('reply_path')}")
+    return code
 
 
 def _run_exit_code(result: RunResult) -> int:
@@ -6949,9 +6990,31 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         "--json",
         action="store_true",
         help="one JSON object: {schema_version, model, effort, ok, seat, attempts, "
-        "attempt_ids, reply, error}",
+        "attempt_ids, reply_sha256, reply, error}",
     )
     p_run.set_defaults(func=cmd_run)
+
+    p_prov = sub.add_parser(
+        "provenance",
+        help="verify one attempt's runner-written reply digest (read-only)",
+        description=(
+            "Find the attempt's runner-written ledger row (source = runner), re-hash the "
+            "reply.txt its run log stores and compare with the row's reply_sha256. Exit 0 "
+            "verified; 1 not found, hand-written row or digest mismatch; 3 unknown (the "
+            "ledger or the stored reply cannot be read, e.g. a pruned run log)."
+        ),
+    )
+    p_prov.add_argument(
+        "-a", "--attempt", required=True, metavar="ID", help="the attempt_id (`run -j`)"
+    )
+    p_prov.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help="one JSON object: {attempt_id, model, seat, purpose, session, ts, "
+        "reply_sha256, digest_ok, reply_path, verified, why}",
+    )
+    p_prov.set_defaults(func=cmd_provenance)
 
     p_usage = sub.add_parser("usage", help="show current Codex rate-limit usage (5h + weekly)")
     p_usage.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")

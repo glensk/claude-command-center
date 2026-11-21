@@ -14,6 +14,7 @@ exactly as in `test_codex_runner.py`.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import time
@@ -292,6 +293,48 @@ def test_record_run_refuses_malformed_input_and_writes_nothing(
     assert code == 2, err
     assert reason in err
     assert not _ledger_rows(three_seats), "a malformed batch records nothing"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"reply_sha256": "0" * 64},
+        {"source": "runner"},
+        {"source": "ai.py"},
+        {"reply_sha256": "0" * 64, "source": "runner"},
+    ],
+)
+def test_record_run_refuses_the_runner_only_provenance_keys(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, extra: dict[str, object]
+) -> None:
+    """tp#2500: a hand-appended row never carries provenance — ``reply_sha256`` and
+    ``source`` are the runner's alone, refused with exit 2 and nothing written."""
+    code, err = _record(monkeypatch, [_claude_row(), _claude_row(**extra)])
+    assert code == 2, err
+    assert "only the Codex runner writes" in err
+    assert next(iter(extra)) in err
+    assert not _ledger_rows(three_seats)
+    with pytest.raises(ValueError, match="only the Codex runner writes"):
+        codex_ledger.validate_row(_claude_row(**extra))
+
+
+def test_runner_rows_say_source_runner_and_carry_the_reply_digest(
+    three_seats: SeatFixture,
+) -> None:
+    """Every physical attempt the runner files is ``source = "runner"``; the one that
+    produced a reply carries ``reply_sha256`` over the bytes its run log stores."""
+    three_seats.scenarios(private="refuse_quota", de={"scenario": "ok", "reply": "de answered"})
+    assert cic.cmd_run(_run_ns(three_seats)) == cic.EX_OK
+    refused, served = _ledger_rows(three_seats)
+    assert refused["source"] == served["source"] == codex_ledger.SOURCE_RUNNER
+    assert "reply_sha256" not in refused, "a refused attempt wrote no reply"
+    assert served["reply_sha256"] == hashlib.sha256(b"de answered").hexdigest()
+
+
+def test_a_skip_row_is_a_runner_row_without_a_digest(three_seats: SeatFixture) -> None:
+    assert codex_ledger.record_skip(purpose="checker") == 1
+    (row,) = _ledger_rows(three_seats)
+    assert row["source"] == codex_ledger.SOURCE_RUNNER and "reply_sha256" not in row
 
 
 def test_record_run_takes_the_positional_dash_and_a_file(

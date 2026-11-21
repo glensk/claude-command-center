@@ -21,7 +21,11 @@ says otherwise), named ``<YYYYmmddTHHMMSS>-<purpose>[-<note>]-<session8>-<attemp
     run was not ephemeral. Written when the attempt STARTS (``status: running``) and
     rewritten when it ends, so a runner that was itself killed still leaves a record.
 ``prompt.txt`` / ``events.jsonl`` / ``stderr.log`` / ``reply.txt``
-    What codex was given, its ``--json`` event stream, its stderr and its ``-o`` reply.
+    What codex was given, its ``--json`` event stream, its stderr and its final reply.
+    ``reply.txt`` is the provenance anchor (tp#2500): its bytes are exactly what
+    :func:`reply_bytes` makes of the reply, ``run.json`` and the attempt's ledger row
+    carry their ``reply_sha256`` and ``codex-in-claude provenance -a ID`` re-hashes the
+    file against the ledger row.
 
 Everything written passes :func:`scrub` (API keys, bearer tokens, JWTs, Slack/GitHub
 tokens → ``[redacted]``); files are ``0600`` in ``0700`` directories. Retention runs on
@@ -78,6 +82,7 @@ DEFAULT_MAX_MB = 500
 
 SCHEMA_VERSION = 1
 RECORD_NAME = "run.json"
+REPLY_NAME = "reply.txt"
 
 #: One cause line is a diagnosis, never a log: capped where it is BUILT, so the ERROR line,
 #: the ``-j`` envelope and the ledger all carry the same bounded text.
@@ -122,6 +127,18 @@ def one_line(text: str, limit: int = CAUSE_CHARS) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
+def reply_bytes(reply: str) -> bytes:
+    """The exact bytes ``reply.txt`` holds for *reply*: scrubbed like every run-log file,
+    UTF-8 encoded. :func:`reply_digest` hashes these bytes, never the unscrubbed text."""
+    return scrub(reply).encode("utf-8")
+
+
+def reply_digest(reply: str) -> str:
+    """``sha256`` hex of :func:`reply_bytes` — the ledger row's ``reply_sha256``; ``""``
+    for an empty reply (no ``reply.txt`` is written then)."""
+    return hashlib.sha256(reply_bytes(reply)).hexdigest() if reply else ""
+
+
 def _env_int(name: str, default: int) -> int:
     """``$name`` as a non-negative int; *default* when unset or garbage."""
     raw = os.environ.get(name, "").strip()
@@ -155,11 +172,17 @@ def _iso(epoch: float) -> str:
 
 
 def _write_private(path: Path, text: str) -> None:
-    """Write *text* to *path* atomically with mode 0600."""
+    """Write *text* (UTF-8) to *path* atomically with mode 0600."""
+    _write_private_bytes(path, text.encode("utf-8"))
+
+
+def _write_private_bytes(path: Path, data: bytes) -> None:
+    """Write *data* to *path* atomically with mode 0600, byte for byte (no newline or
+    encoding translation: the provenance digest covers these exact bytes)."""
     handle, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write(text)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(data)
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except BaseException:
@@ -311,7 +334,8 @@ class RunLog:  # pylint: disable=too-many-instance-attributes  # the record's id
             self._file("events.jsonl", stdout)
             self._file("stderr.log", stderr)
             if reply:
-                self._file("reply.txt", reply)
+                _write_private_bytes(self.path / REPLY_NAME, reply_bytes(reply))
+                self.record["reply_sha256"] = reply_digest(reply)
             home = self.record.get("codex_home") or ""
             rollout = (
                 "" if self.record.get("ephemeral") else find_rollout(home, thread_id, self._t0)
