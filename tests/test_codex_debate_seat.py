@@ -3,12 +3,12 @@
 The rule (owner decision, 2026-09-26): a debate never STARTS on a seat whose five-hour
 reading is at/above the item's cap — 70 % strict, 75 % default — nor outside the allowlist.
 Missing five-hour evidence (tp#2494) stays a per-seat ``unknown``, but after the refresh
-such a seat is tried in routing order (codex order) exactly like ``codex-review.py
-_order_pick``; only evaluator, policy, input and crash failures remain a top-level
+such a seat is tried in routing order (codex order), the first tryable ``seats[]`` entry;
+only evaluator, policy, input and crash failures remain a top-level
 fail-closed ``unknown``. Mid-debate (``-c``) an unmeasured current pin is kept and a
 tool pin fails over to the first tryable candidate. Guarded here: the cap boundaries,
 the allowlist, an inherited ``$CODEX_HOME``, a reading from a window that has reset, a
-policy that does not parse, and the parity with ``_order_pick`` (start and ``-c``).
+policy that does not parse, and the first-tryable rule (start and ``-c``).
 """
 # pylint: disable=too-many-lines  # one module covers the debate start, continue and reserve gates
 
@@ -990,12 +990,14 @@ def test_top_level_weekly_fields_on_every_result(weekly: SeatFixture) -> None:
 
 # --------------------------------------------------------------------------- #
 # Unmeasured seats are tried in codex order (tp#2494): the first ``allowed`` or
-# ``unknown`` seat with a home wins, exactly as ``codex-review.py _order_pick`` picks.
+# ``unknown`` seat with a home wins (the rule codex-review.py relies on, tp#2515).
 # --------------------------------------------------------------------------- #
 
 
-def _order_pick(verdict: dict, *, skip: tuple[str, ...] | list[str] = (), role: str = "") -> dict:
-    """Restated verbatim from ``codex-review.py _order_pick`` (tp#2493), for parity."""
+def _first_tryable(
+    verdict: dict, *, skip: tuple[str, ...] | list[str] = (), role: str = ""
+) -> dict:
+    """The tp#2494 rule: first ``seats[]`` entry with a label, a home, a tryable state."""
     seats = verdict.get("seats")
     for entry in seats if isinstance(seats, list) else []:
         if not isinstance(entry, dict):
@@ -1205,12 +1207,12 @@ def _parity_setup(fixture: SeatFixture, label: str, setup: str, now: int) -> Non
 
 @pytest.mark.parametrize("first", _PARITY_STATES)
 @pytest.mark.parametrize("second", _PARITY_STATES)
-def test_parity_with_codex_review_order_pick(weekly: SeatFixture, first: str, second: str) -> None:
+def test_verdict_is_first_tryable_seat(weekly: SeatFixture, first: str, second: str) -> None:
     now = int(time.time())
     for label, setup in (("private", first), ("de", second)):
         _parity_setup(weekly, label, setup, now)
     verdict = _verdict()
-    pick = _order_pick(verdict)
+    pick = _first_tryable(verdict)
     if pick:
         assert verdict["state"] == "allowed"
         assert verdict["seat"] == pick["seat"]
@@ -1220,8 +1222,8 @@ def test_parity_with_codex_review_order_pick(weekly: SeatFixture, first: str, se
         assert cic._DEBATE_EXIT[verdict["state"]] == 1  # noqa: SLF001
 
 
-def test_parity_table_on_synthetic_entries() -> None:
-    """Homeless and label-less entries, mixed states: ccc picks what _order_pick picks."""
+def test_first_tryable_table_on_synthetic_entries() -> None:
+    """Homeless and label-less entries, mixed states: ccc picks the first tryable one."""
     rows = [
         [_synthetic("a", "capped"), _synthetic("b", "unknown"), _synthetic("c", "allowed")],
         [_synthetic("a", "blocked"), _synthetic("b", "allowed")],
@@ -1232,7 +1234,7 @@ def test_parity_table_on_synthetic_entries() -> None:
     ]
     for seats in rows:
         verdict = cic._debate_pick(seats, "default")  # noqa: SLF001
-        pick = _order_pick(verdict)
+        pick = _first_tryable(verdict)
         assert (verdict["state"] == "allowed") == bool(pick)
         if pick:
             assert verdict["seat"] == pick["seat"]
@@ -1240,7 +1242,7 @@ def test_parity_table_on_synthetic_entries() -> None:
 
 # --------------------------------------------------------------------------- #
 # Mid-debate (tp#2494 B2): an unmeasured current pin is kept, and a tool pin fails over
-# to the first TRYABLE candidate in routing order, as ``codex-review.py`` does.
+# to the first TRYABLE candidate in routing order (codex-review.py relies on it, tp#2515).
 # --------------------------------------------------------------------------- #
 
 
@@ -1276,7 +1278,7 @@ def test_excluded_unknown_current_fails_over_to_the_first_unmeasured_candidate(
         None,
     )
     assert _roles(verdict) == {"private": "excluded", "de": "candidate", "default": "candidate"}
-    assert _order_pick(verdict, skip=["private"], role="candidate")["seat"] == "de"
+    assert _first_tryable(verdict, skip=["private"], role="candidate")["seat"] == "de"
 
 
 def test_human_pin_unknown_current_continues(
@@ -1325,7 +1327,7 @@ def test_all_candidates_capped_or_blocked_still_pauses_with_retry_at(trio: SeatF
         "blocked",
     ]
     assert (verdict["retry_at"], verdict["retry_seat"]) == (now + _HOUR, "default")
-    assert _order_pick(verdict, skip=["private"], role="candidate") == {}
+    assert _first_tryable(verdict, skip=["private"], role="candidate") == {}
 
 
 # The current seat's setups: the parity states plus an unmeasured seat the caller excluded.
@@ -1335,11 +1337,11 @@ _CURRENT_STATES = ("allowed", "unknown", "unknown_excluded", "capped", "weekly_s
 @pytest.mark.parametrize("current", _CURRENT_STATES)
 @pytest.mark.parametrize("second", _PARITY_STATES)
 @pytest.mark.parametrize("third", _PARITY_STATES)
-def test_continue_parity_with_codex_review_order_pick(
+def test_continue_verdict_is_first_tryable_candidate(
     trio: SeatFixture, current: str, second: str, third: str
 ) -> None:
     """``-c``: the pin is kept when tryable, else ccc fails over to what
-    ``_order_pick(role="candidate")`` picks, else it pauses (exit 1)."""
+    ``_first_tryable(role="candidate")`` picks, else it pauses (exit 1)."""
     now = int(time.time())
     excluded = current == "unknown_excluded"
     _parity_setup(trio, "private", "unknown" if excluded else current, now)
@@ -1351,7 +1353,7 @@ def test_continue_parity_with_codex_review_order_pick(
         assert (verdict["state"], verdict["seat"]) == ("continue", "private")
         assert verdict["used_percent"] == cur["used_percent"]
         return
-    pick = _order_pick(verdict, skip=["private"], role="candidate")
+    pick = _first_tryable(verdict, skip=["private"], role="candidate")
     if pick:
         assert (verdict["state"], verdict["seat"]) == ("failover", pick["seat"])
         assert verdict["used_percent"] == pick["used_percent"]

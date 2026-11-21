@@ -426,7 +426,7 @@ or stale weekly data never denies. When both limits apply the reason names both 
 
 Seats without a fresh five-hour reading (younger than `codex_usage_refresh_sec`, before its
 own reset) get one live fetch; still none → the seat's own entry is `unknown`, but it is
-still TRIED in codex order (tp#2494, the rule `codex-review.py` applies too): when it is
+still TRIED in codex order (tp#2494; `codex-review.py` relies on this verdict, tp#2515): when it is
 the first tryable seat, the verdict is `allowed` (exit 0) with `used_percent: null` and
 the reason `seat X unmeasured (no fresh five-hour reading); tried in codex order`; the
 text form prints `5h unmeasured`. A seat that is `capped` (five-hour or weekly — a known
@@ -471,7 +471,7 @@ a debate can move seats between rounds. Before each round after the first,
   **pause point** or is unmeasured (tp#2494: no fresh five-hour reading after the
   refresh — its `seats[]` entry stays `unknown`, the verdict is `continue` with
   `used_percent: null`, for `-p tool` and `-p human` alike; the text form prints
-  `5h unmeasured`). This is the pin `codex-review.py` keeps too.
+  `5h unmeasured`). This is the pin `codex-review.py` relies on (tp#2515).
 - **failover** (`-p tool` only): otherwise the first OTHER candidate in routing order
   that is TRYABLE — it passes the START rule above (fresh reading, below its tier cap,
   outside the weekly reserve) or it is unmeasured (`used_percent: null`); a measured seat
