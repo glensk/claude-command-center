@@ -76,7 +76,7 @@ from . import config, seat_rota, usagecache
 from .codex_in_claude import (
     _FIVE_HOUR_MINUTES,
     _SEVEN_DAY_MINUTES,
-    _latest_rate_limits_event,
+    _rollout_scan,
     codex_refusal,
     refusal_label,
     short_refusal_label,
@@ -171,18 +171,22 @@ _OPENCODE_ACCENT = "#39c5cf"
 _OVERLAY_ON_FILL = "#11131f"  # dark glyphs over the bright "used" portion
 
 # read_codex_usage scans at most this many newest rollout files for a *usable*
-# rate_limits block before giving up, and caches the parse by the newest file's
-# (path, mtime). Kept generous because short ``codex exec`` runs (the ones ccc itself
+# rate_limits block before giving up, and caches the merged result on every scanned
+# file's fingerprint. Kept generous because short ``codex exec`` runs (the ones ccc itself
 # spawns for short-aim/delegate) log a windowless ``limit_id: "premium"`` block and
 # nothing else, so dozens of them can pile up newer than the freshest interactive
 # session that actually carries the 5h/weekly windows — observed >25 deep. Each file
-# is small JSONL and the result is cached, so a deep scan stays cheap (~tens of ms).
+# is read tail-first once per process (``codex_in_claude._rollout_evidence``, tp#2513),
+# so a deep scan stays cheap (a cold pass reads only each file's tail).
 _CODEX_SCAN_LIMIT = 200
+# ``(path, st_dev, st_ino, st_size, st_mtime_ns)`` of one file; all zero when it is absent.
+_FileKey = tuple[str, int, int, int, int]
+_NO_FILE: _FileKey = ("", 0, 0, 0, 0)
 # CODEX_HOME (as a string) -> (cache key, parsed snapshot). Keyed per home because the
 # TUI renders two Codex cards from two homes on the same tick, and a single slot would
-# then miss on every one of them. Each key pairs the newest rollout file's (path, mtime)
-# with the live cache file's, so ANY new data invalidates it and nothing else does.
-_codex_cache: dict[str, tuple[tuple[str, int, str, int], Usage | None]] = {}
+# then miss on every one of them. Each key is the fingerprint of EVERY scanned rollout
+# file plus the live cache file's, so ANY new data invalidates it and nothing else does.
+_codex_cache: dict[str, tuple[tuple[_FileKey, ...], Usage | None]] = {}
 
 # The live ChatGPT usage endpoint — exactly what the web *Settings → Usage* page reads.
 # Authorized by the ChatGPT OAuth access token Codex stores in ``$CODEX_HOME/auth.json``
@@ -1582,6 +1586,11 @@ def _list_rollout_dir(
 
 def _codex_rollout_files(home: Path) -> list[Path]:
     """*home*'s session rollout files, newest mtime first ( ``[]`` when there are none)."""
+    return [Path(name) for name, _st in _codex_rollout_stats(home)]
+
+
+def _codex_rollout_stats(home: Path) -> list[tuple[str, os.stat_result]]:
+    """``(path, stat)`` of *home*'s rollout files, newest mtime first (one stat each)."""
     root = str(home / "sessions")
     cache = _rollout_listing.setdefault(root, {})
     seen: set[str] = set()
@@ -1592,24 +1601,27 @@ def _codex_rollout_files(home: Path) -> list[Path]:
         return []
     for stale in set(cache) - seen:  # directories that vanished since the last call
         del cache[stale]
-    stamped: list[tuple[float, str]] = []
+    stamped: list[tuple[str, os.stat_result]] = []
     for name in names:
         try:
-            stamped.append((os.stat(name).st_mtime, name))
+            stamped.append((name, os.stat(name)))
         except OSError:  # a rollout deleted between the listing and the stat
             continue
-    stamped.sort(key=lambda item: item[0], reverse=True)
-    return [Path(name) for _, name in stamped]
+    stamped.sort(key=lambda item: item[1].st_mtime, reverse=True)
+    return stamped
 
 
-def _path_key(path: Path | None) -> tuple[str, int]:
-    """``(path, mtime_ns)`` cache key for *path*; ``("", 0)`` when it does not exist."""
-    if path is None:
-        return ("", 0)
+def _file_key(name: str, st: os.stat_result) -> _FileKey:
+    """The aggregate-cache fingerprint of one file."""
+    return (name, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _path_key(path: Path) -> _FileKey:
+    """:func:`_file_key` of *path*; :data:`_NO_FILE` when it does not exist."""
     try:
-        return (str(path), int(path.stat().st_mtime_ns))
+        return _file_key(str(path), path.stat())
     except OSError:
-        return ("", 0)
+        return _NO_FILE
 
 
 def _codex_rollout_snapshot(files: list[Path], now: int) -> Usage | None:
@@ -1621,13 +1633,12 @@ def _codex_rollout_snapshot(files: list[Path], now: int) -> Usage | None:
     file sat at position 0 by mtime, so breaking on the first hit returned a 08-25
     reading of 19% while the real newest event said 81%. ``_codex_rate_snapshot`` in
     codex_in_claude.py already picks by ``max(captured_at)``; this mirrors it.
+
+    Each file is answered by the per-process rollout evidence memo, so a re-merge after
+    a live-cache rewrite reads no rollout bytes.
     """
     freshest = max(
-        (
-            rate_snapshot
-            for path in files[:_CODEX_SCAN_LIMIT]
-            if (rate_snapshot := _latest_rate_limits_event(path)) is not None
-        ),
+        (ev.rate for ev in _rollout_scan(files[:_CODEX_SCAN_LIMIT]) if ev.rate is not None),
         key=lambda item: item.captured_at,
         default=None,
     )
@@ -1690,13 +1701,16 @@ def read_codex_usage(now: int | None = None, home: Path | None = None) -> Usage 
     own rollouts — reading the pin-effective home here used to staple a private seat's
     refusal onto the team seat's row whenever a pin was active.
 
-    Parsing is cached per home on the newest rollout file's and the live cache's
-    ``(path, mtime)`` so the 5 s TUI refresh stays cheap when idle.
+    The merged result is cached per home on the fingerprint of every scanned rollout
+    file plus the live cache's, so the 5 s TUI refresh stays cheap when idle and a change
+    to ANY scanned file (not just the newest) invalidates it. A miss re-merges from the
+    per-file rollout evidence memo, which re-reads only files whose fingerprint moved.
     """
     now = int(time.time()) if now is None else now
     home = config.codex_home() if home is None else home
-    files = _codex_rollout_files(home)
-    key = _path_key(files[0] if files else None) + _path_key(_codex_usage_path(home))
+    stats = _codex_rollout_stats(home)[:_CODEX_SCAN_LIMIT]
+    files = [Path(name) for name, _st in stats]
+    key = (*(_file_key(name, st) for name, st in stats), _path_key(_codex_usage_path(home)))
     cached = _codex_cache.get(str(home))
     if cached is not None and cached[0] == key:
         return cached[1]
@@ -1704,7 +1718,7 @@ def read_codex_usage(now: int | None = None, home: Path | None = None) -> Usage 
     # A refusal lives in the windowless blocks the window scan skips, so it is read
     # separately: the windows keep reporting the last healthy figures while Codex rejects
     # every call, and only this field says so.
-    refusal = codex_refusal(home)
+    refusal = codex_refusal(home, files=files)
     live = read_codex_live(home)
     snapshot: Usage | None
     if live is not None and (rollout is None or live.captured_at >= rollout.captured_at):

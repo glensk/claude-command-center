@@ -2784,30 +2784,11 @@ def _latest_rate_limits_event(path: Path) -> _CodexRateSnapshot | None:
     Skips windowless ``premium`` blocks (both windows null) that short ``codex exec``
     runs log. A malformed non-null window is returned as such so safety decisions can
     fail closed instead of silently falling back to an older, apparently healthy event.
+
+    Answered from the per-file evidence memo (:func:`_rollout_evidence`): one tail-first
+    pass per file serves this and :func:`_latest_limit_block` alike.
     """
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        fallback = int(path.stat().st_mtime)
-    except OSError:
-        return None
-    for line in reversed(lines):
-        if '"rate_limits"' not in line:
-            continue
-        try:
-            obj = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        rate_limits = _dig_rate_limits(obj)
-        if rate_limits is None:
-            continue
-        windows, malformed = _windows_by_duration(rate_limits)
-        if windows or malformed:
-            return _CodexRateSnapshot(
-                captured_at=_event_timestamp(obj, fallback),
-                windows=windows,
-                malformed=malformed,
-            )
-    return None
+    return _rollout_evidence(path).rate
 
 
 @dataclass(frozen=True)
@@ -2865,30 +2846,227 @@ def _latest_limit_block(path: Path) -> _CodexRefusal | None:
     happily reports the last healthy percentages while every call is being rejected.
     ``reached_type`` is empty when the newest block records no refusal.
     """
+    return _rollout_evidence(path).refusal
+
+
+# ── rollout evidence: one tail-first pass per file, memoised per process (tp#2513) ──
+# Both per-file answers sit near the END of a rollout, so the file is read backwards in
+# binary chunks and the walk stops as soon as both are known. Only lines holding
+# ``"rate_limits"`` are decoded and parsed; everything else is skipped as raw bytes. The
+# first chunk is small (the answer is usually in the last few KiB) and each further one
+# doubles up to ``_ROLLOUT_CHUNK``, so a deep walk still needs few reads.
+_ROLLOUT_FIRST_CHUNK = 16 * 1024
+_ROLLOUT_CHUNK = 256 * 1024
+_RATE_LIMITS_NEEDLE = b'"rate_limits"'
+# ``(st_dev, st_ino, st_size, st_mtime_ns)``: an append, a rewrite and a same-size,
+# same-mtime replacement (new inode) all change it.
+_RolloutFingerprint = tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _RolloutEvidence:
+    """Both per-file answers: the newest windowed (or malformed) block, the newest block."""
+
+    rate: _CodexRateSnapshot | None
+    refusal: _CodexRefusal | None
+
+
+_NO_ROLLOUT_EVIDENCE = _RolloutEvidence(rate=None, refusal=None)
+# CODEX_HOME partition -> canonical rollout path -> (fingerprint, evidence). ONE entry per
+# path; each partition is pruned to its home's current scan set by :func:`_rollout_scan`,
+# which bounds the long-lived TUI process. Rollouts are static once a run ends, so every
+# process after the first lookup reads no rollout bytes for an unchanged file.
+_rollout_memo: dict[str, dict[str, tuple[_RolloutFingerprint, _RolloutEvidence]]] = {}
+_rollout_memo_lock = threading.Lock()
+
+
+def _rollout_fingerprint(st: os.stat_result) -> _RolloutFingerprint:
+    """The memo identity of a rollout file's stat result."""
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _rollout_partition(canonical: str) -> str:
+    """The CODEX_HOME a canonical rollout path belongs to (the dir above ``sessions/``)."""
+    head, sep, _tail = canonical.rpartition(f"{os.sep}sessions{os.sep}")
+    return head if sep else os.path.dirname(canonical)
+
+
+def _scan_rollout_lines(lines: list[bytes], fallback: int, found: dict[str, Any]) -> bool:
+    """Feed *lines* (newest first) into *found*; True once both answers are known.
+
+    ``found`` holds ``refusal`` (the newest block of any kind) and ``rate`` (the newest
+    windowed or malformed block). A candidate line is decoded and split exactly like the
+    old whole-file ``read_text().splitlines()`` did, so the answers are identical.
+    """
+    for raw in lines:
+        if _RATE_LIMITS_NEEDLE not in raw:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        for line in reversed(text.splitlines()):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            rate_limits = _dig_rate_limits(obj)
+            if rate_limits is None:
+                continue
+            captured_at = _event_timestamp(obj, fallback)
+            if found.get("refusal") is None:
+                reached = rate_limits.get("rate_limit_reached_type")
+                found["refusal"] = _CodexRefusal(
+                    captured_at=captured_at,
+                    reached_type=reached.strip() if isinstance(reached, str) else "",
+                )
+            windows, malformed = _windows_by_duration(rate_limits)
+            if windows or malformed:
+                found["rate"] = _CodexRateSnapshot(
+                    captured_at=captured_at, windows=windows, malformed=malformed
+                )
+                return True
+    return False
+
+
+def _read_rollout_tail(path: str) -> tuple[_RolloutEvidence, _RolloutFingerprint]:
+    """One backwards pass over *path*: its evidence and the fingerprint of what was read.
+
+    Reads from the end in chunks growing from ``_ROLLOUT_FIRST_CHUNK`` to
+    ``_ROLLOUT_CHUNK`` bytes, carrying the partial first line of each chunk into the next
+    one; a line longer than a chunk is joined once, not re-copied per chunk. Raises
+    :class:`OSError` when the file cannot be read.
+    """
+    with open(path, "rb") as handle:  # noqa: PTH123  # module-level ``open`` is the test seam
+        st = os.fstat(handle.fileno())
+        fallback = int(st.st_mtime)
+        found: dict[str, Any] = {}
+        pos = st.st_size
+        partial: list[bytes] = []  # pieces of the line that continues past the last chunk
+        size = min(_ROLLOUT_FIRST_CHUNK, _ROLLOUT_CHUNK)
+        while pos > 0:
+            start = max(0, pos - size)
+            size = min(size * 2, _ROLLOUT_CHUNK)
+            handle.seek(start)
+            chunk = handle.read(pos - start)
+            pos = start
+            if pos > 0 and b"\n" not in chunk:
+                partial.append(chunk)  # still inside one long line
+                continue
+            data = chunk + b"".join(reversed(partial)) if partial else chunk
+            lines = data.split(b"\n")
+            partial = [lines[0]] if pos > 0 else []
+            body = lines[1:] if pos > 0 else lines
+            if _scan_rollout_lines(body[::-1], fallback, found):
+                break
+    evidence = _RolloutEvidence(rate=found.get("rate"), refusal=found.get("refusal"))
+    return evidence, _rollout_fingerprint(st)
+
+
+def _rollout_tail_blocks(
+    path: Path,
+) -> tuple[_CodexRateSnapshot | None, _CodexRefusal | None]:
+    """``(newest windowed block, newest block)`` of one rollout, read tail-first, unmemoised."""
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        fallback = int(path.stat().st_mtime)
+        evidence, _fingerprint = _read_rollout_tail(str(path))
+    except OSError:
+        return None, None
+    return evidence.rate, evidence.refusal
+
+
+def _canonical_rollout(path: Path, dirs: dict[str, str] | None = None) -> str:
+    """*path* with its directory resolved; *dirs* caches the resolution within one scan.
+
+    Rollout files are regular files, so resolving the directory (once per day dir, not
+    once per file) is what makes two spellings of one CODEX_HOME share a memo entry.
+    """
+    parent, name = os.path.split(os.fspath(path))
+    if dirs is None:
+        return os.path.join(os.path.realpath(parent), name)
+    resolved = dirs.get(parent)
+    if resolved is None:
+        resolved = dirs[parent] = os.path.realpath(parent)
+    return os.path.join(resolved, name)
+
+
+def _rollout_evidence_at(
+    path: Path, dirs: dict[str, str] | None = None
+) -> tuple[str, _RolloutEvidence]:
+    """``(canonical path, evidence)`` for one rollout, through the per-process memo.
+
+    A memo entry is used only while the file's fingerprint still matches. After a parse
+    the file is re-stat'ed: a fingerprint that moved during the read (an append, a
+    replacement) retries once, and a result is never stored under a fingerprint that
+    does not describe the bytes it came from — it is returned uncached instead.
+    """
+    canonical = _canonical_rollout(path, dirs)
+    try:
+        current = _rollout_fingerprint(os.stat(canonical))
+    except OSError:
+        return canonical, _NO_ROLLOUT_EVIDENCE
+    partition = _rollout_partition(canonical)
+    with _rollout_memo_lock:
+        entry = _rollout_memo.get(partition, {}).get(canonical)
+    if entry is not None and entry[0] == current:
+        return canonical, entry[1]
+    evidence = _NO_ROLLOUT_EVIDENCE
+    for _attempt in range(2):
+        try:
+            evidence, read_as = _read_rollout_tail(canonical)
+            after = _rollout_fingerprint(os.stat(canonical))
+        except OSError:
+            return canonical, _NO_ROLLOUT_EVIDENCE
+        if read_as == after:
+            with _rollout_memo_lock:
+                _rollout_memo.setdefault(partition, {})[canonical] = (after, evidence)
+            return canonical, evidence
+    return canonical, evidence
+
+
+def _rollout_evidence(path: Path) -> _RolloutEvidence:
+    """Memoised evidence for one rollout file (see :func:`_rollout_evidence_at`)."""
+    return _rollout_evidence_at(path)[1]
+
+
+def _rollout_scan(files: list[Path]) -> list[_RolloutEvidence]:
+    """Evidence for every file of a home's scan set, then prune that home's memo to it.
+
+    *files* is the complete scan set (already cut to the scan limit); memo entries of
+    the same CODEX_HOME partition that are no longer in it are dropped.
+    """
+    keep: dict[str, set[str]] = {}
+    results: list[_RolloutEvidence] = []
+    dirs: dict[str, str] = {}
+    for path in files:
+        canonical, evidence = _rollout_evidence_at(path, dirs)
+        keep.setdefault(_rollout_partition(canonical), set()).add(canonical)
+        results.append(evidence)
+    with _rollout_memo_lock:
+        for partition, paths in keep.items():
+            entries = _rollout_memo.get(partition)
+            if entries is None:
+                continue
+            for stale in [name for name in entries if name not in paths]:
+                del entries[stale]
+    return results
+
+
+def _home_rollout_files(home: Path | None) -> list[Path] | None:
+    """*home*'s newest ``_CODEX_SCAN_LIMIT`` rollout files by mtime; ``None`` on an error."""
+    sessions = (home if home is not None else _codex_home()) / "sessions"
+    try:
+        files = sorted(
+            sessions.glob("**/rollout-*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
     except OSError:
         return None
-    for line in reversed(lines):
-        if '"rate_limits"' not in line:
-            continue
-        try:
-            obj = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        rate_limits = _dig_rate_limits(obj)
-        if rate_limits is None:
-            continue
-        raw = rate_limits.get("rate_limit_reached_type")
-        return _CodexRefusal(
-            captured_at=_event_timestamp(obj, fallback),
-            reached_type=raw.strip() if isinstance(raw, str) else "",
-        )
-    return None
+    return files[:_CODEX_SCAN_LIMIT]
 
 
-def codex_refusal(home: Path | None = None) -> _CodexRefusal | None:
+def codex_refusal(
+    home: Path | None = None, *, files: list[Path] | None = None
+) -> _CodexRefusal | None:
     """The live refusal recorded in *home*'s rollouts (default: the effective home).
 
     Only the NEWEST block across recent rollout files decides: an older refusal that a
@@ -2904,21 +3082,14 @@ def codex_refusal(home: Path | None = None) -> _CodexRefusal | None:
     completed normally minutes before the block appeared — so it says nothing about
     whether calls are being refused. ``rate_limit_reached_type`` is ``null`` while
     healthy and carries the reason once refusals start.
+
+    *files* is *home*'s rollout listing, newest mtime first, when the caller already
+    holds it (``usage.read_codex_usage``); the scan then skips its own directory walk.
     """
-    sessions = (home if home is not None else _codex_home()) / "sessions"
-    try:
-        files = sorted(
-            sessions.glob("**/rollout-*.jsonl"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-    except OSError:
+    scan = _home_rollout_files(home) if files is None else files[:_CODEX_SCAN_LIMIT]
+    if scan is None:
         return None
-    blocks = [
-        block
-        for path in files[:_CODEX_SCAN_LIMIT]
-        if (block := _latest_limit_block(path)) is not None
-    ]
+    blocks = [ev.refusal for ev in _rollout_scan(scan) if ev.refusal is not None]
     newest = max(blocks, key=lambda item: item.captured_at, default=None)
     return newest if newest is not None and newest.reached_type else None
 
@@ -2931,20 +3102,10 @@ def _codex_rate_snapshot(home: Path | None = None) -> _CodexRateSnapshot | None:
     the answer with another seat's name is the misattribution the per-seat rows exist
     to prevent (the same rule as :func:`codex_refusal`).
     """
-    sessions = (home if home is not None else _codex_home()) / "sessions"
-    try:
-        files = sorted(
-            sessions.glob("**/rollout-*.jsonl"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-    except OSError:
+    scan = _home_rollout_files(home)
+    if scan is None:
         return None
-    snapshots = [
-        snapshot
-        for path in files[:_CODEX_SCAN_LIMIT]
-        if (snapshot := _latest_rate_limits_event(path)) is not None
-    ]
+    snapshots = [ev.rate for ev in _rollout_scan(scan) if ev.rate is not None]
     return max(snapshots, key=lambda item: item.captured_at, default=None)
 
 
@@ -3851,8 +4012,8 @@ _DEBATE_EXIT = {
 # ``debate-seat -c`` (tp#620): 0 keep going (same or new seat), 1 paused, 3 unknown.
 _DEBATE_CONTINUE_EXIT = {"continue": 0, "failover": 0, "paused": 1, "disabled": 1, "unknown": 3}
 DEBATE_PINS = ("tool", "human")
-# Seat states a debate may be TRIED on, mirrored from ``codex-review.py``'s
-# ``_TRYABLE_SEAT_STATES`` (tp#2493/tp#2494): measured below its cap, or unmeasured.
+# Seat states a debate may be TRIED on; ``codex-review.py`` relies on this verdict
+# (tp#2515): measured below its cap, or unmeasured (tp#2494).
 _DEBATE_TRYABLE_STATES = ("allowed", "unknown")
 
 
@@ -4066,7 +4227,7 @@ def _debate_pick(seats: list[dict[str, Any]], tier: str) -> dict[str, Any]:
     """Fold the per-seat entries (routing order) into the pool verdict.
 
     The winner is the FIRST tryable entry in routing order (tp#2494, the rule
-    ``codex-review.py _order_pick`` applies client-side). An unmeasured winner
+    ``codex-review.py`` relies on it, tp#2515). An unmeasured winner
     (per-seat ``unknown``, kept as such in ``seats[]``) is promoted to a top-level
     ``allowed`` with ``used_percent`` null; no new JSON key.
     """
