@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """The hook side of ccc's shared thread rows (tp#2372 F3b, Designs 4 and 7).
 
 Each function here is called by one hook handler, opens the shared store only when
@@ -17,6 +18,15 @@ SessionStart, per ``source`` (what the installed Claude Code mints, docs/SPEC.md
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct.py
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+    from command_center._direct import run as _direct_run
+
+    _direct_run(__file__)
 
 import sqlite3
 from typing import TYPE_CHECKING
