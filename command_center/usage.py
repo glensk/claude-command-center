@@ -73,11 +73,11 @@ from rich.cells import cell_len
 from rich.text import Text
 
 from . import config, seat_rota, usagecache
-from .codex_in_claude import (
+from .codex_rollout import (
     _FIVE_HOUR_MINUTES,
     _SEVEN_DAY_MINUTES,
     _rollout_scan,
-    codex_refusal,
+    latest_refusal,
     refusal_label,
     short_refusal_label,
 )
@@ -176,7 +176,7 @@ _OVERLAY_ON_FILL = "#11131f"  # dark glyphs over the bright "used" portion
 # spawns for short-aim/delegate) log a windowless ``limit_id: "premium"`` block and
 # nothing else, so dozens of them can pile up newer than the freshest interactive
 # session that actually carries the 5h/weekly windows — observed >25 deep. Each file
-# is read tail-first once per process (``codex_in_claude._rollout_evidence``, tp#2513),
+# is read tail-first once per process (``codex_rollout._rollout_evidence``, tp#2513),
 # so a deep scan stays cheap (a cold pass reads only each file's tail).
 _CODEX_SCAN_LIMIT = 200
 # ``(path, st_dev, st_ino, st_size, st_mtime_ns)`` of one file; all zero when it is absent.
@@ -269,7 +269,7 @@ class Usage:  # pylint: disable=too-many-instance-attributes  # flat snapshot re
     # Codex only: non-empty when Codex is REFUSING calls for a reason that is not a
     # window — today `workspace_owner_credits_depleted`. The windows above stay whatever
     # the last successful call reported, so without this the card shows healthy headroom
-    # while nothing works. See :func:`codex_in_claude.codex_refusal`.
+    # while nothing works. See :func:`codex_rollout.latest_refusal`.
     blocked_reason: str = ""
     blocked_at: int = 0  # epoch seconds of the refusal that set ``blocked_reason``
     # Codex only: True when the windows came from the LIVE usage endpoint
@@ -361,7 +361,7 @@ _TEMP_PATTERNS = (
     # :mod:`.quota`'s observed-rejection store writes through _atomic_write_json too, so a
     # killed writer strands the same shape of orphan here.
     "cooldowns.json.*.tmp",
-    # codex_in_claude's persistent rollout evidence manifest (tp#2513).
+    # codex_rollout's persistent rollout evidence manifest (tp#2513).
     "codex-rollout-evidence-v1.json.*.tmp",
 )
 # A live temp exists for well under a millisecond, so an hour is ~7 orders of margin.
@@ -1205,7 +1205,7 @@ def _wham_blocked_reason(data: dict) -> str:
     """Why Codex is refusing calls right now, or ``""`` when it is not.
 
     ``rate_limit_reached_type.type`` names the reason when there is one (mapped through
-    :func:`codex_in_claude.refusal_label`, so the wording matches the rollout-sourced
+    :func:`codex_rollout.refusal_label`, so the wording matches the rollout-sourced
     refusal exactly). Failing that, an ``allowed: false`` / ``limit_reached: true`` rate
     limit is a plain window exhaustion.
     """
@@ -1696,7 +1696,7 @@ def read_codex_usage(now: int | None = None, home: Path | None = None) -> Usage 
     * the newest windowed ``rate_limits`` block Codex wrote onto a ``token_count`` event
       in ``<home>/sessions/**/rollout-*.jsonl`` — as old as the last Codex turn.
 
-    A live refusal (:func:`codex_in_claude.codex_refusal`) is read separately from the
+    A live refusal (:func:`codex_rollout.latest_refusal`) is read separately from the
     windowless blocks the window scan skips and stapled on, EXCEPT when the chosen live
     snapshot is already newer than it (the endpoint reports the block itself, and its
     windows are the ones that actually filled). The refusal is scanned from THIS home's
@@ -1720,7 +1720,7 @@ def read_codex_usage(now: int | None = None, home: Path | None = None) -> Usage 
     # A refusal lives in the windowless blocks the window scan skips, so it is read
     # separately: the windows keep reporting the last healthy figures while Codex rejects
     # every call, and only this field says so.
-    refusal = codex_refusal(home, files=files)
+    refusal = latest_refusal(files)
     live = read_codex_live(home)
     snapshot: Usage | None
     if live is not None and (rollout is None or live.captured_at >= rollout.captured_at):

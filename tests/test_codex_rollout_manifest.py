@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from command_center import codex_in_claude as cic
+from command_center import codex_rollout as cro
 from command_center import config, usage
 
 _WINDOWED = {
@@ -83,8 +84,8 @@ def _seat(home: Path) -> dict[str, Path]:
 
 def _new_process() -> None:
     """Forget everything a process keeps in memory: the memo and the loaded manifest."""
-    cic._rollout_memo.clear()  # noqa: SLF001
-    cic._rollout_manifest_state.update(path=None, disk={})  # noqa: SLF001
+    cro._rollout_memo.clear()  # noqa: SLF001
+    cro._rollout_manifest_state.update(path=None, disk={})  # noqa: SLF001
 
 
 @pytest.fixture(autouse=True)
@@ -111,7 +112,7 @@ def _count_opens(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
             opens[key] = opens.get(key, 0) + 1
         return real_open(file, *args, **kwargs)  # pylint: disable=consider-using-with
 
-    monkeypatch.setattr(cic, "open", counting_open, raising=False)
+    monkeypatch.setattr(cro, "open", counting_open, raising=False)
     return opens
 
 
@@ -123,7 +124,7 @@ def _verdict(home: Path) -> tuple[Any, ...]:
         reverse=True,
     )
     per_file = tuple(
-        (cic._latest_rate_limits_event(p), cic._latest_limit_block(p))  # noqa: SLF001
+        (cro._latest_rate_limits_event(p), cro._latest_limit_block(p))  # noqa: SLF001
         for p in files
     )
     return (
@@ -139,7 +140,7 @@ def _real(path: Path) -> str:
 
 
 def _partition(home: Path) -> str:
-    return cic._rollout_partition(  # noqa: SLF001
+    return cro._rollout_partition(  # noqa: SLF001
         _real(home / "sessions" / "2026" / "10" / "26" / "rollout-x.jsonl")
     )
 
@@ -361,12 +362,12 @@ def test_changed_fingerprint_invalidates_only_that_entry(
     verdict = _verdict(home)
     assert opens == {_real(target): 1}
     assert verdict[1] is not None
-    assert verdict[1].captured_at == cic._event_timestamp(  # noqa: SLF001
+    assert verdict[1].captured_at == cro._event_timestamp(  # noqa: SLF001
         {"timestamp": "2026-10-27T09:00:00Z"}, 0
     )
     stored = json.loads(_manifest().read_text(encoding="utf-8"))
     entry = stored["homes"][_partition(home)][_real(target)]
-    assert tuple(entry["fingerprint"]) == cic._rollout_fingerprint(target.stat())  # noqa: SLF001
+    assert tuple(entry["fingerprint"]) == cro._rollout_fingerprint(target.stat())  # noqa: SLF001
 
 
 def test_same_size_same_mtime_replacement_is_reparsed(

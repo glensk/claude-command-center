@@ -20,7 +20,7 @@ from types import ModuleType
 import pytest
 from conftest import SeatFixture
 
-from command_center import codex_launch
+from command_center import codex_launch, codex_rollout
 from command_center.models import job_launch_prefix
 from command_center.store import Store
 
@@ -1311,7 +1311,7 @@ def test_headroom_blocked_by_refusal_despite_window_headroom(
     snapshot = cic._CodexRateSnapshot(
         captured_at=_HEADROOM_NOW,
         windows={
-            300: cic._CodexRateWindow(
+            300: codex_rollout._CodexRateWindow(
                 used_percent=5.0, resets_at=_HEADROOM_NOW + 9000, window_minutes=300
             )
         },

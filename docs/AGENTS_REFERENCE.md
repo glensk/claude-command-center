@@ -142,6 +142,8 @@ The invariants that keep it under a few seconds:
   fingerprint: a changed fingerprint invalidates the entry, an unchanged file costs one
   `stat` and no read. The manifest is disposable and fail-open: delete it any time; a
   corrupt, foreign or unwritable one just means a cold parse, never a different verdict.
+  It lives in `codex_rollout.py`, a leaf below both `codex_in_claude` and `usage`, so
+  neither imports the other for it (tp#2522); keep it free of imports of either.
   `debate-seat` refresh fetches (`_debate_refresh`) run in parallel daemon threads under one
   hard 20 s deadline (15 s per-fetch cap); a fetch still running at the deadline leaves its
   seat `unknown` (tryable in routing order). Final verdicts are never cached.

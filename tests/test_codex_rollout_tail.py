@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from command_center import codex_in_claude as cic
+from command_center import codex_rollout as cro
 from command_center import quota, usage
 
 
@@ -51,7 +52,7 @@ _MALFORMED = {
 
 # ── reference implementations: the pre-tp#2513 whole-file readers, verbatim ──────────
 # pylint: disable=duplicate-code
-def _ref_rate(path: Path) -> cic._CodexRateSnapshot | None:  # noqa: SLF001
+def _ref_rate(path: Path) -> cro._CodexRateSnapshot | None:  # noqa: SLF001
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         fallback = int(path.stat().st_mtime)
@@ -64,20 +65,20 @@ def _ref_rate(path: Path) -> cic._CodexRateSnapshot | None:  # noqa: SLF001
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
-        rate_limits = cic._dig_rate_limits(obj)  # noqa: SLF001
+        rate_limits = cro._dig_rate_limits(obj)  # noqa: SLF001
         if rate_limits is None:
             continue
-        windows, malformed = cic._windows_by_duration(rate_limits)  # noqa: SLF001
+        windows, malformed = cro._windows_by_duration(rate_limits)  # noqa: SLF001
         if windows or malformed:
-            return cic._CodexRateSnapshot(  # noqa: SLF001
-                captured_at=cic._event_timestamp(obj, fallback),  # noqa: SLF001
+            return cro._CodexRateSnapshot(  # noqa: SLF001
+                captured_at=cro._event_timestamp(obj, fallback),  # noqa: SLF001
                 windows=windows,
                 malformed=malformed,
             )
     return None
 
 
-def _ref_block(path: Path) -> cic._CodexRefusal | None:  # noqa: SLF001
+def _ref_block(path: Path) -> cro._CodexRefusal | None:  # noqa: SLF001
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         fallback = int(path.stat().st_mtime)
@@ -90,12 +91,12 @@ def _ref_block(path: Path) -> cic._CodexRefusal | None:  # noqa: SLF001
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
-        rate_limits = cic._dig_rate_limits(obj)  # noqa: SLF001
+        rate_limits = cro._dig_rate_limits(obj)  # noqa: SLF001
         if rate_limits is None:
             continue
         raw = rate_limits.get("rate_limit_reached_type")
-        return cic._CodexRefusal(  # noqa: SLF001
-            captured_at=cic._event_timestamp(obj, fallback),  # noqa: SLF001
+        return cro._CodexRefusal(  # noqa: SLF001
+            captured_at=cro._event_timestamp(obj, fallback),  # noqa: SLF001
             reached_type=raw.strip() if isinstance(raw, str) else "",
         )
     return None
@@ -108,9 +109,9 @@ def _ref_block(path: Path) -> cic._CodexRefusal | None:  # noqa: SLF001
 @pytest.fixture(autouse=True)
 def _fresh_memo() -> Iterator[None]:
     """Every test starts (and ends) with an empty per-process rollout memo."""
-    cic._rollout_memo.clear()  # noqa: SLF001
+    cro._rollout_memo.clear()  # noqa: SLF001
     yield
-    cic._rollout_memo.clear()  # noqa: SLF001
+    cro._rollout_memo.clear()  # noqa: SLF001
 
 
 def _event(rate_limits: dict | None, ts: str | None = None) -> str:
@@ -213,13 +214,13 @@ def test_tail_reader_matches_full_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str, chunks: tuple[int, int]
 ) -> None:
     """``chunks`` = (first, max) chunk size; small ones put lines across boundaries."""
-    monkeypatch.setattr(cic, "_ROLLOUT_FIRST_CHUNK", chunks[0])
-    monkeypatch.setattr(cic, "_ROLLOUT_CHUNK", chunks[1])
+    monkeypatch.setattr(cro, "_ROLLOUT_FIRST_CHUNK", chunks[0])
+    monkeypatch.setattr(cro, "_ROLLOUT_CHUNK", chunks[1])
     path = _rollout(tmp_path / "home", case, _CASES[case], mtime=1782000000)
     expected = (_ref_rate(path), _ref_block(path))
-    assert cic._rollout_tail_blocks(path) == expected  # noqa: SLF001
-    assert cic._latest_rate_limits_event(path) == expected[0]  # noqa: SLF001
-    assert cic._latest_limit_block(path) == expected[1]  # noqa: SLF001
+    assert cro._rollout_tail_blocks(path) == expected  # noqa: SLF001
+    assert cro._latest_rate_limits_event(path) == expected[0]  # noqa: SLF001
+    assert cro._latest_limit_block(path) == expected[1]  # noqa: SLF001
 
 
 def test_cases_exercise_both_answers() -> None:
@@ -230,9 +231,9 @@ def test_cases_exercise_both_answers() -> None:
 
 def test_missing_file_is_no_evidence(tmp_path: Path) -> None:
     missing = tmp_path / "rollout-missing.jsonl"
-    assert cic._rollout_tail_blocks(missing) == (None, None)  # noqa: SLF001
-    assert cic._latest_rate_limits_event(missing) is None  # noqa: SLF001
-    assert cic._latest_limit_block(missing) is None  # noqa: SLF001
+    assert cro._rollout_tail_blocks(missing) == (None, None)  # noqa: SLF001
+    assert cro._latest_rate_limits_event(missing) is None  # noqa: SLF001
+    assert cro._latest_limit_block(missing) is None  # noqa: SLF001
 
 
 def test_newest_event_not_in_newest_mtime_file(tmp_path: Path) -> None:
@@ -316,7 +317,7 @@ def _count_opens(
         hook = (lambda: on_open(name)) if on_open is not None else None
         return _CountingFile(handle, ledger, hook)
 
-    monkeypatch.setattr(cic, "open", counting_open, raising=False)
+    monkeypatch.setattr(cro, "open", counting_open, raising=False)
     return ledger
 
 
@@ -331,11 +332,11 @@ def test_big_file_is_answered_from_its_tail(
     body = filler * ((20 * 1024 * 1024) // len(filler)) + tail
     path = _rollout(tmp_path / "home", "big", body)
     ledger = _count_opens(monkeypatch)
-    rate, refusal = cic._rollout_tail_blocks(path)  # noqa: SLF001
+    rate, refusal = cro._rollout_tail_blocks(path)  # noqa: SLF001
     assert rate is not None
     assert refusal is not None
     assert refusal.reached_type == "workspace_owner_credits_depleted"
-    assert 0 < ledger["bytes"] <= 2 * cic._ROLLOUT_CHUNK  # noqa: SLF001
+    assert 0 < ledger["bytes"] <= 2 * cro._ROLLOUT_CHUNK  # noqa: SLF001
 
 
 def _seat_rollouts(fixture_seats: dict[str, Path]) -> list[Path]:
@@ -384,17 +385,17 @@ def test_touch_and_inode_replacement_are_reread(
 ) -> None:
     path = _rollout(tmp_path / "home", "a", _lines(_event(_WINDOWED)), mtime=1782000000)
     ledger = _count_opens(monkeypatch)
-    first = cic._latest_rate_limits_event(path)  # noqa: SLF001
-    assert cic._latest_rate_limits_event(path) == first  # noqa: SLF001
+    first = cro._latest_rate_limits_event(path)  # noqa: SLF001
+    assert cro._latest_rate_limits_event(path) == first  # noqa: SLF001
     assert sum(ledger["opens"].values()) == 1
 
     os.utime(path, (1782000100, 1782000100))  # mtime moves
-    cic._latest_rate_limits_event(path)  # noqa: SLF001
+    cro._latest_rate_limits_event(path)  # noqa: SLF001
     assert sum(ledger["opens"].values()) == 2
 
     with path.open("ab") as handle:  # size moves
         handle.write(_lines(_event(_REFUSED)))
-    assert cic._latest_limit_block(path) is not None  # noqa: SLF001
+    assert cro._latest_limit_block(path) is not None  # noqa: SLF001
     assert sum(ledger["opens"].values()) == 3
 
     # Same size, same mtime_ns, new inode: only st_ino tells them apart.
@@ -408,7 +409,7 @@ def test_touch_and_inode_replacement_are_reread(
     os.replace(tmp, path)
     assert path.stat().st_ino != st.st_ino
     assert path.stat().st_mtime_ns == st.st_mtime_ns
-    rate = cic._latest_rate_limits_event(path)  # noqa: SLF001
+    rate = cro._latest_rate_limits_event(path)  # noqa: SLF001
     assert rate is not None
     assert rate.windows[300].used_percent == 99.0
     assert sum(ledger["opens"].values()) == 4
@@ -428,14 +429,14 @@ def test_append_during_read_is_not_cached_stale(
             handle.write(_lines(_event(_REFUSED)))
 
     ledger = _count_opens(monkeypatch, append_once)
-    refusal = cic._latest_limit_block(path)  # noqa: SLF001
+    refusal = cro._latest_limit_block(path)  # noqa: SLF001
     # The first pass read a stale fingerprint; the retry saw the append and was stored.
     assert sum(ledger["opens"].values()) == 2
     assert refusal is not None
     assert refusal.reached_type == "workspace_owner_credits_depleted"
     canonical = os.path.realpath(path)
-    stored = cic._rollout_memo[cic._rollout_partition(canonical)][canonical]  # noqa: SLF001
-    assert stored[0] == cic._rollout_fingerprint(path.stat())  # noqa: SLF001
+    stored = cro._rollout_memo[cro._rollout_partition(canonical)][canonical]  # noqa: SLF001
+    assert stored[0] == cro._rollout_fingerprint(path.stat())  # noqa: SLF001
 
 
 def test_append_on_every_read_is_returned_uncached(
@@ -448,18 +449,18 @@ def test_append_on_every_read_is_returned_uncached(
             handle.write(_lines(*_filler()))
 
     ledger = _count_opens(monkeypatch, append_always)
-    assert cic._latest_rate_limits_event(path) is not None  # noqa: SLF001
+    assert cro._latest_rate_limits_event(path) is not None  # noqa: SLF001
     assert sum(ledger["opens"].values()) == 2  # one retry, then give up caching
     canonical = os.path.realpath(path)
-    partition = cic._rollout_partition(canonical)  # noqa: SLF001
-    assert canonical not in cic._rollout_memo.get(partition, {})  # noqa: SLF001
+    partition = cro._rollout_partition(canonical)  # noqa: SLF001
+    assert canonical not in cro._rollout_memo.get(partition, {})  # noqa: SLF001
 
 
 def _memo_names(home: Path) -> set[str]:
-    partition = cic._rollout_partition(  # noqa: SLF001
+    partition = cro._rollout_partition(  # noqa: SLF001
         os.path.realpath(home / "sessions" / "x" / "rollout-x.jsonl")
     )
-    return {os.path.basename(name) for name in cic._rollout_memo.get(partition, {})}  # noqa: SLF001
+    return {os.path.basename(name) for name in cro._rollout_memo.get(partition, {})}  # noqa: SLF001
 
 
 def test_memo_is_pruned_to_the_scan_set_per_home(
