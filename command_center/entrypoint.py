@@ -39,8 +39,16 @@ kill switch and rollback lever).
 
 stdin (read once, when ``--capture-usage`` is given or no ``--session``) is put back as an
 :class:`io.StringIO` before any fall-through, so ``cli`` reads the same text. Everything is
-read and rendered first; only then come the usage-cache write, the role-mark sync and the
-single stdout write. No session id at all: the usage write only, no output.
+read and rendered first; only then come the usage-cache write, the role-mark sync, the
+shared-store beat and the single stdout write. No session id at all: the usage write only,
+no output.
+
+The statusline is a named ``last_beat`` source (tp#2372 Design 7, :func:`_statusline_beat`):
+with ``shared_store_path`` unset it touches no shared file and imports nothing more. On, it
+reads the session's stored beat without a lock and writes nothing while that beat is
+younger than 60 s, the hook beat's throttle; a stale beat is one guarded update (the guards
+of :mod:`.shared_store`, restated stdlib-only) with a 0 s busy timeout, skipped when another
+connection holds the write lock. A beat never changes the output or the exit status.
 
 Each output is computed whole (:func:`command_center.bars.aim_line`,
 :func:`command_center.slrender.statusline_text`, shared with ``cli``) before the single
@@ -264,7 +272,17 @@ STATUSLINE_CONFIG_DEFAULTS: dict[str, Any] = {
     "aim_history": True,
     "aim_score_threshold": 50,
     "claude_accounts": [],
+    "shared_store_path": "",
 }
+#: :mod:`.shared_store`'s beat throttle and guard names without importing it (it loads
+#: ``config``); ``tests/test_statusline_beat.py`` pins each equality.
+BEAT_INTERVAL_MS = 60_000
+SHARED_COMPONENT_KEY = "ccc_shared_schema"
+SHARED_COMPONENT_VERSION = "1"
+SHARED_BACKEND_KEY = "backend"
+SHARED_MAINTENANCE = "maintenance"
+SHARED_EPOCH_KEY = "holder_authority_epoch"
+SHARED_PINS_TABLE = "shared_store_pins"
 
 
 class SessionView:  # pylint: disable=too-many-instance-attributes,too-few-public-methods  # a row
@@ -505,6 +523,142 @@ def _read_stdin_preserved() -> str:
     return raw
 
 
+def _beat_path(cfg: dict[str, Any]) -> str:
+    """``shared_store.configured_path`` from the light config: ``""`` when the store is off."""
+    raw = cfg.get("shared_store_path")
+    raw = raw.strip() if isinstance(raw, str) else ""
+    return os.path.expanduser(raw) if raw else ""
+
+
+def _pinned_epoch(app_home: str) -> str | None:
+    """The authority epoch ccc pinned in ``state.db`` (``SharedStore.pinned_epoch``), read-only.
+
+    ``None`` when nothing is pinned yet (or the table is missing): the statusline never
+    pins, the guarded hook writes do (``SharedStore._tx``).
+    """
+    try:
+        con = sqlite3.connect(_sqlite_uri(os.path.join(app_home, "state.db")), uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        row = con.execute(
+            f"SELECT value FROM {SHARED_PINS_TABLE} WHERE key = 'epoch'"  # noqa: S608
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    return None if row is None else str(row[0])
+
+
+def _beat_timing_row(hold_ms: float, db: str) -> None:
+    """``shared_store._timing_row`` for the statusline beat (verb ``beat_statusline``)."""
+    raw = os.environ.get("TP_TIMING_LOG", "").strip()
+    if not raw:
+        return
+    import json
+    from datetime import UTC, datetime
+
+    row = {
+        "kind": "ccc_write",
+        "verb": "beat_statusline",
+        "hold_ms": round(hold_ms, 2),
+        "db": db,
+        "at": datetime.now(UTC).isoformat(timespec="milliseconds"),
+    }
+    try:
+        path = os.path.expanduser(raw)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def _beat_guard_ok(con: sqlite3.Connection, pinned: str) -> bool:
+    """``SharedStore._guard`` inside the write transaction: component, maintenance, epoch."""
+    meta = {
+        str(key): None if value is None else str(value)
+        for key, value in con.execute(
+            "SELECT key, value FROM meta WHERE key IN (?, ?, ?)",
+            (SHARED_COMPONENT_KEY, SHARED_BACKEND_KEY, SHARED_EPOCH_KEY),
+        )
+    }
+    return (
+        meta.get(SHARED_COMPONENT_KEY) == SHARED_COMPONENT_VERSION
+        and meta.get(SHARED_BACKEND_KEY) != SHARED_MAINTENANCE
+        and meta.get(SHARED_EPOCH_KEY) == pinned
+    )
+
+
+def _beat_write(con: sqlite3.Connection, sid: str, now_ms: int, pinned: str) -> float | None:
+    """The guarded one-row beat update; the write-lock hold in ms, ``None`` if nothing written.
+
+    ``BEGIN IMMEDIATE`` with a 0 s busy timeout raises at once when another connection
+    holds the write lock (the caller skips the beat).
+    """
+    import time
+
+    con.execute("BEGIN IMMEDIATE")
+    started = time.perf_counter()
+    try:
+        written = _beat_guard_ok(con, pinned) and (
+            con.execute(
+                "UPDATE ccc_sessions SET last_beat = ? WHERE session_id = ? "
+                "AND COALESCE(last_beat, 0) < ?",
+                (now_ms, sid, now_ms - BEAT_INTERVAL_MS),
+            ).rowcount
+            > 0
+        )
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    if not written:
+        con.execute("ROLLBACK")
+        return None
+    con.execute("COMMIT")
+    return (time.perf_counter() - started) * 1000
+
+
+def _statusline_beat(app_home: str, shared_path: str, sid: str) -> bool:
+    """The statusline's throttled ``last_beat`` (tp#2372 Design 7); True if written.
+
+    Stdlib only, like the rest of this module (a write run imports neither ``config``
+    nor ``shared_store``). The hook beat's contract (``SharedStore.beat``): the stored
+    beat is read first without a lock and a beat younger than :data:`BEAT_INTERVAL_MS`
+    writes nothing; a due beat is one ``BEGIN IMMEDIATE`` with a 0 s busy timeout (a held
+    write lock skips it), the same guards as ``SharedStore._guard`` (component version,
+    maintenance flag, the epoch ccc pinned; nothing pinned yet = skip) and one timing row.
+    Never raises: a beat is advisory.
+    """
+    import time
+
+    try:
+        if not os.path.isfile(shared_path):
+            return False
+        now = int(time.time() * 1000)
+        con = sqlite3.connect(shared_path, timeout=0, isolation_level=None)
+        try:
+            con.execute("PRAGMA busy_timeout = 0")
+            row = con.execute(
+                "SELECT last_beat FROM ccc_sessions WHERE session_id = ?", (sid,)
+            ).fetchone()
+            if row is None or int(row[0] or 0) >= now - BEAT_INTERVAL_MS:
+                return False
+            pinned = _pinned_epoch(app_home)
+            if pinned is None:
+                return False
+            hold = _beat_write(con, sid, now, pinned)
+        finally:
+            con.close()
+        if hold is None:
+            return False
+        _beat_timing_row(hold, shared_path)
+        return True
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught  # advisory
+        return False
+
+
 def statusline_output(argv: list[str], now: int) -> tuple[str, Any]:
     """Read and render everything ``ccc statusline`` needs; ``(stdout text, writes)``.
 
@@ -554,8 +708,11 @@ def _statusline_plan(
         if account is not None and isinstance(rate_limits, dict):
             usage_write = (rate_limits, account, usagecache.account_config_dir(account, dirs))
     text = ""
+    beat_path = ""
     if sid:
-        text = _statusline_rows(app_home, sid, cfg or statusline_config(app_home), now)
+        cfg = cfg or statusline_config(app_home)
+        text = _statusline_rows(app_home, sid, cfg, now)
+        beat_path = _beat_path(cfg)
 
     def writes() -> None:
         if usage_write is not None:
@@ -568,6 +725,8 @@ def _statusline_plan(
                 pass
         if sid:
             rolemark.sync_role_mark(sid)  # tp#1288: the shell status line's leading badge
+            if beat_path:
+                _statusline_beat(app_home, beat_path, sid)  # tp#2372 Design 7
 
     return text, writes
 
