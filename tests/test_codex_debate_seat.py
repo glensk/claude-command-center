@@ -1,11 +1,15 @@
 """Tests for the Codex DEBATE start caps (tp#619): ``codex-in-claude debate-seat``.
 
-The rule (owner decision, 2026-09-26): a debate may START only on an allowed seat whose FRESH
-five-hour reading is below the item's cap — 70 % strict, 75 % default. Everything that
-could make the gate allow a debate it should refuse is guarded here: the cap boundaries,
-the allowlist, an inherited ``$CODEX_HOME``, a reading from a window that has reset, and
-a policy that does not parse.
+The rule (owner decision, 2026-09-26): a debate never STARTS on a seat whose five-hour
+reading is at/above the item's cap — 70 % strict, 75 % default — nor outside the allowlist.
+Missing five-hour evidence (tp#2494) stays a per-seat ``unknown``, but after the refresh
+such a seat is tried in routing order (codex order) exactly like ``codex-review.py
+_order_pick``; only evaluator, policy, input and crash failures remain a top-level
+fail-closed ``unknown``. Guarded here: the cap boundaries, the allowlist, an inherited
+``$CODEX_HOME``, a reading from a window that has reset, a policy that does not parse,
+and the parity with ``_order_pick``.
 """
+# pylint: disable=too-many-lines  # one module covers the debate start, continue and reserve gates
 
 from __future__ import annotations
 
@@ -154,12 +158,20 @@ def test_routing_order_not_config_order_decides(
     assert _verdict()["seat"] == "de"
 
 
+def _assert_unmeasured_first(verdict: dict) -> None:
+    """The first routed seat wins unmeasured: top-level allowed, per-seat still unknown."""
+    assert verdict["state"] == "allowed"
+    assert verdict["seat"] == verdict["seats"][0]["seat"]
+    assert verdict["used_percent"] is None
+    assert "unmeasured" in verdict["reason"]
+
+
 def test_reading_from_a_reset_window_is_unknown(seats: SeatFixture) -> None:
     now = int(time.time())
     for label in seats.seats:
         _live(seats.seats[label], 5.0, now=now, resets_in=-60)
     verdict = _verdict()
-    assert verdict["state"] == "unknown"
+    _assert_unmeasured_first(verdict)
     assert all(seat["state"] == "unknown" for seat in verdict["seats"])
 
 
@@ -167,7 +179,9 @@ def test_old_reading_is_unknown(seats: SeatFixture) -> None:
     now = int(time.time())
     for label in seats.seats:
         _live(seats.seats[label], 5.0, now=now, age=3600)
-    assert _verdict()["state"] == "unknown"
+    verdict = _verdict()
+    _assert_unmeasured_first(verdict)
+    assert all(seat["state"] == "unknown" for seat in verdict["seats"])
 
 
 def test_refresh_that_yields_a_fresh_reading_is_judged_on_it(
@@ -184,7 +198,9 @@ def test_refresh_that_yields_a_fresh_reading_is_judged_on_it(
         assert timeout is not None
 
     monkeypatch.setattr(usage, "fetch_codex_usage", _fetch)
-    assert cic.debate_seat_verdict(tier="strict", now=now)["state"] == "unknown"
+    stale = cic.debate_seat_verdict(tier="strict", now=now)
+    _assert_unmeasured_first(stale)
+    assert stale["seats"][0]["state"] == "unknown"
     assert not fetched  # no live fetch without the `codex_usage` opt-in
     path = three_seats.ccc_home / "command-center" / "config.toml"
     path.write_text(
@@ -857,7 +873,8 @@ def test_both_limits_name_both_and_take_the_later_reset(
 def test_weekly_capped_first_seat_keeps_the_order_with_an_unknown_next(
     weekly: SeatFixture,
 ) -> None:
-    """(g) a weekly-capped first seat and an unmeasured second keep the routing order."""
+    """(g) a weekly-capped first seat and an unmeasured second keep the routing order;
+    the unmeasured second is tried (tp#2494)."""
     now = int(time.time())
     _week(weekly.seats["private"], 20.0, 99.0, now=now)
     _week(weekly.seats["de"], 20.0, 10.0, now=now, age=_HOUR)
@@ -866,7 +883,7 @@ def test_weekly_capped_first_seat_keeps_the_order_with_an_unknown_next(
         ("private", "capped"),
         ("de", "unknown"),
     ]
-    assert verdict["state"] == "capped"
+    assert (verdict["state"], verdict["seat"], verdict["used_percent"]) == ("allowed", "de", None)
 
 
 def test_current_pin_uses_the_one_round_floor(weekly: SeatFixture) -> None:
@@ -947,3 +964,245 @@ def test_top_level_weekly_fields_on_every_result(weekly: SeatFixture) -> None:
     # the empty shape (a refusal before any seat is judged) carries them too
     empty = cic._debate_result("unknown", "default", "x")  # noqa: SLF001
     assert all(key in empty for key in _WEEKLY_FIELDS)
+
+
+# --------------------------------------------------------------------------- #
+# Unmeasured seats are tried in codex order (tp#2494): the first ``allowed`` or
+# ``unknown`` seat with a home wins, exactly as ``codex-review.py _order_pick`` picks.
+# --------------------------------------------------------------------------- #
+
+
+def _order_pick(verdict: dict, *, skip: tuple[str, ...] | list[str] = (), role: str = "") -> dict:
+    """Restated verbatim from ``codex-review.py _order_pick`` (tp#2493), for parity."""
+    seats = verdict.get("seats")
+    for entry in seats if isinstance(seats, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("seat") or "")
+        if not label or label in skip or not entry.get("home"):
+            continue
+        if role and entry.get("role") != role:
+            continue
+        if entry.get("state") in ("allowed", "unknown"):
+            return entry
+    return {}
+
+
+def test_stale_seat_ahead_of_a_measured_one_wins(weekly: SeatFixture) -> None:
+    now = int(time.time())
+    _week(weekly.seats["private"], 5.0, 10.0, now=now, age=_HOUR)
+    _week(weekly.seats["de"], 10.0, 10.0, now=now)
+    verdict = _verdict()
+    assert (verdict["state"], verdict["seat"], verdict["used_percent"]) == (
+        "allowed",
+        "private",
+        None,
+    )
+    assert verdict["reason"] == (
+        "seat private unmeasured (no fresh five-hour reading); tried in codex order"
+    )
+    assert _entry(verdict, "private")["state"] == "unknown"
+    assert _entry(verdict, "de")["state"] == "allowed"
+
+
+def test_capped_seat_ahead_of_an_unmeasured_one_gives_the_unmeasured_one(
+    weekly: SeatFixture,
+) -> None:
+    now = int(time.time())
+    _week(weekly.seats["private"], 90.0, 10.0, now=now)
+    _week(weekly.seats["de"], 10.0, 10.0, now=now, age=_HOUR)
+    verdict = _verdict()
+    assert (verdict["state"], verdict["seat"], verdict["used_percent"]) == ("allowed", "de", None)
+    assert _entry(verdict, "private")["state"] == "capped"
+
+
+def test_unmeasured_seat_inside_its_weekly_reserve_is_skipped(weekly: SeatFixture) -> None:
+    now = int(time.time())
+    _week(weekly.seats["private"], 5.0, 99.0, now=now, age=_HOUR)
+    _week(weekly.seats["de"], 5.0, 10.0, now=now, age=_HOUR)
+    verdict = _verdict()
+    assert _entry(verdict, "private")["state"] == "capped"
+    assert (verdict["state"], verdict["seat"]) == ("allowed", "de")
+    assert verdict["weekly_used_percent"] == 10.0  # projected through _debate_project
+
+
+def test_inherited_stale_codex_home_is_tried(
+    seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    now = int(time.time())
+    _configure(seats, 'codex_debate_seats = ["private", "de"]')
+    _live(seats.seats["de"], 5.0, now=now, age=_HOUR)
+    _live(seats.seats["private"], 5.0, now=now)
+    monkeypatch.setenv("CODEX_HOME", str(seats.seats["de"]))
+    verdict = _verdict()
+    assert [seat["seat"] for seat in verdict["seats"]] == ["de"]
+    assert (verdict["state"], verdict["seat"], verdict["used_percent"]) == ("allowed", "de", None)
+    assert cic.main(["debate-seat", "-j"]) == 0
+    assert json.loads(capsys.readouterr().out)["seat"] == "de"
+    # a forbidden pin stays a refusal, stale or not
+    _live(seats.seats["default"], 5.0, now=now, age=_HOUR)
+    monkeypatch.setenv("CODEX_HOME", str(seats.seats["default"]))
+    assert _verdict()["state"] == "not_allowed"
+    assert cic.main(["debate-seat", "-j"]) == 1
+    capsys.readouterr()
+
+
+def test_inherited_stale_unregistered_home_stays_not_allowed(
+    seats: SeatFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adhoc = tmp_path / "adhoc"
+    adhoc.mkdir()
+    (adhoc / "auth.json").write_text("{}", encoding="utf-8")
+    _live(adhoc, 1.0, now=int(time.time()), age=_HOUR)
+    monkeypatch.setenv("CODEX_HOME", str(adhoc))
+    assert _verdict()["state"] == "not_allowed"
+    _ = seats
+
+
+def _synthetic(seat: str, state: str, home: str = "/h") -> dict:
+    return {
+        "seat": seat,
+        "home": home,
+        "email": "",
+        "state": state,
+        "cap_percent": 75.0,
+        "used_percent": 10.0 if state == "allowed" else None,
+        "resets_at": None,
+        "weekly_used_percent": None,
+        "weekly_reserve_percent": 16.5,
+        "weekly_reserve_source": "learned",
+        "weekly_resets_at": None,
+        "window": "",
+        "reason": state,
+    }
+
+
+def test_entry_without_a_home_is_never_selected() -> None:
+    seats = [_synthetic("a", "unknown", home=""), _synthetic("b", "allowed", home="")]
+    verdict = cic._debate_pick(seats, "default")  # noqa: SLF001
+    assert verdict["state"] != "allowed"
+    assert verdict["seat"] != "b"
+    seats.append(_synthetic("c", "unknown"))
+    assert cic._debate_pick(seats, "default")["seat"] == "c"  # noqa: SLF001
+
+
+def test_blocked_only_stays_blocked_exit_1(
+    seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    now = int(time.time())
+    _configure(seats, 'codex_debate_seats = ["private", "de"]')
+    for label in ("private", "de"):
+        _live(seats.seats[label], 5.0, now=now, age=_HOUR)
+        quota.record_block(
+            f"codex:{label}", blocked_until=now + _HOUR, kind=quota.KIND_HOLD, reason="h"
+        )
+    assert _verdict()["state"] == "blocked"
+    assert cic.main(["debate-seat", "-j"]) == 1
+    assert json.loads(capsys.readouterr().out)["state"] == "blocked"
+
+
+@pytest.mark.parametrize(
+    ("case", "state", "code"),
+    [
+        ("policy", "unknown", 3),
+        ("tier", "unknown", 3),
+        ("kill", "disabled", 1),
+        ("crash", "unknown", 3),
+    ],
+)
+def test_fail_closed_verdicts_survive_unmeasured_seats(  # pylint: disable=too-many-arguments
+    seats: SeatFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    case: str,
+    state: str,
+    code: int,
+) -> None:
+    now = int(time.time())
+    for label in seats.seats:
+        _live(seats.seats[label], 5.0, now=now, age=_HOUR)  # every seat unmeasured
+    tier = "default"
+    if case == "policy":
+        _configure(seats, "codex_debate_cap_strict_pct = 101")
+    elif case == "tier":
+        tier = "nosuchtier"
+    elif case == "kill":
+        monkeypatch.setenv("CCC_NO_CODEX", "1")
+    else:
+
+        def _boom(*_a: object, **_k: object) -> dict:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(cic, "debate_seat_verdict", _boom)
+    args = argparse.Namespace(json=True, tier=tier, repo="")
+    assert cic.cmd_debate_seat(args) == code
+    assert json.loads(capsys.readouterr().out)["state"] == state
+
+
+def test_text_output_for_an_unmeasured_winner(
+    weekly: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    now = int(time.time())
+    _week(weekly.seats["private"], 5.0, 10.0, now=now, age=_HOUR)
+    _week(weekly.seats["de"], 5.0, 10.0, now=now)
+    assert cic.cmd_debate_seat(argparse.Namespace(json=False, tier="default", repo="")) == 0
+    out = capsys.readouterr().out
+    assert "debate seat: private (5h unmeasured, default)" in out
+    assert "  private: unknown — no fresh five-hour reading" in out
+
+
+# One table row = (private, de) per-seat setups in routing order: a fresh reading below
+# the cap, over the cap, inside the weekly reserve (fresh and unmeasured 5h), unmeasured,
+# or held (blocked).
+_PARITY_STATES = ("allowed", "capped", "weekly", "weekly_stale", "unknown", "blocked")
+
+
+@pytest.mark.parametrize("first", _PARITY_STATES)
+@pytest.mark.parametrize("second", _PARITY_STATES)
+def test_parity_with_codex_review_order_pick(weekly: SeatFixture, first: str, second: str) -> None:
+    now = int(time.time())
+    for label, setup in (("private", first), ("de", second)):
+        home = weekly.seats[label]
+        if setup == "allowed":
+            _week(home, 10.0, 10.0, now=now)
+        elif setup == "capped":
+            _week(home, 90.0, 10.0, now=now)
+        elif setup == "weekly":
+            _week(home, 10.0, 99.0, now=now)
+        elif setup == "weekly_stale":
+            _week(home, 10.0, 99.0, now=now, age=_HOUR)
+        elif setup == "unknown":
+            _week(home, 10.0, 10.0, now=now, age=_HOUR)
+        else:
+            _week(home, 10.0, 10.0, now=now)
+            quota.record_block(
+                f"codex:{label}", blocked_until=now + _HOUR, kind=quota.KIND_HOLD, reason="h"
+            )
+    verdict = _verdict()
+    pick = _order_pick(verdict)
+    if pick:
+        assert verdict["state"] == "allowed"
+        assert verdict["seat"] == pick["seat"]
+        assert verdict["used_percent"] == pick["used_percent"]
+    else:
+        assert verdict["state"] in ("capped", "blocked")
+        assert cic._DEBATE_EXIT[verdict["state"]] == 1  # noqa: SLF001
+
+
+def test_parity_table_on_synthetic_entries() -> None:
+    """Homeless and label-less entries, mixed states: ccc picks what _order_pick picks."""
+    rows = [
+        [_synthetic("a", "capped"), _synthetic("b", "unknown"), _synthetic("c", "allowed")],
+        [_synthetic("a", "blocked"), _synthetic("b", "allowed")],
+        [_synthetic("a", "unknown", home=""), _synthetic("b", "capped")],
+        [_synthetic("", "allowed"), _synthetic("b", "unknown")],
+        [_synthetic("a", "capped"), _synthetic("b", "blocked")],
+        [],
+    ]
+    for seats in rows:
+        verdict = cic._debate_pick(seats, "default")  # noqa: SLF001
+        pick = _order_pick(verdict)
+        assert (verdict["state"] == "allowed") == bool(pick)
+        if pick:
+            assert verdict["seat"] == pick["seat"]

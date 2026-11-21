@@ -399,7 +399,7 @@ the **child** only.
 
 A Codex **debate** costs 3–23 % of a five-hour window (median about 12–14 %, measured
 2026-09-26), and one that runs out of quota halfway wastes its cache writes. So a debate
-may START only on a seat whose FRESH five-hour reading is **below its cap**: 70 % for the
+never STARTS on a seat whose five-hour reading is **at/above its cap**: 70 % for the
 `strict` tier (security-relevant, PRI=high, or a repository in `codex_debate_big_repos`),
 75 % for `default`. `headroom` is the wrong question for this (a learned reserve for
 optional offloads); `debate-seat` is the one evaluator, asked by tp (`tp drive`, `tp open`,
@@ -412,9 +412,10 @@ debate seat: de (5h 42 % < cap 70 %, strict)
 ```
 
 Candidates are `codex_homes_in_order(probe=False)` — the pin, rota, cooldowns and
-fill/order ranking — FILTERED by `codex_debate_seats`; the first allowed one in routing
-order wins. An inherited `$CODEX_HOME` narrows them to that home but is still checked
-against the allowlist and the cap (`not_allowed` for a forbidden or unregistered home).
+fill/order ranking — FILTERED by `codex_debate_seats`; the first TRYABLE one in routing
+(codex) order wins: measured below its cap, or unmeasured (see below). An inherited
+`$CODEX_HOME` narrows them to that home but is still checked against the allowlist and
+the cap (`not_allowed` for a forbidden or unregistered home).
 The WEEK counts too (tp#2495): when a seat's seven-day reading is KNOWN (present, not
 stale, before its reset), its remaining weekly allowance must be at least the learned
 reserve `_headroom_reserve(10080)` (the cost of one full debate; 35 % bootstrap before 10
@@ -424,8 +425,15 @@ or stale weekly data never denies. When both limits apply the reason names both 
 `resets_at` is the later reset.
 
 Seats without a fresh five-hour reading (younger than `codex_usage_refresh_sec`, before its
-own reset) get one live fetch; still none → `unknown`. A reading from a window that has
-reset is never read as 0 %.
+own reset) get one live fetch; still none → the seat's own entry is `unknown`, but it is
+still TRIED in codex order (tp#2494, the rule `codex-review.py` applies too): when it is
+the first tryable seat, the verdict is `allowed` (exit 0) with `used_percent: null` and
+the reason `seat X unmeasured (no fresh five-hour reading); tried in codex order`; the
+text form prints `5h unmeasured`. A seat that is `capped` (five-hour or weekly — a known
+weekly reading inside the reserve caps even an unmeasured seat) or `blocked` is never
+tried, and an inherited `$CODEX_HOME` follows the same rule. A reading from a window that
+has reset is never read as 0 %. Only the evaluator's own failures stay a top-level
+fail-closed `unknown`: a bad policy or tier, or a crash (`CCC_NO_CODEX` → `disabled`).
 
 | key                            | default | meaning                                                   |
 | :----------------------------- | :------ | :-------------------------------------------------------- |

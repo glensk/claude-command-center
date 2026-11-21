@@ -3815,13 +3815,16 @@ def cmd_headroom(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # Debate start caps (tp#619)
 #
-# A Codex DEBATE may start only on a seat whose five-hour window is below the debate's
-# cap (``codex_debate_cap_*`` / ``codex_debate_seat_caps``) and only on a seat the
-# ``codex_debate_seats`` allowlist names. Unlike ``headroom`` (a learned reserve for
-# OPTIONAL offloads) this is a hard per-tier cap on the five-hour window, and it fails
-# CLOSED on every doubt: no fresh reading, a bad policy, a crash → ``unknown``.
+# A Codex DEBATE may start only on a seat the ``codex_debate_seats`` allowlist names
+# and never on one whose five-hour window is at/above the debate's cap
+# (``codex_debate_cap_*`` / ``codex_debate_seat_caps``). Unlike ``headroom`` (a learned
+# reserve for OPTIONAL offloads) this is a hard per-tier cap on the five-hour window.
 # The WEEK counts too (tp#2495): a seat whose known seven-day reading leaves less than
 # the learned weekly reserve (one full debate) is ``capped`` like one over its cap.
+# Missing five-hour evidence (tp#2494) stays a per-seat ``unknown``, but after the
+# refresh such a seat is TRIED in routing order like a measured one below its cap (the
+# first tryable seat wins); only evaluator, policy, input and crash failures remain a
+# top-level fail-closed ``unknown``.
 #
 # MID-debate (tp#620): ``debate-seat -c <seat>`` re-judges the debate's CURRENT seat
 # before a round. Fresh and below the pause point (``codex_debate_pause_pct``, lowered to
@@ -3845,6 +3848,9 @@ _DEBATE_EXIT = {
 # ``debate-seat -c`` (tp#620): 0 keep going (same or new seat), 1 paused, 3 unknown.
 _DEBATE_CONTINUE_EXIT = {"continue": 0, "failover": 0, "paused": 1, "disabled": 1, "unknown": 3}
 DEBATE_PINS = ("tool", "human")
+# Seat states a debate may be TRIED on, mirrored from ``codex-review.py``'s
+# ``_TRYABLE_SEAT_STATES`` (tp#2493/tp#2494): measured below its cap, or unmeasured.
+_DEBATE_TRYABLE_STATES = ("allowed", "unknown")
 
 
 def _debate_stale_after() -> int:
@@ -3877,8 +3883,9 @@ def _debate_fresh_five(
 def _debate_refresh(candidates: list[SeatCandidate], stale_after: int, budget: float) -> None:
     """Fetch live usage for every candidate WITHOUT a fresh five-hour reading.
 
-    Best effort inside *budget*: a seat that still has no fresh reading afterwards is
-    judged ``unknown`` (a refusal), so a failed fetch can never ALLOW anything. A
+    Best effort inside *budget*: a seat that still has no fresh reading afterwards stays
+    a per-seat ``unknown``, which is tryable in routing order (tp#2494) — a failed fetch
+    never raises a capped or blocked seat, and never lets a seat jump the order. A
     module-level function so tests can replace the network step.
     """
     from . import usage  # pylint: disable=import-outside-toplevel
@@ -4039,18 +4046,38 @@ def _debate_result(state: str, tier: str, reason: str, **extra: Any) -> dict[str
     return result
 
 
+def _debate_tryable(entry: dict[str, Any]) -> bool:
+    """May a debate be TRIED on this seat entry: a tryable final state and a home.
+
+    Reads the entry's final state (after tp#2495's blocked > capped > unknown > allowed
+    precedence), so a weekly-capped seat with an unmeasured five-hour window stays out.
+    """
+    return (
+        bool(entry.get("seat"))
+        and bool(entry.get("home"))
+        and (entry.get("state") in _DEBATE_TRYABLE_STATES)
+    )
+
+
 def _debate_pick(seats: list[dict[str, Any]], tier: str) -> dict[str, Any]:
-    """Fold the per-seat entries (routing order) into the pool verdict."""
-    winner = next((seat for seat in seats if seat["state"] == "allowed"), None)
+    """Fold the per-seat entries (routing order) into the pool verdict.
+
+    The winner is the FIRST tryable entry in routing order (tp#2494, the rule
+    ``codex-review.py _order_pick`` applies client-side). An unmeasured winner
+    (per-seat ``unknown``, kept as such in ``seats[]``) is promoted to a top-level
+    ``allowed`` with ``used_percent`` null; no new JSON key.
+    """
+    winner = next((seat for seat in seats if _debate_tryable(seat)), None)
     if winner is not None:
-        return _debate_result(
-            "allowed",
-            tier,
-            f"seat {winner['seat']} {winner['reason']}",
-            seats=seats,
-            **_debate_project(winner),
+        reason = (
+            f"seat {winner['seat']} unmeasured (no fresh five-hour reading); tried in codex order"
+            if winner["state"] == "unknown"
+            else f"seat {winner['seat']} {winner['reason']}"
         )
-    for state in ("capped", "unknown", "blocked"):
+        return _debate_result("allowed", tier, reason, seats=seats, **_debate_project(winner))
+    # A seat-level ``unknown`` with a home is always a winner above; one without a home
+    # can never be tried and folds with the refusals.
+    for state in ("capped", "blocked"):
         losers = [seat for seat in seats if seat["state"] == state]
         if not losers:
             continue
@@ -4061,7 +4088,6 @@ def _debate_pick(seats: list[dict[str, Any]], tier: str) -> dict[str, Any]:
                 f"every allowed seat is at/above its {tier} cap or inside its weekly "
                 f"reserve: {summary}"
             ),
-            "unknown": f"no allowed seat below its cap is measurable: {summary}",
             "blocked": f"every allowed seat is blocked: {summary}",
         }[state]
         return _debate_result(state, tier, reason, seats=seats, **_debate_project(first))
@@ -4085,14 +4111,18 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
       intersected with the allowlist: a pin to a forbidden or unregistered home is
       ``not_allowed``.
     * **evidence**: :func:`_debate_refresh` first (under the ``codex_usage`` opt-in); a
-      seat with no FRESH five-hour reading afterwards is ``unknown`` — unless its KNOWN
-      weekly reading (present, not stale, before its reset; one snapshot with the
-      five-hour one) is already inside the weekly reserve, which makes it ``capped``.
+      seat with no FRESH five-hour reading afterwards is a per-seat ``unknown`` — unless
+      its KNOWN weekly reading (present, not stale, before its reset; one snapshot with
+      the five-hour one) is already inside the weekly reserve, which makes it ``capped``.
       Missing or stale weekly data never denies. A blocked seat is excluded.
     * **cap**: ``used < cap`` allows, and so must the week: weekly remaining >= the
       learned reserve :func:`_headroom_reserve` (``10080``), computed once per verdict
-      (the value only, never the offload gate nor its "reset is near" exception). The
-      first allowed candidate in routing order wins.
+      (the value only, never the offload gate nor its "reset is near" exception).
+    * **winner** (tp#2494): the first TRYABLE seat in routing order — ``allowed`` or
+      ``unknown`` (:data:`_DEBATE_TRYABLE_STATES`) with a home, the inherited
+      ``$CODEX_HOME`` included. An unmeasured winner is a top-level ``allowed`` with
+      ``used_percent`` null (its ``seats[]`` entry stays ``unknown``). Only a bad tier or
+      policy, ``CCC_NO_CODEX`` and a crash stay fail-closed ``unknown`` / ``disabled``.
     """
     from . import config  # pylint: disable=import-outside-toplevel
 
@@ -4454,8 +4484,9 @@ def cmd_debate_seat(args: argparse.Namespace) -> int:
 
     With ``-c/--continue`` the MID-debate verdict instead (tp#620,
     :func:`debate_continue_verdict`); ``-p`` / ``-x`` without ``-c`` is a usage error
-    (exit 2). A crash while computing the verdict is ``unknown`` / exit 3 — fail closed, never a
-    launch onto an unmeasured seat.
+    (exit 2). A crash while computing the verdict is ``unknown`` / exit 3 — fail closed. An
+    unmeasured seat is never a crash: it is an ``allowed`` verdict with ``used_percent``
+    null (tp#2494), printed as ``5h unmeasured``.
     """
     current = getattr(args, "continue_from", None)
     pin = getattr(args, "pin", None)
@@ -4478,10 +4509,13 @@ def cmd_debate_seat(args: argparse.Namespace) -> int:
     else:
         state = str(verdict["state"])
         if state == "allowed":
-            print(
-                f"debate seat: {verdict['seat']} (5h {verdict['used_percent']:.0f} % "
-                f"< cap {verdict['cap_percent']:g} %, {verdict['tier']})"
+            used = verdict["used_percent"]
+            five = (
+                "5h unmeasured"
+                if used is None
+                else f"5h {used:.0f} % < cap {verdict['cap_percent']:g} %"
             )
+            print(f"debate seat: {verdict['seat']} ({five}, {verdict['tier']})")
         else:
             reset = (
                 f", resets {_format_reset(int(verdict['resets_at']))}"
@@ -7088,9 +7122,11 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         help="which Codex seat a debate may START on / CONTINUE on (tp#619, tp#620)",
         description=(
             "Read-only: judge every allowed seat (codex_debate_seats) against the debate "
-            "cap of its tier (codex_debate_cap_*, codex_debate_seat_caps) on a FRESH "
-            "five-hour reading. Starts no Codex process. Exit 0 = allowed, 1 = capped / "
-            "not_allowed / blocked / disabled, 3 = unknown (no fresh reading, bad policy). "
+            "cap of its tier (codex_debate_cap_*, codex_debate_seat_caps) and the weekly "
+            "reserve; the first seat in codex order that is below its cap OR unmeasured "
+            "(no fresh five-hour reading, used_percent null) wins. Starts no Codex "
+            "process. Exit 0 = allowed, 1 = capped / not_allowed / blocked / disabled, "
+            "3 = unknown (bad policy or tier, evaluator crash). "
             "With -c LABEL (mid-debate, tp#620): judge the running debate's seat against "
             "the pause point (codex_debate_pause_pct, lowered by the measured P95 round "
             "cost): exit 0 = continue / failover, 1 = paused (retry_at in the JSON), "
