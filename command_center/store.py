@@ -2737,7 +2737,19 @@ class Store(  # pylint: disable=too-many-public-methods
         duplicate-accept path, which heals a crash after the accepted CAS). Idempotent: a
         recorded id is never overwritten, so a re-run writes nothing and the thread id
         stays stable even if an ancestor row is later deleted.
+
+        With the shared store on (``shared_store_path`` set and the file present) this
+        writes nothing and returns False (tp#2372 F3b8): the shared ``ccc_sessions`` row
+        is the thread id's one writer (the lifecycle hooks and the succession commit) and
+        :meth:`thread_of` reads it there; ``state.db``'s column is the read-only interim
+        double. A configured but missing file keeps the ``state.db`` write, so the id is
+        never recorded nowhere.
         """
+        from . import shared_store  # pylint: disable=import-outside-toplevel  # store-on only
+
+        shared = shared_store.configured_path()
+        if shared is not None and shared.is_file():
+            return False
         thread_id = self.thread_of(source_id)
         cur = self.conn.execute(
             "UPDATE sessions SET thread_id = ? WHERE session_id = ? "

@@ -1,10 +1,11 @@
-"""The thread reader reads the shared store when it is on (tp#2372 F3b7).
+"""The thread reader reads the shared store when it is on (tp#2372 F3b7, F3b8).
 
 ``thread.py`` and ``Store.thread_of`` take a session's recorded thread id from the shared
 store's ``ccc_sessions`` when ``shared_store_path`` is set, and from ``state.db``'s
 ``sessions.thread_id`` otherwise (and for ids without a shared row). With the key unset
 nothing touches any shared file; the standalone reader works on a fresh and an upgraded
-``state.db``. Fixture stores only (``tmp_path``); placeholder ids.
+``state.db``. While the store is on, ``Store.record_thread`` writes nothing to ``state.db``
+(F3b8). Fixture stores only (``tmp_path``); placeholder ids.
 """
 
 from __future__ import annotations
@@ -204,6 +205,53 @@ def test_on_an_unreadable_store_falls_back_to_state_db(
         _turn_on(monkeypatch, shared)
         assert store.thread_of("s1") == "root"
     assert shared.exists() is (kind != "missing")  # ccc never creates the shared file
+
+
+# -- F3b8: record_thread leaves state.db alone while the store is on ------------------
+
+
+def _column(store: Store, sid: str) -> object:
+    row = store.conn.execute("SELECT thread_id FROM sessions WHERE session_id = ?", (sid,))
+    return row.fetchone()[0]
+
+
+def test_on_record_thread_writes_nothing_to_state_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared = _shared_file(tmp_path / "shared.sqlite3", {"root": ("root", 0), "s1": ("root", 1)})
+    before = shared.read_bytes()
+    with Store(tmp_path / "ccc.db") as store:
+        store.ensure("root", cwd="/repo")
+        store.ensure("s1", cwd="/repo")
+        store.update_fields("s1", handed_off_from="root")
+        _turn_on(monkeypatch, shared)
+        assert store.record_thread("s1", "root") is False
+        assert _column(store, "s1") is None  # the column is the read-only interim double
+        assert store.thread_of("s1") == "root"  # answered by the shared row
+    assert shared.read_bytes() == before  # the reader wrote nothing to the shared file either
+
+
+def test_on_a_missing_shared_file_keeps_the_state_db_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(shared_store, "log_line", lambda _text: None)
+    with Store(tmp_path / "ccc.db") as store:
+        store.ensure("root", cwd="/repo")
+        store.ensure("s1", cwd="/repo")
+        _turn_on(monkeypatch, tmp_path / "absent.sqlite3")
+        assert store.record_thread("s1", "root") is True
+        assert _column(store, "s1") == "root"
+    assert not (tmp_path / "absent.sqlite3").exists()
+
+
+def test_off_record_thread_still_writes_state_db(tmp_path: Path, off: list[object]) -> None:
+    with Store(tmp_path / "ccc.db") as store:
+        store.ensure("root", cwd="/repo")
+        store.ensure("s1", cwd="/repo")
+        assert store.record_thread("s1", "root") is True
+        assert store.record_thread("s1", "root") is False  # fill only: a re-run writes nothing
+        assert _column(store, "s1") == "root"
+    assert off == []
 
 
 def test_read_thread_ids_chunks_and_skips_unknown_ids(tmp_path: Path) -> None:
