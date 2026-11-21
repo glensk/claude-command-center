@@ -398,6 +398,34 @@ def test_register_headless_names_the_run_thread_idempotently(shared: Path) -> No
     assert _q(shared, "SELECT kind FROM ccc_threads") == [("headless",)]
 
 
+def test_thread_register_verb_registers_ends_and_is_idempotent(shared: Path) -> None:
+    sid = _sid()
+    assert _verb("thread-register", "-H", "-r", "42/abc", "-S", sid) == 0
+    assert _verb("thread-register", "-H", "-r", "42/abc", "-S", sid) == 0
+    assert _member(shared, sid)[:2] == ("run:42/abc", 0)
+    assert _q(shared, "SELECT count(*) FROM ccc_threads") == [(1,)]
+    assert _verb("thread-register", "-e", "-S", sid) == 0
+    assert _q(shared, "SELECT end_reason FROM ccc_sessions WHERE session_id = ?", sid) == [
+        ("done",)
+    ]
+    other = _sid()
+    assert _verb("thread-register", "-H", "-r", "43/x", "-S", other) == 0
+    assert _verb("thread-register", "-x", "-S", other) == 0
+    assert _q(shared, "SELECT end_reason FROM ccc_sessions WHERE session_id = ?", other) == [
+        ("closed",)
+    ]
+
+
+@pytest.mark.usefixtures("home")
+def test_thread_register_verb_is_a_noop_when_off_and_refuses_bad_usage(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _verb("thread-register", "-H", "-r", "1/a", "-S", _sid()) == 0
+    assert _verb("thread-register", "-H", "-e", "-S", _sid()) == 2
+    assert _verb("thread-register", "-H", "-S", _sid()) == 2
+    assert "error" in capsys.readouterr().err
+
+
 # --------------------------------------------------------------------------- #
 # guards and the beat
 # --------------------------------------------------------------------------- #

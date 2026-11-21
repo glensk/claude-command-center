@@ -3726,6 +3726,41 @@ def cmd_thread_handback(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_thread_register(args: argparse.Namespace) -> int:
+    """``ccc thread-register -H -r RUN -S SID`` / ``-e`` / ``-x``: a headless run's thread.
+
+    The supervising launcher calls it before it spawns the child (tp#2372 Design 6, O9):
+    it writes the ``headless`` thread ``run:<RUN>`` with SID as generation 0, idempotently
+    (a repeat writes nothing). ``-e/--end`` stamps SID's end (``done``) on exit and
+    ``-x/--cancel`` (``closed``) on a spawn failure. The shared store off or missing is a
+    quiet no-op (exit 0): the run keeps its implicit thread. Exit 2 on a usage error.
+    """
+    from . import shared_lifecycle  # pylint: disable=import-outside-toplevel
+
+    sid = (args.session or "").strip()
+    run_id = (args.run or "").strip()
+    modes = [bool(args.headless), bool(args.end), bool(args.cancel)]
+    if modes.count(True) != 1:
+        print("error: give exactly one of -H/--headless, -e/--end, -x/--cancel", file=sys.stderr)
+        return 2
+    if not sid or (args.headless and not run_id):
+        print("error: -S SESSION is required (and -r RUN with -H)", file=sys.stderr)
+        return 2
+    with Store() as store:
+        shared = shared_lifecycle._open(store)  # pylint: disable=protected-access
+        if shared is None:
+            return 0
+        with shared:
+            if args.headless:
+                wrote = shared.register_headless(run_id, sid, now_ms(), cwd=args.cwd or "")
+            else:
+                wrote = shared.end(sid, now_ms(), "done" if args.end else "closed")
+    if wrote is None:
+        print("warning: shared store busy; nothing written", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _edit_job_fields(  # pylint: disable=too-many-branches,too-many-return-statements
     args: argparse.Namespace, store: Store, session: Session, git_base: Any
 ) -> Any:
@@ -8028,6 +8063,24 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     )
     p_thandback.add_argument("-J", "--json", action="store_true", help="print one JSON line")
     p_thandback.set_defaults(func=cmd_thread_handback)
+
+    p_tregister = sub.add_parser(
+        "thread-register",
+        help="register (or end/cancel) a headless run's shared thread run:<id> (launcher verb)",
+    )
+    p_tregister.add_argument(
+        "-H", "--headless", action="store_true", help="register run:<RUN> with SESSION as gen 0"
+    )
+    p_tregister.add_argument(
+        "-e", "--end", action="store_true", help="the run ended: stamp SESSION's end"
+    )
+    p_tregister.add_argument(
+        "-x", "--cancel", action="store_true", help="the spawn failed: close SESSION's row"
+    )
+    p_tregister.add_argument("-r", "--run", default="", help="the tp run id (<tp_id>/<session>)")
+    p_tregister.add_argument("-S", "--session", required=True, help="the headless session id")
+    p_tregister.add_argument("-c", "--cwd", default="", help="the run's working directory")
+    p_tregister.set_defaults(func=cmd_thread_register)
 
     p_editjob = sub.add_parser(
         "edit-job",
