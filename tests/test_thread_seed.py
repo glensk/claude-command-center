@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from test_shared_store import SHARED_DDL
 
 from command_center import cli
 from command_center.store import Store
-from tests.test_shared_store import SHARED_DDL
 
 A, B, C = (f"{n}aaaaaaa-0000-4000-8000-000000000000" for n in "abc")
 F1, F2, F3 = (f"{n}bbbbbbb-0000-4000-8000-000000000000" for n in "def")
