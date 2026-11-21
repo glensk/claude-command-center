@@ -3084,7 +3084,13 @@ short-aim/delegate) log a **windowless** `limit_id: "premium"` block whose
 `primary`/`secondary` are both `null`. The reader skips windowless blocks and scans back
 through enough files to find the freshest one that actually has data — otherwise the
 pile-up of tiny exec runs would bury the real numbers and the card would read "(run Codex
-to populate)". This source is only as fresh as your most recent Codex turn, which is the
+to populate)". Each rollout file is parsed once, by a single reverse read of its tail; the result
+(newest windowed block plus any refusal) is memoised and persisted in
+`<app_home>/codex-rollout-evidence-v1.json`, invalidated per file by its
+`(dev, ino, size, mtime_ns)` fingerprint. The manifest is a disposable, fail-open cache
+(delete it any time; a bad one means a cold parse). Newest-event ordering, live-vs-rollout
+precedence and refusal stapling are unchanged, and final verdicts are never cached.
+This source is only as fresh as your most recent Codex turn, which is the
 gap the endpoint closes: on 2026-08-30 the newest windowed event was ~14 h old and its
 5-hour reset had long passed, so the only *live* window left for a refusal to pin was the
 weekly one — the card claimed `Week: 100%, access returns in 6d 8h` while the web page

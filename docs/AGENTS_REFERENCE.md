@@ -135,6 +135,16 @@ The invariants that keep it under a few seconds:
   the per-file stats remain — ~25 ms warm for ~1900 files vs 60-90 ms for the old glob) and travel with the rows in ONE
   `call_from_thread(_apply_rows, rows, snapshots)`; `_update_usage` renders
   `self._codex_usage` and never reads.
+- **Codex rollout evidence is parsed once per file, ever (tp#2513).** The seat oracle's
+  rollout scan reads each file's tail in a single reverse parse; the parsed quota/refusal
+  evidence is memoised per process and persisted in `<app_home>/codex-rollout-evidence-v1.json`
+  (only parsed fields, never rollout text), keyed by a `(dev, ino, size, mtime_ns)`
+  fingerprint: a changed fingerprint invalidates the entry, an unchanged file costs one
+  `stat` and no read. The manifest is disposable and fail-open: delete it any time; a
+  corrupt, foreign or unwritable one just means a cold parse, never a different verdict.
+  `debate-seat` refresh fetches (`_debate_refresh`) run in parallel daemon threads under one
+  hard 20 s deadline (15 s per-fetch cap); a fetch still running at the deadline leaves its
+  seat `unknown` (tryable in routing order). Final verdicts are never cached.
 - **Idle jump poll = three `stat`s.** `_poll_jump_request` (0.1 s) returns after
   `jumpstate.any_pending()` (restart/toggle/request file existence) when nothing is
   pending; only a present file goes through the `peek_*` readers.

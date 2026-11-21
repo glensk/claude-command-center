@@ -303,7 +303,7 @@ a hold that outlasts our next week is not promised away.
 
 `codex-in-claude headroom` answers "may optional work be offloaded to Codex at all"
 (CLAUDE.md's Codex offload gate; debates deliberately bypass it). Since 2026-09-09 it
-evaluates **every eligible seat**, not one home's rollout files — the bug it fixes is
+evaluates **every eligible seat** (rollout evidence is parsed once per file and kept in the disposable `codex-rollout-evidence-v1.json` manifest; live-usage refresh fetches run in parallel under a hard 20 s deadline, a fetch still running then leaves its seat `unknown`), not one home's rollout files — the bug it fixes is
 exact: a completely fresh team seat at 0 %/0 % was invisible, so the gate answered
 `DENIED (unknown — newest rate_limits event is older than 6h)` while a whole paid seat sat
 idle. Each seat is judged from the same quota row the ranking used (live snapshot +
