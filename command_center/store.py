@@ -69,6 +69,7 @@ from .models import (
     short_id,
 )
 from .slrender import FIRST_AIM_SELECT
+from .thread_join_store import THREAD_JOIN_SCHEMA, ThreadJoinStoreMixin
 from .transfer_store import TRANSFER_SCHEMA, TransferStoreMixin
 
 _JOB_TYPES = frozenset(JOB_TYPES)
@@ -586,7 +587,9 @@ _WAL_RETRY_SLEEP = 0.03
 _LIMIT_SWITCH_TERMINAL: tuple[str, ...] = ("started", "failed", "refused", "abandoned")
 
 
-class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: disable=too-many-public-methods
+class Store(  # pylint: disable=too-many-public-methods
+    AwaitStoreMixin, BridgeStoreMixin, ThreadJoinStoreMixin, TransferStoreMixin
+):
     """Thin wrapper over the SQLite database."""
 
     def __init__(self, path: Path | None = None, *, check_same_thread: bool = True) -> None:
@@ -599,7 +602,9 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         self.conn.execute("PRAGMA busy_timeout=3000")
         self._enable_wal()
         self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.executescript(_SCHEMA + AWAIT_SCHEMA + BRIDGE_SCHEMA + TRANSFER_SCHEMA)
+        self.conn.executescript(
+            _SCHEMA + AWAIT_SCHEMA + BRIDGE_SCHEMA + TRANSFER_SCHEMA + THREAD_JOIN_SCHEMA
+        )
         self.conn.commit()
         self._ensure_columns()
 
@@ -765,6 +770,11 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         # (tp#1989). NULL = not recorded: `thread_of` walks `handed_off_from` instead, so
         # legacy chains need no backfill.
         "thread_id": "TEXT",
+        # A thread relay's source (``new-job --thread-from SID``, tp#2372 F2a) and its join
+        # mode (``start`` | ``accept``) on the draft row. NULL = an ordinary job. Read and
+        # written only by the thread-join code (``thread_join_store``), never mirrored.
+        "thread_from": "TEXT",
+        "thread_join": "TEXT",
     }
     # Same, for the subgoals table (auto-progress marks its rows source='auto').
     _ADDED_SUBGOAL_COLUMNS = {
@@ -1235,6 +1245,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         *,
         no_codex: bool = False,
         launch_profile: str = "",
+        thread_from: str = "",
+        thread_join: str = "",
     ) -> tuple[str, bool]:
         """Atomically reserve *key* for a new draft; return ``(owning id, created)``.
 
@@ -1248,15 +1260,17 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
         The placeholder carries the *identity* fields a caller compares on (``cwd``,
         ``no_codex``) so a loser can check them immediately; the AIM and the rest arrive
         with the winner's :meth:`create_draft` call a moment later (a loser that races
-        in between simply sees ``aim = NULL`` and skips that comparison).
+        in between simply sees ``aim = NULL`` and skips that comparison). The thread relay
+        fields (``thread_from``, ``thread_join``, tp#2372 F2a) are identity too.
         """
         ts = now_ms()
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             self.conn.execute(
                 "INSERT INTO sessions (session_id, cwd, agent, draft, status, no_codex, "
-                "launch_profile, llm_overseer, llm_exec, idempotency_key, created_at, "
-                "updated_at) VALUES (?, ?, 'claude', 1, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "launch_profile, llm_overseer, llm_exec, idempotency_key, thread_from, "
+                "thread_join, created_at, updated_at) "
+                "VALUES (?, ?, 'claude', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     cwd,
@@ -1266,6 +1280,8 @@ class Store(AwaitStoreMixin, BridgeStoreMixin, TransferStoreMixin):  # pylint: d
                     DEFAULT_LLM,
                     DEFAULT_LLM,
                     key,
+                    thread_from or None,
+                    thread_join or None,
                     ts,
                     ts,
                 ),

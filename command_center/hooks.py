@@ -30,6 +30,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 # pylint: disable=wrong-import-position,ungrouped-imports  # the direct-run shim comes first
 import json
 import os
+import sqlite3
 import sys
 import time
 from collections.abc import Callable
@@ -487,6 +488,31 @@ def _adopt_env_launch_profile(store: Store, sid: str, session: Session) -> Sessi
     return store.get(sid) or session
 
 
+# The SessionStart sources a `new-job --thread-from` job joins its thread on (tp#2372 F2a):
+# its own first start, or a resume of its own id when that start was missed. A `fork`, a
+# `resume` with an id ccc never saw (no reservation names it), `clear` and `compact`
+# never join; a forked row with a `handed_off_from` copied from a parent records nothing.
+_THREAD_JOIN_SOURCES = frozenset({"startup", "resume", ""})
+
+
+def _join_thread_relay(store: Store, sid: str, source: object) -> None:
+    """Join *sid*'s thread relay reservation, if any (one indexed read otherwise).
+
+    Never raises: a store error leaves the reservation pending for ``thread-accept`` or
+    the next start, and SessionStart still emits its context.
+    """
+    if str(source or "") not in _THREAD_JOIN_SOURCES:
+        return
+    try:
+        join = store.thread_join_for(sid)
+        if join is not None:
+            from .thread_join_store import join_thread  # lazy: only a relay successor
+
+            join_thread(store, join, now_ms())
+    except sqlite3.Error:
+        pass
+
+
 def handle_session_start(payload: dict[str, Any]) -> int:
     sid = _session_id(payload)
     if not sid:
@@ -503,6 +529,7 @@ def handle_session_start(payload: dict[str, Any]) -> int:
         # mean a new one, which must never inherit (or have close-now restore) the arm.
         if payload.get("source") not in _CLOSE_KEEPING_SOURCES:
             store.disarm_close(sid)
+        _join_thread_relay(store, sid, payload.get("source"))
         if switch_warning and _switch_landed_as_expected(store, sid):
             switch_warning = None
         env_aim = os.environ.get("CLAUDE_SESSION_AIM")
@@ -629,7 +656,11 @@ def _handed_off_target(sid: str) -> str:
     """The successor *sid* was handed off to (``handed_off_to``), or ``""``."""
     with Store() as store:
         session = store.get(sid)
-    return (session.handed_off_to or "").strip() if session is not None else ""
+        target = (session.handed_off_to or "").strip() if session is not None else ""
+        # A staff thread relay's source keeps draining (tp#2372 F2a): not blocked.
+        if target and store.is_drain_relay_source(sid, target):
+            return ""
+    return target
 
 
 def handle_user_prompt(payload: dict[str, Any]) -> int:

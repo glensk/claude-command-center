@@ -50,6 +50,7 @@ import json
 import os
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass as _dataclass
 from typing import TYPE_CHECKING, Any
 
 from . import __version__, brokenpipe, config, entrypoint, hookspec, launch_argv
@@ -104,6 +105,7 @@ if TYPE_CHECKING:  # pragma: no cover - pathlib stays a local import at runtime
     from pathlib import Path
 
     from .input_ledger import LedgerSpec
+    from .thread_join_store import ThreadJoin
 
 # Seconds `ccc close-now` waits before reaping/closing when the Stop barrier is OFF
 # (`stop_barrier_enabled = false`, the escape hatch for a machine whose `ps` cannot be
@@ -3178,19 +3180,120 @@ JSON_SCHEMA_VERSION = 1
 OPEN_JOB_JSON_VERSION = 2
 
 
-def _new_job_json(session: Session, created: bool) -> str:
-    """The single-line ``ccc new-job --json`` document for *session*."""
+def _new_job_json(session: Session, created: bool, join: ThreadJoin | None = None) -> str:
+    """The single-line ``ccc new-job --json`` document for *session*.
+
+    A thread relay (``--thread-from``) adds ``thread_from``, ``thread_join`` and
+    ``thread_op`` (the reservation's op token a staff hand-back cancels by); an ordinary
+    job keeps exactly the original keys.
+    """
     from . import accounts
 
-    return json.dumps(
-        {
-            "version": JSON_SCHEMA_VERSION,
-            "session_id": session.session_id,
-            "created": created,
-            "account": accounts.effective_account_label(session.config_dir or ""),
-            "no_codex": bool(session.no_codex),
-            "launch_profile": session.launch_profile or "",
-        }
+    doc: dict[str, Any] = {
+        "version": JSON_SCHEMA_VERSION,
+        "session_id": session.session_id,
+        "created": created,
+        "account": accounts.effective_account_label(session.config_dir or ""),
+        "no_codex": bool(session.no_codex),
+        "launch_profile": session.launch_profile or "",
+    }
+    if join is not None:
+        doc.update(
+            thread_from=join.source_session, thread_join=join.join_kind, thread_op=join.op_id
+        )
+    return json.dumps(doc)
+
+
+@_dataclass(frozen=True)
+class _ThreadRelay:
+    """The validated ``new-job --thread-from`` request (tp#2372 F2a)."""
+
+    source: str
+    join: str
+    relay_record: str = ""
+    lease_generation: int | None = None
+
+
+def _thread_relay_args(  # pylint: disable=too-many-return-statements
+    args: argparse.Namespace,
+) -> tuple[_ThreadRelay | None, str]:
+    """``(request or None, error)`` from new-job's thread options; no state is read.
+
+    ``--thread-join accept`` (the staff relay) is bound: it needs the staff relay record
+    and the staff lease generation (the predecessor is ``--thread-from``); ``start``
+    refuses them, and every thread option needs ``--thread-from``.
+    """
+    from .thread_join_store import (  # pylint: disable=import-outside-toplevel
+        JOIN_ACCEPT,
+        JOIN_START,
+        RELAY_RECORD_RE,
+        SESSION_ID_RE,
+    )
+
+    source = (getattr(args, "thread_from", None) or "").strip()
+    join = (getattr(args, "thread_join", None) or "").strip()
+    record = (getattr(args, "relay_record", None) or "").strip()
+    generation = getattr(args, "lease_generation", None)
+    if not source:
+        if join or record or generation is not None:
+            return None, "--thread-join/--relay-record/--lease-generation need --thread-from"
+        return None, ""
+    if not SESSION_ID_RE.match(source):
+        return None, f"--thread-from {source!r} is not a session id (a lowercase UUID)"
+    join = join or JOIN_START
+    if join == JOIN_START:
+        if record or generation is not None:
+            return None, "--relay-record/--lease-generation belong to --thread-join accept"
+        return _ThreadRelay(source, join), ""
+    if join != JOIN_ACCEPT:
+        return None, f"--thread-join {join!r}: expected start or accept"
+    if not RELAY_RECORD_RE.match(record):
+        return None, "--thread-join accept needs -r/--relay-record (the staff relay record)"
+    if generation is None or generation < 0:
+        return None, "--thread-join accept needs -g/--lease-generation N (N >= 0)"
+    return _ThreadRelay(source, join, record, int(generation)), ""
+
+
+def _thread_source_refusal(store: Store, relay: _ThreadRelay) -> str:
+    """Why *relay*'s source cannot be continued (unknown id, an unstarted draft), or ``""``."""
+    row = store.get(relay.source)
+    if row is None:
+        return f"--thread-from {relay.source}: no such session in the store"
+    if row.draft:
+        return f"--thread-from {relay.source}: a future job that never started has no thread"
+    return ""
+
+
+def _thread_relay_conflict(store: Store, session_id: str, relay: _ThreadRelay | None) -> str:
+    """The thread half of :func:`_idempotency_conflict` (``-K`` re-run, tp#2372 F2a)."""
+    want_from, want_join = (relay.source, relay.join) if relay else ("", "")
+    have_from, have_join = store.thread_source(session_id)
+    diffs: list[str] = []
+    if have_from != want_from:
+        diffs.append(f"thread_from {have_from!r} != {want_from!r}")
+    if have_join != want_join:
+        diffs.append(f"thread_join {have_join!r} != {want_join!r}")
+    join = store.thread_join_for(session_id) if relay else None
+    if relay and join is not None and not diffs:
+        if join.relay_record != relay.relay_record:
+            diffs.append(f"relay_record {join.relay_record!r} != {relay.relay_record!r}")
+        if join.lease_generation != relay.lease_generation:
+            diffs.append(
+                f"lease_generation {join.lease_generation!r} != {relay.lease_generation!r}"
+            )
+    return "; ".join(diffs)
+
+
+def _reserve_thread_relay(store: Store, session_id: str, relay: _ThreadRelay) -> ThreadJoin:
+    """Stamp the draft's thread source and write its reservation (both idempotent)."""
+    store.set_thread_source(session_id, relay.source, relay.join)
+    return store.reserve_thread_join(
+        session_id,
+        relay.source,
+        relay.join,
+        relay_record=relay.relay_record,
+        lease_generation=relay.lease_generation,
+        now=now_ms(),
     )
 
 
@@ -3290,6 +3393,14 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
     if conflict:
         print(f"error: {conflict}", file=sys.stderr)
         return 2
+    # tp#2372 F2a: a thread relay's source is validated before any write (exit 2).
+    relay, relay_err = _thread_relay_args(args)
+    if not relay_err and relay is not None:
+        with Store() as store:
+            relay_err = _thread_source_refusal(store, relay)
+    if relay_err:
+        print(f"error: {relay_err}", file=sys.stderr)
+        return 2
     start_date = (getattr(args, "start_date", None) or "").strip() or None
     if start_date and parse_iso_date(start_date) is None:
         print(
@@ -3369,12 +3480,26 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
             # Claimed HERE, after every pre-flight check has passed, so a rejected
             # registration never leaves a half-built row owning the key.
             session_id, created = store.claim_idempotency_key(
-                idempotency_key, session_id, cwd, no_codex=no_codex, launch_profile=launch_profile
+                idempotency_key,
+                session_id,
+                cwd,
+                no_codex=no_codex,
+                launch_profile=launch_profile,
+                thread_from=relay.source if relay else "",
+                thread_join=relay.join if relay else "",
             )
             if not created:
                 existing = store.get(session_id)
                 assert existing is not None  # the key's owner row always exists
-                mismatch = _idempotency_conflict(existing, cwd, aim, no_codex, launch_profile)
+                mismatch = "; ".join(
+                    filter(
+                        None,
+                        [
+                            _idempotency_conflict(existing, cwd, aim, no_codex, launch_profile),
+                            _thread_relay_conflict(store, session_id, relay),
+                        ],
+                    )
+                )
                 if mismatch:
                     print(
                         f"error: idempotency key {idempotency_key!r} already names job "
@@ -3387,8 +3512,10 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
                     existing = store.get(session_id) or existing
                 # tp#1512: a retry of an older registration gets the grant too.
                 accounts.grant_registration_trust(existing.config_dir, existing.cwd)
+                # A crash between the draft and its reservation is healed by the re-run.
+                join = _reserve_thread_relay(store, session_id, relay) if relay else None
                 if as_json:
-                    print(_new_job_json(existing, False))
+                    print(_new_job_json(existing, False, join))
                 else:
                     print(f"future job already registered: {session_id}  ({existing.cwd})")
                     print(f"start it with:  ccc start-job {session_id}")
@@ -3414,13 +3541,18 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
             registered_by=registered_by,
             lean_start=bool(getattr(args, "lean_start", False)),
         )
+        join = _reserve_thread_relay(store, session_id, relay) if relay else None
     # tp#1512: registration is the deliberate trust grant (narrowed, logged on stderr), so
     # an unattended `start-job --auto` later only CHECKS trust and never parks on the dialog.
     accounts.grant_registration_trust(session.config_dir, session.cwd)
     if as_json:
-        print(_new_job_json(session, True))
+        print(_new_job_json(session, True, join))
     else:
         print(f"future job created: {session_id}  ({cwd})")
+        if join is not None:
+            print(
+                f"continues the thread of {join.source_session} ({join.join_kind}, op {join.op_id})"
+            )
         print(f"start it with:  ccc start-job {session_id}")
     cfg = config.load_config()
     if fire_at:
@@ -3440,6 +3572,120 @@ def cmd_new_job(  # pylint: disable=too-many-branches,too-many-return-statements
     # Mirror the draft into its Obsidian markdown file out-of-band (never block the caller).
     if cfg.future_files:
         spawn_ccc(["sync-future"])
+    return 0
+
+
+def _thread_verb_say(args: argparse.Namespace, join: ThreadJoin, changed: bool, line: str) -> None:
+    """``thread-accept`` / ``thread-handback`` output: one JSON line or one human line."""
+    if getattr(args, "json", False):
+        doc = {
+            "version": JSON_SCHEMA_VERSION,
+            "session_id": join.target_session,
+            "source": join.source_session,
+            "op": join.op_id,
+            "state": join.state,
+            "changed": changed,
+        }
+        print(json.dumps(doc))
+    else:
+        print(line)
+
+
+def _accept_join_for(store: Store, session_id: str, op: str) -> tuple[ThreadJoin | None, str]:
+    """*session_id*'s ``accept`` reservation (op *op* when given), or ``(None, why)``."""
+    from .thread_join_store import JOIN_ACCEPT  # pylint: disable=import-outside-toplevel
+
+    join = store.thread_join_op(op) if op else store.thread_join_for(session_id)
+    if join is None or join.target_session != session_id:
+        what = f"op {op}" if op else "a thread relay reservation"
+        return None, f"{session_id} has no {what} (new-job --thread-from)"
+    if join.join_kind != JOIN_ACCEPT:
+        return None, f"{session_id} joins its thread at start (-G {join.join_kind}), not by accept"
+    return join, ""
+
+
+def cmd_thread_accept(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
+    """``ccc thread-accept -S NEW -f OLD -r RECORD -g N``: the staff successor's consent moment.
+
+    Bound admission (tp#2372 F2a, O8): the successor's ``new-job --thread-join accept``
+    reservation must name the same predecessor, staff relay record and staff lease
+    generation. ``reserved`` → ``accepted`` (one CAS); a successor whose SessionStart join
+    never ran is joined first. Exit 0 accepted (or already), 1 cancelled by a hand-back or
+    not started, 2 no such reservation or a binding mismatch.
+    """
+    from .thread_join_store import (  # pylint: disable=import-outside-toplevel
+        ACCEPTED,
+        CANCELLED,
+        join_thread,
+    )
+
+    sid = (args.session or "").strip()
+    with Store() as store:
+        join, why = _accept_join_for(store, sid, (args.op or "").strip())
+        if join is None:
+            print(f"error: {why}", file=sys.stderr)
+            return 2
+        diffs = [
+            f"{name} {have!r} != {want!r}"
+            for name, have, want in (
+                ("predecessor", join.source_session, (args.predecessor or "").strip()),
+                ("relay_record", join.relay_record, (args.relay_record or "").strip()),
+                ("lease_generation", join.lease_generation, args.lease_generation),
+            )
+            if have != want
+        ]
+        if diffs:
+            print(f"error: thread-accept refused: {'; '.join(diffs)}", file=sys.stderr)
+            return 2
+        if join.state == ACCEPTED:
+            _thread_verb_say(args, join, False, f"already accepted: {sid} (op {join.op_id})")
+            return 0
+        if join.state == CANCELLED:
+            print(f"error: op {join.op_id} was cancelled by a hand-back", file=sys.stderr)
+            return 1
+        row = store.get(sid)
+        if row is None or row.draft:
+            print(f"error: {sid} has not started (still a future job)", file=sys.stderr)
+            return 1
+        now = now_ms()
+        join_thread(store, join, now)
+        moved = store.settle_thread_join(join.op_id, ACCEPTED, now)
+        current = store.thread_join_op(join.op_id) or join
+    if current.state != ACCEPTED:
+        print(f"error: op {current.op_id} is {current.state}, not accepted", file=sys.stderr)
+        return 1
+    _thread_verb_say(args, current, moved, f"accepted: {sid} continues {current.source_session}")
+    return 0
+
+
+def cmd_thread_handback(args: argparse.Namespace) -> int:
+    """``ccc thread-handback -S NEW -O OP``: cancel a still pending staff relay reservation.
+
+    Only the reservation the op token names, and only while ``reserved`` (tp#2372 F2a,
+    O8): an accepted one is never undone (the successor won; the caller reconciles the
+    staff lease to it). Exit 0 cancelled (or already cancelled; with ``-n`` the state is
+    only reported), 1 already accepted, 2 no such op for this session.
+    """
+    from .thread_join_store import (  # pylint: disable=import-outside-toplevel
+        ACCEPTED,
+        CANCELLED,
+    )
+
+    sid = (args.session or "").strip()
+    with Store() as store:
+        join, why = _accept_join_for(store, sid, (args.op or "").strip())
+        if join is None:
+            print(f"error: {why}", file=sys.stderr)
+            return 2
+        moved = False
+        if join.state not in (ACCEPTED, CANCELLED) and not args.dry_run:
+            moved = store.cancel_thread_join(join, now_ms())
+        current = store.thread_join_op(join.op_id) or join
+    if current.state == ACCEPTED:
+        line = f"not cancelled: op {current.op_id} is accepted ({sid} is current)"
+        _thread_verb_say(args, current, False, line)
+        return 1
+    _thread_verb_say(args, current, moved, f"{current.state}: op {current.op_id} ({sid})")
     return 0
 
 
@@ -7672,7 +7918,79 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         default="five_hour",
         help="which window's reset fires an --at-reset job (default: five_hour)",
     )
+    p_newjob.add_argument(
+        "-F",
+        "--thread-from",
+        default=None,
+        metavar="SID",
+        help="the job continues session SID's thread (a relay successor): its first "
+        "SessionStart records the thread and the lineage; an unknown or malformed SID exits 2",
+    )
+    p_newjob.add_argument(
+        "-G",
+        "--thread-join",
+        choices=("start", "accept"),
+        default=None,
+        help="with -F: start (default; joins at the first SessionStart, the park relay) or "
+        "accept (the staff relay: current only after `ccc thread-accept`; needs -r and -g)",
+    )
+    p_newjob.add_argument(
+        "-r",
+        "--relay-record",
+        default=None,
+        metavar="RECORD",
+        help="with -G accept: the staff relay record this successor belongs to (opaque label)",
+    )
+    p_newjob.add_argument(
+        "-g",
+        "--lease-generation",
+        type=int,
+        default=None,
+        metavar="N",
+        help="with -G accept: the staff lease generation the predecessor (-F) holds",
+    )
     p_newjob.set_defaults(func=cmd_new_job)
+
+    p_taccept = sub.add_parser(
+        "thread-accept",
+        help="accept a staff relay successor into its predecessor's thread (new-job -G accept)",
+    )
+    p_taccept.add_argument("-S", "--session", required=True, help="the successor session id")
+    p_taccept.add_argument(
+        "-f", "--from", dest="predecessor", required=True, help="the predecessor session id"
+    )
+    p_taccept.add_argument(
+        "-r", "--relay-record", required=True, help="the staff relay record (as at new-job)"
+    )
+    p_taccept.add_argument(
+        "-g",
+        "--lease-generation",
+        type=int,
+        required=True,
+        help="the staff lease generation given at new-job",
+    )
+    p_taccept.add_argument(
+        "-O", "--op", default=None, help="the reservation's op token (checked when given)"
+    )
+    p_taccept.add_argument("-J", "--json", action="store_true", help="print one JSON line")
+    p_taccept.set_defaults(func=cmd_thread_accept)
+
+    p_thandback = sub.add_parser(
+        "thread-handback",
+        help="cancel a still pending staff relay reservation by its op token",
+    )
+    p_thandback.add_argument("-S", "--session", required=True, help="the successor session id")
+    p_thandback.add_argument(
+        "-O", "--op", required=True, help="the reservation's op token (new-job's thread_op)"
+    )
+    p_thandback.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="report the reservation's state, change nothing",
+    )
+    p_thandback.add_argument("-J", "--json", action="store_true", help="print one JSON line")
+    p_thandback.set_defaults(func=cmd_thread_handback)
 
     p_editjob = sub.add_parser(
         "edit-job",

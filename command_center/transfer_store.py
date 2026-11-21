@@ -709,3 +709,25 @@ class TransferStoreMixin:
             (source, now, now, target),
         )
         self.conn.commit()
+
+    def set_thread_lineage(self, source: str, target: str, now: int) -> tuple[bool, bool]:
+        """A thread relay's lineage (``new-job --thread-from``, tp#2372 F2a): fill-only.
+
+        Unlike :meth:`set_handoff_lineage` (``continue-session``), the source's ``status``
+        is never touched: a staff relay's source keeps draining. *target*'s
+        ``handed_off_from`` / ``handed_off_at`` and *source*'s ``handed_off_to`` are each
+        written only while empty, so a second relay from the same source keeps the first
+        successor. Returns ``(target side written, source side written)``.
+        """
+        with immediate(self.conn):
+            tgt = self.conn.execute(
+                "UPDATE sessions SET handed_off_from = ?, handed_off_at = ?, updated_at = ? "
+                "WHERE session_id = ? AND COALESCE(handed_off_from, '') = ''",
+                (source, now, now, target),
+            )
+            src = self.conn.execute(
+                "UPDATE sessions SET handed_off_to = ?, updated_at = ? "
+                "WHERE session_id = ? AND COALESCE(handed_off_to, '') = ''",
+                (target, now, source),
+            )
+        return tgt.rowcount > 0, src.rowcount > 0

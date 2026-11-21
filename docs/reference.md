@@ -110,7 +110,8 @@ flags. Grouped by what they do:
 
 **Future jobs**
 
-- `ccc new-job -a "AIM" [-p PROMPT] [-c REPO] [-s YYYY-MM-DD] [-d DEP] [-j codex] [-O overseer] [-E executor] [-l]` — park a future job (`-d` = another job it depends on; `-l/--lean-start` exports `CC_LEAN_START=1` into the job's session so it starts lean).
+- `ccc new-job -a "AIM" [-p PROMPT] [-c REPO] [-s YYYY-MM-DD] [-d DEP] [-j codex] [-O overseer] [-E executor] [-l] [-F SID [-G start|accept] [-r RECORD -g N]]` — park a future job (`-d` = another job it depends on; `-l/--lean-start` exports `CC_LEAN_START=1` into the job's session so it starts lean; `-F/--thread-from` makes it a relay successor that continues SID's thread, see "Relay successors carry the thread" below).
+- `ccc thread-accept -S NEW -f OLD -r RECORD -g N [-O OP] [-J]` · `ccc thread-handback -S NEW -O OP [-n] [-J]` — accept a staff relay successor into its predecessor's thread, or cancel its still pending reservation by the op token (internal-style, no TUI key; see "Relay successors carry the thread" below).
 - `ccc new-prompt [-r cat/repo] [-o]` — a prefilled capture file for a future job. It refuses while `future_files` is off and points at `ccc new-job`.
 - `ccc edit-job ID [-a AIM] [-p PROMPT | -P FILE] [-c REPO] [-D DATE] [-w WHEN] [-d DEP] [-s YYYY-MM-DD] [-j TYPE] [-O MODEL] [-E MODEL] [-A LABEL] [-N | -C] [-R] [-T] [-W] [-U] [-S] [-J]` — change a future job (draft) in the store; only the given fields change. It shares the job-file import's one write path, so the same validation applies: a dependency cycle or an invalid field is refused before any write, and a non-draft exits 2. An AIM change lands in the AIM history as set by the user. `-R/-T/-W/-U/-S` clear the prompt, deadline, when-note, dependency and fixed start date; `-C` allows Codex again after `-N`. `-J` prints one JSON line `{version, session_id, changed}`.
 - `ccc jobs` — list registered future jobs (drafts).
@@ -1923,6 +1924,46 @@ On **Linux**, `ccc daemon --install` writes a **systemd `--user`** service + tim
 a `<label>-future-sync.path` unit replaces launchd's `WatchPaths` when a vault feature is
 on. `ccc doctor`'s Daemon section is platform-aware. See
 [linux.md](linux.md) for the full Ubuntu daemon walkthrough.
+
+### Relay successors carry the thread (`new-job -F`, `thread-accept`, `thread-handback`)
+
+A relay that starts its successor as a future job (the park relay, the staff relay) names
+the predecessor with `ccc new-job -F/--thread-from SID`; the job then belongs to SID's
+thread (its root session id, the `thread_id` column) instead of starting a thread of its
+own. Opt-in per call: without `-F` nothing changes. An unknown SID (no row), a malformed one
+(not a lowercase UUID) or an unstarted future job refuses the registration with exit 2
+before anything is written. `-F` stores `thread_from` and `thread_join` on the draft row and
+writes a reservation (`state.db` table `thread_joins`: op token, source, target, join mode,
+state `reserved` → `accepted` | `cancelled`, every transition one compare-and-set);
+`new-job -J` then adds `thread_from`, `thread_join` and `thread_op` (the op token) to its
+document. The `-K` idempotency check compares `thread_from`, `thread_join` and the staff
+binding too: the same key with a different relay exits 2, a re-run returns the same op.
+
+- `-G start` (default, the park relay; its source tab is closed): the job's first
+  SessionStart (`startup`, or a `resume` of the job's own id when that start was missed)
+  copies the source's thread id (`record_thread`, fill-only), writes the target side of the
+  lineage (`handed_off_from`, `handed_off_at` on the new session, fill-only) and settles the
+  reservation `accepted`.
+- `-G accept` (the staff relay; its source keeps draining) needs `-r/--relay-record RECORD`
+  (the staff relay record, an opaque label) and `-g/--lease-generation N` (the staff lease
+  generation the predecessor holds). SessionStart records the thread and the lineage but
+  leaves the reservation `reserved`; the successor's `ccc thread-accept -S NEW -f OLD -r
+  RECORD -g N` accepts it only when predecessor, record and generation equal the stored
+  ones (a known source id alone admits nothing; exit 0 accepted or already, 1 cancelled or
+  not started, 2 no reservation or a mismatch). `ccc thread-handback -S NEW -O OP` cancels
+  the reservation the op token names, only while it is `reserved` (exit 0 cancelled or
+  already, 1 it is accepted: the successor is current, nothing is undone; 2 no such op for
+  NEW; `-n` reports the state and changes nothing).
+
+The source side (`handed_off_to`) is written only while empty and the source's `status` is
+never changed, unlike `continue-session`'s lineage: a draining staff source is not marked
+handed off and a second relay from the same source keeps the first successor. A staff
+(`accept`) source, or the source of a cancelled relay, keeps taking prompts (the handed-off
+prompt block applies to `continue-session` and park sources only), and a cancel drops a
+source side that still names the cancelled successor. A `fork` SessionStart, a `resume`
+with an id ccc never saw, `clear` and `compact` join nothing, even when the row carries a
+`handed_off_from` copied from a parent. The shared-file reservation and the thread
+generation CAS follow in a later step; these verbs then also write them.
 
 ### Hand a session to a new one — `ccc continue-session` (handoff)
 
