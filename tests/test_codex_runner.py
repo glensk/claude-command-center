@@ -460,6 +460,34 @@ def test_resume_binds_to_recording_home(
     assert "resumed" in capsys.readouterr().out
 
 
+def test_resume_finds_the_selector_seat_missing_from_the_registry(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--resume searches the runner's seat-routed home even when the registry omits it.
+
+    ``codex_launch`` is a leaf (tp#2527): it no longer asks the selector itself, so the
+    runner must pass its effective home as ``active=``. The selector ranks from its own
+    registry, so a seat it picks can be absent from the caller's
+    ``canonical_codex_homes()`` mapping; the session journalled only there must still
+    resume, and on that seat.
+    """
+    chosen = cic._codex_home()  # noqa: SLF001  # the selector's first seat, $CODEX_HOME unset
+    assert "CODEX_HOME" not in os.environ
+    assert chosen == three_seats.seats["private"]
+    registry = {k: v for k, v in three_seats.seats.items() if v != chosen}
+    monkeypatch.setattr(cic, "canonical_codex_homes", lambda: dict(registry))
+    session = "019ff5b3-7bea-7c80-ad5e-21cc5b7c64be"
+    codex_launch.record_launch(session, str(three_seats.workdir), write=False, codex_home=chosen)
+    three_seats.scenarios(
+        private={"scenario": "ok", "reply": "resumed"}, de={"scenario": "ok", "reply": "WRONG"}
+    )
+    assert cic.cmd_delegate(_delegate_ns(three_seats, resume=session)) == cic.EX_OK
+    assert three_seats.call_homes() == ["private"]
+    call = three_seats.calls()[0]
+    assert call["home"] == str(chosen)
+    assert call["argv"][:3] == ["exec", "resume", session]
+
+
 # ── argv shape (per invocation) ───────────────────────────────────────────────────
 def test_argv_rebuilt_per_seat_mcp_and_profile(three_seats: SeatFixture) -> None:
     """Each attempt carries ONLY its own seat's MCP servers and permission profile."""

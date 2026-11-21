@@ -2710,6 +2710,19 @@ def codex_exec_env(
     return env
 
 
+def _effective_codex_home() -> Path:
+    """The home a launch without an explicit seat bills to (env → selector → ``~/.codex``).
+
+    :mod:`command_center.codex_launch` is a leaf that does not know the seat registry, so
+    the runner computes the seat-routed home here and passes it in. Never raises: any
+    failure in the selector falls back to ``~/.codex``.
+    """
+    try:
+        return Path(codex_exec_env()["CODEX_HOME"]).expanduser()
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return Path.home() / ".codex"
+
+
 def _home_rollout_files(home: Path | None) -> list[Path] | None:
     """*home*'s newest ``_CODEX_SCAN_LIMIT`` rollout files by mtime; ``None`` on an error."""
     sessions = (home if home is not None else _codex_home()) / "sessions"
@@ -6229,7 +6242,10 @@ def cmd_delegate(args: argparse.Namespace) -> int:  # pylint: disable=too-many-r
         resume_record: codex_launch.LaunchRecord | None = None
         if resume:
             resume_record, resume_home = codex_launch.resolve_resume_any(
-                str(resume), write=write, homes=canonical_codex_homes()
+                str(resume),
+                write=write,
+                homes=canonical_codex_homes(),
+                active=_effective_codex_home(),
             )
         workdir = codex_launch.resolve_workdir(
             resume_record.resolved_cwd if resume_record is not None else args.cwd,
@@ -6306,7 +6322,9 @@ def cmd_delegate(args: argparse.Namespace) -> int:  # pylint: disable=too-many-r
             preview = build_cmd(
                 seat or SeatCandidate("none", Path.home() / ".codex", "", ""),
                 "<OUTPUT>",
-                codex_launch.permission_args(write, codex_home=seat.home if seat else None),
+                codex_launch.permission_args(
+                    write, codex_home=seat.home if seat else _effective_codex_home()
+                ),
                 [],
             )
         except codex_launch.CodexLaunchError as exc:

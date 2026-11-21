@@ -997,6 +997,42 @@ def test_delegate_show_prompt_dry_run(
     assert "### DRY RUN" in out and "do the thing" in out and " exec " in out
 
 
+def test_delegate_show_prompt_without_a_seat_uses_the_effective_home(
+    cic: ModuleType,  # pylint: disable=redefined-outer-name  # the pytest fixture
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No eligible seat: the dry run reads the profile from the runner's effective home.
+
+    ``codex_launch`` is a leaf (tp#2527) whose own default is ``~/.codex``; the runner
+    passes its seat-routed home (here the pin) so the ``--write`` preview still finds the
+    write profile that only that home declares.
+    """
+
+    def boom(*_: object, **__: object) -> None:
+        raise AssertionError("codex must not launch on --show-prompt")
+
+    fake_home = tmp_path / "home"
+    _write_codex_config(fake_home / ".codex", hardened_rw=False)  # ~/.codex: no rw profile
+    effective = tmp_path / "pinned-seat"
+    _write_codex_config(effective, hardened_rw=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+    monkeypatch.setattr(cic, "codex_homes_in_order", lambda *_a, **_k: [])
+    monkeypatch.setattr(cic, "pinned_codex_home", lambda: effective)
+    monkeypatch.setattr(cic, "_exec_codex", boom)
+    assert cic._effective_codex_home() == effective
+    args = _ns(show_prompt=True, write=True, cwd=str(repo), prompt="do the thing")
+    assert cic.cmd_delegate(args) == cic.EX_OK
+    out = capsys.readouterr().out
+    assert "seat: (no eligible seat)" in out
+    assert "hardened-rw" in out and "do the thing" in out
+
+
 def test_delegate_pointer_hint_for_xhigh(
     cic: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

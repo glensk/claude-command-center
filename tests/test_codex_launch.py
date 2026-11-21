@@ -8,6 +8,7 @@ session journal.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import stat
@@ -308,6 +309,57 @@ def test_active_codex_home_prefers_the_environment(
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "seat"))
     assert codex_launch.active_codex_home() == tmp_path / "seat"
     assert codex_launch.journal_path() == tmp_path / "seat" / codex_launch.JOURNAL_NAME
+
+
+def test_codex_launch_never_imports_codex_in_claude() -> None:
+    """``codex_launch`` stays a leaf: no import of the runner, function bodies included.
+
+    A function-local import still counts as a pylint ``cyclic-import`` edge (tp#2527),
+    so the whole module tree is walked, not just the top level.
+    """
+    source = Path(codex_launch.__file__).read_text(encoding="utf-8")
+    offenders: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            offenders += [a.name for a in node.names if "codex_in_claude" in a.name]
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if "codex_in_claude" in module:
+                offenders.append(module)
+            offenders += [a.name for a in node.names if a.name == "codex_in_claude"]
+    assert not offenders
+
+
+def test_active_codex_home_is_a_leaf_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unset ``$CODEX_HOME`` → ``~/.codex``; a ``~``-relative value is expanded."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    assert codex_launch.active_codex_home() == Path.home() / ".codex"
+    assert codex_launch.active_codex_home() == fake_home / ".codex"
+    monkeypatch.setenv("CODEX_HOME", "~/x")
+    assert codex_launch.active_codex_home() == Path("~/x").expanduser()
+    assert codex_launch.active_codex_home() == fake_home / "x"
+
+
+def test_resolve_resume_any_searches_the_callers_active_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``active=`` home is searched even when *homes* is empty and env points elsewhere."""
+    repo = _git_repo(tmp_path / "repo")
+    seat = tmp_path / "seat"
+    seat.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "elsewhere"))
+    codex_launch.record_launch("only-here", str(repo), write=False, codex_home=seat, now=10)
+    record, home = codex_launch.resolve_resume_any("only-here", write=False, homes={}, active=seat)
+    assert record.session_id == "only-here"
+    assert home == seat
+    with pytest.raises(codex_launch.CodexLaunchError, match="no such session"):
+        codex_launch.resolve_resume_any("only-here", write=False, homes={})
 
 
 # --------------------------------------------------------------------------- #

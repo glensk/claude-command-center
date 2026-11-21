@@ -186,21 +186,18 @@ def resolve_workdir(cwd_arg: str | None, *, write: bool) -> Workdir:
 # CODEX_HOME + permission profiles
 # --------------------------------------------------------------------------- #
 def active_codex_home() -> Path:
-    """The ``CODEX_HOME`` this launch bills to (env → ccc's seat selector → ``~/.codex``).
+    """The leaf default ``CODEX_HOME``: ``$CODEX_HOME`` (expanded), else ``~/.codex``.
 
-    Routed through :func:`command_center.codex_in_claude.codex_exec_env` so the profile
-    lookup and the journal land in the very home the child ``codex`` will use — a pinned
-    or selector-chosen seat included.
+    This module deliberately does not know ccc's seat registry or selector — the launch
+    policy owns argv, not the account list, and importing the registry here would add an
+    import cycle. Seat-aware callers (the runner in ``codex_in_claude``) must therefore
+    pass the home explicitly, so the profile lookup and the journal land in the very home
+    the child ``codex`` will use — a pinned or selector-chosen seat included.
     """
     env = os.environ.get("CODEX_HOME")
     if env:
         return Path(env).expanduser()
-    try:
-        from .codex_in_claude import codex_exec_env  # local: avoid an import cycle
-
-        return Path(codex_exec_env()["CODEX_HOME"]).expanduser()
-    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-        return Path.home() / ".codex"
+    return Path.home() / ".codex"
 
 
 def config_toml_path(codex_home: Path | None = None) -> Path:
@@ -356,7 +353,11 @@ def read_journal(codex_home: Path | None = None) -> list[LaunchRecord]:
 
 
 def resolve_resume_any(
-    ref: str, *, write: bool, homes: dict[str, Path] | None = None
+    ref: str,
+    *,
+    write: bool,
+    homes: dict[str, Path] | None = None,
+    active: Path | None = None,
 ) -> tuple[LaunchRecord, Path]:
     """Resolve ``--resume`` *ref* across EVERY seat's journal → ``(record, its home)``.
 
@@ -372,6 +373,10 @@ def resolve_resume_any(
     not the account list, and importing the registry here would add an import cycle.
     ``None`` searches only the effective home.
 
+    *active* is the caller's effective home (``codex_in_claude`` passes its seat-routed
+    one); ``None`` falls back to :func:`active_codex_home`. It is searched too unless one
+    of *homes* already names it.
+
     ``last`` means the newest record across all searched homes, not the newest of
     whichever home happens to be selected. Every other guard of :func:`resolve_resume`
     still applies (ccc-journalled, same read/write mode, root still acceptable).
@@ -380,7 +385,7 @@ def resolve_resume_any(
     if not wanted:
         raise CodexLaunchError("--resume needs a codex session id (or `last`)")
     homes = dict(homes or {})
-    active = active_codex_home()
+    active = active if active is not None else active_codex_home()
     if not any(str(home) == str(active) for home in homes.values()):
         homes["explicit"] = active
     found: list[tuple[LaunchRecord, Path]] = []
