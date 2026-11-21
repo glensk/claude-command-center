@@ -2023,6 +2023,53 @@ reservation by its op token first, and an op the shared store already accepted i
 settled `accepted` in `state.db` too (never undone). A second successor of the same
 source loses the reservation and is told the winner (target and op id).
 
+#### Back up and restore the shared thread rows (runbook, tp#2372 FB10)
+
+The thread rows live in the shared file, so the file owner's snapshot and restore carry
+them; `state.db` is not rolled back with them. After a restore the **restored shared
+snapshot is authoritative at its recovery point** (the newest ccc fact it holds: a thread
+creation, a session start, end or beat, a succession step). Every private `state.db`
+operation newer than that point is **reported, never applied**.
+
+1. **Back up.** Take the owner's snapshot of the shared file, or an online SQLite backup
+   (`sqlite3 <shared file> ".backup <backup file>"`); a plain file copy of a live WAL
+   database is not a backup. ccc needs nothing of its own backed up for the thread rows.
+2. **Restore.** The owner fences writers (maintenance flag on, old connections closed),
+   puts the snapshot back and mints a new `meta.holder_authority_epoch`. From that moment
+   every ccc write sees a **stale epoch** (the store's epoch differs from the one ccc
+   pinned) and writes nothing: hooks, `thread-accept`, `thread-handback`,
+   `continue-session` and beats log one `refused, nothing written` line to
+   `command-center/shared-store.log` and go on. A delayed callback (a re-delivered
+   accept, a late hand-back, the draining source's SessionEnd) therefore cannot change the
+   restored rows.
+3. **Report.** `ccc thread-reconcile -r` (`-J` for JSON) writes nothing anywhere and shows:
+   the epoch (`store 2  pinned 1  (stale)`), the recovery point, and every **quarantined**
+   private operation newer than it whose outcome the restored store does not show, with
+   its kind (`continue-accept`, `continue-abort`, `relay-accept`, `relay-handback`,
+   `relay-reserve`, `session-start`), op id, session, `state.db` state and shared state.
+   Example: a staff relay accepted after the backup (its source still draining) shows as
+   `relay-accept`, `state.db accepted`, `shared reserved`; a hand-back after the backup as
+   `relay-handback`, `state.db cancelled`, `shared reserved`. A headless admission leaves
+   no private record and is not listed.
+4. **Acknowledge.** `ccc thread-reconcile` (no `-r`) re-pins the new epoch and, in the
+   same transaction, settles each still pending shared reservation of a quarantined
+   operation `failed`, so no later recovery can publish it. It publishes nothing: the
+   restored sources stay current. It exits 1 and writes nothing when the store is under
+   maintenance, of an unknown component version, or moved to yet another epoch since the
+   report. Then it finishes or cancels interrupted successions by op id and fails orphan
+   reservations, as on any run.
+5. **Decide each quarantined operation.** The overseer re-runs it as a fresh operation (a
+   new relay or `continue-session`, a new op id) or drops it; nothing is replayed
+   automatically.
+6. **Check.** `ccc thread-reconcile -r` again: `(ok)`, nothing quarantined; the next
+   SessionStart writes its row (writes flow at the new epoch).
+7. **Missing facts only.** `ccc thread-seed -n` shows what a seed would write (threads and
+   sessions `state.db` knows that the restored file lacks) and every conflict;
+   `ccc thread-seed` then inserts only those proven-missing facts. It never decides a winner after a restore: a conflict is the overseer's
+   call (step 5).
+
+The drill is pinned by `tests/test_shared_store.py::test_restore_drill_reports_newer_private_ops_and_applies_none`.
+
 ### Hand a session to a new one — `ccc continue-session` (handoff)
 
 Moving a conversation to the other Claude account with `switch-account` keeps it intact,

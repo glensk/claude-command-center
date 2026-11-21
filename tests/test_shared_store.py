@@ -604,6 +604,119 @@ def test_thread_reconcile_after_a_restore_quarantines_newer_private_ops(
     assert _member(shared, after) is not None  # re-pinned: writes flow again
 
 
+def _copy_db(src: Path, dst: Path) -> None:
+    """An online SQLite backup of *src* into *dst* (the drill's back up and restore)."""
+    source, target = sqlite3.connect(src), sqlite3.connect(dst)
+    try:
+        source.backup(target)
+    finally:
+        source.close()
+        target.close()
+
+
+def _private_joins() -> list[Any]:
+    with Store() as store:
+        rows = store.conn.execute("SELECT op_id, state, settled_at FROM thread_joins ORDER BY 1")
+        return [tuple(r) for r in rows]
+
+
+def _pins() -> list[Any]:
+    with Store() as store:
+        return [tuple(r) for r in store.conn.execute("SELECT * FROM shared_store_pins")]
+
+
+def _after_recovery_point(*op_ids: str) -> None:
+    """Move the private settle times past the backup's newest fact (ms clocks can tie)."""
+    with Store() as store:
+        for op_id in op_ids:
+            store.conn.execute(
+                "UPDATE thread_joins SET settled_at = settled_at + 10000 WHERE op_id = ?", (op_id,)
+            )
+        store.conn.commit()
+
+
+_STAFF = ("-r", "staff/a/x", "-g", "4")
+
+
+def _drill_until_restore(
+    shared: Path, home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> dict[str, tuple[str, str, str]]:
+    """Three pending staff relays, a backup, then an accept and a release, then the restore."""
+    relays: dict[str, tuple[str, str, str]] = {}
+    for name in ("accept", "release", "late"):
+        src = _source(home)  # the first one pins epoch 1
+        doc = _register(home, capsys, "-F", src, "-G", "accept", *_STAFF)
+        relays[name] = (src, str(doc["session_id"]), str(doc["thread_op"]))
+        _start(relays[name][1])  # lineage recorded, not current until thread-accept
+    snapshot = tmp_path / "backup.sqlite3"
+    _copy_db(shared, snapshot)  # the backup: three pending staff reservations
+    pending = "SELECT COUNT(*) FROM ccc_thread_successions WHERE state = 'reserved'"
+    assert _q(snapshot, pending) == [(3,)]
+    src, new, op_accept = relays["accept"]
+    assert _verb("thread-accept", "-S", new, "-f", src, *_STAFF) == 0  # the source drains on
+    assert _member(shared, new)[:2] == (src, 1)
+    with Store() as store:
+        assert store.get(src).status != Status.HANDED_OFF.value  # type: ignore[union-attr]
+    _, rel_new, op_release = relays["release"]
+    assert _verb("thread-handback", "-S", rel_new, "-O", op_release) == 0  # a newer release
+    _after_recovery_point(op_accept, op_release)
+    _copy_db(snapshot, shared)  # the restore …
+    _set_meta(shared, "holder_authority_epoch", "2")  # … and the owner mints a new epoch
+    assert _current(shared, src) == 0 and _member(shared, new) is None
+    return relays
+
+
+def test_restore_drill_reports_newer_private_ops_and_applies_none(
+    shared: Path, home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FB10: back up, an accept with a draining source, a newer release, restore, a delayed
+    callback; ``thread-reconcile --report`` lists the newer private operations, applies none."""
+    relays = _drill_until_restore(shared, home, tmp_path, capsys)
+    restored = _dump(shared)
+    src, new, op_accept = relays["accept"]
+    late_new, op_late = relays["late"][1:]
+    # Delayed callbacks under the stale pin: none reaches the shared store.
+    assert _verb("thread-accept", "-S", new, "-f", src, *_STAFF) == 0  # re-delivered: no-op
+    assert _verb("thread-handback", "-S", late_new, "-O", op_late) == 0  # a late hand-back
+    _end(src)  # the draining source's SessionEnd arrives
+    assert _dump(shared) == restored
+    assert _member(shared, src)[2] is None  # ended_at stays unwritten
+    _after_recovery_point(op_late)
+
+    private, pins = _private_joins(), _pins()
+    rc, rep = _reconcile(capsys, "-r")
+    assert rc == 0 and rep["applied"] is False and rep["settled_quarantined"] == 0
+    assert (rep["epoch_status"], rep["store_epoch"], rep["pinned_epoch"]) == ("stale", "2", "1")
+    op_release = relays["release"][2]
+    assert {
+        (q["kind"], q["op_id"], q["private_state"], q["shared_state"]) for q in rep["quarantined"]
+    } == {
+        ("relay-accept", op_accept, ACCEPTED, "reserved"),
+        ("relay-handback", op_release, CANCELLED, "reserved"),
+        ("relay-handback", op_late, CANCELLED, "reserved"),
+    }
+    assert rep["recover"] == [] and rep["orphans"] == []
+    # applies none: the shared file, state.db's joins and the epoch pin are unchanged
+    assert (_dump(shared), _private_joins(), _pins()) == (restored, private, pins)
+    capsys.readouterr()
+    assert _verb("thread-reconcile", "-r") == 0
+    human = capsys.readouterr().out
+    assert "report: nothing written" in human and "would re-pin epoch 2" in human
+    assert all(op in human for op in (op_accept, op_release, op_late))
+
+    # The overseer's apply: re-pin, fail the quarantined reservations, publish nothing.
+    rc, rep = _reconcile(capsys)
+    assert rc == 0 and rep["applied"] is True and rep["settled_quarantined"] == 3
+    assert _q(shared, "SELECT DISTINCT state FROM ccc_thread_successions") == [("failed",)]
+    assert [_current(shared, r[0]) for r in relays.values()] == [0, 0, 0]  # sources stay current
+    assert _member(shared, new) is None
+    rc, rep = _reconcile(capsys, "-r")
+    assert rc == 0 and rep["epoch_status"] == "ok" and rep["quarantined"] == []
+    after = _sid()
+    _start(after)
+    assert _member(shared, after) is not None  # writes flow again at epoch 2
+
+
 @pytest.mark.parametrize(("key", "value"), [("backend", "maintenance"), ("ccc_shared_schema", "9")])
 def test_thread_reconcile_refuses_a_fenced_store(
     shared: Path, capsys: pytest.CaptureFixture[str], key: str, value: str
