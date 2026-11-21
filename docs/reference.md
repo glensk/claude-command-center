@@ -1965,6 +1965,60 @@ with an id ccc never saw, `clear` and `compact` join nothing, even when the row 
 `handed_off_from` copied from a parent. The shared-file reservation and the thread
 generation CAS follow in a later step; these verbs then also write them.
 
+### Shared thread rows (`shared_store_path`, tp#2372 F3b)
+
+Off by default. With `shared_store_path` set (the shared SQLite file of the item tracker
+that owns it; ccc never creates the file or its tables), ccc writes each session's thread
+**lifecycle** there: `ccc_threads` (thread, root, fork origin, current generation),
+`ccc_sessions` (thread, generation, `started_at`, `ended_at` + `end_reason`, `cwd`, the
+throttled `last_beat`, the process `incarnation`) and `ccc_thread_successions` (the
+operation-bound succession: `reserved` → `committing` → `accepted` | `cancelled` |
+`failed`, at most one unsettled reservation per source generation). Everything else
+(AIM, status, `done`, todos, per-turn columns) stays in `state.db`. Two facts, two
+columns: `state.db`'s `closed_at` is ccc's tab state; the shared `ended_at` is the
+session's lifecycle end (once per process incarnation).
+
+Every shared write is one `BEGIN IMMEDIATE` transaction that first checks
+`meta.ccc_shared_schema = 1`, that the store is not under maintenance (`meta.backend`)
+and that `meta.holder_authority_epoch` equals the epoch ccc pinned at its first write; any
+mismatch writes nothing and logs one line to `command-center/shared-store.log`. Lifecycle
+writes wait up to 2 s for the lock, a beat not at all. Each committed write appends one
+`ccc_write` row (lock hold in ms) to the JSONL file `TP_TIMING_LOG` names (a separate
+file: a timing row adds no database write).
+
+**Session ids the installed Claude Code mints** (checked 2026-11-21 on 2.1.330 and in
+transcripts of 2.1.292-2.1.322):
+
+| action | session id | SessionStart `source` |
+| :-- | :-- | :-- |
+| `/clear` | NEW id (a new transcript; the old one ends with SessionEnd `reason = clear`) | `clear` |
+| `/compact` (auto or manual) | SAME id (one transcript across the compact boundary) | `compact` |
+| `claude --resume ID --fork-session` | NEW id (transcript lines carry `forkedFrom.sessionId`) | `resume` (an id ccc never saw) |
+| `/branch` (in-session fork) | NEW id | `fork` |
+
+The hooks therefore write, per SessionStart `source`: `startup` → generation 0 of its own
+thread, unless a relay reservation targets it (`new-job -F`, an inbound `continue-session`
+transfer); `resume` of a known id → a new `incarnation`, `ended_at` cleared (a delayed
+SessionEnd of the older process is ignored); `resume` of an unknown id and `fork` → a new
+thread (`forked_from` = the origin's thread when ccc can name it) holding nothing; `clear`
+→ the new id joins as the next generation of the outgoing session that the same process's
+SessionEnd(`clear`) marked, and the outgoing one ends `handed_off`; `compact` → nothing.
+SessionEnd otherwise writes `ended_at` with `end_reason` `done` or `closed`. Stop,
+UserPromptSubmit and PostToolUse (their current matchers) write `last_beat` at most once
+per 60 s per session, skipped when the lock is busy: it is "last hook activity", never
+liveness.
+
+Relays: `new-job -F` writes the shared reservation (`park_start`, or `staff_accept` with
+`-G accept`) with the same op id as `thread_joins`; a `start` join publishes the successor
+at its first SessionStart (the generation compare-and-set; a gen-0 root the successor
+already wrote is re-parented only when it is the sole member of its thread and holds no
+open claim, drive or plan row, else the op fails `quarantined`); `thread-accept`
+publishes before `state.db`'s accepted CAS and refuses (exit 1, the source stays
+current) when the publication is not `accepted`; `thread-handback` cancels the shared
+reservation by its op token first, and an op the shared store already accepted is
+settled `accepted` in `state.db` too (never undone). A second successor of the same
+source loses the reservation and is told the winner (target and op id).
+
 ### Hand a session to a new one — `ccc continue-session` (handoff)
 
 Moving a conversation to the other Claude account with `switch-account` keeps it intact,
