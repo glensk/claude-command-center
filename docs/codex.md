@@ -465,19 +465,27 @@ a debate can move seats between rounds. Before each round after the first,
   as if `$CODEX_HOME` were NOT set, filtered by `codex_debate_seats`, minus every `-x`
   label (`-x` may name the current seat, e.g. after a mid-round refusal); `-p human` =
   exactly the inherited `$CODEX_HOME`, which must be the `-c` seat (else `unknown`).
-- **continue**: the current seat, refreshed first, has a FRESH five-hour reading below
-  the **pause point**, is not blocked and not excluded, and (known weekly reading only)
-  keeps a weekly remainder of at least reserve / 3.3 (one learned round).
+- **continue**: the current seat, refreshed first, is not blocked, not excluded and still
+  routed and allowlisted, (known weekly reading only) keeps a weekly remainder of at least
+  reserve / 3.3 (one learned round), and either has a FRESH five-hour reading below the
+  **pause point** or is unmeasured (tp#2494: no fresh five-hour reading after the
+  refresh — its `seats[]` entry stays `unknown`, the verdict is `continue` with
+  `used_percent: null`, for `-p tool` and `-p human` alike; the text form prints
+  `5h unmeasured`). This is the pin `codex-review.py` keeps too.
 - **failover** (`-p tool` only): otherwise the first OTHER candidate in routing order
-  that passes the START rule above (fresh reading, below its tier cap, outside the weekly
-  reserve); a candidate inside its reserve is skipped.
-- **paused**: otherwise. `retry_at` is the earliest time a specific seat clears its
-  actual cause — the five-hour reset (over the pause point / its cap), the weekly reset
+  that is TRYABLE — it passes the START rule above (fresh reading, below its tier cap,
+  outside the weekly reserve) or it is unmeasured (`used_percent: null`); a measured seat
+  further down the order never jumps an unmeasured one. A candidate that is capped
+  (five-hour or weekly reserve) or blocked is skipped.
+- **paused**: otherwise, i.e. no tryable seat remains. `retry_at` is the earliest time a
+  specific seat clears its actual cause — the five-hour reset (over the pause point / its cap), the weekly reset
   (inside the weekly reserve; the later one when both apply), the blocked row's
   reset (weekly exhaustion, a hold's or cooldown's expiry, the rota's next own week) —
   and `null` when no time is knowable (auth, entitlement, an open-ended block).
-  `retry_seat` names that seat. When no seat has any KNOWN cause (none is measurable),
-  the verdict is `unknown` instead.
+  `retry_seat` names that seat. When no seat has any KNOWN cause, the verdict is
+  `unknown` instead; an unmeasured seat no longer gets there (it is tried), so a
+  top-level `unknown` means a bad pin, tier or policy, an unregistered `-c` seat, a
+  `-p human` pin that does not match `$CODEX_HOME`, or a crash.
 
 The pause point is `codex_debate_pause_pct`; once ccc holds ≥ 10 measured five-hour
 debate-round costs it is `min(codex_debate_pause_pct, 100 − 1.1 × P95)` (the headroom

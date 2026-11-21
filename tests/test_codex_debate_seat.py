@@ -5,9 +5,10 @@ reading is at/above the item's cap — 70 % strict, 75 % default — nor outside
 Missing five-hour evidence (tp#2494) stays a per-seat ``unknown``, but after the refresh
 such a seat is tried in routing order (codex order) exactly like ``codex-review.py
 _order_pick``; only evaluator, policy, input and crash failures remain a top-level
-fail-closed ``unknown``. Guarded here: the cap boundaries, the allowlist, an inherited
-``$CODEX_HOME``, a reading from a window that has reset, a policy that does not parse,
-and the parity with ``_order_pick``.
+fail-closed ``unknown``. Mid-debate (``-c``) an unmeasured current pin is kept and a
+tool pin fails over to the first tryable candidate. Guarded here: the cap boundaries,
+the allowlist, an inherited ``$CODEX_HOME``, a reading from a window that has reset, a
+policy that does not parse, and the parity with ``_order_pick`` (start and ``-c``).
 """
 # pylint: disable=too-many-lines  # one module covers the debate start, continue and reserve gates
 
@@ -450,16 +451,25 @@ def test_blocked_current_fails_over(pair: SeatFixture) -> None:
     assert current["state"] == "blocked"
 
 
-def test_unknown_current_fails_over_to_a_fresh_seat(pair: SeatFixture) -> None:
+def test_unknown_current_is_kept_over_a_fresh_seat(pair: SeatFixture) -> None:
+    """tp#2494: an unmeasured pin continues (tried), never fails over to a measured seat."""
     now = int(time.time())
     _live(pair.seats["private"], 10.0, now=now, age=_HOUR)
     _live(pair.seats["de"], 10.0, now=now)
     verdict = _cont()
-    assert verdict["state"] == "failover"
-    assert verdict["seat"] == "de"
+    assert (verdict["state"], verdict["seat"], verdict["used_percent"]) == (
+        "continue",
+        "private",
+        None,
+    )
+    assert verdict["reason"] == (
+        "seat private unmeasured (no fresh five-hour reading); kept in codex order"
+    )
+    assert verdict["seats"][0]["state"] == "unknown"  # the per-seat state is kept
+    assert _roles(verdict) == {"private": "current"}
 
 
-def test_unknown_current_with_no_other_seat_is_unknown_exit_3(
+def test_unknown_current_with_no_other_seat_continues_exit_0(
     seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     now = int(time.time())
@@ -467,19 +477,31 @@ def test_unknown_current_with_no_other_seat_is_unknown_exit_3(
     monkeypatch.setattr(cic, "_debate_cost_deltas", lambda *_a, **_k: [])
     _live(seats.seats["private"], 10.0, now=now, age=_HOUR)
     verdict = _cont()
-    assert verdict["state"] == "unknown"
+    assert (verdict["state"], verdict["used_percent"]) == ("continue", None)
     assert (verdict["retry_at"], verdict["retry_seat"]) == (None, "")
-    assert cic.main(["debate-seat", "-j", "-c", "private"]) == 3
-    assert json.loads(capsys.readouterr().out)["state"] == "unknown"
+    assert cic.main(["debate-seat", "-j", "-c", "private"]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "continue"
+    assert cic.main(["debate-seat", "-c", "private"]) == 0
+    assert "debate seat: continue private (5h unmeasured; seat private unmeasured" in (
+        capsys.readouterr().out
+    )
 
 
-def test_failover_never_lands_on_a_stale_reading(pair: SeatFixture) -> None:
+def test_failover_may_land_on_an_unmeasured_seat(pair: SeatFixture) -> None:
+    """tp#2494: the first tryable candidate, an unmeasured one included, takes over."""
     now = int(time.time())
     _live(pair.seats["private"], 95.0, now=now)
     _live(pair.seats["de"], 10.0, now=now, age=_HOUR)
     verdict = _cont()
-    assert verdict["state"] == "paused"  # private's known cause (capped) makes it a pause
-    assert verdict["retry_seat"] == "private"
+    assert (verdict["state"], verdict["seat"], verdict["used_percent"]) == (
+        "failover",
+        "de",
+        None,
+    )
+    assert verdict["reason"].endswith(
+        "failover to de unmeasured (no fresh five-hour reading); tried in codex order"
+    )
+    assert _entry(verdict, "de")["state"] == "unknown"
 
 
 def test_refresh_covers_the_current_seat(
@@ -1158,27 +1180,35 @@ def test_text_output_for_an_unmeasured_winner(
 _PARITY_STATES = ("allowed", "capped", "weekly", "weekly_stale", "unknown", "blocked")
 
 
+def _parity_setup(fixture: SeatFixture, label: str, setup: str, now: int) -> None:
+    """Give seat *label* one of the :data:`_PARITY_STATES` setups."""
+    home = fixture.seats[label]
+    if setup == "allowed":
+        _week(home, 10.0, 10.0, now=now)
+    elif setup == "capped":
+        _week(home, 90.0, 10.0, now=now)
+    elif setup == "weekly":
+        _week(home, 10.0, 99.0, now=now)
+    elif setup == "weekly_stale":
+        _week(home, 10.0, 99.0, now=now, age=_HOUR)
+    elif setup == "unknown":
+        _week(home, 10.0, 10.0, now=now, age=_HOUR)
+    else:
+        _week(home, 10.0, 10.0, now=now)
+        quota.record_block(
+            cic._seat_pid(label),  # noqa: SLF001
+            blocked_until=now + _HOUR,
+            kind=quota.KIND_HOLD,
+            reason="h",
+        )
+
+
 @pytest.mark.parametrize("first", _PARITY_STATES)
 @pytest.mark.parametrize("second", _PARITY_STATES)
 def test_parity_with_codex_review_order_pick(weekly: SeatFixture, first: str, second: str) -> None:
     now = int(time.time())
     for label, setup in (("private", first), ("de", second)):
-        home = weekly.seats[label]
-        if setup == "allowed":
-            _week(home, 10.0, 10.0, now=now)
-        elif setup == "capped":
-            _week(home, 90.0, 10.0, now=now)
-        elif setup == "weekly":
-            _week(home, 10.0, 99.0, now=now)
-        elif setup == "weekly_stale":
-            _week(home, 10.0, 99.0, now=now, age=_HOUR)
-        elif setup == "unknown":
-            _week(home, 10.0, 10.0, now=now, age=_HOUR)
-        else:
-            _week(home, 10.0, 10.0, now=now)
-            quota.record_block(
-                f"codex:{label}", blocked_until=now + _HOUR, kind=quota.KIND_HOLD, reason="h"
-            )
+        _parity_setup(weekly, label, setup, now)
     verdict = _verdict()
     pick = _order_pick(verdict)
     if pick:
@@ -1206,3 +1236,125 @@ def test_parity_table_on_synthetic_entries() -> None:
         assert (verdict["state"] == "allowed") == bool(pick)
         if pick:
             assert verdict["seat"] == pick["seat"]
+
+
+# --------------------------------------------------------------------------- #
+# Mid-debate (tp#2494 B2): an unmeasured current pin is kept, and a tool pin fails over
+# to the first TRYABLE candidate in routing order, as ``codex-review.py`` does.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(name="trio")
+def _trio(
+    seats: SeatFixture, reserve_calls: list[int], monkeypatch: pytest.MonkeyPatch
+) -> SeatFixture:
+    """All three seats allowed, the weekly reserve pinned, routing order private, de, default."""
+    _ = reserve_calls
+    _configure(seats, 'codex_debate_seats = ["private", "de", "default"]')
+    monkeypatch.setattr(cic, "_debate_cost_deltas", lambda *_a, **_k: [])
+    real = cic.codex_homes_in_order
+
+    def _ranked(now_ts: int | None = None, *, probe: bool = True) -> list[cic.SeatCandidate]:
+        cands = real(now_ts, probe=probe)
+        return sorted(cands, key=lambda cand: ["private", "de", "default"].index(cand.label))
+
+    monkeypatch.setattr(cic, "codex_homes_in_order", _ranked)
+    return seats
+
+
+def test_excluded_unknown_current_fails_over_to_the_first_unmeasured_candidate(
+    trio: SeatFixture,
+) -> None:
+    now = int(time.time())
+    _week(trio.seats["private"], 10.0, 10.0, now=now, age=_HOUR)
+    _week(trio.seats["de"], 10.0, 10.0, now=now, age=_HOUR)
+    _week(trio.seats["default"], 10.0, 10.0, now=now)
+    verdict = _cont(exclude=["private"])
+    assert (verdict["state"], verdict["seat"], verdict["used_percent"]) == (
+        "failover",
+        "de",
+        None,
+    )
+    assert _roles(verdict) == {"private": "excluded", "de": "candidate", "default": "candidate"}
+    assert _order_pick(verdict, skip=["private"], role="candidate")["seat"] == "de"
+
+
+def test_human_pin_unknown_current_continues(
+    pair: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = int(time.time())
+    _live(pair.seats["private"], 10.0, now=now, age=_HOUR)
+    _live(pair.seats["de"], 10.0, now=now)
+    monkeypatch.setenv("CODEX_HOME", str(pair.seats["private"]))
+    verdict = _cont(pin="human")
+    assert (verdict["state"], verdict["seat"], verdict["used_percent"]) == (
+        "continue",
+        "private",
+        None,
+    )
+    assert _roles(verdict) == {"private": "current"}
+
+
+def test_unmeasured_current_inside_the_one_round_floor_does_not_continue(
+    weekly: SeatFixture,
+) -> None:
+    """A known 7d 97 % leaves 3 % < one round (5 %): ``capped``, even with no fresh 5h."""
+    now = int(time.time())
+    _week(weekly.seats["private"], 10.0, 97.0, now=now, age=_HOUR, week_resets_in=_DAY)
+    _week(weekly.seats["de"], 10.0, 10.0, now=now)
+    moved = _cont()
+    cur = _entry(moved, "private")
+    assert (cur["state"], cur["window"], cur["used_percent"]) == ("capped", "seven_day", None)
+    assert (moved["state"], moved["seat"]) == ("failover", "de")
+    paused = _cont(exclude=["de"])
+    assert paused["state"] == "paused"
+    assert (paused["retry_at"], paused["retry_seat"]) == (now + _DAY, "private")
+
+
+def test_all_candidates_capped_or_blocked_still_pauses_with_retry_at(trio: SeatFixture) -> None:
+    now = int(time.time())
+    _week(trio.seats["private"], 95.0, 10.0, now=now, five_resets_in=4 * _HOUR)
+    _week(trio.seats["de"], 80.0, 10.0, now=now, five_resets_in=2 * _HOUR)
+    _week(trio.seats["default"], 10.0, 10.0, now=now)
+    quota.record_block("codex", blocked_until=now + _HOUR, kind=quota.KIND_HOLD, reason="h")
+    verdict = _cont()
+    assert verdict["state"] == "paused"
+    assert [_entry(verdict, label)["state"] for label in ("private", "de", "default")] == [
+        "capped",
+        "capped",
+        "blocked",
+    ]
+    assert (verdict["retry_at"], verdict["retry_seat"]) == (now + _HOUR, "default")
+    assert _order_pick(verdict, skip=["private"], role="candidate") == {}
+
+
+# The current seat's setups: the parity states plus an unmeasured seat the caller excluded.
+_CURRENT_STATES = ("allowed", "unknown", "unknown_excluded", "capped", "weekly_stale", "blocked")
+
+
+@pytest.mark.parametrize("current", _CURRENT_STATES)
+@pytest.mark.parametrize("second", _PARITY_STATES)
+@pytest.mark.parametrize("third", _PARITY_STATES)
+def test_continue_parity_with_codex_review_order_pick(
+    trio: SeatFixture, current: str, second: str, third: str
+) -> None:
+    """``-c``: the pin is kept when tryable, else ccc fails over to what
+    ``_order_pick(role="candidate")`` picks, else it pauses (exit 1)."""
+    now = int(time.time())
+    excluded = current == "unknown_excluded"
+    _parity_setup(trio, "private", "unknown" if excluded else current, now)
+    _parity_setup(trio, "de", second, now)
+    _parity_setup(trio, "default", third, now)
+    verdict = _cont(exclude=["private"] if excluded else [])
+    cur = _entry(verdict, "private")
+    if cur["role"] == "current" and cur["state"] in ("allowed", "unknown"):
+        assert (verdict["state"], verdict["seat"]) == ("continue", "private")
+        assert verdict["used_percent"] == cur["used_percent"]
+        return
+    pick = _order_pick(verdict, skip=["private"], role="candidate")
+    if pick:
+        assert (verdict["state"], verdict["seat"]) == ("failover", pick["seat"])
+        assert verdict["used_percent"] == pick["used_percent"]
+    else:
+        assert verdict["state"] == "paused"
+        assert cic._DEBATE_CONTINUE_EXIT["paused"] == 1  # noqa: SLF001
