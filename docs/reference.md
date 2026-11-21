@@ -1997,9 +1997,19 @@ Every shared write is one `BEGIN IMMEDIATE` transaction that first checks
 `meta.ccc_shared_schema = 1`, that the store is not under maintenance (`meta.backend`)
 and that `meta.holder_authority_epoch` equals the epoch ccc pinned at its first write; any
 mismatch writes nothing and logs one line to `command-center/shared-store.log`. Lifecycle
-writes wait up to 2 s for the lock, a beat not at all. Each committed write appends one
+writes wait up to 5 s for the lock, a beat not at all. Each committed write appends one
 `ccc_write` row (lock hold in ms) to the JSONL file `TP_TIMING_LOG` names (a separate
 file: a timing row adds no database write).
+
+Measured 2026-11-21 12:12-16:50 UTC (tp#2372 FB11, `ccc_write` and `slow_tx` rows of
+`TP_TIMING_LOG`): beats ran 368 an hour on average, 414 at peak (1 800 from the statusline
+fast path, 41 from the hooks, which the statusline mostly pre-empts within the 60 s
+throttle), well under the 600-an-hour estimate; ccc's lock holds stayed small (statusline
+beat p95 0.63 ms, max 18 ms; hook beat max 0.7 ms; lifecycle writes max 2.1 ms; the
+one-off `thread-seed` 336 ms). The file owner's own slow transactions held the lock p50
+1.6 s, p95 4.6 s, max 6.6 s: a 2 s lifecycle wait would lose about 0.17 % of lifecycle
+writes, 5 s (the owner's own `busy_timeout`) about 0.01 %, so lifecycle writes wait 5 s;
+a beat still waits 0 s (skipped at most ~0.65 % of the time, retried a minute later).
 
 **Session ids the installed Claude Code mints** (checked 2026-11-21 on 2.1.330 and in
 transcripts of 2.1.292-2.1.322):

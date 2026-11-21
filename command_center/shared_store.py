@@ -17,10 +17,10 @@ Every write runs in one ``BEGIN IMMEDIATE`` transaction that first checks, insid
 transaction, the component version (``meta.ccc_shared_schema``), the owner's maintenance
 flag (``meta.backend``) and the authority epoch (``meta.holder_authority_epoch``) against
 the epoch ccc pinned at its first write: any mismatch writes nothing and logs one line.
-Lifecycle writes wait up to 2 s for the write lock; a beat waits not at all (skipped when
-busy). Each committed write appends one timing row (how long it held the write lock) to
-the JSONL file ``TP_TIMING_LOG`` names, the owner's lock-timing log (a separate file, so a
-timing row adds no database write).
+Lifecycle writes wait up to 5 s for the write lock (the owner's own wait, FB11); a beat
+waits not at all (skipped when busy). Each committed write appends one timing row (how
+long it held the write lock) to the JSONL file ``TP_TIMING_LOG`` names, the owner's
+lock-timing log (a separate file, so a timing row adds no database write).
 
 ccc-private bookkeeping (the pinned epoch, the process → incarnation map, a pending
 ``/clear`` hand-over) stays in ``state.db``, in tables created only when the store is on.
@@ -59,7 +59,13 @@ EPOCH_KEY = "holder_authority_epoch"
 BACKEND_KEY = "backend"
 MAINTENANCE = "maintenance"
 
-LIFECYCLE_BUSY_MS = 2000
+#: Lock waits, measured 2026-11-21 12:12-16:50 UTC (tp#2372 FB11) from ``TP_TIMING_LOG``:
+#: ccc's own holds are tiny (1 800 statusline beats p95 0.63 ms, max 18 ms; 41 hook beats
+#: max 0.7 ms; lifecycle writes max 2.1 ms), but the owner's slow write transactions held
+#: the lock p50 1.6 s, p95 4.6 s, max 6.6 s (0.65 % of the time locked). A 2 s lifecycle
+#: wait lost ~0.17 % of lifecycle writes; 5 s (the owner's own ``busy_timeout``) ~0.01 %.
+#: A beat keeps 0 ms: it is skipped at most ~0.65 % of the time and retried next minute.
+LIFECYCLE_BUSY_MS = 5000
 BEAT_BUSY_MS = 0
 #: How long a thread-id read (:func:`read_thread_ids`) waits behind a writer's lock.
 READ_BUSY_MS = 250
