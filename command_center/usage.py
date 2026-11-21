@@ -361,6 +361,8 @@ _TEMP_PATTERNS = (
     # :mod:`.quota`'s observed-rejection store writes through _atomic_write_json too, so a
     # killed writer strands the same shape of orphan here.
     "cooldowns.json.*.tmp",
+    # codex_in_claude's persistent rollout evidence manifest (tp#2513).
+    "codex-rollout-evidence-v1.json.*.tmp",
 )
 # A live temp exists for well under a millisecond, so an hour is ~7 orders of margin.
 _TEMP_MAX_AGE_SEC = 3600

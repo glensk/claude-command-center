@@ -435,12 +435,13 @@ def test_sweep_covers_every_producer_prefix(
         "usage-work-b6f4d184.json.cccccccc.tmp",
         "copilot_usage.json.dddddddd.tmp",
         "codex_usage-a1b2c3d4.json.eeeeeeee.tmp",
+        "codex-rollout-evidence-v1.json.ffffffff.tmp",
     ):
         path = home / name
         path.write_text("{}", encoding="utf-8")
         os.utime(path, (old, old))
 
-    assert usage.sweep_stale_temps() == 3
+    assert usage.sweep_stale_temps() == 4
     assert list(home.glob("*.tmp")) == []
 
 

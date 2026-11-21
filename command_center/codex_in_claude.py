@@ -2874,8 +2874,9 @@ class _RolloutEvidence:
 _NO_ROLLOUT_EVIDENCE = _RolloutEvidence(rate=None, refusal=None)
 # CODEX_HOME partition -> canonical rollout path -> (fingerprint, evidence). ONE entry per
 # path; each partition is pruned to its home's current scan set by :func:`_rollout_scan`,
-# which bounds the long-lived TUI process. Rollouts are static once a run ends, so every
-# process after the first lookup reads no rollout bytes for an unchanged file.
+# which bounds the long-lived TUI process. Rollouts are static once a run ends, so after
+# the first lookup an unchanged file costs no rollout bytes — across processes too, via
+# the persistent manifest below (:func:`_load_rollout_manifest`).
 _rollout_memo: dict[str, dict[str, tuple[_RolloutFingerprint, _RolloutEvidence]]] = {}
 _rollout_memo_lock = threading.Lock()
 
@@ -3022,8 +3023,248 @@ def _rollout_evidence_at(
     return canonical, evidence
 
 
+# ── persistent rollout evidence manifest (tp#2513 B2) ──
+# The memo above, persisted per CODEX_HOME partition so a NEW process reads no rollout
+# bytes for unchanged files. ccc's own state dir, never Codex's: Codex owns ``~/.codex``.
+# Schema ``{"version": 1, "homes": {<home>: {<canonical path>: {"fingerprint": [dev, ino,
+# size, mtime_ns], "rate": ..., "refusal": ...}}}}`` — only parsed quota/refusal fields,
+# never rollout text. A disposable cache: every entry is validated before use and only
+# trusted while its fingerprint still matches the file on disk; a corrupt, foreign,
+# unreadable or unwritable manifest simply means a cold parse. No lock across processes:
+# a lost concurrent update costs a later reparse, never a different answer.
+_ROLLOUT_MANIFEST_NAME = "codex-rollout-evidence-v1.json"
+_ROLLOUT_MANIFEST_VERSION = 1
+_ManifestPartitions = dict[str, dict[str, tuple[_RolloutFingerprint, _RolloutEvidence]]]
+_rollout_manifest_lock = threading.Lock()
+# ``path``: the manifest this process loaded (``None`` = not yet); ``disk``: partition ->
+# {canonical path: fingerprint} as last read or written, so a scan that changed nothing
+# writes nothing.
+_rollout_manifest_state: dict[str, Any] = {"path": None, "disk": {}}
+
+
+class _ManifestInvalid(ValueError):
+    """A manifest entry that fails validation; the entry is skipped."""
+
+
+def _rollout_manifest_path() -> Path:
+    """``<app_home>/codex-rollout-evidence-v1.json``."""
+    from . import config  # pylint: disable=import-outside-toplevel  # cheap, per-call
+
+    return config.app_home() / _ROLLOUT_MANIFEST_NAME
+
+
+def _json_int(raw: object) -> int:
+    """*raw* as an int; bools and every other type are invalid."""
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise _ManifestInvalid(raw)
+    return raw
+
+
+def _rate_to_json(rate: _CodexRateSnapshot | None) -> dict[str, Any] | None:
+    if rate is None:
+        return None
+    return {
+        "captured_at": rate.captured_at,
+        "malformed": rate.malformed,
+        "windows": [
+            {
+                "used_percent": w.used_percent,
+                "resets_at": w.resets_at,
+                "window_minutes": w.window_minutes,
+            }
+            for w in rate.windows.values()
+        ],
+    }
+
+
+def _rate_from_json(raw: object) -> _CodexRateSnapshot | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("malformed"), bool):
+        raise _ManifestInvalid(raw)
+    items = raw.get("windows")
+    if not isinstance(items, list):
+        raise _ManifestInvalid(raw)
+    windows: dict[int, _CodexRateWindow] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise _ManifestInvalid(item)
+        pct = item.get("used_percent")
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            raise _ManifestInvalid(item)
+        window = _CodexRateWindow(
+            float(pct), _json_int(item.get("resets_at")), _json_int(item.get("window_minutes"))
+        )
+        if window.window_minutes <= 0 or window.window_minutes in windows:
+            raise _ManifestInvalid(item)
+        windows[window.window_minutes] = window
+    if not windows and not raw["malformed"]:
+        raise _ManifestInvalid(raw)  # the reader never stores such a block
+    return _CodexRateSnapshot(
+        captured_at=_json_int(raw.get("captured_at")),
+        windows=windows,
+        malformed=raw["malformed"],
+    )
+
+
+def _refusal_from_json(raw: object) -> _CodexRefusal | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("reached_type"), str):
+        raise _ManifestInvalid(raw)
+    return _CodexRefusal(
+        captured_at=_json_int(raw.get("captured_at")), reached_type=raw["reached_type"]
+    )
+
+
+def _manifest_entry(
+    home: str, path: object, raw: object
+) -> tuple[_RolloutFingerprint, _RolloutEvidence]:
+    """One validated manifest entry; raises :class:`_ManifestInvalid` otherwise."""
+    if (
+        not isinstance(path, str)
+        or not os.path.isabs(path)
+        or _rollout_partition(path) != home
+        or not os.path.basename(path).startswith("rollout-")
+        or not isinstance(raw, dict)
+    ):
+        raise _ManifestInvalid(path)
+    fingerprint = raw.get("fingerprint")
+    if not isinstance(fingerprint, list) or len(fingerprint) != 4:
+        raise _ManifestInvalid(fingerprint)
+    fp = (
+        _json_int(fingerprint[0]),
+        _json_int(fingerprint[1]),
+        _json_int(fingerprint[2]),
+        _json_int(fingerprint[3]),
+    )
+    evidence = _RolloutEvidence(
+        rate=_rate_from_json(raw.get("rate")), refusal=_refusal_from_json(raw.get("refusal"))
+    )
+    return fp, evidence
+
+
+def _read_rollout_manifest(path: Path) -> _ManifestPartitions:
+    """The valid entries of the manifest at *path*; ``{}`` when absent or unusable.
+
+    Read with :mod:`pathlib`, not the module-level ``open`` (that is the rollout test
+    seam). Invalid entries are dropped one by one; a wrong version drops everything.
+    """
+    try:
+        payload = json.loads(path.read_bytes())
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    version = payload.get("version")
+    homes = payload.get("homes")
+    if isinstance(version, bool) or version != _ROLLOUT_MANIFEST_VERSION:
+        return {}
+    if not isinstance(homes, dict):
+        return {}
+    partitions: _ManifestPartitions = {}
+    for home, entries in homes.items():
+        if not isinstance(home, str) or not isinstance(entries, dict):
+            continue
+        valid: dict[str, tuple[_RolloutFingerprint, _RolloutEvidence]] = {}
+        for name, raw in entries.items():
+            try:
+                valid[name] = _manifest_entry(home, name, raw)
+            except (_ManifestInvalid, TypeError, ValueError, OverflowError):
+                continue
+        if valid:
+            partitions[home] = valid
+    return partitions
+
+
+def _manifest_fingerprints(partitions: _ManifestPartitions) -> dict[str, dict[str, Any]]:
+    return {
+        home: {name: entry[0] for name, entry in entries.items()}
+        for home, entries in partitions.items()
+    }
+
+
+def _load_rollout_manifest() -> None:
+    """Seed the memo from the manifest, once per process (and per manifest path).
+
+    Existing memo entries win (they are at least as fresh); seeded ones are trusted only
+    while their fingerprint matches, exactly like entries this process parsed itself.
+    """
+    path = _rollout_manifest_path()
+    if _rollout_manifest_state["path"] == str(path):
+        return
+    with _rollout_manifest_lock:
+        if _rollout_manifest_state["path"] == str(path):
+            return
+        partitions = _read_rollout_manifest(path)
+        with _rollout_memo_lock:
+            for home, entries in partitions.items():
+                bucket = _rollout_memo.setdefault(home, {})
+                for name, entry in entries.items():
+                    bucket.setdefault(name, entry)
+        _rollout_manifest_state["disk"] = _manifest_fingerprints(partitions)
+        _rollout_manifest_state["path"] = str(path)
+
+
+def _save_rollout_manifest(homes: set[str]) -> None:
+    """Persist *homes*' memo partitions if they differ from what the manifest holds.
+
+    Read-merge-write: the file is re-read so other homes' partitions (possibly written by
+    another process) survive. A failed write is remembered as done, so an unwritable
+    state dir costs one attempt per change, not one per refresh.
+    """
+    with _rollout_memo_lock:
+        current = {home: dict(_rollout_memo.get(home, {})) for home in homes}
+    with _rollout_manifest_lock:
+        disk: dict[str, dict[str, Any]] = _rollout_manifest_state["disk"]
+        changed = {
+            home
+            for home, entries in current.items()
+            if {name: entry[0] for name, entry in entries.items()} != disk.get(home, {})
+        }
+        if not changed:
+            return
+        path = _rollout_manifest_path()
+        merged = _read_rollout_manifest(path)
+        for home in changed:
+            if current[home]:
+                merged[home] = current[home]
+            else:
+                merged.pop(home, None)
+        payload = {
+            "version": _ROLLOUT_MANIFEST_VERSION,
+            "homes": {
+                home: {
+                    name: {
+                        "fingerprint": list(fp),
+                        "rate": _rate_to_json(evidence.rate),
+                        "refusal": (
+                            None
+                            if evidence.refusal is None
+                            else {
+                                "captured_at": evidence.refusal.captured_at,
+                                "reached_type": evidence.refusal.reached_type,
+                            }
+                        ),
+                    }
+                    for name, (fp, evidence) in entries.items()
+                }
+                for home, entries in merged.items()
+            },
+        }
+        from .usagecache import (  # pylint: disable=import-outside-toplevel
+            _atomic_write_json,
+        )
+
+        with contextlib.suppress(OSError, TypeError, ValueError):
+            _atomic_write_json(path, payload)
+        _rollout_manifest_state["disk"] = _manifest_fingerprints(merged)
+        _rollout_manifest_state["path"] = str(path)
+
+
 def _rollout_evidence(path: Path) -> _RolloutEvidence:
     """Memoised evidence for one rollout file (see :func:`_rollout_evidence_at`)."""
+    _load_rollout_manifest()
     return _rollout_evidence_at(path)[1]
 
 
@@ -3031,8 +3272,11 @@ def _rollout_scan(files: list[Path]) -> list[_RolloutEvidence]:
     """Evidence for every file of a home's scan set, then prune that home's memo to it.
 
     *files* is the complete scan set (already cut to the scan limit); memo entries of
-    the same CODEX_HOME partition that are no longer in it are dropped.
+    the same CODEX_HOME partition that are no longer in it are dropped. The memo is
+    seeded from the persistent manifest first and the scanned partitions are written
+    back when they changed.
     """
+    _load_rollout_manifest()
     keep: dict[str, set[str]] = {}
     results: list[_RolloutEvidence] = []
     dirs: dict[str, str] = {}
@@ -3047,6 +3291,8 @@ def _rollout_scan(files: list[Path]) -> list[_RolloutEvidence]:
                 continue
             for stale in [name for name in entries if name not in paths]:
                 del entries[stale]
+    if keep:
+        _save_rollout_manifest(set(keep))
     return results
 
 
