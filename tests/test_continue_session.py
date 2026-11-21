@@ -1186,7 +1186,12 @@ def test_a_failing_hook_leaves_the_transfer_opened(  # pylint: disable=too-many-
 ) -> None:
     tid = _opened_transfer(harness)
     _as_successor(monkeypatch, harness, tid)
-    _hooks(monkeypatch, [_script(tmp_path, "bad.sh", body)], window=0, timeout=1)
+    _hooks(
+        monkeypatch,
+        [_script(tmp_path, "bad.sh", body)],
+        window=0,
+        timeout=1 if why == "timed out" else 30,
+    )
     capsys.readouterr()
     assert cli.main(["continue-session", "accept", tid]) == 1
     assert why in capsys.readouterr().err
