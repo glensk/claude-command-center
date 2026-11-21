@@ -1380,6 +1380,11 @@ def _open_target(  # pylint: disable=too-many-arguments
     target_row = store.get(transfer.target_session)
     if target_row is None or not target_row.draft:
         return None
+    shared_on = _shared_on()
+    if shared_on:  # tp#2372 F3b2: the thread reservation before the launch can race
+        refused = _reserve_before_launch(store, transfer)
+        if refused is not None:
+            return refused
     launcher = _launch(transfer.target_session)  # never started: (re)launch it
     if not launcher:
         if transfer.state == PREPARED:
@@ -1387,6 +1392,8 @@ def _open_target(  # pylint: disable=too-many-arguments
                 transfer.transfer_id, FAILED, _now_ms(), failure="launch: no terminal tab"
             )
             store.update_fields(transfer.target_session, archived=True)
+            if shared_on:
+                _shared_cancel(store, transfer.transfer_id)
         print(
             "error: could not open a terminal tab for the successor — the source "
             "session is unchanged",
@@ -2308,6 +2315,8 @@ def _accept_again(store: Store, transfer: Any, as_json: bool) -> int:
     (``carry_first_aim``) and the thread id (tp#1989). Never ``_reconcile_successor_aim``:
     it would overwrite an AIM the successor changed since (tp#1991)."""
     before = transfer.state
+    if _shared_on():
+        _shared_heal_accepted(store, transfer)  # a replay never reactivates the target
     store.carry_first_aim(transfer.target_session, transfer.source_session)
     store.record_thread(transfer.target_session, transfer.source_session)
     source = _finalize_after_accept(store, transfer)
@@ -2385,14 +2394,30 @@ def accept_as(  # pylint: disable=too-many-return-statements
             file=sys.stderr,
         )
         return 1
-    hooks = _run_hooks_with_retry(store, transfer, cfg.handoff_hooks, cfg)
+    hooks = _publish_steps(store, transfer, cfg)  # Design 3 steps 1-3 (store on), or hooks
     if isinstance(hooks, int):
         return hooks
     transfer, steps = hooks
-    moved = _accept_and_rebind(store, transfer)
+    moved = _accept_and_rebind(store, transfer)  # step 4: state.db's accepted CAS
     if moved is None:
+        if _shared_on():
+            print(
+                f"note: the shared thread store already names {transfer.target_session} "
+                f"current (op {transfer.transfer_id}); ccc's reconciler finishes this accept, "
+                "or run accept again",
+                file=sys.stderr,
+            )
         return 1
     steps += moved
+    source = _after_accept(store, transfer)
+    _print_accepted(transfer, steps, source, as_json)
+    return 0
+
+
+def _after_accept(store: Store, transfer: Any) -> dict[str, Any]:
+    """Everything after the accepted CAS (accept and the op-id recovery): the source record."""
+    from .models import now_ms
+
     # The lineage's first AIM becomes this session's `/aim (1)` anchor (tp#1553).
     store.carry_first_aim(transfer.target_session, transfer.source_session)
     # …it joins the source's thread: one id across every relay (tp#1989)…
@@ -2402,9 +2427,43 @@ def accept_as(  # pylint: disable=too-many-return-statements
     _mark_retired(transfer)
     store.note_transfer(transfer.transfer_id, now_ms(), failure="")
     # accept is the primary finalizer (tp#1582): an idle source never runs it itself.
-    source = _finalize_after_accept(store, transfer)
-    _print_accepted(transfer, steps, source, as_json)
-    return 0
+    return _finalize_after_accept(store, transfer)
+
+
+def _publish_steps(  # pylint: disable=too-many-return-statements  # one exit per step
+    store: Store, transfer: Any, cfg: Any
+) -> tuple[Any, list[str]] | int:
+    """Design 3's steps 1-3 before state.db's accepted CAS (tp#2372 F3b2): ``(transfer,
+    next steps)`` to go on with step 4, or an exit code (the source stays current).
+
+    With the shared store off this is exactly the hook run. On: (1) the op's reservation
+    (op id = the transfer id; written by ``start`` before the launch, here when missing),
+    (2) accept-prepare and every ``handoff_hooks`` entry, then accept-prepare once more as
+    the settled check (an await collision, an SQLite error or a transfer that changed state
+    is caught HERE, before anything is published) and ``committing``, (3) the shared
+    generation CAS. An op the shared store already accepted (a crash after step 3) skips
+    the hooks: only step 4 is left.
+    """
+    if not _shared_on():
+        return _run_hooks_with_retry(store, transfer, cfg.handoff_hooks, cfg)
+    pub = _shared_reserve(store, transfer)
+    refused = _refuse_publication(store, transfer, pub)
+    if refused is not None:
+        return refused
+    if pub.state == "accepted":
+        return transfer, []
+    hooks = _run_hooks_with_retry(store, transfer, cfg.handoff_hooks, cfg)
+    if isinstance(hooks, int):
+        return hooks
+    transfer, steps = hooks
+    refused = _accept_prepare(store, transfer)  # the settled check, right before step 3
+    if refused is not None:
+        return refused
+    pub = _shared_commit(store, transfer)
+    refused = _refuse_publication(store, transfer, pub)
+    if refused is not None:
+        return refused
+    return transfer, steps
 
 
 AUTO_ACCEPT_HEAD = "handoff {transfer} accepted"  # what the preamble tells the model to look for
@@ -2638,6 +2697,18 @@ def _abort(store: Store, transfer_id: str, reason: str, now: int) -> _Abort:
                 state=transfer.state,
                 was=transfer.state,
             )
+        if _shared_on() and _shared_cancel(store, tid) == ACCEPTED:
+            # tp#2372 F3b2: the op token is cancelled first; a published succession is
+            # never undone (the reconciler finishes its accept).
+            return _Abort(
+                1,
+                f"transfer {tid}: the shared thread store already names {target} current, so "
+                "it cannot be aborted; ccc's reconciler finishes the accept",
+                tid,
+                state=transfer.state,
+                was=transfer.state,
+                next_step=f"in the successor {target} run `ccc continue-session accept {tid}`",
+            )
         reserved = [group.id for group in store.reserved_awaits(tid)]
         if not store.transition_transfer(tid, FAILED, now, failure=failure):
             continue  # the state moved between the read and the CAS: judge it again
@@ -2714,6 +2785,428 @@ _VERBS = {
     "status": cmd_status,
     "abort": cmd_abort,
 }
+
+
+# --------------------------------------- shared thread publication (tp#2372 F3b2, Design 3)
+#
+# With ``shared_store_path`` set, a continue-session transfer is an operation-bound
+# succession in the shared store whose op id is the transfer id: ``start`` reserves the
+# source's generation before the successor's launch, ``accept`` settles its checks and
+# hooks, publishes the generation CAS and only then runs state.db's accepted CAS. An
+# interrupted operation is finished or cancelled by op id from ccc's reconciler
+# (:func:`recover_shared_ops`, called by ``core.reconcile_pass``), never by a later hook
+# of a possibly dead process. Off: nothing here opens any file.
+
+CONTINUE_JOIN = "continue"
+#: The reconciler leaves an op this young alone (a live accept or hook is finishing it).
+RECOVER_GRACE_MS = 30_000
+_PUBLISHED = ("accepted", "already")
+
+
+@dataclass(frozen=True)
+class _Publication:
+    """A shared succession step's outcome: the op's state (or ``lost`` / ``quarantined``
+    / ``unavailable``) and, for ``lost``, the winning succession."""
+
+    state: str
+    winner: Any = None
+
+
+def _shared_on() -> bool:
+    """True when ``shared_store_path`` is set (the shared thread store is on)."""
+    from . import config, shared_store
+
+    try:
+        return shared_store.configured_path(config.load_config()) is not None
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return False
+
+
+def _open_shared(store: Store) -> Any:
+    """The shared store (a context manager), ``None`` when it is unavailable (logged)."""
+    from . import shared_store
+
+    return shared_store.open_shared(store.conn)
+
+
+def _fork_root(shared: Any, transfer: Any, now: int) -> None:
+    """A successor that lost its succession: an independent root, zero inherited rights."""
+    if shared.session_row(transfer.target_session) is None:
+        origin = shared.thread_of(transfer.source_session)
+        shared.start_root(transfer.target_session, now, cwd=transfer.cwd, forked_from=origin)
+
+
+def _reserve_in(store: Store, shared: Any, transfer: Any, now: int) -> _Publication:
+    """Step 1 on an open *shared* store: the op's state (idempotent on the transfer id).
+
+    A ``lost`` reservation whose winner is a settled-in-state.db leftover (its transfer
+    failed, its relay cancelled) is recovered by op id once and the reservation retried.
+    """
+    tid = transfer.transfer_id
+    for attempt in range(2):
+        op = shared.op(tid)
+        if op is not None:
+            return _Publication(op.state)
+        res = shared.reserve(
+            transfer.source_session, transfer.target_session, CONTINUE_JOIN, now, op_id=tid
+        )
+        if res is None:
+            return _Publication("unavailable")
+        if res.status != "lost":
+            return _Publication(res.op.state if res.op is not None else res.status)
+        winner = res.winner
+        if attempt == 0 and winner is not None and _cancel_leftover(store, shared, winner, now):
+            continue
+        return _Publication("lost", winner)
+    return _Publication("lost")
+
+
+def _cancel_leftover(store: Store, shared: Any, op: Any, now: int) -> bool:
+    """Cancel a pending *op* that state.db already settled as given up (its transfer
+    failed, its relay cancelled); True if this call cancelled it. Nothing else is touched."""
+    from .thread_join_store import CANCELLED
+    from .transfer_store import FAILED
+
+    if not op.pending:
+        return False
+    if op.join_kind == CONTINUE_JOIN:
+        transfer = store.get_transfer(op.op_id)
+        dead = transfer is not None and transfer.state == FAILED
+    elif op.join_kind in ("park_start", "staff_accept"):
+        join = store.thread_join_op(op.op_id)
+        dead = join is not None and join.state == CANCELLED
+    else:
+        dead = False
+    return bool(dead and shared.settle(op.op_id, "cancelled", now))
+
+
+def _shared_reserve(store: Store, transfer: Any) -> _Publication:
+    """Design 3 step 1 for *transfer*: reserve its source's generation for its successor."""
+    import sqlite3
+
+    from .models import now_ms
+
+    try:
+        shared = _open_shared(store)
+        if shared is None:
+            return _Publication("unavailable")
+        with shared:
+            now = now_ms()
+            pub = _reserve_in(store, shared, transfer, now)
+            if pub.state == "lost":
+                _fork_root(shared, transfer, now)
+            return pub
+    except (sqlite3.Error, OSError) as exc:
+        _shared_log(f"reserve {transfer.transfer_id}: {type(exc).__name__}: {exc}")
+        return _Publication("unavailable")
+
+
+def _shared_commit(store: Store, transfer: Any) -> _Publication:
+    """Steps 2-3 for *transfer*: ``committing``, then the shared generation CAS.
+
+    ``accepted`` / ``already`` publish the successor (the source's row ends
+    ``handed_off``); ``lost`` / ``quarantined`` fail the op and leave the successor an
+    independent root; ``unavailable`` leaves the op pending for the reconciler.
+    """
+    import sqlite3
+
+    from .models import now_ms
+
+    tid = transfer.transfer_id
+    try:
+        shared = _open_shared(store)
+        if shared is None:
+            return _Publication("unavailable")
+        with shared:
+            now = now_ms()
+            shared.mark_committing(tid, now)
+            outcome = shared.commit(tid, now, cwd=transfer.cwd)
+            if outcome is None:
+                return _Publication("unavailable")
+            if outcome in _PUBLISHED:
+                op = shared.op(tid)
+                if op is not None:
+                    shared.transfer_end(op, now)
+            elif outcome in ("lost", "quarantined"):
+                _fork_root(shared, transfer, now)
+            return _Publication(outcome)
+    except (sqlite3.Error, OSError) as exc:
+        _shared_log(f"commit {tid}: {type(exc).__name__}: {exc}")
+        return _Publication("unavailable")
+
+
+def _shared_cancel(store: Store, transfer_id: str) -> str | None:
+    """Cancel *transfer_id*'s still pending reservation; the op's state after (``None`` =
+    no op or the store unavailable). An ``accepted`` op is never undone."""
+    import sqlite3
+
+    from .models import now_ms
+
+    try:
+        shared = _open_shared(store)
+        if shared is None:
+            return None
+        with shared:
+            shared.settle(transfer_id, "cancelled", now_ms())
+            op = shared.op(transfer_id)
+            return None if op is None else str(op.state)
+    except (sqlite3.Error, OSError) as exc:
+        _shared_log(f"cancel {transfer_id}: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _shared_heal_accepted(store: Store, transfer: Any) -> None:
+    """A duplicate accept (state.db already accepted): publish a still pending op; an
+    accepted one is a no-op (a replayed A→B after B→C never reactivates B)."""
+    import sqlite3
+
+    from .models import now_ms
+
+    try:
+        shared = _open_shared(store)
+        if shared is None:
+            return
+        with shared:
+            op = shared.op(transfer.transfer_id)
+            if op is None or not op.pending:
+                return
+            now = now_ms()
+            shared.mark_committing(op.op_id, now)
+            if shared.commit(op.op_id, now, cwd=transfer.cwd) in _PUBLISHED:
+                shared.transfer_end(op, now)
+    except (sqlite3.Error, OSError) as exc:
+        _shared_log(f"heal {transfer.transfer_id}: {type(exc).__name__}: {exc}")
+
+
+def _shared_log(text: str) -> None:
+    from . import shared_store
+
+    shared_store.log_line(text)
+
+
+def _refuse_publication(store: Store, transfer: Any, pub: _Publication) -> int | None:
+    """``None`` when *pub* lets accept go on; else report why (the source stays current)."""
+    from .models import now_ms
+
+    tid = transfer.transfer_id
+    if pub.state in ("reserved", "committing", *_PUBLISHED):
+        return None
+    if pub.state == "unavailable":
+        why = (
+            "the shared thread store is unavailable (see shared-store.log); nothing moved "
+            "and the source stays current — run accept again"
+        )
+    elif pub.state == "lost":
+        won = pub.winner
+        who = f"{won.target_session} (op {won.op_id})" if won is not None else "another session"
+        why = (
+            f"lost the thread succession to {who}: this session starts its own thread with "
+            f"nothing inherited; the source is unchanged — `ccc continue-session abort {tid}`"
+        )
+    else:
+        why = (
+            f"the shared thread succession of op {tid} is {pub.state}; nothing moved and the "
+            f"source stays current — `ccc continue-session abort {tid}`"
+        )
+    store.note_transfer(tid, now_ms(), failure=f"thread: {why}"[:200])
+    print(f"error: {why}", file=sys.stderr)
+    return 1
+
+
+def _reserve_before_launch(store: Store, transfer: Any) -> int | None:
+    """``start``: the shared reservation BEFORE the successor's launch can race (step 1).
+
+    ``None`` = launch; a lost or settled succession fails a still ``prepared`` transfer
+    (the source stays current) and returns 1. An unavailable store only warns: accept
+    reserves again before it publishes anything.
+    """
+    from .transfer_store import FAILED, PREPARED
+
+    pub = _shared_reserve(store, transfer)
+    if pub.state in ("reserved", "committing"):
+        return None
+    if pub.state == "unavailable":
+        print(
+            "warning: the shared thread store is unavailable; the successor's accept "
+            "reserves its thread generation instead",
+            file=sys.stderr,
+        )
+        return None
+    won = pub.winner
+    who = f" to {won.target_session} (op {won.op_id})" if won is not None else ""
+    failure = f"thread: succession {pub.state}{who}"
+    if transfer.state == PREPARED:
+        store.transition_transfer(transfer.transfer_id, FAILED, _now_ms(), failure=failure[:200])
+        store.update_fields(transfer.target_session, archived=True)
+    print(f"error: {failure}; the source session is unchanged", file=sys.stderr)
+    return 1
+
+
+# -- recovery by op id (the reconciler) ------------------------------------------------
+
+
+def _quiet(fn: Any, *args: Any) -> tuple[Any, str]:
+    """Run *fn* with its stdout/stderr captured (the reconciler prints nothing)."""
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        got = fn(*args)
+    return got, " ".join(buf.getvalue().split())[:300]
+
+
+def _finish_accept(store: Store, transfer: Any) -> str:
+    """Step 4 (+ everything after it) for a transfer whose op the shared store accepted."""
+    moved, said = _quiet(_accept_and_rebind, store, transfer)
+    tid = transfer.transfer_id
+    if moved is None:
+        return f"op {tid}: published, state.db accept still pending ({said})"
+    record, _ = _quiet(_after_accept, store, transfer)
+    return f"op {tid}: accept finished (source {record.get('state', '?')})"
+
+
+def _old(at: int | None, now: int, grace_ms: int) -> bool:
+    return at is not None and int(at) <= now - grace_ms
+
+
+def _commit_op(shared: Any, op: Any, now: int, cwd: str = "") -> str | None:
+    """Finish a pending op's steps 2-3; the outcome word (``None`` = not written)."""
+    shared.mark_committing(op.op_id, now)
+    outcome: str | None = shared.commit(op.op_id, now, cwd=cwd)
+    return outcome
+
+
+def _recover_continue(store: Store, shared: Any, op: Any, now: int, grace_ms: int) -> str | None:
+    """A pending ``continue`` op, judged by its transfer (op id = transfer id)."""
+    from .transfer_store import ACCEPTED, FAILED, FINALIZED
+
+    transfer = store.get_transfer(op.op_id)
+    if transfer is None:
+        return None  # not this state.db's transfer: `ccc thread-reconcile --report` lists it
+    if transfer.state == FAILED:
+        shared.settle(op.op_id, "cancelled", now)
+        return f"op {op.op_id}: transfer failed, reservation cancelled"
+    if transfer.state in (ACCEPTED, FINALIZED):
+        outcome = _commit_op(shared, op, now, transfer.cwd)
+        if outcome in _PUBLISHED:
+            shared.transfer_end(op, now)
+        return f"op {op.op_id}: transfer {transfer.state}, shared publication {outcome}"
+    if op.state != "committing" or not _old(op.created_at, now, grace_ms):
+        return None  # reserved: the successor has not accepted yet
+    outcome = _commit_op(shared, op, now, transfer.cwd)
+    if outcome in _PUBLISHED:
+        shared.transfer_end(op, now)
+        return _finish_accept(store, transfer)
+    if outcome in ("lost", "quarantined"):
+        _fork_root(shared, transfer, now)
+    return f"op {op.op_id}: shared publication {outcome}"
+
+
+def _recover_relay(store: Store, shared: Any, op: Any, now: int, grace_ms: int) -> str | None:
+    """A pending ``park_start`` / ``staff_accept`` op, judged by its ``thread_joins`` row."""
+    from .thread_join_store import ACCEPTED, CANCELLED, RESERVED
+
+    join = store.thread_join_op(op.op_id)
+    if join is None:
+        return None
+    if join.state == CANCELLED:
+        shared.settle(op.op_id, "cancelled", now)
+        return f"op {op.op_id}: relay cancelled, reservation cancelled"
+    committing = op.state == "committing" and _old(op.created_at, now, grace_ms)
+    if join.state != ACCEPTED and not committing:
+        return None  # reserved: the job has not started / staff consent not given yet
+    outcome = _commit_op(shared, op, now)
+    if outcome in _PUBLISHED and join.state == RESERVED:
+        store.settle_thread_join(op.op_id, ACCEPTED, now)
+    elif outcome in ("lost", "quarantined") and shared.session_row(op.target_session) is None:
+        origin = shared.thread_of(op.source_session)
+        shared.start_root(op.target_session, now, forked_from=origin)
+    return f"op {op.op_id}: relay {join.state}, shared publication {outcome}"
+
+
+def _recover_clear(shared: Any, op: Any, now: int, grace_ms: int) -> str | None:
+    """A ``/clear`` join its SessionStart hook never finished."""
+    if not _old(op.created_at, now, grace_ms):
+        return None
+    outcome = _commit_op(shared, op, now)
+    if outcome in _PUBLISHED:
+        shared.end(op.source_session, now, "handed_off")
+    elif shared.session_row(op.target_session) is None:
+        shared.start_root(op.target_session, now)
+    return f"op {op.op_id}: /clear join {outcome}"
+
+
+def _recover_op(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    store: Store, shared: Any, op: Any, now: int, grace_ms: int = RECOVER_GRACE_MS
+) -> str | None:
+    """Finish or cancel ONE pending succession by its op id; what it did (``None`` = left
+    as it is). ``headless`` ops belong to ``ccc thread-register``."""
+    if not op.pending:
+        return None
+    if op.join_kind == CONTINUE_JOIN:
+        return _recover_continue(store, shared, op, now, grace_ms)
+    if op.join_kind in ("park_start", "staff_accept"):
+        return _recover_relay(store, shared, op, now, grace_ms)
+    if op.join_kind == "clear":
+        return _recover_clear(shared, op, now, grace_ms)
+    return None
+
+
+def _recover_published(store: Store, shared: Any, now: int, grace_ms: int) -> list[str]:
+    """state.db steps a crash after step 3 left undone: an in-flight transfer, or a
+    reserved relay row, whose op the shared store already accepted."""
+    from .thread_join_store import ACCEPTED
+
+    lines: list[str] = []
+    for transfer in store.dead_transfer_candidates(now):  # every prepared/opened transfer
+        op = shared.op(transfer.transfer_id)
+        if op is not None and op.state == "accepted" and _old(op.settled_at, now, grace_ms):
+            lines.append(_finish_accept(store, transfer))
+    rows = store.conn.execute("SELECT op_id FROM thread_joins WHERE state = 'reserved'")
+    for (op_id,) in rows.fetchall():
+        op = shared.op(str(op_id))
+        if op is not None and op.state == "accepted" and _old(op.settled_at, now, grace_ms):
+            if store.settle_thread_join(op.op_id, ACCEPTED, now):
+                lines.append(f"op {op.op_id}: relay accepted in state.db (published before)")
+    return lines
+
+
+def recover_shared_ops(
+    store: Store, *, now: int | None = None, grace_ms: int = RECOVER_GRACE_MS
+) -> list[str]:
+    """ccc's recovery by op id (Design 3/4): finish or cancel every interrupted succession.
+
+    Pending ops: a ``continue`` op whose transfer failed is cancelled, one whose transfer
+    state.db accepted is published, a ``committing`` one (its checks and hooks settled) is
+    published and its accept finished; a relay op follows its ``thread_joins`` row; a
+    ``/clear`` join is finished. Accepted ops whose state.db step a crash skipped are
+    finished (step 4) with no further prompt. Ops younger than *grace_ms* are left to the
+    live caller. What it did, one line per op (also logged). Off: ``[]``, no file opened.
+    """
+    import sqlite3
+
+    from .models import now_ms
+
+    if not _shared_on():
+        return []
+    at = now_ms() if now is None else now
+    lines: list[str] = []
+    try:
+        shared = _open_shared(store)
+        if shared is None:
+            return []
+        with shared:
+            for op in shared.pending_ops():
+                line = _recover_op(store, shared, op, at, grace_ms)
+                if line:
+                    lines.append(line)
+            lines += _recover_published(store, shared, at, grace_ms)
+    except (sqlite3.Error, OSError) as exc:
+        lines.append(f"recovery stopped: {type(exc).__name__}: {exc}")
+    for line in lines:
+        _shared_log(f"recover: {line}")
+    return lines
 
 
 def dispatch(args: argparse.Namespace) -> int:

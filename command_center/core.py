@@ -652,7 +652,23 @@ def reconcile_pass(  # pylint: disable=too-many-locals,too-many-branches,too-man
                 continue
             refreshed.append(fresh)
         sessions = refreshed
+    if relevance is None:
+        _recover_shared_ops(store)
     return ReconcilePass(scans=scans, live_by_id=live_by_id, sessions=sessions)
+
+
+def _recover_shared_ops(store: Store) -> None:
+    """The full pass finishes or cancels interrupted thread successions by op id
+    (tp#2372 F3b2, ``continue_session.recover_shared_ops``). With ``shared_store_path``
+    unset nothing is imported or opened; a failure never breaks the pass."""
+    try:
+        if not config.load_config().shared_store_path:
+            return
+        from . import continue_session  # pylint: disable=import-outside-toplevel
+
+        continue_session.recover_shared_ops(store)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        pass
 
 
 def reconcile(
