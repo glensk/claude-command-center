@@ -40,8 +40,13 @@ _HELP = "from command_center import {mod} as m\nraise SystemExit(m.main(['--help
 
 def _run_with_dead_stdout(body: str) -> subprocess.CompletedProcess[str]:
     # Drop the ccc config env but keep the child guard (CCC_TEST_*, tests/_childguard).
+    # Also drop PYTHONUNBUFFERED (pytest-slot sets it for full runs): these cases need the
+    # child's stdout BLOCK-buffered, as on a real pipe. Unbuffered, `--help` hits EPIPE
+    # inside argparse's own write, which swallows OSError and exits 0 (tp#2527 follow-up).
     env = {
-        k: v for k, v in os.environ.items() if not k.startswith("CCC") or k.startswith("CCC_TEST_")
+        k: v
+        for k, v in os.environ.items()
+        if (not k.startswith("CCC") or k.startswith("CCC_TEST_")) and k != "PYTHONUNBUFFERED"
     }
     root = str(Path(__file__).resolve().parent.parent)
     env["PYTHONPATH"] = os.pathsep.join([root, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)

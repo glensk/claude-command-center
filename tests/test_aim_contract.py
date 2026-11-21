@@ -609,11 +609,16 @@ def test_dead_stdout_is_a_silent_sigpipe_exit(
     homes: dict[str, Path], args: tuple[str, ...]
 ) -> None:
     home = homes["default"]
+    env = _env(home)
+    # The case under test is a BLOCK-buffered stdout (as on a real pipe). pytest-slot runs
+    # the full suite with PYTHONUNBUFFERED=1; inherited, `-h` would hit EPIPE inside
+    # argparse's own write, which swallows OSError and exits 0 (tp#2527 follow-up).
+    env.pop("PYTHONUNBUFFERED", None)
     proc = subprocess.Popen(  # pylint: disable=consider-using-with
         [sys.executable, "-m", "command_center", "aim", *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=_env(home),
+        env=env,
         cwd=home,
     )
     assert proc.stdout is not None
