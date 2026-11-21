@@ -2,10 +2,12 @@
 """A session's thread: its handoff chain's root id and the chain's real AIM changes (tp#1989).
 
 A *thread* is every session one piece of work ran in across ``ccc continue-session``
-relays. Its id is the chain root's session id: ``sessions.thread_id`` when ``accept``
-recorded it, else the root reached by walking back (the rule of ``ccc lineage``,
-:mod:`command_center.bridge_lineage`: the row's ``handed_off_from``, else the best
-non-failed transfer into the session; at most :data:`MAX_HOPS` hops, cycle guard).
+relays. Its id is the chain root's session id: the shared store's
+``ccc_sessions.thread_id`` when ``shared_store_path`` is set and has a row (tp#2372 F3b7),
+else ``sessions.thread_id`` when ``accept`` recorded it, else the root reached by walking
+back (the rule of ``ccc lineage``, :mod:`command_center.bridge_lineage`: the row's
+``handed_off_from``, else the best non-failed transfer into the session; at most
+:data:`MAX_HOPS` hops, cycle guard).
 
 The walk is batched level by level (one ``sessions`` and at most one ``transfers`` query
 per hop depth for every asked id at once), so ``ccc sessions -j`` pays a few queries per
@@ -34,7 +36,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from . import aimprov
+from . import aimprov, shared_store
 from .aimprov import AimRow, HandAim
 from .bridge_json import iso
 
@@ -48,6 +50,7 @@ __all__ = [
     "ThreadPath",
     "facts",
     "hand_set_aims",
+    "shared_thread_ids",
     "thread_aims",
     "walk",
 ]
@@ -76,7 +79,7 @@ class ThreadPath:
     path: list[str] = field(default_factory=list)
     thread_id: str = ""
     #: False when the walk was cut (cycle, > :data:`MAX_HOPS`) or a session on the path
-    #: has no row, and no recorded ``thread_id`` column vouches for the id.
+    #: has no row, and no recorded thread id (shared row or ``thread_id`` column) vouches.
     exact: bool = True
 
 
@@ -140,6 +143,20 @@ def _transfer_parents(conn: sqlite3.Connection, ids: Iterable[str]) -> dict[str,
     return {target: source for target, (_key, source) in best.items()}
 
 
+def shared_thread_ids(session_ids: Iterable[str]) -> dict[str, str]:
+    """The recorded thread id of every id in the shared store's ``ccc_sessions`` (F3b7).
+
+    ``{}`` when ``shared_store_path`` is unset: then nothing touches any shared file and
+    the ``state.db`` ``sessions.thread_id`` column stays the only recorded id. On, one
+    read-only query per ≤ 500 ids (:func:`shared_store.read_thread_ids`); ids without a
+    shared row are absent, so the walk falls back to ``state.db`` for them.
+    """
+    path = shared_store.configured_path()
+    if path is None:
+        return {}
+    return shared_store.read_thread_ids(path, session_ids)
+
+
 def _walk(
     conn: sqlite3.Connection, session_ids: Iterable[str], max_hops: int = MAX_HOPS
 ) -> tuple[dict[str, ThreadPath], dict[str, sqlite3.Row]]:
@@ -172,9 +189,10 @@ def _walk(
             else:
                 chains[sid].append(parent)
                 seen[sid].add(parent)
+    shared = shared_thread_ids(dict.fromkeys(c for chain in chains.values() for c in chain))
     paths: dict[str, ThreadPath] = {}
     for sid, chain in chains.items():
-        column = next(
+        column = next((shared[c] for c in chain if c in shared), "") or next(
             (str(rows[c]["thread_id"]) for c in chain if c in rows and rows[c]["thread_id"]),
             "",
         )

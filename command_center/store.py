@@ -2708,9 +2708,12 @@ class Store(  # pylint: disable=too-many-public-methods
     def thread_of(self, session_id: str) -> str:
         """*session_id*'s thread id: its handoff chain's root session id (tp#1989).
 
-        The recorded ``thread_id`` column when set (on the session or the nearest ancestor
-        that has it); else the oldest id the ``handed_off_from`` walk reaches (the rule of
-        ``ccc lineage``: ≤ 50 hops, cycle guard; :func:`thread.walk`); else *session_id*.
+        With ``shared_store_path`` set, the shared store's ``ccc_sessions.thread_id`` (on the
+        session or the nearest ancestor with a shared row; tp#2372 F3b7). Else, and for ids
+        without a shared row, the recorded ``thread_id`` column when set (on the session or
+        the nearest ancestor that has it); else the oldest id the ``handed_off_from`` walk
+        reaches (the rule of ``ccc lineage``: ≤ 50 hops, cycle guard; :func:`thread.walk`);
+        else *session_id*. With the key unset no shared file is touched.
         """
         from . import thread  # pylint: disable=import-outside-toplevel  # thread reads the store
 

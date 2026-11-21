@@ -32,7 +32,7 @@ import os
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -51,6 +51,10 @@ MAINTENANCE = "maintenance"
 
 LIFECYCLE_BUSY_MS = 2000
 BEAT_BUSY_MS = 0
+#: How long a thread-id read (:func:`read_thread_ids`) waits behind a writer's lock.
+READ_BUSY_MS = 250
+#: Ids per ``IN (...)`` list of a read (well under SQLite's bound-parameter limit).
+READ_CHUNK = 500
 #: A session's ``last_beat`` is written at most once per this many milliseconds.
 BEAT_INTERVAL_MS = 60_000
 #: A ``/clear`` hand-over mark older than this is never consumed.
@@ -744,3 +748,41 @@ def open_shared(
     except sqlite3.Error as exc:
         log_line(f"open {target}: {type(exc).__name__}: {exc}")
         return None
+
+
+def read_thread_ids(path: Path, session_ids: Iterable[str]) -> dict[str, str]:
+    """Every id's ``ccc_sessions.thread_id`` in the shared file at *path* (tp#2372 F3b7).
+
+    The thread reader's helper (:mod:`command_center.thread`): it opens the file READ-ONLY
+    (``mode=ro``), so a read writes nothing anywhere, unlike :class:`SharedStore`, which
+    creates ccc's private tables in ``state.db`` and is the write path. Ids without a row
+    are absent. A missing or unreadable file, or a store without the table, gives ``{}``
+    (one log line per call): the caller falls back to ``state.db``. Never raises
+    ``sqlite3.Error``.
+    """
+    ids = list(dict.fromkeys(s for s in session_ids if s))
+    if not ids or not path.is_file():
+        return {}
+    out: dict[str, str] = {}
+    try:
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=READ_BUSY_MS / 1000)
+    except sqlite3.Error as exc:
+        log_line(f"read {path}: {type(exc).__name__}: {exc}")
+        return {}
+    try:
+        for start in range(0, len(ids), READ_CHUNK):
+            batch = ids[start : start + READ_CHUNK]
+            marks = ",".join("?" * len(batch))
+            rows = conn.execute(
+                "SELECT session_id, thread_id FROM ccc_sessions "
+                f"WHERE session_id IN ({marks}) AND COALESCE(thread_id, '') != ''",
+                batch,
+            ).fetchall()
+            out.update({str(sid): str(tid) for sid, tid in rows})
+    except sqlite3.Error as exc:
+        log_line(f"read {path}: {type(exc).__name__}: {exc}")
+        return {}
+    finally:
+        conn.close()
+    return out
