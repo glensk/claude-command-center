@@ -3761,6 +3761,34 @@ def cmd_thread_register(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config(args: argparse.Namespace) -> int:
+    """``ccc config set KEY VALUE`` / ``ccc config unset KEY`` (tp#2372 Design 12).
+
+    Validated against ``config.DEFAULTS`` (inert keys included; an unknown key or a
+    value of the wrong type is refused, exit 2) and written atomically to config.toml.
+    ``unset`` restores the key's default. The only supported way to flip a key such as
+    ``shared_store_path`` (never a hand edit, never the ``ccc init`` wizard).
+    """
+    key = (args.key or "").strip()
+    try:
+        if args.action == "set":
+            if args.value is None:
+                print("error: config set needs KEY VALUE", file=sys.stderr)
+                return 2
+            value = config.set_config_key(key, args.value)
+            print(f"{key} = {json.dumps(value)}")
+        else:
+            if args.value is not None:
+                print("error: config unset takes only KEY", file=sys.stderr)
+                return 2
+            value = config.unset_config_key(key)
+            print(f"{key} unset (default {json.dumps(value)})")
+    except config.ConfigKeyError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def _edit_job_fields(  # pylint: disable=too-many-branches,too-many-return-statements
     args: argparse.Namespace, store: Store, session: Session, git_base: Any
 ) -> Any:
@@ -8081,6 +8109,15 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
     p_tregister.add_argument("-S", "--session", required=True, help="the headless session id")
     p_tregister.add_argument("-c", "--cwd", default="", help="the run's working directory")
     p_tregister.set_defaults(func=cmd_thread_register)
+
+    p_config = sub.add_parser(
+        "config",
+        help="set or unset one config.toml key, validated against the defaults",
+    )
+    p_config.add_argument("action", choices=("set", "unset"))
+    p_config.add_argument("key", help="a config key (see config.DEFAULTS)")
+    p_config.add_argument("value", nargs="?", default=None, help="the new value (set only)")
+    p_config.set_defaults(func=cmd_config)
 
     p_editjob = sub.add_parser(
         "edit-job",

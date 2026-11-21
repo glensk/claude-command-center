@@ -24,6 +24,7 @@ if __name__ == "__main__" and not __package__:  # pragma: no cover - see _direct
 import contextlib
 import copy
 import datetime
+import json
 import os
 import re
 import shutil
@@ -1624,3 +1625,80 @@ def save_config(cfg: Config) -> None:  # pylint: disable=too-many-branches
             with contextlib.suppress(OSError):
                 os.unlink(tmp_name)
     invalidate_config_cache()  # mtime granularity: never serve the pre-save Config again
+
+
+class ConfigKeyError(ValueError):
+    """``ccc config set|unset`` refused: an unknown key or a value of the wrong type."""
+
+
+_BOOL_WORDS = {"true": True, "yes": True, "on": True, "1": True}
+_BOOL_FALSE_WORDS = {"false": False, "no": False, "off": False, "0": False}
+
+
+def parse_config_value(key: str, raw: str) -> object:  # pylint: disable=too-many-return-statements
+    """*raw* coerced to the type of ``DEFAULTS[key]``; ``ConfigKeyError`` when it does not fit.
+
+    bool: true/false (yes/no, on/off, 1/0); int/float: a number; str: as given; list: a
+    JSON array, or comma-separated strings (empty = ``[]``); dict: a JSON object.
+    """
+    if key not in DEFAULTS:
+        raise ConfigKeyError(f"unknown config key {key!r}")
+    default = DEFAULTS[key]
+    text = raw.strip()
+    try:
+        if isinstance(default, bool):
+            word = text.lower()
+            if word in _BOOL_WORDS:
+                return True
+            if word in _BOOL_FALSE_WORDS:
+                return False
+            raise ValueError("expected true or false")
+        if isinstance(default, int):
+            return int(text)
+        if isinstance(default, float):
+            return float(text)
+        if isinstance(default, str):
+            return raw
+        if isinstance(default, list):
+            if text.startswith("["):
+                value = json.loads(text)
+                if isinstance(value, list):
+                    return value
+                raise ValueError("expected a JSON array")
+            return [part.strip() for part in text.split(",") if part.strip()]
+        value = json.loads(text)
+        if isinstance(value, dict):
+            return value
+        raise ValueError("expected a JSON object")
+    except ValueError as exc:
+        raise ConfigKeyError(f"bad value for {key} ({type(default).__name__}): {exc}") from exc
+
+
+def _write_key(key: str, value: object) -> None:
+    cfg = load_config()
+    setattr(cfg, key, value)
+    try:
+        save_config(cfg)
+    except RuntimeError as exc:  # an unparsable config.toml: never clobbered
+        raise ConfigKeyError(str(exc)) from exc
+
+
+def set_config_key(key: str, raw: str) -> object:
+    """Validate *raw* against ``DEFAULTS[key]`` and write it to config.toml (atomic).
+
+    Every ``DEFAULTS`` key is accepted, the inert ones included; an unknown key or a
+    value of the wrong type raises :class:`ConfigKeyError` before any write. Returns the
+    stored value.
+    """
+    value = parse_config_value(key, raw)
+    _write_key(key, value)
+    return value
+
+
+def unset_config_key(key: str) -> object:
+    """Reset *key* to its ``DEFAULTS`` value (the inert default) and write config.toml."""
+    if key not in DEFAULTS:
+        raise ConfigKeyError(f"unknown config key {key!r}")
+    value = copy.deepcopy(DEFAULTS[key])
+    _write_key(key, value)
+    return value
