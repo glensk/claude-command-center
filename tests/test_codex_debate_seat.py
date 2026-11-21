@@ -681,3 +681,269 @@ def test_continue_parser_short_flags() -> None:
         ["debate-seat", "-c", "private", "-p", "human", "-x", "de", "-x", "default"]
     )
     assert (args.continue_from, args.pin, args.exclude) == ("private", "human", ["de", "default"])
+
+
+# --------------------------------------------------------------------------- #
+# The weekly reserve (tp#2495): a seat whose KNOWN seven-day reading leaves less than
+# the learned weekly reserve (one full debate) is ``capped`` — at the start, for a
+# failover candidate, and (at one round's worth) for the current seat mid-debate.
+# --------------------------------------------------------------------------- #
+_RESERVE = 16.5  # the learned weekly reserve the tests pin
+_WEEKLY_FIELDS = frozenset(
+    {"window", "weekly_resets_at", "weekly_reserve_source", "weekly_reserve_percent"}
+) | {"weekly_used_percent"}
+
+
+def _week(  # pylint: disable=too-many-arguments
+    home: Path,
+    five: float,
+    week: float | None,
+    *,
+    now: int,
+    age: int = 0,
+    five_resets_in: int = 4 * _HOUR,
+    week_resets_in: int = 3 * _DAY,
+) -> None:
+    """A live reading: five-hour *five* %, weekly *week* % (``None`` = no weekly window)."""
+    usage._write_codex_usage(  # noqa: SLF001
+        home,
+        usage.Usage(
+            captured_at=now - age,
+            five_hour=usage.Window(used_percentage=five, resets_at=now + five_resets_in),
+            seven_day=(
+                None
+                if week is None
+                else usage.Window(used_percentage=week, resets_at=now + week_resets_in)
+            ),
+            live=True,
+        ),
+        now - age,
+    )
+    usage._codex_cache.clear()  # noqa: SLF001
+
+
+@pytest.fixture(name="reserve_calls")
+def _reserve_calls(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Pin the learned weekly reserve to 16.5 %; the list records every lookup."""
+    calls: list[int] = []
+
+    def _reserve(minutes: int) -> tuple[float, str]:
+        calls.append(minutes)
+        return (_RESERVE, "learned")
+
+    monkeypatch.setattr(cic, "_headroom_reserve", _reserve)
+    return calls
+
+
+@pytest.fixture(name="weekly")
+def _weekly(
+    pair: SeatFixture, reserve_calls: list[int], monkeypatch: pytest.MonkeyPatch
+) -> SeatFixture:
+    """``pair`` with the weekly reserve pinned and the routing order fixed (private, de)."""
+    _ = reserve_calls
+    real = cic.codex_homes_in_order
+
+    def _ranked(now_ts: int | None = None, *, probe: bool = True) -> list[cic.SeatCandidate]:
+        cands = real(now_ts, probe=probe)
+        return sorted(cands, key=lambda cand: ["private", "de", "default"].index(cand.label))
+
+    monkeypatch.setattr(cic, "codex_homes_in_order", _ranked)
+    return pair
+
+
+def _entry(verdict: dict, label: str) -> dict:
+    return next(seat for seat in verdict["seats"] if seat["seat"] == label)
+
+
+def test_weekly_reserve_caps_a_seat_and_the_next_seat_wins(
+    weekly: SeatFixture, reserve_calls: list[int]
+) -> None:
+    """(a) 5h 20 % but 7d 99 %: capped on the weekly reset; the next seat in order wins."""
+    now = int(time.time())
+    _week(weekly.seats["private"], 20.0, 99.0, now=now, week_resets_in=2 * _DAY)
+    _week(weekly.seats["de"], 30.0, 50.0, now=now)
+    verdict = _verdict()
+    assert [seat["seat"] for seat in verdict["seats"]][:2] == ["private", "de"]
+    first = _entry(verdict, "private")
+    assert first["state"] == "capped"
+    assert first["resets_at"] == now + 2 * _DAY
+    assert first["used_percent"] == 20.0
+    assert (first["weekly_used_percent"], first["weekly_resets_at"]) == (99.0, now + 2 * _DAY)
+    assert (first["weekly_reserve_percent"], first["weekly_reserve_source"]) == (
+        _RESERVE,
+        "learned",
+    )
+    assert first["window"] == "seven_day"
+    assert first["reason"] == "7d 99 % — inside weekly reserve 16.5 %"
+    assert (verdict["state"], verdict["seat"]) == ("allowed", "de")
+    assert verdict["weekly_used_percent"] == 50.0
+    assert verdict["window"] == ""
+    assert reserve_calls == [cic._SEVEN_DAY_MINUTES]  # noqa: SLF001  # once per verdict
+
+
+def test_weekly_reserve_caps_an_unmeasured_five_hour_seat(weekly: SeatFixture) -> None:
+    """(b) no fresh 5h reading but a known 7d 99 %: ``capped``, never ``unknown``."""
+    now = int(time.time())
+    _week(weekly.seats["private"], 20.0, 99.0, now=now, age=_HOUR)
+    _week(weekly.seats["de"], 20.0, 99.0, now=now, age=_HOUR)
+    verdict = _verdict()
+    entry = _entry(verdict, "private")
+    assert entry["state"] == "capped"
+    assert entry["used_percent"] is None
+    assert entry["window"] == "seven_day"
+    assert verdict["state"] == "capped"
+
+
+@pytest.mark.parametrize("week", ["missing", "stale"])
+def test_missing_or_stale_weekly_never_denies(weekly: SeatFixture, week: str) -> None:
+    """(c) no weekly window, or one past its reset: fresh stays allowed, unfresh unknown."""
+    now = int(time.time())
+    used = None if week == "missing" else 99.0
+    week_in = -60 if week == "stale" else 3 * _DAY
+    _week(weekly.seats["private"], 20.0, used, now=now, week_resets_in=week_in)
+    _week(weekly.seats["de"], 20.0, used, now=now, age=_HOUR, week_resets_in=week_in)
+    verdict = _verdict()
+    assert _entry(verdict, "private")["state"] == "allowed"
+    assert _entry(verdict, "private")["weekly_used_percent"] is None
+    assert _entry(verdict, "de")["state"] == "unknown"
+    assert verdict["seat"] == "private"
+
+
+def test_weekly_reserve_has_no_reset_is_near_exception(weekly: SeatFixture) -> None:
+    """(d) 7d 99 % resetting in five minutes is still capped until the reset passes."""
+    now = int(time.time())
+    for label in ("private", "de"):
+        _week(weekly.seats[label], 20.0, 99.0, now=now, week_resets_in=300)
+    verdict = _verdict()
+    assert verdict["state"] == "capped"
+    assert verdict["resets_at"] == now + 300
+
+
+@pytest.mark.parametrize(("week", "state"), [(83.5, "allowed"), (83.6, "capped")])
+def test_weekly_reserve_boundary(weekly: SeatFixture, week: float, state: str) -> None:
+    """(e) remaining == reserve (16.5 %) is eligible; 16.4 % is capped."""
+    now = int(time.time())
+    _week(weekly.seats["private"], 20.0, week, now=now)
+    _week(weekly.seats["de"], 20.0, 99.0, now=now)
+    assert _entry(_verdict(), "private")["state"] == state
+
+
+@pytest.mark.parametrize("weekly_later", [True, False])
+def test_both_limits_name_both_and_take_the_later_reset(
+    weekly: SeatFixture, *, weekly_later: bool
+) -> None:
+    """(f) 5h over its cap AND 7d inside the reserve: both reasons, the LATER reset."""
+    now = int(time.time())
+    five_in, week_in = (2 * _HOUR, 3 * _HOUR) if weekly_later else (3 * _HOUR, 2 * _HOUR)
+    for label in ("private", "de"):
+        _week(
+            weekly.seats[label],
+            80.0,
+            99.0,
+            now=now,
+            five_resets_in=five_in,
+            week_resets_in=week_in,
+        )
+    verdict = _verdict()
+    entry = _entry(verdict, "private")
+    assert entry["state"] == "capped"
+    assert entry["window"] == "both"
+    assert "5h 80 % >= cap 75 %" in entry["reason"]
+    assert "7d 99 % — inside weekly reserve 16.5 %" in entry["reason"]
+    assert entry["resets_at"] == now + 3 * _HOUR
+    assert verdict["resets_at"] == now + 3 * _HOUR
+
+
+def test_weekly_capped_first_seat_keeps_the_order_with_an_unknown_next(
+    weekly: SeatFixture,
+) -> None:
+    """(g) a weekly-capped first seat and an unmeasured second keep the routing order."""
+    now = int(time.time())
+    _week(weekly.seats["private"], 20.0, 99.0, now=now)
+    _week(weekly.seats["de"], 20.0, 10.0, now=now, age=_HOUR)
+    verdict = _verdict()
+    assert [(seat["seat"], seat["state"]) for seat in verdict["seats"]][:2] == [
+        ("private", "capped"),
+        ("de", "unknown"),
+    ]
+    assert verdict["state"] == "capped"
+
+
+def test_current_pin_uses_the_one_round_floor(weekly: SeatFixture) -> None:
+    """(h) mid-debate the current seat continues while one round (16.5 / 3.3 = 5 %) fits."""
+    now = int(time.time())
+    floor = _RESERVE / cic._ROUNDS_PER_RESERVE  # noqa: SLF001
+    _week(weekly.seats["private"], 20.0, 90.0, now=now)
+    _week(weekly.seats["de"], 20.0, 10.0, now=now)
+    verdict = _cont()
+    assert verdict["state"] == "continue"
+    assert verdict["weekly_reserve_percent"] == pytest.approx(floor)
+    assert verdict["weekly_used_percent"] == 90.0
+    # 97 %: 3 % left < one round → fail over to the allowed candidate
+    _week(weekly.seats["private"], 20.0, 97.0, now=now, week_resets_in=_DAY)
+    moved = _cont()
+    assert (moved["state"], moved["seat"]) == ("failover", "de")
+    cur = _entry(moved, "private")
+    assert (cur["state"], cur["window"]) == ("capped", "seven_day")
+    assert "inside weekly reserve 5 %" in cur["reason"]
+    # no candidate left → paused until the weekly reset
+    paused = _cont(exclude=["de"])
+    assert paused["state"] == "paused"
+    assert (paused["retry_at"], paused["retry_seat"]) == (now + _DAY, "private")
+    assert paused["window"] == "seven_day"
+
+
+def test_failover_candidate_inside_the_weekly_reserve_is_skipped(weekly: SeatFixture) -> None:
+    """(i) a candidate with 5 % of its week left cannot take over a debate (full reserve)."""
+    now = int(time.time())
+    _week(weekly.seats["private"], 95.0, 10.0, now=now, five_resets_in=4 * _HOUR)
+    _week(weekly.seats["de"], 20.0, 95.0, now=now, week_resets_in=2 * _HOUR)
+    verdict = _cont()
+    assert verdict["state"] == "paused"
+    cand = _entry(verdict, "de")
+    assert (cand["state"], cand["window"]) == ("capped", "seven_day")
+    assert cand["weekly_reserve_percent"] == _RESERVE
+    assert (verdict["retry_at"], verdict["retry_seat"]) == (now + 2 * _HOUR, "de")
+
+
+def test_every_seat_in_its_reserve_exits_1_with_the_weekly_reason(
+    weekly: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(j) all seats inside the weekly reserve → ``debate-seat`` exit 1, the reason says so."""
+    now = int(time.time())
+    for label in ("private", "de"):
+        _week(weekly.seats[label], 20.0, 99.0, now=now)
+    assert cic.cmd_debate_seat(argparse.Namespace(json=False, tier="default", repo="")) == 1
+    out = capsys.readouterr().out
+    assert "debate seat: CAPPED" in out
+    assert "inside weekly reserve 16.5 %" in out
+    assert cic.main(["debate-seat", "-j"]) == 1
+    verdict = json.loads(capsys.readouterr().out)
+    assert verdict["state"] == "capped"
+    assert "inside its weekly reserve" in verdict["reason"]
+
+
+def test_top_level_weekly_fields_on_every_result(weekly: SeatFixture) -> None:
+    """(k) start, continue, failover and paused results all carry the weekly fields."""
+    now = int(time.time())
+    _week(weekly.seats["private"], 20.0, 40.0, now=now)
+    _week(weekly.seats["de"], 20.0, 30.0, now=now)
+    start = _verdict()
+    cont = _cont()
+    _week(weekly.seats["private"], 95.0, 40.0, now=now)
+    failover = _cont()
+    paused = _cont(exclude=["de"])
+    states = [result["state"] for result in (start, cont, failover, paused)]
+    assert states == ["allowed", "continue", "failover", "paused"]
+    for result in (start, cont, failover, paused):
+        assert all(key in result for key in _WEEKLY_FIELDS)
+        assert result["weekly_reserve_source"] == "learned"
+    assert (start["weekly_used_percent"], start["weekly_reserve_percent"]) == (40.0, _RESERVE)
+    assert start["weekly_resets_at"] == now + 3 * _DAY
+    assert failover["weekly_used_percent"] == 30.0  # the target's facts
+    assert failover["weekly_reserve_percent"] == _RESERVE
+    assert paused["weekly_used_percent"] == 40.0  # the current seat's facts
+    assert paused["window"] == "five_hour"
+    # the empty shape (a refusal before any seat is judged) carries them too
+    empty = cic._debate_result("unknown", "default", "x")  # noqa: SLF001
+    assert all(key in empty for key in _WEEKLY_FIELDS)

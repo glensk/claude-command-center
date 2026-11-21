@@ -3820,6 +3820,8 @@ def cmd_headroom(args: argparse.Namespace) -> int:
 # ``codex_debate_seats`` allowlist names. Unlike ``headroom`` (a learned reserve for
 # OPTIONAL offloads) this is a hard per-tier cap on the five-hour window, and it fails
 # CLOSED on every doubt: no fresh reading, a bad policy, a crash → ``unknown``.
+# The WEEK counts too (tp#2495): a seat whose known seven-day reading leaves less than
+# the learned weekly reserve (one full debate) is ``capped`` like one over its cap.
 #
 # MID-debate (tp#620): ``debate-seat -c <seat>`` re-judges the debate's CURRENT seat
 # before a round. Fresh and below the pause point (``codex_debate_pause_pct``, lowered to
@@ -3895,22 +3897,78 @@ def _debate_refresh(candidates: list[SeatCandidate], stale_after: int, budget: f
             continue
 
 
-def _debate_seat_entry(
-    cand: SeatCandidate, row: quota.ProviderQuota, cap: float, now: int, stale_after: int
+def _debate_known_week(row: quota.ProviderQuota, now: int) -> quota.WindowState | None:
+    """*row*'s seven-day window when its reading is KNOWN (tp#2495), else ``None``.
+
+    Known = present, not ``stale`` and before its own ``resets_at``. Usage only rises
+    inside a window, so a known reading is a valid lower bound; missing or stale weekly
+    data never denies a debate.
+    """
+    win = row.windows.get("seven_day")
+    if win is None or win.stale or win.resets_at <= now:
+        return None
+    return win
+
+
+def _debate_weekly_reserve() -> tuple[float, str]:
+    """The weekly reserve a debate must leave: the learned cost of one full debate.
+
+    Only the VALUE of :func:`_headroom_reserve` for the seven-day window (never the
+    offload gate nor its "reset is near" exception). A history that cannot be read
+    falls back to the bootstrap reserve, exactly as too few samples would.
+    """
+    try:
+        return _headroom_reserve(_SEVEN_DAY_MINUTES)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return (_HEADROOM_BOOTSTRAP_RESERVE_PERCENT, "bootstrap")
+
+
+def _debate_seat_entry(  # pylint: disable=too-many-arguments,too-many-locals
+    cand: SeatCandidate,
+    row: quota.ProviderQuota,
+    cap: float,
+    now: int,
+    stale_after: int,
+    *,
+    weekly_reserve: float,
+    weekly_reserve_source: str,
 ) -> dict[str, Any]:
-    """ONE seat's debate verdict: ``allowed | capped | blocked | unknown``."""
+    """ONE seat's debate verdict: ``allowed | capped | blocked | unknown``.
+
+    ``capped`` = a fresh five-hour reading at/above *cap*, OR a KNOWN weekly reading
+    (:func:`_debate_known_week`) with less than *weekly_reserve* % left — even when the
+    five-hour reading is not fresh. With both limits the reason names both and
+    ``resets_at`` is the LATER reset. Precedence: blocked > capped > unknown > allowed.
+    """
     from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
 
     five = _debate_fresh_five(row, now, stale_after)
+    week = _debate_known_week(row, now)
     used = five.used_pct if five is not None else None
     resets = five.resets_at if five is not None else None
+    five_capped = five is not None and five.used_pct >= cap
+    week_capped = week is not None and 100.0 - week.used_pct < weekly_reserve
+    window = ""
     if row.state == quota.BLOCKED:
         state, reason = "blocked", row.reason or "seat is blocked"
         resets = row.resets_at or resets
+    elif five_capped or week_capped:
+        state = "capped"
+        causes: list[str] = []
+        clears: list[int] = []
+        if five is not None and five_capped:
+            causes.append(f"5h {five.used_pct:.0f} % >= cap {cap:g} %")
+            clears.append(int(five.resets_at))
+        if week is not None and week_capped:
+            causes.append(f"7d {week.used_pct:.0f} % — inside weekly reserve {weekly_reserve:g} %")
+            clears.append(int(week.resets_at))
+        reason = "; ".join(causes)
+        resets = max(clears)  # both limits must clear before a retry can succeed
+        window = (
+            "both" if five_capped and week_capped else ("five_hour" if five_capped else "seven_day")
+        )
     elif five is None:
         state, reason = "unknown", "no fresh five-hour reading"
-    elif five.used_pct >= cap:
-        state, reason = "capped", f"5h {five.used_pct:.0f} % >= cap {cap:g} %"
     else:
         state, reason = "allowed", f"5h {five.used_pct:.0f} % < cap {cap:g} %"
     return {
@@ -3921,8 +3979,40 @@ def _debate_seat_entry(
         "cap_percent": cap,
         "used_percent": used,
         "resets_at": resets,
+        "weekly_used_percent": week.used_pct if week is not None else None,
+        "weekly_reserve_percent": weekly_reserve,
+        "weekly_reserve_source": weekly_reserve_source,
+        "weekly_resets_at": week.resets_at if week is not None else None,
+        "window": window,
         "reason": reason,
     }
+
+
+# The per-seat facts a pool verdict carries up to its top level (start, continue,
+# failover, paused): the five-hour fields plus the weekly-reserve fields (tp#2495).
+_DEBATE_PROJECTED_FIELDS = (
+    "seat",
+    "home",
+    "email",
+    "cap_percent",
+    "used_percent",
+    "resets_at",
+    "weekly_used_percent",
+    "weekly_reserve_percent",
+    "weekly_reserve_source",
+    "weekly_resets_at",
+    "window",
+)
+
+
+def _debate_project(entry: dict[str, Any]) -> dict[str, Any]:
+    """The :data:`_DEBATE_PROJECTED_FIELDS` of one seat entry."""
+    return {key: entry[key] for key in _DEBATE_PROJECTED_FIELDS}
+
+
+def _debate_mark_blocked(entry: dict[str, Any], reason: str) -> None:
+    """Force *entry* to ``blocked`` for a policy/routing *reason* (no capped window)."""
+    entry["state"], entry["reason"], entry["window"] = "blocked", reason, ""
 
 
 def _debate_result(state: str, tier: str, reason: str, **extra: Any) -> dict[str, Any]:
@@ -3937,6 +4027,11 @@ def _debate_result(state: str, tier: str, reason: str, **extra: Any) -> dict[str
         "cap_percent": None,
         "used_percent": None,
         "resets_at": None,
+        "weekly_used_percent": None,
+        "weekly_reserve_percent": None,
+        "weekly_reserve_source": "",
+        "weekly_resets_at": None,
+        "window": "",
         "reason": reason,
         "seats": [],
     }
@@ -3946,7 +4041,6 @@ def _debate_result(state: str, tier: str, reason: str, **extra: Any) -> dict[str
 
 def _debate_pick(seats: list[dict[str, Any]], tier: str) -> dict[str, Any]:
     """Fold the per-seat entries (routing order) into the pool verdict."""
-    fields = ("seat", "home", "email", "cap_percent", "used_percent", "resets_at")
     winner = next((seat for seat in seats if seat["state"] == "allowed"), None)
     if winner is not None:
         return _debate_result(
@@ -3954,7 +4048,7 @@ def _debate_pick(seats: list[dict[str, Any]], tier: str) -> dict[str, Any]:
             tier,
             f"seat {winner['seat']} {winner['reason']}",
             seats=seats,
-            **{key: winner[key] for key in fields},
+            **_debate_project(winner),
         )
     for state in ("capped", "unknown", "blocked"):
         losers = [seat for seat in seats if seat["state"] == state]
@@ -3963,13 +4057,14 @@ def _debate_pick(seats: list[dict[str, Any]], tier: str) -> dict[str, Any]:
         first = min(losers, key=lambda seat: int(seat["resets_at"] or 2**62))
         summary = ", ".join(f"{seat['seat']} {seat['reason']}" for seat in losers)
         reason = {
-            "capped": f"every allowed seat is at/above its {tier} cap: {summary}",
+            "capped": (
+                f"every allowed seat is at/above its {tier} cap or inside its weekly "
+                f"reserve: {summary}"
+            ),
             "unknown": f"no allowed seat below its cap is measurable: {summary}",
             "blocked": f"every allowed seat is blocked: {summary}",
         }[state]
-        return _debate_result(
-            state, tier, reason, seats=seats, **{key: first[key] for key in fields}
-        )
+        return _debate_result(state, tier, reason, seats=seats, **_debate_project(first))
     return _debate_result("blocked", tier, "no eligible debate seat", seats=seats)
 
 
@@ -3990,9 +4085,14 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
       intersected with the allowlist: a pin to a forbidden or unregistered home is
       ``not_allowed``.
     * **evidence**: :func:`_debate_refresh` first (under the ``codex_usage`` opt-in); a
-      seat with no FRESH five-hour reading afterwards is ``unknown``. A blocked seat is
-      excluded.
-    * **cap**: ``used < cap`` allows; the first allowed candidate in routing order wins.
+      seat with no FRESH five-hour reading afterwards is ``unknown`` — unless its KNOWN
+      weekly reading (present, not stale, before its reset; one snapshot with the
+      five-hour one) is already inside the weekly reserve, which makes it ``capped``.
+      Missing or stale weekly data never denies. A blocked seat is excluded.
+    * **cap**: ``used < cap`` allows, and so must the week: weekly remaining >= the
+      learned reserve :func:`_headroom_reserve` (``10080``), computed once per verdict
+      (the value only, never the offload gate nor its "reset is near" exception). The
+      first allowed candidate in routing order wins.
     """
     from . import config  # pylint: disable=import-outside-toplevel
 
@@ -4038,6 +4138,7 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
         # own pre-selection refresh; without it the rollout readings are the evidence.
         _debate_refresh(candidates, stale_after, _DEBATE_REFRESH_BUDGET_SEC)
         candidates = _select()
+    reserve, reserve_source = _debate_weekly_reserve()
     seats = [
         _debate_seat_entry(
             cand,
@@ -4045,6 +4146,8 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
             policy.cap_for(cand.label, tier),
             now_ts,
             stale_after,
+            weekly_reserve=reserve,
+            weekly_reserve_source=reserve_source,
         )
         for cand in candidates
     ]
@@ -4057,10 +4160,16 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
             ghost = SeatCandidate(label=label, home=home, email="", pid=_seat_pid(label))
             cap = policy.cap_for(label, tier)
             entry = _debate_seat_entry(
-                ghost, _candidate_row(ghost, now_ts), cap, now_ts, stale_after
+                ghost,
+                _candidate_row(ghost, now_ts),
+                cap,
+                now_ts,
+                stale_after,
+                weekly_reserve=reserve,
+                weekly_reserve_source=reserve_source,
             )
             if entry["state"] != "blocked":
-                entry["state"], entry["reason"] = "blocked", "not eligible in routing"
+                _debate_mark_blocked(entry, "not eligible in routing")
             seats.append(entry)
     return _debate_pick(seats, tier)
 
@@ -4097,7 +4206,9 @@ def _debate_retry(
 ) -> tuple[bool, int | None]:
     """``(known cause, retry_at)`` for ONE ineligible seat entry (tp#620 D2, O9).
 
-    * ``capped`` (at/above the pause point or the start cap) → its five-hour reset;
+    * ``capped`` → the entry's ``resets_at``: the five-hour reset (at/above the pause
+      point or the start cap), the weekly reset (inside the weekly reserve), or the
+      LATER of both when both limits apply;
     * ``blocked`` → the blocked row's own ``resets_at`` (weekly exhaustion, a hold or
       cooldown's expiry, the rota's next own week); ``null`` for an ``auth`` /
       ``entitlement`` block, an open-ended one, or a seat the routing dropped for a
@@ -4151,9 +4262,11 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
     * **pool**: ``pin="tool"`` → the routing order computed WITHOUT the inherited
       ``$CODEX_HOME``, filtered by ``codex_debate_seats``, minus *exclude*; ``pin="human"``
       → exactly the inherited ``$CODEX_HOME``, which must be *current*.
-    * **current**: refreshed first; fresh, not blocked, not excluded and below the pause
-      point → ``continue``.
-    * **failover** (tool only): the first OTHER candidate passing the tier's START rule.
+    * **current**: refreshed first; fresh, not blocked, not excluded, below the pause
+      point and — when its weekly reading is known — with at least one round of the
+      weekly reserve left (``reserve / _ROUNDS_PER_RESERVE``) → ``continue``.
+    * **failover** (tool only): the first OTHER candidate passing the tier's START rule
+      (five-hour cap AND the full weekly reserve).
     * otherwise ``paused`` with the earliest ``retry_at`` a specific seat clears its
       actual cause — or ``unknown`` when no seat has any KNOWN cause (no fresh reading).
     """
@@ -4233,19 +4346,29 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
     rows: dict[str, quota.ProviderQuota] = {}
     untimed: set[str] = set()  # ineligible for a policy reason: never a retry time
 
+    # The weekly reserve, once per verdict: a NEW seat (failover) must fit a whole
+    # debate; the current seat continues while one more round still fits (tp#2495).
+    reserve, reserve_source = _debate_weekly_reserve()
     cur_cand = routed.get(current) or _ghost(current)
     rows[current] = _candidate_row(cur_cand, now_ts)
-    cur = _debate_seat_entry(cur_cand, rows[current], pause, now_ts, stale_after)
+    cur = _debate_seat_entry(
+        cur_cand,
+        rows[current],
+        pause,
+        now_ts,
+        stale_after,
+        weekly_reserve=reserve / _ROUNDS_PER_RESERVE,
+        weekly_reserve_source=reserve_source,
+    )
     cur["reason"] = cur["reason"].replace(" cap ", " pause point ")
     if current not in allowed:
-        cur["state"], cur["reason"] = "blocked", "not in codex_debate_seats"
+        _debate_mark_blocked(cur, "not in codex_debate_seats")
         untimed.add(current)
     elif current not in routed and cur["state"] != "blocked":
-        cur["state"], cur["reason"] = "blocked", "not eligible in routing"
+        _debate_mark_blocked(cur, "not eligible in routing")
     cur_excluded = current in excluded
     cur["role"] = "excluded" if cur_excluded else "current"
-    cur_fields = {key: cur[key] for key in ("seat", "home", "email", "used_percent", "resets_at")}
-    cur_fields["cap_percent"] = pause
+    cur_fields = _debate_project(cur)
     if not cur_excluded and cur["state"] == "allowed":
         return _out("continue", f"seat {current} {cur['reason']}", seats=[cur], **cur_fields)
 
@@ -4255,7 +4378,13 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
             continue
         rows[cand.label] = _candidate_row(cand, now_ts)
         entry = _debate_seat_entry(
-            cand, rows[cand.label], policy.cap_for(cand.label, tier), now_ts, stale_after
+            cand,
+            rows[cand.label],
+            policy.cap_for(cand.label, tier),
+            now_ts,
+            stale_after,
+            weekly_reserve=reserve,
+            weekly_reserve_source=reserve_source,
         )
         entry["role"] = "excluded" if cand.label in excluded else "candidate"
         others.append(entry)
@@ -4267,10 +4396,16 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
             ghost = _ghost(label)
             rows[label] = _candidate_row(ghost, now_ts)
             entry = _debate_seat_entry(
-                ghost, rows[label], policy.cap_for(label, tier), now_ts, stale_after
+                ghost,
+                rows[label],
+                policy.cap_for(label, tier),
+                now_ts,
+                stale_after,
+                weekly_reserve=reserve,
+                weekly_reserve_source=reserve_source,
             )
             if entry["state"] != "blocked":
-                entry["state"], entry["reason"] = "blocked", "not eligible in routing"
+                _debate_mark_blocked(entry, "not eligible in routing")
             entry["role"] = "excluded" if label in excluded else "candidate"
             others.append(entry)
     seats = [cur, *others]
@@ -4280,12 +4415,11 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
             (e for e in others if e["role"] == "candidate" and e["state"] == "allowed"), None
         )
         if target is not None:
-            fields = ("seat", "home", "email", "cap_percent", "used_percent", "resets_at")
             return _out(
                 "failover",
                 f"{why_not}; failover to {target['seat']} {target['reason']}",
                 seats=seats,
-                **{key: target[key] for key in fields},
+                **_debate_project(target),
             )
     considered = [cur] + ([e for e in others if e["role"] == "candidate"] if pin == "tool" else [])
     known = False
