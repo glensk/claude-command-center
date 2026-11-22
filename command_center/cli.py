@@ -1353,7 +1353,18 @@ def cmd_mark_done(args: argparse.Namespace) -> int:
             # Reopening disarms any pending close request so a resumed session never
             # self-closes on a stale arm (nor can an in-flight close-now restore one).
             store.disarm_close(session_id)
-            if session is not None and session.draft and session.archived:
+            if (
+                session is not None
+                and session.draft
+                and session.archived
+                and _relay_successor_draft(store, session_id)
+            ):
+                print(
+                    f"note: {session_id} is a withdrawn relay successor draft — left archived "
+                    "(reviving it could start a successor of a failed transfer)",
+                    file=sys.stderr,
+                )
+            elif session is not None and session.draft and session.archived:
                 # Un-doing a future-job draft: clear the archived flag and re-export its
                 # mirror file so it reappears in both ccc's FUTURE list and the Obsidian
                 # folder (inverse of the done-draft archive above).
@@ -4376,6 +4387,16 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches,too-many
         # os.getpid(): _exec_in replaces THIS process with claude, so this pid is the
         # claude pid — the prune pass spares the row while it waits at a dialog (tp#1512).
         if not store.claim_draft(args.session_id, pid=os.getpid()):
+            # Re-read: a lost claim on a row archived since the top check is a withdraw
+            # (tp#2449 D2: the relay gave up on this successor), not a rival launcher.
+            current = store.get(args.session_id)
+            if current is not None and current.draft and current.archived:
+                print(
+                    f"error: job {args.session_id} was withdrawn by its launcher (the relay "
+                    "gave up on it) — not starting it",
+                    file=sys.stderr,
+                )
+                return 1
             print(
                 f"error: job {args.session_id} was already claimed by another launcher — "
                 "not starting it twice",
@@ -4497,6 +4518,21 @@ def _resolve_job_or_report(store: Store, given: str) -> str | None:
         print(f"error: no such job {given}", file=sys.stderr)
         return None
     return resolved
+
+
+def _relay_successor_draft(store: Store, session_id: str) -> bool:
+    """Whether *session_id* is the successor (target) of any relay transfer (tp#2449 O7).
+
+    The delete-job undo paths (``done --undo``, ``restore-job``) un-archive an archived
+    draft; for a relay successor that would revive a draft its launcher WITHDREW
+    (:meth:`Store.withdraw_draft`) so it could fail the transfer — a later claim would
+    then start a successor of a FAILED transfer, the exact state tp#2449 rules out.
+    The transfer itself is the marker (no new column): an archived draft that is a
+    transfer target was withdrawn — the transfer is FAILED, or still prepared/opened in
+    the short window before the withdraw-first FAILED CAS — while an accepted/finalized
+    transfer's target is no longer a draft (the claim cleared the flag).
+    """
+    return any(t.target_session == session_id for t in store.transfers_of(session_id))
 
 
 def _job_target_id(args: argparse.Namespace) -> str:
@@ -4693,6 +4729,13 @@ def cmd_restore_job(args: argparse.Namespace) -> int:  # pylint: disable=too-man
         session = store.get(session_id)
         if session is not None and session.draft and not session.archived:
             print(f"error: {session_id} is already a live future job", file=sys.stderr)
+            return 1
+        if session is not None and session.draft and _relay_successor_draft(store, session_id):
+            print(
+                f"error: {session_id} is a withdrawn relay successor draft — not restoring it "
+                "(reviving it could start a successor of a failed transfer)",
+                file=sys.stderr,
+            )
             return 1
         if session is not None and session.draft:
             # fire_at=0: a restored job must never inherit a stale armed fire time —

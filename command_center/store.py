@@ -1414,13 +1414,19 @@ class Store(  # pylint: disable=too-many-public-methods
         claude pid; stamped into ``last_seen_pid`` in the same ``UPDATE`` so the prune
         pass can tell a launch still waiting at a pre-registry dialog from a dead one
         (``core.orphan_launched_ids``). ``0`` leaves the column alone.
+
+        ``AND archived = 0`` (tp#2449): an archived draft is withdrawn (by its relay
+        launcher via :meth:`withdraw_draft`, or deleted) and must never launch. The
+        ``start-job`` top check alone is not enough — a withdraw can land between that
+        check and this ``UPDATE``; putting the condition in the claim's own ``WHERE``
+        makes claim and withdraw mutually exclusive, SQLite serializing the two writes.
         """
         ts = now_ms()
         cur = self.conn.execute(
             "UPDATE sessions SET draft = 0, fire_at = 0, launched_from_draft = 1, status = ?, "
             "updated_at = ?, "
             "last_seen_pid = CASE WHEN ? > 0 THEN ? ELSE last_seen_pid END "
-            "WHERE session_id = ? AND draft = 1",
+            "WHERE session_id = ? AND draft = 1 AND archived = 0",
             (Status.IDLE.value, ts, pid, pid, session_id),
         )
         claimed = cur.rowcount == 1
@@ -1428,6 +1434,25 @@ class Store(  # pylint: disable=too-many-public-methods
             self._stamp_target_launched(session_id, ts)
         self.conn.commit()
         return claimed
+
+    def withdraw_draft(self, session_id: str) -> bool:
+        """Atomically withdraw (archive) a still-unclaimed draft: ``True`` iff it was.
+
+        The counterpart of :meth:`claim_draft` (tp#2449 D2): a relay that gives up on
+        its successor must not mark the transfer FAILED while the successor's
+        ``start-job`` claims the draft. Both are conditional ``UPDATE``s on ``draft = 1``
+        and the claim also requires ``archived = 0``, so SQLite lets exactly one win:
+        ``True`` → the draft can no longer launch (the caller may fail the transfer);
+        ``False`` → it was already claimed (the successor started) or is not a draft,
+        and the row is left untouched. Withdrawing an already-archived draft is
+        idempotent (``True``).
+        """
+        cur = self.conn.execute(
+            "UPDATE sessions SET archived = 1, updated_at = ? WHERE session_id = ? AND draft = 1",
+            (now_ms(), session_id),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
 
     def armed_draft_summary(self, now: int | None = None) -> tuple[int, int] | None:
         """``(earliest fire_at, count)`` over ALL armed fire times, or ``None``.

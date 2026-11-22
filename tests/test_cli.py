@@ -1258,6 +1258,56 @@ def test_restore_job_stages_deleted_job_back(
     assert future_files._RESTORE_JOB_COMMAND_ID not in text
 
 
+def _withdrawn_relay_draft(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sid: str) -> None:
+    """A relay successor draft its launcher withdrew, its transfer then FAILED (tp#2449 D2)."""
+    from command_center.transfer_store import FAILED, Transfer, new_transfer_id
+
+    _seed_filed_draft(tmp_path, monkeypatch, sid)
+    with Store(tmp_path / "command-center" / "state.db") as store:
+        transfer = Transfer(
+            transfer_id=new_transfer_id(),
+            source_session="relay-src",
+            target_session=sid,
+            target_label="private",
+            cwd=str(tmp_path / "repo"),
+            source_aim="tp#1 done",
+            prompt_sha256="ab" * 32,
+        )
+        store.create_transfer(transfer, 1_800_000_000_000)
+        assert store.withdraw_draft(sid) is True
+        store.transition_transfer(
+            transfer.transfer_id, FAILED, 1_800_000_000_001, failure="launch: no terminal tab"
+        )
+
+
+def test_restore_job_refuses_a_withdrawn_relay_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#2449 O7: restore-job must not revive a draft its relay withdrew."""
+    from command_center.cli import cmd_restore_job
+
+    _withdrawn_relay_draft(tmp_path, monkeypatch, _JOB_UUID)
+    assert cmd_restore_job(argparse.Namespace(session_id=_JOB_UUID, file=None)) == 1
+    assert "withdrawn relay successor draft" in capsys.readouterr().err
+    with Store(tmp_path / "command-center" / "state.db") as store:
+        row = store.get(_JOB_UUID)
+        assert row is not None and row.draft and row.archived
+        assert store.claim_draft(_JOB_UUID) is False
+
+
+def test_mark_done_undo_leaves_a_withdrawn_relay_draft_archived(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#2449 O7: `mark-done --undo` must not un-archive a draft its relay withdrew."""
+    _withdrawn_relay_draft(tmp_path, monkeypatch, _JOB_UUID)
+    assert cli.main(["mark-done", "--session", _JOB_UUID, "--undo"]) == 0
+    assert "withdrawn relay successor draft" in capsys.readouterr().err
+    with Store(tmp_path / "command-center" / "state.db") as store:
+        row = store.get(_JOB_UUID)
+        assert row is not None and row.draft and row.archived
+        assert store.claim_draft(_JOB_UUID) is False
+
+
 def test_restore_job_reregisters_pruned_row_from_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

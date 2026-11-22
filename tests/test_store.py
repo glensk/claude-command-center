@@ -1883,6 +1883,53 @@ def test_claim_draft_stamps_the_launch_pid(tmp_path: Path) -> None:
     store.close()
 
 
+# ---- tp#2449 D2: withdraw_draft vs claim_draft (exactly one wins) ---------------------
+
+
+def test_withdraw_draft_archives_an_unclaimed_draft(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.create_draft("j1", "/repo", "aim")
+    assert store.withdraw_draft("j1") is True
+    row = store.get("j1")
+    assert row is not None and row.draft and row.archived
+    store.close()
+
+
+def test_withdraw_draft_after_claim_loses_and_leaves_the_row(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.create_draft("j1", "/repo", "aim")
+    assert store.claim_draft("j1", pid=4242) is True
+    before = store.get("j1")
+    assert store.withdraw_draft("j1") is False
+    after = store.get("j1")
+    assert after == before  # untouched, updated_at included
+    assert after is not None and not after.draft and not after.archived
+    store.close()
+
+
+def test_claim_draft_after_withdraw_loses(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.create_draft("j1", "/repo", "aim")
+    assert store.withdraw_draft("j1") is True
+    assert store.claim_draft("j1", pid=4242) is False
+    row = store.get("j1")
+    assert row is not None and row.draft and row.archived
+    assert not row.launched_from_draft and row.last_seen_pid is None
+    store.close()
+
+
+def test_claim_and_withdraw_draft_refuse_a_non_draft(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.ensure("s1", cwd="/repo")
+    before = store.get("s1")
+    assert store.withdraw_draft("s1") is False
+    assert store.claim_draft("s1", pid=4242) is False
+    assert store.get("s1") == before
+    assert store.withdraw_draft("nosuch") is False
+    assert store.claim_draft("nosuch") is False
+    store.close()
+
+
 # ---- B5 (tp#1566): aim_history.set_by + latest_user_aim -----------------------------
 
 

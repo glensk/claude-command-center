@@ -442,3 +442,51 @@ def test_start_job_no_grant_survives_the_tab_hop(
     )
     assert rc == 0
     assert opened == {"session_id": "job-tty", "force": True, "auto": False, "no_grant": True}
+
+
+def test_start_job_withdrawn_between_guard_and_claim_names_the_withdraw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#2449 D2: a draft withdrawn after the top check loses the claim with its own message."""
+    from command_center import cli
+
+    store = _make_draft(tmp_path, monkeypatch, cwd=str(tmp_path))
+    _a_tty(monkeypatch)
+    seen = _exec_stub(monkeypatch)
+    real_claim = Store.claim_draft
+
+    def _withdraw_then_claim(self: Store, session_id: str, pid: int = 0) -> bool:
+        assert self.withdraw_draft(session_id) is True  # the relay gives up in between
+        return real_claim(self, session_id, pid=pid)
+
+    monkeypatch.setattr(Store, "claim_draft", _withdraw_then_claim)
+    rc = cli.cmd_start_job(argparse.Namespace(session_id="job-tty", force=False, auto=False))
+    assert rc == 1 and not seen
+    err = capsys.readouterr().err
+    assert "withdrawn by its launcher" in err and "already claimed" not in err
+    session = store.get("job-tty")
+    assert session is not None and session.draft and session.archived
+    store.close()
+
+
+def test_start_job_lost_claim_on_a_live_draft_still_says_already_claimed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#2449 D2: a rival launcher's claim (not a withdraw) keeps the old message."""
+    from command_center import cli
+
+    store = _make_draft(tmp_path, monkeypatch, cwd=str(tmp_path))
+    _a_tty(monkeypatch)
+    seen = _exec_stub(monkeypatch)
+    real_claim = Store.claim_draft
+
+    def _rival_then_claim(self: Store, session_id: str, pid: int = 0) -> bool:
+        assert real_claim(self, session_id, pid=1) is True  # the rival wins first
+        return real_claim(self, session_id, pid=pid)
+
+    monkeypatch.setattr(Store, "claim_draft", _rival_then_claim)
+    rc = cli.cmd_start_job(argparse.Namespace(session_id="job-tty", force=False, auto=False))
+    assert rc == 1 and not seen
+    err = capsys.readouterr().err
+    assert "already claimed" in err and "withdrawn" not in err
+    store.close()
