@@ -223,6 +223,7 @@ class _Harness:  # pylint: disable=too-many-instance-attributes  # + the fake cl
         self.clock = 0.0  # the fake monotonic clock: only ``_sleep`` advances it
         monkeypatch.setattr(continue_session, "_sleep", self._sleep)
         monkeypatch.setattr(continue_session, "_monotonic", lambda: self.clock)
+        monkeypatch.delenv(continue_session.LATE_LAUNCH_ENV, raising=False)  # the 30 s default
         self.left_background = 0  # accept's QoS step (tp#1805): counted, never real here
         monkeypatch.setattr(continue_session, "leave_darwin_background", self._leave_background)
         self.file = tmp_path / "handoff.md"
@@ -372,6 +373,284 @@ def test_launcher_failure_leaves_the_source_untouched(harness: _Harness) -> None
         assert not source.close_requested_at
         job = store.get(transfer.target_session)
         assert job is not None and job.archived
+
+
+# ------------------------------------------------- late launch (tp#2449 D1/D2)
+
+
+def _claim_active_target() -> str:
+    """The successor's late tab runs ``start-job``: it claims the active transfer's draft."""
+    with Store() as store:
+        active = store.active_transfer(SID)
+        assert active is not None
+        assert store.claim_draft(active.target_session)
+        return active.transfer_id
+
+
+def _grace_states(harness: _Harness, monkeypatch: pytest.MonkeyPatch, claim_at: int) -> list[str]:
+    """Wrap the harness ``_sleep``: record the active transfer's state at every sleep and
+    claim its draft on sleep number *claim_at* (1-based; 0 = never). A sleep taken while the
+    transfer is still ``prepared`` is a grace sleep (the accept wait runs on ``opened``)."""
+    states: list[str] = []
+    inner = continue_session._sleep  # pylint: disable=protected-access
+
+    def _sleep(seconds: float) -> None:
+        with Store() as store:
+            active = store.active_transfer(SID)
+        states.append(active.state if active is not None else "")
+        if len(states) == claim_at:
+            _claim_active_target()
+        inner(seconds)
+
+    monkeypatch.setattr(continue_session, "_sleep", _sleep)
+    del harness
+    return states
+
+
+def _only_transfer() -> Any:
+    with Store() as store:
+        (transfer,) = store.transfers_of(SID)
+        return transfer
+
+
+def _archived(session_id: str) -> bool:
+    with Store() as store:
+        job = store.get(session_id)
+        assert job is not None
+        return bool(job.archived)
+
+
+def test_late_launch_claim_on_first_grace_poll_opens_and_finalizes(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(a) the ladder said "" but the tab claimed the draft during the grace: launched."""
+    harness.launcher = ""
+    states = _grace_states(harness, monkeypatch, claim_at=1)
+    assert harness.start() == 0
+    assert states[0] == "prepared" and states.count("prepared") == 1  # one grace sleep
+    transfer = _only_transfer()
+    assert transfer.state == "finalized" and transfer.launcher == "unconfirmed"
+    assert transfer.target_launched_at > 0 and not _archived(transfer.target_session)
+    out = capsys.readouterr()
+    assert "claimed its draft" in out.err and "launcher: unconfirmed" in out.err
+    assert "(unconfirmed); waiting for it to accept" in out.out and "finalized:" in out.out
+    assert "could not open a terminal tab" not in out.err
+
+
+def test_late_launch_already_claimed_when_the_launcher_returns(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(b) the draft is claimed before ``_launch`` returns "": no grace sleep at all."""
+
+    def _launch(target: str) -> str:
+        harness.launches.append(target)
+        _claim_active_target()
+        return ""
+
+    monkeypatch.setattr(continue_session, "_launch", _launch)
+    states = _grace_states(harness, monkeypatch, claim_at=0)
+    assert harness.start() == 0
+    assert "prepared" not in states  # zero grace sleeps
+    transfer = _only_transfer()
+    assert transfer.state == "finalized" and transfer.launcher == "unconfirmed"
+    assert not _archived(transfer.target_session)
+    assert "(unconfirmed); waiting for it to accept" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(("wait", "waited"), [((), 30.0), (("-w", "10"), 10.0)])
+def test_late_launch_never_claimed_fails_after_the_grace(
+    harness: _Harness,
+    capsys: pytest.CaptureFixture[str],
+    wait: tuple[str, ...],
+    waited: float,
+) -> None:
+    """(c) never claimed: FAILED + archived after the grace, which never outlasts ``-w``."""
+    harness.launcher = ""
+    assert harness.start(*wait) == 1
+    assert harness.clock == waited  # the grace, bounded by the accept window
+    assert continue_session.LATE_LAUNCH_GRACE_S == 30
+    transfer = _only_transfer()
+    assert transfer.state == "failed" and transfer.failure == "launch: no terminal tab"
+    assert not transfer.launcher
+    assert _archived(transfer.target_session)
+    err = capsys.readouterr().err
+    assert "could not open a terminal tab" in err and "claimed its draft" not in err
+
+
+def test_late_launch_claim_between_last_poll_and_withdraw_opens(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(d) the claim lands after the grace's last poll: the withdraw loses, not FAILED."""
+    real = Store.withdraw_draft
+    withdrawn: list[bool] = []
+
+    def _claim_first(self: Store, session_id: str) -> bool:
+        assert self.claim_draft(session_id)
+        withdrawn.append(real(self, session_id))
+        return withdrawn[-1]
+
+    monkeypatch.setattr(Store, "withdraw_draft", _claim_first)
+    harness.launcher = ""
+    harness.accept_on_sleep = False
+    assert harness.start("-w", "4") == continue_session.EXIT_WAITING
+    assert withdrawn == [False]
+    transfer = _only_transfer()
+    assert transfer.state == "opened" and transfer.launcher == "unconfirmed"
+    assert not _archived(transfer.target_session)
+
+
+def test_late_launch_zero_grace_checks_once_without_sleeping(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(e) ``CCC_RELAY_LATE_LAUNCH_S=0``: one store check, no sleep: today's behaviour."""
+    monkeypatch.setenv(continue_session.LATE_LAUNCH_ENV, "0")
+    polls: list[str] = []  # every grace poll refreshes the start heartbeat first
+    real = Store.heartbeat_transfer
+
+    def _counted(self: Store, transfer_id: str, pid: int, now: int) -> bool:
+        polls.append(transfer_id)
+        return real(self, transfer_id, pid, now)
+
+    monkeypatch.setattr(Store, "heartbeat_transfer", _counted)
+    harness.launcher = ""
+    assert harness.start() == 1
+    assert harness.clock == 0.0 and len(polls) == 1
+    transfer = _only_transfer()
+    assert transfer.state == "failed" and _archived(transfer.target_session)
+
+
+def test_late_launch_shared_cancel_only_when_the_withdraw_won(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shared store on: a won withdraw cancels the op; a lost one (claimed) never does."""
+    cancels: list[str] = []
+    monkeypatch.setattr(continue_session, "_shared_on", lambda: True)
+    monkeypatch.setattr(continue_session, "_reserve_before_launch", lambda *_a: None)
+
+    def _cancel(_store: Store, tid: str) -> None:
+        cancels.append(tid)
+
+    monkeypatch.setattr(continue_session, "_shared_cancel", _cancel)
+    monkeypatch.setenv(continue_session.LATE_LAUNCH_ENV, "0")
+    harness.launcher = ""
+    assert harness.start() == 1
+    failed = _only_transfer()
+    assert failed.state == "failed" and cancels == [failed.transfer_id]
+
+    real = Store.withdraw_draft
+
+    def _claim_first(self: Store, session_id: str) -> bool:
+        self.claim_draft(session_id)
+        return real(self, session_id)
+
+    monkeypatch.setattr(Store, "withdraw_draft", _claim_first)
+    harness.accept_on_sleep = False
+    assert harness.start("-w", "0") == continue_session.EXIT_WAITING
+    opened = next(t for t in _transfers() if t.state == "opened")
+    assert opened.launcher == "unconfirmed" and cancels == [failed.transfer_id]
+
+
+def _launch_script(harness: _Harness, launchers: list[str]) -> Any:
+    """A ``_launch`` returning *launchers* in turn (the last one repeats)."""
+
+    def _launch(target: str) -> str:
+        harness.launches.append(target)
+        return launchers[min(len(harness.launches), len(launchers)) - 1]
+
+    return _launch
+
+
+def test_late_launch_relaunch_claimed_in_the_grace_finalizes(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(f) the relaunch after a dead first successor gets the same grace."""
+    monkeypatch.setattr(
+        continue_session, "_launch", _launch_script(world.harness, ["iterm_api", ""])
+    )
+
+    def script(w: _World) -> None:
+        if len(w.harness.launches) < 2:
+            return  # the first successor never starts: dead:never-started
+        active = w.active()
+        if active is not None and active.target_launched_at == 0:
+            w.claim()  # the second tab is late, but it claims its draft
+        elif active is not None and active.state == "opened":
+            w.accept()
+
+    world.script = script
+    assert world.harness.start() == 0
+    first, second = _transfers()
+    assert first.state == "failed" and first.failure == "aborted: successor dead: never-started"
+    assert second.state == "finalized" and second.launcher == "unconfirmed"
+    assert not _archived(second.target_session)
+
+
+def test_late_launch_relaunch_never_claimed_fails_and_withdraws(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(f) the relaunch's "" with no claim: the second transfer fails like a first launch."""
+    monkeypatch.setattr(
+        continue_session, "_launch", _launch_script(world.harness, ["iterm_api", ""])
+    )
+    assert world.harness.start() == 1
+    by_target = {t.target_session: t for t in _transfers()}
+    first, second = (by_target[target] for target in world.harness.launches)
+    assert first.failure == "aborted: successor dead: never-started"
+    assert second.state == "failed" and second.failure == "launch: no terminal tab"
+    assert world.harness.clock >= continue_session.LAUNCH_GRACE_S + 30  # + the late grace
+    assert _archived(second.target_session)
+
+
+def test_late_launch_real_accept_in_the_grace_finalizes(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(g) debate O6: the late tab claims AND accepts (the real PREPARED → OPENED → ACCEPTED
+    CAS) during the grace; ``start`` finalizes it and prints no "opened" line."""
+    harness.launcher = ""
+    harness.accept_on_sleep = False
+    inner = continue_session._sleep  # pylint: disable=protected-access
+
+    def _sleep(seconds: float) -> None:
+        with Store() as store:
+            active = store.active_transfer(SID)
+            if active is not None and active.state == "prepared":
+                assert store.claim_draft(active.target_session)
+                assert store.accept_transfer(active.transfer_id, 1) is not None
+        inner(seconds)
+
+    monkeypatch.setattr(continue_session, "_sleep", _sleep)
+    assert harness.start() == 0
+    transfer = _only_transfer()
+    assert transfer.state == "finalized" and transfer.launcher == "unconfirmed"
+    assert transfer.opened_at and transfer.accepted_at and transfer.finalized_at
+    assert not _archived(transfer.target_session)
+    out = capsys.readouterr().out
+    assert "opened:" not in out and "finalized:" in out
+
+
+def test_late_launch_opened_rerun_never_withdraws(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(h) debate O2: an OPENED re-run whose relaunch returns "" leaves the draft alone."""
+    harness.accept_on_sleep = False
+    assert harness.start("-w", "0") == continue_session.EXIT_WAITING
+    withdraws: list[str] = []
+
+    def _withdraw(_self: Store, sid: str) -> bool:
+        withdraws.append(sid)
+        return True
+
+    monkeypatch.setattr(Store, "withdraw_draft", _withdraw)
+    harness.launcher = ""
+    assert harness.start() == 1
+    assert harness.clock == continue_session.LATE_LAUNCH_GRACE_S
+    assert not withdraws
+    transfer = _only_transfer()
+    assert transfer.state == "opened" and transfer.launcher == "iterm_api"
+    with Store() as store:
+        job = store.get(transfer.target_session)
+    assert job is not None and job.draft and not job.archived
+    assert harness.launches == [transfer.target_session] * 2
 
 
 def test_timeout_leaves_both_open_and_a_retry_reuses_the_transfer(harness: _Harness) -> None:

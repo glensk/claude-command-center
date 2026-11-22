@@ -60,6 +60,10 @@ LAUNCHER_ITERM_APPLESCRIPT = "iterm_applescript"
 LAUNCHER_ITERM_API = "iterm_api"
 LAUNCHER_TMUX = "tmux"
 LAUNCHERS = frozenset({LAUNCHER_ITERM_APPLESCRIPT, LAUNCHER_ITERM_API, LAUNCHER_TMUX})
+#: Not a rung (never in :data:`LAUNCHERS`): a relay transfer's launcher when the ladder
+#: reported failure but the successor claimed its draft anyway (tp#2449: under load a timed-out
+#: Apple event may still open the tab), so where it runs is unknown.
+LAUNCHER_UNCONFIRMED = "unconfirmed"
 #: The rungs that put a visible iTerm2 tab on screen.
 TAB_LAUNCHERS = frozenset({LAUNCHER_ITERM_APPLESCRIPT, LAUNCHER_ITERM_API})
 #: The marker ``ccc terminal-probe`` prints into the tab it opens (followed by a nonce).
@@ -892,13 +896,16 @@ def degraded_launch_warning(launcher: str) -> str:
 
 
 def describe_launcher(launcher: str) -> str:
-    """Human phrase for a rung of :data:`LAUNCHERS`: where the launched command runs."""
+    """Human phrase for a rung of :data:`LAUNCHERS` (or :data:`LAUNCHER_UNCONFIRMED`): where
+    the launched command runs."""
     if launcher == LAUNCHER_ITERM_APPLESCRIPT:
         return "in a new iTerm2 tab (AppleScript)"
     if launcher == LAUNCHER_ITERM_API:
         return "in a new iTerm2 tab (Python API)"
     if launcher == LAUNCHER_TMUX:
         return f"in a new window of tmux session {_tmux_session()!r} — NOT an iTerm2 tab"
+    if launcher == LAUNCHER_UNCONFIRMED:
+        return "somewhere unconfirmed (the launcher reported failure, yet the job started)"
     return "nowhere (no launcher succeeded)"
 
 

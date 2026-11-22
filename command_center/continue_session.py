@@ -995,6 +995,12 @@ START_GRACE_ENV = "CCC_RELAY_START_GRACE_S"  # R1: 0 = an unregistered successor
 START_GRACE_DEFAULT_S = 90  # registry entry missing this long after the draft cleared: dead
 NO_ACCEPT_ENV = "CCC_RELAY_NO_ACCEPT_S"
 NO_ACCEPT_DEFAULT_S = 240  # registered, transcript still, no accept: above tp#1805's 180 s hooks
+# tp#2449 D1: after the launch ladder returns "" (under load a timed-out Apple event may still
+# open the tab), wait this long for the successor's draft claim before failing the transfer;
+# taken from the `-w` window, never added to it. 0 = check the store once, no wait.
+LATE_LAUNCH_ENV = "CCC_RELAY_LATE_LAUNCH_S"
+LATE_LAUNCH_GRACE_S = 30
+LATE_LAUNCH_POLL_SEC = 2.0
 GONE_POLLS = 2  # a registered successor missing from the registry on this many polls in a row
 AUTO_RELAUNCHES = 1  # D5 (Q3): one automatic relaunch per `start` call
 STARTING = "starting"
@@ -1348,6 +1354,7 @@ def _open_target(  # pylint: disable=too-many-arguments
     text: str,
     watch: SuccessorWatch,
     *,
+    deadline: float,
     rewrite: bool = True,
     sidecars: Sidecars = NO_SIDECARS,
 ) -> int | None:
@@ -1357,7 +1364,11 @@ def _open_target(  # pylint: disable=too-many-arguments
     ``rewrite=False`` (D6: a differing re-run meets a live or starting successor) leaves
     the stored handoff file untouched: the successor already read it. A rewrite also writes
     this call's *sidecars* next to it (tp#2172 D1/D2), before the successor's preamble names
-    them."""
+    them.
+
+    A launcher that reports ``""`` is not trusted (tp#2449): the store's draft claim is the
+    ground truth, polled for a grace inside *deadline* (the call's accept window); a still
+    ``prepared`` transfer is failed only after an atomic ``withdraw_draft`` won."""
     from .transfer_store import FAILED, OPENED, PREPARED
 
     if transfer.state not in (PREPARED, OPENED):
@@ -1385,15 +1396,10 @@ def _open_target(  # pylint: disable=too-many-arguments
         refused = _reserve_before_launch(store, transfer)
         if refused is not None:
             return refused
-    launcher = _launch(transfer.target_session)  # never started: (re)launch it
+    launcher = _launch(transfer.target_session) or _late_launch(  # never started: (re)launch it
+        store, transfer, deadline, shared_on=shared_on
+    )
     if not launcher:
-        if transfer.state == PREPARED:
-            store.transition_transfer(
-                transfer.transfer_id, FAILED, _now_ms(), failure="launch: no terminal tab"
-            )
-            store.update_fields(transfer.target_session, archived=True)
-            if shared_on:
-                _shared_cancel(store, transfer.transfer_id)
         print(
             "error: could not open a terminal tab for the successor — the source "
             "session is unchanged",
@@ -1403,11 +1409,71 @@ def _open_target(  # pylint: disable=too-many-arguments
     watch.launched_ms = _now_ms()
     store.note_transfer(transfer.transfer_id, watch.launched_ms, launcher=launcher)
     store.transition_transfer(transfer.transfer_id, OPENED, watch.launched_ms)
-    print(
-        f"opened: successor {transfer.target_session} on {transfer.target_label} "
-        f"({launcher}); waiting for it to accept transfer {transfer.transfer_id}"
-    )
+    current = store.get_transfer(transfer.transfer_id)
+    if current is not None and current.state in (PREPARED, OPENED):  # not accepted meanwhile
+        print(
+            f"opened: successor {transfer.target_session} on {transfer.target_label} "
+            f"({launcher}); waiting for it to accept transfer {transfer.transfer_id}"
+        )
     return None
+
+
+def _late_launch(store: Store, transfer: Any, deadline: float, *, shared_on: bool) -> str:
+    """The launcher reported ``""``: :data:`LAUNCHER_UNCONFIRMED` when the successor claimed
+    its draft anyway, else ``""`` (tp#2449 D1/D2).
+
+    A still ``prepared`` transfer (re-read from the store, never the snapshot; debate O2: an
+    OPENED re-run leaves the draft alone) is failed only after the atomic ``withdraw_draft``
+    won — then the shared-store op is cancelled too; a lost withdraw means the claim landed
+    after the last poll: launched after all."""
+    from .transfer_store import FAILED, PREPARED
+
+    if _late_launch_claimed(store, transfer.transfer_id, deadline):
+        return _unconfirmed_launch(transfer)
+    current = store.get_transfer(transfer.transfer_id)
+    if current is None or current.state != PREPARED:
+        return ""
+    if not store.withdraw_draft(transfer.target_session):
+        return _unconfirmed_launch(transfer)  # claimed after the last poll
+    store.transition_transfer(
+        transfer.transfer_id, FAILED, _now_ms(), failure="launch: no terminal tab"
+    )
+    if shared_on:
+        _shared_cancel(store, transfer.transfer_id)
+    return ""
+
+
+def _late_launch_claimed(store: Store, transfer_id: str, deadline: float) -> bool:
+    """D1 (tp#2449): did the successor claim its draft although the launcher reported ``""``?
+
+    Polls the transfer's ``target_launched_at`` (only a won ``claim_draft`` stamps it; a bare
+    ``draft = 0`` is not proof) every :data:`LATE_LAUNCH_POLL_SEC` for up to the
+    :data:`LATE_LAUNCH_ENV` grace, bounded by the call's accept *deadline*; ``0`` checks once.
+    Each poll refreshes the ``start`` heartbeat, as the accept wait does."""
+    grace = _knob(LATE_LAUNCH_ENV, LATE_LAUNCH_GRACE_S, 0)
+    end = min(_monotonic() + grace, deadline)
+    pid = os.getpid()
+    while True:
+        store.heartbeat_transfer(transfer_id, pid, _now_ms())
+        current = store.get_transfer(transfer_id)
+        if current is not None and current.target_launched_at > 0:
+            return True
+        left = end - _monotonic()
+        if left <= 0:
+            return False
+        _sleep(min(LATE_LAUNCH_POLL_SEC, left))
+
+
+def _unconfirmed_launch(transfer: Any) -> str:
+    """The launcher of a successor that claimed its draft after the ladder reported ``""``."""
+    from .terminal import LAUNCHER_UNCONFIRMED
+
+    print(
+        f"note: the terminal launcher reported no tab, but successor {transfer.target_session} "
+        "claimed its draft — treating it as launched (launcher: unconfirmed)",
+        file=sys.stderr,
+    )
+    return LAUNCHER_UNCONFIRMED
 
 
 def _abort_dead(store: Store, transfer: Any, verdict: str) -> Any | None:
@@ -1489,7 +1555,9 @@ def _drive(  # pylint: disable=too-many-locals,too-many-arguments
     watch = SuccessorWatch.from_env()
     deadline = _monotonic() + max(0.0, float(args.wait))
     adapter = _adapter()
-    code = _open_target(store, transfer, src, text, watch, rewrite=rewrite, sidecars=sidecars)
+    code = _open_target(
+        store, transfer, src, text, watch, deadline=deadline, rewrite=rewrite, sidecars=sidecars
+    )
     if code is not None:
         return code
     current, dead = _wait_accepted_or_dead(store, adapter, transfer.transfer_id, deadline, watch)
@@ -1514,7 +1582,14 @@ def _drive(  # pylint: disable=too-many-locals,too-many-arguments
         print(f"relaunched: successor {transfer.target_session} (first {first} died: {why})")
         watch = watch.fresh()
         code = _open_target(
-            store, transfer, src, text, watch, rewrite=not chosen.ignored, sidecars=sidecars
+            store,
+            transfer,
+            src,
+            text,
+            watch,
+            deadline=deadline,
+            rewrite=not chosen.ignored,
+            sidecars=sidecars,
         )
         if code is not None:
             return code
