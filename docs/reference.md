@@ -870,8 +870,19 @@ tmux window, and never retry a launch that returned 0.
 Under launchd the AppleScript rung is gated by macOS **Automation (TCC)** for the launchd job's
 *real executable path* (the process launchd started — for a job launched by another program,
 that program's interpreter, not ccc's). Every Homebrew/uv python patch release is a new path
-and therefore a new prompt; an unattended job hits ccc's 10 s `osascript` timeout and falls
-through to tmux until Allow is clicked once. Two tools make this visible without dispatching
+and therefore a new prompt; an unattended job hits ccc's tab-launch `osascript` timeout and
+falls through to tmux until Allow is clicked once.
+
+**Tab-launch timeout (tp#2449).** The AppleScript tab-open call waits up to 30 s
+(`CCC_LAUNCH_TIMEOUT_S`, a whole number ≥ 1; any other value keeps 30 s and warns once on
+stderr). Under heavy load a 10 s bound expired although iTerm2 still opened the tab, so a
+live tab was reported as "no terminal tab". Only the launch call uses it: every other
+`osascript` call (focus, close, paste, the Automation probe) keeps its own 10 s or 5 s bound,
+and each of the tmux rung's calls stays at 5 s. The worst-case ladder is 30 + 8 (Python API,
+only when it is free of Apple events) + 3 × 5 (tmux) = 53 s. `continue-session start` also
+clamps the AppleScript bound to the time left in its `-w` accept wait; the late-launch grace
+(`CCC_RELAY_LATE_LAUNCH_S`, 30 s) follows inside that same wait, so launch plus grace (83 s)
+fit even the 120 s `-w` floor. Two tools make this visible without dispatching
 anything real: **`ccc terminal-probe [-j]`** runs the exact `open-job` ladder with one harmless
 command that prints `CCC-TERMINAL-PROBE <nonce>` into the tab it opens (JSON `{"version": 1,
 "launcher", "marker"}`; exit 0 iff something launched; a tmux landing closes itself) — run it

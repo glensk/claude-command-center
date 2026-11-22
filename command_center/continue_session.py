@@ -412,11 +412,22 @@ def _drain_seconds(value: str) -> int:
     return seconds
 
 
-def _launch(target_session: str) -> str:
-    """Open the successor's tab (``ccc start-job <id>``); the launcher rung or ``""``."""
+def _launch(target_session: str, *, timeout: float) -> str:
+    """Open the successor's tab (``ccc start-job <id>``); the launcher rung or ``""``.
+
+    *timeout* bounds the AppleScript rung (:func:`_launch_timeout`)."""
     from . import terminal
 
-    return terminal.start_job_launch(target_session)
+    return terminal.start_job_launch(target_session, timeout=timeout)
+
+
+def _launch_timeout(deadline: float) -> float:
+    """The AppleScript launch bound: ``terminal.launch_timeout()`` (30 s, tp#2449 B3a) clamped
+    to the time left before the accept *deadline* (≥ 1 s), so the launch and the late-launch
+    grace after it both stay inside ``-w`` (budget: ``terminal.LAUNCH_TIMEOUT_S``)."""
+    from . import terminal
+
+    return max(1.0, min(float(terminal.launch_timeout()), deadline - _monotonic()))
 
 
 def _sleep(seconds: float) -> None:
@@ -1403,9 +1414,9 @@ def _open_target(  # pylint: disable=too-many-arguments
         refused = _reserve_before_launch(store, transfer)
         if refused is not None:
             return refused
-    launcher = _launch(transfer.target_session) or _late_launch(  # never started: (re)launch it
-        store, transfer, deadline, shared_on=shared_on
-    )
+    launcher = _launch(  # never started: (re)launch it
+        transfer.target_session, timeout=_launch_timeout(deadline)
+    ) or _late_launch(store, transfer, deadline, shared_on=shared_on)
     if not launcher:
         print(
             "error: could not open a terminal tab for the successor — the source "

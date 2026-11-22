@@ -61,8 +61,10 @@ def opened(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Record every command the launch ladder would type into a new tab (nothing opens)."""
     calls: list[str] = []
 
-    def fake_open_tab(command: str, *, tmux_fallback: bool) -> str:
-        del tmux_fallback
+    def fake_open_tab(
+        command: str, *, tmux_fallback: bool, iterm_timeout: float | None = None
+    ) -> str:
+        del tmux_fallback, iterm_timeout
         calls.append(command)
         return terminal.LAUNCHER_ITERM_APPLESCRIPT
 

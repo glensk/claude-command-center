@@ -69,6 +69,51 @@ TAB_LAUNCHERS = frozenset({LAUNCHER_ITERM_APPLESCRIPT, LAUNCHER_ITERM_API})
 #: The marker ``ccc terminal-probe`` prints into the tab it opens (followed by a nonce).
 PROBE_MARKER_PREFIX = "CCC-TERMINAL-PROBE"
 
+#: The AppleScript tab-launch rung's ``osascript`` timeout (tp#2449 B3a). Under load (~80) a
+#: 10 s bound expired although iTerm2 still delivered the Apple event and opened the tab; a
+#: longer FIXED bound (no load scaling) cuts those false negatives. Only the launch call in
+#: :func:`_iterm` uses it — every other :func:`_osascript` caller keeps its own timeout.
+#: Override: :data:`LAUNCH_TIMEOUT_ENV` (a whole number ≥ 1).
+#:
+#: Budget (worst case of one :func:`start_job_launch` through :func:`_open_tab`): AppleScript
+#: ``LAUNCH_TIMEOUT_S`` (30) + the Python-API rung's connect bound (8, only when it is
+#: TCC-free) + the tmux rung's three calls × :data:`TMUX_LAUNCH_TIMEOUT_S` (15) = 53 s; the
+#: relay's late-launch grace (``CCC_RELAY_LATE_LAUNCH_S``, 30) follows inside the same accept
+#: deadline → 83 s, under the smallest clamped ``continue-session start -w`` (120 s floor,
+#: default 420, the whole call ≤ ``START_CALL_BUDGET_SEC`` 540 under the 600 s Bash tool cap).
+#: 30 s on EVERY rung would be 30 + 8 + 90 + 30 = 158 s, over that 120 s floor, so the tmux
+#: rung keeps its 5 s calls; ``continue-session`` also clamps the AppleScript bound to the
+#: time left before its accept deadline (``start_job_launch(timeout=…)``).
+LAUNCH_TIMEOUT_S = 30
+LAUNCH_TIMEOUT_ENV = "CCC_LAUNCH_TIMEOUT_S"
+#: Each of the tmux launch rung's ``subprocess.run`` calls (``has-session``, ``new-session``,
+#: ``new-window``): kept at 5 s so the ladder fits the budget above (tp#2449 B3a).
+TMUX_LAUNCH_TIMEOUT_S = 5
+#: Values of :data:`LAUNCH_TIMEOUT_ENV` already warned about (one stderr warning per value).
+_LAUNCH_TIMEOUT_WARNED: set[str] = set()
+
+
+def launch_timeout() -> int:
+    """The tab-launch ``osascript`` timeout in seconds: :data:`LAUNCH_TIMEOUT_ENV` when it is
+    a whole number ≥ 1, else :data:`LAUNCH_TIMEOUT_S` (a bad value warns once on stderr)."""
+    raw = os.environ.get(LAUNCH_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return LAUNCH_TIMEOUT_S
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value >= 1:
+        return value
+    if raw not in _LAUNCH_TIMEOUT_WARNED:
+        _LAUNCH_TIMEOUT_WARNED.add(raw)
+        print(
+            f"warning: {LAUNCH_TIMEOUT_ENV}={raw!r} is not a whole number ≥ 1 — using the "
+            f"default {LAUNCH_TIMEOUT_S} s",
+            file=sys.stderr,
+        )
+    return LAUNCH_TIMEOUT_S
+
 
 def color_rgb(name: str | None) -> tuple[int, int, int] | None:
     """Resolve a color name or ``#rrggbb`` to an RGB triple (or None)."""
@@ -377,17 +422,17 @@ def _tmux_window(command: str, cwd: str | None = None) -> bool:
         has = subprocess.run(
             [tmux, "has-session", "-t", session],
             capture_output=True,
-            timeout=5,
+            timeout=TMUX_LAUNCH_TIMEOUT_S,
             check=False,
         )
         if has.returncode != 0:
             create = [tmux, "new-session", "-d", "-s", session]
-            subprocess.run(create, capture_output=True, timeout=5, check=True)
+            subprocess.run(create, capture_output=True, timeout=TMUX_LAUNCH_TIMEOUT_S, check=True)
         args = [tmux, "new-window", "-t", session]
         if cwd:
             args += ["-c", cwd]
         args.append(command)
-        subprocess.run(args, capture_output=True, timeout=5, check=True)
+        subprocess.run(args, capture_output=True, timeout=TMUX_LAUNCH_TIMEOUT_S, check=True)
         return True
     except (subprocess.SubprocessError, OSError):
         return False
@@ -818,7 +863,12 @@ def start_job_in_new_tab(
 
 
 def start_job_launch(
-    session_id: str, force: bool = False, auto: bool = False, no_grant: bool = False
+    session_id: str,
+    force: bool = False,
+    auto: bool = False,
+    no_grant: bool = False,
+    *,
+    timeout: float | None = None,
 ) -> str:
     """Launch ``ccc start-job <id>`` in a new tab and report the rung that landed it.
 
@@ -838,6 +888,9 @@ def start_job_launch(
     ``start-job``'s no-tty hop, the TUI, the daemon, ``park``, futuresync,
     ``continue-session``) passes here, so a caller under ``AI_AUTOMATED`` enforce gets
     ``""`` and nothing opens (:func:`command_center.automated.refuse_start`).
+
+    *timeout* bounds the AppleScript rung (default :func:`launch_timeout`); ``continue-session``
+    passes its clamp so the launch stays inside its accept deadline (tp#2449 B3a).
     """
     from . import automated
 
@@ -851,7 +904,7 @@ def start_job_launch(
     command = f"ccc start-job{flag} {shlex.quote(session_id)}"
     if _launcher_mode() == "tmux":
         return LAUNCHER_TMUX if _tmux_window(command) else ""
-    return _open_tab(command, tmux_fallback=True)
+    return _open_tab(command, tmux_fallback=True, iterm_timeout=timeout)
 
 
 def probe_launch() -> tuple[str, str]:
@@ -909,7 +962,7 @@ def describe_launcher(launcher: str) -> str:
     return "nowhere (no launcher succeeded)"
 
 
-def _open_tab(command: str, *, tmux_fallback: bool) -> str:
+def _open_tab(command: str, *, tmux_fallback: bool, iterm_timeout: float | None = None) -> str:
     """Run *command* in a new iTerm2 tab; return the rung that landed it (or ``""``).
 
     The ladder every launch path shares: AppleScript (``osascript``, bounded by
@@ -918,9 +971,12 @@ def _open_tab(command: str, *, tmux_fallback: bool) -> str:
     the very Apple event that just failed, with no timeout) → tmux when
     *tmux_fallback* (job launches, attached-prompt fires) — never for a resume or
     a ``tmux attach``, where a tmux window would be nonsense. *command* must
-    already be shell-quoted.
+    already be shell-quoted. *iterm_timeout* overrides the AppleScript rung's bound
+    (:func:`_iterm`); ``None`` keeps :func:`launch_timeout`.
     """
-    if _iterm(command):
+    # The one-argument call stays the default, so `_iterm(command)` seams keep working.
+    iterm_args = () if iterm_timeout is None else (iterm_timeout,)
+    if _iterm(command, *iterm_args):
         return LAUNCHER_ITERM_APPLESCRIPT
     if _iterm_api_tab(command):
         return LAUNCHER_ITERM_API
@@ -2328,7 +2384,7 @@ def fire_await_in_new_tab(group_id: int, token: str) -> bool:
     return bool(_open_tab(command, tmux_fallback=True))
 
 
-def _iterm(command: str) -> bool:
+def _iterm(command: str, timeout: float | None = None) -> bool:
     """Open an iTerm2 tab (AppleScript) and type *command* into it; False when that failed.
 
     The created session is PINNED before it is written to (tp#312, 2026-09-19): the old
@@ -2341,6 +2397,10 @@ def _iterm(command: str) -> bool:
     the session component is id-keyed, so a tab index that shifts afterwards can only make
     the write FAIL (-1728 → osascript exit 1 → False → the caller's next launcher rung),
     never deliver the command to somebody else's tab.
+
+    The ``osascript`` call is bounded by *timeout*, default :func:`launch_timeout`
+    (:data:`LAUNCH_TIMEOUT_S`, 30 s; tp#2449 B3a) — longer than the other callers' 10 s,
+    since under load a slow-but-delivered tab-open Apple event must not read as failure.
     """
     # command is already shell-quoted; _as_quote escapes it for the AppleScript "..."
     # literal too, so a cwd/path containing a double-quote can't break out.
@@ -2358,7 +2418,8 @@ def _iterm(command: str) -> bool:
         activate
     end tell
     '''
-    return _osascript(script) is not None
+    bound = launch_timeout() if timeout is None else timeout
+    return _osascript(script, bound) is not None
 
 
 # Standing rule (2026-09-01): a launch never falls back to Terminal.app. On

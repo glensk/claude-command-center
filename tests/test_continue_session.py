@@ -217,7 +217,9 @@ class _Harness:  # pylint: disable=too-many-instance-attributes  # + the fake cl
             handoff_facts, "Scrubber", lambda policy=None: real_scrubber(policy or stub.scrub_cmd)
         )
         self.launches: list[str] = []
+        self.launch_timeouts: list[float] = []  # each `_launch`'s AppleScript bound (B3a)
         self.launcher = "iterm_api"
+        monkeypatch.delenv(terminal.LAUNCH_TIMEOUT_ENV, raising=False)  # the 30 s default
         monkeypatch.setattr(continue_session, "_launch", self._launch)
         self.accept_on_sleep = True
         self.clock = 0.0  # the fake monotonic clock: only ``_sleep`` advances it
@@ -240,8 +242,9 @@ class _Harness:  # pylint: disable=too-many-instance-attributes  # + the fake cl
         self.spawned.append(args)
         return self.spawn_ok
 
-    def _launch(self, target: str) -> str:
+    def _launch(self, target: str, *, timeout: float) -> str:
         self.launches.append(target)
+        self.launch_timeouts.append(timeout)
         return self.launcher
 
     def _leave_background(self) -> None:
@@ -442,7 +445,8 @@ def test_late_launch_already_claimed_when_the_launcher_returns(
 ) -> None:
     """(b) the draft is claimed before ``_launch`` returns "": no grace sleep at all."""
 
-    def _launch(target: str) -> str:
+    def _launch(target: str, *, timeout: float) -> str:
+        del timeout
         harness.launches.append(target)
         _claim_active_target()
         return ""
@@ -475,6 +479,32 @@ def test_late_launch_never_claimed_fails_after_the_grace(
     assert _archived(transfer.target_session)
     err = capsys.readouterr().err
     assert "could not open a terminal tab" in err and "claimed its draft" not in err
+
+
+@pytest.mark.parametrize(
+    ("wait", "env", "bound"),
+    [((), None, 30.0), (("-w", "10"), None, 10.0), ((), "45", 45.0), (("-w", "20"), "45", 20.0)],
+)
+def test_launch_timeout_is_clamped_to_the_accept_wait(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    wait: tuple[str, ...],
+    env: str | None,
+    bound: float,
+) -> None:
+    """B3a: the AppleScript launch bound is 30 s (or ``CCC_LAUNCH_TIMEOUT_S``), never more
+    than the ``-w`` accept window left, so launch + late-launch grace stay inside it."""
+    from command_center import terminal  # pylint: disable=import-outside-toplevel
+
+    if env is not None:
+        monkeypatch.setenv(terminal.LAUNCH_TIMEOUT_ENV, env)
+    assert harness.start(*wait) == 0
+    assert harness.launch_timeouts == [bound]
+
+
+def test_launch_timeout_clamp_never_drops_below_one_second() -> None:
+    """A deadline already passed still hands the launch a positive bound (≥ 1 s)."""
+    assert continue_session._launch_timeout(continue_session._monotonic() - 5) == 1.0
 
 
 def test_late_launch_claim_between_last_poll_and_withdraw_opens(
@@ -553,7 +583,8 @@ def test_late_launch_shared_cancel_only_when_the_withdraw_won(
 def _launch_script(harness: _Harness, launchers: list[str]) -> Any:
     """A ``_launch`` returning *launchers* in turn (the last one repeats)."""
 
-    def _launch(target: str) -> str:
+    def _launch(target: str, *, timeout: float) -> str:
+        del timeout
         harness.launches.append(target)
         return launchers[min(len(harness.launches), len(launchers)) - 1]
 

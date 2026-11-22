@@ -348,3 +348,84 @@ def test_iterm_pinned_write_keeps_the_applescript_escaping(monkeypatch: pytest.M
     monkeypatch.setattr(terminal, "_osascript", mock_osascript)
     assert terminal._iterm('echo "a\\b"') is True
     assert r'tell newSession to write text "echo \"a\\b\""' in scripts[0]
+
+
+# ---------------- longer fixed tab-launch timeout (tp#2449 B3a) ---------------- #
+class _KwRecorder:
+    """Record ``(argv, timeout)`` of every subprocess.run; every command succeeds."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], Any]] = []
+
+    def __call__(self, args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        self.calls.append((list(args), kwargs.get("timeout")))
+        return subprocess.CompletedProcess(args, 0, stdout="true", stderr="")
+
+
+@pytest.fixture(name="kw_run")
+def _kw_run(monkeypatch: pytest.MonkeyPatch) -> _KwRecorder:
+    monkeypatch.setattr(config, "load_config", lambda: _cfg("iterm"))
+    monkeypatch.setattr(terminal.shutil, "which", _which(_BOTH_TOOLS))
+    monkeypatch.delenv(terminal.LAUNCH_TIMEOUT_ENV, raising=False)
+    monkeypatch.setattr(terminal, "_LAUNCH_TIMEOUT_WARNED", set())
+    rec = _KwRecorder()
+    monkeypatch.setattr(terminal.subprocess, "run", rec)
+    return rec
+
+
+def test_launch_timeout_reaches_the_applescript_launch_call(kw_run: _KwRecorder) -> None:
+    assert terminal.LAUNCH_TIMEOUT_S == 30
+    assert terminal.start_job_launch("deadbeef") == terminal.LAUNCHER_ITERM_APPLESCRIPT
+    assert [(argv[0], timeout) for argv, timeout in kw_run.calls] == [("osascript", 30)]
+    # continue-session's clamp travels as a keyword and replaces the bound.
+    launched = terminal.start_job_launch("deadbeef", timeout=12.5)
+    assert launched == terminal.LAUNCHER_ITERM_APPLESCRIPT
+    assert kw_run.calls[-1][1] == 12.5
+
+
+def test_launch_timeout_env_override(
+    kw_run: _KwRecorder, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv(terminal.LAUNCH_TIMEOUT_ENV, " 45 ")
+    assert terminal.launch_timeout() == 45
+    assert terminal.start_job_launch("deadbeef") == terminal.LAUNCHER_ITERM_APPLESCRIPT
+    assert kw_run.calls[-1][1] == 45
+    monkeypatch.setenv(terminal.LAUNCH_TIMEOUT_ENV, "1")
+    assert terminal.launch_timeout() == 1  # the minimum is accepted
+    assert not capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["0", "-3", "abc", "2.5"])
+def test_launch_timeout_bad_env_value_defaults_with_one_warning(
+    kw_run: _KwRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    bad: str,
+) -> None:
+    monkeypatch.setenv(terminal.LAUNCH_TIMEOUT_ENV, bad)
+    assert terminal.start_job_launch("deadbeef") == terminal.LAUNCHER_ITERM_APPLESCRIPT
+    assert terminal.start_job_launch("deadbeef") == terminal.LAUNCHER_ITERM_APPLESCRIPT
+    assert [timeout for _argv, timeout in kw_run.calls] == [30, 30]
+    err = capsys.readouterr().err
+    assert err.count("warning:") == 1  # once, not per launch
+    assert terminal.LAUNCH_TIMEOUT_ENV in err and "default 30" in err
+
+
+def test_non_launch_osascript_callers_keep_their_timeouts(
+    kw_run: _KwRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(terminal.LAUNCH_TIMEOUT_ENV, "45")
+    assert terminal.focus_tty("/dev/ttys001") is True
+    assert terminal._iterm_reachable_by_apple_event() is True
+    assert [timeout for _argv, timeout in kw_run.calls] == [10, 5]
+
+
+def test_tmux_launch_rung_keeps_its_bounded_calls(
+    kw_run: _KwRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tmux rung stays at 5 s per call so the whole ladder fits the budget."""
+    monkeypatch.setenv(terminal.LAUNCH_TIMEOUT_ENV, "45")
+    monkeypatch.setattr(config, "load_config", lambda: _cfg("tmux"))
+    assert terminal.start_job_launch("deadbeef") == terminal.LAUNCHER_TMUX
+    assert terminal.TMUX_LAUNCH_TIMEOUT_S == 5
+    assert [timeout for _argv, timeout in kw_run.calls] == [5, 5]  # has-session, new-window
