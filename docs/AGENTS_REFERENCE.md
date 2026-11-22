@@ -372,9 +372,11 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
 - **Launch truth is claim vs withdraw, never the launcher's return value.** The successor
   started iff its `start-job` CASed `claim_draft` (needs `archived = 0`); it did not iff the
   relay won `withdraw_draft` first. Every abort path withdraws BEFORE the failed CAS; a lost
-  withdraw means `successor started` (exit 1). `unconfirmed` and a failed launcher are hints:
-  `start` waits the `CCC_RELAY_LATE_LAUNCH_S` grace (default 30 s, inside `-w`) before
-  withdrawing. A withdrawn draft is refused by `start-job` and by the `delete-job` undo.
+  withdraw means `successor started` (exit 1). A failed launcher return is only a hint: `start`
+  waits the `CCC_RELAY_LATE_LAUNCH_S` grace (default 30 s, inside `-w`) before withdrawing, and
+  launcher `unconfirmed` marks a late claim (the ladder reported failure, the draft was claimed
+  anyway). A withdrawn draft is refused by `start-job` and never revived by `mark-done --undo`,
+  `restore-job` or `archive -u`.
 - **Ownership moves only on `accept`**, from the recorded target session under the recorded
   account, after EVERY `handoff_hooks` entry succeeded (argv-only, bounded, JSON `"ok":
   true`); the source is retired only after `accepted` (`finalize`: idempotent session

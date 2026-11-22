@@ -2439,11 +2439,15 @@ store, not by the launcher: `claim_draft` (its tab's `start-job` took the draft;
 the launcher's return value is only a hint. After a launch that reported failure, `start` keeps
 checking inside its `-w` accept window for a late launch: a grace of `CCC_RELAY_LATE_LAUNCH_S`
 seconds (default 30; `0` = one check only), counted from that window, so a tab that opens
-slowly is accepted rather than orphaned. A launch that neither confirmed nor failed reports the
-launcher `unconfirmed`; the draft is then withdrawn only if still unclaimed once the grace ends.
+slowly is accepted rather than orphaned. When the launcher reported failure but the successor
+claimed its draft anyway (during the grace, or between the last check and the withdraw), the
+transfer is `opened` with the launcher `unconfirmed` and the normal accept wait follows. Without
+a claim, a still-`prepared` transfer has its draft withdrawn once the grace ends and is failed
+(`launch: no terminal tab`); an `opened` re-run whose relaunch reports failure never withdraws.
 A withdrawn draft that a tab later starts is refused: `start-job` exits 1 with `job <id> was
-withdrawn by its launcher (...)`, and `delete-job --undo` will not restore a withdrawn draft. The
-tab-open bound itself is in "Tab-launch timeout" above.
+withdrawn by its launcher (...)`, and `ccc mark-done --undo`, `ccc restore-job` and
+`ccc archive -u` will not revive a withdrawn draft. The tab-open bound itself is in
+"Tab-launch timeout" above.
 
 **Who finalizes and closes the source.** `ccc continue-session accept` is the primary
 finalizer: right after the `opened → accepted` CAS, when the source is idle (or alive), it
