@@ -323,8 +323,14 @@ def _abort_dead(sweep: _Pass, transfer: Transfer, watch: Any) -> None:
         return
     why = verdict.removeprefix(continue_session.DEAD_PREFIX)
     code, message = continue_session.abort_transfer(
-        sweep.store, tid, f"sweep: successor dead: {why}", sweep.now
+        sweep.store,
+        tid,
+        f"sweep: successor dead: {why}",
+        sweep.now,
+        never_started=why == continue_session.NEVER_STARTED,
     )
+    if code != 0 and message.startswith(continue_session.ABORT_STARTED_PREFIX):
+        return  # tp#2449 D2: claimed before the withdraw — it started, not dead
     if code != 0:
         sweep.report.handoff_errors.append(f"{tid}: {message}")
     elif message.startswith(continue_session.ABORT_PREFIX):

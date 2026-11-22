@@ -1007,6 +1007,7 @@ STARTING = "starting"
 LIVE = "live"
 DEAD_PREFIX = "dead:"
 NO_FIRST_TURN = "no-first-turn"  # tp#2326 D3: registered, alive, its first prompt never sent
+NEVER_STARTED = "never-started"  # still a draft LAUNCH_GRACE_S after its (re)launch
 NO_FIRST_TURN_CAUSES = (
     "a trust dialog, a stalled start hook, or a launch route that did not submit the prompt"
 )
@@ -1148,7 +1149,7 @@ def successor_state(
     row = store.get(target)
     if row is None or row.draft:
         since = max(transfer.opened_at or transfer.created_at, watch.launched_ms)
-        return DEAD_PREFIX + "never-started" if now - since >= LAUNCH_GRACE_S * 1000 else STARTING
+        return DEAD_PREFIX + NEVER_STARTED if now - since >= LAUNCH_GRACE_S * 1000 else STARTING
     launched = transfer.target_launched_at or transfer.opened_at or transfer.created_at
     try:
         alive = any(e.session_id == target and e.alive for e in adapter.discover())
@@ -1296,7 +1297,20 @@ def _settle_active(
         verdict = successor_state(store, adapter, active, _now_ms())
     tid = active.transfer_id
     if verdict.startswith(DEAD_PREFIX):  # dead or never started: no successor will accept it
-        code, message = abort_transfer(store, tid, "superseded", _now_ms())
+        code, message = abort_transfer(
+            store,
+            tid,
+            "superseded",
+            _now_ms(),
+            never_started=verdict == DEAD_PREFIX + NEVER_STARTED,
+        )
+        if code != 0 and message.startswith(ABORT_STARTED_PREFIX):  # tp#2449: it started
+            print(
+                f"note: {message}; it keeps the handoff it was given; ignored from this "
+                "call: " + ", ".join(ignored),
+                file=sys.stderr,
+            )
+            return _Chosen(active, ignored)
         print(
             f"note: transfer {tid}'s successor is {verdict}; superseded by this call: {message}"
             if code == 0
@@ -1369,7 +1383,7 @@ def _open_target(  # pylint: disable=too-many-arguments
     A launcher that reports ``""`` is not trusted (tp#2449): the store's draft claim is the
     ground truth, polled for a grace inside *deadline* (the call's accept window); a still
     ``prepared`` transfer is failed only after an atomic ``withdraw_draft`` won."""
-    from .transfer_store import FAILED, OPENED, PREPARED
+    from .transfer_store import OPENED, PREPARED
 
     if transfer.state not in (PREPARED, OPENED):
         return None
@@ -1379,14 +1393,7 @@ def _open_target(  # pylint: disable=too-many-arguments
     try:  # re-resolved from its name before every (re)launch, never from a snapshot
         _checked_profile(transfer.launch_profile)
     except StartRefused as exc:
-        if transfer.state == PREPARED:
-            store.transition_transfer(
-                transfer.transfer_id, FAILED, _now_ms(), failure=f"launch: {exc}"[:200]
-            )
-            if store.get(transfer.target_session) is not None:
-                store.update_fields(transfer.target_session, archived=True)
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+        return _profile_refused(store, transfer, exc)
     _create_successor(store, transfer, src, text)
     target_row = store.get(transfer.target_session)
     if target_row is None or not target_row.draft:
@@ -1416,6 +1423,38 @@ def _open_target(  # pylint: disable=too-many-arguments
             f"({launcher}); waiting for it to accept transfer {transfer.transfer_id}"
         )
     return None
+
+
+def _profile_refused(store: Store, transfer: Any, exc: StartRefused) -> int | None:
+    """``_open_target``'s launch-profile refusal: exit 1, a ``prepared`` transfer failed —
+    unless its draft was already claimed (tp#2449 D2, debate O1: the withdraw runs BEFORE
+    the CAS and lost), then the successor started, nothing is failed and ``None`` goes on
+    waiting for its accept."""
+    from .transfer_store import FAILED, PREPARED
+
+    if transfer.state == PREPARED and not _withdrawn(store, transfer.target_session):
+        print(
+            f"note: {exc}; but successor {transfer.target_session} already claimed its "
+            f"draft, so transfer {transfer.transfer_id} is not failed — waiting for its accept",
+            file=sys.stderr,
+        )
+        return None
+    if transfer.state == PREPARED:
+        store.transition_transfer(
+            transfer.transfer_id, FAILED, _now_ms(), failure=f"launch: {exc}"[:200]
+        )
+    print(f"error: {exc}", file=sys.stderr)
+    return 1
+
+
+def _withdrawn(store: Store, target: str) -> bool:
+    """tp#2449 D2 (debate O1): may a transfer whose successor is *target* be failed?
+
+    ``True`` when *target* has no row yet (nothing can launch) or the atomic
+    ``withdraw_draft`` won (its draft can no longer launch); ``False`` when the draft was
+    already claimed — the successor started, so the transfer must not fail. Always called
+    BEFORE the ``failed`` CAS, never after it."""
+    return store.get(target) is None or store.withdraw_draft(target)
 
 
 def _late_launch(store: Store, transfer: Any, deadline: float, *, shared_on: bool) -> str:
@@ -1479,18 +1518,29 @@ def _unconfirmed_launch(transfer: Any) -> str:
 def _abort_dead(store: Store, transfer: Any, verdict: str) -> Any | None:
     """Abort *transfer* for its dead successor (D3's core); ``None`` once it is failed, or
     the re-read transfer when it was accepted meanwhile (then it is finalized, not
-    relaunched). A ``no-first-turn`` abort that changed the row also stamps the orphan
+    relaunched) or, for ``never-started``, its draft was claimed before the abort could
+    withdraw it (tp#2449 D2: the successor started; still ``prepared``/``opened``, the
+    wait goes on). A ``no-first-turn`` abort that changed the row also stamps the orphan
     close (tp#2326 D6): the daemon closes that successor's tab once it is idle."""
-    from .transfer_store import ACCEPTED, FINALIZED
+    from .transfer_store import ACCEPTED, FINALIZED, OPENED, PREPARED
 
     why = verdict.removeprefix(DEAD_PREFIX)
     now = _now_ms()
-    code, message = abort_transfer(store, transfer.transfer_id, f"successor dead: {why}", now)
-    print(f"note: {message}" if code == 0 else f"warning: {message}", file=sys.stderr)
+    code, message = abort_transfer(
+        store,
+        transfer.transfer_id,
+        f"successor dead: {why}",
+        now,
+        never_started=why == NEVER_STARTED,
+    )
+    started = code != 0 and message.startswith(ABORT_STARTED_PREFIX)
+    print(f"note: {message}" if code == 0 or started else f"warning: {message}", file=sys.stderr)
     if code == 0 and why == NO_FIRST_TURN and message.startswith(ABORT_PREFIX):
         store.record_orphaned(transfer.transfer_id, now)
     current = store.get_transfer(transfer.transfer_id)
     if current is not None and current.state in (ACCEPTED, FINALIZED):
+        return current
+    if started and current is not None and current.state in (PREPARED, OPENED):
         return current
     return None
 
@@ -1565,9 +1615,14 @@ def _drive(  # pylint: disable=too-many-locals,too-many-arguments
     while dead:
         why = dead.removeprefix(DEAD_PREFIX)
         healed = _abort_dead(store, current, dead)
-        if healed is not None:  # accepted between the verdict and the abort: finalize it
-            current = healed
+        if healed is not None and healed.state in (ACCEPTED, FINALIZED):
+            current = healed  # accepted between the verdict and the abort: finalize it
             break
+        if healed is not None:  # tp#2449: claimed between the verdict and the withdraw
+            current, dead = _wait_accepted_or_dead(
+                store, adapter, healed.transfer_id, deadline, watch
+            )
+            continue
         deaths.append(why)
         first = current.target_session
         if len(deaths) > AUTO_RELAUNCHES:
@@ -2706,6 +2761,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 ABORT_DEFAULT_REASON = "by hand"
 ABORT_PREFIX = "aborted: "  # the ``failure`` text of an aborted transfer starts with this
+#: tp#2449 D2: an abort refused because the successor claimed its draft first (exit 1).
+ABORT_STARTED_PREFIX = "successor started: "
 
 
 @dataclass
@@ -2736,13 +2793,22 @@ class _Abort:  # pylint: disable=too-many-instance-attributes  # one report row
         }
 
 
-def _abort(store: Store, transfer_id: str, reason: str, now: int) -> _Abort:
+def _abort(  # pylint: disable=too-many-return-statements  # one per refusal
+    store: Store, transfer_id: str, reason: str, now: int, *, never_started: bool = False
+) -> _Abort:
     """The ``abort`` core: CAS ``prepared|opened → failed`` with ``aborted: <reason>``.
 
     ``accepted`` is refused (ownership moved; there is no ``accepted → failed`` edge and
     the successor already holds the work): its accept finalizes it. ``finalized``/``failed``
     are reported unchanged (idempotent). A lost CAS (the state moved under us) is re-read
     once and judged again, so a concurrent accept is refused, never overwritten.
+
+    A draft successor is withdrawn BEFORE the CAS (tp#2449 D2, debate O1): a lost
+    ``withdraw_draft`` (its ``start-job`` claimed it first) refuses the abort with
+    :data:`ABORT_STARTED_PREFIX` (exit 1) and changes nothing — a failed transfer never
+    has a started successor. *never_started* (a ``dead:never-started`` verdict) also
+    treats a row that is no longer a draft as claimed since the verdict; without it a
+    started successor is aborted as before (its accept then refuses).
     """
     from .transfer_store import ACCEPTED, FAILED, OPENED, PREPARED
 
@@ -2772,6 +2838,10 @@ def _abort(store: Store, transfer_id: str, reason: str, now: int) -> _Abort:
                 state=transfer.state,
                 was=transfer.state,
             )
+        row = store.get(target)
+        archived = row is not None and (bool(row.draft) or never_started)
+        if archived and not store.withdraw_draft(target):  # D2: before the CAS, never after
+            return _started_refusal(transfer)
         if _shared_on() and _shared_cancel(store, tid) == ACCEPTED:
             # tp#2372 F3b2: the op token is cancelled first; a published succession is
             # never undone (the reconciler finishes its accept).
@@ -2787,10 +2857,6 @@ def _abort(store: Store, transfer_id: str, reason: str, now: int) -> _Abort:
         reserved = [group.id for group in store.reserved_awaits(tid)]
         if not store.transition_transfer(tid, FAILED, now, failure=failure):
             continue  # the state moved between the read and the CAS: judge it again
-        row = store.get(target)
-        archived = row is not None and bool(row.draft)
-        if archived:  # never launched, or launched and never started: as `_drive`'s launch failure
-            store.update_fields(target, archived=True)
         what = [f"transfer {tid} {transfer.state} → failed ({failure})"]
         if reserved:
             what.append(f"released {len(reserved)} await group(s) to the source")
@@ -2824,13 +2890,34 @@ def _abort(store: Store, transfer_id: str, reason: str, now: int) -> _Abort:
     return _Abort(1, f"transfer {transfer_id} kept changing state; try again", transfer_id)
 
 
-def abort_transfer(store: Store, transfer_id: str, reason: str, now: int) -> tuple[int, str]:
+def _started_refusal(transfer: Any) -> _Abort:
+    """The abort of *transfer* lost the withdraw race: its successor claimed its draft."""
+    tid, target = transfer.transfer_id, transfer.target_session
+    return _Abort(
+        1,
+        f"{ABORT_STARTED_PREFIX}successor {target} claimed its draft before the abort could "
+        f"withdraw it, so transfer {tid} was NOT aborted and stays {transfer.state}",
+        tid,
+        state=transfer.state,
+        was=transfer.state,
+        next_step=(
+            f"let {target} accept (`ccc continue-session accept {tid}`); to give it up anyway "
+            f"run `ccc continue-session abort {tid}` again (its tab stays open)"
+        ),
+    )
+
+
+def abort_transfer(
+    store: Store, transfer_id: str, reason: str, now: int, *, never_started: bool = False
+) -> tuple[int, str]:
     """Fail an active (``prepared``/``opened``) transfer: ``(exit code, message)``.
 
     The reusable core of ``continue-session abort`` (and of the dead-successor relaunch
     and the daemon sweep): ``failure = "aborted: <reason>"``, the reserved await groups
-    released (the ``failed`` CAS's transaction), a draft successor archived."""
-    done = _abort(store, transfer_id, reason, now)
+    released (the ``failed`` CAS's transaction), a draft successor withdrawn first
+    (tp#2449: a lost withdraw is exit 1 with :data:`ABORT_STARTED_PREFIX`, nothing
+    changed). *never_started*: the caller judged the successor ``dead:never-started``."""
+    done = _abort(store, transfer_id, reason, now, never_started=never_started)
     return done.code, done.message
 
 

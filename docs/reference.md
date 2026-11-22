@@ -2414,8 +2414,13 @@ is closed by the daemon; fix the cause and start a new transfer. `ccc continue-s
 `opened` transfer whose successor is stuck or dead: it moves it to `failed` with
 `aborted: REASON` (default `by hand`), hands the reserved `ccc await` groups back to the
 source and archives a never-started (draft) successor; a started successor tab stays open
-and its `accept` then refuses. It refuses an `accepted` transfer (ownership already moved:
-run `accept` in the successor) and reports a `finalized` or `failed` one unchanged (exit 0).
+and its `accept` then refuses. A draft successor is withdrawn atomically BEFORE the transfer
+fails: when its tab claims the draft first, the abort exits 1 with `successor started: …` and
+changes nothing (run `abort` again to give up the now-started successor). The same
+withdraw-first rule guards `start`'s `never-started` relaunch, the daemon sweep and a refused
+launch profile, so a `failed` transfer never has a started successor. It refuses an
+`accepted` transfer (ownership already moved: run `accept` in the successor) and reports a
+`finalized` or `failed` one unchanged (exit 0).
 
 **Who finalizes and closes the source.** `ccc continue-session accept` is the primary
 finalizer: right after the `opened → accepted` CAS, when the source is idle (or alive), it

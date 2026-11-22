@@ -2579,9 +2579,11 @@ def test_start_no_first_turn_accepted_before_the_abort_finalizes(
 ) -> None:
     real_abort = continue_session.abort_transfer
 
-    def accept_then_abort(store: Store, tid: str, reason: str, now: int) -> tuple[int, str]:
+    def accept_then_abort(
+        store: Store, tid: str, reason: str, now: int, **kwargs: Any
+    ) -> tuple[int, str]:
         world.accept()  # the successor accepted between the verdict and the abort
-        return real_abort(store, tid, reason, now)
+        return real_abort(store, tid, reason, now, **kwargs)
 
     monkeypatch.setattr(continue_session, "abort_transfer", accept_then_abort)
 
@@ -4226,3 +4228,253 @@ def test_c9_unreadable_ps_without_a_drain_still_refuses(
     assert continue_session.PS_UNKNOWN_NOTE not in err
     with Store() as store:
         assert store.transfers_of(SID) == []
+
+
+# ------------------------------------- withdraw first on every FAILED path (tp#2449 D2, O1)
+
+
+def _claim_inside_withdraw(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """The successor's ``start-job`` claims the draft just before the withdraw's ``UPDATE``:
+    the withdraw loses. Returns the withdraw results."""
+    real = Store.withdraw_draft
+    results: list[bool] = []
+
+    def _claim_first(self: Store, session_id: str) -> bool:
+        self.claim_draft(session_id)
+        results.append(real(self, session_id))
+        return results[-1]
+
+    monkeypatch.setattr(Store, "withdraw_draft", _claim_first)
+    return results
+
+
+def _claim_after_never_started(world: _World, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The successor claims its draft right AFTER the first ``dead:never-started`` verdict,
+    before the abort runs. Returns the verdicts that triggered a claim."""
+    real = continue_session.successor_state
+    claimed: list[str] = []
+
+    def _racing(store: Store, adapter: Any, transfer: Any, now: int, watch: Any = None) -> str:
+        verdict = real(store, adapter, transfer, now, watch)
+        never = continue_session.DEAD_PREFIX + continue_session.NEVER_STARTED
+        if verdict == never and not claimed:
+            world.claim()
+            claimed.append(verdict)
+        return verdict
+
+    monkeypatch.setattr(continue_session, "successor_state", _racing)
+    return claimed
+
+
+@pytest.mark.parametrize("race", ["after_verdict", "inside_withdraw"])
+def test_withdraw_first_claim_after_never_started_keeps_waiting(
+    world: _World,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    race: str,
+) -> None:
+    """(a) the draft is claimed between the ``never-started`` poll and the abort: the
+    transfer is never failed, no relaunch, the late successor's accept finalizes it."""
+    claimed: list[str] = []
+    results: list[bool] = []
+    if race == "after_verdict":
+        claimed = _claim_after_never_started(world, monkeypatch)
+    else:
+        results = _claim_inside_withdraw(monkeypatch)
+
+    def script(w: _World) -> None:
+        active = w.active()
+        if active is not None and active.target_launched_at > 0:
+            w.accept()  # the claimed successor accepts on the next poll
+
+    world.script = script
+    assert world.harness.start() == 0
+    (transfer,) = _transfers()
+    assert transfer.state == "finalized" and not transfer.failure
+    assert world.harness.launches == [transfer.target_session]  # no relaunch
+    assert world.harness.clock >= continue_session.LAUNCH_GRACE_S
+    with Store() as store:
+        job = store.get(transfer.target_session)
+    assert job is not None and not job.draft and not job.archived
+    assert (claimed, results) == (
+        (["dead:never-started"], []) if race == "after_verdict" else ([], [False])
+    )
+    err = capsys.readouterr().err
+    assert continue_session.ABORT_STARTED_PREFIX in err and "relaunched" not in err
+
+
+def test_withdraw_first_never_claimed_fails_and_archives(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(b) never claimed: ``failed`` + archived as today — the withdraw runs BEFORE the CAS."""
+    tid = _opened_transfer(harness)
+    calls: list[str] = []
+    real_withdraw, real_cas = Store.withdraw_draft, Store.transition_transfer
+
+    def _withdraw(self: Store, session_id: str) -> bool:
+        calls.append("withdraw")
+        return real_withdraw(self, session_id)
+
+    def _cas(self: Store, *args: Any, **kwargs: Any) -> bool:
+        calls.append("cas")
+        return real_cas(self, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "withdraw_draft", _withdraw)
+    monkeypatch.setattr(Store, "transition_transfer", _cas)
+    with Store() as store:
+        code, message = continue_session.abort_transfer(
+            store, tid, "successor dead: never-started", 5, never_started=True
+        )
+    assert code == 0 and message.startswith(continue_session.ABORT_PREFIX)
+    assert "archived the never-started successor" in message
+    assert calls == ["withdraw", "cas"]
+    transfer = _transfer(tid)
+    assert transfer.state == "failed"
+    assert transfer.failure == "aborted: successor dead: never-started"
+    row = _target_row(tid)
+    assert row.archived and row.draft
+
+
+def test_withdraw_first_user_abort_lost_withdraw_refuses(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """(c) ``continue-session abort`` on a draft whose withdraw loses: exit 1, "successor
+    started", nothing changed; a second abort gives up the now-started successor."""
+    gid = _arm_await(SID)
+    tid = _opened_transfer(harness)
+    real = Store.withdraw_draft
+    results = _claim_inside_withdraw(monkeypatch)
+    capsys.readouterr()
+    assert _abort(tid, "-j") == 1
+    data = json.loads(capsys.readouterr().out)
+    assert results == [False]
+    assert not data["ok"] and not data["changed"] and data["state"] == "opened"
+    assert data["message"].startswith(continue_session.ABORT_STARTED_PREFIX)
+    assert "NOT aborted" in data["message"] and f"abort {tid}` again" in data["next"]
+    assert _transfer(tid).state == "opened" and _group(gid).transfer_id == tid
+    row = _target_row(tid)
+    assert not row.draft and not row.archived
+    monkeypatch.setattr(Store, "withdraw_draft", real)
+    assert _abort(tid) == 0  # the row is no longer a draft: aborted as before
+    assert _transfer(tid).state == "failed" and not _target_row(tid).archived
+    assert "was started and stays open" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("race", ["before_read", "inside_withdraw"])
+def test_withdraw_first_abort_transfer_never_started_race(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, race: str
+) -> None:
+    """(c) the ``abort_transfer`` core with a ``never-started`` verdict: a claim before the
+    abort reads the row, or inside its withdraw, refuses with exit 1 and changes nothing."""
+    tid = _opened_transfer(harness)
+    if race == "before_read":
+        with Store() as store:
+            assert store.claim_draft(_transfer(tid).target_session)
+    else:
+        _claim_inside_withdraw(monkeypatch)
+    with Store() as store:
+        code, message = continue_session.abort_transfer(
+            store, tid, "sweep: successor dead: never-started", 5, never_started=True
+        )
+    assert code == 1 and message.startswith(continue_session.ABORT_STARTED_PREFIX)
+    transfer = _transfer(tid)
+    assert transfer.state == "opened" and not transfer.failure
+    assert not _target_row(tid).archived
+
+
+def _sweep_dead(tid: str, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """One daemon-sweep ``_abort_dead`` of *tid*, past the never-started grace, with no
+    ``start`` alive: the sweep's report."""
+    from command_center import handoff_sweep  # pylint: disable=import-outside-toplevel
+    from command_center.daemon import DaemonReport  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(handoff_sweep, "_start_live", lambda *_a: False)
+    transfer = _transfer(tid)
+    now = transfer.opened_at + continue_session.LAUNCH_GRACE_S * 1000 + 1
+    report = DaemonReport()
+    with Store() as store:
+        sweep = handoff_sweep._Pass(  # pylint: disable=protected-access
+            store, {}, report, False, now, {}
+        )
+        handoff_sweep._abort_dead(  # pylint: disable=protected-access
+            sweep, transfer, continue_session.SuccessorWatch()
+        )
+    return report
+
+
+@pytest.mark.parametrize("race", ["after_verdict", "inside_withdraw", "never_claimed"])
+def test_withdraw_first_daemon_sweep_race(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, race: str
+) -> None:
+    """(c) the daemon sweep's never-started abort: a claim after its verdict or inside the
+    withdraw leaves the transfer alone (no abort, no error); never claimed → failed +
+    archived."""
+    tid = _opened_transfer(harness)
+    target = _transfer(tid).target_session
+    if race == "after_verdict":
+        real = continue_session.successor_state
+
+        def _racing(*args: Any) -> str:
+            verdict = real(*args)
+            with Store() as store:
+                store.claim_draft(target)
+            return verdict
+
+        monkeypatch.setattr(continue_session, "successor_state", _racing)
+    elif race == "inside_withdraw":
+        _claim_inside_withdraw(monkeypatch)
+    report = _sweep_dead(tid, monkeypatch)
+    assert not report.handoff_errors
+    transfer = _transfer(tid)
+    if race == "never_claimed":
+        assert report.handoff_aborted == [tid]
+        assert transfer.failure == "aborted: sweep: successor dead: never-started"
+        assert transfer.state == "failed" and _target_row(tid).archived
+        return
+    assert not report.handoff_aborted
+    assert transfer.state == "opened" and not transfer.failure
+    row = _target_row(tid)
+    assert not row.draft and not row.archived
+
+
+@pytest.mark.parametrize("claimed", [True, False])
+def test_withdraw_first_profile_refusal(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    claimed: bool,
+) -> None:
+    """(D2) the ``_checked_profile`` refusal of a ``prepared`` re-run: a lost withdraw (the
+    draft was claimed) keeps waiting, never ``failed``; a won one fails as before, archived."""
+    tid = _opened_transfer(harness)
+    with Store() as store:  # a start that died before its launch left it prepared
+        store.conn.execute(
+            "UPDATE transfers SET state = 'prepared', launch_profile = 'gone' "
+            "WHERE transfer_id = ?",
+            (tid,),
+        )
+        store.conn.commit()
+    real = continue_session._checked_profile  # pylint: disable=protected-access
+
+    def _checked(profile: str) -> str:
+        if profile == "gone":
+            raise continue_session.StartRefused("launch profile 'gone' is unknown")
+        return real(profile)
+
+    monkeypatch.setattr(continue_session, "_checked_profile", _checked)
+    if claimed:
+        _claim_inside_withdraw(monkeypatch)
+    capsys.readouterr()
+    code = harness.start("-w", "0")
+    transfer = _transfer(tid)
+    row = _target_row(tid)
+    err = capsys.readouterr().err
+    if claimed:
+        assert code == continue_session.EXIT_WAITING
+        assert transfer.state == "prepared" and not transfer.failure
+        assert not row.draft and not row.archived and "already claimed its draft" in err
+    else:
+        assert code == 1 and transfer.state == "failed"
+        assert transfer.failure.startswith("launch: launch profile 'gone'")
+        assert row.draft and row.archived
+    assert len(harness.launches) == 1  # never relaunched
