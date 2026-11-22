@@ -2433,6 +2433,18 @@ launch profile, so a `failed` transfer never has a started successor. It refuses
 `accepted` transfer (ownership already moved: run `accept` in the successor) and reports a
 `finalized` or `failed` one unchanged (exit 0).
 
+**Launch truth and late launches (tp#2449).** Whether the successor started is decided by the
+store, not by the launcher: `claim_draft` (its tab's `start-job` took the draft; it now requires
+`archived = 0`) versus `withdraw_draft` (the relay archived it first). Exactly one wins, and
+the launcher's return value is only a hint. After a launch that reported failure, `start` keeps
+checking inside its `-w` accept window for a late launch: a grace of `CCC_RELAY_LATE_LAUNCH_S`
+seconds (default 30; `0` = one check only), counted from that window, so a tab that opens
+slowly is accepted rather than orphaned. A launch that neither confirmed nor failed reports the
+launcher `unconfirmed`; the draft is then withdrawn only if still unclaimed once the grace ends.
+A withdrawn draft that a tab later starts is refused: `start-job` exits 1 with `job <id> was
+withdrawn by its launcher (...)`, and `delete-job --undo` will not restore a withdrawn draft. The
+tab-open bound itself is in "Tab-launch timeout" above.
+
 **Who finalizes and closes the source.** `ccc continue-session accept` is the primary
 finalizer: right after the `opened → accepted` CAS, when the source is idle (or alive), it
 marks the transfer `finalized`, writes the source's handed-off state and spawns the closer
