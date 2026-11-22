@@ -4523,8 +4523,8 @@ def _resolve_job_or_report(store: Store, given: str) -> str | None:
 def _relay_successor_draft(store: Store, session_id: str) -> bool:
     """Whether *session_id* is the successor (target) of any relay transfer (tp#2449 O7).
 
-    The delete-job undo paths (``done --undo``, ``restore-job``) un-archive an archived
-    draft; for a relay successor that would revive a draft its launcher WITHDREW
+    The undo paths (``mark-done --undo``, ``restore-job``, ``archive -u``) un-archive an
+    archived draft; for a relay successor that would revive a draft its launcher WITHDREW
     (:meth:`Store.withdraw_draft`) so it could fail the transfer — a later claim would
     then start a successor of a FAILED transfer, the exact state tp#2449 rules out.
     The transfer itself is the marker (no new column): an archived draft that is a
@@ -4674,6 +4674,13 @@ def cmd_archive(args: argparse.Namespace) -> int:  # pylint: disable=too-many-re
         if args.undo:
             if not session.archived:
                 print(f"error: {resolved} is not archived", file=sys.stderr)
+                return 1
+            if session.draft and _relay_successor_draft(store, resolved):
+                print(
+                    f"error: {resolved} is a withdrawn relay successor draft — not "
+                    "unarchiving it (reviving it could start a successor of a failed transfer)",
+                    file=sys.stderr,
+                )
                 return 1
             store.update_fields(resolved, archived=False)
             print(f"unarchived {resolved}")

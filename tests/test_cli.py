@@ -1308,6 +1308,21 @@ def test_mark_done_undo_leaves_a_withdrawn_relay_draft_archived(
         assert store.claim_draft(_JOB_UUID) is False
 
 
+def test_archive_undo_refuses_a_withdrawn_relay_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#2449 O7: `archive -u` must not un-archive a draft its relay withdrew either."""
+    from command_center.cli import cmd_archive
+
+    _withdrawn_relay_draft(tmp_path, monkeypatch, _JOB_UUID)
+    assert cmd_archive(argparse.Namespace(session_id=_JOB_UUID, undo=True)) == 1
+    assert "withdrawn relay successor draft" in capsys.readouterr().err
+    with Store(tmp_path / "command-center" / "state.db") as store:
+        row = store.get(_JOB_UUID)
+        assert row is not None and row.draft and row.archived
+        assert store.claim_draft(_JOB_UUID) is False
+
+
 def test_restore_job_reregisters_pruned_row_from_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
