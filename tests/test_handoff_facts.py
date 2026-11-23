@@ -160,6 +160,21 @@ def test_provider_ok_records_merge(world: dict[str, Any], tmp_path: Path) -> Non
     assert doc["providers"][0]["ok"] is True
 
 
+def test_provider_overseen_record_validates(world: dict[str, Any], tmp_path: Path) -> None:
+    """tp#2622 B2: the ``overseen`` kind (nested launch / next dicts) is a provider kind."""
+    launch = {"id": 94, "box_id": "B1", "state": "ready", "wait_reason": "due"}
+    fact = _fact("overseen", "overseen:2606", tp_id=2606, title="fix", launch=launch)
+    fact["priority"] = 1
+    other = _fact("overseen", "overseen:2622", tp_id=2622, title="feat")
+    other["fields"]["next"] = {"action": "hand", "box_id": "B1", "reason": "r"}
+    argv = _provider(tmp_path, "ov", _good_doc(fact, other))
+    doc = _collect(world, tmp_path, specs_config=[{"argv": argv, "name": "ov"}])
+    assert doc["providers"][0]["ok"] is True, doc["providers"][0]
+    got = {f["key"]: f["fields"] for f in _by_kind(doc, "overseen")}
+    assert got["overseen:2606"]["launch"] == launch
+    assert got["overseen:2622"]["next"]["action"] == "hand"
+
+
 @pytest.mark.parametrize(
     ("name", "body", "why"),
     [

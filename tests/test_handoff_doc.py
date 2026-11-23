@@ -548,3 +548,108 @@ def test_compose_facts_overflow_moves_lowest_priority_to_rest(tmp_path: Path) ->
     assert "AIM (done-condition): ship tp#9" in result.text  # the session fact never moves
     small, composed = _compose(_model("mine"), _snap(_session_fact(), *_questions(3)), tmp_path)
     assert small.ok and composed.rest == ""
+
+
+# ------------------------------------------- tp#2622 B2: dispatcher-overseen items
+
+
+def _overseen_facts() -> list[dict]:
+    from command_center.handoff_facts import rec
+
+    launch = {"id": 94, "box_id": "B1", "state": "ready", "wait_reason": "due; next sweep in 60 s"}
+    return [
+        rec(
+            "overseen", "overseen:2606", "tp ownership", 1, tp_id=2606, title="fix q", launch=launch
+        ),
+        rec(
+            "overseen",
+            "overseen:2622",
+            "tp ownership",
+            1,
+            tp_id=2622,
+            title="feat h",
+            next={"action": "hand", "box_id": "B1", "reason": "box repo differs"},
+        ),
+        rec(
+            "overseen",
+            "overseen:2700",
+            "tp ownership",
+            1,
+            tp_id=2700,
+            title="",
+            next={"action": "done", "box_id": None, "reason": "every box landed"},
+        ),
+    ]
+
+
+def _base_facts() -> list[dict]:
+    from command_center.handoff_facts import rec
+
+    return [
+        _session_fact(),
+        rec("tp_item", "tp_item:5", "tp ownership", 0, tp_id=5, title="held", state="work"),
+        rec("tp_filed", "tp_filed:6", "tp ownership", 4, tp_id=6, title="filed", state="open"),
+    ]
+
+
+def test_overseen_items_render_under_one_header_in_tp_ownership() -> None:
+    lines = handoff_doc._facts_lines(_snap(*_base_facts(), *_overseen_facts()), 0, "sid-x")
+    own = lines["tp ownership"]
+    assert own.count(handoff_doc.OVERSEEN_HEADER) == 1
+    at = own.index(handoff_doc.OVERSEEN_HEADER)
+    assert own[at + 1 : at + 4] == [
+        "- tp#2606 fix q — launch 94 B1 ready: due; next sweep in 60 s",
+        "- tp#2622 feat h — no open launch; next box B1 (hand: box repo differs)",
+        "- tp#2700 — next: done (every box landed)",
+    ]
+    assert len(lines) == len(handoff_doc.REQUIRED_SECTIONS)  # no tenth section
+
+
+def test_overseen_lines_clip_compact_and_floor() -> None:
+    from command_center.handoff_facts import rec
+
+    long = rec(
+        "overseen",
+        "overseen:1",
+        "tp ownership",
+        1,
+        tp_id=1,
+        title="t" * 200,
+        launch={"id": 3, "box_id": "B2", "state": "waiting", "wait_reason": "w" * 300},
+    )
+    tier9 = handoff_doc._facts_lines(_snap(long), handoff_doc.COMPACT_LEVEL, "sid-x")
+    item = [ln for ln in tier9["tp ownership"] if ln.startswith("- tp#1 ")]
+    assert len(item) == 1 and len(item[0].encode()) <= handoff_doc.OVERSEEN_MAX_BYTES
+    floor = handoff_doc._facts_lines(_snap(*_overseen_facts()), handoff_doc.MAX_LEVEL, "sid-x")
+    assert floor["tp ownership"][1:] == [
+        "- tp#2606 overseen: launch 94 B1 ready",
+        "- tp#2622 overseen: next B1 hand",
+        "- tp#2700 overseen: next done",
+    ]
+
+
+def test_overseen_lines_survive_the_hard_guard() -> None:
+    from command_center.handoff_facts import rec
+
+    filler = [
+        rec("commit", f"commit:{i}", "tp ownership", 4, repo="r", hash=f"{i:040d}", subject="s")
+        for i in range(50)
+    ]
+    snap = _snap(*_overseen_facts(), *filler)
+    lines = handoff_doc._facts_lines(snap, handoff_doc.MAX_LEVEL, "sid-x", facts_cap=200)
+    own = lines["tp ownership"]
+    assert handoff_doc.OVERSEEN_HEADER in own
+    assert "- tp#2606 overseen: launch 94 B1 ready" in own
+    assert "- tp#2622 overseen: next B1 hand" in own
+
+
+@pytest.mark.parametrize("level", [0, 5, 9, 10, 11])
+def test_overseen_facts_only_add_their_own_lines(level: int) -> None:
+    """A document without ``overseen`` facts renders exactly as before (tp#2622)."""
+    plain = handoff_doc._facts_lines(_snap(*_base_facts()), level, "sid-x")
+    with_ = handoff_doc._facts_lines(_snap(*_base_facts(), *_overseen_facts()), level, "sid-x")
+    ours = {handoff_doc.OVERSEEN_HEADER}
+    for title, lines in with_.items():
+        kept = [ln for ln in lines if ln not in ours and not ln.startswith("- tp#2")]
+        assert kept == plain[title], title
+    assert not any(handoff_doc.OVERSEEN_HEADER in ln for v in plain.values() for ln in v)

@@ -670,6 +670,45 @@ def _tp_minimal(held: list[dict[str, Any]], keys: list[str], ref: str) -> list[t
     return out
 
 
+OVERSEEN_HEADER = "Overseen via dispatcher (released, not claimed; accept moves the plan rows):"
+OVERSEEN_MAX_BYTES = 160  # from tier 9: one overseen item line
+
+
+def _overseen(f: dict[str, Any], level: int) -> str:
+    """One dispatcher-overseen item (tp#2622): its open launch, else its next box."""
+    head = f"- tp#{f.get('tp_id')}"
+    launch, nxt = f.get("launch"), f.get("next")
+    launch = launch if isinstance(launch, dict) else None
+    nxt = nxt if isinstance(nxt, dict) else None
+    if level >= MAX_LEVEL:
+        words: tuple[Any, ...]
+        if launch:
+            words = ("launch", launch.get("id"), launch.get("box_id"), launch.get("state"))
+        elif nxt:
+            words = ("next", nxt.get("box_id"), nxt.get("action"))
+        else:
+            words = ("no open launch",)
+        return f"{head} overseen: " + " ".join(w for w in map(_one, words) if w)
+    title = _clip(_one(f.get("title")), TITLE_MAX_BYTES)
+    line = f"{head} {title} — " if title else f"{head} — "
+    if launch:
+        what = " ".join(
+            w for w in map(_one, (launch.get("id"), launch.get("box_id"), launch.get("state"))) if w
+        )
+        line += f"launch {what}"
+        if _one(launch.get("wait_reason")):
+            line += f": {_one(launch.get('wait_reason'))}"
+    elif nxt and _one(nxt.get("box_id")):
+        line += f"no open launch; next box {_one(nxt['box_id'])} ({_one(nxt.get('action'))}"
+        line += f": {_one(nxt['reason'])})" if _one(nxt.get("reason")) else ")"
+    elif nxt:
+        line += f"next: {_one(nxt.get('action')) or '?'}"
+        line += f" ({_one(nxt['reason'])})" if _one(nxt.get("reason")) else ""
+    else:
+        line += "no open launch"
+    return _clip(line, OVERSEEN_MAX_BYTES) if level >= COMPACT_LEVEL else line
+
+
 def _tp_item(fact: dict[str, Any], level: int) -> list[str]:
     """Tier 9+: one line per held item (below tier 9 :func:`_tp_minimal` renders them)."""
     del level
@@ -770,6 +809,8 @@ def _render_plain(  # pylint: disable=too-many-return-statements
         return _tp_item(fact, level)
     if kind == "tp_filed":
         return [f"- tp#{f.get('tp_id')} [{_one(f.get('state'))}] {_one(f.get('title'))}"]
+    if kind == "overseen":
+        return [_overseen(f, level)]
     if kind == "question":
         return [f"- ? tp#{f.get('tp_id')} {_one(f.get('source'))}: {_one(f.get('detail'))}"]
     if kind == "agent":
@@ -828,7 +869,7 @@ def _section_of(fact: dict[str, Any]) -> str:
 
 def _protected(kind: str, line: str) -> bool:
     """Is *line* (rendered from a fact of *kind*) on the never-cut list?"""
-    if kind in ("tp_item", "shell", *_FLOOR_KINDS):
+    if kind in ("tp_item", "overseen", "shell", *_FLOOR_KINDS):
         return True
     if kind == "session":
         return line.startswith(("AIM ", "Deadline:"))
@@ -951,6 +992,8 @@ def _render_facts(  # pylint: disable=too-many-locals,too-many-branches,too-many
             out[section].append(
                 ("Filed, not held (this session filed them; accept moves nothing):", False)
             )
+        if kind == "overseen" and not any(ln == OVERSEEN_HEADER for ln, _keep in out[section]):
+            out[section].append((OVERSEEN_HEADER, True))
         out[section] += [(ln, _protected(kind, ln)) for ln in lines]
     for text in doc.get("warnings", []):
         if _one(text) not in seen_msgs:

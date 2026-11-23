@@ -70,6 +70,7 @@ PROVIDER_KINDS = frozenset(
     {
         "tp_item",
         "tp_filed",
+        "overseen",
         "question",
         "you_line",
         "wait",
