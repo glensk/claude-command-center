@@ -957,8 +957,8 @@ def test_the_quota_footer_names_the_policy(
     _ = three_seats
 
 
-# ---- tp#2574: headroom states its scope, the debate verdict and per-seat figures ----
-_DEBATE_LINE = "debate (default tier, no refresh; authoritative: debate-seat -r <repo>)"
+# ---- tp#2574: headroom states its scope, the debate-seat pointer and per-seat figures ----
+_DEBATE_POINTER = "debates: run `codex-in-claude debate-seat -r <repo>`"
 
 
 def _learned_reserve_60(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -971,32 +971,33 @@ def _hold(*pids: str, now: int) -> None:
         quota.record_block(pid, blocked_until=now + _HOUR, kind=quota.KIND_HOLD, reason="held")
 
 
-def test_headroom_prints_scope_banner_and_debate_line(
+def test_headroom_prints_scope_banner_and_debate_pointer(
     three_seats: SeatFixture,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """65 % of 5h used: offload is in the reserve zone, yet a debate is allowed (cap 75 %)."""
+    """65 % of 5h used: offload is in the reserve zone; headroom points to debate-seat and
+    computes no debate verdict of its own (owner decision R1=B)."""
     now = int(time.time())
     _learned_reserve_60(monkeypatch)
     _hold("codex:private", "codex:de", now=now)
     _live(three_seats.seats["default"], five=65.0, week=10.0, now=now)
+
+    def _never(**_kw: object) -> dict[str, object]:
+        raise AssertionError("headroom must not compute a debate verdict")
+
+    monkeypatch.setattr(cic, "debate_seat_verdict", _never)
     assert cic.cmd_headroom(argparse.Namespace(json=False)) == 1
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == "gate: optional offload only — debates use `codex-in-claude debate-seat`"
     assert any(line.startswith("offload: DENIED (reserve zone — ") for line in lines)
-    assert any(line.startswith(f"{_DEBATE_LINE}: ALLOWED on default") for line in lines)
-    assert "default: 5h 35% left, 7d 90% left — offload reserve · debate allowed" in lines
+    assert _DEBATE_POINTER in lines
+    assert not any(line.startswith("debate (") for line in lines)
+    assert "default: 5h 35% left, 7d 90% left — offload reserve" in lines
     assert cic.cmd_headroom(argparse.Namespace(json=True)) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["state"] == "reserve"
-    assert payload["debate"] == {
-        "state": "allowed",
-        "seat": "default",
-        "tier": "default",
-        "reason": payload["debate"]["reason"],
-        "refreshed": False,
-    }
+    assert "debate" not in payload
 
 
 def test_headroom_blocked_exits_8(
@@ -1012,30 +1013,6 @@ def test_headroom_blocked_exits_8(
     _ = three_seats
 
 
-def test_headroom_debate_verdict_error_is_soft(
-    three_seats: SeatFixture,
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A crashing debate verdict prints `unknown (<exc type>)` and never moves the exit code."""
-    now = int(time.time())
-    _learned_reserve_60(monkeypatch)
-    _hold("codex:private", "codex:de", now=now)
-    _live(three_seats.seats["default"], five=65.0, week=10.0, now=now)
-
-    def _boom(**_kw: object) -> dict[str, object]:
-        raise RuntimeError("debate policy exploded")
-
-    monkeypatch.setattr(cic, "debate_seat_verdict", _boom)
-    assert cic.cmd_headroom(argparse.Namespace(json=False)) == 1
-    out = capsys.readouterr().out
-    assert f"{_DEBATE_LINE}: unknown (RuntimeError)" in out
-    assert "offload: DENIED (reserve zone — " in out
-    assert cic.cmd_headroom(argparse.Namespace(json=True)) == 1
-    debate = json.loads(capsys.readouterr().out)["debate"]
-    assert debate["state"] == "unknown" and debate["reason"] == "RuntimeError"
-
-
 def test_headroom_seat_lines_show_percent_left(
     three_seats: SeatFixture,
     capsys: pytest.CaptureFixture[str],
@@ -1048,9 +1025,9 @@ def test_headroom_seat_lines_show_percent_left(
     _live(three_seats.seats["de"], five=65.0, week=77.0, now=now)
     cic.cmd_headroom(argparse.Namespace(json=False))
     lines = capsys.readouterr().out.splitlines()
-    assert "default: 5h 80% left, 7d 70% left — offload allowed · debate allowed" in lines
-    assert "de: 5h 35% left, 7d 23% left — offload reserve · debate capped" in lines
-    assert "private: unknown — no usage snapshot · debate unknown" in lines
+    assert "default: 5h 80% left, 7d 70% left — offload allowed" in lines
+    assert "de: 5h 35% left, 7d 23% left — offload reserve" in lines
+    assert "private: unknown — no usage snapshot" in lines
 
 
 def test_headroom_free_plan_seat_notes_debate_refused(
@@ -1058,7 +1035,7 @@ def test_headroom_free_plan_seat_notes_debate_refused(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A seat whose live meta says plan `free` says so on its seat and debate lines."""
+    """A seat whose live meta says plan `free` is marked `plan free` on its seat line."""
     del three_seats  # wires the three seats in; the rows come from it
     now = int(time.time())
     _hold("codex:de", "codex", now=now)
@@ -1075,7 +1052,5 @@ def test_headroom_free_plan_seat_notes_debate_refused(
     cic.cmd_headroom(argparse.Namespace(json=False))
     lines = capsys.readouterr().out.splitlines()
     seat = next(line for line in lines if line.startswith("private: "))
-    assert seat.endswith("plan free — debate refused recently")
-    debate = next(line for line in lines if line.startswith(_DEBATE_LINE))
-    assert "ALLOWED on private" in debate
-    assert debate.endswith("private plan free — debate refused recently")
+    assert seat.endswith(" · plan free")
+    assert _DEBATE_POINTER in lines

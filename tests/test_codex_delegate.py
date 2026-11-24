@@ -391,9 +391,8 @@ def test_headroom_cli_json_and_exit_codes(  # pylint: disable=too-many-arguments
     payload = json.loads(capsys.readouterr().out)
     assert payload["state"] == expected_state
     assert payload["offload_allowed"] is (expected_exit == 0)
-    # tp#2574: the informational debate verdict is additive; every older key stays.
-    assert payload["debate"]["tier"] == "default"
-    assert payload["debate"]["refreshed"] is False
+    # tp#2574 (owner decision R1=B): headroom carries no debate verdict; every older key stays.
+    assert "debate" not in payload
     assert {"state", "reason", "seat", "seats", "windows", "blocked", "needs_login"} <= set(payload)
 
 
