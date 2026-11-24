@@ -20,7 +20,8 @@ command (``/codex-implement-task-and-claude-review`` and ``/codex-debate``):
                     would otherwise call ``codex exec`` themselves.
 * ``order``       — show/set the ORDER every Codex consumer tries the ChatGPT logins in.
 * ``usage``       — print the current Codex rate-limit usage (5h + weekly windows).
-* ``headroom``    — decide whether enough quota remains for optional offload work.
+* ``headroom``    — decide whether enough quota remains for OPTIONAL offload work only
+                    (exit 0/1/3/8); debates are gated by ``debate-seat``.
 
 Model source: ``codex debug models`` (``--refresh``), else the offline cache
 ``~/.codex/models_cache.json`` (fast / wifi-friendly default). Only models with
@@ -3187,7 +3188,20 @@ def seat_headroom(row: quota.ProviderQuota, now: int) -> dict[str, Any]:
         # Additive (tp#1202): when a blocked seat can run again (None = unknown / not blocked).
         "until": block["until"] if block else None,
         "until_local": block["until_local"] if block else None,
+        # Additive (tp#2574): the plan type of the seat's newest windowless live reading
+        # (the quota row's ``live_meta``), e.g. ``free``; None when unknown.
+        "plan_type": _row_live_plan(row),
     }
+
+
+def _row_live_plan(row: quota.ProviderQuota) -> str | None:
+    """The ``plan_type`` of *row*'s ``live_meta`` (a dict or an object), else None."""
+    meta = getattr(row, "live_meta", None)
+    if not meta:
+        return None
+    plan = meta.get("plan_type") if isinstance(meta, dict) else getattr(meta, "plan_type", None)
+    text = str(plan or "").strip().lower()
+    return text or None
 
 
 def _headroom_rows(now: int) -> list[tuple[SeatCandidate, quota.ProviderQuota]]:
@@ -3575,17 +3589,109 @@ def _headroom_unknown(reason: str) -> dict[str, Any]:
         "seats": [],
         "needs_login": [],
         "blocked": [],
+        "debate": None,
     }
 
 
-def _headroom_other_seat_lines(decision: dict[str, Any]) -> list[str]:
-    """One line per seat the verdict is NOT about: candidates, blocked seats, dead logins."""
+# tp#2574: ``headroom`` answers the OFFLOAD question only; agents read its exit 1 as
+# "Codex has no quota" and skipped debates the debate gate would have allowed.
+_HEADROOM_SCOPE_BANNER = "gate: optional offload only — debates use `codex-in-claude debate-seat`"
+_HEADROOM_DEBATE_LABEL = "debate (default tier, no refresh; authoritative: debate-seat -r <repo>)"
+_FREE_PLAN_NOTE = "plan free — debate refused recently"
+
+
+def _headroom_debate(decision: dict[str, Any] | None) -> dict[str, Any]:
+    """The informational debate verdict ``headroom`` prints (tp#2574 D3). Fail-soft.
+
+    Default tier, no repo, no refresh (``headroom`` has already refreshed): never the
+    authoritative answer, which is ``debate-seat -r <repo>``. Any exception becomes
+    ``unknown (<exc type>)``. ``seats`` (label -> per-seat debate state) feeds the
+    per-seat lines only and is not part of the JSON key.
+    """
+    if decision is None:
+        return {
+            "state": "unknown",
+            "seat": "",
+            "tier": "default",
+            "reason": "not computed (headroom crashed)",
+            "refreshed": False,
+            "seats": {},
+        }
+    try:
+        verdict = debate_seat_verdict(refresh=False)
+    except Exception as exc:  # pylint: disable=broad-exception-caught  # informational only
+        return {
+            "state": "unknown",
+            "seat": "",
+            "tier": "default",
+            "reason": type(exc).__name__,
+            "refreshed": False,
+            "seats": {},
+        }
+    return {
+        "state": str(verdict.get("state") or "unknown"),
+        "seat": str(verdict.get("seat") or ""),
+        "tier": str(verdict.get("tier") or "default"),
+        "reason": str(verdict.get("reason") or ""),
+        "refreshed": False,
+        "seats": {
+            str(entry.get("seat")): str(entry.get("state"))
+            for entry in verdict.get("seats") or []
+            if entry.get("seat")
+        },
+    }
+
+
+def _headroom_debate_line(debate: dict[str, Any], free_seats: set[str]) -> str:
+    """The human debate line: ALLOWED on <seat>, DENIED (<state> — <reason>) or unknown."""
+    state = debate["state"]
+    if state == "allowed":
+        line = f"{_HEADROOM_DEBATE_LABEL}: ALLOWED on {debate['seat']} ({debate['reason']})"
+    elif state == "unknown":
+        line = f"{_HEADROOM_DEBATE_LABEL}: unknown ({debate['reason']})"
+    else:
+        line = f"{_HEADROOM_DEBATE_LABEL}: DENIED ({state} — {debate['reason']})"
+    if debate.get("seat") and debate["seat"] in free_seats:
+        line += f" · {debate['seat']} {_FREE_PLAN_NOTE}"
+    return line
+
+
+def _headroom_seat_line(seat: dict[str, Any], debate_states: dict[str, str]) -> str:
+    """One seat's quota line: percent left per FRESH window, offload and debate state.
+
+    A seat with no fresh window keeps the reason form (``unknown — …``).
+    """
+    label, state = str(seat["label"]), str(seat["state"])
+    mark = "⛔ " if state == "blocked" else ""
+    left = ", ".join(
+        f"{win['duration']} {float(win['remaining_percent']):.0f}% left"
+        for win in seat.get("windows") or []
+        if not win.get("stale")
+    )
+    if left:
+        line = f"{label}: {mark}{left} — offload {state}"
+        if state not in ("allowed", "reserve"):
+            line += f" ({seat['reason']})"
+    else:
+        line = f"{label}: {mark}{state} — {seat['reason']}"
+    if label in debate_states:
+        line += f" · debate {debate_states[label]}"
+    if seat.get("plan_type") == "free":
+        line += f" · {_FREE_PLAN_NOTE}"
+    return line
+
+
+def _headroom_other_seat_lines(
+    decision: dict[str, Any], debate_states: dict[str, str] | None = None
+) -> list[str]:
+    """One quota line per candidate seat (the chosen one included), then blocked seats
+    and dead logins (their texts unchanged)."""
     dead_labels = {str(seat.get("label")) for seat in decision.get("needs_login") or []}
-    lines: list[str] = []
-    for seat in decision.get("seats") or []:
-        if seat.get("label") != decision.get("seat") and seat.get("label") not in dead_labels:
-            mark = "⛔ " if seat.get("state") == "blocked" else ""
-            lines.append(f"{seat['label']}: {mark}{seat['state']} — {seat['reason']}")
+    lines = [
+        _headroom_seat_line(seat, debate_states or {})
+        for seat in decision.get("seats") or []
+        if seat.get("label") not in dead_labels
+    ]
     lines.extend(_blocked_line(block) for block in decision.get("blocked") or [])
     lines.extend(_needs_login_line(seat) for seat in decision.get("needs_login") or [])
     return lines
@@ -3595,22 +3701,35 @@ def cmd_headroom(args: argparse.Namespace) -> int:
     """Report whether optional Codex offloads can spend quota beyond the reserve.
 
     The verdict is the whole seat POOL's (plan D4): the ``seat:`` line names the seat it
-    is about, the window lines are that seat's, and one line per OTHER seat says why it
-    did not win — so "DENIED (unknown)" can no longer hide a fresh, idle paid seat.
+    is about, the window lines are that seat's, and one line per seat gives its percent
+    left per live window, its offload state and its debate state (tp#2574) — so
+    "DENIED (unknown)" can no longer hide a fresh, idle paid seat.
+
+    The first line states the gate's scope, and an informational debate verdict follows
+    the offload one (tp#2574): exit 1 ("reserve zone") is not "Codex has no quota". The
+    exit code is the OFFLOAD verdict only: 0 allowed, 1 reserve, 3 unknown, 8 no usable
+    seat (:data:`EX_QUOTA`).
 
     A crash while computing the verdict (e.g. a missing dependency, tp#394) is reported
     as ``unknown`` / exit 3 — the gate's documented fail-closed code — not as exit 1,
     which callers read as "reserve zone".
     """
+    crashed = False
     try:
         if not getattr(args, "no_refresh", False):
             refresh_seat_readings()  # tp#1202: judge on the runner's evidence
         decision = codex_headroom()
     except Exception as exc:  # pylint: disable=broad-exception-caught  # any crash = unknown
         decision = _headroom_unknown(f"unknown: {type(exc).__name__}: {exc}")
+        crashed = True
+    debate = _headroom_debate(None if crashed else decision)
+    debate_states = debate.pop("seats")
+    if not crashed:
+        decision["debate"] = debate
     if args.json:
         print(json.dumps(decision))
     else:
+        print(_HEADROOM_SCOPE_BANNER)
         if decision.get("seat"):
             email = next(
                 (
@@ -3637,11 +3756,17 @@ def cmd_headroom(args: argparse.Namespace) -> int:
             print(f"offload: DENIED (reserve zone — {decision['reason']})")
         else:
             print(f"offload: DENIED (unknown — {decision['reason']})")
-        for line in _headroom_other_seat_lines(decision):
+        free_seats = {
+            str(seat["label"])
+            for seat in decision.get("seats") or []
+            if seat.get("plan_type") == "free"
+        }
+        print(_headroom_debate_line(debate, free_seats))
+        for line in _headroom_other_seat_lines(decision, debate_states):
             print(line)
-    # "blocked" shares the reserve exit code: the documented contract is 0 = offload
-    # allowed, non-zero = keep the work on Claude, and 3 already means "no usable data".
-    return {"allowed": 0, "reserve": 1, "blocked": 1, "unknown": 3}[decision["state"]]
+    # Non-zero = keep the work on Claude. "blocked" (no usable seat at all) has its own
+    # code since tp#2574, so it can no longer be confused with the reserve zone (1).
+    return {"allowed": 0, "reserve": 1, "blocked": EX_QUOTA, "unknown": 3}[decision["state"]]
 
 
 # --------------------------------------------------------------------------- #
@@ -7047,11 +7172,11 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
 
     p_headroom = sub.add_parser(
         "headroom",
-        help="check quota reserve before optional Codex offloads",
+        help="check quota reserve before OPTIONAL Codex offloads (not debates: debate-seat)",
         description=(
-            "Check whether every live Codex quota window has enough remaining reserve "
-            "for optional offload work. Missing/stale data fails closed; debates remain "
-            "always allowed and should not use this gate."
+            "Gates OPTIONAL offload work only (exit 0 allowed, 1 reserve zone, 3 unknown, "
+            "8 no usable seat). Debates are gated by `debate-seat`; the debate line below "
+            "is informational. Missing/stale data fails closed."
         ),
     )
     p_headroom.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")

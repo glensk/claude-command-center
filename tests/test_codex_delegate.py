@@ -364,14 +364,16 @@ def test_headroom_reset_within_ten_minutes_counts_as_fresh(
 
 
 @pytest.mark.parametrize(
-    ("fixture_name", "expected_exit", "expected_state"),
+    ("fixture_name", "expected_exit", "expected_state", "kill_switch"),
     [
-        ("one_window.jsonl", 0, "allowed"),
-        ("reordered_windows.jsonl", 1, "reserve"),
-        ("stale.jsonl", 3, "unknown"),
+        ("one_window.jsonl", 0, "allowed", False),
+        ("reordered_windows.jsonl", 1, "reserve", False),
+        ("stale.jsonl", 3, "unknown", False),
+        # tp#2574: no usable seat at all is exit 8 (EX_QUOTA), no longer the reserve's 1.
+        ("one_window.jsonl", 8, "blocked", True),
     ],
 )
-def test_headroom_cli_json_and_exit_codes(
+def test_headroom_cli_json_and_exit_codes(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     cic: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -379,13 +381,20 @@ def test_headroom_cli_json_and_exit_codes(
     fixture_name: str,
     expected_exit: int,
     expected_state: str,
+    kill_switch: bool,
 ) -> None:
     _install_headroom_fixture(cic, tmp_path, monkeypatch, fixture_name)
     monkeypatch.setattr(cic.time, "time", lambda: float(_HEADROOM_NOW))
+    if kill_switch:
+        monkeypatch.setenv("CCC_NO_CODEX", "1")
     assert cic.main(["headroom", "--json"]) == expected_exit
     payload = json.loads(capsys.readouterr().out)
     assert payload["state"] == expected_state
     assert payload["offload_allowed"] is (expected_exit == 0)
+    # tp#2574: the informational debate verdict is additive; every older key stays.
+    assert payload["debate"]["tier"] == "default"
+    assert payload["debate"]["refreshed"] is False
+    assert {"state", "reason", "seat", "seats", "windows", "blocked", "needs_login"} <= set(payload)
 
 
 def test_usage_json_carries_window_duration(
@@ -408,7 +417,9 @@ def test_headroom_help_says_unknown_is_offload_only(cic: ModuleType) -> None:
     help_text = cic.build_parser()._subparsers._group_actions[0].choices["headroom"].format_help()
     normalized = " ".join(help_text.split())
     assert "Missing/stale data fails closed" in normalized
-    assert "debates remain always allowed" in normalized
+    assert "Gates OPTIONAL offload work only" in normalized
+    assert "8 no usable seat" in normalized
+    assert "Debates are gated by `debate-seat`" in normalized
 
 
 def test_learned_reserve_p95_and_exact_ten_sample_switchover(
@@ -1359,7 +1370,7 @@ def test_headroom_blocked_by_refusal_despite_window_headroom(
     assert decision["offload_allowed"] is False
     assert decision["refused_by"] == "workspace_owner_credits_depleted"
     args = argparse.Namespace(json=False)
-    assert cic.cmd_headroom(args) == 1
+    assert cic.cmd_headroom(args) == cic.EX_QUOTA  # blocked = 8 since tp#2574
 
 
 # ---- account pin (`codex-in-claude.py home`) -----------------------------------

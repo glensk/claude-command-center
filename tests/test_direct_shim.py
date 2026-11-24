@@ -198,7 +198,7 @@ def test_shim_reexecs_from_foreign_python(tmp_path: Path) -> None:
         check=False,
         timeout=120,
     )
-    assert proc.returncode in {0, 1, 3}, proc.stderr
+    assert proc.returncode in {0, 1, 3, 8}, proc.stderr  # 8 = blocked (tp#2574)
     assert "state" in json.loads(proc.stdout)
 
 
