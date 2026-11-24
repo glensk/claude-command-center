@@ -2203,6 +2203,96 @@ def test_fetch_codex_usage_healthy_payload_is_not_blocked(
     assert snap.five_hour is not None and snap.five_hour.used_percentage == 12.0
 
 
+_WHAM_FREE = {
+    "email": "alice.example@example.com",
+    "plan_type": "free",
+    "rate_limit": {
+        "allowed": True,
+        "limit_reached": False,
+        "primary_window": {
+            "used_percent": 4,
+            "limit_window_seconds": 2592000,
+            "reset_after_seconds": 2000000,
+            "reset_at": _LIVE_NOW + 2000000,
+        },
+        "secondary_window": None,
+    },
+    "rate_limit_reached_type": None,
+}
+
+
+def test_windowless_body_records_plan_meta(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A free plan's lone 30-day window is a measurement: recorded, not dropped (tp#2574 D5)."""
+    home = tmp_path / "codex"
+    _write_codex_auth(home)
+    # The stale ``team`` reading the seat had before the plan lapsed.
+    _seed_codex_live(home, captured_at=_LIVE_NOW - 23 * 86400)
+    assert usage.read_codex_live(home) is not None
+    _fake_wham(monkeypatch, _WHAM_FREE)
+
+    snap = usage.fetch_codex_usage(home, now=_LIVE_NOW)
+
+    assert snap is not None and snap.live is True
+    assert snap.five_hour is None and snap.seven_day is None
+    assert snap.plan_type == "free"
+    cache = json.loads(usage._codex_usage_path(home).read_text(encoding="utf-8"))
+    assert cache["plan_type"] == "free"
+    assert cache["captured_at"] == _LIVE_NOW
+    assert cache["other_windows"][0]["seconds"] == 2592000
+    assert cache["other_windows"][0]["used_percent"] == 4.0
+    assert cache["five_hour"] is None and cache["seven_day"] is None
+    # The old 5h/7d reading is gone; the windowed reader falls back (fail-open)…
+    usage._codex_cache.clear()
+    assert usage.read_codex_live(home) is None
+    # …and the meta reader is the one that sees the plan the seat is on now.
+    assert usage.read_codex_live_meta(home) == {
+        "plan_type": "free",
+        "captured_at": _LIVE_NOW,
+        "other_windows": [
+            {"seconds": 2592000, "used_percent": 4.0, "resets_at": _LIVE_NOW + 2000000}
+        ],
+    }
+
+
+def test_windowed_cache_has_no_meta_and_no_other_windows_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 5h/7d path is unchanged: no ``other_windows`` key, and no windowless meta."""
+    home = tmp_path / "codex"
+    _write_codex_auth(home)
+    _fake_wham(monkeypatch, _WHAM_BLOCKED)
+    assert usage.fetch_codex_usage(home, now=_LIVE_NOW) is not None
+    cache = json.loads(usage._codex_usage_path(home).read_text(encoding="utf-8"))
+    assert "other_windows" not in cache
+    assert usage.read_codex_live_meta(home) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"plan_type": "free"},
+        {"plan_type": "free", "rate_limit": {"primary_window": None, "secondary_window": None}},
+        {"plan_type": "free", "rate_limit": {"primary_window": {"used_percent": 3}}},
+        {"plan_type": "free", "rate_limit": "garbage"},
+        ["not", "a", "dict"],
+    ],
+)
+def test_garbage_body_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: object
+) -> None:
+    """A body with no parseable window at all never overwrites a good cache."""
+    home = tmp_path / "codex"
+    _write_codex_auth(home)
+    path = _seed_codex_live(home, captured_at=_LIVE_NOW - 3600)
+    before = path.read_bytes()
+    _fake_wham(monkeypatch, payload)  # type: ignore[arg-type]
+
+    assert usage.fetch_codex_usage(home, now=_LIVE_NOW) is None
+    assert path.read_bytes() == before
+    assert usage.read_codex_live_meta(home) is None
+
+
 def test_fetch_codex_usage_skips_an_api_key_login(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -3167,7 +3167,7 @@ def seat_headroom(row: quota.ProviderQuota, now: int) -> dict[str, Any]:
     elif row.malformed:
         state, reason = "unknown", "usage snapshot contains a malformed window"
     elif not fresh:
-        state, reason = "unknown", "no usage snapshot"
+        state, reason = "unknown", _windowless_reason(row) or "no usage snapshot"
     elif now - row.captured_at > _HEADROOM_STALE_AFTER_SECONDS:
         state, reason = "unknown", "newest usage snapshot is older than 6h"
     elif any(win["verdict"] == "reserve" for win in fresh):
@@ -3192,6 +3192,37 @@ def seat_headroom(row: quota.ProviderQuota, now: int) -> dict[str, Any]:
         # (the quota row's ``live_meta``), e.g. ``free``; None when unknown.
         "plan_type": _row_live_plan(row),
     }
+
+
+def _window_span(seconds: int) -> str:
+    """``2592000`` → ``30d``, ``7200`` → ``2h``: a window length the way a person says it."""
+    if seconds >= 86400 and seconds % 86400 == 0:
+        return f"{seconds // 86400}d"
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    return f"{seconds}s"
+
+
+def _windowless_reason(row: quota.ProviderQuota) -> str:
+    """Why a seat whose newest live reading had no 5h/7d window is ``unknown`` (tp#2574 D5).
+
+    ``plan free: only a 30d window (not measurable by the 5h/7d gate)``; ``""`` when the
+    row carries no windowless ``live_meta`` (the caller keeps ``no usage snapshot``).
+    """
+    meta = getattr(row, "live_meta", None)
+    if not isinstance(meta, dict):
+        return ""
+    spans = [
+        _window_span(int(win.get("seconds") or 0))
+        for win in meta.get("other_windows") or []
+        if isinstance(win, dict) and int(win.get("seconds") or 0) > 0
+    ]
+    if not spans:
+        return ""
+    plan = _row_live_plan(row)
+    head = f"plan {plan}: only" if plan else "only"
+    what = f"a {spans[0]} window" if len(spans) == 1 else f"{'/'.join(spans)} windows"
+    return f"{head} {what} (not measurable by the 5h/7d gate)"
 
 
 def _row_live_plan(row: quota.ProviderQuota) -> str | None:
@@ -5288,6 +5319,11 @@ def _pre_selection_refresh(candidates: list[SeatCandidate], budget: float) -> No
         try:
             row = _candidate_row(cand, now)
             if row.captured_at and now - row.captured_at <= stale_after and row.windows:
+                continue
+            # A fresh WINDOWLESS reading (tp#2574 D5, e.g. a free plan's lone 30d window)
+            # is a measurement too: re-fetching it on every call would only find it again.
+            meta_at = int((getattr(row, "live_meta", None) or {}).get("captured_at") or 0)
+            if meta_at and now - meta_at <= stale_after:
                 continue
             usage.fetch_codex_usage(cand.home, now, timeout=min(_REFRESH_FETCH_TIMEOUT_SEC, left))
         except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught

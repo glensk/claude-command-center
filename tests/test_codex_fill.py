@@ -1054,3 +1054,141 @@ def test_headroom_free_plan_seat_notes_debate_refused(
     seat = next(line for line in lines if line.startswith("private: "))
     assert seat.endswith(" · plan free")
     assert _DEBATE_POINTER in lines
+
+
+# ── a windowless live reading (tp#2574 D5): a free plan's lone 30-day window ─────────
+def _free_body(now: int) -> str:
+    """The live endpoint's body for a ``free`` plan: ONE 30-day window, no 5h/7d."""
+    return json.dumps(
+        {
+            "plan_type": "free",
+            "rate_limit": {
+                "allowed": True,
+                "primary_window": {
+                    "used_percent": 4,
+                    "limit_window_seconds": 2592000,
+                    "reset_at": now + 20 * _DAY,
+                },
+                "secondary_window": None,
+            },
+        }
+    )
+
+
+def _fetch_free(monkeypatch: pytest.MonkeyPatch, home: Path, now: int) -> None:
+    """Run the REAL fetch for *home* against a fake free-plan body (no network)."""
+    monkeypatch.setattr(usage, "_codex_auth_tokens", lambda _home: ("tok", "acct"))
+    monkeypatch.setattr(usage, "_get_wham_usage_body", lambda *_a, **_k: (_free_body(now), 200))
+    snap = usage.fetch_codex_usage(home, now)
+    assert snap is not None and snap.plan_type == "free" and snap.five_hour is None
+    usage._codex_cache.clear()  # noqa: SLF001
+
+
+def _order_view(now: int) -> tuple[list[str], dict[str, dict], dict[str, str]]:
+    """``(attempt order, codex_seat_order rows by label, provider state by label)``."""
+    snap = quota.snapshot(now=now)
+    rows = {row["label"]: row for row in snap["codex_seat_order"]}
+    states = {
+        row.get("account", ""): row["state"] for row in snap["providers"] if row["kind"] == "codex"
+    }
+    return [row["label"] for row in snap["codex_seat_order"]], rows, states
+
+
+def test_windowless_seat_rank_and_state_before_after(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A windowless write drops the stale 5h/7d reading; rank and state are unchanged.
+
+    Before: private carries a 23-day-old `plus` 5h/7d reading (all windows stale). After
+    the free-plan body is recorded, the seat is ranked on its rollout figures (none here):
+    still unmeasured, still `unknown` (fail-open, tryable), still the daily probe. Pinned
+    so a later change to the fallback is a visible decision.
+    """
+    now = int(time.time())
+    three_seats.reorder("private", "de", "default")
+    three_seats.measure("de", "default")
+    _live(three_seats.seats["private"], five=15.0, week=67.0, now=now, age=23 * _DAY)
+
+    order_before, rows_before, states_before = _order_view(now)
+    assert states_before["private"] == quota.UNKNOWN
+    assert rows_before["private"]["measured"] is False
+    # The one unmeasured seat is the daily probe, so it leads the attempt order.
+    assert rows_before["private"]["probe"] is True
+    assert order_before == ["private", "de", "default"]
+    assert rows_before["private"]["reason"] == "snapshot stale"
+    assert set(rows_before["private"]["windows"]) == {"five_hour", "seven_day"}
+
+    _fetch_free(monkeypatch, three_seats.seats["private"], now)
+
+    order_after, rows_after, states_after = _order_view(now)
+    assert states_after["private"] == quota.UNKNOWN
+    assert rows_after["private"]["measured"] is False
+    assert rows_after["private"]["probe"] is True
+    assert order_after == order_before
+    # The stale `plus` figures are no longer shown as the seat's reading.
+    assert not rows_after["private"]["windows"]
+    assert rows_after["private"]["reason"] == "no usage snapshot"
+    row = quota._codex_seat_quota(  # noqa: SLF001
+        "codex:private", "private", three_seats.seats["private"], now, {}
+    )
+    assert row.state == quota.UNKNOWN and row.windows == {}
+    assert quota.codex_seat_candidates([row], "", ["private"], policy="fill", now=now)
+
+
+def test_free_plan_meta_marks_seat_risky(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The windowless free-plan reading reaches the row: risky, noted, headroom reason."""
+    now = int(time.time())
+    home = three_seats.seats["private"]
+    _live(home, five=15.0, week=67.0, now=now, age=23 * _DAY)
+    stale = quota._codex_seat_quota("codex:private", "private", home, now, {})  # noqa: SLF001
+    assert stale.risky is False and "plan free" not in stale.note and stale.live_meta == {}
+
+    _fetch_free(monkeypatch, home, now)
+
+    row = quota._codex_seat_quota("codex:private", "private", home, now, {})  # noqa: SLF001
+    assert row.risky is True
+    assert "plan free — entitlement unproven" in row.note
+    assert row.live_meta["plan_type"] == "free"
+    assert row.live_meta["other_windows"][0]["seconds"] == 2592000
+    verdict = cic.seat_headroom(row, now)
+    assert verdict["state"] == "unknown"
+    assert verdict["reason"] == ("plan free: only a 30d window (not measurable by the 5h/7d gate)")
+    assert verdict["plan_type"] == "free"
+    # The serialized row round-trips the meta (``ccc quota -j`` / ``provider_state``).
+    assert quota._rehydrate(quota._provider_dict(row)).live_meta == row.live_meta  # noqa: SLF001
+
+
+def test_windowless_meta_skips_presel_refresh(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh windowless reading is a measurement: no re-fetch on every run/order call."""
+    now = int(time.time())
+    three_seats.reorder("private", "de", "default")
+    three_seats.measure("de", "default")
+    _live(three_seats.seats["de"], five=10.0, week=10.0, now=now)
+    _live(three_seats.seats["default"], five=10.0, week=10.0, now=now)
+    _fetch_free(monkeypatch, three_seats.seats["private"], now)
+
+    fetched: list[Path] = []
+
+    def _fetch(home: Path, now: int | None = None, *, timeout: float | None = None) -> None:
+        del now, timeout
+        fetched.append(home)
+
+    monkeypatch.setattr(usage, "fetch_codex_usage", _fetch)
+    cands = cic.codex_homes_in_order()
+    cic._pre_selection_refresh(cands, cic._REFRESH_BUDGET_SEC)  # noqa: SLF001
+    assert three_seats.seats["private"] not in fetched
+    assert fetched == []  # the other two carry fresh 5h/7d readings
+
+    # Once the meta is older than ``codex_usage_refresh_sec`` the seat IS re-measured.
+    stale_after = int(config.load_config().codex_usage_refresh_sec)
+    path = usage._codex_usage_path(three_seats.seats["private"])  # noqa: SLF001
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["captured_at"] = now - stale_after - 60
+    path.write_text(json.dumps(data), encoding="utf-8")
+    usage._codex_cache.clear()  # noqa: SLF001
+    cic._pre_selection_refresh(cands, cic._REFRESH_BUDGET_SEC)  # noqa: SLF001
+    assert fetched == [three_seats.seats["private"]]

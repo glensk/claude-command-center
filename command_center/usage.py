@@ -1257,6 +1257,55 @@ def _parse_wham_usage(data: object, now: int) -> Usage | None:
     )
 
 
+def _wham_other_windows(data: object) -> list[dict[str, Any]]:
+    """Every parseable endpoint window that is NOT the 5h/7d pair, as cache dicts.
+
+    A ``free`` plan reports ONE 30-day window (``limit_window_seconds: 2592000``) and no
+    5h/7d at all (tp#2574 D5). That body is a real measurement, so its window is kept as
+    ``{seconds, used_percent, resets_at}`` instead of being thrown away with the body.
+    """
+    if not isinstance(data, dict):
+        return []
+    rate = data.get("rate_limit")
+    if not isinstance(rate, dict):
+        return []
+    others: list[dict[str, Any]] = []
+    for field_name in ("primary_window", "secondary_window"):
+        parsed = _wham_window(rate.get(field_name))
+        if parsed is None or parsed[0] in (_WHAM_FIVE_HOUR_SEC, _WHAM_SEVEN_DAY_SEC):
+            continue
+        seconds, win = parsed
+        others.append(
+            {"seconds": seconds, "used_percent": win.used_percentage, "resets_at": win.resets_at}
+        )
+    return others
+
+
+def _parse_wham_windowless(data: object, now: int) -> tuple[Usage, list[dict[str, Any]]] | None:
+    """A 200 body with windows but no 5h/7d one: ``(windowless Usage, other windows)``.
+
+    ``None`` when the body carries no parseable window at all, so a garbage body still
+    writes nothing (the :func:`_parse_wham_usage` guard is unchanged).
+    """
+    others = _wham_other_windows(data)
+    if not others or not isinstance(data, dict):
+        return None
+    reason = _wham_blocked_reason(data)
+    email = data.get("email")
+    plan = data.get("plan_type")
+    snap = Usage(
+        captured_at=now,
+        five_hour=None,
+        seven_day=None,
+        blocked_reason=reason,
+        blocked_at=now if reason else 0,
+        live=True,
+        email=email if isinstance(email, str) else "",
+        plan_type=plan if isinstance(plan, str) else "",
+    )
+    return snap, others
+
+
 def _get_wham_usage_body(
     token: str, account_id: str, timeout: float = _WHAM_TIMEOUT_SEC
 ) -> tuple[str | None, int]:
@@ -1429,14 +1478,19 @@ def _fetch_codex_usage_appserver(home: Path, now: int | None = None) -> Usage | 
     return None
 
 
-def _write_codex_usage(home: Path, snap: Usage, now: int) -> None:
+def _write_codex_usage(
+    home: Path, snap: Usage, now: int, other_windows: list[dict[str, Any]] | None = None
+) -> None:
     """Persist *snap* as *home*'s live cache (atomic, under the same ``flock`` as the rest).
 
     ``captured_at`` dates the FIGURES, ``fetched_at`` the call — they coincide today but
     :func:`read_codex_usage` compares ``captured_at`` against the newest rollout event,
-    so the two stay separate fields. Never raises.
+    so the two stay separate fields. *other_windows* (a windowless body's non-5h/7d
+    windows, tp#2574 D5) is written only when non-empty, so a 5h/7d payload is unchanged.
+    The whole file is rewritten, so a windowless write drops an older 5h/7d reading: it
+    is no longer the seat's newest truth. Never raises.
     """
-    payload = {
+    payload: dict[str, Any] = {
         "captured_at": snap.captured_at,
         "fetched_at": now,
         "home": str(home.expanduser().resolve()),
@@ -1447,6 +1501,8 @@ def _write_codex_usage(home: Path, snap: Usage, now: int) -> None:
         "blocked_reason": snap.blocked_reason,
         "blocked_at": snap.blocked_at,
     }
+    if other_windows:
+        payload["other_windows"] = other_windows
     path = _codex_usage_path(home)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1467,6 +1523,9 @@ def fetch_codex_usage(
     :func:`_fetch_codex_usage_appserver` (which refreshes and writes the token back).
     Best-effort throughout: a missing/API-key ``auth.json``, an HTTP or timeout error, or
     a malformed body all return ``None`` with NO write, so callers keep the last cache.
+    A body whose windows are all neither 5h nor 7d (a ``free`` plan's lone 30-day window,
+    tp#2574 D5) is a measurement: it is cached with ``plan_type`` and ``other_windows``
+    and returned as a windowless :class:`Usage` (see :func:`read_codex_live_meta`).
 
     *timeout* caps the HTTP call for a caller fetching inside a budget (plan D6, debate
     O13). When one is given and is smaller than the app-server fallback's own need
@@ -1485,9 +1544,16 @@ def fetch_codex_usage(
     snap: Usage | None = None
     if body is not None:
         try:
-            snap = _parse_wham_usage(json.loads(body), now)
+            data = json.loads(body)
         except (json.JSONDecodeError, ValueError):
             return None
+        snap = _parse_wham_usage(data, now)
+        if snap is None:
+            windowless = _parse_wham_windowless(data, now)
+            if windowless is None:
+                return None
+            _write_codex_usage(home, windowless[0], now, other_windows=windowless[1])
+            return windowless[0]
     elif status in (401, 403) and (timeout is None or budget >= _APPSERVER_TIMEOUT_SEC):
         snap = _fetch_codex_usage_appserver(home, now)
     if snap is None:
@@ -1533,6 +1599,43 @@ def read_codex_live(home: Path) -> Usage | None:
             plan_type=str(data.get("plan_type") or ""),
         )
     except (TypeError, ValueError):
+        return None
+
+
+def read_codex_live_meta(home: Path) -> dict[str, Any] | None:
+    """*home*'s WINDOWLESS live record ``{plan_type, captured_at, other_windows}``, else ``None``.
+
+    Set only when the newest live fetch carried no 5h/7d window (tp#2574 D5, e.g. a
+    ``free`` plan's lone 30-day window). :func:`read_codex_live` returns ``None`` for such
+    a cache, so this is the only reader that sees the plan the seat is on now. A cache
+    with a 5h/7d window, or none at all, gives ``None``.
+    """
+    data = _read_codex_live_data(home)
+    if data is None:
+        return None
+    try:
+        if _window(data.get("five_hour")) is not None or _window(data.get("seven_day")) is not None:
+            return None
+        raw = data.get("other_windows")
+        others: list[dict[str, Any]] = []
+        for item in raw if isinstance(raw, list) else []:
+            if not isinstance(item, dict):
+                continue
+            others.append(
+                {
+                    "seconds": int(item["seconds"]),
+                    "used_percent": float(item["used_percent"]),
+                    "resets_at": int(item["resets_at"]),
+                }
+            )
+        if not others:
+            return None
+        return {
+            "plan_type": str(data.get("plan_type") or ""),
+            "captured_at": _int_field(data, "captured_at"),
+            "other_windows": others,
+        }
+    except (KeyError, TypeError, ValueError):
         return None
 
 

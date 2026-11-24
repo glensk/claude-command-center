@@ -520,6 +520,11 @@ class ProviderQuota:
     # ``ccc quota -P`` next — the last probe + the INSTALLED agent's interval
     # (:func:`command_center.quota_probe.next_probe_at`); 0 (dropped) with no agent.
     next_probe_at: int = 0
+    # Codex seats only (tp#2574 D5): the seat's newest live reading when it carried NO
+    # 5h/7d window — ``{"plan_type", "captured_at", "other_windows"}`` from
+    # :func:`usage.read_codex_live_meta` (e.g. a ``free`` plan's lone 30-day window).
+    # Advisory: feeds ``note``/``risky`` and the headroom reason, never ``state``.
+    live_meta: dict[str, Any] = field(default_factory=dict)
 
 
 def _cooldowns_path() -> Path:
@@ -1020,15 +1025,33 @@ def _subscription_card(label: str) -> str:
     return f"codex_{label}"
 
 
-def _codex_seat_note(label: str, live: usage.Usage | None, today: str = "") -> str:
+def _live_plan_type(live: usage.Usage | None, meta: dict[str, Any] | None = None) -> str:
+    """The seat's newest live ``plan_type`` (lower-case): *meta*'s when it is newer, else *live*'s.
+
+    *meta* is the windowless live record (:func:`usage.read_codex_live_meta`, tp#2574 D5).
+    Both come from the one cache file, so in practice only one of them is ever set.
+    """
+    live_plan = (live.plan_type or "").strip().lower() if live is not None else ""
+    meta_plan = str((meta or {}).get("plan_type") or "").strip().lower()
+    if meta_plan and (
+        live is None or int((meta or {}).get("captured_at") or 0) >= live.captured_at
+    ):
+        return meta_plan
+    return live_plan
+
+
+def _codex_seat_note(
+    label: str, live: usage.Usage | None, today: str = "", meta: dict[str, Any] | None = None
+) -> str:
     """Advisory prose for one seat — NEVER a state (see :attr:`ProviderQuota.note`).
 
     Two facts a technically-usable seat's windows cannot show: a ``free`` plan (the
     entitlement may not cover the request — that refusal arrives at run time as
-    ``usage_not_included``) and a ``subscription_ends`` date that has passed.
+    ``usage_not_included``) and a ``subscription_ends`` date that has passed. The plan is
+    the newest live one: a windowless reading (*meta*) beats an older windowed snapshot.
     """
     parts: list[str] = []
-    if live is not None and (live.plan_type or "").strip().lower() == "free":
+    if _live_plan_type(live, meta) == "free":
         parts.append("plan free — entitlement unproven")
     # ISO-8601 dates compare correctly as strings, and config.parse_subscription_ends
     # has already rejected anything that is not a real day — no date parsing needed.
@@ -1069,6 +1092,17 @@ def _seat_evidence(home: Path, now: int) -> tuple[usage.Usage | None, dict[str, 
     return snap, (_codex_windows(snap, now) if snap is not None else {}), live
 
 
+def _seat_live_meta(home: Path) -> dict[str, Any]:
+    """*home*'s windowless live record (:func:`usage.read_codex_live_meta`), ``{}`` if none.
+
+    Never raises: the record is advisory, a bad cache never fails the row.
+    """
+    try:
+        return usage.read_codex_live_meta(home) or {}
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return {}
+
+
 def _codex_seat_quota(
     pid: str, label: str, home: Path, now: int, cooldowns: dict[str, dict]
 ) -> ProviderQuota:
@@ -1097,6 +1131,7 @@ def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-loca
         email = ""  # identity is display metadata, never a reason to fail the row
     has_auth = (home.expanduser() / "auth.json").is_file()
     snap, windows, live = _seat_evidence(home, now) if has_auth else (None, {}, None)
+    meta = _seat_live_meta(home) if has_auth and live is None else {}
     entry = cooldowns.get(pid)
     renewed = entry is not None and login_renewed(entry, home)
     superseded = entry is not None and (
@@ -1105,6 +1140,7 @@ def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-loca
     if entry is not None and not superseded:
         quota = _cooldown_quota(pid, "codex", entry, windows)
         quota.account, quota.email = label, email
+        quota.live_meta = meta
         return quota
     # No auth.json = no login here (or a keyring store this reader cannot see). UNKNOWN,
     # never BLOCKED: "we could not measure it" must not delete a rung — the run-time
@@ -1119,8 +1155,9 @@ def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-loca
             account=label,
             email=email,
         )
-    note = _codex_seat_note(label, live)
-    free_plan = live is not None and (live.plan_type or "").strip().lower() == "free"
+    note = _codex_seat_note(label, live, meta=meta)
+    # A windowless free-plan reading (``meta``) marks the seat risky too (tp#2574 D5).
+    free_plan = _live_plan_type(live, meta) == "free"
     if snap is None:
         return ProviderQuota(
             id=pid,
@@ -1132,6 +1169,7 @@ def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-loca
             email=email,
             risky=free_plan,
             note=note,
+            live_meta=meta,
         )
     if superseded and entry is not None:
         # Say WHY the row disagrees with a cooldown entry a reader can still see in
@@ -1179,6 +1217,7 @@ def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-loca
                 email=snap.email or email,
                 note=note,
                 malformed=snap.malformed,
+                live_meta=meta,
             )
         age = _compact_duration(now - observed) if observed else "unknown-age"
         note = " · ".join(part for part in (note, f"refusal {age} old — remeasure") if part)
@@ -1198,6 +1237,7 @@ def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-loca
         email=snap.email or email,
         note=note,
         malformed=snap.malformed,
+        live_meta=meta,
     )
 
 
@@ -2514,6 +2554,7 @@ def _rehydrate(raw: dict[str, Any]) -> ProviderQuota:
         rota=dict(raw.get("rota") or {}),
         last_run=dict(raw.get("last_run") or {}),
         next_probe_at=int(raw.get("next_probe_at", 0) or 0),
+        live_meta=dict(raw.get("live_meta") or {}),
     )
 
 
