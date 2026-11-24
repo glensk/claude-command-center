@@ -311,16 +311,30 @@ rollout + cooldowns), and the pool takes the best verdict: any `allowed` allows 
 that seat, else `reserve`, else `unknown`, else `blocked`.
 
 ```
+gate: optional offload only — debates use `codex-in-claude debate-seat`
 seat: default (openai.account@example.org)
 5h: 0% used, resets in 4h 12m, reserve 35% (reserve_source bootstrap), ALLOWED
 7d: 0% used, resets in 5d 3h, reserve 35% (reserve_source bootstrap), ALLOWED
 offload: ALLOWED
-private: blocked — included usage limit reached (no credit overflow)
+debates: run `codex-in-claude debate-seat -r <repo>`
+default: 5h 100% left, 7d 100% left — offload allowed
+private: ⛔ blocked — included usage limit reached (no credit overflow)
 de: reserve — at least one live window is inside its reserve
 ```
 
-Exit codes are unchanged (0 allowed, 1 reserve/blocked, 3 unknown) and the JSON payload is
-additive: `seat` (the label the verdict is about) and `seats[]` (every seat's own verdict).
+`headroom` is **offload-only**: the first line says so and the fixed `debates:` line points
+at `debate-seat`, the one debate gate. It computes and prints NO debate verdict, so a
+"DENIED" here never means a debate may not start.
+
+| exit | meaning                                                              |
+| :--- | :------------------------------------------------------------------- |
+| 0    | offload allowed                                                      |
+| 1    | reserve zone: a live window is inside its reserve (not "no quota")   |
+| 3    | unknown (no fresh window, stale snapshot, or a crash; fails closed)  |
+| 8    | blocked: no usable seat at all (`EX_QUOTA`; was 1 before tp#2574)    |
+
+The JSON payload is additive: `seat` (the label the verdict is about) and `seats[]` (every
+seat's own verdict).
 It still fails **closed** per seat — no fresh window, a snapshot older than 6 h, or a
 window whose duration could not be read are all `unknown`. Routing itself keeps failing
 **open** on the same row; the asymmetry is the point.
@@ -402,7 +416,7 @@ A Codex **debate** costs 3–23 % of a five-hour window (median about 12–14 %,
 never STARTS on a seat whose five-hour reading is **at/above its cap**: 70 % for the
 `strict` tier (security-relevant, PRI=high, or a repository in `codex_debate_big_repos`),
 75 % for `default`. `headroom` is the wrong question for this (a learned reserve for
-optional offloads); `debate-seat` is the one evaluator, asked by tp (`tp drive`, `tp open`,
+optional offloads, exit codes 0/1/3/8, no debate verdict); `debate-seat` is the one evaluator, asked by tp (`tp drive`, `tp open`,
 the autopilot) and by `codex-review.py` before round 1. It starts no Codex process.
 
 ```
