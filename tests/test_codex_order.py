@@ -157,6 +157,35 @@ def test_passed_renewal_date_is_a_note_only(
     assert row.note == "renewal date 2020-01-31 passed"
 
 
+@pytest.mark.parametrize(
+    ("plan", "expected"),
+    [
+        ("plus", "renewal date 2020-01-31 stale (plan plus live) — update subscription_ends"),
+        (
+            "free",
+            "plan free — entitlement unproven · subscription lapsed (plan free; pinned 2020-01-31)",
+        ),
+    ],
+)
+def test_passed_renewal_date_reads_the_live_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plan: str, expected: str
+) -> None:
+    monkeypatch.setattr(config, "subscription_end_map", lambda: {"codex_private": "2020-01-31"})
+    snap = usage.Usage(
+        captured_at=_NOW,
+        five_hour=usage.Window(used_percentage=10.0, resets_at=_NOW + 3600),
+        seven_day=None,
+        plan_type=plan,
+    )
+    monkeypatch.setattr(usage, "read_codex_live", lambda _h: snap)
+    monkeypatch.setattr(usage, "read_codex_usage", lambda _n, _h: snap)
+    row = quota._codex_seat_quota(  # noqa: SLF001
+        "codex:private", "private", _seat(tmp_path), _NOW, {}
+    )
+    assert row.state == quota.AVAILABLE  # the note never moves the state
+    assert row.note == expected
+
+
 def test_an_entitlement_block_excludes_the_seat(tmp_path: Path) -> None:
     """A recorded entitlement refusal is a cooldown like any other: not a candidate."""
     entry = {

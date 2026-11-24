@@ -1040,6 +1040,9 @@ def _live_plan_type(live: usage.Usage | None, meta: dict[str, Any] | None = None
     return live_plan
 
 
+_PAID_PLANS = frozenset({"plus", "team", "pro", "business", "enterprise"})
+
+
 def _codex_seat_note(
     label: str, live: usage.Usage | None, today: str = "", meta: dict[str, Any] | None = None
 ) -> str:
@@ -1051,13 +1054,19 @@ def _codex_seat_note(
     the newest live one: a windowless reading (*meta*) beats an older windowed snapshot.
     """
     parts: list[str] = []
-    if _live_plan_type(live, meta) == "free":
+    plan = _live_plan_type(live, meta)
+    if plan == "free":
         parts.append("plan free — entitlement unproven")
     # ISO-8601 dates compare correctly as strings, and config.parse_subscription_ends
     # has already rejected anything that is not a real day — no date parsing needed.
     ends = config.subscription_end_map().get(_subscription_card(label), "")
     if ends and ends != "auto" and ends < (today or time.strftime("%Y-%m-%d")):
-        parts.append(f"renewal date {ends} passed")
+        if plan == "free":
+            parts.append(f"subscription lapsed (plan free; pinned {ends})")
+        elif plan in _PAID_PLANS:
+            parts.append(f"renewal date {ends} stale (plan {plan} live) — update subscription_ends")
+        else:
+            parts.append(f"renewal date {ends} passed")
     return " · ".join(parts)
 
 
