@@ -583,7 +583,7 @@ def test_record_run_validates_a_marker(
     code, err = _record(monkeypatch, _marker(**change))
     assert code == 2
     assert why in err
-    assert codex_ledger.read_runs(include_markers=True) == []
+    assert not codex_ledger.read_runs(include_markers=True)
     _ = three_seats
 
 
@@ -614,9 +614,7 @@ def test_repeated_mark_writes_one_marker(
     _ = three_seats
 
 
-def test_cost_row_carries_attempt_and_debate_id(
-    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_cost_row_carries_attempt_and_debate_id(three_seats: SeatFixture) -> None:
     """``run -D <id> -R <n>``: every attempt's cost row and ledger line carry the debate
     identity, and the cost row the ledger line's own ``attempt_id``."""
     parsed = cic.build_parser().parse_args(["run", "-D", "nonce-1", "-R", "2", "x"])
