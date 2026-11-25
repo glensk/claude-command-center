@@ -244,6 +244,9 @@ def test_snapshot_carries_the_ranked_seat_order_and_next_attempt(
         # additive since tp#2672 B2 — the live eligibility verdict, and why a seat is out
         "eligible",
         "skip_reason",
+        # additive since tp#2672 B4 — the live plan reading and every blocking cause
+        "plan_type",
+        "blockers",
     }
     assert [row["eligible"] for row in rows] == [False, True, True]
     assert rows[0]["skip_reason"] == rows[0]["reason"] and rows[0]["skip_reason"]

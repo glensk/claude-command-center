@@ -5983,12 +5983,22 @@ def _print_codex_seat_footer(snap: dict[str, Any], now: int, *, fit: int | None 
         tail = f"next attempt: none eligible{when}"
     policy = str(snap.get("codex_seat_policy") or "fill")
     print(_fit_cells(f"codex seats [{policy}]: {ladder or '(none configured)'}     {tail}", fit))
+    indent = " " * len(f"codex seats [{policy}]: ")
+    # tp#2672 B4: every seat the ranking leaves out says why, with its live plan reading
+    # (`codex-priv (free) skipped — plan free (live 3m)`), so a skipped seat is never a
+    # silent gap in the ladder.
+    for row in rows:
+        if row.get("eligible", True) or not row.get("skip_reason"):
+            continue
+        plan = str(row.get("plan_type") or "")
+        shown = f"{_seat_name(row)}{f' ({plan})' if plan else ''}"
+        print(_fit_cells(f"{indent}{shown} skipped — {row['skip_reason']}", fit))
     notes = [f"{_seat_name(row)}: {row['note']}" for row in rows if row.get("note")]
     order_tokens = " ".join(str(row.get("label", "")) for row in rows if row.get("label"))
     if notes:
         print(
             _fit_cells(
-                " " * len(f"codex seats [{policy}]: ")
+                indent
                 + "⚠ "
                 + " · ".join(notes)
                 + f" · change: codex-in-claude order {order_tokens}",

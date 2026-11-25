@@ -1834,6 +1834,8 @@ def _row_fields(row: quota.ProviderQuota) -> dict[str, Any]:
         "blocked_by": row.blocked_by,
         "block_scope": row.block_scope,
         "resets_at": row.resets_at,
+        "plan_type": str(row.plan.get("plan_type") or ""),
+        "blockers": list(row.blockers),
     }
 
 
@@ -1851,7 +1853,14 @@ def seat_block(row: Mapping[str, Any], now: int | None = None) -> dict[str, Any]
     ``refusal``, ``observed-rejection``, ``hold``, ``rota``), ``reason`` (compact),
     ``until`` (epoch seconds, ``None`` when unknown), ``until_local`` (Swiss local
     time) and ``text`` — ``usage limit reached · until 00:56``, what every surface prints.
+
+    A seat the LIVE eligibility verdict skips (tp#2672 B4: ``plan free``, a fresh
+    ``refused:model``) is not shortened to a card label: ``skipped`` is ``True``,
+    ``reason`` and ``text`` are the full cause (:func:`quota.skip_text`, so a refusal
+    ends in ``, retry in <dur>``) and ``plan_type`` the live plan reading.
     """
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
     now_ts = int(time.time()) if now is None else int(now)
     state = str(row.get("state") or "")
     scope = str(row.get("block_scope") or "")
@@ -1859,6 +1868,22 @@ def seat_block(row: Mapping[str, Any], now: int | None = None) -> dict[str, Any]
         return None
     blocker = str(row.get("blocked_by") or "")
     reason = str(row.get("reason") or "").strip()
+    blockers = row.get("blockers") or []
+    if quota.eligibility_skipped(blockers):
+        text = quota.skip_text(reason, blockers, now_ts) or "skipped"
+        until = int(row.get("resets_at") or 0)  # 0 while any cause is untimed (B1)
+        return {
+            "label": str(row.get("label") or ""),
+            "id": str(row.get("id") or ""),
+            "email": str(row.get("email") or ""),
+            "kind": blocker or scope or "blocked",
+            "reason": text,
+            "until": until if until > now_ts else None,
+            "until_local": until_local(until, now_ts) if until > now_ts else None,
+            "text": text,
+            "skipped": True,
+            "plan_type": str(row.get("plan_type") or ""),
+        }
     if blocker in ("rota", "hold", "observed-rejection"):
         # A fail-closed rota reason already starts with "rota:" — never "rota: rota:".
         if not reason.startswith(f"{blocker}:"):
@@ -1900,8 +1925,24 @@ def blocked_seats(now: int | None = None, *, model: str = "") -> list[dict[str, 
 
 
 def _blocked_line(block: Mapping[str, Any]) -> str:
-    """``default: ⛔ blocked — usage limit reached · until 00:56``."""
+    """``default: ⛔ blocked — usage limit reached · until 00:56``.
+
+    A seat the live eligibility verdict skips reads ``private: ⛔ codex-priv (free)
+    skipped — plan free (live 3m)`` (tp#2672 B4, :func:`_skip_phrase`).
+    """
+    if block.get("skipped"):
+        return f"{block['label']}: ⛔ {_skip_phrase(block, str(block['text']))}"
     return f"{block['label']}: ⛔ blocked — {block['text']}"
+
+
+def _skip_phrase(seat: Mapping[str, Any], text: str) -> str:
+    """``codex-priv (free) skipped — <text>`` — the seat under its ``ccc quota`` name, its
+    live plan reading, and why the live eligibility verdict skips it (tp#2672 B4)."""
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    name = quota.display_id(str(seat.get("id") or "")) or str(seat.get("label") or "?")
+    plan = str(seat.get("plan_type") or "")
+    return f"{name}{f' ({plan})' if plan else ''} skipped — {text}"
 
 
 def refresh_seat_readings(*, probe: bool = True) -> None:
@@ -1959,7 +2000,10 @@ def _seat_table_lines(now: int | None = None, *, model: str = "") -> list[str]:
         if dead_home is not None:
             detail = f"run `{codex_login.login_command(dead_home)}`"
         elif block is not None:
-            detail = block["text"]  # tp#1202: the runner's block, until when (Swiss time)
+            # tp#1202: the runner's block, until when (Swiss time); tp#2672 B4: a seat the
+            # live verdict skips says why, under its `ccc quota` name and live plan.
+            text = str(block["text"])
+            detail = _skip_phrase(row, text) if block.get("skipped") else text
         elif state != "available":
             blocker = str(row.get("blocked_by") or "")
             reason = str(row.get("reason") or "")
@@ -3487,6 +3531,9 @@ def seat_headroom(row: quota.ProviderQuota, now: int) -> dict[str, Any]:
         # Additive (tp#2574): the plan type of the seat's newest windowless live reading
         # (the quota row's ``live_meta``), e.g. ``free``; None when unknown.
         "plan_type": _row_live_plan(row),
+        # Additive (tp#2672 B4): the live eligibility verdict skips this seat (plan free,
+        # a fresh refused:model); ``reason`` then carries the full cause.
+        "skipped": bool(block and block.get("skipped")),
     }
 
 
@@ -3943,6 +3990,10 @@ def _headroom_seat_line(seat: dict[str, Any]) -> str:
         for win in seat.get("windows") or []
         if not win.get("stale")
     )
+    if seat.get("skipped"):
+        # tp#2672 B4: why the live verdict skips it, plan beside its `ccc quota` name.
+        line = f"{label}: {mark}{_skip_phrase(seat, str(seat['reason']))}"
+        return line + (f" · {left}" if left else "")
     if left:
         line = f"{label}: {mark}{left} — offload {state}"
         if state not in ("allowed", "reserve"):

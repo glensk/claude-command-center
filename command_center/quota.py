@@ -2764,7 +2764,7 @@ def snapshot(
         # How the ranking was produced — "fill" (weekly-reset-soonest first) or the
         # strict "order". Consumers render it so a surprising next attempt is legible.
         "codex_seat_policy": policy,
-        "codex_seat_order": _seat_order_rows(codex_rows, order, ranks, pin_label),
+        "codex_seat_order": _seat_order_rows(codex_rows, order, ranks, pin_label, now),
         # ADDITIVE (2026-09-21): where the run ledger lives, so a consumer that wants
         # the rows themselves (`ai logs`) reads the file ccc writes instead of guessing
         # its home. Each Codex provider row carries its own `last_run` summary. Two keys,
@@ -2829,9 +2829,44 @@ def _api_credit_rows(now: int, labels: list[str]) -> list[dict[str, Any]]:
     return rows
 
 
-def _skip_reason(row: ProviderQuota) -> str:
+ELIGIBILITY_BLOCKERS = ("funding", "model_refusal")
+
+
+def eligibility_skipped(blockers: Any) -> bool:
+    """True when *blockers* (a row's ``blockers`` list) holds a live-eligibility cause.
+
+    A seat skipped for funding (``plan free``) or a (seat, model) refusal is SKIPPED, not
+    merely blocked until a reset: every surface says ``skipped — <reason>`` (tp#2672 B4).
+    """
+    return any(
+        isinstance(b, dict) and b.get("kind") in ELIGIBILITY_BLOCKERS for b in blockers or []
+    )
+
+
+def skip_text(reason: str, blockers: Any, now: int) -> str:
+    """*reason* with ``, retry in <dur>`` after each live model-refusal cause (tp#2672 B4).
+
+    ``refused:model gpt-x 2h ago`` → ``refused:model gpt-x 2h ago, retry in 22h``: a
+    refusal clears at a known time (its TTL), so the reader is told when. Funding and
+    every other cause keep their text — they are untimed or already say their reset.
+    """
+    text = " ".join(str(reason or "").split())
+    for blocker in blockers or []:
+        if not isinstance(blocker, dict) or blocker.get("kind") != "model_refusal":
+            continue
+        cause, until = str(blocker.get("reason") or ""), int(blocker.get("resets_at") or 0)
+        if cause and until > now and cause in text:
+            wait = -(-(until - now) // 60) * 60  # up to the minute: never promise early
+            retry = f"{cause}, retry in {_compact_duration(wait)}"
+            text = text.replace(cause, retry, 1)
+    return text
+
+
+def _skip_reason(row: ProviderQuota, now: int) -> str:
     """Why the ranking left *row* out: its (composed) reason, else its state."""
-    return row.reason or (row.state if row.state != AVAILABLE else "not ranked")
+    if row.reason:
+        return skip_text(row.reason, row.blockers, now)
+    return row.state if row.state != AVAILABLE else "not ranked"
 
 
 def _seat_order_rows(
@@ -2839,6 +2874,7 @@ def _seat_order_rows(
     order: list[str],
     ranks: list[SeatRank],
     pin_label: str,
+    now: int = 0,
 ) -> list[dict[str, Any]]:
     """One ranked dict per seat label in *order* — the ``codex_seat_order`` payload.
 
@@ -2848,7 +2884,9 @@ def _seat_order_rows(
     ``configured_rank`` is the seat's place in the resolved order (1-based);
     ``attempt_rank`` its place among the ELIGIBLE candidates, ``None`` when skipped.
     Additive (tp#2672 B2): ``eligible`` (the seat has an ``attempt_rank``) and
-    ``skip_reason`` (why it has none: the row's composed ``reason``, else ``""``).
+    ``skip_reason`` (why it has none: the row's composed ``reason``, else ``""``; a
+    model refusal ends in ``, retry in <dur>``, :func:`skip_text`). Additive (tp#2672
+    B4): ``plan_type`` (the newest plan reading, ``""`` = none) and ``blockers``.
     """
     by_label = {row.account: row for row in rows}
     by_id = {id(rank.row): (index, rank) for index, rank in enumerate(ranks, 1)}
@@ -2863,7 +2901,11 @@ def _seat_order_rows(
                 "configured_rank": index,
                 "attempt_rank": attempt_rank,
                 "eligible": attempt_rank is not None,
-                "skip_reason": "" if attempt_rank is not None else _skip_reason(row),
+                "skip_reason": "" if attempt_rank is not None else _skip_reason(row, now),
+                # Additive (tp#2672 B4): the live plan reading and every blocking cause,
+                # so a renderer can say "skipped — plan free" with the plan beside it.
+                "plan_type": str(row.plan.get("plan_type") or ""),
+                "blockers": list(row.blockers),
                 "id": row.id,
                 "label": label,
                 "email": row.email,
