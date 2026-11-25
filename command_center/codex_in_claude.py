@@ -135,6 +135,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -977,6 +978,8 @@ _CODEX_SCAN_LIMIT = (
 # Optional offloads should leave room for interactive/debate work.  The function seam
 # below deliberately owns this bootstrap value so a learned reserve (3 x P95 debate-round
 # cost + 10% margin) can replace it without changing the decision/output machinery.
+# That formula is the OFFLOAD reserve only (headroom); a debate's own START reserve is
+# the measured cost of one whole debate (:func:`_debate_weekly_reserve`, tp#2672 B3).
 _HEADROOM_BOOTSTRAP_RESERVE_PERCENT = 35.0
 _HEADROOM_MIN_SAMPLES = 10
 _HEADROOM_MIN_RESERVE_PERCENT = 5.0
@@ -984,6 +987,15 @@ _HEADROOM_MAX_RESERVE_PERCENT = 60.0
 _HEADROOM_STALE_AFTER_SECONDS = 6 * 3600
 _HEADROOM_RESET_FRESH_SECONDS = 10 * 60
 _COST_HISTORY_SECONDS = 90 * 24 * 3600
+# ── the debate reserves (tp#2672 B3) ─────────────────────────────────────────────────
+# START: 1.10 x nearest-rank P95 of the 7d cost of one whole, closed debate; per seat
+# from this many of that seat's debates, else pooled over every seat with history.
+_DEBATE_PER_SEAT_MIN = 20
+_DEBATE_RESERVE_MARGIN = 1.10
+# Legacy cost rows (no ``debate_id``) are joined to exactly one ledger row of the same
+# seat within this many seconds, then grouped by the ledger ``session`` with this gap.
+_LEGACY_MATCH_SECONDS = 90
+_LEGACY_DEBATE_GAP_SECONDS = 3 * 3600
 
 # ── routing feedback budgets (plan D6, debate O13) ──────────────────────────────────
 # A measurement is best-effort garnish on a run, never a reason for it to be late: the
@@ -992,11 +1004,9 @@ _COST_HISTORY_SECONDS = 90 * 24 * 3600
 _REFRESH_BUDGET_SEC = 20.0
 _REFRESH_FETCH_TIMEOUT_SEC = 15.0
 # The write-mode floor when no learned round cost exists yet: a seat with less than a
-# tenth of a window left is not where a run that may EDIT files should start.
+# tenth of a window left is not where a run that may EDIT files should start. The same
+# value is the bootstrap of the one-round reserve (:func:`_round_reserve`).
 _WRITE_FLOOR_BOOTSTRAP_PCT = 10.0
-# The learned weekly reserve is 3 rounds + 10 % (see _headroom_reserve); dividing it back
-# out recovers the P95 cost of ONE round, which is what a single write run needs.
-_ROUNDS_PER_RESERVE = 3.3
 
 
 # --------------------------------------------------------------------------- #
@@ -2872,6 +2882,9 @@ def record_codex_run(
     ts: int | None = None,
     path: Path | None = None,
     home: Path | None = None,
+    attempt_id: str = "",
+    debate_id: str = "",
+    debate_round: int | None = None,
 ) -> bool:
     """Record one Codex run and prune history older than 90 days.
 
@@ -2882,6 +2895,10 @@ def record_codex_run(
     spanning several logins can still be read per seat (the learned headroom reserve
     aggregates over all of them today, which is only sound while the rows say which
     seat each delta came from).
+
+    *attempt_id* is the ledger line's own (:class:`RunAttempt`); *debate_id* and
+    *debate_round* (``run -D``/``-R``) say which debate round the row measured, so the
+    debate reserve can sum a whole debate (tp#2672 B3).
     """
     now = int(time.time()) if ts is None else ts
     target = path or codex_cost_history_path()
@@ -2896,6 +2913,12 @@ def record_codex_run(
     }
     if home is not None:
         row["seat"] = _seat_candidate_for(home).label
+    if attempt_id:
+        row["attempt_id"] = attempt_id
+    if debate_id:
+        row["debate_id"] = debate_id
+        if debate_round is not None:
+            row["debate_round"] = int(debate_round)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("w", encoding="utf-8") as lock:
@@ -2944,26 +2967,16 @@ def _reading_predates_a_reset(snapshot: dict[str, Any], ts: float) -> bool:
     return False
 
 
-def _debate_cost_deltas(window_minutes: int, *, now: int | None = None) -> list[float]:
-    """Valid debate-run usage deltas for one duration from the retained history.
+def _debate_history_rows(now_ts: int) -> list[tuple[dict[str, Any], float]]:
+    """Every retained ``purpose == "debate"`` cost row of the last 90 days, with its ts.
 
-    A row counts only when it was actually MEASURED (tp#227):
-
-    * ``before == after`` means no new reading was taken between them — an ephemeral
-      run leaves no rollout, so a rollout-only snapshot repeats itself and records a
-      fake 0. A genuine zero from two live fetches still differs in ``_meta``.
-    * a ``before`` reading ANY of whose windows has ``resets_at`` at or before the
-      row's own ``ts`` predates that reset, so the whole reading is old — its other
-      windows included (a 38 h-old 7d 5 % against a fresh 52 % once read as a 47 %
-      debate, though only the 5h window gave the age away).
+    Raises :class:`OSError` when the history cannot be read (a missing file is empty).
     """
-    now_ts = int(time.time()) if now is None else now
     try:
         lines = codex_cost_history_path().read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
+    except FileNotFoundError:
         return []
-    key = str(window_minutes)
-    deltas: list[float] = []
+    out: list[tuple[dict[str, Any], float]] = []
     for line in lines:
         try:
             row = json.loads(line)
@@ -2977,31 +2990,241 @@ def _debate_cost_deltas(window_minutes: int, *, now: int | None = None) -> list[
             or row_ts < now_ts - _COST_HISTORY_SECONDS
         ):
             continue
-        before = row.get("before")
-        after = row.get("after")
-        if not isinstance(before, dict) or not isinstance(after, dict) or before == after:
+        out.append((row, row_ts))
+    return out
+
+
+def _row_window_delta(row: dict[str, Any], row_ts: float, key: str) -> float | None:
+    """One cost row's MEASURED usage delta for window *key* (``"10080"``), else None.
+
+    A row counts only when it was actually MEASURED (tp#227):
+
+    * ``before == after`` means no new reading was taken between them — an ephemeral
+      run leaves no rollout, so a rollout-only snapshot repeats itself and records a
+      fake 0. A genuine zero from two live fetches still differs in ``_meta``.
+    * a ``before`` reading ANY of whose windows has ``resets_at`` at or before the
+      row's own ``ts`` predates that reset, so the whole reading is old — its other
+      windows included (a 38 h-old 7d 5 % against a fresh 52 % once read as a 47 %
+      debate, though only the 5h window gave the age away).
+    """
+    before = row.get("before")
+    after = row.get("after")
+    if (
+        not isinstance(before, dict)
+        or not isinstance(after, dict)
+        or before == after
+        or _reading_predates_a_reset(before, row_ts)
+    ):
+        return None
+    old = _window_reading(before.get(key))
+    new = _window_reading(after.get(key))
+    # A changed reset boundary means the run crossed a reset, even if the new
+    # window happened to climb back above the old used percentage.
+    if old is None or new is None or new[1] != old[1] or new[0] < old[0]:
+        return None
+    return new[0] - old[0]
+
+
+def _window_reading(window: object) -> tuple[float, int] | None:
+    """``(used_percent, resets_at)`` of one snapshot window, None when malformed."""
+    if not isinstance(window, dict):
+        return None
+    try:
+        pct = float(window["used_percent"])
+        resets = int(window["resets_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (pct, resets) if math.isfinite(pct) else None
+
+
+def _debate_cost_deltas(
+    window_minutes: int, *, now: int | None = None, seat: str | None = None
+) -> list[float]:
+    """Valid debate-run usage deltas for one duration from the retained history.
+
+    One per measured cost row (:func:`_row_window_delta`), i.e. per ATTEMPT; *seat*
+    keeps only the rows that seat billed. An unreadable history is no samples.
+    """
+    now_ts = int(time.time()) if now is None else now
+    try:
+        rows = _debate_history_rows(now_ts)
+    except OSError:
+        return []
+    key = str(window_minutes)
+    deltas: list[float] = []
+    for row, row_ts in rows:
+        if seat is not None and row.get("seat") != seat:
             continue
-        if _reading_predates_a_reset(before, row_ts):
-            continue
-        before_window = before.get(key)
-        after_window = after.get(key)
-        if not isinstance(before_window, dict) or not isinstance(after_window, dict):
-            continue
-        try:
-            before_pct = float(before_window["used_percent"])
-            after_pct = float(after_window["used_percent"])
-            before_reset = int(before_window["resets_at"])
-            after_reset = int(after_window["resets_at"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if not all(math.isfinite(value) for value in (before_pct, after_pct)):
-            continue
-        # A changed reset boundary means the run crossed a reset, even if the new
-        # window happened to climb back above the old used percentage.
-        if after_reset != before_reset or after_pct < before_pct:
-            continue
-        deltas.append(after_pct - before_pct)
+        delta = _row_window_delta(row, row_ts, key)
+        if delta is not None:
+            deltas.append(delta)
     return deltas
+
+
+@dataclass
+class DebateHistory:
+    """The measured debate costs one verdict judges by (tp#2672 B3), read once.
+
+    ``debates``: start seat → the 7d cost of each complete, closed debate it opened.
+    ``rounds``: billed seat → the 7d delta of each measured debate attempt.
+    """
+
+    debates: dict[str, list[float]] = field(default_factory=dict)
+    rounds: dict[str, list[float]] = field(default_factory=dict)
+
+    def debate_costs(self, seat: str | None = None) -> list[float]:
+        """*seat*'s debate sums, or every seat's (pooled) for None."""
+        if seat is not None:
+            return list(self.debates.get(seat, []))
+        return [cost for costs in self.debates.values() for cost in costs]
+
+    def round_costs(self, seat: str | None = None) -> list[float]:
+        """*seat*'s round deltas, or every seat's (pooled) for None."""
+        if seat is not None:
+            return list(self.rounds.get(seat, []))
+        return [cost for costs in self.rounds.values() for cost in costs]
+
+
+def _closed_debate_sums(
+    measured: list[tuple[dict[str, Any], float | None]],
+    markers: dict[str, dict[str, Any]],
+) -> dict[str, list[float]]:
+    """start seat → the cost of each CLOSED debate with a ``debate_id`` (tp#2672 B3).
+
+    A debate counts only when its close marker exists, its ``round_numbers`` are
+    contiguous from the first to the last entry, and every listed round has at least
+    one measured attempt; its cost is the sum of the listed rounds' measured attempts on
+    every seat it touched (a failover round included), attributed to ``start_seat``.
+    """
+    rounds_of: dict[str, dict[int, list[float | None]]] = {}
+    for row, delta in measured:
+        debate_id = str(row.get("debate_id") or "")
+        round_no = row.get("debate_round")
+        if not debate_id or isinstance(round_no, bool) or not isinstance(round_no, int):
+            continue
+        rounds_of.setdefault(debate_id, {}).setdefault(round_no, []).append(delta)
+    sums: dict[str, list[float]] = {}
+    for debate_id, marker in markers.items():
+        listed = marker.get("round_numbers")
+        start_seat = str(marker.get("start_seat") or marker.get("seat") or "")
+        if not isinstance(listed, list) or not listed or not start_seat:
+            continue
+        numbers = sorted({n for n in listed if isinstance(n, int) and not isinstance(n, bool)})
+        if not numbers or numbers != list(range(numbers[0], numbers[-1] + 1)):
+            continue  # a gap: a round ran unrecorded, the sum would understate
+        rounds = rounds_of.get(debate_id, {})
+        valid = [[d for d in rounds.get(n, []) if d is not None] for n in numbers]
+        if any(not deltas for deltas in valid):
+            continue  # a round without a measured delta
+        sums.setdefault(start_seat, []).append(sum(sum(deltas) for deltas in valid))
+    return sums
+
+
+def _legacy_debate_sums(
+    measured: list[tuple[dict[str, Any], float | None]],
+    ledger_rows: list[dict[str, Any]],
+) -> dict[str, list[float]]:
+    """start seat → the cost of each LEGACY debate (cost rows without ``debate_id``).
+
+    Each cost row is joined to exactly ONE ledger debate attempt of the same seat within
+    :data:`_LEGACY_MATCH_SECONDS` — two candidates, or one ledger row claimed by two
+    cost rows, drop the row — then grouped by the ledger ``session``, a new debate after
+    a :data:`_LEGACY_DEBATE_GAP_SECONDS` gap. A group counts when at least one of its
+    rows was measured; its cost goes to the seat of its first row.
+    """
+    attempts = [
+        (
+            float(codex_ledger.row_epoch(row)),
+            str(row.get("seat") or ""),
+            str(row.get("session") or ""),
+        )
+        for row in ledger_rows
+        if codex_ledger.provider_of(row) == "codex"
+        and row.get("purpose") == "debate"
+        and not row.get("debate_id")
+        and codex_ledger.row_epoch(row)
+    ]
+    matches = _legacy_matches(measured, attempts)
+    claimed = Counter(matches.values())
+    joined: dict[str, list[tuple[float, str, float | None]]] = {}
+    for index, attempt in matches.items():
+        epoch, seat, session = attempts[attempt]
+        if claimed[attempt] != 1 or not session:
+            continue
+        joined.setdefault(session, []).append((epoch, seat, measured[index][1]))
+    sums: dict[str, list[float]] = {}
+    for entries in joined.values():
+        entries.sort(key=lambda entry: entry[0])
+        groups: list[list[tuple[float, str, float | None]]] = []
+        for entry in entries:
+            if groups and entry[0] - groups[-1][-1][0] <= _LEGACY_DEBATE_GAP_SECONDS:
+                groups[-1].append(entry)
+            else:
+                groups.append([entry])
+        for group in groups:
+            deltas = [delta for _epoch, _seat, delta in group if delta is not None]
+            if deltas:
+                sums.setdefault(group[0][1], []).append(sum(deltas))
+    return sums
+
+
+def _legacy_matches(
+    measured: list[tuple[dict[str, Any], float | None]],
+    attempts: list[tuple[float, str, str]],
+) -> dict[int, int]:
+    """Cost row index → the index of the ONE ledger attempt ``(epoch, seat, session)``
+    of the same seat within :data:`_LEGACY_MATCH_SECONDS`; rows with a ``debate_id``,
+    no seat or two candidates are left out."""
+    matches: dict[int, int] = {}
+    for index, (row, _delta) in enumerate(measured):
+        row_ts = _history_row_timestamp(row)
+        seat = str(row.get("seat") or "")
+        if row.get("debate_id") or row_ts is None or not seat:
+            continue
+        found = [
+            i
+            for i, (epoch, attempt_seat, _session) in enumerate(attempts)
+            if attempt_seat == seat and abs(epoch - row_ts) <= _LEGACY_MATCH_SECONDS
+        ]
+        if len(found) == 1:
+            matches[index] = found[0]
+    return matches
+
+
+def load_debate_history(now: int | None = None) -> DebateHistory:
+    """The debate costs from the cost history and the run ledger (tp#2672 B3).
+
+    Raises :class:`OSError` when the cost history cannot be read; callers fall back to
+    an empty history (the bootstrap reserves).
+    """
+    now_ts = int(time.time()) if now is None else now
+    key = str(_SEVEN_DAY_MINUTES)
+    measured = [(row, _row_window_delta(row, ts, key)) for row, ts in _debate_history_rows(now_ts)]
+    history = DebateHistory()
+    for row, delta in measured:
+        if delta is not None:
+            history.rounds.setdefault(str(row.get("seat") or ""), []).append(delta)
+    ledger_rows = codex_ledger.read_runs(include_markers=True)
+    markers: dict[str, dict[str, Any]] = {}
+    for row in ledger_rows:
+        if codex_ledger.is_marker(row) and row.get("outcome") == codex_ledger.OUTCOME_DEBATE_CLOSED:
+            markers.setdefault(str(row.get("debate_id") or ""), row)
+    markers.pop("", None)
+    for sums in (
+        _closed_debate_sums(measured, markers),
+        _legacy_debate_sums(measured, [r for r in ledger_rows if not codex_ledger.is_marker(r)]),
+    ):
+        for seat, costs in sums.items():
+            history.debates.setdefault(seat, []).extend(costs)
+    return history
+
+
+def _safe_debate_history() -> DebateHistory:
+    """:func:`load_debate_history`, or an empty history when it cannot be read."""
+    try:
+        return load_debate_history()
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return DebateHistory()
 
 
 def _codex_usage_windows(
@@ -3864,17 +4087,58 @@ def _debate_known_week(row: quota.ProviderQuota, now: int) -> quota.WindowState 
     return win
 
 
-def _debate_weekly_reserve() -> tuple[float, str]:
-    """The weekly reserve a debate must leave: the learned cost of one full debate.
+def _debate_weekly_reserve(
+    seat: str | None = None, *, history: DebateHistory | None = None
+) -> tuple[float, str]:
+    """The weekly reserve a debate must leave to START on *seat*: one whole debate.
 
-    Only the VALUE of :func:`_headroom_reserve` for the seven-day window (never the
-    offload gate nor its "reset is near" exception). A history that cannot be read
-    falls back to the bootstrap reserve, exactly as too few samples would.
+    1.10 x the nearest-rank P95 of the 7d cost of one complete, closed debate
+    (:class:`DebateHistory`, tp#2672 B3) — *seat*'s own debates once it has
+    :data:`_DEBATE_PER_SEAT_MIN` of them (source ``learned-seat``), else pooled over
+    every seat with history (``learned``); the bootstrap 35 % below
+    :data:`_HEADROOM_MIN_SAMPLES` pooled debates; bounded to 5..60 %. A history that
+    cannot be read falls back to the bootstrap reserve, exactly as too few debates would.
     """
     try:
-        return _headroom_reserve(_SEVEN_DAY_MINUTES)
+        hist = _safe_debate_history() if history is None else history
+        own = hist.debate_costs(seat) if seat else []
+        pooled = hist.debate_costs()
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return (_HEADROOM_BOOTSTRAP_RESERVE_PERCENT, "bootstrap")
+    if len(own) >= _DEBATE_PER_SEAT_MIN:
+        costs, source = own, "learned-seat"
+    elif len(pooled) >= _HEADROOM_MIN_SAMPLES:
+        costs, source = pooled, "learned"
+    else:
+        return (_HEADROOM_BOOTSTRAP_RESERVE_PERCENT, "bootstrap")
+    learned = _DEBATE_RESERVE_MARGIN * _nearest_rank_p95(costs)
+    return (
+        min(_HEADROOM_MAX_RESERVE_PERCENT, max(_HEADROOM_MIN_RESERVE_PERCENT, learned)),
+        source,
+    )
+
+
+def _round_reserve(
+    seat: str | None = None, *, history: DebateHistory | None = None
+) -> tuple[float, str]:
+    """The 7d cost of ONE more debate round on *seat* (tp#2672 B3).
+
+    1.10 x the nearest-rank P95 of one measured debate attempt's 7d delta — *seat*'s
+    own once it has :data:`_DEBATE_PER_SEAT_MIN` of them (``learned-seat``), else pooled
+    (``learned``) from :data:`_HEADROOM_MIN_SAMPLES` on; below that the bootstrap
+    :data:`_WRITE_FLOOR_BOOTSTRAP_PCT`. The mid-debate continue gate and the write floor.
+    """
+    try:
+        hist = _safe_debate_history() if history is None else history
+        own = hist.round_costs(seat) if seat else []
+        pooled = hist.round_costs()
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return (_WRITE_FLOOR_BOOTSTRAP_PCT, "bootstrap")
+    if len(own) >= _DEBATE_PER_SEAT_MIN:
+        return (_DEBATE_RESERVE_MARGIN * _nearest_rank_p95(own), "learned-seat")
+    if len(pooled) >= _HEADROOM_MIN_SAMPLES:
+        return (_DEBATE_RESERVE_MARGIN * _nearest_rank_p95(pooled), "learned")
+    return (_WRITE_FLOOR_BOOTSTRAP_PCT, "bootstrap")
 
 
 def _debate_seat_entry(  # pylint: disable=too-many-arguments,too-many-locals
@@ -4063,8 +4327,8 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
       the five-hour one) is already inside the weekly reserve, which makes it ``capped``.
       Missing or stale weekly data never denies. A blocked seat is excluded.
     * **cap**: ``used < cap`` allows, and so must the week: weekly remaining >= the
-      learned reserve :func:`_headroom_reserve` (``10080``), computed once per verdict
-      (the value only, never the offload gate nor its "reset is near" exception).
+      seat's debate reserve :func:`_debate_weekly_reserve` (the measured cost of one
+      whole debate; the history is read once per verdict).
     * **winner** (tp#2494): the first TRYABLE seat in routing order — ``allowed`` or
       ``unknown`` (:data:`_DEBATE_TRYABLE_STATES`) with a home, the inherited
       ``$CODEX_HOME`` included. An unmeasured winner is a top-level ``allowed`` with
@@ -4115,19 +4379,21 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
         # own pre-selection refresh; without it the rollout readings are the evidence.
         _debate_refresh(candidates, stale_after, _DEBATE_REFRESH_BUDGET_SEC)
         candidates = _select()
-    reserve, reserve_source = _debate_weekly_reserve()
-    seats = [
-        _debate_seat_entry(
-            cand,
-            _candidate_row(cand, now_ts),
-            policy.cap_for(cand.label, tier),
-            now_ts,
-            stale_after,
-            weekly_reserve=reserve,
-            weekly_reserve_source=reserve_source,
+    history = _safe_debate_history()
+    seats = []
+    for cand in candidates:
+        reserve, reserve_source = _debate_weekly_reserve(cand.label, history=history)
+        seats.append(
+            _debate_seat_entry(
+                cand,
+                _candidate_row(cand, now_ts),
+                policy.cap_for(cand.label, tier),
+                now_ts,
+                stale_after,
+                weekly_reserve=reserve,
+                weekly_reserve_source=reserve_source,
+            )
         )
-        for cand in candidates
-    ]
     if not inherited:
         # Allowed seats the ranking dropped (held / blocked / rota): listed, never chosen.
         listed = {cand.label for cand in candidates}
@@ -4136,6 +4402,7 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
                 continue
             ghost = SeatCandidate(label=label, home=home, email="", pid=_seat_pid(label))
             cap = policy.cap_for(label, tier)
+            reserve, reserve_source = _debate_weekly_reserve(label, history=history)
             entry = _debate_seat_entry(
                 ghost,
                 _candidate_row(ghost, now_ts),
@@ -4240,8 +4507,8 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
       ``$CODEX_HOME``, filtered by ``codex_debate_seats``, minus *exclude*; ``pin="human"``
       → exactly the inherited ``$CODEX_HOME``, which must be *current*.
     * **current**: refreshed first; not blocked, not excluded, still routed and
-      allowlisted, and — when its weekly reading is known — with at least one round of
-      the weekly reserve left (``reserve / _ROUNDS_PER_RESERVE``) → ``continue`` when it
+      allowlisted, and — when its weekly reading is known — with at least one more round
+      left (:func:`_round_reserve`, the seat's P95 round cost) → ``continue`` when it
       is fresh and below the pause point OR unmeasured (tp#2494: missing five-hour
       evidence stays a per-seat ``unknown`` but the pin is kept, ``used_percent`` null,
       for ``-p tool`` and ``-p human`` alike, as ``codex-review.py`` keeps it).
@@ -4330,9 +4597,10 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
     rows: dict[str, quota.ProviderQuota] = {}
     untimed: set[str] = set()  # ineligible for a policy reason: never a retry time
 
-    # The weekly reserve, once per verdict: a NEW seat (failover) must fit a whole
-    # debate; the current seat continues while one more round still fits (tp#2495).
-    reserve, reserve_source = _debate_weekly_reserve()
+    # The history, once per verdict: a NEW seat (failover) must fit a whole debate;
+    # the current seat continues while one more round still fits (tp#2495, tp#2672 B3).
+    history = _safe_debate_history()
+    round_reserve, round_source = _round_reserve(current, history=history)
     cur_cand = routed.get(current) or _ghost(current)
     rows[current] = _candidate_row(cur_cand, now_ts)
     cur = _debate_seat_entry(
@@ -4341,8 +4609,8 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
         pause,
         now_ts,
         stale_after,
-        weekly_reserve=reserve / _ROUNDS_PER_RESERVE,
-        weekly_reserve_source=reserve_source,
+        weekly_reserve=round_reserve,
+        weekly_reserve_source=round_source,
     )
     cur["reason"] = cur["reason"].replace(" cap ", " pause point ")
     if current not in allowed:
@@ -4367,6 +4635,7 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
         if cand.label == current:
             continue
         rows[cand.label] = _candidate_row(cand, now_ts)
+        reserve, reserve_source = _debate_weekly_reserve(cand.label, history=history)
         entry = _debate_seat_entry(
             cand,
             rows[cand.label],
@@ -4385,6 +4654,7 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
                 continue
             ghost = _ghost(label)
             rows[label] = _candidate_row(ghost, now_ts)
+            reserve, reserve_source = _debate_weekly_reserve(label, history=history)
             entry = _debate_seat_entry(
                 ghost,
                 rows[label],
@@ -5147,6 +5417,8 @@ def _attempt_codex(  # pylint: disable=too-many-locals
     started: float | None = None,
     exec_done: list[float] | None = None,
     runlog: codex_runlog.RunLog | None = None,
+    attempt_id: str = "",
+    debate: tuple[str, int | None] = ("", None),
 ) -> tuple[subprocess.CompletedProcess[str], str, list[str] | None]:
     """ONE supervised ``codex exec`` on *cand*: ``(proc, reply, worktree before)``.
 
@@ -5165,6 +5437,8 @@ def _attempt_codex(  # pylint: disable=too-many-locals
     is also what lets the NEXT ranking — this call's own hop included — see the cost.
     *exec_done*, when given, receives the ``time.monotonic()`` at which ``codex exec``
     ended (success or raise), so the caller can time the attempt without that fetch.
+    The cost row carries *attempt_id* and *debate* (``(debate_id, debate_round)``,
+    ``run -D``/``-R``) so a debate's rounds can be summed (tp#2672 B3).
     """
     perm_args = codex_launch.permission_args(write, codex_home=cand.home)
     mcp_args = codex_launch.mcp_disable_args(cand.home)
@@ -5211,6 +5485,9 @@ def _attempt_codex(  # pylint: disable=too-many-locals
                 before=cost_before,
                 after=codex_cost_snapshot(cand.home),
                 home=cand.home,
+                attempt_id=attempt_id,
+                debate_id=debate[0],
+                debate_round=debate[1],
             )
         try:
             reply = Path(out_path).read_text(encoding="utf-8").strip()
@@ -5256,13 +5533,11 @@ def write_floor_percent() -> float:
 
     A write round that dies half-way through leaves a worktree to review
     (``SEAT-REFUSED-MIDRUN``), so it must not START on a seat that is one round from
-    empty. Once ten debate samples exist the learned P95 cost of a single round is the
-    honest floor; before that, a flat tenth of the window (plan D5).
+    empty. Once ten debate samples exist the learned P95 cost of a single round (pooled
+    :func:`_round_reserve`) is the honest floor; before that, a flat tenth of the
+    window (plan D5).
     """
-    reserve, source = _headroom_reserve(_SEVEN_DAY_MINUTES)
-    if source != "learned":
-        return _WRITE_FLOOR_BOOTSTRAP_PCT
-    return reserve / _ROUNDS_PER_RESERVE
+    return _round_reserve()[0]
 
 
 def _candidate_row(cand: SeatCandidate, now: int) -> quota.ProviderQuota:
@@ -5581,7 +5856,20 @@ def run_with_fallback(**kwargs: Any) -> RunResult:
     # TypeError mid-run.
     note = str(kwargs.pop("note", "") or "")
     caller = str(kwargs.pop("caller", "") or "")
-    result = _run_with_fallback(**kwargs, log_context={"note": note, "caller": caller})
+    # ``debate_id``/``debate_round`` (``run -D``/``-R``, tp#2672 B3) label the cost rows
+    # and the ledger lines of this round; like the note they never change what runs.
+    debate_id = str(kwargs.pop("debate_id", "") or "")
+    raw_round = kwargs.pop("debate_round", None)
+    debate_round = int(raw_round) if debate_id and raw_round is not None else None
+    result = _run_with_fallback(
+        **kwargs,
+        log_context={
+            "note": note,
+            "caller": caller,
+            "debate_id": debate_id,
+            "debate_round": debate_round,
+        },
+    )
     workdir = kwargs.get("workdir", "")
     codex_ledger.record_result(
         result,
@@ -5593,6 +5881,8 @@ def run_with_fallback(**kwargs: Any) -> RunResult:
         workdir=os.fspath(workdir) if workdir else "",
         note=note,
         caller=caller,
+        debate_id=debate_id,
+        debate_round=debate_round,
     )
     return result
 
@@ -5734,12 +6024,13 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
     headroom: bool = False,
     min_remaining_pct: float = 0.0,
     seat: str = "",
-    log_context: dict[str, str] | None = None,
+    log_context: dict[str, Any] | None = None,
 ) -> RunResult:
     """The seat-hopping round behind :func:`run_with_fallback` (which adds the ledger).
 
     *log_context* (``note``/``caller``) only labels each attempt's run-log directory
-    (:mod:`codex_runlog`); it never changes what runs.
+    (:mod:`codex_runlog`), and its ``debate_id``/``debate_round`` each attempt's cost
+    row; it never changes what runs.
 
     ``delegate`` and ``run`` both come through
     here, so "which seat, in which order, and what happens when it says no" has one
@@ -5909,6 +6200,11 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
                 started=started,
                 exec_done=exec_done,
                 runlog=runlog,
+                attempt_id=attempt_id,
+                debate=(
+                    str((log_context or {}).get("debate_id") or ""),
+                    (log_context or {}).get("debate_round"),
+                ),
             )
         except FileNotFoundError:
             elapsed = _attempt_elapsed(attempt_started, exec_done)
@@ -6561,6 +6857,8 @@ def cmd_run(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return
             purpose=args.purpose or "run",
             note=getattr(args, "note", "") or "",
             caller=getattr(args, "caller", "") or "",
+            debate_id=getattr(args, "debate_id", "") or "",
+            debate_round=getattr(args, "debate_round", None),
             seat=getattr(args, "seat", "") or "",
             model=model,
             effort=shown_effort,
@@ -7049,6 +7347,23 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         metavar="NAME",
         help="who is calling (e.g. 'ai.py:<attempt_id>'), written to the run ledger as "
         "`caller` on every attempt",
+    )
+    p_run.add_argument(
+        "-D",
+        "--debate-id",
+        default="",
+        metavar="ID",
+        help="the debate this round belongs to (a nonce the debate driver mints), written "
+        "to the cost row and the ledger of every attempt; the debate reserve sums a "
+        "debate's rounds by it",
+    )
+    p_run.add_argument(
+        "-R",
+        "--debate-round",
+        type=int,
+        default=None,
+        metavar="N",
+        help="the debate round number (0 = blind round) of this call; needs -D",
     )
     p_run.add_argument(
         "-n",

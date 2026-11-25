@@ -522,3 +522,135 @@ def test_launchd_job_reads_ai_job_then_xpc(monkeypatch: pytest.MonkeyPatch) -> N
     assert codex_ledger.launchd_job() == ""
     monkeypatch.setenv("AI_JOB", "myjob")
     assert codex_ledger.launchd_job() == "myjob"
+
+
+# ── tp#2672 B3: debate identity and the debate_closed marker ─────────────────────────
+# The marker shape the debate driver's `mark` appends through `ccc record-run`.
+def _marker(**kw: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "schema_version": 1,
+        "provider": "codex",
+        "seat": "de",
+        "purpose": "marker",
+        "outcome": "debate_closed",
+        "ok": True,
+        "ms": 0,
+        "debate_id": "0f3c",
+        "round_numbers": [2, 0, 1, 1],
+        "start_seat": "de",
+        "final_seat": "default",
+    }
+    row.update(kw)
+    return row
+
+
+def test_debate_closed_marker_not_counted_as_attempt(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``read_runs()`` hides a marker, ``read_runs(include_markers=True)`` returns it, and
+    no seat's ``last_run`` counts it."""
+    code, err = _record(monkeypatch, [_claude_row(), _marker()])
+    assert (code, err) == (0, "")
+    rows = _ledger_rows(three_seats)
+    assert [row["purpose"] for row in rows] == ["checker"]
+    every = codex_ledger.read_runs(include_markers=True)
+    marker = every[-1]
+    assert codex_ledger.is_marker(marker)
+    assert marker["round_numbers"] == [0, 1, 2], "stored sorted and unique"
+    assert (marker["start_seat"], marker["final_seat"]) == ("de", "default")
+    assert "attempt_id" not in marker, "a marker is no attempt"
+    assert "codex:de" not in codex_ledger.last_runs(rows)
+
+
+@pytest.mark.parametrize(
+    ("change", "why"),
+    [
+        ({"debate_id": ""}, "needs 'debate_id'"),
+        ({"round_numbers": []}, "round_numbers"),
+        ({"round_numbers": [0, "1"]}, "round_numbers"),
+        ({"round_numbers": [True]}, "round_numbers"),
+        ({"start_seat": ""}, "needs 'start_seat'"),
+        ({"tokens_in": 3}, "carries no tokens_in"),
+        ({"attempt_id": "abc"}, "carries no attempt_id"),
+    ],
+)
+def test_record_run_validates_a_marker(
+    three_seats: SeatFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    change: dict[str, object],
+    why: str,
+) -> None:
+    code, err = _record(monkeypatch, _marker(**change))
+    assert code == 2
+    assert why in err
+    assert codex_ledger.read_runs(include_markers=True) == []
+    _ = three_seats
+
+
+def test_marker_keys_only_on_a_marker(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code, err = _record(monkeypatch, _claude_row(start_seat="de"))
+    assert code == 2 and "only on a marker" in err
+    _ = three_seats
+
+
+def test_repeated_mark_writes_one_marker(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second close of the same ``debate_id`` (a repeated ``mark``, or a crash between
+    the append and the lease release) is a no-op: exit 0, nothing appended."""
+    assert _record(monkeypatch, _marker()) == (0, "")
+    assert _record(monkeypatch, _marker(final_seat="de")) == (0, "")
+    assert _record(monkeypatch, [_marker(debate_id="b"), _marker(debate_id="b")]) == (
+        0,
+        "",
+    )
+    markers = [r for r in codex_ledger.read_runs(include_markers=True) if codex_ledger.is_marker(r)]
+    assert [(m["debate_id"], m["final_seat"]) for m in markers] == [
+        ("0f3c", "default"),
+        ("b", "default"),
+    ]
+    _ = three_seats
+
+
+def test_cost_row_carries_attempt_and_debate_id(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``run -D <id> -R <n>``: every attempt's cost row and ledger line carry the debate
+    identity, and the cost row the ledger line's own ``attempt_id``."""
+    parsed = cic.build_parser().parse_args(["run", "-D", "nonce-1", "-R", "2", "x"])
+    assert (parsed.debate_id, parsed.debate_round) == ("nonce-1", 2)
+    three_seats.scenarios(private="refuse_quota", de={"scenario": "ok", "reply": "de answered"})
+    assert (
+        cic.cmd_run(_run_ns(three_seats, purpose="debate", debate_id="nonce-1", debate_round=2))
+        == cic.EX_OK
+    )
+    ledger = _ledger_rows(three_seats)
+    assert [(r["seat"], r["debate_id"], r["debate_round"]) for r in ledger] == [
+        ("private", "nonce-1", 2),
+        ("de", "nonce-1", 2),
+    ]
+    costs = [
+        json.loads(line)
+        for line in cic.codex_cost_history_path().read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(c["seat"], c["debate_id"], c["debate_round"]) for c in costs] == [
+        ("private", "nonce-1", 2),
+        ("de", "nonce-1", 2),
+    ]
+    assert [c["attempt_id"] for c in costs] == [r["attempt_id"] for r in ledger]
+
+
+def test_a_run_without_debate_id_writes_no_debate_keys(
+    three_seats: SeatFixture,
+) -> None:
+    three_seats.scenarios(private={"scenario": "ok", "reply": "fine"})
+    assert cic.cmd_run(_run_ns(three_seats, debate_round=3)) == cic.EX_OK
+    (row,) = _ledger_rows(three_seats)
+    assert "debate_id" not in row and "debate_round" not in row
+    (cost,) = [
+        json.loads(line)
+        for line in cic.codex_cost_history_path().read_text(encoding="utf-8").splitlines()
+    ]
+    assert "debate_id" not in cost and cost["attempt_id"] == row["attempt_id"]

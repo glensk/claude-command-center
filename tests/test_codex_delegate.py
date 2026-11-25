@@ -745,8 +745,11 @@ def test_delegate_records_cost_snapshots_and_purpose_without_stdout_preamble(
             # The seat that billed the run: $CODEX_HOME here is a tmp dir ccc does not
             # know, so it is the "explicit" seat rather than a registered label.
             "seat": "explicit",
+            # The ledger line's attempt identity (tp#2672 B3).
+            "attempt_id": rows[0]["attempt_id"],
         }
     ]
+    assert len(rows[0]["attempt_id"]) == 32
 
 
 def test_delegate_parser_purpose_defaults_and_override(cic: ModuleType) -> None:
@@ -1573,3 +1576,325 @@ def test_codex_home_fails_over_when_default_seat_is_held(
         reason="team seat reserved",
     )
     assert engine._codex_home() == private
+
+
+# ---- tp#2672 B3: the debate START reserve is the measured cost of one whole DEBATE ----
+_WEEK = "10080"
+
+
+def _week_cost_row(
+    ts: int, seat: str, delta: float, *, debate_id: str = "", rnd: int | None = None
+) -> dict[str, object]:
+    """One measured debate attempt costing *delta* % of *seat*'s week."""
+    resets = _HEADROOM_NOW + 5 * 86_400
+    row: dict[str, object] = {
+        "ts": ts,
+        "purpose": "debate",
+        "model": "m",
+        "effort": "high",
+        "seat": seat,
+        "before": {
+            _WEEK: {"used_percent": 10.0, "resets_at": resets},
+            "_meta": {"n": 0},
+        },
+        "after": {
+            _WEEK: {"used_percent": 10.0 + delta, "resets_at": resets},
+            "_meta": {"n": 1},
+        },
+    }
+    if debate_id:
+        row["debate_id"] = debate_id
+        if rnd is not None:
+            row["debate_round"] = rnd
+    return row
+
+
+def _write_costs(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rows: list[dict]
+) -> None:
+    path = tmp_path / "cost-history.jsonl"
+    monkeypatch.setenv("CODEX_IN_CLAUDE_COST_LOG", str(path))
+    monkeypatch.setattr(cic.time, "time", lambda: float(_HEADROOM_NOW))
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def _close(debate_id: str, rounds: list[int], start: str, final: str = "") -> None:
+    """Append the ``debate_closed`` marker the debate driver writes via ``record-run``."""
+    from command_center import codex_ledger  # pylint: disable=import-outside-toplevel
+
+    codex_ledger.append_rows(
+        [
+            codex_ledger.validate_row(
+                {
+                    "provider": "codex",
+                    "seat": start,
+                    "purpose": "marker",
+                    "outcome": "debate_closed",
+                    "ok": True,
+                    "ms": 0,
+                    "debate_id": debate_id,
+                    "round_numbers": rounds,
+                    "start_seat": start,
+                    "final_seat": final or start,
+                }
+            )
+        ]
+    )
+
+
+def _ledger_attempt(ts: int, seat: str, session: str, debate_id: str = "") -> dict[str, object]:
+    from command_center import codex_ledger  # pylint: disable=import-outside-toplevel
+
+    row: dict[str, object] = {
+        "ts": codex_ledger._iso(ts),  # noqa: SLF001
+        "provider": "codex",
+        "seat": seat,
+        "id": f"codex:{seat}",
+        "attempt_id": codex_ledger.new_attempt_id(),
+        "purpose": "debate",
+        "outcome": "ok",
+        "ok": True,
+        "ms": 1000,
+        "session": session,
+    }
+    if debate_id:
+        row["debate_id"] = debate_id
+    return row
+
+
+def _one_round_debates(seat: str, costs: list[float], *, start_ts: int) -> list[dict]:
+    """One closed, one-round (``[1]``) debate per cost, ``debate_id`` ``<seat>-<i>``."""
+    rows = []
+    for index, cost in enumerate(costs):
+        debate_id = f"{seat}-{index}"
+        rows.append(_week_cost_row(start_ts + index * 60, seat, cost, debate_id=debate_id, rnd=1))
+        _close(debate_id, [1], seat)
+    return rows
+
+
+def test_debate_reserve_from_debate_sums(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """25 closed debates of one seat costing 1..25: 1.1 x nearest-rank P95 (24)."""
+    rows = _one_round_debates("de", [float(n) for n in range(1, 26)], start_ts=_HEADROOM_NOW - 9000)
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    reserve, source = cic._debate_weekly_reserve("de")  # noqa: SLF001
+    assert (reserve, source) == (pytest.approx(1.1 * 24), "learned-seat")
+    # pooled (no seat) is the same 25 debates here
+    assert cic._debate_weekly_reserve() == (pytest.approx(1.1 * 24), "learned")  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("own", "expected"), [(19, (33.0, "learned")), (20, (11.0, "learned-seat"))]
+)
+def test_debate_reserve_per_seat_threshold(
+    cic: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    own: int,
+    expected: tuple[float, str],
+) -> None:
+    """de's own debates count from 20 on; below that the pool (default's 30 % debates)."""
+    rows = _one_round_debates("de", [10.0] * own, start_ts=_HEADROOM_NOW - 9000)
+    rows += _one_round_debates("default", [30.0] * 10, start_ts=_HEADROOM_NOW - 4000)
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    reserve, source = cic._debate_weekly_reserve("de")  # noqa: SLF001
+    assert (reserve, source) == (pytest.approx(expected[0]), expected[1])
+
+
+def test_debate_reserve_bootstrap_and_bounds(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Below 10 pooled debates the bootstrap 35 %; the learned value is bounded 5..60."""
+    rows = _one_round_debates("de", [3.0] * 9, start_ts=_HEADROOM_NOW - 9000)
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    assert cic._debate_weekly_reserve("de") == (35.0, "bootstrap")  # noqa: SLF001
+    rows += _one_round_debates("default", [3.0], start_ts=_HEADROOM_NOW - 100)
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    assert cic._debate_weekly_reserve("de") == (5.0, "learned")  # noqa: SLF001  # 3.3 -> 5
+    hist = cic.DebateHistory(debates={"de": [80.0] * 20})
+    assert cic._debate_weekly_reserve("de", history=hist) == (60.0, "learned-seat")  # noqa: SLF001
+
+
+def test_failover_debate_attributed_to_start_seat(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rounds on de then default: ONE sum (every seat's attempts), counted for de only."""
+    t0 = _HEADROOM_NOW - 7200
+    rows = [
+        _week_cost_row(t0, "de", 3.0, debate_id="d1", rnd=0),
+        _week_cost_row(t0 + 600, "de", 1.0, debate_id="d1", rnd=1),
+        _week_cost_row(t0 + 650, "default", 2.0, debate_id="d1", rnd=1),  # the failover hop
+        _week_cost_row(t0 + 1200, "default", 1.5, debate_id="d1", rnd=2),
+    ]
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    _close("d1", [0, 1, 2], "de", "default")
+    hist = cic.load_debate_history()
+    assert hist.debates == {"de": [pytest.approx(7.5)]}
+    assert hist.debate_costs("default") == []
+
+
+def test_gapped_round_numbers_not_counted(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``[0, 2]`` (round 1 unrecorded) and a round without a measured delta are dropped."""
+    t0 = _HEADROOM_NOW - 7200
+    unmeasured = _week_cost_row(t0 + 900, "de", 2.0, debate_id="d2", rnd=2)
+    unmeasured["after"] = unmeasured["before"]  # no new reading: no delta
+    rows = [
+        _week_cost_row(t0, "de", 3.0, debate_id="d1", rnd=0),
+        _week_cost_row(t0 + 600, "de", 2.0, debate_id="d1", rnd=2),
+        _week_cost_row(t0 + 700, "de", 2.0, debate_id="d2", rnd=1),
+        unmeasured,
+    ]
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    _close("d1", [0, 2], "de")
+    _close("d2", [1, 2], "de")
+    assert cic.load_debate_history().debates == {}
+
+
+def test_blind_and_non_blind_debates_both_counted(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A debate with a blind round 0 (``[0, 1, 2]``) and one without (``[1, 2]``)."""
+    t0 = _HEADROOM_NOW - 7200
+    rows = [
+        _week_cost_row(t0, "de", 2.0, debate_id="blind", rnd=0),
+        _week_cost_row(t0 + 60, "de", 1.0, debate_id="blind", rnd=1),
+        _week_cost_row(t0 + 120, "de", 2.0, debate_id="blind", rnd=2),
+        _week_cost_row(t0 + 180, "de", 1.0, debate_id="plain", rnd=1),
+        _week_cost_row(t0 + 240, "de", 1.0, debate_id="plain", rnd=2),
+    ]
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    _close("blind", [0, 1, 2], "de")
+    _close("plain", [1, 2], "de")
+    assert sorted(cic.load_debate_history().debate_costs("de")) == [2.0, 5.0]
+
+
+def test_open_debate_not_counted(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rounds with a ``debate_id`` but no ``debate_closed`` marker never count."""
+    t0 = _HEADROOM_NOW - 7200
+    rows = [
+        _week_cost_row(t0, "de", 2.0, debate_id="open", rnd=1),
+        _week_cost_row(t0 + 60, "de", 2.0, debate_id="open", rnd=2),
+    ]
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    hist = cic.load_debate_history()
+    assert hist.debates == {}
+    assert hist.round_costs("de") == [2.0, 2.0]  # still per-round evidence
+
+
+def test_two_debates_same_session_and_dir_stay_separate(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two interleaved debates of one session: the ``debate_id`` keeps them apart."""
+    t0 = _HEADROOM_NOW - 7200
+    rows = [
+        _week_cost_row(t0, "de", 1.0, debate_id="a", rnd=1),
+        _week_cost_row(t0 + 30, "de", 4.0, debate_id="b", rnd=1),
+        _week_cost_row(t0 + 60, "de", 1.0, debate_id="a", rnd=2),
+        _week_cost_row(t0 + 90, "de", 4.0, debate_id="b", rnd=2),
+    ]
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    _close("a", [1, 2], "de")
+    _close("b", [1, 2], "de")
+    assert sorted(cic.load_debate_history().debate_costs("de")) == [2.0, 8.0]
+
+
+def test_legacy_association_rejects_collisions(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy rows join exactly ONE same-seat ledger attempt within 90 s, then group by
+    session with a 3 h gap; two candidates (or one attempt claimed twice) drop the row."""
+    from command_center import codex_ledger  # pylint: disable=import-outside-toplevel
+
+    t0 = _HEADROOM_NOW - 80_000
+    later = t0 + 4 * 3600  # > 3 h after the first group: a second debate
+    rows = [
+        _week_cost_row(t0, "de", 2.0),  # joins s1 alone
+        _week_cost_row(t0 + 600, "de", 3.0),  # joins s1 alone, same debate
+        _week_cost_row(later, "de", 4.0),  # joins s1 again, a NEW debate (gap)
+        _week_cost_row(t0 + 20_000, "de", 50.0),  # two ledger candidates: dropped
+        _week_cost_row(t0 + 30_000, "default", 60.0),  # claims one attempt ...
+        _week_cost_row(t0 + 30_030, "default", 70.0),  # ... with this row: both dropped
+        _week_cost_row(t0 + 40_000, "default", 80.0),  # the only attempt is another seat's
+    ]
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    ledger = [
+        _ledger_attempt(t0 + 5, "de", "s1"),
+        _ledger_attempt(t0 + 605, "de", "s1"),
+        _ledger_attempt(later + 5, "de", "s1"),
+        _ledger_attempt(t0 + 20_010, "de", "s2"),
+        _ledger_attempt(t0 + 20_050, "de", "s2"),
+        _ledger_attempt(t0 + 30_015, "default", "s3"),
+        _ledger_attempt(t0 + 40_005, "de", "s4"),
+    ]
+    codex_ledger.append_rows(ledger)
+    hist = cic.load_debate_history()
+    assert hist.debates == {"de": [5.0, 4.0]}
+
+
+def test_debate_history_unreadable_is_bootstrap(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CODEX_IN_CLAUDE_COST_LOG", str(tmp_path))  # a directory: unreadable
+    assert cic._debate_weekly_reserve("de") == (35.0, "bootstrap")  # noqa: SLF001
+    assert cic._round_reserve("de") == (10.0, "bootstrap")  # noqa: SLF001
+
+
+def _ten_round_rows() -> list[dict]:
+    """Ten measured per-attempt 7d deltas, nearest-rank P95 = 4."""
+    deltas = [1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0, 4.0]
+    return [_week_cost_row(_HEADROOM_NOW - 50_000 + i * 60, "de", d) for i, d in enumerate(deltas)]
+
+
+def test_write_floor_unchanged_by_debate_reserve(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The write floor is the pooled one-round reserve, 1.1 x the per-attempt P95 —
+    closing the same rounds into debates (big debate sums) moves it not at all;
+    bootstrap 10 % below ten rounds."""
+    rows = _ten_round_rows()
+    _write_costs(cic, tmp_path, monkeypatch, rows[:9])
+    assert cic.write_floor_percent() == 10.0
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    assert cic.write_floor_percent() == pytest.approx(4.4)
+    for index, row in enumerate(rows):  # the same ten rounds as two closed debates
+        row["debate_id"], row["debate_round"] = f"d{index // 5}", index % 5
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    _close("d0", [0, 1, 2, 3, 4], "de")
+    _close("d1", [0, 1, 2, 3, 4], "de")
+    assert sorted(cic.load_debate_history().debate_costs("de")) == [8.0, 16.0]
+    assert cic.write_floor_percent() == pytest.approx(4.4)
+
+
+def test_headroom_reserve_formula_unchanged(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The OFFLOAD reserve keeps 3 x P95 of a round x 1.10; the debate reserve differs."""
+    rows = _ten_round_rows()
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    assert cic._headroom_reserve(10080) == (pytest.approx(13.2), "learned")  # noqa: SLF001
+    assert cic.headroom_reserve_percent(10080) == pytest.approx(13.2)
+    rows += _one_round_debates("de", [4.0] * 10, start_ts=_HEADROOM_NOW - 9000)
+    _write_costs(cic, tmp_path, monkeypatch, rows)
+    # ten closed one-round 4 % debates: the round P95 is still 4 → 13.2 for the offload
+    # reserve, while the debate START reserve is 1.1 x 4 = 4.4 → its 5 % floor
+    assert cic._headroom_reserve(10080) == (pytest.approx(13.2), "learned")  # noqa: SLF001
+    assert cic._debate_weekly_reserve("de") == (5.0, "learned")  # noqa: SLF001
+
+
+def test_round_reserve_per_seat_from_twenty_rounds(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The continue gate's one-round reserve: the seat's own from 20 rounds, else pooled."""
+    hist = cic.DebateHistory(rounds={"de": [1.0] * 19, "default": [9.0] * 10})
+    assert cic._round_reserve("de", history=hist) == (pytest.approx(9.9), "learned")  # noqa: SLF001
+    hist.rounds["de"].append(1.0)
+    assert cic._round_reserve("de", history=hist) == (
+        pytest.approx(1.1),
+        "learned-seat",
+    )  # noqa: SLF001
+    _ = (tmp_path, monkeypatch)

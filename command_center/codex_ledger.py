@@ -47,6 +47,16 @@ run log stores as ``reply.txt`` (:func:`command_center.codex_runlog.reply_digest
 :func:`verify_provenance` (``codex-in-claude provenance -a ID``) re-hashes the stored reply
 against the runner row.
 
+Since 2026-11-25 (tp#2672 B3) a Codex DEBATE is identified too. Each attempt of a round
+started with ``codex-in-claude run -D <debate_id> -R <round>`` carries ``debate_id`` and
+``debate_round``, and the debate driver closes a debate with ONE marker row appended
+through ``ccc record-run`` (:data:`MARKER_PURPOSE`, :func:`is_marker`): ``provider
+codex``, ``seat`` = ``start_seat``, ``purpose "marker"``, ``outcome "debate_closed"``,
+``ok true``, ``ms 0``, plus ``debate_id``, ``round_numbers`` (the sorted unique rounds
+that ran), ``start_seat`` and ``final_seat``. A marker is no attempt:
+:func:`read_runs` hides it unless asked (``include_markers=True``), and a second marker
+for the same ``debate_id`` is a no-op (:func:`append_rows`), so a repeated close writes one.
+
 Append-only, best-effort, never raises into the runner: a ledger that cannot be written
 is a missing measurement, not a failed Codex call. Timestamps are local ISO seconds with
 the UTC offset — the same spelling ai.py's own ``calls-*.jsonl`` uses, so the two sort
@@ -138,7 +148,39 @@ _OPTIONAL: dict[str, type | tuple[type, ...]] = {
     # tp#1697: the row came from an ``AI_AUTOMATED`` caller / reached a seat anyway.
     "automated": bool,
     "seat_violation": bool,
+    # tp#2672 B3: the debate an attempt belongs to, and the close marker's own keys.
+    "debate_id": str,
+    "debate_round": int,
+    "round_numbers": list,
+    "start_seat": str,
+    "final_seat": str,
 }
+
+#: A row is a debate-close marker iff its ``purpose`` is this (tp#2672 B3): never an
+#: attempt, so every attempt reader skips it.
+MARKER_PURPOSE = "marker"
+#: The marker's ``outcome``.
+OUTCOME_DEBATE_CLOSED = "debate_closed"
+#: Keys a marker must not carry: it is no attempt, so no token or attempt facts.
+_MARKER_FORBIDDEN = (
+    "attempt_id",
+    "debate_round",
+    "model",
+    "requested_model",
+    "effort",
+    "prompt_chars",
+    "llm_ms",
+    "tokens_in",
+    "tokens_out",
+    "tokens_cache_read",
+    "tokens_cache_create",
+    "tokens_cache_create_1h",
+    "usd",
+    "write",
+    "error",
+    "error_message",
+    "run_dir",
+)
 
 #: Keys only the runner writes (tp#2500 provenance): ``ccc record-run`` refuses them.
 SOURCE_RUNNER = "runner"
@@ -183,6 +225,11 @@ def new_attempt_id() -> str:
     return uuid.uuid4().hex
 
 
+def is_marker(row: dict[str, Any]) -> bool:
+    """True when *row* is a debate-close marker, not a physical attempt (tp#2672 B3)."""
+    return row.get("purpose") == MARKER_PURPOSE
+
+
 def provider_of(row: dict[str, Any]) -> str:
     """The row's provider family — ``codex`` when the key predates the field."""
     return str(row.get("provider") or "codex")
@@ -209,6 +256,8 @@ def attempt_records(
     workdir: str,
     note: str = "",
     caller: str = "",
+    debate_id: str = "",
+    debate_round: int | None = None,
 ) -> list[dict[str, Any]]:
     """The ledger lines for *result*: one per PHYSICAL attempt, oldest first.
 
@@ -219,7 +268,8 @@ def attempt_records(
     rides on EVERY attempt of the round — a hop does not change what it was for, and so
     does *caller* (``run -X``). ``attempt_id`` is the attempt's own
     (:attr:`~command_center.codex_in_claude.RunAttempt.attempt_id`), the one ``run -j``
-    reports, so a caller can reference exactly these lines.
+    reports, so a caller can reference exactly these lines. *debate_id* and
+    *debate_round* (``run -D``/``-R``) ride on every attempt too (tp#2672 B3).
     """
     from . import automated  # pylint: disable=import-outside-toplevel
     from .codex_in_claude import _seat_pid  # pylint: disable=import-outside-toplevel
@@ -258,6 +308,10 @@ def attempt_records(
             row["note"] = clean_note
         if clean_caller:
             row["caller"] = clean_caller
+        if debate_id:
+            row["debate_id"] = debate_id
+            if debate_round is not None:
+                row["debate_round"] = int(debate_round)
         if violation:
             row["automated"] = True
             row["seat_violation"] = True
@@ -387,6 +441,10 @@ def validate_row(raw: Any, where: str = "row") -> dict[str, Any]:
             continue
         row[key] = sanitize_note(value) if key in ("note", "caller") else value
     _check_new_keys(row, where)
+    if is_marker(row):
+        _check_marker(raw, row, where)
+    elif "round_numbers" in row or "start_seat" in row or "final_seat" in row:
+        raise ValueError(f"{where}: round_numbers/start_seat/final_seat only on a marker row")
     if "error_message" in row:
         row["error_message"] = " ".join(str(row["error_message"]).split())[:_ERROR_CHARS]
     return row
@@ -405,6 +463,28 @@ def _check_new_keys(row: dict[str, Any], where: str) -> None:
         raise ValueError(f"{where}: 'tokens_cache_create_1h' must be >= 0")
     if "job" in row:
         row["job"] = sanitize_note(row["job"])[:JOB_CHARS]
+
+
+def _check_marker(raw: dict[str, Any], row: dict[str, Any], where: str) -> None:
+    """A ``purpose: "marker"`` row (tp#2672 B3): ``debate_id``, a non-empty list of
+    int ``round_numbers`` (stored sorted and unique) and ``start_seat``; no token or
+    attempt field. Its ``attempt_id`` is dropped (a marker is no attempt)."""
+    forbidden = [key for key in _MARKER_FORBIDDEN if raw.get(key) not in (None, "")]
+    if forbidden:
+        raise ValueError(f"{where}: a marker row carries no {', '.join(forbidden)}")
+    row.pop("attempt_id", None)
+    if not str(row.get("debate_id") or "").strip():
+        raise ValueError(f"{where}: a marker row needs 'debate_id'")
+    if not str(row.get("start_seat") or "").strip():
+        raise ValueError(f"{where}: a marker row needs 'start_seat'")
+    rounds = row.get("round_numbers")
+    if (
+        not isinstance(rounds, list)
+        or not rounds
+        or any(isinstance(n, bool) or not isinstance(n, int) or n < 0 for n in rounds)
+    ):
+        raise ValueError(f"{where}: a marker row needs a non-empty int list 'round_numbers'")
+    row["round_numbers"] = sorted(set(rounds))
 
 
 def _check_keys(raw: Any, where: str) -> None:
@@ -442,14 +522,47 @@ def _check_type(value: Any, kind: type | tuple[type, ...], key: str, where: str)
 def append_rows(rows: list[dict[str, Any]], path: Path | None = None) -> int:
     """Append already-validated *rows*; the number written. Raises on I/O failure —
     this is the strict entrance behind ``ccc record-run``, whose exit code must say
-    whether the record exists."""
+    whether the record exists.
+
+    A debate-close marker whose ``debate_id`` already has a marker in the ledger (or
+    earlier in *rows*) is dropped, under the same lock as the append: a repeated close
+    writes one marker (tp#2672 B3). The count excludes the dropped ones."""
     if not rows:
         return 0
-    return _append_locked(rows, path)
+    if not any(is_marker(row) for row in rows):
+        return _append_locked(rows, path)
+    from . import usage  # pylint: disable=import-outside-toplevel  # cycle-safe here
+
+    target = ledger_path() if path is None else path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with usage._flock(target.with_suffix(".lock")):  # noqa: SLF001
+        closed = {
+            str(row.get("debate_id") or "")
+            for row in read_runs(target, include_markers=True)
+            if is_marker(row)
+        }
+        fresh: list[dict[str, Any]] = []
+        for row in rows:
+            if is_marker(row):
+                debate_id = str(row.get("debate_id") or "")
+                if debate_id in closed:
+                    continue
+                closed.add(debate_id)
+            fresh.append(row)
+        if fresh:
+            text = "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in fresh)
+            with target.open("a", encoding="utf-8") as fh:
+                fh.write(text)
+    return len(fresh)
 
 
-def read_runs(path: Path | None = None) -> list[dict[str, Any]]:
-    """Every ledger line as a dict, oldest first; malformed lines are skipped."""
+def read_runs(path: Path | None = None, *, include_markers: bool = False) -> list[dict[str, Any]]:
+    """Every ledger line as a dict, oldest first; malformed lines are skipped.
+
+    Debate-close markers (:func:`is_marker`) are no physical attempt and are skipped
+    unless *include_markers* — every attempt reader (``last_runs``, the quota probe, the
+    session handoff) keeps the default (tp#2672 B3).
+    """
     path = ledger_path() if path is None else path
     try:
         text = path.read_text(encoding="utf-8")
@@ -461,7 +574,9 @@ def read_runs(path: Path | None = None) -> list[dict[str, Any]]:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(row, dict) and row.get("ts"):
+        if not isinstance(row, dict) or not row.get("ts"):
+            continue
+        if include_markers or not is_marker(row):
             rows.append(row)
     return rows
 
@@ -649,6 +764,11 @@ def _epoch(stamp: str) -> int:
         return int(datetime.fromisoformat(stamp).timestamp())
     except ValueError:
         return 0
+
+
+def row_epoch(row: dict[str, Any]) -> int:
+    """The epoch second of a ledger row's ``ts``, 0 when missing or unparsable."""
+    return _epoch(str(row.get("ts") or ""))
 
 
 def last_runs(rows: list[dict[str, Any]], now: int | None = None) -> dict[str, dict[str, Any]]:

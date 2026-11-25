@@ -726,8 +726,11 @@ def test_continue_parser_short_flags() -> None:
 # The weekly reserve (tp#2495): a seat whose KNOWN seven-day reading leaves less than
 # the learned weekly reserve (one full debate) is ``capped`` — at the start, for a
 # failover candidate, and (at one round's worth) for the current seat mid-debate.
+# Since tp#2672 B3 the start reserve is per seat (``_debate_weekly_reserve(seat)``) and
+# the one-round reserve its own seam (``_round_reserve``); the fixture pins both.
 # --------------------------------------------------------------------------- #
 _RESERVE = 16.5  # the learned weekly reserve the tests pin
+_ROUND = 5.0  # the learned one-round reserve the tests pin (tp#2672 B3)
 _WEEKLY_FIELDS = frozenset(
     {"window", "weekly_resets_at", "weekly_reserve_source", "weekly_reserve_percent"}
 ) | {"weekly_used_percent"}
@@ -762,21 +765,33 @@ def _week(  # pylint: disable=too-many-arguments
 
 
 @pytest.fixture(name="reserve_calls")
-def _reserve_calls(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    """Pin the learned weekly reserve to 16.5 %; the list records every lookup."""
-    calls: list[int] = []
+def _reserve_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Pin the debate start reserve to 16.5 % and one round to 5 %; the list records
+    every start-reserve lookup by seat, and the history is read once per verdict."""
+    calls: list[str] = []
+    loads: list[int] = []
 
-    def _reserve(minutes: int) -> tuple[float, str]:
-        calls.append(minutes)
+    def _reserve(seat: str | None = None, **_kw: object) -> tuple[float, str]:
+        calls.append(str(seat))
         return (_RESERVE, "learned")
 
-    monkeypatch.setattr(cic, "_headroom_reserve", _reserve)
+    def _round(_seat: str | None = None, **_kw: object) -> tuple[float, str]:
+        return (_ROUND, "learned")
+
+    def _history() -> cic.DebateHistory:
+        loads.append(1)
+        calls.append("<history>")
+        return cic.DebateHistory()
+
+    monkeypatch.setattr(cic, "_debate_weekly_reserve", _reserve)
+    monkeypatch.setattr(cic, "_round_reserve", _round)
+    monkeypatch.setattr(cic, "_safe_debate_history", _history)
     return calls
 
 
 @pytest.fixture(name="weekly")
 def _weekly(
-    pair: SeatFixture, reserve_calls: list[int], monkeypatch: pytest.MonkeyPatch
+    pair: SeatFixture, reserve_calls: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> SeatFixture:
     """``pair`` with the weekly reserve pinned and the routing order fixed (private, de)."""
     _ = reserve_calls
@@ -795,7 +810,7 @@ def _entry(verdict: dict, label: str) -> dict:
 
 
 def test_weekly_reserve_caps_a_seat_and_the_next_seat_wins(
-    weekly: SeatFixture, reserve_calls: list[int]
+    weekly: SeatFixture, reserve_calls: list[str]
 ) -> None:
     """(a) 5h 20 % but 7d 99 %: capped on the weekly reset; the next seat in order wins."""
     now = int(time.time())
@@ -817,7 +832,10 @@ def test_weekly_reserve_caps_a_seat_and_the_next_seat_wins(
     assert (verdict["state"], verdict["seat"]) == ("allowed", "de")
     assert verdict["weekly_used_percent"] == 50.0
     assert verdict["window"] == ""
-    assert reserve_calls == [cic._SEVEN_DAY_MINUTES]  # noqa: SLF001  # once per verdict
+    # the history once per verdict, then each judged seat's own start reserve
+    assert reserve_calls[0] == "<history>"
+    assert reserve_calls.count("<history>") == 1
+    assert {"private", "de"} <= set(reserve_calls[1:])
 
 
 def test_weekly_reserve_caps_an_unmeasured_five_hour_seat(weekly: SeatFixture) -> None:
@@ -910,9 +928,9 @@ def test_weekly_capped_first_seat_keeps_the_order_with_an_unknown_next(
 
 
 def test_current_pin_uses_the_one_round_floor(weekly: SeatFixture) -> None:
-    """(h) mid-debate the current seat continues while one round (16.5 / 3.3 = 5 %) fits."""
+    """(h) mid-debate the current seat continues while one round (5 %) fits."""
     now = int(time.time())
-    floor = _RESERVE / cic._ROUNDS_PER_RESERVE  # noqa: SLF001
+    floor = _ROUND
     _week(weekly.seats["private"], 20.0, 90.0, now=now)
     _week(weekly.seats["de"], 20.0, 10.0, now=now)
     verdict = _cont()
@@ -1249,7 +1267,7 @@ def test_first_tryable_table_on_synthetic_entries() -> None:
 
 @pytest.fixture(name="trio")
 def _trio(
-    seats: SeatFixture, reserve_calls: list[int], monkeypatch: pytest.MonkeyPatch
+    seats: SeatFixture, reserve_calls: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> SeatFixture:
     """All three seats allowed, the weekly reserve pinned, routing order private, de, default."""
     _ = reserve_calls
