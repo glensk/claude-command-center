@@ -1760,11 +1760,20 @@ def _python_api_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
-def _probe_python_api() -> str:
+#: ``python_api_error`` when the probe child outlived its wall-clock bound: the connect is
+#: stuck before the websocket's own ``wait_for`` — in the ``iterm2`` package's unbounded
+#: cookie request (tp#2698).
+PYTHON_API_COOKIE_PENDING = (
+    f"no answer within {CHANNEL_PROBE_TIMEOUT + 1:g} s (Python API cookie request pending: "
+    "answer iTerm2's prompt or allow all apps to use the API)"
+)
+
+
+def _python_api_connect() -> str:
     """``""`` when a bounded Python-API connect succeeds (closed again, nothing sent),
-    else the reason it did not."""
-    if not _iterm_api_auth_is_tcc_free() and not _iterm_reachable_by_apple_event():
-        return "no Automation grant for iTerm2 (the API cookie request would hang)"
+    else the reason it did not. Runs IN-PROCESS: only the probe child calls it
+    (:func:`python_api_probe_child`), on its main thread — with pyobjc installed the
+    package's cookie request is an in-process ``NSAppleScript``."""
     try:
         import asyncio  # pylint: disable=import-outside-toplevel
 
@@ -1783,6 +1792,66 @@ def _probe_python_api() -> str:
     return ""
 
 
+def python_api_probe_child() -> int:
+    """The probe child's entry point: connect once, print the reason on failure.
+
+    Exit status 0 = connected (and closed again), 1 = not; the reason is the last
+    stdout line. Called by :func:`_python_api_probe_argv`'s command only.
+    """
+    error = _python_api_connect()
+    if error:
+        print(error, flush=True)
+        return 1
+    return 0
+
+
+def _python_api_probe_argv() -> list[str]:
+    """The probe child's command: THIS interpreter, THIS copy of the package."""
+    root = str(Path(__file__).resolve().parent.parent)
+    code = (
+        f"import sys; sys.path.insert(0, {root!r}); "
+        "import command_center.terminal as t; raise SystemExit(t.python_api_probe_child())"
+    )
+    return [sys.executable, "-c", code]
+
+
+def _probe_python_api(apple_event_ok: bool | None = None) -> str:
+    """``""`` when a bounded Python-API connect succeeds (closed again, nothing sent),
+    else the reason it did not.
+
+    The connect runs in a short-lived CHILD process killed after
+    ``CHANNEL_PROBE_TIMEOUT + 1`` s (tp#2698): the ``iterm2`` package's cookie request
+    has no timeout of its own, and with pyobjc it is an in-process ``NSAppleScript``
+    that must stay on a main thread, so no worker thread can bound it. *apple_event_ok*
+    is the caller's :func:`_iterm_reachable_by_apple_event` result (``None``: ask).
+    """
+    if not _iterm_api_auth_is_tcc_free():
+        if apple_event_ok is None:
+            apple_event_ok = _iterm_reachable_by_apple_event()
+        if not apple_event_ok:
+            return "no Automation grant for iTerm2 (the API cookie request would hang)"
+    try:
+        result = subprocess.run(
+            _python_api_probe_argv(),
+            capture_output=True,
+            text=True,
+            timeout=CHANNEL_PROBE_TIMEOUT + 1,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return PYTHON_API_COOKIE_PENDING
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"the probe could not start: {_python_api_error(exc)}"
+    if result.returncode == 0:
+        return ""
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    if lines:
+        return lines[-1][:200]
+    err = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+    tail = f": {err[-1][:120]}" if err else ""
+    return f"the probe exited {result.returncode}{tail}"
+
+
 def delivery_channel_health() -> dict[str, Any]:
     """Which live-tab delivery channels :func:`send_text_via` can use from THIS process.
 
@@ -1792,12 +1861,16 @@ def delivery_channel_health() -> dict[str, Any]:
     closed; nothing is sent to any session), ``applescript`` =
     :func:`_iterm_reachable_by_apple_event`. Measured by the ``ccc await`` poller (the
     process that delivers) and recorded; views only read the record.
+
+    Worst case about 9 s: the AppleScript version query (5 s, asked ONCE and reused as
+    the probe's grant guard) plus the probe child's ``CHANNEL_PROBE_TIMEOUT + 1`` s.
     """
 
-    error = _probe_python_api()
+    applescript = _iterm_reachable_by_apple_event()
+    error = _probe_python_api(applescript)
     return {
         "python_api": not error,
-        "applescript": _iterm_reachable_by_apple_event(),
+        "applescript": applescript,
         "checked_at": int(time.time()),
         "python_api_error": error,
     }

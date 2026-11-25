@@ -79,8 +79,8 @@ def test_channel_probe_closes_without_a_traceback(
 ) -> None:
     monkeypatch.setattr(terminal, "_iterm_api_auth_is_tcc_free", lambda: True)
     monkeypatch.setattr(terminal, "_iterm_reachable_by_apple_event", lambda timeout=5: True)
-    health = terminal.delivery_channel_health()
-    assert health["python_api"] is True and health["python_api_error"] == ""
+    # The connect the probe child runs (tp#2698), in-process so the fake server is reached.
+    assert terminal._python_api_connect() == ""
     assert fake_iterm.done.wait(5)
     assert fake_iterm.closes == [1000]  # the server saw the client's normal close
     err = capfd.readouterr().err

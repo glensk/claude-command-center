@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -113,18 +114,108 @@ def test_no_automation_grant_sends_nothing(
 
 
 # --------------------------------------------------------------------------- probe
+_REAL_RUN = subprocess.run
+
+
+def _child(monkeypatch: pytest.MonkeyPatch, rungs: dict[str, Any], code: str) -> None:
+    """The probe child runs *code* for real; every other ``subprocess.run`` stays faked."""
+    fake_run = terminal.subprocess.run
+
+    def run(argv: list[str], **kwargs: Any) -> Any:
+        if argv[:2] == [sys.executable, "-c"] and "probe child" in argv[2]:
+            rungs["child_timeout"] = kwargs.get("timeout")
+            return _REAL_RUN(argv, **kwargs)  # pylint: disable=subprocess-run-check
+        return fake_run(argv, **kwargs)  # pylint: disable=subprocess-run-check
+
+    monkeypatch.setattr(terminal.subprocess, "run", run)
+    monkeypatch.setattr(
+        terminal, "_python_api_probe_argv", lambda: [sys.executable, "-c", f"# probe child\n{code}"]
+    )
+
+
 @pytest.mark.real_channel_probe
-def test_delivery_channel_health_reports_a_refused_api(rungs: dict[str, Any]) -> None:
+def test_a_hung_cookie_request_is_killed_within_the_bound(
+    rungs: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _child(monkeypatch, rungs, "import time; time.sleep(30)")
+    started = time.monotonic()
     health = terminal.delivery_channel_health()
+    assert time.monotonic() - started < 10
     assert health["python_api"] is False and health["applescript"] is True
-    assert health["python_api_error"] == terminal.PYTHON_API_DISABLED
-    assert abs(health["checked_at"] - time.time()) < 5
+    assert health["python_api_error"] == terminal.PYTHON_API_COOKIE_PENDING
+    assert "cookie request pending" in health["python_api_error"]
+    assert "no answer within 4 s" in health["python_api_error"]
+    assert rungs["child_timeout"] == terminal.CHANNEL_PROBE_TIMEOUT + 1
     assert not rungs["argv"]  # the probe never runs the typing script
 
 
 @pytest.mark.real_channel_probe
-def test_delivery_channel_health_closes_a_working_connection(
+def test_a_child_that_connected_reports_the_api_up(
     rungs: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _child(monkeypatch, rungs, "raise SystemExit(0)")
+    health = terminal.delivery_channel_health()
+    assert health["python_api"] is True and health["python_api_error"] == ""
+
+
+@pytest.mark.real_channel_probe
+def test_the_child_reason_becomes_the_error(
+    rungs: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code = f"print('noise'); print({terminal.PYTHON_API_DISABLED!r}); raise SystemExit(1)"
+    _child(monkeypatch, rungs, code)
+    health = terminal.delivery_channel_health()
+    assert health["python_api"] is False
+    assert health["python_api_error"] == terminal.PYTHON_API_DISABLED
+    _child(monkeypatch, rungs, "import sys; sys.stderr.write('boom\\n'); raise SystemExit(3)")
+    assert terminal.delivery_channel_health()["python_api_error"] == "the probe exited 3: boom"
+
+
+@pytest.mark.real_channel_probe
+@pytest.mark.parametrize("tcc_free", [True, False])
+def test_the_version_query_runs_once_per_health_check(
+    rungs: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tcc_free: bool
+) -> None:
+    asked: list[float] = []
+
+    def reachable(timeout: float = 5) -> bool:
+        asked.append(timeout)
+        return False
+
+    monkeypatch.setattr(terminal, "_iterm_api_auth_is_tcc_free", lambda: tcc_free)
+    monkeypatch.setattr(terminal, "_iterm_reachable_by_apple_event", reachable)
+    _child(monkeypatch, rungs, "raise SystemExit(0)")
+    health = terminal.delivery_channel_health()
+    assert len(asked) == 1 and health["applescript"] is False
+    # No grant and no TCC-free switch: the child is never started.
+    assert health["python_api"] is tcc_free
+    assert ("child_timeout" in rungs) is tcc_free
+
+
+def test_the_real_child_command_imports_this_package() -> None:
+    argv = terminal._python_api_probe_argv()
+    assert argv[:2] == [sys.executable, "-c"]
+    code = argv[2].replace("t.python_api_probe_child()", "0 if t.CHANNEL_PROBE_TIMEOUT else 1")
+    assert code != argv[2]
+    result = _REAL_RUN(
+        [argv[0], "-c", code], capture_output=True, text=True, timeout=30, check=False
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.real_channel_probe
+def test_the_child_entry_reports_a_refused_api(
+    rungs: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert terminal.python_api_probe_child() == 1
+    assert capsys.readouterr().out.strip() == terminal.PYTHON_API_DISABLED
+    assert terminal._python_api_connect() == terminal.PYTHON_API_DISABLED
+    assert not rungs["argv"]  # the probe never runs the typing script
+
+
+@pytest.mark.real_channel_probe
+def test_the_child_entry_closes_a_working_connection(
+    rungs: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     import iterm2
 
@@ -141,8 +232,8 @@ def test_delivery_channel_health_closes_a_working_connection(
         return _Conn()
 
     monkeypatch.setattr(iterm2.Connection, "async_create", staticmethod(ok))
-    health = terminal.delivery_channel_health()
-    assert health["python_api"] is True and health["python_api_error"] == ""
+    assert terminal.python_api_probe_child() == 0
+    assert capsys.readouterr().out == ""
     assert closed == [True]
 
 
