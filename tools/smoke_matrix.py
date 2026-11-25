@@ -67,6 +67,7 @@ _VOLATILE_NAMES = {
     "mirror-sync.log",
     "usage.json",
     "copilot_usage.json",
+    "copilot_usage.attempt",
     "alerts.json",
     "jump_selected",
     "jump_request",
@@ -145,6 +146,7 @@ class Ctx:
     bindir: Path
     verbose: bool
     results: list[Result] = field(default_factory=list)
+    mark: float = field(default_factory=time.monotonic)
 
     def env(self) -> dict[str, str]:
         """The minimal sandbox env: HOME + CLAUDE_HOME + a venv-first PATH + LANG/TERM."""
@@ -158,14 +160,25 @@ class Ctx:
         return env
 
     def add(self, label: str, ok: bool, detail: str = "") -> bool:
-        """Record a matrix row and return its pass/fail bool."""
-        self.results.append(Result(label, ok, detail))
+        """Record a matrix row (detail ends with the step's seconds); return its pass/fail."""
+        now = time.monotonic()
+        elapsed = f"{now - self.mark:.1f} s"
+        self.mark = now
+        self.results.append(Result(label, ok, f"{detail}, {elapsed}" if detail else elapsed))
         return ok
 
 
 # --------------------------------------------------------------------------- #
 # subprocess helpers
 # --------------------------------------------------------------------------- #
+def _as_text(data: str | bytes | None) -> str:
+    """A TimeoutExpired stream (bytes, str or None) as text, newline-terminated when set."""
+    if data is None:
+        return ""
+    text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+    return text if not text or text.endswith("\n") else text + "\n"
+
+
 def _run(
     cmd: list[str],
     *,
@@ -175,15 +188,23 @@ def _run(
     verbose: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run *cmd* capturing text output; never raises on a non-zero exit."""
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout,
-        env=env,
-        stdin=subprocess.DEVNULL if stdin_devnull else None,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+            env=env,
+            stdin=subprocess.DEVNULL if stdin_devnull else None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        proc = subprocess.CompletedProcess(
+            cmd,
+            124,
+            _as_text(exc.stdout),
+            _as_text(exc.stderr) + f"timed out after {timeout} s",
+        )
     if verbose:
         print(f"    $ {' '.join(cmd)}  (rc={proc.returncode})")
         for stream in (proc.stdout, proc.stderr):
@@ -413,6 +434,17 @@ def run_checks(ctx: Ctx) -> None:  # pylint: disable=too-many-locals
     # 3. ccc demo --ls
     p = _run([ccc, "demo", "--ls"], env=env, verbose=v)
     ctx.add("ccc demo --ls", p.returncode == 0 and not _has_traceback(p), f"exit {p.returncode}")
+
+    # 3b. seed a fresh channel-health record so doctor (and the doctor nested in
+    # `ccc init --minimal`) never sends an Apple event to the real iTerm2.
+    seed = (
+        "import time\n"
+        "from command_center.store import Store\n"
+        "Store().put_channel_health({'python_api': False, 'applescript': False,"
+        " 'checked_at': int(time.time()), 'python_api_error': 'seeded by smoke matrix'})\n"
+    )
+    p = _run([str(ctx.venv / "bin" / "python"), "-c", seed], env=env, verbose=v)
+    ctx.add("seed channel health (hermetic doctor)", p.returncode == 0, f"exit {p.returncode}")
 
     # 4. ccc doctor — exit 0 or 1 both OK on a bare machine; a traceback is a FAIL.
     p = _run([ccc, "doctor"], env=env, verbose=v)

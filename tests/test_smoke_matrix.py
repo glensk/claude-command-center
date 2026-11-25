@@ -48,6 +48,14 @@ def _load_smoke_module() -> ModuleType:
     return mod
 
 
+def test_run_timeout_returns_124_instead_of_raising() -> None:
+    """A hung step becomes a FAIL row (rc 124), never a crash before the table prints."""
+    mod = _load_smoke_module()
+    proc = mod._run([sys.executable, "-c", "import time; time.sleep(5)"], timeout=1)
+    assert proc.returncode == 124
+    assert "timed out after 1 s" in proc.stderr
+
+
 def test_daemon_quota_caches_are_churn_not_leaks() -> None:
     """tp#687: the live daemon rewrites these mid-run; flagging them made the matrix flaky."""
     mod = _load_smoke_module()
@@ -62,6 +70,7 @@ def test_daemon_quota_caches_are_churn_not_leaks() -> None:
         "cooldowns.json",
         "codex-seat-attempts.json",
         "codex-runs.jsonl",
+        "copilot_usage.attempt",
         "snapshots/20260830-164938.json",
         "codex-switch/17fdeb91eff8033c.json",
     ]
