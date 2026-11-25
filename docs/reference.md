@@ -1415,8 +1415,10 @@ session via applescript").
 
 The poller also MEASURES both channels — where delivery happens, under the poller's own
 executable and Automation grant — at most every 5 minutes
-(`terminal.delivery_channel_health`: a ≤ 3 s Python-API connect that is closed again
-and sends nothing, plus the AppleScript version query) and records the result in the
+(`terminal.delivery_channel_health`: a Python-API connect in a child process that is
+killed after `CHANNEL_PROBE_TIMEOUT` + 1 s — a pending iTerm2 cookie prompt reads
+"Python API cookie request pending" instead of blocking up to 120 s — closed again and
+sending nothing, plus one AppleScript version query; about 9 s worst case) and records the result in the
 single-row `await_channel_health` table of the store (`checked_at`, `python_api`,
 `applescript`, `python_api_error` — the `mirror_health` pattern). The pass that
 measured logs it as `channels={…}`. The TUI AWAITING rule, the AWAITING detail pane and
