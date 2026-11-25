@@ -426,14 +426,23 @@ debate seat: de (5h 42 % < cap 70 %, strict)
 ```
 
 Candidates are `codex_homes_in_order(probe=False)` — the pin, rota, cooldowns and
-fill/order ranking — FILTERED by `codex_debate_seats`; the first TRYABLE one in routing
-(codex) order wins: measured below its cap, or unmeasured (see below). An inherited
-`$CODEX_HOME` narrows them to that home but is still checked against the allowlist and
-the cap (`not_allowed` for a forbidden or unregistered home).
+fill/order ranking — ordered by `codex_debate_seats` (a preference order over ALL
+registered seats: listed seats first, then the rest in `codex_seat_order`); the first
+TRYABLE and ELIGIBLE one in routing (codex) order wins: measured below its cap, or
+unmeasured (see below). Eligibility is live per (seat, model): a plan reading of `free`
+funding-blocks a seat, a `refused:model` attempt blocks that seat for that model for
+`codex_model_refusal_ttl_h` (24) hours (a later same-model `ok` clears it; one read-only
+canary runs after half the TTL), and quota applies as below. An inherited `$CODEX_HOME`,
+`run -S`, a resume or `-Q` narrow the choice to that home but never bypass a funding or
+same-model refusal block (`seat_unavailable` with the reason; no codex process starts).
+`ccc quota`, `debate-seat`, `headroom` and `order` (all take `-m/--model`) show a skipped
+seat as `<seat> (<plan>) skipped — <reason>`; the refresh measures every registered seat
+before eligibility filtering.
 The WEEK counts too (tp#2495): when a seat's seven-day reading is KNOWN (present, not
 stale, before its reset), its remaining weekly allowance must be at least the learned
-reserve `_headroom_reserve(10080)` (the cost of one full debate; 35 % bootstrap before 10
-samples). Only the value is used, not the offload gate, so there is no ten-minute
+reserve (the debate start reserve: 1.1 x the nearest-rank P95 of the measured cost of one
+closed debate, per seat from 20 debates, else pooled over all seats; 35 % bootstrap below
+10 debates; bounds 5-60 %). Only the value is used, not the offload gate, so there is no ten-minute
 near-reset exception: a seat inside its reserve is `capped` until the weekly reset. Missing
 or stale weekly data never denies. When both limits apply the reason names both and
 `resets_at` is the later reset.
@@ -451,7 +460,7 @@ fail-closed `unknown`: a bad policy or tier, or a crash (`CCC_NO_CODEX` → `dis
 
 | key                            | default | meaning                                                   |
 | :----------------------------- | :------ | :-------------------------------------------------------- |
-| `codex_debate_seats`           | `[]`    | labels / `codex_seat_aliases` a debate may bill; `[]` = all |
+| `codex_debate_seats`           | `[]`    | debate preference order (labels / `codex_seat_aliases`); unlisted seats follow in `codex_seat_order`; eligibility is live, not a filter |
 | `codex_debate_cap_strict_pct`  | `70`    | cap of the strict tier                                    |
 | `codex_debate_cap_default_pct` | `75`    | cap of the default tier                                   |
 | `codex_debate_seat_caps`       | `[]`    | per-seat overrides, `"label=<strict>/<default>"`          |
@@ -476,12 +485,12 @@ a debate can move seats between rounds. Before each round after the first,
 <tier> -r <repo>`:
 
 - **pool**: `-p tool` (the default — a tool chose the seat) = the routing order computed
-  as if `$CODEX_HOME` were NOT set, filtered by `codex_debate_seats`, minus every `-x`
+  as if `$CODEX_HOME` were NOT set, ordered by `codex_debate_seats` and limited to live-eligible seats, minus every `-x`
   label (`-x` may name the current seat, e.g. after a mid-round refusal); `-p human` =
   exactly the inherited `$CODEX_HOME`, which must be the `-c` seat (else `unknown`).
 - **continue**: the current seat, refreshed first, is not blocked, not excluded and still
-  routed and allowlisted, (known weekly reading only) keeps a weekly remainder of at least
-  reserve / 3.3 (one learned round), and either has a FRESH five-hour reading below the
+  routed and live-eligible, (known weekly reading only) keeps a weekly remainder of at least
+  one learned round (1.1 x P95 of one round's cost, per seat from 20 rounds, else pooled), and either has a FRESH five-hour reading below the
   **pause point** or is unmeasured (tp#2494: no fresh five-hour reading after the
   refresh — its `seats[]` entry stays `unknown`, the verdict is `continue` with
   `used_percent: null`, for `-p tool` and `-p human` alike; the text form prints

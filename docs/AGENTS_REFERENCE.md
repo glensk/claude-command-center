@@ -336,7 +336,11 @@ Four more the runner owns (tests: `tests/test_codex_runner.py`, `tests/test_code
    *Which* seat leads is `codex_seat_policy` (`quota.rank_codex_seats`, pure and injectable):
    `fill` (the default) spends the seat whose WEEKLY allowance resets soonest — seats resetting
    within 12 h of each other are one cohort, filled equally by 5 % usage bucket then by the
-   `codex-seat-attempts.json` ledger — while `order` is the strict `codex_seat_order`. The
+   `codex-seat-attempts.json` ledger — while `order` is the strict `codex_seat_order`.
+`codex_seat_order` and `codex_debate_seats` are preference orders over all registered
+seats, not allowlists: eligibility is live per (seat, model) (plan `free` funding block,
+`refused:model` for `codex_model_refusal_ttl_h`, quota), a pin never bypasses it, and
+`ccc quota` shows the skip reason. The
    account pin leads under `fill` but only enrolled paths may be pinned; under `order` an
    explicit order disarms it. A seat SHARED on alternating weeks (`codex_seat_rota`) is a
    COMPUTED block for the weeks that are somebody else's — absolute for automation (`-Q`, a
