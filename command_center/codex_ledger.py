@@ -85,6 +85,7 @@ import tempfile
 import time
 import uuid
 from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -780,23 +781,99 @@ def last_runs(rows: list[dict[str, Any]], now: int | None = None) -> dict[str, d
     refusals included: a refusal is a round trip the seat was asked to bill even when it
     declined.
     """
+    return summarize_seat_models(rows, now).last_runs
+
+
+#: The ``outcome`` of an attempt whose seat does not serve the requested model (tp#1632).
+OUTCOME_REFUSED_MODEL = "refused:model"
+
+
+def normalize_model(model: object) -> str:
+    """A ledger ``model`` value as a comparison key: stripped, lower-case (``""`` if none)."""
+    return str(model or "").strip().lower() if isinstance(model, str) else ""
+
+
+@dataclass
+class SeatModelSummary:
+    """What ONE pass over the ledger says per Codex seat and per (seat, model) pair.
+
+    ``last_runs`` is exactly :func:`last_runs`'s mapping. ``models`` maps
+    ``(oracle id, normalized model)`` to ``{"ok": epoch, "refused": epoch}`` — the newest
+    ``ok`` attempt and the newest ``refused:model`` attempt of that model on that seat
+    (0 when there is none). A row with no model, no seat id or an unparsable ``ts`` names
+    no pair and is left out of ``models``.
+    """
+
+    last_runs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    models: dict[tuple[str, str], dict[str, int]] = field(default_factory=dict)
+
+    def pair(self, pid: str, model: str) -> dict[str, int]:
+        """The ``{"ok", "refused"}`` epochs of (*pid*, *model*); both 0 when unseen."""
+        return self.models.get((pid, normalize_model(model)), {"ok": 0, "refused": 0})
+
+
+def _row_pid(row: dict[str, Any]) -> str:
+    """The oracle id a Codex row names: its ``id``, else one derived from ``seat``."""
+    pid = str(row.get("id") or "")
+    if pid:
+        return pid
+    seat = str(row.get("seat") or "")
+    if not seat:
+        return ""
+    return "codex" if seat == "default" else f"codex:{seat}"
+
+
+def summarize_seat_models(rows: list[dict[str, Any]], now: int | None = None) -> SeatModelSummary:
+    """Fold attempt *rows* (oldest first) into a :class:`SeatModelSummary` in ONE pass.
+
+    Codex rows only, markers excluded (a marker is no attempt, even when a caller passes
+    ``read_runs(include_markers=True)`` output). ``last_runs`` keeps :func:`last_runs`'s
+    contract: the newest line per ``id`` wins and ``runs_24h`` counts refusals too.
+    """
     now = int(time.time()) if now is None else now
-    rows = [row for row in rows if provider_of(row) == "codex"]  # Claude rows stamp nothing
-    recent = Counter(
-        str(row.get("id") or "") for row in rows if now - _epoch(str(row["ts"])) <= 86_400
-    )
-    out: dict[str, dict[str, Any]] = {}
+    recent: Counter[str] = Counter()
+    out = SeatModelSummary()
     for row in rows:  # oldest first, so the last write per id wins
-        pid = str(row.get("id") or "")
-        if not pid:
+        if provider_of(row) != "codex" or is_marker(row):
+            continue  # Claude rows stamp nothing; a marker is no attempt
+        epoch = _epoch(str(row.get("ts") or ""))
+        raw_pid = str(row.get("id") or "")
+        if now - epoch <= 86_400:
+            recent[raw_pid] += 1
+        if raw_pid:
+            out.last_runs[raw_pid] = {
+                "ts": row["ts"],
+                "age_s": max(0, now - epoch),
+                "purpose": str(row.get("purpose") or ""),
+                "outcome": str(row.get("outcome") or ""),
+                "ok": bool(row.get("ok")),
+                "ms": int(row.get("ms") or 0),
+            }
+        pid, model = _row_pid(row), normalize_model(row.get("model"))
+        if not (pid and model and epoch):
             continue
-        out[pid] = {
-            "ts": row["ts"],
-            "age_s": max(0, now - _epoch(str(row["ts"]))),
-            "purpose": str(row.get("purpose") or ""),
-            "outcome": str(row.get("outcome") or ""),
-            "ok": bool(row.get("ok")),
-            "ms": int(row.get("ms") or 0),
-            "runs_24h": recent.get(pid, 0),
-        }
+        outcome = str(row.get("outcome") or "")
+        if outcome == "ok" and row.get("ok") is True:
+            slot = "ok"
+        elif outcome == OUTCOME_REFUSED_MODEL:
+            slot = "refused"
+        else:
+            continue
+        pair = out.models.setdefault((pid, model), {"ok": 0, "refused": 0})
+        pair[slot] = max(pair[slot], epoch)
+    for pid, entry in out.last_runs.items():
+        entry["runs_24h"] = recent.get(pid, 0)
     return out
+
+
+def seat_model_summary(path: Path | None = None, now: int | None = None) -> SeatModelSummary:
+    """:func:`summarize_seat_models` over ONE :func:`read_runs` (markers excluded). Never raises.
+
+    The single ledger read a quota snapshot makes: the ``last_run`` stamps and the
+    (seat, model) refusal verdict (:func:`command_center.quota.codex_seat_eligibility`)
+    both come from it. A missing or unreadable ledger is an empty summary.
+    """
+    try:
+        return summarize_seat_models(read_runs(path), now)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return SeatModelSummary()

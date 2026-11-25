@@ -270,6 +270,12 @@ DEFAULTS: dict[str, object] = {
     # ``min(codex_debate_pause_pct, 100 - 1.1 x P95)``. 1..100, validated with the keys
     # above (fail closed).
     "codex_debate_pause_pct": 90,
+    # MODEL REFUSAL TTL (tp#2672 B1): a ``refused:model`` attempt keeps THAT (seat, model)
+    # pair out of routing for this many hours — never the whole seat. A later ``ok`` run
+    # of the same model on the seat clears it early; after half the TTL the pair gets ONE
+    # read-only canary attempt. A number of hours in (0, 720], validated by
+    # :func:`codex_model_refusal_ttl_h` (a bad value falls back to the default).
+    "codex_model_refusal_ttl_h": 24,
     # RELAY ACCOUNT SWITCH (tp#2149): a relay successor (``ccc quota -n``) stays on its
     # predecessor's Claude account and switches only when that account is PROVEN at/over
     # ``relay_switch_weekly_pct`` on one of ``relay_switch_windows`` (fresh reading) or
@@ -876,6 +882,32 @@ def relay_switch_policy(cfg: Config | None = None) -> tuple[float, tuple[str, ..
     return pct, tuple(windows)
 
 
+#: Upper bound of ``codex_model_refusal_ttl_h``: a refusal older than 30 days proves nothing.
+MODEL_REFUSAL_TTL_MAX_H = 720.0
+
+
+class RefusalTtlError(ValueError):
+    """``codex_model_refusal_ttl_h`` cannot be trusted — the message names the key."""
+
+
+def codex_model_refusal_ttl_h(cfg: Config | None = None) -> float:
+    """Hours a ``refused:model`` attempt blocks its (seat, model) pair (tp#2672 B1).
+
+    A number (never a bool) in ``(0, MODEL_REFUSAL_TTL_MAX_H]``; anything else raises
+    :class:`RefusalTtlError` naming the key. The eligibility verdict catches it and uses
+    the default, so a typo can neither unblock a refusing pair nor block one forever.
+    """
+    cfg = load_config() if cfg is None else cfg
+    key = "codex_model_refusal_ttl_h"
+    raw = cfg.codex_model_refusal_ttl_h
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        raise RefusalTtlError(f"{key}: {raw!r} is not a number")
+    hours = float(raw)
+    if not 0 < hours <= MODEL_REFUSAL_TTL_MAX_H:
+        raise RefusalTtlError(f"{key}: {hours:g} is outside (0, {MODEL_REFUSAL_TTL_MAX_H:g}]")
+    return hours
+
+
 def unknown_config_keys() -> list[str]:
     """Keys in the on-disk ``config.toml`` that :data:`DEFAULTS` does not know, sorted.
 
@@ -1273,6 +1305,7 @@ class Config:
     codex_debate_seat_caps: list[str] = field(default_factory=list)  # "label=strict/default"
     codex_debate_big_repos: list[str] = field(default_factory=list)  # force the strict tier
     codex_debate_pause_pct: float = 90  # mid-debate pause point (tp#620)
+    codex_model_refusal_ttl_h: float = 24  # (seat, model) refusal block, hours (tp#2672)
     relay_switch_weekly_pct: int = 98  # relay account switch threshold (tp#2149)
     relay_switch_windows: list[str] = field(default_factory=lambda: ["seven_day"])
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account

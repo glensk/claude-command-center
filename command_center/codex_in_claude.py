@@ -2576,6 +2576,13 @@ class SeatCandidate:  # pylint: disable=too-many-instance-attributes  # flat sea
     cohort: int | None = None
     measured: bool = False
     probe: bool = False
+    # tp#2672 B1: which claim a ``probe`` candidate needs — ``unmeasured``
+    # (:func:`command_center.quota.claim_probe`) or ``refusal_canary``
+    # (:func:`command_center.quota.claim_refusal_canary`, for ``model`` due at
+    # ``canary_at``). ``model`` is the normalized model the seat was judged for.
+    probe_kind: str = ""
+    model: str = ""
+    canary_at: int = 0
 
 
 def canonical_codex_homes() -> dict[str, Path]:
@@ -2619,7 +2626,9 @@ def _seat_candidate_for(home: Path) -> SeatCandidate:
     return SeatCandidate(label=label, home=home, email=email, pid=pid)
 
 
-def codex_homes_in_order(now: int | None = None, *, probe: bool = True) -> list[SeatCandidate]:
+def codex_homes_in_order(
+    now: int | None = None, *, probe: bool = True, model: str = "", canary: bool = False
+) -> list[SeatCandidate]:
     """The Codex seats to TRY, best first — the single source of truth for every runner.
 
     Three regimes, in this order:
@@ -2643,6 +2652,12 @@ def codex_homes_in_order(now: int | None = None, *, probe: bool = True) -> list[
     experiment (plan D5). A candidate carrying ``probe=True`` must not be launched until
     :func:`command_center.quota.claim_probe` has been won — the ranker only MARKS it.
 
+    *model* is the model the caller will run: the rows are judged for that (seat, model)
+    pair (tp#2672 B1), so a seat that refused it recently is out. *canary* (read-only
+    runs only, independent of *probe*) appends a due refusal canary last; its candidate
+    carries ``probe_kind="refusal_canary"`` and must win
+    :func:`command_center.quota.claim_refusal_canary` before launch.
+
     An empty list in regime 3 means every seat is held/blocked, and that is FINAL:
     there is deliberately no "fall back to the default seat anyway" any more (debate
     objection O3). A call the oracle knows will be refused costs a round trip, muddies
@@ -2660,10 +2675,14 @@ def codex_homes_in_order(now: int | None = None, *, probe: bool = True) -> list[
 
         now_ts = int(time.time()) if now is None else int(now)
         homes = quota._canonical_codex_homes()  # noqa: SLF001
-        rows = quota._codex_quotas(now_ts, quota.read_cooldowns(now_ts))  # noqa: SLF001
+        rows = quota._codex_quotas(  # noqa: SLF001
+            now_ts, quota.read_cooldowns(now_ts), model=model
+        )
         order = quota.codex_seat_order_labels(homes)
         pin = quota._codex_pin_label(homes)  # noqa: SLF001
-        ranked = quota.rank_codex_seats(rows, pin, order, now=now_ts, probe=probe)
+        ranked = quota.rank_codex_seats(
+            rows, pin, order, now=now_ts, probe=probe, canary=canary and bool(model)
+        )
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         print(
             f"⚠️  Codex seat selection failed ({type(exc).__name__}: {exc}) — no seat tried",
@@ -2680,6 +2699,9 @@ def codex_homes_in_order(now: int | None = None, *, probe: bool = True) -> list[
             cohort=rank.cohort,
             measured=rank.measured,
             probe=rank.probe,
+            probe_kind=rank.probe_kind,
+            model=rank.model or quota.normalize_model(model),
+            canary_at=rank.canary_at,
         )
         for rank in ranked
         if rank.row.account in homes
@@ -4311,11 +4333,16 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
     now: int | None = None,
     *,
     refresh: bool = True,
+    model: str = "",
 ) -> dict[str, Any]:
     """Which seat may a Codex debate START on now — the tp#619 gate. Starts no Codex.
 
     * **tier**: ``strict`` when *tier* says so OR *repo* is in ``codex_debate_big_repos``;
       every input can only raise it.
+    * **model** (tp#2672 B1): the debate's model; the seats are judged for that (seat,
+      model) pair, and a due refusal canary is offered last (a debate round is a
+      read-only run; ``probe=False`` governs the unmeasured-seat probe only). ``""``
+      judges funding alone.
     * **candidates**: :func:`codex_homes_in_order` (``probe=False``) — ccc's own pin,
       rota, cooldowns and fill/order ranking — FILTERED by ``codex_debate_seats``. An
       inherited ``$CODEX_HOME`` narrows them to that one home, but it is still
@@ -4354,7 +4381,7 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
     inherited = bool(os.environ.get("CODEX_HOME"))
 
     def _select() -> list[SeatCandidate]:
-        cands = codex_homes_in_order(now_ts, probe=False)
+        cands = codex_homes_in_order(now_ts, probe=False, model=model, canary=True)
         return cands if inherited else [cand for cand in cands if cand.label in allowed]
 
     candidates = _select()
@@ -4400,7 +4427,9 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
         for label, home in registered.items():
             if label not in allowed or label in listed:
                 continue
-            ghost = SeatCandidate(label=label, home=home, email="", pid=_seat_pid(label))
+            ghost = SeatCandidate(
+                label=label, home=home, email="", pid=_seat_pid(label), model=model
+            )
             cap = policy.cap_for(label, tier)
             reserve, reserve_source = _debate_weekly_reserve(label, history=history)
             entry = _debate_seat_entry(
@@ -5552,8 +5581,12 @@ def _candidate_row(cand: SeatCandidate, now: int) -> quota.ProviderQuota:
 
     cooldowns = quota.read_cooldowns(now)
     if cand.pid:
-        for row in quota._codex_quotas(now, cooldowns):  # noqa: SLF001
+        # Judged for the candidate's own model (tp#2672 B1); a refusal canary runs against
+        # the pre-refusal row, exactly as the ranking that offered it saw it.
+        for row in quota._codex_quotas(now, cooldowns, model=cand.model):  # noqa: SLF001
             if row.id == cand.pid:
+                if cand.probe_kind == "refusal_canary":
+                    return quota.refusal_canary_view(row)
                 return row
     return quota._codex_seat_quota(cand.pid, cand.label, cand.home, now, cooldowns)  # noqa: SLF001
 
@@ -5638,10 +5671,16 @@ def _record_attempt(cand: SeatCandidate) -> None:
 
 
 def _claim_probe(cand: SeatCandidate) -> bool:
-    """Win the once-a-day probe of unmeasured seat *cand*; False ⇒ someone else has it."""
+    """Win *cand*'s probe claim; False ⇒ someone else has it.
+
+    The once-a-day probe of an unmeasured seat, or — ``probe_kind="refusal_canary"`` —
+    the ONE canary of a refused (seat, model) pair, claimed in its own namespace.
+    """
     from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
 
     try:
+        if cand.probe_kind == "refusal_canary":
+            return quota.claim_refusal_canary(cand.pid, cand.model, due_at=cand.canary_at)
         return quota.claim_probe(cand.pid)
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return False  # cannot claim ⇒ do not probe; the ranking has other seats
@@ -6099,11 +6138,14 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
     # A resume binds to one seat, so promoting an unmeasured seat would be meaningless;
     # a write run refuses to experiment at all (plan D5/D7).
     probe_ok = resume_home is None and not write
+    # The (seat, model) refusal canary (tp#2672 B1) is offered to every READ-ONLY run —
+    # never a write run or a resume — independently of the unmeasured-seat probe.
+    canary_ok = resume_home is None and not write
     if resume_home is not None:
         pending = [_seat_candidate_for(resume_home)]
     else:
         refresh_seat_readings(probe=probe_ok)
-        pending = codex_homes_in_order(probe=probe_ok)
+        pending = codex_homes_in_order(probe=probe_ok, model=model, canary=canary_ok)
     pending = _confined(pending, seat)
     if not pending:
         return _seat_result(result, seat) if seat else _no_seat_result(result)
@@ -6116,7 +6158,9 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
     while True:
         if attempted and resume_home is None:
             # a hold written mid-run removes a seat
-            pending = _confined(codex_homes_in_order(probe=probe_ok), seat)
+            pending = _confined(
+                codex_homes_in_order(probe=probe_ok, model=model, canary=canary_ok), seat
+            )
         pending = [c for c in pending if str(c.home) not in attempted]
         if not pending:
             break
@@ -6137,9 +6181,15 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
         if cand.probe and not _claim_probe(cand):
             # Another runner took today's probe of this unmeasured seat: re-rank WITHOUT
             # it rather than spend a second round trip on the same experiment (plan D7).
-            probe_ok = False
+            # A lost refusal canary withdraws only the canary, a lost probe only the probe.
+            if cand.probe_kind == "refusal_canary":
+                canary_ok = False
+            else:
+                probe_ok = False
             attempted.discard(str(cand.home))
-            pending = _confined(codex_homes_in_order(probe=False), seat)
+            pending = _confined(
+                codex_homes_in_order(probe=probe_ok, model=model, canary=canary_ok), seat
+            )
             continue
         if max_attempts and physical >= max_attempts:
             result.error_kind = "attempts_exhausted"
@@ -6307,7 +6357,11 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
             result.seat, result.reply = cand, reply
             result.error_kind = kind
             result.error_message = message
-            result.attempts.append(done.finish("failed", kind, cause, result.error_message))
+            # A model refusal that may not hop (``-S``, a resume, a touched worktree) is
+            # still the seat refusing THAT model: the ledger must say ``refused:model``,
+            # or the (seat, model) eligibility verdict never sees it (tp#2672 B1).
+            outcome = "refused:model" if kind == "model_unavailable" else "failed"
+            result.attempts.append(done.finish(outcome, kind, cause, result.error_message))
             return result
 
         record_seat_refusal(cand, failure)

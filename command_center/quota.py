@@ -310,6 +310,9 @@ _COOLDOWNS_NAME = "cooldowns.json"
 # arrives between two short runs — see :func:`rank_codex_seats`), and the once-a-day
 # claim that lets ONE unmeasured seat be probed.
 _SEAT_ATTEMPTS_NAME = "codex-seat-attempts.json"
+# The (seat, model) refusal canaries' claims (tp#2672 B1): a file of their own, so the
+# seat-wide probe and attempt map above can never postpone or consume one.
+_REFUSAL_CANARIES_NAME = "codex-refusal-canaries.json"
 
 # ── the ``fill`` policy's constants (plan D2, debate O1/O2/O5/O7) ────────────────────
 # Two weekly resets this close together are "about equally urgent": the seats form ONE
@@ -525,6 +528,17 @@ class ProviderQuota:
     # :func:`usage.read_codex_live_meta` (e.g. a ``free`` plan's lone 30-day window).
     # Advisory: feeds ``note``/``risky`` and the headroom reason, never ``state``.
     live_meta: dict[str, Any] = field(default_factory=dict)
+    # Codex seats only (tp#2672 B1): the seat's NEWEST plan reading — ``{"plan_type",
+    # "captured_at", "source"}`` (``source`` ``windows`` | ``live_meta``) — the funding
+    # half of :func:`codex_seat_eligibility`. Empty when no reading carried a plan.
+    plan: dict[str, Any] = field(default_factory=dict)
+    # Every cause that blocks the row, ``{"kind", "reason", "resets_at"}`` each (tp#2672
+    # B1), ``kind`` one of :data:`BLOCKER_ORDER`; ``state``/``reason``/``resets_at`` are
+    # their composition. Set by :func:`codex_seat_eligibility` on BLOCKED Codex rows.
+    blockers: list[dict[str, Any]] = field(default_factory=list)
+    # The row's verdict BEFORE the eligibility blockers were composed on (internal, never
+    # serialized): what a refusal canary (:func:`refusal_canary_view`) runs against.
+    pre_eligibility: dict[str, Any] = field(default_factory=dict)
 
 
 def _cooldowns_path() -> Path:
@@ -752,6 +766,61 @@ def claim_probe(pid: str, now: int | None = None, interval: int = _PROBE_INTERVA
             _write_seat_attempts(current)
     except OSError:
         return False  # cannot claim ⇒ do not probe (another runner may hold the file)
+    return True
+
+
+def _refusal_canaries_path() -> Path:
+    """Path of the (seat, model) refusal-canary claims — a namespace of their own."""
+    return config.app_home() / _REFUSAL_CANARIES_NAME
+
+
+def refusal_canary_key(pid: str, model: str) -> str:
+    """``model-refusal:<seat>:<normalized model>`` — one canary per refused pair."""
+    return f"model-refusal:{pid}:{normalize_model(model)}"
+
+
+def read_refusal_canaries() -> dict[str, int]:
+    """``{refusal_canary_key: last claim, epoch seconds}``; ``{}`` when absent/corrupt."""
+    try:
+        data = json.loads(_refusal_canaries_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    entries = data.get("claims") if isinstance(data, dict) else None
+    out: dict[str, int] = {}
+    for key, value in (entries if isinstance(entries, dict) else {}).items():
+        try:
+            out[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def claim_refusal_canary(seat: str, model: str, *, due_at: int = 0, now: int | None = None) -> bool:
+    """Atomically claim the ONE canary attempt of refused pair (*seat*, *model*) (tp#2672 B1).
+
+    True only when the pair's stored claim is older than *due_at* — the moment the canary
+    became due (refusal + half the TTL) — so each refusal buys exactly one canary, a
+    second caller loses, and a NEW refusal (a later *due_at*) re-arms it. The claims live
+    in their own file: neither the seat-wide unmeasured-seat probe (:func:`claim_probe`)
+    nor ordinary attempts (:func:`record_seat_attempt`) can postpone or consume them.
+    """
+    if not seat or not normalize_model(model):
+        return False
+    now = int(time.time()) if now is None else int(now)
+    key = refusal_canary_key(seat, model)
+    path = _refusal_canaries_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with usage._flock(path.with_suffix(".lock")):  # noqa: SLF001
+            current = read_refusal_canaries()
+            if int(current.get(key, 0)) >= int(due_at) and key in current:
+                return False
+            current[key] = now
+            usage._atomic_write_json(  # noqa: SLF001
+                path, {"version": SCHEMA_VERSION, "claims": current}
+            )
+    except OSError:
+        return False  # cannot claim ⇒ no canary
     return True
 
 
@@ -1041,6 +1110,34 @@ def _live_plan_type(live: usage.Usage | None, meta: dict[str, Any] | None = None
 
 
 _PAID_PLANS = frozenset({"plus", "team", "pro", "business", "enterprise"})
+#: Plans that count as FUNDED for :func:`codex_seat_eligibility` (tp#2672 B1 rule 1).
+_FUNDED_PLANS = _PAID_PLANS | {"edu"}
+
+
+def _plan_reading(
+    snap: usage.Usage | None, live: usage.Usage | None, meta: dict[str, Any] | None
+) -> dict[str, Any]:
+    """The seat's NEWEST plan reading ``{"plan_type", "captured_at", "source"}``, else ``{}``.
+
+    Candidates are the windowed snapshot (*snap*, live or rollout), the windowed live
+    cache (*live*) and the windowless live record (*meta*); a reading without a plan is
+    no reading. The newest ``captured_at`` wins, *meta* on a tie (it is always a fresh
+    live fetch, like :func:`_live_plan_type`).
+    """
+    best: dict[str, Any] = {}
+    for source, plan, captured in (
+        ("windows", snap.plan_type if snap is not None else "", snap.captured_at if snap else 0),
+        ("windows", live.plan_type if live is not None else "", live.captured_at if live else 0),
+        (
+            "live_meta",
+            str((meta or {}).get("plan_type") or ""),
+            int((meta or {}).get("captured_at") or 0),
+        ),
+    ):
+        plan_type = (plan or "").strip().lower()
+        if plan_type and (not best or int(captured) >= int(best["captured_at"])):
+            best = {"plan_type": plan_type, "captured_at": int(captured), "source": source}
+    return best
 
 
 def _codex_seat_note(
@@ -1149,7 +1246,7 @@ def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-loca
     if entry is not None and not superseded:
         quota = _cooldown_quota(pid, "codex", entry, windows)
         quota.account, quota.email = label, email
-        quota.live_meta = meta
+        quota.live_meta, quota.plan = meta, _plan_reading(snap, live, meta)
         return quota
     # No auth.json = no login here (or a keyring store this reader cannot see). UNKNOWN,
     # never BLOCKED: "we could not measure it" must not delete a rung — the run-time
@@ -1179,6 +1276,7 @@ def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-loca
             risky=free_plan,
             note=note,
             live_meta=meta,
+            plan=_plan_reading(snap, live, meta),
         )
     if superseded and entry is not None:
         # Say WHY the row disagrees with a cooldown entry a reader can still see in
@@ -1227,6 +1325,7 @@ def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-loca
                 note=note,
                 malformed=snap.malformed,
                 live_meta=meta,
+                plan=_plan_reading(snap, live, meta),
             )
         age = _compact_duration(now - observed) if observed else "unknown-age"
         note = " · ".join(part for part in (note, f"refusal {age} old — remeasure") if part)
@@ -1247,6 +1346,7 @@ def _codex_seat_row(  # pylint: disable=too-many-return-statements,too-many-loca
         note=note,
         malformed=snap.malformed,
         live_meta=meta,
+        plan=_plan_reading(snap, live, meta),
     )
 
 
@@ -1360,6 +1460,7 @@ def _rota_blocked(
         "underlying": {
             "state": row.state,
             "blocked_by": row.blocked_by,
+            "block_scope": row.block_scope,
             "reason": row.reason,
             "resets_at": row.resets_at,
             "resets_label": seat_rota.day_label(row.resets_at, str(payload.get("tz") or "")),
@@ -1490,32 +1591,259 @@ def _rota_state(spec: seat_rota.RotaSpec, me: str, now: int) -> seat_rota.RotaSt
         return None
 
 
-def _codex_quotas(now: int, cooldowns: dict[str, dict]) -> list[ProviderQuota]:
-    """One row per configured Codex seat.
+def _codex_quotas(
+    now: int,
+    cooldowns: dict[str, dict],
+    *,
+    model: str = "",
+    summary: codex_ledger.SeatModelSummary | None = None,
+) -> list[ProviderQuota]:
+    """One row per configured Codex seat, judged by :func:`codex_seat_eligibility`.
 
     ``codex`` (team), then ``codex:private``, then one ``codex:<label>`` per
     ``codex_homes_extra`` login — the ids an account pin and a hold are named by.
+    The live eligibility verdict (funding always; the (seat, *model*) refusal when a
+    *model* is given) is applied HERE, before any ranking, so every consumer of the rows
+    sees one answer. *summary* is the caller's single ledger pass; without one it is read
+    only when a model needs it.
     """
     rows = []
     for label, home in _canonical_codex_homes().items():
         pid = "codex" if label == "default" else f"codex:{label}"
         rows.append(_codex_seat_quota(pid, label, home, now, cooldowns))
-    return rows
+    return codex_seat_eligibility(rows, now, model, summary=summary)
 
 
-def _attach_last_runs(rows: list[ProviderQuota], now: int) -> None:
+def _attach_last_runs(
+    rows: list[ProviderQuota], now: int, summary: codex_ledger.SeatModelSummary | None = None
+) -> None:
     """Stamp each Codex row with its newest ledger attempt (``last_run``); no-op without one.
 
-    Read once per snapshot, never fatal: a corrupt or missing ledger leaves the rows as
-    they were — the ledger is evidence for a person, not an input to any verdict.
+    Read once per snapshot (the caller's *summary*, else one read here), never fatal: a
+    corrupt or missing ledger leaves the rows as they were — ``last_run`` is evidence for
+    a person, not an input to any verdict.
     """
-    try:
-        runs = codex_ledger.last_runs(codex_ledger.read_runs(), now)
-    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-        return
+    runs = (summary if summary is not None else codex_ledger.seat_model_summary(now=now)).last_runs
     for row in rows:
         if row.id in runs:
             row.last_run = runs[row.id]
+
+
+# ── live eligibility: one (seat, model) verdict (tp#2672 B1) ─────────────────────────
+#: Blocker kinds, in the order a composed ``reason`` names them.
+BLOCKER_ORDER = ("needs_login", "hold", "funding", "model_refusal", "quota", "rota")
+
+
+def normalize_model(model: str) -> str:
+    """*model* as a ledger comparison key: alias-resolved, stripped, lower-case.
+
+    Short names (``astra``) resolve through codex-in-claude's alias table first, so a
+    refusal recorded under the slug matches a request made by alias. Never raises: an
+    alias table that cannot be read leaves the name as given.
+    """
+    name = codex_ledger.normalize_model(model)
+    if not name:
+        return ""
+    try:
+        from . import codex_in_claude  # pylint: disable=import-outside-toplevel  # cycle
+
+        resolved = codex_in_claude.resolve_alias(name)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        resolved = None
+    return codex_ledger.normalize_model(resolved) or name
+
+
+def _model_refusal_ttl_sec() -> int:
+    """``codex_model_refusal_ttl_h`` in seconds; the default when the value is invalid."""
+    try:
+        hours = config.codex_model_refusal_ttl_h()
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught  # never fatal
+        hours = float(config.Config().codex_model_refusal_ttl_h)
+    return int(hours * 3600)
+
+
+def _blocker(kind: str, reason: str, resets_at: int = 0, **extra: Any) -> dict[str, Any]:
+    """One ``blockers`` entry."""
+    return {"kind": kind, "reason": reason, "resets_at": int(resets_at or 0), **extra}
+
+
+def _blocker_kind(scope: str, blocked_by: str, source: str = "") -> str:
+    """Classify an ordinary block by its cooldown scope / signal."""
+    if scope == "auth":
+        return "needs_login"
+    if scope == "hold" or blocked_by == "hold" or source == "hold":
+        return "hold"
+    if scope == "funding":
+        return "funding"
+    return "quota"
+
+
+def _base_blockers(row: ProviderQuota) -> list[dict[str, Any]]:
+    """The causes that block *row* before eligibility: its own block, a rota's two halves."""
+    if row.state != BLOCKED:
+        return []
+    if row.block_scope == "rota":
+        out: list[dict[str, Any]] = []
+        under = row.rota.get("underlying") or {}
+        if under.get("state") == BLOCKED:
+            kind = _blocker_kind(str(under.get("block_scope") or ""), str(under.get("blocked_by")))
+            out.append(_blocker(kind, str(under.get("reason") or ""), under.get("resets_at") or 0))
+        out.append(_blocker("rota", row.reason, row.rota.get("next_mine_at") or 0))
+        return out
+    kind = _blocker_kind(row.block_scope, row.blocked_by, row.source)
+    return [_blocker(kind, row.reason or "seat is blocked", row.resets_at)]
+
+
+def _funding_blocker(row: ProviderQuota, now: int) -> dict[str, Any] | None:
+    """Rule 1: a NEWEST plan reading of ``free`` blocks; no or an odd reading is fail-open."""
+    plan = str(row.plan.get("plan_type") or "")
+    if plan != "free":
+        return None
+    age = _compact_duration(now - int(row.plan.get("captured_at") or 0))
+    return _blocker("funding", f"plan free (live {age})", 0)
+
+
+def _refusal_blocker(
+    row: ProviderQuota, model: str, summary: codex_ledger.SeatModelSummary, now: int, ttl: int
+) -> dict[str, Any] | None:
+    """Rule 2: a fresh ``refused:model`` of (seat, *model*) not cleared by a later same-model ok."""
+    if not model or not row.id:
+        return None
+    pair = summary.pair(row.id, model)
+    refused, ok = int(pair.get("refused") or 0), int(pair.get("ok") or 0)
+    if not refused or ok >= refused or refused + ttl <= now:
+        return None
+    age = _compact_duration(now - refused)
+    return _blocker(
+        "model_refusal",
+        f"refused:model {model} {age} ago",
+        refused + ttl,
+        model=model,
+        refused_at=refused,
+        canary_at=refused + ttl // 2,
+    )
+
+
+def _compose(row: ProviderQuota, blockers: list[dict[str, Any]], extra: list[str]) -> ProviderQuota:
+    """*row* BLOCKED by every one of *blockers*, its pre-verdict state kept for a canary."""
+    blockers = sorted(blockers, key=lambda b: BLOCKER_ORDER.index(b["kind"]))
+    timed = all(int(b["resets_at"]) > 0 for b in blockers)
+    first_new = next(b for b in blockers if b["kind"] in extra)
+    pre = {
+        "state": row.state,
+        "reason": row.reason,
+        "source": row.source,
+        "blocked_by": row.blocked_by,
+        "resets_at": row.resets_at,
+        "block_scope": row.block_scope,
+        "risky": row.risky,
+        "blockers": list(row.blockers),
+    }
+    was_blocked = row.state == BLOCKED
+    return replace(
+        row,
+        state=BLOCKED,
+        reason="; ".join(b["reason"] for b in blockers),
+        source=row.source if was_blocked else "eligibility",
+        blocked_by=(
+            row.blocked_by
+            if was_blocked
+            else ("plan_type" if first_new["kind"] == "funding" else "model_refusal")
+        ),
+        # A rota / needs-login / hold keeps its scope: the runner's typed skips and `-Q`'s
+        # waiver read it. A seat blocked by eligibility alone is ``funding``.
+        block_scope=row.block_scope or "funding",
+        resets_at=max(int(b["resets_at"]) for b in blockers) if timed else 0,
+        risky=True,
+        blockers=blockers,
+        pre_eligibility=pre,
+    )
+
+
+def codex_seat_eligibility(
+    rows: list[ProviderQuota],
+    now: int,
+    model: str = "",
+    *,
+    summary: codex_ledger.SeatModelSummary | None = None,
+) -> list[ProviderQuota]:
+    """Judge every Codex row by LIVE state — the ONE (seat, *model*) eligibility verdict.
+
+    Recomputed from the rows' plan readings and the run ledger on every call; nothing is
+    written to the cooldown store. Per seat, in order (tp#2672 B1):
+
+    1. **funding** — the newest plan reading (:attr:`ProviderQuota.plan`) ``free`` blocks
+       (``blocked_by="plan_type"``, untimed). A funded plan, no reading, or an
+       unrecognized one stays eligible; an unrecognized one adds ``plan <x> unknown`` to
+       the note (fail-open).
+    2. **model refusal** — a ``refused:model`` attempt of (seat, *model*) within
+       ``codex_model_refusal_ttl_h`` blocks that pair only (``blocked_by="model_refusal"``,
+       ``resets_at`` = the refusal's expiry), until a LATER ``ok`` of the same model on
+       the seat or the TTL. A plan reading never clears it. Skipped without a *model*.
+    3. quota, cooldowns, holds, needs-login and rota stay as the row already says.
+
+    Several causes compose into ONE ``BLOCKED`` row listing every cause in ``blockers``;
+    ``resets_at`` is the latest reset only when every cause has one, else 0. A blocked
+    row keeps its windows. Rows that are not blocked by anything get no ``blockers``.
+    """
+    model = normalize_model(model)
+    if model and summary is None:
+        summary = codex_ledger.seat_model_summary(now=now)
+    ttl = _model_refusal_ttl_sec()
+    out: list[ProviderQuota] = []
+    for row in rows:
+        if row.pre_eligibility:  # already judged: start again from the pre-verdict row
+            row = replace(row, **row.pre_eligibility, pre_eligibility={})  # noqa: PLW2901
+        plan = str(row.plan.get("plan_type") or "")
+        unknown = f"plan {plan} unknown"
+        if plan and plan != "free" and plan not in _FUNDED_PLANS and unknown not in row.note:
+            row.note = " · ".join(p for p in (row.note, unknown) if p)
+        added = [
+            b
+            for b in (
+                _funding_blocker(row, now),
+                _refusal_blocker(row, model, summary, now, ttl) if summary is not None else None,
+            )
+            if b is not None
+        ]
+        base = _base_blockers(row)
+        if added:
+            row = _compose(row, base + added, ["funding", "model_refusal"])  # noqa: PLW2901
+        elif base:
+            row.blockers = base
+        out.append(row)
+    return out
+
+
+def _refusal_only(row: ProviderQuota) -> dict[str, Any] | None:
+    """The model-refusal blocker of *row* when it is the row's ONLY cause, else ``None``."""
+    if row.state != BLOCKED or not row.pre_eligibility or len(row.blockers) != 1:
+        return None
+    blocker = row.blockers[0]
+    return blocker if blocker.get("kind") == "model_refusal" else None
+
+
+def refusal_canary_due(row: ProviderQuota, now: int) -> dict[str, Any] | None:
+    """The blocker whose ONE canary attempt *row* may get now, else ``None``.
+
+    Only a row blocked by a (seat, model) refusal alone qualifies, once half the TTL has
+    passed (``canary_at``) and the pair's canary has not been claimed since.
+    """
+    blocker = _refusal_only(row)
+    if blocker is None or int(blocker.get("canary_at") or 0) > now:
+        return None
+    key = refusal_canary_key(row.id, str(blocker.get("model") or ""))
+    claims = read_refusal_canaries()
+    if key in claims and claims[key] >= int(blocker.get("canary_at") or 0):
+        return None
+    return blocker
+
+
+def refusal_canary_view(row: ProviderQuota) -> ProviderQuota:
+    """*row* as its refusal canary runs it: the pre-refusal verdict, else *row* unchanged."""
+    if _refusal_only(row) is None:
+        return row
+    return replace(row, **row.pre_eligibility, pre_eligibility={})
 
 
 def _codex_pin_label(homes: dict[str, Path]) -> str:
@@ -1571,7 +1899,7 @@ def codex_seat_order_labels(homes: dict[str, Path]) -> list[str]:
 
 
 @dataclass(frozen=True)
-class SeatRank:
+class SeatRank:  # pylint: disable=too-many-instance-attributes  # flat rank record
     """One eligible Codex seat with its place in the ranking and WHY it is there.
 
     ``cohort`` is 1-based and only set for a measured seat under the ``fill`` policy
@@ -1585,6 +1913,12 @@ class SeatRank:
     reason: str
     measured: bool
     probe: bool = False
+    # ``unmeasured`` (the daily seat probe, :func:`claim_probe`) | ``refusal_canary`` (the
+    # one read-only try of a refused (seat, model) pair, :func:`claim_refusal_canary`);
+    # ``""`` when ``probe`` is False. ``model``/``canary_at`` belong to a refusal canary.
+    probe_kind: str = ""
+    model: str = ""
+    canary_at: int = 0
 
 
 def _compact_duration(seconds: int) -> str:
@@ -1778,6 +2112,7 @@ def _fill_ranking(  # pylint: disable=too-many-locals
                     reason="probe: unmeasured, no attempt in 24h",
                     measured=False,
                     probe=True,
+                    probe_kind="unmeasured",
                 )
             )
 
@@ -1825,8 +2160,15 @@ def rank_codex_seats(  # pylint: disable=too-many-arguments,too-many-positional-
     now: int | None = None,
     attempts: dict[str, int] | None = None,
     probe: bool = True,
+    canary: bool = False,
 ) -> list[SeatRank]:
     """The eligible seats, best first, each carrying WHY — the ONE ranking, explained.
+
+    *canary* (READ-ONLY runs only, debate rounds included — independent of *probe*,
+    which governs the unmeasured-seat probe alone) appends, LAST, every seat blocked only
+    by a (seat, model) refusal whose half-TTL canary is due and unclaimed
+    (:func:`refusal_canary_due`), as a ``probe_kind="refusal_canary"`` rank carrying the
+    pre-refusal row. The runner must win :func:`claim_refusal_canary` before launching it.
 
     Eligible = not BLOCKED and not DISABLED (UNKNOWN stays runnable: fail-open; a seat
     we merely failed to measure must never be deleted). *policy* defaults to
@@ -1843,8 +2185,37 @@ def rank_codex_seats(  # pylint: disable=too-many-arguments,too-many-positional-
     attempts = read_seat_attempts() if attempts is None else attempts
     eligible = [row for row in rows if row.state not in (BLOCKED, DISABLED)]
     if policy == "order":
-        return _order_ranking(eligible, pin_label, order)
-    return _fill_ranking(eligible, pin_label, order, now=now, attempts=attempts, probe=probe)
+        ranks = _order_ranking(eligible, pin_label, order)
+    else:
+        ranks = _fill_ranking(eligible, pin_label, order, now=now, attempts=attempts, probe=probe)
+    if canary:
+        ranks.extend(_canary_ranks(rows, order, now))
+    return ranks
+
+
+def _canary_ranks(rows: list[ProviderQuota], order: list[str], now: int) -> list[SeatRank]:
+    """The due refusal canaries of *rows*, in configured order (see :func:`rank_codex_seats`)."""
+    out: list[SeatRank] = []
+    for row in sorted(rows, key=lambda r: _configured_rank(r.account, order)):
+        blocker = refusal_canary_due(row, now)
+        if blocker is None:
+            continue
+        view = refusal_canary_view(row)
+        if view.state in (BLOCKED, DISABLED):
+            continue  # something else blocks the seat too: no canary can run there
+        out.append(
+            SeatRank(
+                row=view,
+                cohort=None,
+                reason=f"refusal canary: {blocker['reason']}",
+                measured=_measured_week(view) is not None,
+                probe=True,
+                probe_kind="refusal_canary",
+                model=str(blocker.get("model") or ""),
+                canary_at=int(blocker.get("canary_at") or 0),
+            )
+        )
+    return out
 
 
 def codex_seat_candidates(
@@ -2355,8 +2726,10 @@ def snapshot(
     claude.sort(key=lambda q: (q.state != AVAILABLE, -(q.urgency or 0.0)))
 
     homes = _canonical_codex_homes()
-    codex_rows = _codex_quotas(now, cooldowns)
-    _attach_last_runs(codex_rows, now)
+    # ONE ledger pass per snapshot: the ``last_run`` stamps and the eligibility verdict.
+    ledger_summary = codex_ledger.seat_model_summary(now=now)
+    codex_rows = _codex_quotas(now, cooldowns, summary=ledger_summary)
+    _attach_last_runs(codex_rows, now, ledger_summary)
     pin_label = _codex_pin_label(homes)
     configured = config.codex_seat_order()
     policy = config.codex_seat_policy()
@@ -2511,6 +2884,7 @@ def _seat_order_rows(
 def _provider_dict(quota: ProviderQuota) -> dict[str, Any]:
     """Serialize one provider, dropping empty optional fields to keep the JSON readable."""
     data = asdict(quota)
+    data.pop("pre_eligibility", None)  # internal: the refusal canary's base verdict
     data["windows"] = {name: asdict(win) for name, win in quota.windows.items()}
     # ADDITIVE (2026-09-18, v2 stays v2): the human spelling of ``id`` and the shell
     # command that opens that seat, so a consumer rendering a report for a person does
@@ -2524,7 +2898,9 @@ def _provider_dict(quota: ProviderQuota) -> dict[str, Any]:
     if color := seat_color(quota.id, quota.kind, quota.account):
         data["color"] = color
     return {
-        k: v for k, v in data.items() if v not in ("", 0, None, {}) or k in ("state", "id", "kind")
+        k: v
+        for k, v in data.items()
+        if v not in ("", 0, None, {}, []) or k in ("state", "id", "kind")
     }
 
 
@@ -2564,6 +2940,8 @@ def _rehydrate(raw: dict[str, Any]) -> ProviderQuota:
         last_run=dict(raw.get("last_run") or {}),
         next_probe_at=int(raw.get("next_probe_at", 0) or 0),
         live_meta=dict(raw.get("live_meta") or {}),
+        plan=dict(raw.get("plan") or {}),
+        blockers=[dict(item) for item in raw.get("blockers") or [] if isinstance(item, dict)],
     )
 
 

@@ -19,6 +19,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from conftest import SeatFixture
@@ -152,8 +153,10 @@ def test_routing_order_not_config_order_decides(
     _configure(seats, 'codex_debate_seats = ["private", "de"]')
     real = cic.codex_homes_in_order
 
-    def _ranked(now_ts: int | None = None, *, probe: bool = True) -> list[cic.SeatCandidate]:
-        cands = real(now_ts, probe=probe)
+    def _ranked(
+        now_ts: int | None = None, *, probe: bool = True, **kw: Any
+    ) -> list[cic.SeatCandidate]:
+        cands = real(now_ts, probe=probe, **kw)
         return sorted(cands, key=lambda cand: ["de", "default", "private"].index(cand.label))
 
     monkeypatch.setattr(cic, "codex_homes_in_order", _ranked)
@@ -797,8 +800,10 @@ def _weekly(
     _ = reserve_calls
     real = cic.codex_homes_in_order
 
-    def _ranked(now_ts: int | None = None, *, probe: bool = True) -> list[cic.SeatCandidate]:
-        cands = real(now_ts, probe=probe)
+    def _ranked(
+        now_ts: int | None = None, *, probe: bool = True, **kw: Any
+    ) -> list[cic.SeatCandidate]:
+        cands = real(now_ts, probe=probe, **kw)
         return sorted(cands, key=lambda cand: ["private", "de", "default"].index(cand.label))
 
     monkeypatch.setattr(cic, "codex_homes_in_order", _ranked)
@@ -1275,8 +1280,10 @@ def _trio(
     monkeypatch.setattr(cic, "_debate_cost_deltas", lambda *_a, **_k: [])
     real = cic.codex_homes_in_order
 
-    def _ranked(now_ts: int | None = None, *, probe: bool = True) -> list[cic.SeatCandidate]:
-        cands = real(now_ts, probe=probe)
+    def _ranked(
+        now_ts: int | None = None, *, probe: bool = True, **kw: Any
+    ) -> list[cic.SeatCandidate]:
+        cands = real(now_ts, probe=probe, **kw)
         return sorted(cands, key=lambda cand: ["private", "de", "default"].index(cand.label))
 
     monkeypatch.setattr(cic, "codex_homes_in_order", _ranked)

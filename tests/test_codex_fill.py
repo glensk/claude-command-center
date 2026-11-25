@@ -1097,12 +1097,13 @@ def _order_view(now: int) -> tuple[list[str], dict[str, dict], dict[str, str]]:
 def test_windowless_seat_rank_and_state_before_after(
     three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A windowless write drops the stale 5h/7d reading; rank and state are unchanged.
+    """A windowless write drops the stale 5h/7d reading; the live `free` plan blocks the seat.
 
-    Before: private carries a 23-day-old `plus` 5h/7d reading (all windows stale). After
-    the free-plan body is recorded, the seat is ranked on its rollout figures (none here):
-    still unmeasured, still `unknown` (fail-open, tryable), still the daily probe. Pinned
-    so a later change to the fallback is a visible decision.
+    Before: private carries a 23-day-old `plus` 5h/7d reading (all windows stale) and is
+    the daily probe. After the free-plan body is recorded, the seat's ordinary row is
+    still unmeasured and `unknown`, but the live eligibility verdict (tp#2672 B1 rule 1)
+    turns the newest `free` reading into a computed funding block: the seat leaves the
+    attempt order with no config change.
     """
     now = int(time.time())
     three_seats.reorder("private", "de", "default")
@@ -1121,18 +1122,20 @@ def test_windowless_seat_rank_and_state_before_after(
     _fetch_free(monkeypatch, three_seats.seats["private"], now)
 
     order_after, rows_after, states_after = _order_view(now)
-    assert states_after["private"] == quota.UNKNOWN
-    assert rows_after["private"]["measured"] is False
-    assert rows_after["private"]["probe"] is True
-    assert order_after == order_before
+    assert states_after["private"] == quota.BLOCKED
+    assert rows_after["private"]["attempt_rank"] is None
+    assert rows_after["private"]["probe"] is False
+    assert order_after == order_before  # the configured order itself is untouched
     # The stale `plus` figures are no longer shown as the seat's reading.
     assert not rows_after["private"]["windows"]
-    assert rows_after["private"]["reason"] == "no usage snapshot"
     row = quota._codex_seat_quota(  # noqa: SLF001
         "codex:private", "private", three_seats.seats["private"], now, {}
     )
     assert row.state == quota.UNKNOWN and row.windows == {}
-    assert quota.codex_seat_candidates([row], "", ["private"], policy="fill", now=now)
+    assert row.plan["plan_type"] == "free"
+    judged = quota.codex_seat_eligibility([row], now)
+    assert judged[0].state == quota.BLOCKED and "plan free" in judged[0].reason
+    assert not quota.codex_seat_candidates(judged, "", ["private"], policy="fill", now=now)
 
 
 def test_free_plan_meta_marks_seat_risky(
@@ -1178,7 +1181,9 @@ def test_windowless_meta_skips_presel_refresh(
         fetched.append(home)
 
     monkeypatch.setattr(usage, "fetch_codex_usage", _fetch)
-    cands = cic.codex_homes_in_order()
+    # The free seat is funding-blocked (tp#2672 B1), so the ranking no longer offers it;
+    # the refresh is handed every seat explicitly to pin the staleness rule itself.
+    cands = [cic._seat_candidate_for(home) for home in three_seats.seats.values()]  # noqa: SLF001
     cic._pre_selection_refresh(cands, cic._REFRESH_BUDGET_SEC)  # noqa: SLF001
     assert three_seats.seats["private"] not in fetched
     assert fetched == []  # the other two carry fresh 5h/7d readings
