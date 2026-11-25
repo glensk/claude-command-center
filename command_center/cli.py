@@ -8482,7 +8482,8 @@ def build_parser(only: str | None = None) -> argparse.ArgumentParser:
         "--model",
         default="",
         metavar="NAME",
-        help="the model you intend to call (echoed in the JSON report)",
+        help="the model you intend to call (echoed in the JSON report; the Codex seats are "
+        "judged for it: a seat that recently refused it is eligible: false)",
     )
     p_quota.add_argument(
         "-r",

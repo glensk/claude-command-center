@@ -248,9 +248,11 @@ DEFAULTS: dict[str, object] = {
     # registered seat, or an existing config.toml that does not parse makes every
     # verdict ``unknown`` (a refusal) instead of silently falling back to defaults.
     #
-    # ``codex_debate_seats``: the labels (or ``codex_seat_aliases`` names) a debate may
-    #   bill — a FILTER over the routing order, never a second order. Empty = every
-    #   registered seat.
+    # ``codex_debate_seats``: the labels (or ``codex_seat_aliases`` names) a debate
+    #   PREFERS (tp#2672 B2) — a preference ORDER, never an allowlist: the listed seats
+    #   first in list order, then every other registered seat in ``codex_seat_order``
+    #   order. Eligibility is live (plan type, same-model refusals, quota), never this
+    #   list. Empty = the routing order as it is.
     "codex_debate_seats": [],
     # The two tiers: ``strict`` (security-relevant, PRI=high, or a big repo below) and
     # ``default`` (everything else). A seat at or above the cap is ``capped``.
@@ -731,9 +733,10 @@ class DebatePolicyError(ValueError):
 class DebateSeatPolicy:
     """The validated debate start-cap policy (tp#619): see the ``codex_debate_*`` DEFAULTS.
 
-    ``seats`` holds resolved seat LABELS (aliases already mapped) and is EMPTY when every
-    registered seat may bill a debate. ``seat_caps`` maps a label to its own
-    ``(strict, default)`` caps.
+    ``seats`` holds resolved seat LABELS (aliases already mapped) in PREFERENCE order
+    (tp#2672 B2: every registered seat may bill a debate; the listed ones are tried
+    first) and is EMPTY when the routing order alone decides. ``seat_caps`` maps a label
+    to its own ``(strict, default)`` caps.
     """
 
     seats: tuple[str, ...]
@@ -799,6 +802,10 @@ def codex_debate_policy(cfg: Config | None = None) -> DebateSeatPolicy:  # pylin
     defaults there; this policy does not), a non-list, a malformed ``label=s/d`` entry, a
     cap outside 1..100, or a seat label (after ``codex_seat_aliases``) that is not a
     registered Codex seat. ``codex_debate_pause_pct`` (tp#620) is validated here too.
+
+    ``codex_debate_seats`` is a preference ORDER over all seats (tp#2672 B2), never an
+    allowlist: which seat may run is the live eligibility verdict's call
+    (:func:`command_center.quota.codex_seat_eligibility`), not this list's.
     """
     cfg = load_config() if cfg is None else cfg
     if not cfg.loaded_from_disk:
@@ -1299,7 +1306,7 @@ class Config:
     codex_seat_rota_me: str = ""
     codex_seat_aliases: list[str] = field(default_factory=list)  # "alias=label" for /switch
     # Debate start caps (tp#619) — validated together by codex_debate_policy().
-    codex_debate_seats: list[str] = field(default_factory=list)  # [] = every registered seat
+    codex_debate_seats: list[str] = field(default_factory=list)  # preference order; [] = routing
     codex_debate_cap_strict_pct: float = 70
     codex_debate_cap_default_pct: float = 75
     codex_debate_seat_caps: list[str] = field(default_factory=list)  # "label=strict/default"

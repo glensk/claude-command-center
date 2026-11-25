@@ -109,7 +109,7 @@ def test_big_repo_raises_the_tier(seats: SeatFixture) -> None:
     assert _verdict(repo="home/other")["state"] == "allowed"
 
 
-def test_per_seat_override(seats: SeatFixture) -> None:
+def test_per_seat_override(seats: SeatFixture, monkeypatch: pytest.MonkeyPatch) -> None:
     now = int(time.time())
     for label in seats.seats:
         _live(seats.seats[label], 60.0, now=now)
@@ -118,21 +118,23 @@ def test_per_seat_override(seats: SeatFixture) -> None:
         'codex_debate_seats = ["private"]',
         'codex_debate_seat_caps = ["private=55/58"]',
     )
+    _only_seats(monkeypatch, "private")
     verdict = _verdict()
     assert verdict["state"] == "capped"
     assert verdict["cap_percent"] == 58
     assert _verdict("strict")["cap_percent"] == 55
 
 
-def test_disallowed_default_seat_is_never_chosen(seats: SeatFixture) -> None:
+def test_unlisted_default_seat_follows_the_listed_ones(seats: SeatFixture) -> None:
+    """tp#2672 B2: an unlisted seat is not forbidden — it is tried after the listed ones."""
     now = int(time.time())
     _live(seats.seats["default"], 1.0, now=now)
     _live(seats.seats["private"], 90.0, now=now)
     _live(seats.seats["de"], 90.0, now=now)
     _configure(seats, 'codex_debate_seats = ["private", "de"]')
     verdict = _verdict()
-    assert verdict["state"] == "capped"
-    assert {seat["seat"] for seat in verdict["seats"]} == {"private", "de"}
+    assert (verdict["state"], verdict["seat"]) == ("allowed", "default")
+    assert [seat["seat"] for seat in verdict["seats"]] == ["private", "de", "default"]
 
 
 def test_alias_resolves_in_the_allowlist(seats: SeatFixture) -> None:
@@ -143,10 +145,10 @@ def test_alias_resolves_in_the_allowlist(seats: SeatFixture) -> None:
     assert _verdict()["seat"] == "private"
 
 
-def test_routing_order_not_config_order_decides(
+def test_config_order_not_routing_order_decides(
     seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The allowlist FILTERS the ranking; its own order means nothing."""
+    """tp#2672 B2: the list is a PREFERENCE — its order leads the routing ranking."""
     now = int(time.time())
     for label in seats.seats:
         _live(seats.seats[label], 10.0, now=now)
@@ -160,7 +162,9 @@ def test_routing_order_not_config_order_decides(
         return sorted(cands, key=lambda cand: ["de", "default", "private"].index(cand.label))
 
     monkeypatch.setattr(cic, "codex_homes_in_order", _ranked)
-    assert _verdict()["seat"] == "de"
+    verdict = _verdict()
+    assert verdict["seat"] == "private"
+    assert [seat["seat"] for seat in verdict["seats"]] == ["private", "de", "default"]
 
 
 def _assert_unmeasured_first(verdict: dict) -> None:
@@ -230,6 +234,8 @@ def test_blocked_seat_is_excluded(seats: SeatFixture) -> None:
     states = {seat["seat"]: seat["state"] for seat in verdict["seats"]}
     assert states["private"] == "blocked"
     quota.record_block("codex:de", blocked_until=now + _HOUR, kind=quota.KIND_HOLD, reason="h")
+    assert _verdict()["seat"] == "default"  # tp#2672 B2: the unlisted seat follows
+    quota.record_block("codex", blocked_until=now + _HOUR, kind=quota.KIND_HOLD, reason="h")
     assert _verdict()["state"] == "blocked"
 
 
@@ -244,8 +250,8 @@ def test_inherited_codex_home(seats: SeatFixture, monkeypatch: pytest.MonkeyPatc
     _live(seats.seats["default"], 1.0, now=now)
     monkeypatch.setenv("CODEX_HOME", str(seats.seats["default"]))
     verdict = _verdict()
-    assert verdict["state"] == "not_allowed"
-    assert "codex_debate_seats" in verdict["reason"]
+    # tp#2672 B2: an unlisted pin is judged like any seat, no longer `not_allowed`.
+    assert (verdict["state"], verdict["seat"]) == ("allowed", "default")
 
 
 def test_inherited_unregistered_home_is_not_allowed(
@@ -348,10 +354,25 @@ def _live_full(
     usage._codex_cache.clear()  # noqa: SLF001
 
 
+def _only_seats(monkeypatch: pytest.MonkeyPatch, *labels: str) -> None:
+    """Register ONLY *labels* (tp#2672 B2: ``codex_debate_seats`` no longer filters).
+
+    Before B2 the allowlist kept ``default`` out of a two-seat debate; a preference
+    cannot, so a two-seat world is now a registry of two seats.
+    """
+    real = quota._canonical_codex_homes  # noqa: SLF001
+
+    def _homes() -> dict[str, Path]:
+        return {label: home for label, home in real().items() if label in labels}
+
+    monkeypatch.setattr(quota, "_canonical_codex_homes", _homes)
+
+
 @pytest.fixture(name="pair")
 def _pair(seats: SeatFixture, monkeypatch: pytest.MonkeyPatch) -> SeatFixture:
-    """``private`` + ``de`` allowed, no measured round costs (the config pause point)."""
+    """``private`` + ``de`` registered (in that preference), no measured round costs."""
     _configure(seats, 'codex_debate_seats = ["private", "de"]')
+    _only_seats(monkeypatch, "private", "de")
     monkeypatch.setattr(cic, "_debate_cost_deltas", lambda *_a, **_k: [])
     return seats
 
@@ -1087,11 +1108,11 @@ def test_inherited_stale_codex_home_is_tried(
     assert (verdict["state"], verdict["seat"], verdict["used_percent"]) == ("allowed", "de", None)
     assert cic.main(["debate-seat", "-j"]) == 0
     assert json.loads(capsys.readouterr().out)["seat"] == "de"
-    # a forbidden pin stays a refusal, stale or not
+    # tp#2672 B2: an unlisted stale pin is tried too (a preference forbids nothing)
     _live(seats.seats["default"], 5.0, now=now, age=_HOUR)
     monkeypatch.setenv("CODEX_HOME", str(seats.seats["default"]))
-    assert _verdict()["state"] == "not_allowed"
-    assert cic.main(["debate-seat", "-j"]) == 1
+    assert (_verdict()["state"], _verdict()["seat"]) == ("allowed", "default")
+    assert cic.main(["debate-seat", "-j"]) == 0
     capsys.readouterr()
 
 
@@ -1135,10 +1156,11 @@ def test_entry_without_a_home_is_never_selected() -> None:
 
 
 def test_blocked_only_stays_blocked_exit_1(
-    seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+    seats: SeatFixture, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = int(time.time())
     _configure(seats, 'codex_debate_seats = ["private", "de"]')
+    _only_seats(monkeypatch, "private", "de")
     for label in ("private", "de"):
         _live(seats.seats[label], 5.0, now=now, age=_HOUR)
         quota.record_block(
@@ -1533,3 +1555,180 @@ def test_no_opt_in_or_kill_switch_starts_no_thread(
     assert cic.debate_seat_verdict(tier="default", now=now)["state"] == "disabled"
     assert _cont()["state"] == "disabled"
     assert not created
+
+
+# --------------------------------------------------------------------------- #
+# tp#2672 B2: codex_debate_seats is a PREFERENCE; the seats are judged for the model.
+# --------------------------------------------------------------------------- #
+_SOL = "gpt-5.6-sol"
+_ASTRA = "gpt-5.5-astra"
+
+
+@pytest.fixture(name="catalog")
+def _catalog(seats: SeatFixture, monkeypatch: pytest.MonkeyPatch) -> SeatFixture:
+    """The three seats plus an offline model catalog (``sol`` / ``astra`` short names)."""
+    models = [
+        {"slug": _SOL, "visibility": "list", "default_reasoning_level": "medium"},
+        {"slug": _ASTRA, "visibility": "list", "default_reasoning_level": "medium"},
+    ]
+    monkeypatch.setattr(cic, "list_models", lambda **_: models)
+    return seats
+
+
+def _plan(home: Path, plan: str, five: float = 10.0, *, now: int) -> None:
+    """A fresh live reading of *plan* for one seat: five-hour *five* %, weekly 10 %."""
+    usage._write_codex_usage(  # noqa: SLF001
+        home,
+        usage.Usage(
+            captured_at=now,
+            five_hour=usage.Window(used_percentage=five, resets_at=now + 4 * _HOUR),
+            seven_day=usage.Window(used_percentage=10.0, resets_at=now + 3 * _DAY),
+            live=True,
+            plan_type=plan,
+        ),
+        now,
+    )
+    usage._codex_cache.clear()  # noqa: SLF001
+
+
+def _refusal(seat: str, model: str, age: int) -> None:
+    """One ``refused:model`` ledger attempt of *model* on *seat*."""
+    from command_center import codex_ledger  # pylint: disable=import-outside-toplevel
+
+    row = {
+        "ts": codex_ledger._iso(time.time() - age),  # noqa: SLF001
+        "provider": "codex",
+        "seat": seat,
+        "id": "codex" if seat == "default" else f"codex:{seat}",
+        "purpose": "debate",
+        "model": model,
+        "outcome": "refused:model",
+        "ok": False,
+        "ms": 10,
+    }
+    path = codex_ledger.ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row) + "\n")
+
+
+def test_debate_seat_skips_free_seat_listed_first(catalog: SeatFixture) -> None:
+    """The first listed seat is on a free plan: the next listed one wins, the free one says why."""
+    now = int(time.time())
+    _plan(catalog.seats["private"], "free", now=now)
+    _plan(catalog.seats["de"], "plus", now=now)
+    _plan(catalog.seats["default"], "team", now=now)
+    _configure(catalog, 'codex_debate_seats = ["private", "de"]')
+    verdict = cic.debate_seat_verdict(now=now, model=_SOL)
+    assert (verdict["state"], verdict["seat"]) == ("allowed", "de")
+    private = next(seat for seat in verdict["seats"] if seat["seat"] == "private")
+    assert private["state"] == "blocked"
+    assert private["reason"].startswith("plan free")
+    # The listed order leads, then the unlisted seat: nothing is dropped as "not allowed".
+    assert [seat["seat"] for seat in verdict["seats"]] == ["de", "default", "private"]
+
+
+def test_debate_seat_uses_unlisted_funded_seat(catalog: SeatFixture) -> None:
+    """A preference is not an allowlist: a capped listed seat hands over to an unlisted one."""
+    now = int(time.time())
+    _plan(catalog.seats["de"], "plus", 90.0, now=now)
+    _plan(catalog.seats["default"], "team", 20.0, now=now)
+    _plan(catalog.seats["private"], "free", now=now)
+    _configure(catalog, 'codex_debate_seats = ["de"]')
+    verdict = cic.debate_seat_verdict(now=now, model=_SOL)
+    assert (verdict["state"], verdict["seat"]) == ("allowed", "default")
+    states = {seat["seat"]: seat["state"] for seat in verdict["seats"]}
+    assert states == {"de": "capped", "default": "allowed", "private": "blocked"}
+
+
+def test_debate_seat_list_order_leads(
+    catalog: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The listed seats come first in LIST order, whatever the routing ranking says."""
+    now = int(time.time())
+    for label in catalog.seats:
+        _plan(catalog.seats[label], "plus", now=now)
+    _configure(catalog, 'codex_debate_seats = ["de", "private"]')
+    real = cic.codex_homes_in_order
+
+    def _ranked(
+        now_ts: int | None = None, *, probe: bool = True, **kw: Any
+    ) -> list[cic.SeatCandidate]:
+        cands = real(now_ts, probe=probe, **kw)
+        return sorted(cands, key=lambda cand: ["default", "private", "de"].index(cand.label))
+
+    monkeypatch.setattr(cic, "codex_homes_in_order", _ranked)
+    verdict = cic.debate_seat_verdict(now=now, model=_SOL)
+    assert [seat["seat"] for seat in verdict["seats"]] == ["de", "private", "default"]
+    assert verdict["seat"] == "de"
+
+
+def test_inherited_codex_home_is_judged_not_filtered(
+    catalog: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unlisted $CODEX_HOME seat is fine; a free one is blocked with the reason."""
+    now = int(time.time())
+    _plan(catalog.seats["default"], "team", now=now)
+    _plan(catalog.seats["private"], "free", now=now)
+    _configure(catalog, 'codex_debate_seats = ["de"]')
+    monkeypatch.setenv("CODEX_HOME", str(catalog.seats["default"]))
+    assert cic.debate_seat_verdict(now=now, model=_SOL)["seat"] == "default"
+    monkeypatch.setenv("CODEX_HOME", str(catalog.seats["private"]))
+    verdict = cic.debate_seat_verdict(now=now, model=_SOL)
+    assert verdict["state"] == "blocked"
+    assert "plan free" in verdict["reason"]
+
+
+def test_debate_seat_judges_explicit_model_override(
+    catalog: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A refusal of the OVERRIDE model skips the seat only when `-m <override>` is passed."""
+    now = int(time.time())
+    for label in catalog.seats:
+        _plan(catalog.seats[label], "plus", now=now)
+    _configure(catalog, 'codex_debate_seats = ["private", "de"]')
+    _refusal("private", _ASTRA, 2 * _HOUR)
+    assert cic.main(["debate-seat", "-j"]) == 0  # the configured model (sol) is served
+    assert json.loads(capsys.readouterr().out)["seat"] == "private"
+    assert cic.main(["debate-seat", "-j", "-m", _ASTRA]) == 0
+    verdict = json.loads(capsys.readouterr().out)
+    assert verdict["seat"] == "de"
+    private = next(seat for seat in verdict["seats"] if seat["seat"] == "private")
+    assert private["state"] == "blocked" and f"refused:model {_ASTRA}" in private["reason"]
+    # The continue gate judges the same model: the current seat is out for astra only.
+    assert cic.main(["debate-seat", "-j", "-c", "private", "-m", _ASTRA]) == 0
+    cont = json.loads(capsys.readouterr().out)
+    assert (cont["state"], cont["seat"]) == ("failover", "de")
+    assert cic.main(["debate-seat", "-j", "-c", "private"]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "continue"
+
+
+def test_model_alias_normalized_before_ledger_match(
+    catalog: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`-m sol` / `-m GPT-5.6-SOL` match a refusal the ledger recorded under the slug."""
+    now = int(time.time())
+    for label in catalog.seats:
+        _plan(catalog.seats[label], "plus", now=now)
+    _configure(catalog, 'codex_debate_seats = ["private", "de"]')
+    _refusal("private", _SOL, 2 * _HOUR)
+    for name in ("sol", " GPT-5.6-SOL "):
+        verdict = cic.debate_seat_verdict(now=now, model=name)
+        assert verdict["seat"] == "de", name
+    assert cic.main(["order", "-j", "-n", "-m", "sol"]) == 0
+    order = json.loads(capsys.readouterr().out)
+    assert order["model"] == _SOL
+    assert "private" not in [cand["label"] for cand in order["candidates"]]
+
+
+def test_funding_block_gives_no_retry_time(catalog: SeatFixture) -> None:
+    """Mid-debate: a seat whose plan went free is paused with no retry time (untimed)."""
+    now = int(time.time())
+    _plan(catalog.seats["private"], "free", now=now)
+    for label in ("de", "default"):
+        _plan(catalog.seats[label], "plus", 95.0, now=now)
+    verdict = cic.debate_continue_verdict("private", now=now, model=_SOL)
+    assert verdict["state"] == "paused"
+    private = next(seat for seat in verdict["seats"] if seat["seat"] == "private")
+    assert private["state"] == "blocked" and "plan free" in private["reason"]
+    assert verdict["retry_seat"] != "private"

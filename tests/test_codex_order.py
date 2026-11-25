@@ -241,12 +241,58 @@ def test_snapshot_carries_the_ranked_seat_order_and_next_attempt(
         "rota",
         # additive since 2026-10-24 (tp#1196) — "auth" marks a dead login (needs login)
         "block_scope",
+        # additive since tp#2672 B2 — the live eligibility verdict, and why a seat is out
+        "eligible",
+        "skip_reason",
     }
+    assert [row["eligible"] for row in rows] == [False, True, True]
+    assert rows[0]["skip_reason"] == rows[0]["reason"] and rows[0]["skip_reason"]
+    assert rows[1]["skip_reason"] == ""
     assert snap["codex_seat_policy"] == "fill"
     assert rows[0]["state"] == quota.BLOCKED
     assert rows[1]["email"] == "de@example.org"
     assert "codex_pin" not in snap  # no pin set
     _ = three_seats  # the fixture IS the setup
+
+
+def test_quota_json_model_rows_carry_eligible_and_skip_reason(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ccc quota -j -M <model>` judges the Codex rows for that model (tp#2672 B2)."""
+    del three_seats
+    slug = "gpt-5.6-sol"
+    monkeypatch.setattr(
+        cic,
+        "list_models",
+        lambda **_: [{"slug": slug, "visibility": "list", "default_reasoning_level": "medium"}],
+    )
+    from command_center import codex_ledger  # pylint: disable=import-outside-toplevel
+
+    path = codex_ledger.ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "ts": codex_ledger._iso(time.time() - 7200),  # noqa: SLF001
+        "provider": "codex",
+        "seat": "private",
+        "id": "codex:private",
+        "purpose": "test",
+        "model": slug,
+        "outcome": "refused:model",
+        "ok": False,
+        "ms": 10,
+    }
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    assert cli.main(["quota", "-j", "-M", slug]) in (0, 1, 2)
+    snap = json.loads(capsys.readouterr().out)
+    rows = {row["label"]: row for row in snap["codex_seat_order"]}
+    assert rows["private"]["eligible"] is False
+    assert rows["private"]["attempt_rank"] is None
+    assert rows["private"]["skip_reason"].startswith(f"refused:model {slug} 2h")
+    assert rows["de"]["eligible"] is True and rows["de"]["skip_reason"] == ""
+    # Without -M the refusal is not this caller's model: the seat stays eligible.
+    assert cli.main(["quota", "-j"]) in (0, 1, 2)
+    plain = {row["label"]: row for row in json.loads(capsys.readouterr().out)["codex_seat_order"]}
+    assert plain["private"]["eligible"] is True
 
 
 def test_quota_footer_names_the_ladder_and_the_next_attempt(

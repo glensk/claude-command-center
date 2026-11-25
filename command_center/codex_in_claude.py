@@ -137,7 +137,7 @@ import time
 import urllib.parse
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
@@ -1881,18 +1881,19 @@ def seat_block(row: Mapping[str, Any], now: int | None = None) -> dict[str, Any]
     }
 
 
-def blocked_seats(now: int | None = None) -> list[dict[str, Any]]:
+def blocked_seats(now: int | None = None, *, model: str = "") -> list[dict[str, Any]]:
     """Every registered seat that cannot run right now (:func:`seat_block`), registry order.
 
-    Read from the same quota rows the runner ranks, so this list and the runner can never
-    disagree about a seat. Dead logins are left to :func:`needs_login_seats`. ``[]`` on
-    any failure: display data, never a routing input.
+    Read from the same quota rows the runner ranks (judged for *model*, tp#2672 B2), so
+    this list and the runner can never disagree about a seat. Dead logins are left to
+    :func:`needs_login_seats`. ``[]`` on any failure: display data, never a routing input.
     """
     from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
 
     now_ts = int(time.time()) if now is None else int(now)
     try:
-        rows = quota._codex_quotas(now_ts, quota.read_cooldowns(now_ts))  # noqa: SLF001
+        cooldowns = quota.read_cooldowns(now_ts)
+        rows = quota._codex_quotas(now_ts, cooldowns, model=model)  # noqa: SLF001
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         return []
     return [block for row in rows if (block := seat_block(_row_fields(row), now_ts)) is not None]
@@ -1919,7 +1920,7 @@ def refresh_seat_readings(*, probe: bool = True) -> None:
         _pre_selection_refresh(codex_homes_in_order(probe=probe), _REFRESH_BUDGET_SEC)
 
 
-def _seat_table_lines(now: int | None = None) -> list[str]:
+def _seat_table_lines(now: int | None = None, *, model: str = "") -> list[str]:
     """The ranked seat table ``order`` prints — one line per configured seat.
 
     The first line names the POLICY, and every seat line ends with the ranker's own
@@ -1931,7 +1932,7 @@ def _seat_table_lines(now: int | None = None) -> list[str]:
     try:
         from . import quota  # pylint: disable=import-outside-toplevel
 
-        snap = quota.snapshot(now=now_ts)
+        snap = quota.snapshot(model=model, now=now_ts)
         rows = snap.get("codex_seat_order") or []
         policy = str(snap.get("codex_seat_policy") or "fill")
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
@@ -2049,7 +2050,8 @@ def cmd_order(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
     if not getattr(args, "no_refresh", False):
         refresh_seat_readings()  # tp#1202: the runner's evidence, not an older reading
     configured, order, unknown = _seat_order_state()
-    candidates = codex_homes_in_order()
+    model = _judged_model(args, None)
+    candidates = codex_homes_in_order(model=model)
     cfg = load_config()
     if getattr(args, "json", False):
         print(
@@ -2067,12 +2069,14 @@ def cmd_order(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
                     "needs_login": needs_login_seats(),
                     # Additive (tp#1202): seats left out because something blocks them
                     # (usage limit, refusal, hold, rota) and until when.
-                    "blocked": blocked_seats(),
+                    "blocked": blocked_seats(model=model),
+                    # Additive (tp#2672 B2): the model the seats were judged for.
+                    "model": quota.normalize_model(model),
                 }
             )
         )
         return EX_OK
-    for line in _seat_table_lines():
+    for line in _seat_table_lines(model=model):
         print(line)
     pin = _pin_payload(cfg)
     if pin is not None:
@@ -2626,6 +2630,53 @@ def _seat_candidate_for(home: Path) -> SeatCandidate:
     return SeatCandidate(label=label, home=home, email=email, pid=pid)
 
 
+def _pinned_candidate(
+    home: Path, model: str = "", *, canary: bool = False, now: int | None = None
+) -> SeatCandidate:
+    """An EXPLICIT home (``$CODEX_HOME``, a journal resume) judged for *model* (tp#2672 B2).
+
+    The candidate carries the normalized *model*, so its quota row — the one the
+    preflight reads — is the (seat, model) verdict: a pin never bypasses a funding or a
+    fresh same-model refusal block. *canary* (a read-only run, never a resume) turns a
+    seat blocked by that refusal ALONE into its due refusal canary, exactly as the
+    ranking offers one; the runner must still win the claim.
+    """
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    cand = replace(_seat_candidate_for(home), model=quota.normalize_model(model))
+    if not (canary and cand.model and cand.pid):
+        return cand
+    try:
+        now_ts = int(time.time()) if now is None else int(now)
+        row = next(
+            (
+                r
+                for r in quota._codex_quotas(  # noqa: SLF001
+                    now_ts, quota.read_cooldowns(now_ts), model=cand.model
+                )
+                if r.id == cand.pid
+            ),
+            None,
+        )
+        if row is None:
+            return cand
+        blocker = quota.refusal_canary_due(row, now_ts)
+        if blocker is None or quota.refusal_canary_view(row).state in (
+            quota.BLOCKED,
+            quota.DISABLED,
+        ):
+            return cand
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return cand  # no verdict ⇒ no canary; the preflight judges the plain row
+    return replace(
+        cand,
+        probe=True,
+        probe_kind="refusal_canary",
+        canary_at=int(blocker.get("canary_at") or 0),
+        reason=f"refusal canary: {blocker['reason']}",
+    )
+
+
 def codex_homes_in_order(
     now: int | None = None, *, probe: bool = True, model: str = "", canary: bool = False
 ) -> list[SeatCandidate]:
@@ -2669,7 +2720,7 @@ def codex_homes_in_order(
         return []
     env = os.environ.get("CODEX_HOME")
     if env:
-        return [_seat_candidate_for(Path(env).expanduser())]
+        return [_pinned_candidate(Path(env).expanduser(), model, canary=canary, now=now)]
     try:
         from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
 
@@ -3480,7 +3531,7 @@ def _row_live_plan(row: quota.ProviderQuota) -> str | None:
     return text or None
 
 
-def _headroom_rows(now: int) -> list[tuple[SeatCandidate, quota.ProviderQuota]]:
+def _headroom_rows(now: int, model: str = "") -> list[tuple[SeatCandidate, quota.ProviderQuota]]:
     """The candidate seats paired with their quota rows, in attempt order.
 
     A registered candidate reuses the row :func:`command_center.quota._codex_quotas`
@@ -3489,11 +3540,14 @@ def _headroom_rows(now: int) -> list[tuple[SeatCandidate, quota.ProviderQuota]]:
     """
     from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
 
-    candidates = codex_homes_in_order(now)
+    candidates = codex_homes_in_order(now, model=model)
     if not candidates:
         return []
     cooldowns = quota.read_cooldowns(now)
-    by_pid = {row.id: row for row in quota._codex_quotas(now, cooldowns)}  # noqa: SLF001
+    by_pid = {
+        row.id: row
+        for row in quota._codex_quotas(now, cooldowns, model=model)  # noqa: SLF001
+    }
     pairs: list[tuple[SeatCandidate, quota.ProviderQuota]] = []
     for cand in candidates:
         row = by_pid.get(cand.pid) if cand.pid else None
@@ -3505,7 +3559,7 @@ def _headroom_rows(now: int) -> list[tuple[SeatCandidate, quota.ProviderQuota]]:
     return pairs
 
 
-def codex_headroom(now: int | None = None) -> dict[str, Any]:
+def codex_headroom(now: int | None = None, *, model: str = "") -> dict[str, Any]:
     """Structured quota-reserve decision for optional Codex offloads — over the POOL.
 
     The question this answers is "may optional work be offloaded to Codex at all", and
@@ -3525,12 +3579,12 @@ def codex_headroom(now: int | None = None) -> dict[str, Any]:
 
     Missing, malformed, or older-than-six-hours data still fails closed per seat. This
     policy governs optional offload work only; debate callers intentionally remain
-    always allowed.
+    always allowed. Every seat is judged for *model* (tp#2672 B2; ``""`` = funding only).
     """
     from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
 
     now_ts = int(time.time()) if now is None else now
-    pairs = _headroom_rows(now_ts)
+    pairs = _headroom_rows(now_ts, model)
     seats = [seat_headroom(row, now_ts) for _cand, row in pairs]
     chosen: dict[str, Any] | None = None
     for wanted in ("allowed", "reserve", "unknown", "blocked"):
@@ -3545,7 +3599,7 @@ def codex_headroom(now: int | None = None) -> dict[str, Any]:
     held = (
         []
         if os.environ.get("CCC_NO_CODEX") or os.environ.get("CODEX_HOME")
-        else [block for block in blocked_seats(now_ts) if block["label"] not in shown]
+        else [block for block in blocked_seats(now_ts, model=model) if block["label"] not in shown]
     )
     if chosen is None:
         state = "blocked"
@@ -3934,7 +3988,7 @@ def cmd_headroom(args: argparse.Namespace) -> int:
     try:
         if not getattr(args, "no_refresh", False):
             refresh_seat_readings()  # tp#1202: judge on the runner's evidence
-        decision = codex_headroom()
+        decision = codex_headroom(model=_judged_model(args, None))
     except Exception as exc:  # pylint: disable=broad-exception-caught  # any crash = unknown
         decision = _headroom_unknown(f"unknown: {type(exc).__name__}: {exc}")
     if args.json:
@@ -3978,8 +4032,9 @@ def cmd_headroom(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # Debate start caps (tp#619)
 #
-# A Codex DEBATE may start only on a seat the ``codex_debate_seats`` allowlist names
-# and never on one whose five-hour window is at/above the debate's cap
+# A Codex DEBATE may start on any ELIGIBLE seat (tp#2672 B2: live plan type and
+# same-model refusals; ``codex_debate_seats`` is only the preference order it tries
+# them in) and never on one whose five-hour window is at/above the debate's cap
 # (``codex_debate_cap_*`` / ``codex_debate_seat_caps``). Unlike ``headroom`` (a learned
 # reserve for OPTIONAL offloads) this is a hard per-tier cap on the five-hour window.
 # The WEEK counts too (tp#2495): a seat whose known seven-day reading leaves less than
@@ -4061,39 +4116,21 @@ def _debate_refresh(candidates: list[SeatCandidate], stale_after: int, budget: f
     abandoned: its seat stays a per-seat ``unknown``, and a late success writes genuine
     data through the atomic, flock'ed live-cache writer. Short-lived CLI processes only
     (``codex-in-claude debate-seat``): an abandoned daemon thread ends with the process.
-    """
-    from . import usage  # pylint: disable=import-outside-toplevel
 
-    deadline = time.monotonic() + budget
+    Since tp#2672 B2 this is :func:`_concurrent_refresh` over the *candidates* and then
+    every other REGISTERED seat (:func:`_refresh_targets`), before eligibility
+    filtering; a seat whose fresh reading is windowless (``live_meta``, a free plan)
+    counts as measured and is not re-fetched.
+    """
     now = int(time.time())
 
-    def _fetch(home: Path, timeout: float) -> None:
-        with contextlib.suppress(Exception):
-            usage.fetch_codex_usage(home, now, timeout=timeout)
+    def _stale(cand: SeatCandidate) -> bool:
+        row = _candidate_row(cand, now)
+        if _debate_fresh_five(row, now, stale_after) is not None:
+            return False
+        return not _fresh_live_meta(row, now, stale_after)
 
-    workers: list[threading.Thread] = []
-    for cand in candidates:
-        left = deadline - time.monotonic()
-        if left <= 0:
-            break
-        try:
-            if _debate_fresh_five(_candidate_row(cand, now), now, stale_after) is not None:
-                continue
-        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-            continue
-        worker = threading.Thread(
-            target=_fetch,
-            args=(cand.home, min(_REFRESH_FETCH_TIMEOUT_SEC, left)),
-            name=f"debate-refresh-{cand.label}",
-            daemon=True,
-        )
-        worker.start()
-        workers.append(worker)
-    for worker in workers:
-        left = deadline - time.monotonic()
-        if left <= 0:
-            return
-        worker.join(left)
+    _concurrent_refresh(_refresh_targets(candidates), budget, _stale, "debate-refresh")
 
 
 def _debate_known_week(row: quota.ProviderQuota, now: int) -> quota.WindowState | None:
@@ -4327,6 +4364,41 @@ def _debate_pick(seats: list[dict[str, Any]], tier: str) -> dict[str, Any]:
     return _debate_result("blocked", tier, "no eligible debate seat", seats=seats)
 
 
+def _debate_order_labels(preference: tuple[str, ...], registered: dict[str, Path]) -> list[str]:
+    """Every registered seat label in DEBATE order (tp#2672 B2).
+
+    ``codex_debate_seats`` is a preference, not an allowlist: its labels first, in list
+    order, then every other registered seat in the resolved ``codex_seat_order``.
+    """
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    seat_order = quota.codex_seat_order_labels(registered)
+    rest = [label for label in seat_order if label not in preference]
+    rest += [label for label in registered if label not in preference and label not in rest]
+    return [label for label in preference if label in registered] + rest
+
+
+def _debate_preferred(
+    cands: list[SeatCandidate], preference: tuple[str, ...]
+) -> list[SeatCandidate]:
+    """*cands* in debate order: listed seats first (list order), then the rest.
+
+    No preference keeps the routing order as it is. With one, the listed seats lead in
+    list order and every other seat follows in ``codex_seat_order`` order
+    (:func:`_debate_order_labels`); a refusal canary stays LAST whatever its place in the
+    list, as the ranking put it (tp#2672 B1).
+    """
+    if not preference:
+        return list(cands)
+    labels = _debate_order_labels(preference, canonical_codex_homes())
+
+    def _key(cand: SeatCandidate) -> tuple[bool, int]:
+        place = labels.index(cand.label) if cand.label in labels else len(labels)
+        return (cand.probe_kind == "refusal_canary", place)
+
+    return sorted(cands, key=_key)
+
+
 def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-statements,too-many-branches
     tier: str = "default",
     repo: str = "",
@@ -4344,11 +4416,14 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
       read-only run; ``probe=False`` governs the unmeasured-seat probe only). ``""``
       judges funding alone.
     * **candidates**: :func:`codex_homes_in_order` (``probe=False``) — ccc's own pin,
-      rota, cooldowns and fill/order ranking — FILTERED by ``codex_debate_seats``. An
-      inherited ``$CODEX_HOME`` narrows them to that one home, but it is still
-      intersected with the allowlist: a pin to a forbidden or unregistered home is
-      ``not_allowed``.
-    * **evidence**: :func:`_debate_refresh` first (under the ``codex_usage`` opt-in); a
+      rota, cooldowns, the live (seat, model) eligibility and the fill/order ranking —
+      ORDERED by ``codex_debate_seats`` (tp#2672 B2: a preference, no longer an
+      allowlist): the listed seats first in list order, then every other registered
+      seat in ``codex_seat_order`` order; a refusal canary stays last. An inherited
+      ``$CODEX_HOME`` narrows them to that one home, judged by the same row (a pin never
+      bypasses funding); an unregistered home is ``not_allowed``.
+    * **evidence**: :func:`_debate_refresh` first (under the ``codex_usage`` opt-in,
+      every registered seat, even when no seat is eligible); a
       seat with no FRESH five-hour reading afterwards is a per-seat ``unknown`` — unless
       its KNOWN weekly reading (present, not stale, before its reset; one snapshot with
       the five-hour one) is already inside the weekly reserve, which makes it ``capped``.
@@ -4376,13 +4451,12 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
         tier = "strict"
     now_ts = int(time.time()) if now is None else int(now)
     registered = canonical_codex_homes()
-    allowed = set(policy.seats) if policy.seats else set(registered)
     stale_after = _debate_stale_after()
     inherited = bool(os.environ.get("CODEX_HOME"))
 
     def _select() -> list[SeatCandidate]:
         cands = codex_homes_in_order(now_ts, probe=False, model=model, canary=True)
-        return cands if inherited else [cand for cand in cands if cand.label in allowed]
+        return cands if inherited else _debate_preferred(cands, policy.seats)
 
     candidates = _select()
     if inherited:
@@ -4393,17 +4467,11 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
             return _debate_result(
                 "not_allowed", tier, f"$CODEX_HOME {cand.home} is not a registered seat"
             )
-        if cand.label not in allowed:
-            return _debate_result(
-                "not_allowed",
-                tier,
-                f"$CODEX_HOME pins seat {cand.label}, not in codex_debate_seats",
-                seat=cand.label,
-                home=str(cand.home),
-            )
-    if refresh and candidates and _usage_feedback_on():
+    if refresh and _usage_feedback_on():
         # Only under the live-usage opt-in (``codex_usage``), exactly like the runner's
         # own pre-selection refresh; without it the rollout readings are the evidence.
+        # Every registered seat is refreshed (tp#2672 B2), so a seat no ranking offers
+        # (a free plan) is still measured and comes back once it is paid.
         _debate_refresh(candidates, stale_after, _DEBATE_REFRESH_BUDGET_SEC)
         candidates = _select()
     history = _safe_debate_history()
@@ -4422,13 +4490,14 @@ def debate_seat_verdict(  # pylint: disable=too-many-locals,too-many-return-stat
             )
         )
     if not inherited:
-        # Allowed seats the ranking dropped (held / blocked / rota): listed, never chosen.
+        # Registered seats the ranking dropped (held / blocked / unfunded / refused /
+        # rota): listed with the row's reason, in debate preference order, never chosen.
         listed = {cand.label for cand in candidates}
-        for label, home in registered.items():
-            if label not in allowed or label in listed:
+        for label in _debate_order_labels(policy.seats, registered):
+            if label in listed:
                 continue
             ghost = SeatCandidate(
-                label=label, home=home, email="", pid=_seat_pid(label), model=model
+                label=label, home=registered[label], email="", pid=_seat_pid(label), model=model
             )
             cap = policy.cap_for(label, tier)
             reserve, reserve_source = _debate_weekly_reserve(label, history=history)
@@ -4484,8 +4553,9 @@ def _debate_retry(
       LATER of both when both limits apply;
     * ``blocked`` → the blocked row's own ``resets_at`` (weekly exhaustion, a hold or
       cooldown's expiry, the rota's next own week); ``null`` for an ``auth`` /
-      ``entitlement`` block, an open-ended one, or a seat the routing dropped for a
-      reason no row states;
+      ``entitlement`` block, a FUNDING block (a free plan clears on no clock, tp#2672
+      B2 — composed with any other cause too), an open-ended one, or a seat the routing
+      dropped for a reason no row states; a (seat, model) refusal alone keeps its expiry;
     * ``unknown`` (no fresh reading) → no known cause at all.
     """
     from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
@@ -4497,20 +4567,23 @@ def _debate_retry(
     if state == "blocked":
         if row.state != quota.BLOCKED or row.block_scope in ("auth", "entitlement"):
             return True, None
+        if any(blocker.get("kind") == "funding" for blocker in row.blockers):
+            return True, None
         resets = int(row.resets_at or 0)
         return True, resets if resets > now else None
     return False, None
 
 
-def _without_codex_home() -> list[SeatCandidate]:
+def _without_codex_home(model: str = "") -> list[SeatCandidate]:
     """:func:`codex_homes_in_order` (``probe=False``) as if ``$CODEX_HOME`` were unset.
 
     A TOOL pin must not narrow the pool to itself (regime 2), or the debate could never
-    fail over. The variable is restored whatever happens.
+    fail over. The variable is restored whatever happens. Judged for *model*, with a
+    due refusal canary offered last (a debate round is read-only).
     """
     saved = os.environ.pop("CODEX_HOME", None)
     try:
-        return codex_homes_in_order(probe=False)
+        return codex_homes_in_order(probe=False, model=model, canary=True)
     finally:
         if saved is not None:
             os.environ["CODEX_HOME"] = saved
@@ -4525,18 +4598,22 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
     repo: str = "",
     now: int | None = None,
     refresh: bool = True,
+    model: str = "",
 ) -> dict[str, Any]:
     """May a running debate keep its seat *current* for the next round — tp#620 D2.
 
     Starts no Codex. The ``debate-seat`` JSON (``schema_version`` 1) plus the additive
     ``continue_from, pin, excluded, pause_*, retry_at, retry_seat`` fields and a
-    ``role`` (``current | candidate | excluded``) on every ``seats[]`` entry.
+    ``role`` (``current | candidate | excluded``) on every ``seats[]`` entry. Every
+    seat is judged for *model* (tp#2672 B2: a same-model refusal or a free plan blocks
+    the current seat too; a funding block never yields a retry time).
 
     * **pool**: ``pin="tool"`` → the routing order computed WITHOUT the inherited
-      ``$CODEX_HOME``, filtered by ``codex_debate_seats``, minus *exclude*; ``pin="human"``
-      → exactly the inherited ``$CODEX_HOME``, which must be *current*.
-    * **current**: refreshed first; not blocked, not excluded, still routed and
-      allowlisted, and — when its weekly reading is known — with at least one more round
+      ``$CODEX_HOME``, in ``codex_debate_seats`` PREFERENCE order (no allowlist), minus
+      *exclude*; ``pin="human"`` → exactly the inherited ``$CODEX_HOME``, which must be
+      *current*.
+    * **current**: refreshed first; not blocked, not excluded, still routed, and —
+      when its weekly reading is known — with at least one more round
       left (:func:`_round_reserve`, the seat's P95 round cost) → ``continue`` when it
       is fresh and below the pause point OR unmeasured (tp#2494: missing five-hour
       evidence stays a per-seat ``unknown`` but the pin is kept, ``used_percent`` null,
@@ -4587,7 +4664,6 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
     pause = float(base["pause_percent"])
     now_ts = int(time.time()) if now is None else int(now)
     registered = canonical_codex_homes()
-    allowed = set(policy.seats) if policy.seats else set(registered)
     stale_after = _debate_stale_after()
     if current not in registered:
         return _out("unknown", f"--continue {current!r} is not a registered seat")
@@ -4596,23 +4672,23 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
         env = os.environ.get("CODEX_HOME")
         if not env:
             return _out("unknown", "-p human needs the inherited $CODEX_HOME")
-        pinned = codex_homes_in_order(now_ts, probe=False)
+        pinned = codex_homes_in_order(now_ts, probe=False, model=model, canary=True)
         if not pinned or pinned[0].label != current:
             got = pinned[0].label if pinned else "nothing"
             return _out("unknown", f"$CODEX_HOME pins {got or env}, not the current seat {current}")
-        if current not in allowed:
-            return _out("unknown", f"$CODEX_HOME pins seat {current}, not in codex_debate_seats")
 
         def _select() -> list[SeatCandidate]:
-            return codex_homes_in_order(now_ts, probe=False)[:1]
+            return codex_homes_in_order(now_ts, probe=False, model=model, canary=True)[:1]
 
     else:
 
         def _select() -> list[SeatCandidate]:
-            return [cand for cand in _without_codex_home() if cand.label in allowed]
+            return _debate_preferred(_without_codex_home(model), policy.seats)
 
     def _ghost(label: str) -> SeatCandidate:
-        return SeatCandidate(label=label, home=registered[label], email="", pid=_seat_pid(label))
+        return SeatCandidate(
+            label=label, home=registered[label], email="", pid=_seat_pid(label), model=model
+        )
 
     candidates = _select()
     if refresh and _usage_feedback_on():
@@ -4624,7 +4700,6 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
         candidates = _select()
     routed = {cand.label: cand for cand in candidates}
     rows: dict[str, quota.ProviderQuota] = {}
-    untimed: set[str] = set()  # ineligible for a policy reason: never a retry time
 
     # The history, once per verdict: a NEW seat (failover) must fit a whole debate;
     # the current seat continues while one more round still fits (tp#2495, tp#2672 B3).
@@ -4642,10 +4717,7 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
         weekly_reserve_source=round_source,
     )
     cur["reason"] = cur["reason"].replace(" cap ", " pause point ")
-    if current not in allowed:
-        _debate_mark_blocked(cur, "not in codex_debate_seats")
-        untimed.add(current)
-    elif current not in routed and cur["state"] != "blocked":
+    if current not in routed and cur["state"] != "blocked":
         _debate_mark_blocked(cur, "not eligible in routing")
     cur_excluded = current in excluded
     cur["role"] = "excluded" if cur_excluded else "current"
@@ -4677,9 +4749,10 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
         entry["role"] = "excluded" if cand.label in excluded else "candidate"
         others.append(entry)
     if pin == "tool":
-        # Allowed seats the ranking dropped (held / blocked / rota): listed, never chosen.
-        for label in registered:
-            if label not in allowed or label in routed or label == current:
+        # Registered seats the ranking dropped (held / blocked / unfunded / refused /
+        # rota): listed with the row's reason, in preference order, never chosen.
+        for label in _debate_order_labels(policy.seats, registered):
+            if label in routed or label == current:
                 continue
             ghost = _ghost(label)
             rows[label] = _candidate_row(ghost, now_ts)
@@ -4720,12 +4793,9 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
     best_seat = ""
     for entry in considered:
         label = entry["seat"]
-        if label in untimed:
-            cause, retry = True, None
-        else:
-            cause, retry = _debate_retry(entry, rows[label], now_ts)
-            if entry is cur and cur_excluded:
-                cause = True  # the caller excluded it (a refusal it saw): known, untimed
+        cause, retry = _debate_retry(entry, rows[label], now_ts)
+        if entry is cur and cur_excluded:
+            cause = True  # the caller excluded it (a refusal it saw): known, untimed
         known = known or cause
         if retry is not None and (best_at is None or retry < best_at):
             best_at, best_seat = retry, label
@@ -4740,6 +4810,22 @@ def debate_continue_verdict(  # pylint: disable=too-many-locals,too-many-return-
     if best_at is not None:
         base["retry_at"], base["retry_seat"] = best_at, best_seat
     return _out("paused", reason, seats=seats, **cur_fields)
+
+
+def _judged_model(args: argparse.Namespace, for_command: str | None) -> str:
+    """The model a read-only verdict judges the seats for (``-m``, tp#2672 B2).
+
+    An explicit ``-m/--model`` wins; otherwise the model *for_command* resolves to
+    (:func:`resolve_model`: ``debate`` for ``debate-seat``, the global default for
+    ``headroom`` / ``order``). Never raises: an unreadable config judges funding alone.
+    """
+    explicit = str(getattr(args, "model", None) or "").strip()
+    if explicit:
+        return explicit
+    try:
+        return resolve_model(for_command)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return ""
 
 
 def cmd_debate_seat(args: argparse.Namespace) -> int:
@@ -4764,7 +4850,9 @@ def cmd_debate_seat(args: argparse.Namespace) -> int:
     if current is not None:
         return _cmd_debate_continue(args, current, pin or "tool", exclude)
     try:
-        verdict = debate_seat_verdict(tier=args.tier, repo=args.repo or "")
+        verdict = debate_seat_verdict(
+            tier=args.tier, repo=args.repo or "", model=_judged_model(args, "debate")
+        )
     except Exception as exc:  # pylint: disable=broad-exception-caught  # any crash = unknown
         verdict = _debate_result("unknown", args.tier, f"{type(exc).__name__}: {exc}")
     if args.json:
@@ -4797,7 +4885,12 @@ def _cmd_debate_continue(
     """``debate-seat -c``: may the running debate keep its seat (tp#620); exit 0 / 1 / 3."""
     try:
         verdict = debate_continue_verdict(
-            current, pin=pin, exclude=exclude, tier=args.tier, repo=args.repo or ""
+            current,
+            pin=pin,
+            exclude=exclude,
+            tier=args.tier,
+            repo=args.repo or "",
+            model=_judged_model(args, "debate"),
         )
     except Exception as exc:  # pylint: disable=broad-exception-caught  # any crash = unknown
         verdict = _debate_result(
@@ -5600,42 +5693,111 @@ def _below_floor(row: quota.ProviderQuota, floor: float) -> str:
 
 
 def _pre_selection_refresh(candidates: list[SeatCandidate], budget: float) -> None:
-    """Refresh every stale/unmeasured candidate's live figures, once, inside *budget*.
+    """Refresh every stale/unmeasured seat's live figures, once, inside *budget*.
 
-    Best effort in the strongest sense: each fetch is capped, the aggregate is capped,
-    and every failure is swallowed (plan D6, debate O13). Ranking on slightly old
-    numbers is a mild inefficiency; making a run wait on the network is a regression.
-    A module-level function so tests can monkeypatch the whole step.
+    The *candidates* first, then every other REGISTERED seat (:func:`_refresh_targets`,
+    tp#2672 B2), all fetched concurrently by :func:`_concurrent_refresh`. Stale = no
+    reading with windows younger than ``codex_usage_refresh_sec`` and no fresh
+    windowless ``live_meta`` either. Best effort in the strongest sense: each fetch is
+    capped, the aggregate is capped, and every failure is swallowed (plan D6, debate
+    O13). Ranking on slightly old numbers is a mild inefficiency; making a run wait on
+    the network is a regression. A module-level function so tests can monkeypatch the
+    whole step.
     """
-    from . import config, usage  # pylint: disable=import-outside-toplevel
+    from . import config  # pylint: disable=import-outside-toplevel
 
     try:
         stale_after = int(config.load_config().codex_usage_refresh_sec)
     except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         stale_after = 600
     now = int(time.time())
-    deadline = time.monotonic() + budget
+
+    def _stale(cand: SeatCandidate) -> bool:
+        row = _candidate_row(cand, now)
+        if row.captured_at and now - row.captured_at <= stale_after and row.windows:
+            return False
+        # A fresh WINDOWLESS reading (tp#2574 D5, e.g. a free plan's lone 30d window)
+        # is a measurement too: re-fetching it on every call would only find it again.
+        return not _fresh_live_meta(row, now, stale_after)
+
+    _concurrent_refresh(_refresh_targets(candidates), budget, _stale, "seat-refresh")
+
+
+def _fresh_live_meta(row: quota.ProviderQuota, now: int, stale_after: int) -> bool:
+    """Whether *row* has a windowless live reading (``live_meta``) younger than *stale_after*."""
+    meta_at = int((getattr(row, "live_meta", None) or {}).get("captured_at") or 0)
+    return bool(meta_at) and now - meta_at <= stale_after
+
+
+def _refresh_targets(first: list[SeatCandidate]) -> list[SeatCandidate]:
+    """*first* (deduplicated by home), then every OTHER registered seat (tp#2672 B2).
+
+    The refresh runs BEFORE eligibility filtering: a seat the ranking dropped (a free
+    plan, a hold) is measured all the same, so a seat that gets funded again comes back
+    with no config edit. Registered seats are added as plain candidates (no model): only
+    their readings matter here.
+    """
+    out: list[SeatCandidate] = []
     seen: set[str] = set()
-    for cand in candidates:
+    for cand in first:
+        if str(cand.home) not in seen:
+            seen.add(str(cand.home))
+            out.append(cand)
+    for label, home in canonical_codex_homes().items():
+        if str(home) not in seen:
+            seen.add(str(home))
+            out.append(SeatCandidate(label=label, home=home, email="", pid=_seat_pid(label)))
+    return out
+
+
+def _concurrent_refresh(
+    targets: list[SeatCandidate],
+    budget: float,
+    stale: Callable[[SeatCandidate], bool],
+    name: str,
+) -> None:
+    """THE seat refresher (tp#2672 B2): fetch live usage for every *stale* target at once.
+
+    All fetches start together in daemon threads (target order), each capped at
+    :data:`_REFRESH_FETCH_TIMEOUT_SEC` and the time left, and are joined against ONE
+    *budget* deadline — the worst case is the slowest fetch, not the sum, so a late seat
+    in the list can no longer starve behind earlier ones. A fetch still running at the
+    deadline is abandoned (a late success writes genuine data through the atomic,
+    flock'ed live-cache writer). Every failure is swallowed: a seat we could not measure
+    keeps its last reading.
+    """
+    from . import usage  # pylint: disable=import-outside-toplevel
+
+    deadline = time.monotonic() + budget
+    now = int(time.time())
+
+    def _fetch(home: Path, timeout: float) -> None:
+        with contextlib.suppress(Exception):
+            usage.fetch_codex_usage(home, now, timeout=timeout)
+
+    workers: list[threading.Thread] = []
+    for cand in targets:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        try:
+            if not stale(cand):
+                continue
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            continue
+        worker = threading.Thread(
+            target=_fetch,
+            args=(cand.home, min(_REFRESH_FETCH_TIMEOUT_SEC, left)),
+            name=f"{name}-{cand.label}",
+            daemon=True,
+        )
+        worker.start()
+        workers.append(worker)
+    for worker in workers:
         left = deadline - time.monotonic()
         if left <= 0:
             return
-        home = str(cand.home)
-        if home in seen:
-            continue
-        seen.add(home)
-        try:
-            row = _candidate_row(cand, now)
-            if row.captured_at and now - row.captured_at <= stale_after and row.windows:
-                continue
-            # A fresh WINDOWLESS reading (tp#2574 D5, e.g. a free plan's lone 30d window)
-            # is a measurement too: re-fetching it on every call would only find it again.
-            meta_at = int((getattr(row, "live_meta", None) or {}).get("captured_at") or 0)
-            if meta_at and now - meta_at <= stale_after:
-                continue
-            usage.fetch_codex_usage(cand.home, now, timeout=min(_REFRESH_FETCH_TIMEOUT_SEC, left))
-        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
-            continue  # a seat we could not measure simply stays where the ranking put it
+        worker.join(left)
 
 
 def _post_attempt_refresh(cand: SeatCandidate, budget: float) -> None:
@@ -5701,6 +5863,31 @@ def _rota_configured() -> bool:
         return False
 
 
+#: ``RunAttempt.outcome`` of a seat the live eligibility verdict denies (tp#2672 B2).
+_ELIGIBILITY_SKIPS = {"funding": "skipped:funding", "model_refusal": "skipped:model_refusal"}
+
+
+def _eligibility_skip(row: quota.ProviderQuota) -> str:
+    """``skipped:funding`` / ``skipped:model_refusal`` when *row* carries that blocker, else ``""``.
+
+    Funding wins when both apply (a free plan blocks every model).
+    """
+    kinds = {str(blocker.get("kind") or "") for blocker in row.blockers}
+    for kind, outcome in _ELIGIBILITY_SKIPS.items():
+        if kind in kinds:
+            return outcome
+    return ""
+
+
+def _eligibility_reason(row: quota.ProviderQuota) -> str:
+    """The reasons of *row*'s funding / model-refusal blockers, ``; ``-joined."""
+    return "; ".join(
+        str(blocker.get("reason") or "")
+        for blocker in row.blockers
+        if blocker.get("kind") in _ELIGIBILITY_SKIPS
+    )
+
+
 def _skip_reason(  # pylint: disable=too-many-return-statements  # one per skip outcome
     cand: SeatCandidate,
     *,
@@ -5721,9 +5908,13 @@ def _skip_reason(  # pylint: disable=too-many-return-statements  # one per skip 
     this week, and no amount of accepting a refusal makes billing their week ours
     (debate O7). So whenever a rota is configured the row is built even under ``-Q``,
     and ``skipped:rota`` outranks it. A human override exists — ``/switch <seat>!``.
+
+    The live ELIGIBILITY verdict (tp#2672 B2) is not a quota verdict either: a free plan
+    (``skipped:funding``) or a fresh refusal of the run's model on this seat
+    (``skipped:model_refusal``) is judged from the row even under ``-Q`` — so ``-Q``
+    always builds the row — and outranks every quota skip. A refusal canary candidate
+    is judged on the pre-refusal row, exactly as the ranking offered it.
     """
-    if ignore_quota and not (write or min_remaining_pct or headroom or _rota_configured()):
-        return ""  # nothing left to check — do not pay for a quota row
     from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
 
     now = int(time.time())
@@ -5733,6 +5924,9 @@ def _skip_reason(  # pylint: disable=too-many-return-statements  # one per skip 
         return ""  # a row we cannot build proves nothing — fail open, as everywhere else
     if row.block_scope == "rota":
         return "skipped:rota"
+    eligibility = _eligibility_skip(row)
+    if eligibility:
+        return eligibility
     if not ignore_quota and row.state == quota.BLOCKED:
         # A dead login is its own typed skip (tp#1196): "exhausted" would send the
         # reader to wait for a reset that never fixes it. ``-Q`` still waives it — the
@@ -5947,7 +6141,22 @@ def _confined(pending: list[SeatCandidate], seat: str) -> list[SeatCandidate]:
     return [c for c in pending if seat in _seat_names(c.label, c.pid)]
 
 
-def _seat_result(result: RunResult, seat: str) -> RunResult:
+def _seat_eligibility_why(seat: str, model: str) -> str:
+    """The funding / model-refusal reason that keeps ``run -S`` *seat* out, else ``""``."""
+    from . import quota  # pylint: disable=import-outside-toplevel  # cycle: quota needs the pin
+
+    now = int(time.time())
+    try:
+        rows = quota._codex_quotas(now, quota.read_cooldowns(now), model=model)  # noqa: SLF001
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        return ""
+    for row in rows:
+        if seat in _seat_names(row.account, row.id):
+            return _eligibility_reason(row)
+    return ""
+
+
+def _seat_result(result: RunResult, seat: str, model: str = "") -> RunResult:
     """Fill *result* in for a ``run -S`` seat that did not serve: never a hop, one kind.
 
     ``seat_unknown`` = no registered seat answers to *seat*; ``seat_needs_login`` = its
@@ -5992,11 +6201,25 @@ def _seat_result(result: RunResult, seat: str) -> RunResult:
         )
     else:
         lines, result.earliest_reset = seat_status_report()
-        why = last or "not eligible right now"
+        why = last or _seat_eligibility_why(seat, model) or "not eligible right now"
         result.error_message = f"seat {seat} is unavailable ({why}) — -S never hops" + (
             ("\n  " + "\n  ".join(lines)) if lines else ""
         )
         result.error_kind = "seat_unavailable"
+    return result
+
+
+def _pinned_ineligible(result: RunResult, cand: SeatCandidate) -> RunResult:
+    """``seat_unavailable`` for a pinned *cand* the eligibility verdict denies (tp#2672 B2)."""
+    try:
+        why = _eligibility_reason(_candidate_row(cand, int(time.time())))
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        why = ""
+    result.error_kind = "seat_unavailable"
+    result.error_message = (
+        f"seat {cand.label} is unavailable ({why or 'not eligible'}) — a pin never "
+        "bypasses the live eligibility verdict (plan type, model refusal)"
+    )
     return result
 
 
@@ -6142,13 +6365,15 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
     # never a write run or a resume — independently of the unmeasured-seat probe.
     canary_ok = resume_home is None and not write
     if resume_home is not None:
-        pending = [_seat_candidate_for(resume_home)]
+        # Judged for the run's model (tp#2672 B2): a resume never bypasses a funding or
+        # a fresh same-model refusal block, and never takes a refusal canary.
+        pending = [_pinned_candidate(resume_home, model)]
     else:
         refresh_seat_readings(probe=probe_ok)
         pending = codex_homes_in_order(probe=probe_ok, model=model, canary=canary_ok)
     pending = _confined(pending, seat)
     if not pending:
-        return _seat_result(result, seat) if seat else _no_seat_result(result)
+        return _seat_result(result, seat, model) if seat else _no_seat_result(result)
 
     attempted: set[str] = set()
     physical = 0
@@ -6177,6 +6402,12 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
             result.attempts.append(RunAttempt(cand.label, str(cand.home), 0.0, skip))
             if skip == "skipped:needs_login":
                 _announce_needs_login(cand, "recorded dead login")
+            if skip in _ELIGIBILITY_SKIPS.values() and (
+                seat or resume_home is not None or os.environ.get("CODEX_HOME")
+            ):
+                # A PIN (``-S``, ``$CODEX_HOME``, a resume) is never a bypass of the live
+                # eligibility verdict (tp#2672 B2): fail with the reason, start nothing.
+                return _pinned_ineligible(result, cand)
             continue
         if cand.probe and not _claim_probe(cand):
             # Another runner took today's probe of this unmeasured seat: re-rank WITHOUT
@@ -6419,7 +6650,7 @@ def _run_with_fallback(  # pylint: disable=too-many-branches,too-many-statements
         result.seat, result.reply, result.error_message = model_refusal
         result.error_kind = "model_unavailable"
         return result
-    return _seat_result(result, seat) if seat else _no_seat_result(result)
+    return _seat_result(result, seat, model) if seat else _no_seat_result(result)
 
 
 def _model_refusal_may_hop(  # pylint: disable=too-many-positional-arguments
@@ -7516,6 +7747,13 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     )
     p_headroom.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")
     p_headroom.add_argument(
+        "-m",
+        "--model",
+        default=None,
+        metavar="MODEL",
+        help="judge the seats for MODEL (alias or slug; default: the configured default model)",
+    )
+    p_headroom.add_argument(
         "-n",
         "--no-refresh",
         action="store_true",
@@ -7528,9 +7766,11 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         "debate-seat",
         help="which Codex seat a debate may START on / CONTINUE on (tp#619, tp#620)",
         description=(
-            "Read-only: judge every allowed seat (codex_debate_seats) against the debate "
+            "Read-only: judge every registered seat for the debate model (-m; live plan "
+            "and same-model refusals) against the debate "
             "cap of its tier (codex_debate_cap_*, codex_debate_seat_caps) and the weekly "
-            "reserve; the first seat in codex order that is below its cap OR unmeasured "
+            "reserve; codex_debate_seats is a preference order (listed seats first, then "
+            "the rest in codex_seat_order); the first seat that is below its cap OR unmeasured "
             "(no fresh five-hour reading, used_percent null) wins. Starts no Codex "
             "process. Exit 0 = allowed, 1 = capped / not_allowed / blocked / disabled, "
             "3 = unknown (bad policy or tier, evaluator crash). "
@@ -7573,9 +7813,17 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
         choices=DEBATE_PINS,
         default=None,
         help=(
-            "with -c: who chose the seat — tool (the default: may fail over within "
-            "codex_debate_seats, $CODEX_HOME ignored) or human ($CODEX_HOME, never moves)"
+            "with -c: who chose the seat — tool (the default: may fail over to any "
+            "eligible seat, codex_debate_seats first, $CODEX_HOME ignored) or human "
+            "($CODEX_HOME, never moves)"
         ),
+    )
+    p_debate.add_argument(
+        "-m",
+        "--model",
+        default=None,
+        metavar="MODEL",
+        help="judge the seats for MODEL (alias or slug; default: the resolved debate model)",
     )
     p_debate.add_argument(
         "-x",
@@ -7623,6 +7871,13 @@ def build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-state
     )
     p_order.add_argument(
         "-c", "--clear", action="store_true", help="drop the order (back to canonical)"
+    )
+    p_order.add_argument(
+        "-m",
+        "--model",
+        default=None,
+        metavar="MODEL",
+        help="judge the seats for MODEL (alias or slug; default: the configured default model)",
     )
     p_order.add_argument(
         "-j",

@@ -2713,9 +2713,11 @@ def snapshot(
     """The full quota picture, cache-only. Never raises, never touches the network.
 
     *model* is the model the caller intends to invoke; it is echoed in the result (every
-    Claude window governs every model). Claude accounts are ordered by
-    DESCENDING urgency so the first usable one is the account whose allowance would
-    otherwise expire soonest.
+    Claude window governs every model) and the Codex rows are JUDGED for it (tp#2672
+    B2): a seat that recently refused that (seat, model) pair is a BLOCKED row with
+    ``eligible: false`` in ``codex_seat_order``. ``""`` judges funding alone. Claude
+    accounts are ordered by DESCENDING urgency so the first usable one is the account
+    whose allowance would otherwise expire soonest.
     """
     now = int(time.time()) if now is None else now
     cooldowns = read_cooldowns(now)
@@ -2728,7 +2730,7 @@ def snapshot(
     homes = _canonical_codex_homes()
     # ONE ledger pass per snapshot: the ``last_run`` stamps and the eligibility verdict.
     ledger_summary = codex_ledger.seat_model_summary(now=now)
-    codex_rows = _codex_quotas(now, cooldowns, summary=ledger_summary)
+    codex_rows = _codex_quotas(now, cooldowns, model=model, summary=ledger_summary)
     _attach_last_runs(codex_rows, now, ledger_summary)
     pin_label = _codex_pin_label(homes)
     configured = config.codex_seat_order()
@@ -2827,6 +2829,11 @@ def _api_credit_rows(now: int, labels: list[str]) -> list[dict[str, Any]]:
     return rows
 
 
+def _skip_reason(row: ProviderQuota) -> str:
+    """Why the ranking left *row* out: its (composed) reason, else its state."""
+    return row.reason or (row.state if row.state != AVAILABLE else "not ranked")
+
+
 def _seat_order_rows(
     rows: list[ProviderQuota],
     order: list[str],
@@ -2840,6 +2847,8 @@ def _seat_order_rows(
     ``measured`` / ``probe`` / ``rank_reason``, which are additive (plan D9).
     ``configured_rank`` is the seat's place in the resolved order (1-based);
     ``attempt_rank`` its place among the ELIGIBLE candidates, ``None`` when skipped.
+    Additive (tp#2672 B2): ``eligible`` (the seat has an ``attempt_rank``) and
+    ``skip_reason`` (why it has none: the row's composed ``reason``, else ``""``).
     """
     by_label = {row.account: row for row in rows}
     by_id = {id(rank.row): (index, rank) for index, rank in enumerate(ranks, 1)}
@@ -2853,6 +2862,8 @@ def _seat_order_rows(
             {
                 "configured_rank": index,
                 "attempt_rank": attempt_rank,
+                "eligible": attempt_rank is not None,
+                "skip_reason": "" if attempt_rank is not None else _skip_reason(row),
                 "id": row.id,
                 "label": label,
                 "email": row.email,

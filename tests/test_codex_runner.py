@@ -39,7 +39,7 @@ import pytest
 from conftest import SeatFixture, make_three_seats
 
 from command_center import codex_in_claude as cic
-from command_center import codex_launch, codex_ledger, config, quota
+from command_center import codex_launch, codex_ledger, config, quota, usage
 
 # pylint: disable=too-many-lines  # one cohesive suite: the runner's hops, hygiene and CLI
 
@@ -1644,3 +1644,218 @@ def test_unautomated_run_rows_carry_no_guard_keys(
     assert cic.cmd_run(_run_ns(three_seats)) == cic.EX_OK
     capsys.readouterr()
     assert all("seat_violation" not in r for r in codex_ledger.read_runs())
+
+
+# ── tp#2672 B2: a pin, a resume and -Q never bypass the live eligibility verdict ──────
+_H = 3600
+
+
+def _plan_reading(home: Path, plan: str) -> None:
+    """A fresh windowed live reading of *plan* for *home* (10 % / 10 %)."""
+    now = int(time.time())
+    usage._write_codex_usage(  # noqa: SLF001
+        home,
+        usage.Usage(
+            captured_at=now,
+            five_hour=usage.Window(used_percentage=10.0, resets_at=now + 4 * _H),
+            seven_day=usage.Window(used_percentage=10.0, resets_at=now + 72 * _H),
+            live=True,
+            plan_type=plan,
+        ),
+        now,
+    )
+    usage._codex_cache.clear()  # noqa: SLF001
+
+
+def _refused(seat: str, age: int, model: str = _MODEL) -> None:
+    """One `refused:model` ledger attempt of *model* on *seat*, *age* seconds old."""
+    row = {
+        "ts": codex_ledger._iso(time.time() - age),  # noqa: SLF001
+        "provider": "codex",
+        "seat": seat,
+        "id": "codex" if seat == "default" else f"codex:{seat}",
+        "purpose": "test",
+        "model": model,
+        "outcome": "refused:model",
+        "ok": False,
+        "ms": 10,
+    }
+    path = codex_ledger.ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row) + "\n")
+
+
+def _blocked_by(kind: str, seats: SeatFixture) -> str:
+    """Block seat ``private``: a free plan (``funding``) or a 2 h old same-model refusal."""
+    if kind == "funding":
+        _plan_reading(seats.seats["private"], "free")
+        return "plan free"
+    _refused("private", 2 * _H)
+    return f"refused:model {_MODEL}"
+
+
+def _assert_pinned_refusal(
+    seats: SeatFixture, capsys: pytest.CaptureFixture[str], rc: int, reason: str
+) -> dict:
+    envelope = _envelope(capsys)
+    assert rc != cic.EX_OK
+    assert seats.calls() == []  # zero codex processes
+    assert envelope["error"]["kind"] == "seat_unavailable", envelope["error"]
+    assert reason in envelope["error"]["message"]
+    return envelope
+
+
+def _codex_home_blocked(
+    kind: str,
+    seats: SeatFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An inherited $CODEX_HOME is judged by its row: blocked ⇒ seat_unavailable, nothing runs."""
+    reason = _blocked_by(kind, seats)
+    monkeypatch.setenv("CODEX_HOME", str(seats.seats["private"]))
+    rc = cic.cmd_run(_run_ns(seats))
+    _assert_pinned_refusal(seats, capsys, rc, reason)
+
+
+def test_codex_home_pin_respects_funding(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _codex_home_blocked("funding", three_seats, monkeypatch, capsys)
+
+
+def test_codex_home_pin_respects_refusal(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _codex_home_blocked("refusal", three_seats, monkeypatch, capsys)
+
+
+def _seat_pin_blocked(kind: str, seats: SeatFixture, capsys: pytest.CaptureFixture[str]) -> None:
+    """`run -S private` on a blocked seat names the reason and starts nothing."""
+    reason = _blocked_by(kind, seats)
+    rc = cic.cmd_run(_run_ns(seats, seat="private"))
+    _assert_pinned_refusal(seats, capsys, rc, reason)
+
+
+def test_seat_pin_respects_funding(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seat_pin_blocked("funding", three_seats, capsys)
+
+
+def test_seat_pin_respects_refusal(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seat_pin_blocked("refusal", three_seats, capsys)
+
+
+def _resume_blocked(kind: str, seats: SeatFixture, capsys: pytest.CaptureFixture[str]) -> None:
+    reason = _blocked_by(kind, seats)
+    session = "019ff5b3-7bea-7c80-ad5e-21cc5b7c64bd"
+    codex_launch.record_launch(
+        session, str(seats.workdir), write=False, codex_home=seats.seats["private"]
+    )
+    rc = cic.cmd_delegate(_delegate_ns(seats, resume=session))
+    out = capsys.readouterr()
+    assert rc != cic.EX_OK
+    assert seats.calls() == []  # zero codex processes
+    assert reason in out.out + out.err
+    assert not quota.read_refusal_canaries()  # a resume never takes a canary
+
+
+def test_resume_respects_funding(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _resume_blocked("funding", three_seats, capsys)
+
+
+def test_resume_respects_refusal(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _resume_blocked("refusal", three_seats, capsys)
+
+
+def _ignore_quota_blocked(
+    kind: str,
+    seats: SeatFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reason = _blocked_by(kind, seats)
+    # `-Q` with `-S`: the ranking already dropped the seat; with $CODEX_HOME: the fast
+    # path that skipped the quota row must now build it.
+    rc = cic.cmd_run(_run_ns(seats, seat="private", ignore_quota=True))
+    _assert_pinned_refusal(seats, capsys, rc, reason)
+    monkeypatch.setenv("CODEX_HOME", str(seats.seats["private"]))
+    rc = cic.cmd_run(_run_ns(seats, ignore_quota=True))
+    envelope = _assert_pinned_refusal(seats, capsys, rc, reason)
+    outcome = "skipped:funding" if kind == "funding" else "skipped:model_refusal"
+    assert [attempt["outcome"] for attempt in envelope["attempts"]] == [outcome]
+
+
+def test_ignore_quota_does_not_override_funding(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _ignore_quota_blocked("funding", three_seats, monkeypatch, capsys)
+
+
+def test_ignore_quota_does_not_override_refusal(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _ignore_quota_blocked("refusal", three_seats, monkeypatch, capsys)
+
+
+def test_ignore_quota_still_waives_a_quota_block(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`-Q` keeps waiving a QUOTA block on a pin: only eligibility is out of its reach."""
+    quota.record_block("codex:private", blocked_until=int(time.time()) + _H, reason="limit")
+    monkeypatch.setenv("CODEX_HOME", str(three_seats.seats["private"]))
+    assert cic.cmd_run(_run_ns(three_seats, ignore_quota=True)) == cic.EX_OK
+    capsys.readouterr()
+    assert three_seats.call_homes() == ["private"]
+
+
+def test_read_only_pin_takes_refusal_canary_after_half_ttl(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 13 h old refusal: ONE read-only $CODEX_HOME run takes the canary; a write never does."""
+    _refused("private", 13 * _H)
+    monkeypatch.setenv("CODEX_HOME", str(three_seats.seats["private"]))
+    assert cic.cmd_run(_run_ns(three_seats)) == cic.EX_OK
+    capsys.readouterr()
+    assert three_seats.call_homes() == ["private"]
+    assert list(quota.read_refusal_canaries()) == [f"model-refusal:codex:private:{_MODEL}"]
+    # The canary served the model: the later same-model `ok` cleared the refusal.
+    three_seats.reset_log()
+    assert cic.cmd_run(_run_ns(three_seats)) == cic.EX_OK
+    capsys.readouterr()
+    assert three_seats.call_homes() == ["private"]
+
+
+def test_read_only_pin_canary_is_claimed_once(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Once the pair's canary is claimed, a second pinned caller gets seat_unavailable."""
+    _refused("private", 13 * _H)
+    refused_at = int(time.time()) - 13 * _H
+    assert quota.claim_refusal_canary("codex:private", _MODEL, due_at=refused_at + 12 * _H)
+    monkeypatch.setenv("CODEX_HOME", str(three_seats.seats["private"]))
+    rc = cic.cmd_run(_run_ns(three_seats))
+    _assert_pinned_refusal(three_seats, capsys, rc, "refused:model")
+
+
+def test_all_seats_funding_blocked_starts_nothing(
+    three_seats: SeatFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for home in three_seats.seats.values():
+        _plan_reading(home, "free")
+    assert cic.codex_homes_in_order(model=_MODEL) == []
+    assert cic.cmd_run(_run_ns(three_seats)) != cic.EX_OK
+    envelope = _envelope(capsys)
+    assert three_seats.calls() == []
+    assert envelope["error"]["kind"] == "all_seats_unavailable"
+    verdict = cic.debate_seat_verdict(refresh=False, model=_MODEL)
+    assert verdict["state"] == "blocked"
+    assert all("plan free" in seat["reason"] for seat in verdict["seats"])

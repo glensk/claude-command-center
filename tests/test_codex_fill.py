@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -1041,8 +1042,8 @@ def test_headroom_free_plan_seat_notes_debate_refused(
     _hold("codex:de", "codex", now=now)
     real_rows = cic._headroom_rows  # noqa: SLF001
 
-    def _rows(now_ts: int) -> list[tuple[cic.SeatCandidate, quota.ProviderQuota]]:
-        pairs = real_rows(now_ts)
+    def _rows(now_ts: int, model: str = "") -> list[tuple[cic.SeatCandidate, quota.ProviderQuota]]:
+        pairs = real_rows(now_ts, model)
         for cand, row in pairs:
             if cand.label == "private":
                 setattr(row, "live_meta", {"plan_type": "free"})  # noqa: B010
@@ -1197,3 +1198,85 @@ def test_windowless_meta_skips_presel_refresh(
     usage._codex_cache.clear()  # noqa: SLF001
     cic._pre_selection_refresh(cands, cic._REFRESH_BUDGET_SEC)  # noqa: SLF001
     assert fetched == [three_seats.seats["private"]]
+
+
+# ── tp#2672 B2: ONE concurrent refresher over every REGISTERED seat ──────────────────
+def _plan_live(home: Path, plan: str, *, now: int, age: int = 0) -> None:
+    """A live reading of *plan* (10 % / 10 %), measured *age* seconds before *now*."""
+    usage._write_codex_usage(  # noqa: SLF001
+        home,
+        usage.Usage(
+            captured_at=now - age,
+            five_hour=usage.Window(used_percentage=10.0, resets_at=now + 4 * _HOUR),
+            seven_day=usage.Window(used_percentage=10.0, resets_at=now + 3 * _DAY),
+            live=True,
+            plan_type=plan,
+        ),
+        now - age,
+    )
+    usage._codex_cache.clear()  # noqa: SLF001
+
+
+def test_refresh_reaches_ineligible_seat_and_restores_it(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A free (funding-blocked) seat is still re-measured; once paid it is ranked again."""
+    now = int(time.time())
+    stale = 2 * int(config.load_config().codex_usage_refresh_sec)
+    _plan_live(three_seats.seats["private"], "free", now=now, age=stale)
+    for label in ("de", "default"):
+        _plan_live(three_seats.seats[label], "plus", now=now)
+    assert "private" not in [cand.label for cand in cic.codex_homes_in_order(now)]
+    fetched: list[Path] = []
+
+    def _fetch(home: Path, _now: int | None = None, *, timeout: float | None = None) -> None:
+        assert timeout is not None
+        fetched.append(home)
+        _plan_live(home, "plus", now=int(time.time()))  # the seat was funded again
+
+    monkeypatch.setattr(usage, "fetch_codex_usage", _fetch)
+    monkeypatch.setattr(cic, "_usage_feedback_on", lambda: True)
+    cic.refresh_seat_readings()
+    assert fetched == [three_seats.seats["private"]]  # the only stale seat, ranked or not
+    assert "private" in [cand.label for cand in cic.codex_homes_in_order()]  # no config edit
+
+
+def test_refresh_is_concurrent_and_reaches_last_seat(
+    three_seats: SeatFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three stale seats whose fetches each take most of the budget all finish in time.
+
+    The LAST configured seat is funding-blocked, so no ranking offers it: it is still
+    refreshed, and fetched concurrently rather than starved behind the other two.
+    """
+    now = int(time.time())
+    stale = 2 * int(config.load_config().codex_usage_refresh_sec)
+    three_seats.reorder("de", "default", "private")
+    _plan_live(three_seats.seats["private"], "free", now=now, age=stale)
+    for label in ("de", "default"):
+        _plan_live(three_seats.seats[label], "plus", now=now, age=stale)
+    budget = 1.0
+    gate = threading.Event()
+    running: list[int] = []
+    peak: list[int] = [0]
+    lock = threading.Lock()
+    fetched: list[Path] = []
+
+    def _slow(home: Path, _now: int | None = None, *, timeout: float | None = None) -> None:
+        assert timeout is not None and timeout <= budget
+        with lock:
+            running.append(1)
+            peak[0] = max(peak[0], len(running))
+        gate.wait(0.6 * budget)  # 60 % of the budget each: in a row, the third would starve
+        with lock:
+            running.pop()
+            fetched.append(home)
+
+    monkeypatch.setattr(usage, "fetch_codex_usage", _slow)
+    cands = cic.codex_homes_in_order(now)
+    assert [cand.label for cand in cands] == ["de", "default"]
+    started = time.monotonic()
+    cic._pre_selection_refresh(cands, budget)  # noqa: SLF001
+    assert time.monotonic() - started < budget + 0.5
+    assert sorted(map(str, fetched)) == sorted(str(home) for home in three_seats.seats.values())
+    assert peak[0] == 3  # all three overlapped
