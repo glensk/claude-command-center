@@ -10,7 +10,7 @@ from __future__ import annotations
 import fcntl
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -247,6 +247,35 @@ def test_a_raw_model_id_survives_export_and_import(
     assert _session(env, sid).llm_exec == "nova-12.5-preview"
     assert "<!-- ccc-sync-error -->" not in path.read_text(encoding="utf-8")
     assert futuresync.run_sync(env.store, env.cfg).total() == 0
+
+
+def test_retired_model_in_file_imports_as_replacement(env: Env) -> None:
+    """tp#2036: a vault file holding the retired ``opus-5`` syncs, stored as ``opus-5.5``."""
+    sid = _new_draft(env, "Ship the thing")
+    futuresync.run_sync(env.store, env.cfg)
+    env.store.update_fields(sid, llm_overseer="opus-4.8", llm_exec="opus-4.8")
+    futuresync.run_sync(env.store, env.cfg)
+    path = _abs(env, sid)
+    text = path.read_text(encoding="utf-8")
+    text = text.replace('llm_overseer: "opus-4.8"', 'llm_overseer: "opus-5"')
+    text = text.replace('llm_exec: "opus-4.8"', 'llm_exec: "opus-5"')
+    path.write_text(text, encoding="utf-8")
+    report = futuresync.run_sync(env.store, env.cfg)
+    assert report.imported == [sid]
+    assert _session(env, sid).llm_overseer == "opus-5.5"
+    assert _session(env, sid).llm_exec == "opus-5.5"
+    assert "<!-- ccc-sync-error -->" not in path.read_text(encoding="utf-8")
+
+
+def test_edit_job_with_retired_model_stores_replacement(env: Env) -> None:
+    sid = _new_draft(env, "Ship the thing")
+    futuresync.run_sync(env.store, env.cfg)
+    env.store.update_fields(sid, llm_overseer="opus-4.8", llm_exec="opus-4.8")
+    job = parse_job_file(_abs(env, sid).read_text(encoding="utf-8"))
+    job = replace(job, llm_overseer="opus-5", llm_exec="opus-5")
+    futuresync.apply_job_fields(env.store, env.cfg, _session(env, sid), job, env.git_base)
+    assert _session(env, sid).llm_overseer == "opus-5.5"
+    assert _session(env, sid).llm_exec == "opus-5.5"
 
 
 def test_repo_change_moves_file_and_updates_cwd(env: Env) -> None:

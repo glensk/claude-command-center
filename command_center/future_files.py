@@ -319,12 +319,12 @@ def validate(job: ParsedJob, git_base: Path) -> list[str]:
     if job.job_type not in models.JOB_TYPES:
         errors.append(f"job_type {job.job_type!r} is not one of {', '.join(models.JOB_TYPES)}")
     # A raw model id (a model newer than the choice table, tp#2335) is valid too.
-    if not models.is_launchable_llm(job.llm_overseer):
+    if not models.launchable_llm_or(job.llm_overseer, ""):
         errors.append(
             f"llm_overseer {job.llm_overseer!r} is not one of {', '.join(models.LLM_CHOICES)}"
             " or a model id"
         )
-    if not models.is_launchable_llm(job.llm_exec):
+    if not models.launchable_llm_or(job.llm_exec, ""):
         errors.append(
             f"llm_exec {job.llm_exec!r} is not one of {', '.join(models.LLM_CHOICES)} or a model id"
         )
@@ -484,7 +484,7 @@ def _llm_options(llm_values: tuple[str, ...]) -> str:
     """
     options = list(models.LLM_CHOICES)
     for value in llm_values:
-        if value not in options and _SAFE_OPTION_RE.match(value or ""):
+        if value not in options and models.is_raw_model_id(value) and _SAFE_OPTION_RE.match(value):
             options.append(value)
     return ", ".join(f"option({m})" for m in options)
 

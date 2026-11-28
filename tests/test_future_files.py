@@ -187,6 +187,26 @@ def test_a_raw_model_id_round_trips_and_joins_the_select_options() -> None:
     assert "option(claude-opus-4-8[1m])" not in text
 
 
+def test_validate_accepts_retired_and_rejects_garbage(tmp_path: Path) -> None:
+    """tp#2036: a retired choice is repairable (valid); a non-token value still fails."""
+    git_base = tmp_path / "git"
+    (git_base / "home" / "ccc").mkdir(parents=True)
+    good = _valid_job("home/ccc")
+    retired = replace(good, llm_overseer="opus-5", llm_exec="opus-5")
+    assert not future_files.validate(retired, git_base)
+    assert any(
+        "llm_overseer" in e
+        for e in future_files.validate(replace(good, llm_overseer="has space"), git_base)
+    )
+
+
+def test_select_does_not_offer_a_held_retired_choice() -> None:
+    text = future_files.serialize(
+        session_id=_UUID, aim="x", repo="home/ccc", llm_overseer="opus-5", llm_exec="opus-5"
+    )
+    assert "option(opus-5)" not in text
+
+
 def test_controls_block_labels_every_select() -> None:
     # Each Controls widget carries a bold label so the boxes are identifiable.
     text = future_files.serialize(session_id=_UUID, aim="x", repo="home/ccc")

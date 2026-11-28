@@ -71,7 +71,7 @@ from .models import (  # pylint: disable=wrong-import-position  # after the dire
     DEFAULT_LLM,
     JOB_TYPES,
     Session,
-    is_launchable_llm,
+    launchable_llm_or,
     now_ms,
 )
 from .store import Store
@@ -684,10 +684,8 @@ def archive_file(store: Store, cfg: config.Config, session: object, final_status
                 job_type=(job.job_type if job.job_type in JOB_TYPES else session_jt),
                 no_codex=job.no_codex or session_nc,
                 launch_profile=session_lp,
-                llm_overseer=(
-                    job.llm_overseer if is_launchable_llm(job.llm_overseer) else session_ov
-                ),
-                llm_exec=(job.llm_exec if is_launchable_llm(job.llm_exec) else session_ex),
+                llm_overseer=(launchable_llm_or(job.llm_overseer, session_ov)),
+                llm_exec=(launchable_llm_or(job.llm_exec, session_ex)),
                 start_when=job.start_when,
                 start_date=job.start_date,
                 depends_on=job.depends_on,
@@ -794,10 +792,8 @@ def delete_file(store: Store, cfg: config.Config, session: object) -> Path | Non
             job_type=(job.job_type if job and job.job_type in JOB_TYPES else session_jt),
             no_codex=(job.no_codex if job else False) or session_nc,
             launch_profile=session_lp,
-            llm_overseer=(
-                job.llm_overseer if job and is_launchable_llm(job.llm_overseer) else session_ov
-            ),
-            llm_exec=(job.llm_exec if job and is_launchable_llm(job.llm_exec) else session_ex),
+            llm_overseer=(launchable_llm_or(job.llm_overseer, session_ov) if job else session_ov),
+            llm_exec=(launchable_llm_or(job.llm_exec, session_ex) if job else session_ex),
             start_when=(job.start_when if job else "") or (session.start_when or ""),  # type: ignore[attr-defined]
             start_date=(job.start_date if job else "") or (session.start_date or ""),  # type: ignore[attr-defined]
             depends_on=(job.depends_on if job else "") or (session.depends_on or ""),  # type: ignore[attr-defined]
@@ -1011,8 +1007,8 @@ def _handle_duplicate(  # pylint: disable=too-many-arguments,too-many-positional
         job_type=(job.job_type if job.job_type in JOB_TYPES else "claude"),
         no_codex=job.no_codex,
         launch_profile=job.launch_profile,
-        llm_overseer=(job.llm_overseer if is_launchable_llm(job.llm_overseer) else DEFAULT_LLM),
-        llm_exec=(job.llm_exec if is_launchable_llm(job.llm_exec) else DEFAULT_LLM),
+        llm_overseer=(launchable_llm_or(job.llm_overseer, DEFAULT_LLM)),
+        llm_exec=(launchable_llm_or(job.llm_exec, DEFAULT_LLM)),
         start_when=job.start_when,
         start_date=job.start_date,
         depends_on=job.depends_on,
@@ -1179,12 +1175,12 @@ def apply_job_fields(  # pylint: disable=too-many-locals,too-many-branches,too-m
     # launch_profile is deliberately NOT imported: the store owns the billing route, so a
     # file edit never re-routes a job (the canonical rewrite puts the stored label back).
 
-    new_overseer = job.llm_overseer if is_launchable_llm(job.llm_overseer) else DEFAULT_LLM
+    new_overseer = launchable_llm_or(job.llm_overseer, DEFAULT_LLM)
     if new_overseer != (session.llm_overseer or DEFAULT_LLM):  # type: ignore[attr-defined]
         store.update_fields(session_id, llm_overseer=new_overseer)
         changed.append("llm_overseer")
 
-    new_exec = job.llm_exec if is_launchable_llm(job.llm_exec) else DEFAULT_LLM
+    new_exec = launchable_llm_or(job.llm_exec, DEFAULT_LLM)
     if new_exec != (session.llm_exec or DEFAULT_LLM):  # type: ignore[attr-defined]
         store.update_fields(session_id, llm_exec=new_exec)
         changed.append("llm_exec")
