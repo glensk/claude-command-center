@@ -5567,7 +5567,8 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
             return quota.EXIT_UNKNOWN
         if not args.json:
             reason = f" — {match['reason']}" if match.get("reason") else ""
-            print(f"{quota.display_id(match['id'])}: {match['state']}{reason}")
+            full = f" ({note})" if (note := _quota_seat_full_note(match)) else ""
+            print(f"{quota.display_id(match['id'])}: {match['state']}{full}{reason}")
         else:
             print(json.dumps(match, indent=2))
         return {
@@ -5671,6 +5672,8 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
             detail = reason
         if unblock_note:
             detail = f"{unblock_note} · {detail}" if detail else unblock_note
+        if full_note := _quota_seat_full_note(prov):
+            detail = f"{full_note} · {detail}" if detail else full_note
         # What THIS machine last launched on a Codex seat (the run ledger), so a usage
         # figure can be read against our own spend: a 2 % window nobody here opened is
         # another user of the shared login, not a mystery.
@@ -5709,6 +5712,14 @@ def cmd_quota(  # pylint: disable=too-many-branches,too-many-return-statements
         print(_fit_cells(f"best Claude account (spends what resets soonest): {best}", fit))
     _print_codex_seat_footer(snap, now, fit=fit)
     return 0
+
+
+def _quota_seat_full_note(prov: dict[str, Any]) -> str:
+    """``full ≥98%`` for a Claude row judged seat-full (tp#2877 B3), else ``""``."""
+    if not prov.get("seat_full"):
+        return ""
+    pct = prov.get("seat_full_pct")
+    return f"full ≥{pct:g}%" if isinstance(pct, int | float) else "full"
 
 
 def _quota_fit_cols(*, wide: bool) -> int | None:

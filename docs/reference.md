@@ -3518,6 +3518,27 @@ re-measures; a frozen file of an older `version` is re-decided and replaced, one
 different base or `-A` exits 2. Exit 0 = decided, 1 = decided but the chosen account is
 itself full (the JSON is still complete), 2 = no pick.
 
+### The seat-full verdict (`seat_full`)
+
+The same pair of keys is **the seat-full threshold** for relays, staff starts and hand
+starts, and `ccc quota` publishes the judgement so no consumer re-derives it (additive,
+schema still v2). Every Claude row of `ccc quota -j` (and of `-p claude:<x> -j`) carries
+`seat_full` (always present on a Claude row, `true` or `false`) and `seat_full_pct` (the
+threshold applied). A row is `seat_full` exactly when the pick above would call it a full
+source: an observed cooldown or hold block, or a reading younger than 15 min at or over
+`relay_switch_weekly_pct` on a live `relay_switch_windows` window. A stale or missing
+reading is never full. The payload's top level carries `seat_full_pct` and
+`seat_full_windows`. An invalid config value fails **open** here: every row's `seat_full`
+is `false`, the row's `reason` and the top-level `seat_full_reason` name the key, and the
+top-level `seat_full_pct` / `seat_full_windows` are `null` / `[]`.
+
+`best_claude_account` (and `ccc quota -b`) is the first `available` account that is not
+`seat_full`, in urgency order; when every available account is full it is the first
+`available` one. The human table marks a full row `full ≥98%` (the configured threshold) in
+its detail column, and `ccc quota -p claude-priv` appends `(full ≥98%)` to the state.
+Readers built against an older ccc fall back to the weekly window at 98 % when the field is
+absent.
+
 ### Two vocabularies: what you read and what machines key on
 
 The report names every seat **the way you open it** — `claude-work (cwork)`,

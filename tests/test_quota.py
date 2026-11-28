@@ -1965,3 +1965,162 @@ def test_quota_report_piped_is_never_clipped(
     assert cli.cmd_quota(_quota_args()) == 0
     out = capsys.readouterr().out
     assert reason in out and "…" not in out
+
+
+# ── seat_full: the published seat-full verdict (tp#2877 B3) ──────────────────
+#
+# Relays, staff starts and hand starts read ONE judgement: the relay pick's "source full"
+# rule on `relay_switch_weekly_pct` / `relay_switch_windows`. A stale reading is never
+# full (fail open), an observed hold is, and `best_claude_account` skips a full seat.
+
+_TWO_SEATS = {"private": Path("/x"), "work": Path("/y")}
+
+
+def _seat_snaps(monkeypatch: pytest.MonkeyPatch, snaps: dict[str, usage.Usage]) -> None:
+    monkeypatch.setattr(usage, "read_usage", snaps.get)
+    monkeypatch.setattr(quota.config, "claude_config_dirs", lambda: dict(_TWO_SEATS))
+    monkeypatch.setattr(usage, "read_codex_usage", lambda _n=None, _h=None: None)
+    monkeypatch.setattr(usage, "read_copilot_usage", lambda: None)
+    quota.config.invalidate_config_cache()
+
+
+def _seat_config(*lines: str) -> None:
+    path = quota.config.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    quota.config.invalidate_config_cache()
+
+
+def _claude_rows(snap: dict) -> dict[str, dict]:
+    return {p["id"]: p for p in snap["providers"] if p["kind"] == "claude"}
+
+
+def test_row_seat_full_at_threshold_fresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    _seat_snaps(
+        monkeypatch,
+        {
+            "private": usage.Usage(NOW - 60, _win(5.0), _win(98.0, 86400)),
+            "work": usage.Usage(NOW - 60, _win(99.0), _win(97.9, 86400)),
+        },
+    )
+    snap = quota.snapshot(now=NOW)
+    rows = _claude_rows(snap)
+    assert rows["claude:private"]["seat_full"] is True
+    assert rows["claude:private"]["seat_full_pct"] == 98.0
+    # 97.9 % weekly is below the line, and the five-hour window is outside the gate.
+    assert rows["claude:work"]["seat_full"] is False
+    assert (snap["seat_full_pct"], snap["seat_full_windows"]) == (98.0, ["seven_day"])
+    assert "seat_full_reason" not in snap
+
+
+def test_row_not_seat_full_when_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reading older than the pick's freshness bound proves nothing: never full."""
+    old = NOW - quota.PICK_FRESH_SEC - 60
+    _seat_snaps(monkeypatch, {"private": usage.Usage(old, _win(5.0), _win(99.0, 86400))})
+    row = quota._claude_quota("private", NOW, {})
+    assert row.state == quota.AVAILABLE
+    assert row.seat_full is False
+
+
+def test_row_seat_full_when_blocked_by_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    _seat_snaps(monkeypatch, {"private": usage.Usage(NOW - 60, _win(5.0), _win(10.0, 86400))})
+    quota.record_block(
+        "claude:private",
+        blocked_until=NOW + 3600,
+        observed_at=NOW,
+        kind=quota.KIND_HOLD,
+    )
+    row = quota._claude_quota("private", NOW, quota.read_cooldowns(NOW))
+    assert (row.state, row.source) == (quota.BLOCKED, "hold")
+    assert row.seat_full is True
+
+
+def test_seat_full_pct_follows_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    _seat_snaps(monkeypatch, {"private": usage.Usage(NOW - 60, _win(5.0), _win(95.0, 86400))})
+    _seat_config(
+        "relay_switch_weekly_pct = 95",
+        'relay_switch_windows = ["five_hour", "seven_day"]',
+    )
+    snap = quota.snapshot(now=NOW)
+    assert (snap["seat_full_pct"], snap["seat_full_windows"]) == (
+        95.0,
+        ["five_hour", "seven_day"],
+    )
+    row = _claude_rows(snap)["claude:private"]
+    assert (row["seat_full"], row["seat_full_pct"]) == (True, 95.0)
+    # An invalid value fails OPEN: nothing is full and the why is reported.
+    _seat_config("relay_switch_weekly_pct = 101")
+    snap = quota.snapshot(now=NOW)
+    row = _claude_rows(snap)["claude:private"]
+    assert row["seat_full"] is False
+    assert "seat_full_pct" not in row
+    assert "relay_switch_weekly_pct" in row["reason"]
+    assert snap["seat_full_pct"] is None and snap["seat_full_windows"] == []
+    assert "relay_switch_weekly_pct" in snap["seat_full_reason"]
+    quota.config.config_path().unlink()
+    quota.config.invalidate_config_cache()
+
+
+def test_best_claude_account_skips_full_seat(monkeypatch: pytest.MonkeyPatch) -> None:
+    _seat_snaps(
+        monkeypatch,
+        {
+            # Most urgent (1.5 % left over 2 h = 0.75 %/h) but full: skipped.
+            "private": usage.Usage(NOW - 60, _win(5.0), _win(98.5, 7200)),
+            # 70 % left over 5 d = 0.58 %/h.
+            "work": usage.Usage(NOW - 60, _win(5.0), _win(30.0, 5 * 86400)),
+        },
+    )
+    snap = quota.snapshot(now=NOW)
+    order = [p["id"] for p in snap["providers"] if p["kind"] == "claude"]
+    assert order == ["claude:private", "claude:work"]  # urgency order is unchanged
+    assert snap["best_claude_account"] == "claude:work"
+
+
+def test_best_claude_account_all_full_keeps_urgency_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seat_snaps(
+        monkeypatch,
+        {
+            "private": usage.Usage(NOW - 60, _win(5.0), _win(98.5, 7200)),
+            "work": usage.Usage(NOW - 60, _win(5.0), _win(99.0, 5 * 86400)),
+        },
+    )
+    snap = quota.snapshot(now=NOW)
+    assert all(row["seat_full"] for row in _claude_rows(snap).values())
+    assert snap["best_claude_account"] == "claude:private"
+
+
+def test_provider_json_carries_seat_full(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import cli
+
+    _seat_snaps(
+        monkeypatch,
+        {
+            "private": usage.Usage(NOW - 60, _win(5.0), _win(98.0, 86400)),
+            "work": usage.Usage(NOW - 60, _win(5.0), _win(6.0, 5 * 86400)),
+        },
+    )
+    monkeypatch.setattr(time, "time", lambda: float(NOW))
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    assert cli.cmd_quota(_quota_args(json=True, provider="claude:work")) == quota.EXIT_AVAILABLE
+    work = json.loads(capsys.readouterr().out)
+    assert (work["seat_full"], work["seat_full_pct"]) == (False, 98.0)
+    assert cli.cmd_quota(_quota_args(json=True, provider="claude-priv")) == quota.EXIT_AVAILABLE
+    priv = json.loads(capsys.readouterr().out)
+    assert (priv["seat_full"], priv["seat_full_pct"]) == (True, 98.0)
+    # Non-Claude rows carry no seat_full field at all.
+    snap = quota.snapshot(now=NOW)
+    assert all("seat_full" not in p for p in snap["providers"] if p["kind"] != "claude")
+    # The round trip keeps it, and the plain report marks the full row.
+    assert quota._rehydrate(_claude_rows(snap)["claude:private"]).seat_full is True
+    assert cli.cmd_quota(_quota_args(no_bars=True, wide=True)) == 0
+    lines = capsys.readouterr().out.splitlines()
+    priv_line = next(line for line in lines if "claude-priv" in line)
+    work_line = next(line for line in lines if "claude-work" in line)
+    assert "full ≥98%" in priv_line and "full ≥" not in work_line
+    assert cli.cmd_quota(_quota_args(provider="claude-priv")) == quota.EXIT_AVAILABLE
+    assert "(full ≥98%)" in capsys.readouterr().out

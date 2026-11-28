@@ -286,6 +286,10 @@ DEFAULTS: dict[str, object] = {
     # window never moves a relay. Percent 1..100; windows a non-empty subset of
     # ``RELAY_SWITCH_WINDOW_NAMES``. Validated by :func:`relay_switch_policy` (fail closed:
     # a bad value makes the pick exit 2 instead of guessing).
+    # This pair is THE seat-full threshold (tp#2877) for relays, staff starts and hand
+    # starts: ``ccc quota -j`` judges every Claude row with it and publishes ``seat_full``
+    # / ``seat_full_pct`` per row and ``seat_full_pct`` / ``seat_full_windows`` on top;
+    # there a bad value fails OPEN (``seat_full`` false, the why in ``reason``).
     "relay_switch_weekly_pct": 98,
     "relay_switch_windows": ["seven_day"],
     # Multi-account Claude Code. ``claude_accounts`` maps labels to config dirs, one

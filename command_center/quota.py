@@ -539,6 +539,14 @@ class ProviderQuota:
     # The row's verdict BEFORE the eligibility blockers were composed on (internal, never
     # serialized): what a refusal canary (:func:`refusal_canary_view`) runs against.
     pre_eligibility: dict[str, Any] = field(default_factory=dict)
+    # Claude rows only (tp#2877 B3): THE seat-full judgement every relay, staff start and
+    # hand start reads — the relay pick's own "source full" rule (an observed cooldown/hold
+    # block, or a reading younger than ``PICK_FRESH_SEC`` at/over ``relay_switch_weekly_pct``
+    # on a live ``relay_switch_windows`` window). ``seat_full_pct`` is the threshold applied
+    # (``None`` when the config is invalid: then ``seat_full`` is False, fail open, and the
+    # row's ``reason`` says why). ``None`` on every other kind (dropped from the JSON).
+    seat_full: bool | None = None
+    seat_full_pct: float | None = None
 
 
 def _cooldowns_path() -> Path:
@@ -990,7 +998,51 @@ def _claude_windows(snap: usage.Usage, now: int) -> dict[str, WindowState]:
     return windows
 
 
-def _claude_quota(account: str, now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
+#: ``(threshold_pct, gate windows, error)`` of the seat-full judgement (tp#2877 B3).
+SeatFullPolicy = tuple[float | None, tuple[str, ...], str]
+
+
+def seat_full_policy() -> SeatFullPolicy:
+    """The configured seat-full threshold and windows; never raises.
+
+    An invalid ``relay_switch_weekly_pct`` / ``relay_switch_windows`` yields ``(None, (),
+    "<why>")``: no row is judged full (fail open) and the why travels in ``reason``.
+    """
+    try:
+        pct, windows = config.relay_switch_policy()
+    except config.RelaySwitchError as exc:
+        return None, (), f"seat_full off: config: {exc}"
+    return pct, windows, ""
+
+
+def _judge_seat_full(row: ProviderQuota, now: int, policy: SeatFullPolicy) -> ProviderQuota:
+    """Set *row*'s ``seat_full``/``seat_full_pct`` with the relay pick's own rule."""
+    threshold, windows, error = policy
+    if threshold is None:
+        row.seat_full, row.seat_full_pct = False, None
+        row.reason = f"{row.reason}; {error}" if row.reason else error
+        return row
+    row.seat_full = _source_full(_pick_evidence(row, now, windows), threshold)
+    row.seat_full_pct = threshold
+    return row
+
+
+def _claude_quota(
+    account: str,
+    now: int,
+    cooldowns: dict[str, dict],
+    policy: SeatFullPolicy | None = None,
+) -> ProviderQuota:
+    """Resolve one Claude account and judge it against the seat-full threshold.
+
+    *policy* defaults to :func:`seat_full_policy` (a caller judging several accounts
+    passes it once).
+    """
+    row = _claude_quota_row(account, now, cooldowns)
+    return _judge_seat_full(row, now, seat_full_policy() if policy is None else policy)
+
+
+def _claude_quota_row(account: str, now: int, cooldowns: dict[str, dict]) -> ProviderQuota:
     """Resolve one Claude account against its session and weekly windows."""
     pid = f"claude:{account}"
     config_dir = str(config.claude_config_dirs().get(account, ""))
@@ -2723,7 +2775,8 @@ def snapshot(
     cooldowns = read_cooldowns(now)
     labels = accounts if accounts is not None else list(config.claude_config_dirs())
 
-    claude = [_claude_quota(label, now, cooldowns) for label in labels]
+    full_policy = seat_full_policy()
+    claude = [_claude_quota(label, now, cooldowns, full_policy) for label in labels]
     # Usable accounts first, then by descending urgency (spend what resets soonest).
     claude.sort(key=lambda q: (q.state != AVAILABLE, -(q.urgency or 0.0)))
 
@@ -2747,7 +2800,11 @@ def snapshot(
         *_opencode_quotas(now, cooldowns),
         _muse_quota(now, cooldowns),
     ]
-    best = next((q.id for q in claude if q.state == AVAILABLE), "")
+    # The first usable account that is not seat-full (tp#2877 B3), in urgency order; when
+    # every usable account is full, the first usable one (urgency order unchanged).
+    usable = [q.id for q in claude if q.state == AVAILABLE]
+    roomy = [q.id for q in claude if q.state == AVAILABLE and not q.seat_full]
+    best = (roomy or usable or [""])[0]
     result: dict[str, Any] = {
         "version": SCHEMA_VERSION,
         "now": now,
@@ -2756,6 +2813,11 @@ def snapshot(
         # decision owned by each caller's ladder config, not a quota fact this module can
         # know. Only Claude-account ranking is a quota-domain decision.
         "best_claude_account": best,
+        # ADDITIVE (tp#2877 B3): the seat-full threshold and gate windows every Claude row's
+        # ``seat_full`` was judged with (``relay_switch_weekly_pct``/``relay_switch_windows``);
+        # ``null``/``[]`` with ``seat_full_reason`` when the config is invalid (fail open).
+        "seat_full_pct": full_policy[0],
+        "seat_full_windows": list(full_policy[1]),
         # The Codex seat the next attempt bills. ``best_codex_account`` is the v2 name
         # kept for existing consumers; ``codex_next_attempt`` is the honest one — the
         # runner hops on a run-time refusal, so this is a first try, not a verdict.
@@ -2775,6 +2837,8 @@ def snapshot(
         "codex_runs_log": str(codex_ledger.ledger_path()),
         "providers": [_provider_dict(q) for q in providers],
     }
+    if full_policy[2]:
+        result["seat_full_reason"] = full_policy[2]
     if unknown_labels:
         result["codex_seat_order_unknown"] = unknown_labels
     # Rota entries ccc could not use. Reported in the payload AND once on stderr: an
@@ -2953,7 +3017,10 @@ def _provider_dict(quota: ProviderQuota) -> dict[str, Any]:
     return {
         k: v
         for k, v in data.items()
-        if v not in ("", 0, None, {}, []) or k in ("state", "id", "kind")
+        if v not in ("", 0, None, {}, [])
+        or k in ("state", "id", "kind")
+        # A Claude row's ``seat_full: false`` is a verdict, not an empty field.
+        or (k == "seat_full" and v is not None)
     }
 
 
@@ -2995,6 +3062,8 @@ def _rehydrate(raw: dict[str, Any]) -> ProviderQuota:
         live_meta=dict(raw.get("live_meta") or {}),
         plan=dict(raw.get("plan") or {}),
         blockers=[dict(item) for item in raw.get("blockers") or [] if isinstance(item, dict)],
+        seat_full=raw.get("seat_full"),
+        seat_full_pct=raw.get("seat_full_pct"),
     )
 
 
