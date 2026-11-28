@@ -494,6 +494,65 @@ def test_parity_without_capture_leaves_stdin_unread(
     assert out and not effects
 
 
+def _seed_seats(tmp_path: Path, own_pct: float, work_pct: float) -> None:
+    """Two configured seats; the session's own (default ``private``) seat at *own_pct*."""
+    from command_center import usagecache  # pylint: disable=import-outside-toplevel
+
+    work = tmp_path / "claude-work"
+    work.mkdir()
+    _config(f'claude_accounts = ["private={_claude_home()}", "work={work}"]\n')
+    dirs = usagecache.parse_claude_accounts(config.load_config().claude_accounts)
+    for label, pct in (("private", own_pct), ("work", work_pct)):
+        usagecache.write_usage(
+            {
+                "five_hour": {"used_percentage": 12.5, "resets_at": NOW + 3 * 3600},
+                "seven_day": {"used_percentage": pct, "resets_at": NOW + 4 * 86400},
+            },
+            account=label,
+            app_home=_app_home(),
+            account_dir=dirs[label],
+            now=NOW - 10,
+        )
+
+
+@pytest.mark.parametrize(
+    ("own_pct", "work_pct", "row"),
+    [
+        (99.0, 6.0, "⇄ cpriv 99 % weekly: the next relay moves to cwork (6 %)"),
+        (99.0, 98.0, "⚠ cpriv and cwork at or above 98 %: staying on cpriv"),
+        (50.0, 6.0, ""),
+    ],
+)
+def test_parity_seat_row_and_seat_full_file(  # pylint: disable=too-many-positional-arguments
+    own_pct: float,
+    work_pct: float,
+    row: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """tp#2877 B7: both paths print the same seat row and write the same seat-full.json."""
+    _case_aim_subgoals()
+    _seed_seats(tmp_path, own_pct, work_pct)
+    seat_file = _app_home() / "seat-full.json"
+    cli_result = _run(monkeypatch, capsys, cli.main, DEFAULT_ARGV, PAYLOAD)
+    cli_seat = seat_file.read_bytes()
+    seat_file.unlink()
+    monkeypatch.setattr(cli, "main", _fail_cli)
+    fast_result = _run(monkeypatch, capsys, entrypoint.main, DEFAULT_ARGV, PAYLOAD)
+    assert fast_result == cli_result
+    assert seat_file.read_bytes() == cli_seat
+    doc = json.loads(cli_seat)
+    assert doc["at"] == NOW and set(doc["accounts"]) == {"private", "work"}
+    last = fast_result[1].decode().splitlines()[-1]
+    plain = last.replace("\033[38;5;214m", "").replace("\033[38;5;196m", "")
+    plain = plain.replace("\033[0m", "")
+    if row:
+        assert plain == row
+    else:
+        assert plain.startswith("Status:")
+
+
 # ---- lean imports -----------------------------------------------------------------------
 
 _PROBE = (

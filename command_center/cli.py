@@ -6491,15 +6491,19 @@ def _read_statusline_stdin() -> dict | None:
     return usagecache.loads_dict(raw)
 
 
-def _capture_usage_from_payload(data: dict) -> None:
+def _capture_usage_from_payload(data: dict) -> dict[str, Any] | None:
     """Persist the account-wide ``rate_limits`` (+ effort) from a parsed status-line payload.
 
     ``rate_limits`` is the only place this subscription-usage data is exposed. The
     write is routed to the account named by :func:`_account_from_env`, and SKIPPED
-    entirely when that is ``None`` (never guess the default). Silent on every error —
-    the status line must never break.
+    entirely when that is ``None`` (never guess the default). Then every configured
+    Claude account is judged from the cache and ``seat-full.json`` kept current
+    (:func:`seatfull.refresh`, tp#2877 B7); the judged document is returned (``None`` on
+    error). Silent on every error — the status line must never break.
     """
-    from . import usage
+    import time
+
+    from . import seatfull, usage
 
     account = _account_from_env()
     if account is not None:
@@ -6507,7 +6511,38 @@ def _capture_usage_from_payload(data: dict) -> None:
             usage.write_usage(data.get("rate_limits"), account=account)
         except OSError:
             pass
+    doc: dict[str, Any] | None = None
+    try:
+        cfg = config.load_config()
+        doc = seatfull.refresh(
+            config.app_home(),
+            config.claude_config_dirs(),
+            cfg.relay_switch_weekly_pct,
+            cfg.relay_switch_windows,
+            int(time.time()),
+        )
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught  # never breaks
+        doc = None
     _capture_effort_from_payload(data)
+    return doc
+
+
+def _seat_row(doc: dict[str, Any] | None, now: int) -> str:
+    """The status line's seat row for this session's own account (tp#2877 B7); "" if none."""
+    from . import seatfull
+
+    try:
+        cfg = config.load_config()
+        return seatfull.statusline_row(
+            config.app_home(),
+            config.claude_config_dirs(),
+            (cfg.relay_switch_weekly_pct, cfg.relay_switch_windows),
+            _account_from_env(),
+            now=now,
+            doc=doc,
+        )
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught  # never breaks
+        return ""
 
 
 def _capture_effort_from_payload(data: dict) -> None:
@@ -6571,13 +6606,14 @@ def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     from .models import derive_status
 
     sid = args.session
+    seat_doc: dict[str, Any] | None = None
     # stdin carries the status-line JSON. Read it once when we need usage capture OR a
     # session id we were not given, then reuse the parsed payload for both.
     if getattr(args, "capture_usage", False) or not sid:
         payload = _read_statusline_stdin()
         if payload is not None:
             if getattr(args, "capture_usage", False):
-                _capture_usage_from_payload(payload)
+                seat_doc = _capture_usage_from_payload(payload)
             if not sid:
                 derived = payload.get("session_id") or payload.get("sessionId")
                 if isinstance(derived, str) and derived:
@@ -6612,7 +6648,8 @@ def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many
                 aim_score=True,
                 aim_history=True,
                 now=int(time.time()),
-            ),
+            )
+            + _seat_row(seat_doc, int(time.time())),
             end="",
         )
         return 0
@@ -6644,7 +6681,8 @@ def cmd_statusline(args: argparse.Namespace) -> int:  # pylint: disable=too-many
             aim_score=bool(cfg.aim_score),
             aim_history=bool(cfg.aim_history),
             now=int(time.time()),
-        ),
+        )
+        + _seat_row(seat_doc, int(time.time())),
         end="",
     )
     return 0

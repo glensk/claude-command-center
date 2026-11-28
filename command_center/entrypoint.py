@@ -8,7 +8,7 @@ target of the ``ccc`` console script and of ``python -m command_center`` — ans
 itself from a read-only SQLite connection (no schema DDL, no commit, only the columns it
 prints), a light read of the config keys it needs and the shared stdlib modules
 (:mod:`.bars`, :mod:`.slrender`, :mod:`.rolemark`, :mod:`.livestatus`, :mod:`.usagecache`,
-:mod:`.staffrole`) that ``cli`` runs too. It hands the untouched argv to
+:mod:`.staffrole`, :mod:`.seatfull`) that ``cli`` runs too. It hands the untouched argv to
 :func:`command_center.cli.main` instead, before writing anything, whenever it cannot
 answer exactly as ``cli`` would. ``CCC_NO_FASTPATH=1`` sends every verb to ``cli`` (the
 kill switch and rollback lever).
@@ -39,7 +39,8 @@ kill switch and rollback lever).
 
 stdin (read once, when ``--capture-usage`` is given or no ``--session``) is put back as an
 :class:`io.StringIO` before any fall-through, so ``cli`` reads the same text. Everything is
-read and rendered first; only then come the usage-cache write, the role-mark sync, the
+read and rendered first; only then come the usage-cache write, the seat-full file and the
+seat row judged after it (tp#2877 B7, as ``cli`` orders them), the role-mark sync, the
 shared-store beat and the single stdout write. No session id at all: the usage write only,
 no output.
 
@@ -273,6 +274,8 @@ STATUSLINE_CONFIG_DEFAULTS: dict[str, Any] = {
     "aim_score_threshold": 50,
     "claude_accounts": [],
     "shared_store_path": "",
+    "relay_switch_weekly_pct": 98,
+    "relay_switch_windows": ["seven_day"],
 }
 #: :mod:`.shared_store`'s beat throttle and guard names without importing it (it loads
 #: ``config``); ``tests/test_statusline_beat.py`` pins each equality.
@@ -663,9 +666,10 @@ def statusline_output(argv: list[str], now: int) -> tuple[str, Any]:
     """Read and render everything ``ccc statusline`` needs; ``(stdout text, writes)``.
 
     *argv* follows the verb; *now* is the clock every fire time is formatted against.
-    *writes* is a no-argument callable doing the side effects (usage-cache write, role-mark
-    sync) — nothing is written before it runs. :class:`_Unsupported` (stdin preserved)
-    whenever ``cli`` must answer.
+    *writes* is a no-argument callable doing the side effects (usage-cache write, the
+    seat-full file, role-mark sync) — nothing is written before it runs — and returning the
+    seat row (tp#2877 B7, judged after the usage write as ``cli`` does; ``""`` for none).
+    :class:`_Unsupported` (stdin preserved) whenever ``cli`` must answer.
     """
     session, capture = parse_statusline_argv(argv)
     payload: dict | None = None
@@ -687,7 +691,7 @@ def _statusline_plan(
     """The read/render phase of :func:`statusline_output` (any exception → ``cli``)."""
     from pathlib import Path
 
-    from . import rolemark, slrender, usagecache
+    from . import rolemark, seatfull, slrender, usagecache
 
     sid = session
     if payload is not None:
@@ -700,6 +704,7 @@ def _statusline_plan(
     app_home = _app_home()
     cfg: dict[str, Any] | None = None
     usage_write: tuple[dict, str, Path] | None = None
+    seat_capture = capture and payload is not None
     if capture and payload is not None:
         cfg = statusline_config(app_home)
         dirs = usagecache.parse_claude_accounts(cfg["claude_accounts"])
@@ -713,8 +718,12 @@ def _statusline_plan(
         cfg = cfg or statusline_config(app_home)
         text = _statusline_rows(app_home, sid, cfg, now)
         beat_path = _beat_path(cfg)
+    seat_cfg = (
+        (cfg["relay_switch_weekly_pct"], cfg["relay_switch_windows"]) if cfg else (None, None)
+    )
+    seat_dirs = usagecache.parse_claude_accounts(cfg["claude_accounts"]) if cfg else {}
 
-    def writes() -> None:
+    def writes() -> str:
         if usage_write is not None:
             rate_limits, account, account_dir = usage_write
             try:
@@ -723,10 +732,21 @@ def _statusline_plan(
                 )
             except OSError:
                 pass
+        seat_doc = (
+            seatfull.refresh(Path(app_home), seat_dirs, seat_cfg[0], seat_cfg[1], now)
+            if seat_capture
+            else None
+        )
+        row = ""
         if sid:
             rolemark.sync_role_mark(sid)  # tp#1288: the shell status line's leading badge
             if beat_path:
                 _statusline_beat(app_home, beat_path, sid)  # tp#2372 Design 7
+            own = usagecache.account_from_env(seat_dirs)
+            row = seatfull.statusline_row(
+                Path(app_home), seat_dirs, seat_cfg, own, now=now, doc=seat_doc
+            )
+        return row
 
     return text, writes
 
@@ -736,9 +756,9 @@ def _serve_statusline(argv: list[str]) -> int:
     import time
 
     text, writes = statusline_output(argv[1:], int(time.time()))
-    writes()
+    row = writes()
     if text:
-        sys.stdout.write(text)
+        sys.stdout.write(text + row)
     return 0
 
 

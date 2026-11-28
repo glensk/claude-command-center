@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import io
+import json
 import re
+import time
 from argparse import Namespace
 from pathlib import Path
 
@@ -513,3 +515,142 @@ def test_adopted_role_rejects_path_tricks(tmp_path: Path, monkeypatch: pytest.Mo
     assert cli.adopted_role("s1") == "email-agent"
     assert cli.adopted_role("../session-role/s1") is None
     assert cli.adopted_role("") is None
+
+
+# ---- the seat row and seat-full.json (tp#2877 B7) ---------------------------------------
+
+SEAT_NOW = 1_900_000_000
+
+
+def _seats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    priv: float,
+    work: float | None,
+    *,
+    work_age: int = 60,
+) -> Path:
+    """Two Claude seats with cached weekly readings; the session runs on ``private``."""
+    from command_center import usagecache  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    dirs = {"private": tmp_path / "claude-priv", "work": tmp_path / "claude-work"}
+    for path in dirs.values():
+        path.mkdir(exist_ok=True)
+    dirs = {label: path.resolve() for label, path in dirs.items()}
+    monkeypatch.setattr(config, "claude_config_dirs", lambda: dict(dirs))
+    monkeypatch.setattr(time, "time", lambda: float(SEAT_NOW))
+    app = config.app_home()
+    app.mkdir(parents=True, exist_ok=True)
+    for label, pct, age in (("private", priv, 60), ("work", work, work_age)):
+        if pct is None:
+            continue
+        usagecache.write_usage(
+            {
+                "five_hour": {"used_percentage": 1, "resets_at": SEAT_NOW + 3600},
+                "seven_day": {"used_percentage": pct, "resets_at": SEAT_NOW + 2 * 86400},
+            },
+            account=label,
+            app_home=app,
+            account_dir=dirs[label],
+            now=SEAT_NOW - age,
+        )
+    return app / "seat-full.json"
+
+
+def _rows(capsys: pytest.CaptureFixture[str]) -> list[str]:
+    cli.cmd_statusline(Namespace(session="s1"))
+    return [_ANSI.sub("", line) for line in capsys.readouterr().out.splitlines()]
+
+
+def test_capture_writes_seat_full_file_on_change_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seat_file = _seats(tmp_path, monkeypatch, 40.0, 6.0)
+    cli._capture_usage_from_payload({})  # pylint: disable=protected-access
+    doc = json.loads(seat_file.read_text(encoding="utf-8"))
+    assert doc == {
+        "version": 1,
+        "threshold_pct": 98.0,
+        "accounts": {
+            "private": {"full": False, "pct": 40.0, "room": True},
+            "work": {"full": False, "pct": 6.0, "room": True},
+        },
+        "at": SEAT_NOW,
+    }
+    # Same content 10 min on, nothing full: no rewrite (the at stays).
+    monkeypatch.setattr(time, "time", lambda: float(SEAT_NOW + 600))
+    cli._capture_usage_from_payload({})  # pylint: disable=protected-access
+    assert json.loads(seat_file.read_text(encoding="utf-8"))["at"] == SEAT_NOW
+    _seats(tmp_path, monkeypatch, 98.0, 6.0)  # the clock is back at SEAT_NOW
+    cli._capture_usage_from_payload({})  # pylint: disable=protected-access
+    doc = json.loads(seat_file.read_text(encoding="utf-8"))
+    assert doc["accounts"]["private"] == {"full": True, "pct": 98.0, "room": False}
+    assert doc["at"] == SEAT_NOW
+
+
+def test_capture_refreshes_full_file_every_5_min(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seat_file = _seats(tmp_path, monkeypatch, 99.0, 6.0)
+    cli._capture_usage_from_payload({})  # pylint: disable=protected-access
+    monkeypatch.setattr(time, "time", lambda: float(SEAT_NOW + 299))
+    cli._capture_usage_from_payload({})  # pylint: disable=protected-access
+    assert json.loads(seat_file.read_text(encoding="utf-8"))["at"] == SEAT_NOW
+    # 5 min on (the readings are still fresh: 60 s + 300 s < 15 min) the full file is restamped.
+    monkeypatch.setattr(time, "time", lambda: float(SEAT_NOW + 300))
+    cli._capture_usage_from_payload({})  # pylint: disable=protected-access
+    doc = json.loads(seat_file.read_text(encoding="utf-8"))
+    assert doc["at"] == SEAT_NOW + 300
+    assert doc["accounts"]["private"]["full"] is True
+
+
+def test_row_names_other_seat_when_own_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed(tmp_path, monkeypatch, todos=None)
+    _seats(tmp_path, monkeypatch, 98.0, 6.0)
+    rows = _rows(capsys)
+    assert rows[-1] == "⇄ cpriv 98 % weekly: the next relay moves to cwork (6 %)"
+
+
+def test_row_says_staying_when_all_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed(tmp_path, monkeypatch, todos=None)
+    _seats(tmp_path, monkeypatch, 98.5, 99.0)
+    rows = _rows(capsys)
+    assert rows[-1] == "⚠ cpriv and cwork at or above 98 %: staying on cpriv"
+
+
+def test_no_row_below_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed(tmp_path, monkeypatch, todos=None)
+    _seats(tmp_path, monkeypatch, 97.9, 99.0)  # only the OTHER seat is full
+    rows = _rows(capsys)
+    assert len(rows) == 2  # the aim row + the status row, no seat row
+    assert not any("⇄" in row or "⚠" in row for row in rows)
+
+
+def test_stale_other_seat_never_offered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed(tmp_path, monkeypatch, todos=None)
+    _seats(tmp_path, monkeypatch, 99.0, 6.0, work_age=16 * 60)  # work read 16 min ago
+    rows = _rows(capsys)
+    assert "moves to" not in rows[-1]
+    assert rows[-1] == (
+        "⚠ cpriv at or above 98 %, no fresh reading below it for cwork: staying on cpriv"
+    )
+
+
+def test_seat_row_is_silent_on_a_broken_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed(tmp_path, monkeypatch, todos=None)
+    _seats(tmp_path, monkeypatch, 99.0, 6.0)
+    (config.app_home() / "usage.json").write_text("{not json", encoding="utf-8")
+    (config.app_home() / "cooldowns.json").write_text("[]", encoding="utf-8")
+    rows = _rows(capsys)
+    assert len(rows) == 2

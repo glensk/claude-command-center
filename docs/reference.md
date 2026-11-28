@@ -3539,6 +3539,22 @@ its detail column, and `ccc quota -p claude-priv` appends `(full ≥98%)` to the
 Readers built against an older ccc fall back to the weekly window at 98 % when the field is
 absent.
 
+**`seat-full.json` and the status-line seat row (tp#2877 B7).** Every `ccc statusline
+--capture-usage` call judges every configured Claude account with the same rule, from the
+usage cache and the cooldown store only (no network, stdlib only, the lean path too), and
+keeps `<app_home>/seat-full.json` current: `{"version": 1, "threshold_pct": 98.0,
+"accounts": {"private": {"full": true, "pct": 98.0, "room": false}, …}, "at": <epoch>}`.
+`pct` is the highest live gate window (`null` without one), `room` the pick's "proven room"
+(available, a reading younger than 15 min, every live gate window below the threshold).
+The file is replaced atomically when its content (everything but `at`) changes, and also
+every 5 min while any account is full, so a reader such as the Stop hook can trust a full
+verdict whose `at` is younger than 15 min. An invalid config writes `threshold_pct: null`
+and nothing full. When the session's own account is full the status line adds one row:
+`⇄ cpriv 98 % weekly: the next relay moves to cwork (6 %)` (the first other account with
+proven room, config order), else `⚠ cpriv and cwork at or above 98 %: staying on cpriv`; an
+other account without a fresh reading is named as such and never offered. Every error is
+silent: no row, no file.
+
 ### Two vocabularies: what you read and what machines key on
 
 The report names every seat **the way you open it** — `claude-work (cwork)`,

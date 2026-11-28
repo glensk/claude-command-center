@@ -1,6 +1,6 @@
 """The stdlib-only status-line modules load no heavy module (tp#1806 B2).
 
-``slrender``, ``rolemark``, ``livestatus`` and ``usagecache`` are what the lean
+``slrender``, ``rolemark``, ``livestatus``, ``usagecache`` and ``seatfull`` are what the lean
 ``ccc statusline`` path runs on; importing (and exercising) them in a fresh interpreter
 must not pull in ``cli``, ``config``, ``models``, ``store``, ``usage``, ``park``,
 ``tabsymbol``, ``accounts``, ``adapters``, ``dataclasses``, ``argparse``, rich or textual.
@@ -16,12 +16,12 @@ from pathlib import Path
 
 from leanprobe import child_pythonpath, forbidden
 
-LEAN = ("slrender", "rolemark", "livestatus", "usagecache")
+LEAN = ("slrender", "rolemark", "livestatus", "usagecache", "seatfull")
 
 _PROBE = """
 import json, sys
 from pathlib import Path
-from command_center import livestatus, rolemark, slrender, usagecache
+from command_center import livestatus, rolemark, seatfull, slrender, usagecache
 tmp = Path(sys.argv[2])
 livestatus.derive_status_value(("busy", True), None)
 livestatus.find_transcript([tmp / "projects"], "/repo", "sid")
@@ -33,6 +33,9 @@ usagecache.write_usage(
     account_dir=tmp / "claude",
 )
 usagecache.account_from_env(usagecache.parse_claude_accounts([]))
+dirs = {"private": tmp / "claude"}
+doc = seatfull.refresh(tmp / "app", dirs, 98, ["seven_day"], 4102444000)
+seatfull.statusline_row(tmp / "app", dirs, (98, ["seven_day"]), "private", now=4102444000, doc=doc)
 with open(sys.argv[1], "w", encoding="utf-8") as fh:
     json.dump(sorted(sys.modules), fh)
 """
@@ -57,6 +60,7 @@ def test_lean_modules_load_no_heavy_module(tmp_path: Path) -> None:
     modules = json.loads(report.read_text(encoding="utf-8"))
     assert all(f"command_center.{name}" in modules for name in LEAN)
     assert (tmp_path / "app" / "usage.json").is_file()  # the probe really wrote
+    assert (tmp_path / "app" / "seat-full.json").is_file()
     assert [m for m in modules if forbidden(m)] == []
 
 
