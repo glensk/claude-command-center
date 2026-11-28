@@ -63,7 +63,6 @@ _MODEL_IDS = {
     "opus-5.5": "claude-opus-5-5",
     "sonnet-5": "claude-sonnet-5",
     "opus-4.8": "claude-opus-4-8",
-    "opus-4.8-1m": "claude-opus-4-8[1m]",
     "haiku-4.5": "claude-haiku-4-5-20251001",
 }
 _VERSION = "2.1.193"
@@ -286,7 +285,7 @@ def _sessions() -> list[DemoSession]:
             checked=3,
             aim_met=True,  # impartial checker thinks it is done → red DONE stamped in the bar
             importance=0,
-            model="opus-4.8-1m",
+            model="opus-4.8",
             effort="xhigh",
             age_min=40,
         ),

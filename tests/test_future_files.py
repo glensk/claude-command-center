@@ -176,15 +176,15 @@ def test_a_raw_model_id_round_trips_and_joins_the_select_options() -> None:
         aim="x",
         repo="home/ccc",
         llm_overseer="claude-brand-new-9",
-        llm_exec="claude-opus-4-8[1m]",  # not Meta-Bind-safe: kept, not offered
+        llm_exec="claude-brand-new-9[1m]",  # not Meta-Bind-safe: kept, not offered
     )
     job = future_files.parse_job_file(text)
-    assert job.llm_overseer == "claude-brand-new-9" and job.llm_exec == "claude-opus-4-8[1m]"
+    assert job.llm_overseer == "claude-brand-new-9" and job.llm_exec == "claude-brand-new-9[1m]"
     base = ", ".join(f"option({choice})" for choice in models.LLM_CHOICES)
     llm_opts = f"{base}, option(claude-brand-new-9)"
     assert f"inlineSelect({llm_opts}):llm_overseer]" in text
     assert f"inlineSelect({llm_opts}):llm_exec]" in text
-    assert "option(claude-opus-4-8[1m])" not in text
+    assert "option(claude-brand-new-9[1m])" not in text
 
 
 def test_validate_accepts_retired_and_rejects_garbage(tmp_path: Path) -> None:

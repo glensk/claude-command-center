@@ -394,7 +394,6 @@ class MirrorHealth:
 LLM_CHOICES: tuple[str, ...] = (
     "opus-5.5",
     "opus-4.8",
-    "opus-4.8-1m",
     "sonnet-5",
     "haiku-4.5",
     "fable-5.2",
@@ -405,21 +404,18 @@ DEFAULT_LLM = "opus-5.5"
 NEW_JOB_LLM_CHOICES: tuple[str, ...] = LLM_CHOICES
 NEW_JOB_DEFAULT_LLM = DEFAULT_LLM
 # Full model ids for ``claude --model`` (the overseer the session runs on).
-# ``opus-4.8-1m`` is the 1M-context beta form; sonnet-5 is natively 1M.
+# sonnet-5 is natively 1M.
 LLM_MODEL_IDS: dict[str, str] = {
     "opus-5.5": "claude-opus-5-5",
     "opus-4.8": "claude-opus-4-8",
-    "opus-4.8-1m": "claude-opus-4-8[1m]",
     "sonnet-5": "claude-sonnet-5",
     "haiku-4.5": "claude-haiku-4-5-20251001",
     "fable-5.2": "claude-fable-5-2",
 }
 # The Agent-tool ``model`` enum used in the delegation instruction (executor subagents).
-# The enum has no 1M variant, so opus-4.8-1m delegates to plain "opus".
 LLM_AGENT_ALIAS: dict[str, str] = {
     "opus-5.5": "opus",
     "opus-4.8": "opus",
-    "opus-4.8-1m": "opus",
     "sonnet-5": "sonnet",
     "haiku-4.5": "haiku",
     "fable-5.2": "fable",
@@ -432,13 +428,21 @@ LLM_AGENT_ALIAS: dict[str, str] = {
 # absent from every executable choice/id/alias map above. Launch resolution maps it to its
 # replacement before an argv or delegation prompt is built — a stored job, a relay
 # successor inheriting its predecessor's observed model, and a raw transcript id alike.
-RETIRED_LLM_REPLACEMENTS: dict[str, str] = {"fable-5": DEFAULT_LLM, "opus-5": "opus-5.5"}
+RETIRED_LLM_REPLACEMENTS: dict[str, str] = {
+    "fable-5": DEFAULT_LLM,
+    "opus-5": "opus-5.5",
+    "opus-4.8-1m": "opus-4.8",
+}
 
 # Historical transcripts may name a retired raw model. Reverse-map those observations for
 # display without putting the raw id back into the executable ``LLM_MODEL_IDS`` map.
-_RETIRED_MODEL_LABELS: dict[str, str] = {"claude-fable-5": "fable-5", "claude-opus-5": "opus-5"}
+_RETIRED_MODEL_LABELS: dict[str, str] = {
+    "claude-fable-5": "fable-5",
+    "claude-opus-5": "opus-5",
+    "claude-opus-4-8[1m]": "opus-4.8-1m",
+}
 # Shorthands whose prefix match is genuinely ambiguous and so must be pinned explicitly.
-# ``"opus"`` prefixes three choices (opus-5.5, opus-4.8, opus-4.8-1m) and the shortest of
+# ``"opus"`` prefixes two choices (opus-5.5, opus-4.8) and the shortest of
 # them (opus-5.5) is not a prefix of the 4.8 ones, so :func:`expand_llm_choice`'s
 # shortest-wins rule cannot decide and would reject the input. Bare ``"opus"`` means the
 # CURRENT Opus generation; an older generation needs its version (``"opus-4"`` → opus-4.8).
@@ -586,8 +590,8 @@ def expand_llm_choice(value: str) -> str | None:
 
     ``"opus"`` → ``"opus-5.5"``, ``"sonnet"`` → ``"sonnet-5"``;
     an exact choice passes through unchanged. When one choice is itself a prefix of the
-    others it matches (``"opus-4"`` hits both ``opus-4.8`` and ``opus-4.8-1m``), the shortest
-    wins — the longer variant needs its own longer prefix (``"opus-4.8-"``). Shorthands whose
+    others it matches, the shortest wins — the longer variant needs its own longer prefix.
+    Shorthands whose
     match set has no such common prefix are pinned in :data:`LLM_PREFIX_ALIASES` (bare
     ``"opus"`` → the current generation) since shortest-wins cannot decide them. Returns
     ``None`` when *value* is empty or genuinely ambiguous/unknown — the caller then

@@ -3968,6 +3968,15 @@ def test_an_outside_relay_of_an_unknown_source_model_keeps_it(
     assert _model_flag(_successor_argv(monkeypatch, target)) == "claude-brand-new-9"
 
 
+def test_a_retired_1m_source_model_is_replaced_silently(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """tp#2036: a source observed on the retired 1M id maps to opus-4.8, no notice."""
+    assert continue_session._job_model("claude-opus-4-8[1m]", None) == "opus-4.8"  # noqa: SLF001  # pylint: disable=protected-access
+    continue_session._notice_unknown_model("claude-opus-4-8[1m]", "opus-4.8", "opus-4.8")  # noqa: SLF001  # pylint: disable=protected-access
+    assert capsys.readouterr().err == ""
+
+
 def test_a_synthetic_source_model_falls_back_with_a_notice(
     harness: _Harness, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -4058,6 +4067,7 @@ def test_an_explicit_non_token_model_is_refused() -> None:
         ("<synthetic>", None, "opus-5.5"),  # no model id: the default
         ("opus-5", None, "opus-5.5"),  # retired: its replacement
         ("claude-opus-5", None, "opus-5.5"),
+        ("claude-opus-4-8[1m]", None, "opus-4.8"),  # tp#2036: retired 1M id
         ("fable-5.2", "haiku-4.5", "haiku-4.5"),  # -O/-E wins
         ("fable-5.2", "claude-brand-new-9", "claude-brand-new-9"),
         ("fable-5.2", "claude-sonnet-5", "sonnet-5"),  # a known raw id maps to its label

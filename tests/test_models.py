@@ -63,13 +63,13 @@ def test_expand_llm_choice() -> None:
     assert expand_llm_choice("opus-5") == "opus-5.5"  # retired: the prefix hits 5.5 only
     assert expand_llm_choice("fable") == "fable-5.2"  # tp#2330: the current Fable model
     assert expand_llm_choice("SONNET") == "sonnet-5"  # case-insensitive
-    # Bare "opus" prefixes opus-5.5, opus-4.8 AND opus-4.8-1m, so shortest-wins
+    # Bare "opus" prefixes opus-5.5 and opus-4.8, so shortest-wins
     # cannot decide it — LLM_PREFIX_ALIASES pins it to the current Opus generation.
     assert expand_llm_choice("  opus ") == "opus-5.5"  # trimmed; explicit alias
     assert expand_llm_choice("opus-5.") == "opus-5.5"  # unique prefix
     assert expand_llm_choice("haiku") == "haiku-4.5"  # unique prefix
-    assert expand_llm_choice("opus-4") == "opus-4.8"  # shortest wins over -1m
-    assert expand_llm_choice("opus-4.8-") == "opus-4.8-1m"  # longer prefix → 1M variant
+    assert expand_llm_choice("opus-4") == "opus-4.8"  # unique prefix
+    assert expand_llm_choice("opus-4.8-") is None  # the retired -1m is no choice
     assert expand_llm_choice("") is None  # empty
     assert expand_llm_choice("gpt-9") is None  # unknown
 
@@ -489,7 +489,7 @@ def test_current_model_replaces_superseded_ids() -> None:
 
 @pytest.mark.parametrize(
     "value",
-    ["claude-brand-new-9", "nova-12.5-preview", "claude-opus-4-8[1m]", "vendor/model:v2"],
+    ["claude-brand-new-9", "nova-12.5-preview", "claude-brand-new-9[1m]", "vendor/model:v2"],
 )
 def test_is_raw_model_id_accepts_plain_tokens(value: str) -> None:
     assert is_raw_model_id(value)
@@ -512,6 +512,8 @@ def test_is_raw_model_id_accepts_plain_tokens(value: str) -> None:
         "opus-5",  # retired choice
         "claude-opus-5",  # retired raw id
         "fable-5",
+        "claude-opus-4-8[1m]",  # retired raw id
+        "opus-4.8-1m",  # retired choice
     ],
 )
 def test_is_raw_model_id_rejects_non_tokens_choices_and_retired(value: str | None) -> None:
@@ -527,7 +529,7 @@ def test_is_launchable_llm() -> None:
 
 def test_llm_model_id() -> None:
     assert llm_model_id("fable-5.2") == "claude-fable-5-2"
-    assert llm_model_id("opus-4.8-1m") == "claude-opus-4-8[1m]"
+    assert llm_model_id("opus-4.8") == "claude-opus-4-8"
     assert llm_model_id("claude-brand-new-9") == "claude-brand-new-9"
     assert llm_model_id("nova-12.5-preview") == "nova-12.5-preview"
     for bad in ("", "<synthetic>", "-x", "opus-5", "a b"):
@@ -536,7 +538,7 @@ def test_llm_model_id() -> None:
 
 
 def test_llm_agent_alias() -> None:
-    assert llm_agent_alias("opus-4.8-1m") == "opus"
+    assert llm_agent_alias("opus-4.8") == "opus"
     assert llm_agent_alias("fable-5.2") == "fable"
     assert llm_agent_alias("claude-sonnet-9-preview") == "sonnet"
     assert llm_agent_alias("Claude-Haiku-7") == "haiku"
@@ -575,3 +577,14 @@ def test_retired_raw_ids_map_to_replacement() -> None:
     assert resolve_job_llm("Claude-Opus-5") == ("opus-5.5", True)
     assert launchable_llm_or("claude-opus-5", "X") == "opus-5.5"
     assert current_model("Claude-Opus-5") == "claude-opus-5-5"
+
+
+def test_opus_4_8_1m_is_retired() -> None:
+    """tp#2036: the 1M choice resolves to opus-4.8 in either form; display stays truthful."""
+    assert "opus-4.8-1m" not in LLM_CHOICES
+    assert "opus-4.8-1m" not in LLM_MODEL_IDS
+    assert resolve_job_llm("opus-4.8-1m") == ("opus-4.8", True)
+    assert resolve_job_llm("claude-opus-4-8[1m]") == ("opus-4.8", True)
+    assert current_model("claude-opus-4-8[1m]") == "claude-opus-4-8"
+    assert current_model("opus-4.8-1m") == "opus-4.8"
+    assert launchable_llm_or("opus-4.8-1m", "X") == "opus-4.8"

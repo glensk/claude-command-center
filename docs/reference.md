@@ -818,14 +818,13 @@ future job), **cancelled** (the dependency was `mark-done`-on-draft or `delete-j
   byte-identical.
 
 Each future job also picks **which models it runs on**: `-O/--overseer` and `-E/--executor`
-(choices `opus-5.5` / `opus-4.8` / `opus-4.8-1m` / `sonnet-5` / `haiku-4.5` / `fable-5.2`, both
-defaulting to `opus-5.5`; `fable-5.2` launches as `claude-fable-5-2` and delegates to `fable`; `opus-4.8-1m` is the 1M-context Opus, launched as `claude-opus-4-8[1m]` and delegating
-to plain `opus` — sonnet-5 is natively 1M). At launch the session
+(choices `opus-5.5` / `opus-4.8` / `sonnet-5` / `haiku-4.5` / `fable-5.2`, both
+defaulting to `opus-5.5`; `fable-5.2` launches as `claude-fable-5-2` and delegates to `fable`; sonnet-5 is natively 1M). At launch the session
 runs on the **overseer's** model (`claude --model …`) with an **explicit reasoning effort**
 (`claude --effort <level>`, config key `launch_effort`, default `xhigh`; set it to `""` to omit the
 flag and let `~/.claude/settings.json`'s `effortLevel` decide — whose own absence means `high`).
 Jobs stored with a retired choice are resolved through one table
-(`models.RETIRED_LLM_REPLACEMENTS`: `fable-5` and `opus-5` → `opus-5.5`) at launch, with one
+(`models.RETIRED_LLM_REPLACEMENTS`: `fable-5` and `opus-5` → `opus-5.5`; `opus-4.8-1m` → `opus-4.8`) at launch, with one
 notice on stderr; the retired model is never passed to Claude or offered by a model selector.
 The same table covers raw ids: `claude_argv` never emits `--model claude-opus-5`, and a
 `continue-session` successor never inherits its predecessor's retired observed model — a
