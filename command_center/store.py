@@ -836,6 +836,8 @@ class Store(  # pylint: disable=too-many-public-methods
         "start_heartbeat_at": "INTEGER NOT NULL DEFAULT 0",
         # tp#2172 D13: the successor's accept refusal on a failed transfer (orphan close).
         "accept_refused_at": "INTEGER NOT NULL DEFAULT 0",
+        # tp#2877 B8: ``continue-session start -P``'s stored account pick (JSON).
+        "account_pick": "TEXT",
     }
 
     def _add_column(self, table: str, column: str, decl: str) -> None:

@@ -4509,3 +4509,161 @@ def test_withdraw_first_profile_refusal(
         assert transfer.failure.startswith("launch: launch profile 'gone'")
         assert row.draft and row.archived
     assert len(harness.launches) == 1  # never relaunched
+
+
+# ------------------------------------------------------------- start -P (tp#2877 B8)
+
+
+class _Meter:
+    """Per-account weekly readings (fresh, 30 s old) and a counting fake of the refresh."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time  # pylint: disable=import-outside-toplevel
+
+        from command_center import usage  # pylint: disable=import-outside-toplevel
+
+        self.usage = usage
+        self.now = int(time.time())
+        self.snaps: dict[str, Any] = {}
+        self.fetched: list[str] = []
+        monkeypatch.setattr(usage, "read_usage", self.snaps.get)
+        monkeypatch.setattr(usage, "fetch_claude_usage", self._fetch)
+
+    def _fetch(self, account: str, _now: int | None = None) -> Any:
+        self.fetched.append(account)
+        return self.snaps.get(account)
+
+    def set(self, account: str, seven: float) -> None:
+        self.snaps[account] = self.usage.Usage(
+            captured_at=self.now - 30,
+            five_hour=self.usage.Window(used_percentage=10.0, resets_at=self.now + 3600),
+            seven_day=self.usage.Window(used_percentage=seven, resets_at=self.now + 3 * 86400),
+        )
+
+
+@pytest.fixture(name="meter")
+def _meter(monkeypatch: pytest.MonkeyPatch) -> _Meter:
+    return _Meter(monkeypatch)
+
+
+def _start_pick(harness: _Harness, *extra: str) -> int:
+    argv = ["continue-session", "start", "-A", "private", "-P", "-f", str(harness.file)]
+    return cli.main([*argv, *extra])
+
+
+def _pick_of(transfer: Any) -> dict[str, Any]:
+    doc = json.loads(transfer.account_pick)
+    assert isinstance(doc, dict)
+    return doc
+
+
+def test_pick_switches_when_base_full_and_other_has_room(
+    harness: _Harness, meter: _Meter, capsys: pytest.CaptureFixture[str]
+) -> None:
+    meter.set("private", 99.0)
+    meter.set("work", 10.0)
+    assert _start_pick(harness) == 0
+    out = capsys.readouterr().out
+    assert "account: private → work (source private full (" in out
+    assert sorted(meter.fetched) == ["private", "work"]  # the ONE refresh
+    transfer = _only_transfer()
+    assert transfer.target_label == "work"
+    assert transfer.target_config_dir == str(harness.work)
+    pick = _pick_of(transfer)
+    assert pick["base"] == "private" and pick["account"] == "work"
+    assert pick["decision"] == "switch"
+
+
+def test_pick_stays_when_both_full(
+    harness: _Harness, meter: _Meter, capsys: pytest.CaptureFixture[str]
+) -> None:
+    meter.set("private", 99.0)
+    meter.set("work", 99.5)
+    assert _start_pick(harness) == 0
+    assert "account: private → private (source private full; no alternative" in (
+        capsys.readouterr().out
+    )
+    transfer = _only_transfer()
+    assert transfer.target_label == "private"
+    pick = _pick_of(transfer)
+    assert pick["decision"] == "stay" and pick["full"] is True
+
+
+def test_pick_stays_when_unknown(
+    harness: _Harness, meter: _Meter, capsys: pytest.CaptureFixture[str]
+) -> None:
+    meter.set("work", 10.0)  # private has no reading at all
+    assert _start_pick(harness) == 0
+    assert "account: private → private (source private evidence stale or missing)" in (
+        capsys.readouterr().out
+    )
+    transfer = _only_transfer()
+    assert transfer.target_label == "private"
+    assert _pick_of(transfer)["decision"] == "stay"
+
+
+def test_pick_fails_open_on_an_invalid_config(
+    harness: _Harness,
+    meter: _Meter,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from command_center import quota  # pylint: disable=import-outside-toplevel
+
+    def _broken(*_a: Any, **_k: Any) -> Any:
+        raise quota.PickError("relay_switch_weekly_pct invalid")
+
+    monkeypatch.setattr(quota, "pick_account", _broken)
+    meter.set("private", 99.0)
+    meter.set("work", 10.0)
+    assert _start_pick(harness) == 0
+    assert "account: private → private (no pick (relay_switch_weekly_pct invalid)" in (
+        capsys.readouterr().out
+    )
+    assert _only_transfer().target_label == "private"
+
+
+def test_pick_refuses_an_unknown_base(
+    harness: _Harness, meter: _Meter, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = ["continue-session", "start", "-A", "nope", "-P", "-f", str(harness.file)]
+    assert cli.main(argv) == 1
+    assert "-P: unknown Claude account 'nope'" in capsys.readouterr().err
+    assert not meter.fetched and harness.launches == []
+    with Store() as store:
+        assert store.transfers_of(SID) == []
+
+
+def test_pick_reused_on_retry(
+    harness: _Harness, meter: _Meter, capsys: pytest.CaptureFixture[str]
+) -> None:
+    meter.set("private", 99.0)
+    meter.set("work", 10.0)
+    harness.accept_on_sleep = False
+    assert _start_pick(harness, "-w", "0") == continue_session.EXIT_WAITING
+    first = _only_transfer()
+    assert first.target_label == "work" and first.state == "opened"
+    capsys.readouterr()
+    meter.fetched.clear()
+    meter.set("private", 10.0)  # a re-decision now would stay on private
+    harness.accept_on_sleep = True
+    assert _start_pick(harness) == 0
+    out = capsys.readouterr().out
+    assert "account: private → work (" in out and "[stored pick reused]" in out
+    assert not meter.fetched  # never re-decided, no second refresh
+    transfer = _only_transfer()
+    assert transfer.transfer_id == first.transfer_id
+    assert transfer.target_label == "work" and transfer.state == "finalized"
+    assert transfer.account_pick == first.account_pick
+
+
+def test_without_pick_account_is_explicit(
+    harness: _Harness, meter: _Meter, capsys: pytest.CaptureFixture[str]
+) -> None:
+    meter.set("private", 99.0)
+    meter.set("work", 10.0)
+    assert harness.start() == 0
+    assert "account: " not in capsys.readouterr().out
+    assert not meter.fetched
+    transfer = _only_transfer()
+    assert transfer.target_label == "private" and transfer.account_pick == ""

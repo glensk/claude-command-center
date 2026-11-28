@@ -704,6 +704,7 @@ def _candidate(  # pylint: disable=too-many-arguments,too-many-positional-argume
         prompt_sha256=digest,
         capped=bool(getattr(args, "capped", False)),
         facts_snapshot=facts_snapshot,
+        account_pick=str(getattr(args, "account_pick", "") or ""),
     )
 
 
@@ -2061,6 +2062,80 @@ def _start_input(args: argparse.Namespace) -> tuple[bytes, str]:
         return b"", f"cannot read the handoff file: {exc}"
 
 
+#: The keys of a pick document ``start -P`` stores in the transfer (tp#2877 B8).
+PICK_STORED_KEYS = ("version", "base", "account", "decision", "reason", "decided_at", "full")
+
+
+def _stored_pick(active: Any) -> dict[str, Any] | None:
+    """The account pick stored in the PREPARED / OPENED transfer *active*, if any."""
+    from .transfer_store import OPENED, PREPARED
+
+    if active is None or active.state not in (PREPARED, OPENED) or not active.account_pick:
+        return None
+    try:
+        doc = json.loads(active.account_pick)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict) or not doc.get("base") or not doc.get("account"):
+        return None
+    return doc
+
+
+def _fresh_pick(base: str, labels: list[str]) -> dict[str, Any]:
+    """One usage refresh of every Claude account, then ``quota.pick_account`` from *base*.
+
+    Fails open (tp#2877 D2): an error stays on *base* with the why in ``reason``."""
+    from . import quota, usage
+
+    now = int(time.time())
+    try:
+        for label in labels:  # the ONE refresh of this pick, as ``ccc quota -n`` does
+            usage.fetch_claude_usage(label, now)
+        doc = quota.pick_account(base, quota.claude_rows(labels, now), now=now)
+    except (quota.PickError, OSError, ValueError) as exc:
+        doc = {
+            "version": quota.PICK_VERSION,
+            "base": base,
+            "account": base,
+            "decision": quota.STAY,
+            "reason": f"no pick ({exc}); stays on {base}",
+            "decided_at": now,
+            "full": False,
+        }
+    return {key: doc.get(key) for key in PICK_STORED_KEYS}
+
+
+def _apply_pick(args: argparse.Namespace, active: Any, sid: str) -> str:
+    """``start -P`` (tp#2877 B8): ``-A`` is the BASE; set ``args.account`` to the pick.
+
+    A retry of an active transfer whose stored pick has the same base reuses that pick
+    (never re-decided); else one refresh and ``quota.pick_account``. Prints
+    ``account: <base> → <picked> (<reason>)``; returns a refusal ("" = go on). Without
+    ``-P`` nothing changes."""
+    from . import config, quota
+
+    if not getattr(args, "pick", False):
+        return ""
+    labels = list(config.claude_config_dirs())
+    try:
+        base = quota.resolve_account(args.account, labels)
+    except quota.PickError as exc:
+        return f"-P: {exc}"
+    doc = _stored_pick(active)
+    reused = doc is not None and doc.get("base") == base
+    if doc is None or not reused:
+        doc = _fresh_pick(base, labels)
+    args.account = str(doc["account"])
+    args.account_pick = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    line = f"account: {base} → {args.account} ({doc.get('reason') or doc.get('decision')})"
+    print(line + (" [stored pick reused]" if reused else ""))
+    if getattr(args, "capped", False):
+        from . import handoff_capped
+
+        handoff_capped.log_event(sid, line)
+    return ""
+
+
 def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements,too-many-branches
     """``continue-session start``: hand this session's work to a NEW session."""
     from .models import now_ms
@@ -2110,6 +2185,9 @@ def cmd_start(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retu
                 f"work is still in flight after {args.drain}s — no transfer started; "
                 "the source session stays authoritative",
             )
+        problem = _apply_pick(args, active, src.session_id)
+        if problem:
+            return _fail(args, src.session_id, problem)
         try:
             composed = _compose(adapter, store, src, raw, active, args)
         except StartRefused as exc:
@@ -3499,12 +3577,26 @@ def add_parser(sub: Any) -> None:
             "example (from inside the session; pass the Bash tool timeout 600000):\n"
             "  ccc continue-session start -A private -D 30 -f /path/handoff.md  # new-session-ok\n"
             "example (from any other shell; the source must be live and idle):\n"
-            "  ccc continue-session start -X -s <sid> -A private -f /path/handoff.md"
+            "  ccc continue-session start -X -s <sid> -A private -f /path/handoff.md\n"
+            "example (base private; moves to another account when private is full):\n"
+            "  ccc continue-session start -A private -P -D 30 -f /path/handoff.md"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_start.add_argument(
-        "-A", "--account", required=True, help="target account label (see claude_accounts)"
+        "-A",
+        "--account",
+        required=True,
+        help="target account label (see claude_accounts); with -P the BASE account",
+    )
+    p_start.add_argument(
+        "-P",
+        "--pick",
+        action="store_true",
+        help="pick the account from -A as the relay rule does (ccc quota -n): stay on it "
+        "unless it is proven full (relay_switch_weekly_pct on relay_switch_windows) and "
+        "another account is proven to have room; one usage refresh first; the pick is "
+        "stored in the transfer and a retry reuses it",
     )
     p_start.add_argument("-f", "--file", help="the filled handoff document")
     p_start.add_argument(

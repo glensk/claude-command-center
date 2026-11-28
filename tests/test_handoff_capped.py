@@ -617,3 +617,65 @@ def test_facts_only_part_reads_the_last_todowrite_from_the_transcript(tmp_path: 
     path = _transcript(tmp_path / "t.jsonl", todo)
     text = handoff_capped.model_part("sid", _facts(), path, _scrubber(), use_router=False)
     assert "[x] one" in text and "[ ] two" in text
+
+
+# ── tp#2877 B8: the same-seat continue commands pass -P, the cross-seat ones stay hard ──
+
+
+def _capped_spawn(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[list[str]]:
+    """A capped, clear source on ``work``; the detached start is captured, never run."""
+    from command_center import continue_session, spawn  # pylint: disable=C0415
+
+    src = Source(
+        session_id="src",
+        cwd="/repo",
+        config_dir=str(tmp_path / "cfg-work"),
+        label="work",
+        transcript=None,
+    )
+    monkeypatch.setattr(continue_session, "_adapter", lambda: None)
+    monkeypatch.setattr(continue_session, "resolve_source", lambda *_a: src)
+    monkeypatch.setattr(handoff_capped, "is_capped", lambda *_a: (True, "seat capped"))
+    monkeypatch.setattr(
+        continue_session, "inventory", lambda *_a: type("Inv", (), {"clear": True})()
+    )
+    calls: list[list[str]] = []
+
+    def _spawn(args: list[str], *, internal: bool = True) -> bool:
+        del internal
+        calls.append(args)
+        return True
+
+    monkeypatch.setattr(spawn, "spawn_ccc", _spawn)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    return calls
+
+
+def test_same_seat_capped_handoff_passes_pick(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _capped_spawn(monkeypatch, tmp_path)
+    assert handoff_capped.intercept("src", "/cpriv-continue-in-new-session") is True
+    assert calls == [["continue-session", "start", "--capped", "-A", "private", "-P", "-s", "src"]]
+    reason = json.loads(capsys.readouterr().out)["reason"]
+    assert "opens on private (or the other seat when private is full)" in reason
+    assert handoff_capped.PICK_COMMANDS == {
+        "/cwork-continue-in-new-session",
+        "/cpriv-continue-in-new-session",
+    }
+
+
+@pytest.mark.parametrize(("command", "label"), [("/cwork-to-cpriv", "private")])
+def test_cross_seat_capped_handoff_stays_hard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    label: str,
+) -> None:
+    calls = _capped_spawn(monkeypatch, tmp_path)
+    assert handoff_capped.intercept("src", command) is True
+    assert calls == [["continue-session", "start", "--capped", "-A", label, "-s", "src"]]
+    assert "-P" not in calls[0]
+    assert "or the other seat" not in json.loads(capsys.readouterr().out)["reason"]
+    assert "/cpriv-to-cwork" not in handoff_capped.PICK_COMMANDS

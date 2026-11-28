@@ -60,6 +60,10 @@ HANDOFF_COMMANDS = {
     "/cwork-continue-in-new-session": "work",
     "/cpriv-continue-in-new-session": "private",
 }
+# The same-seat continue commands (tp#2877 B8): their detached start passes ``-P`` so the
+# label is the BASE and the relay pick may move a full seat to one with room. The
+# cross-seat ``…-to-…`` commands name their target explicitly and stay hard.
+PICK_COMMANDS = frozenset({"/cwork-continue-in-new-session", "/cpriv-continue-in-new-session"})
 # Target label → the same-session switch that still works on a capped seat.
 CACHE_WRITE_HIT = {
     "private": "/cwork-to-cpriv-cache-write-hit",
@@ -90,8 +94,12 @@ _TAIL_BYTES = 4 * 1024 * 1024
 
 def handoff_command(prompt: str) -> str | None:
     """The target label when the WHOLE first token of *prompt* is a handoff command."""
+    return HANDOFF_COMMANDS.get(_first_token(prompt))
+
+
+def _first_token(prompt: str) -> str:
     head = prompt.strip().split(maxsplit=1)
-    return HANDOFF_COMMANDS.get(head[0]) if head else None
+    return head[0] if head else ""
 
 
 def cache_write_hit_for(label: str, source_label: str) -> str:
@@ -266,13 +274,17 @@ def intercept(sid: str, prompt: str) -> bool:  # pylint: disable=too-many-return
         return True
     os.environ["CLAUDE_CODE_SESSION_ID"] = sid  # the detached start runs AS the source
     args = ["continue-session", "start", "--capped", "-A", label, "-s", sid]
+    picks = _first_token(prompt) in PICK_COMMANDS
+    if picks:
+        args.insert(args.index("-s"), "-P")
     if not spawn.spawn_ccc(args, internal=False):
         _block(f"handoff could not start (ccc not on PATH) — use {fallback}")
         return True
     log_event(sid, f"capped handoff to {label} started ({why})")
     _block(
         f"capped seat ({why}): the handoff summary is being written by the configured "
-        f"router; a NEW session opens on {label} when it is ready "
+        f"router; a NEW session opens on {label}"
+        f"{' (or the other seat when ' + label + ' is full)' if picks else ''} when it is ready "
         "(`ccc continue-session status`). If nothing opens: " + fallback
     )
     return True

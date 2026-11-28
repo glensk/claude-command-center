@@ -134,7 +134,8 @@ CREATE TABLE IF NOT EXISTS transfers (
     target_launched_at INTEGER NOT NULL DEFAULT 0,
     start_pid         INTEGER NOT NULL DEFAULT 0,
     start_heartbeat_at INTEGER NOT NULL DEFAULT 0,
-    accept_refused_at INTEGER NOT NULL DEFAULT 0
+    accept_refused_at INTEGER NOT NULL DEFAULT 0,
+    account_pick      TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_transfers_active_source ON transfers(source_session)
     WHERE state IN ('prepared', 'opened', 'accepted');
@@ -189,6 +190,9 @@ class Transfer:  # pylint: disable=too-many-instance-attributes
     # failed, or (tp#2326 D6) when a ``no-first-turn`` abort orphaned it: accept refused or
     # orphaned, the stamp the daemon sweep's orphan close keys on. 0 = never.
     accept_refused_at: int = 0
+    # tp#2877 B8: ``start -P``'s account pick as compact JSON (base, account, decision,
+    # reason, decided_at); "" = an explicit ``-A``. A retry of this transfer reuses it.
+    account_pick: str = ""
 
     def snapshot(self) -> dict[str, Any]:
         """The fields a retry must match (:data:`SNAPSHOT_FIELDS`)."""
@@ -306,6 +310,7 @@ def _row_to_transfer(row: sqlite3.Row) -> Transfer:
     data["capped"] = bool(data.get("capped"))
     data["launch_profile"] = str(data.get("launch_profile") or "")  # NULL (old row) = none
     data["facts_snapshot"] = str(data.get("facts_snapshot") or "")
+    data["account_pick"] = str(data.get("account_pick") or "")
     return Transfer(**data)
 
 
@@ -327,6 +332,7 @@ class TransferStoreMixin:
         data["capped"] = int(bool(data["capped"]))
         data["launch_profile"] = data["launch_profile"] or None
         data["facts_snapshot"] = data["facts_snapshot"] or None
+        data["account_pick"] = data["account_pick"] or None
         cols = ", ".join(data)
         marks = ", ".join("?" for _ in data)
         try:
