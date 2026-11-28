@@ -502,6 +502,19 @@ def is_launchable_llm(value: str | None) -> bool:
     return bool(value) and (value in LLM_CHOICES or is_raw_model_id(value))
 
 
+def retired_replacement(value: str | None) -> str | None:
+    """The replacement choice for a retired *value*, in either form, else ``None``.
+
+    The form is a retired ccc choice (``opus-5``) or its raw transcript id
+    (``claude-opus-5``); matching is case-insensitive and whitespace-trimmed.
+    """
+    lowered = (value or "").strip().lower()
+    if lowered in RETIRED_LLM_REPLACEMENTS:
+        return RETIRED_LLM_REPLACEMENTS[lowered]
+    label = _RETIRED_MODEL_LABELS.get(lowered)
+    return RETIRED_LLM_REPLACEMENTS.get(label) if label is not None else None
+
+
 def launchable_llm_or(value: str | None, fallback: str) -> str:
     """*value* when launchable, its replacement when retired, else *fallback* (tp#2335).
 
@@ -511,7 +524,7 @@ def launchable_llm_or(value: str | None, fallback: str) -> str:
     """
     if value and is_launchable_llm(value):
         return value
-    return RETIRED_LLM_REPLACEMENTS.get((value or "").strip().lower(), fallback)
+    return retired_replacement(value) or fallback
 
 
 def model_select_options(*held: str) -> list[tuple[str, str]]:
@@ -603,13 +616,14 @@ def resolve_job_llm(value: str | None) -> tuple[str, bool]:
 
     A raw model id (:func:`is_raw_model_id`, tp#2335) is returned unchanged; corrupt values
     use :data:`DEFAULT_LLM`, as before. A persisted pre-retirement value (``fable-5``,
-    ``opus-5``) resolves to its :data:`RETIRED_LLM_REPLACEMENTS` entry, but reports
+    ``opus-5``) or retired raw id (``claude-opus-5``) resolves to its
+    :data:`RETIRED_LLM_REPLACEMENTS` entry, but reports
     ``True`` so the launch boundary can emit exactly one notice even when both job fields
     contain it.
     """
     stripped = (value or "").strip()
     candidate = stripped.lower()
-    replacement = RETIRED_LLM_REPLACEMENTS.get(candidate)
+    replacement = retired_replacement(stripped)
     if replacement is not None:
         return replacement, True
     if candidate in LLM_MODEL_IDS:
@@ -630,9 +644,10 @@ def current_model(model: str | None) -> str:
     facts) calls this first, so a chain started on a retired model never stays on it.
     """
     value = model or ""
-    if value in RETIRED_LLM_REPLACEMENTS:
-        return RETIRED_LLM_REPLACEMENTS[value]
-    label = _RETIRED_MODEL_LABELS.get(value)
+    lowered = value.strip().lower()
+    if lowered in RETIRED_LLM_REPLACEMENTS:
+        return RETIRED_LLM_REPLACEMENTS[lowered]
+    label = _RETIRED_MODEL_LABELS.get(lowered)
     if label is not None and label in RETIRED_LLM_REPLACEMENTS:
         return LLM_MODEL_IDS[RETIRED_LLM_REPLACEMENTS[label]]
     return value

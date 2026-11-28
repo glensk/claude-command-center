@@ -385,6 +385,22 @@ def test_start_job_legacy_opus5_row_launches_on_opus55(
     ]
 
 
+def test_start_job_raw_retired_id_row_maps_with_notice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """tp#2036: a stored raw claude-opus-5 maps to opus-5.5 and says so once."""
+    argv = _start_job_argv(
+        tmp_path, monkeypatch, overseer="claude-opus-5", executor="claude-opus-5"
+    )
+    assert argv[:3] == ["claude", "--model", "claude-opus-5-5"]
+    notices = [line for line in capsys.readouterr().err.splitlines() if "retired model" in line]
+    assert notices == [
+        "notice: job job-x requested retired model claude-opus-5; launching on opus-5.5 instead"
+    ]
+
+
 def test_start_job_effort_omitted_when_config_empty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

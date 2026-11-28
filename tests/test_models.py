@@ -566,3 +566,12 @@ def test_launchable_llm_or_and_select_options() -> None:
     held = model_select_options("claude-brand-new-9", "claude-brand-new-9", "sonnet-5")
     assert [value for _label, value in held] == [*LLM_CHOICES, "claude-brand-new-9"]
     assert model_select_options("<synthetic>") == plain
+
+
+def test_retired_raw_ids_map_to_replacement() -> None:
+    """tp#2036: a retired raw id resolves like its choice, case-insensitively."""
+    assert resolve_job_llm("claude-opus-5") == ("opus-5.5", True)
+    assert resolve_job_llm("claude-fable-5") == ("opus-5.5", True)
+    assert resolve_job_llm("Claude-Opus-5") == ("opus-5.5", True)
+    assert launchable_llm_or("claude-opus-5", "X") == "opus-5.5"
+    assert current_model("Claude-Opus-5") == "claude-opus-5-5"
